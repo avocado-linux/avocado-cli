@@ -1,0 +1,11 @@
+[project]
+name = "avocado"
+version = "0.1.0"
+description = "Avocado CLI tool for building and provisioning"
+readme = "README.md"
+dependencies = [
+    # Your dependencies here
+]
+
+[project.scripts]
+avocado = "avocado.cli:main"
