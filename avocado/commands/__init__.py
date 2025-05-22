@@ -2,5 +2,6 @@
 
 from avocado.commands.build import BuildCommand
 from avocado.commands.provision import ProvisionCommand
+from avocado.commands.sdk import SdkCommand
 
-__all__ = ['BuildCommand', 'ProvisionCommand']
+__all__ = ['BuildCommand', 'ProvisionCommand', 'SdkCommand']
