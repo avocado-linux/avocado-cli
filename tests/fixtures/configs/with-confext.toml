@@ -1,0 +1,15 @@
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime]
+target = "x86_64-unknown-linux-gnu"
+
+[ext.test-confext]
+sysext = false
+confext = true
+
+[ext.test-confext.files]
+"etc/app.conf" = """
+[app]
+name=test"""
+"etc/test.conf" = "test=value"

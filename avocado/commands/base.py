@@ -17,12 +17,14 @@ class BaseCommand(ABC):
         pass
 
     @abstractmethod
-    def execute(self, args):
+    def execute(self, args, parser=None, unknown=None):
         """
         Execute the command with the provided arguments.
 
         Args:
             args: The parsed command-line arguments from argparse.
+            parser: The parser object (optional).
+            unknown: Unknown arguments that weren't parsed (optional).
 
         Returns:
             bool: True if the command executed successfully, False otherwise.

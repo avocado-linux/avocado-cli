@@ -1,0 +1,35 @@
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:v1.0.0"
+version = "1.0.0"
+
+[runtime]
+target = "aarch64-unknown-linux-gnu"
+board = "raspberry-pi-4"
+
+[ext.web-server]
+sysext = true
+confext = true
+packages = ["nginx", "certbot", "python3"]
+
+[ext.config-only]
+sysext = false
+confext = true
+
+[ext.config-only.files]
+"etc/app/config.yaml" = """
+version: 1.0
+features:
+  - logging
+  - metrics"""
+"etc/systemd/system/myapp.service" = """
+[Unit]
+Description=My App
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/myapp"""
+
+[ext.monitoring]
+sysext = true
+confext = false
+packages = ["prometheus", "grafana", "node-exporter"]

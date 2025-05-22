@@ -1,0 +1,13 @@
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime]
+target = "x86_64-unknown-linux-gnu"
+
+[ext.test-both]
+sysext = true
+confext = true
+packages = ["vim"]
+
+[ext.test-both.files]
+"etc/config.conf" = "key=value"
