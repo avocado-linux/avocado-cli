@@ -2,9 +2,10 @@
 
 import os
 from avocado.commands.base import BaseCommand
-from avocado.utils.container import SdkContainerHelper
-from avocado.utils.output import print_success, print_info, print_error
+from avocado.utils.container import SdkContainer
+from avocado.utils.output import print_success, print_info, print_error, print_debug
 from avocado.utils.config import load_config
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class ExtInstallCommand(BaseCommand):
@@ -36,6 +37,12 @@ class ExtInstallCommand(BaseCommand):
             "extension",
             nargs="?",
             help="Name of the extension to install (if not provided, installs all extensions)"
+        )
+
+        parser.add_argument(
+            "-f", "--force",
+            action="store_true",
+            help="Force the operation to proceed, bypassing warnings or confirmation prompts."
         )
 
         return parser
@@ -76,8 +83,8 @@ class ExtInstallCommand(BaseCommand):
                 print_info("No extensions found in configuration.")
                 return True
 
-            print_info("Installing {} extension(s): {}.".format(
-                       len(extensions_to_install), ', '.join(extensions_to_install)))
+        print_info("Installing {} extension(s): {}.".format(
+                   len(extensions_to_install), ', '.join(extensions_to_install)))
 
         # Get the SDK image and target from configuration
         container_image = config.get('sdk', {}).get('image')
@@ -86,23 +93,30 @@ class ExtInstallCommand(BaseCommand):
                 "No container image specified in config under 'sdk.image'.")
             return False
 
-        target = config.get('runtime', {}).get('target')
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target:
             print_error(
-                "No target architecture specified in config under 'runtime.target'.")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
             return False
 
         # Use the container helper to run the setup commands
-        container_helper = SdkContainerHelper()
+        container_helper = SdkContainer()
+        index = 0
+        total = len(extensions_to_install)
 
         # Install each extension
         for ext_name in extensions_to_install:
-            print_info(f"Installing extension '{ext_name}'.")
+            index += 1
+            if args.verbose:
+                print_debug(f"Installing ({index}/{total}) {ext_name}.")
 
-            if not self._install_single_extension(config, ext_name, container_helper, container_image, target, verbose):
+            if not self._install_single_extension(config, ext_name, container_helper,
+                                                  container_image, target, verbose,
+                                                  args.force):
                 return False
-
-            print_info(f"Installed extension '{ext_name}'.")
 
         if len(extensions_to_install) >= 1:
             print_success(f"Installed {
@@ -110,28 +124,29 @@ class ExtInstallCommand(BaseCommand):
 
         return True
 
-    def _install_single_extension(self, config, extension, container_helper, container_image, target, verbose):
+    def _install_single_extension(self, config, extension, container_helper,
+                                  container_image, target, verbose, force):
         """Install a single extension."""
         # Create the commands to check and set up the directory structure
-        check_command = f"[ -d ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension} ]"
-        setup_command = f"mkdir -p ${{AVOCADO_SDK_SYSROOTS}}/extensions/{
-            extension}/var/lib && cp -rf ${{AVOCADO_SDK_SYSROOTS}}/rootfs/var/lib/rpm ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}/var/lib"
+        check_command = f"[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]"
+        setup_command = f"mkdir -p ${{AVOCADO_EXT_SYSROOTS}}/{
+            extension}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm ${{AVOCADO_EXT_SYSROOTS}}/{extension}/var/lib"
 
         # First check if the sysroot already exists
-        sysroot_exists = container_helper.run_user_command(
+        sysroot_exists = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", check_command],
             target=target,
+            command=check_command,
             verbose=verbose,
             source_environment=False
         )
 
         if not sysroot_exists:
             # Create the sysroot
-            success = container_helper.run_user_command(
+            success = container_helper.run_in_container(
                 container_image=container_image,
-                command=["bash", "-c", setup_command],
                 target=target,
+                command=setup_command,
                 verbose=verbose,
                 source_environment=False
             )
@@ -148,60 +163,56 @@ class ExtInstallCommand(BaseCommand):
         dependencies = extension_config.get("dependencies", {})
 
         if dependencies:
-            print_info(f"Found {len(dependencies)} dependencies for extension '{
-                       extension}'.")
-
             # Build list of packages to install
             packages = []
             for package_name, version in dependencies.items():
+                # Skip compile dependencies (identified by dict value with 'compile' key)
+                if isinstance(version, dict) and 'compile' in version:
+                    continue
+
                 if version == "*":
                     packages.append(package_name)
                 else:
                     packages.append(f"{package_name}-{version}")
 
             if packages:
-                print_info(f"Installing packages into sysroot: {
-                           ', '.join(packages)}.")
-
                 # Build DNF install command
-                installroot = f"${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}"
-                dnf_cmd = f"$DNF_SDK_HOST --installroot={
-                    installroot} install -y {' '.join(packages)}"
+                yes = "-y" if force else ""
+                installroot = f"${{AVOCADO_EXT_SYSROOTS}}/{extension}"
+                command = f"""
+RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_TARGET_REPO_CONF \
+    --installroot={installroot} \
+    install \
+    {yes} \
+    {' '.join(packages)}
+"""
 
                 if verbose:
-                    print_info(f"Running command: {dnf_cmd}.")
-
-                # Create the entrypoint script
-                entrypoint_script = container_helper._create_entrypoint_script(
-                    target, source_environment=False)
-
-                # Create the complete bash command
-                bash_cmd = [
-                    "bash", "-c",
-                    entrypoint_script +
-                    f"\n# Install dependencies\n{dnf_cmd}"
-                ]
+                    print_info(f"Running command: {command}.")
 
                 # Run the DNF install command
-                install_success = container_helper.runner.run_container_command(
+                install_success = container_helper.run_in_container(
                     container_image=container_image,
-                    command=bash_cmd,
                     target=target,
-                    interactive=False,
-                    tty=False
+                    command=command,
+                    source_environment=False,
+                    use_entrypoint=True
                 )
 
-                if install_success:
-                    print_info(
-                        f"Installed {len(packages)} dependency(s) into extension '{extension}' sysroot: {os.getcwd()}/_avocado/sdk/sysroots/extensions/{extension}.")
-                else:
+                if not install_success:
                     print_error(
                         f"Failed to install dependencies for extension '{extension}'.")
                     return False
             else:
-                print_info(f"No valid dependencies to install for extension '{
-                           extension}'.")
+                if verbose:
+                    print_debug(f"No valid dependencies to install for extension '{
+                               extension}'.")
         else:
-            print_info(f"No dependencies defined for extension '{extension}'.")
+            if verbose:
+                print_debug(f"No dependencies defined for extension '{extension}'.")
 
         return True

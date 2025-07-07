@@ -33,3 +33,7 @@ def print_success(message):
 def print_info(message):
     """Print an info message with blue [INFO] prefix."""
     print(f"{Colors.BLUE}[INFO]{Colors.RESET} {message}")
+
+def print_debug(message):
+    """Print a debug message with cyan [DEBUG] prefix."""
+    print(f"{Colors.CYAN}[DEBUG]{Colors.RESET} {message}")

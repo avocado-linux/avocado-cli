@@ -1,9 +1,10 @@
-"""Extension DNF command implementation."""
+"""Extension dnf command implementation."""
 import sys
 from avocado.commands.base import BaseCommand
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.config import load_config
 from avocado.utils.output import print_error, print_info, print_success
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class ExtDnfCommand(BaseCommand):
@@ -13,10 +14,10 @@ class ExtDnfCommand(BaseCommand):
         """Perform extension setup for DNF operations."""
         # Check if extension directory structure exists, create it if not
         check_cmd = f"test -d ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}"
-        dir_exists = container_helper.run_user_command(
+        dir_exists = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", check_cmd],
             target=target,
+            command=["bash", "-c", check_cmd],
             verbose=False,  # Don't show verbose output for the check
             source_environment=False
         )
@@ -29,10 +30,10 @@ class ExtDnfCommand(BaseCommand):
                     extension}/var/lib"
             ]
 
-            setup_success = container_helper.run_user_command(
+            setup_success = container_helper.run_in_container(
                 container_image=container_image,
-                command=["bash", "-c", " && ".join(setup_commands)],
                 target=target,
+                command=["bash", "-c", " && ".join(setup_commands)],
                 verbose=verbose,
                 source_environment=False
             )
@@ -40,7 +41,8 @@ class ExtDnfCommand(BaseCommand):
             if setup_success:
                 print_success(f"Created sysroot for extension '{extension}'.")
             else:
-                print_error(f"Failed to create sysroot for extension '{extension}'.")
+                print_error(
+                    f"Failed to create sysroot for extension '{extension}'.")
                 return False
 
         return True
@@ -104,14 +106,16 @@ class ExtDnfCommand(BaseCommand):
                 "Error: No container image specified in config under 'sdk.image'", file=sys.stderr)
             return False
 
-        # Get the target architecture from configuration
-        target = config.get('runtime', {}).get('target')
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target:
             print(
-                "Error: No target architecture specified in config under 'runtime.target'", file=sys.stderr)
+                "Error: No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.", file=sys.stderr)
             return False
 
-        container_helper = SdkContainerHelper()
+        container_helper = SdkContainer()
 
         # Check if extension exists in configuration
         if "ext" not in config or extension not in config["ext"]:
@@ -128,23 +132,13 @@ class ExtDnfCommand(BaseCommand):
         dnf_cmd = f"$DNF_SDK_HOST --installroot={
             installroot} {' '.join(dnf_args)}"
 
-        # Create the entrypoint script
-        entrypoint_script = container_helper._create_entrypoint_script(
-            target, source_environment=False)
-
-        # Create the complete bash command
-        bash_cmd = [
-            "bash", "-c",
-            entrypoint_script + f"\n# Execute DNF command\n{dnf_cmd}"
-        ]
-
-        # Run the command
-        success = container_helper.runner.run_container_command(
+        # Run the DNF command using the container helper
+        success = container_helper.run_in_container(
             container_image=container_image,
-            command=bash_cmd,
             target=target,
-            interactive=True,
-            tty=True
+            command=["bash", "-c", dnf_cmd],
+            source_environment=False,
+            use_entrypoint=True
         )
 
         # Log the result

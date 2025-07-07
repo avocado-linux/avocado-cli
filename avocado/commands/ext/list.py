@@ -1,6 +1,7 @@
 """Extension list command implementation."""
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
+from avocado.utils.output import print_success
 
 
 class ExtListCommand(BaseCommand):
@@ -110,4 +111,5 @@ class ExtListCommand(BaseCommand):
         for ext_name in extensions:
             print(ext_name)
 
+        print_success(f"Listed {len(extensions)} extension(s).")
         return True

@@ -7,6 +7,7 @@ from avocado.commands.ext import ExtCommand
 from avocado.commands.init import InitCommand
 from avocado.commands.runtime import RuntimeCommand
 from avocado.commands.clean import CleanCommand
+from avocado.utils.target import resolve_target
 
 
 def main():
@@ -15,6 +16,13 @@ def main():
         description="Avocado CLI tool",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
+
+    # Add global target argument
+    parser.add_argument(
+        "--target", "-t",
+        help="Target architecture/board (can also be set via AVOCADO_TARGET env var)"
+    )
+
     subparsers = parser.add_subparsers(
         dest="main_command", help="Command to execute")
 
@@ -27,9 +35,20 @@ def main():
 
     args, unknown = parser.parse_known_args()
 
+    # Resolve target from CLI args, environment, and config (future)
+    resolved_target = resolve_target(cli_target=args.target)
+
+    # Store the resolved target back in args for commands to use
+    args.resolved_target = resolved_target
+
     if not args.main_command:
         parser.print_help()
         return 0
+
+    # Resolve target with proper precedence (CLI > env var > config)
+    resolved_target = resolve_target(cli_target=args.target)
+    # Store resolved target back in args for commands to use
+    args.resolved_target = resolved_target
 
     # Dispatch to appropriate command
     if args.main_command == "sdk":

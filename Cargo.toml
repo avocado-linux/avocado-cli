@@ -1,0 +1,15 @@
+[package]
+name = "avocado-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command line interface for Avocado."
+authors = ["Avocado"]
+license = "MIT"
+repository = "https://github.com/avocado-framework/avocado-cli"
+keywords = ["cli", "build", "provisioning", "containers", "extensions"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"

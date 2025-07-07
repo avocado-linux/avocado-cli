@@ -3,8 +3,9 @@ import os
 import sys
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.output import print_error, print_success, print_info
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class ExtImageCommand(BaseCommand):
@@ -78,13 +79,18 @@ class ExtImageCommand(BaseCommand):
 
         # Get runtime configuration
         runtime_config = config.get('runtime', {})
-        target_arch = runtime_config.get('target')
+
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target_arch = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target_arch:
-            print_error("No target architecture specified in configuration.")
+            print_error(
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
             return False
 
         # Initialize SDK container helper
-        container_helper = SdkContainerHelper(verbose=verbose)
+        container_helper = SdkContainer(verbose=verbose)
 
         # Create images based on configuration
         overall_success = True
@@ -93,16 +99,14 @@ class ExtImageCommand(BaseCommand):
             print_info(f"Creating {ext_type} image for extension '{
                        extension_name}'.")
 
+            result = self._create_image(
+                container_helper, container_image, target_arch,
+                extension_name, ext_type, verbose
+            )
             if ext_type == 'sysext':
-                result = self._create_sysext_image(
-                    container_helper, container_image, target_arch,
-                    extension_name, verbose
-                )
+                print("sysext")
             elif ext_type == 'confext':
-                result = self._create_confext_image(
-                    container_helper, container_image, target_arch,
-                    extension_name, verbose
-                )
+                print("confext")
 
             if result:
                 print_success(f"Successfully created {ext_type} image for extension '{
@@ -114,21 +118,20 @@ class ExtImageCommand(BaseCommand):
 
         return overall_success
 
-    def _create_sysext_image(self, container_helper, container_image, target_arch,
-                             extension_name, verbose):
-        """Create a sysext squashfs image."""
-
-        # Create the sysext build script
-        build_script = self._create_sysext_build_script(extension_name)
+    def _create_image(self, container_helper, container_image, target_arch,
+                      extension_name, extension_type, verbose):
+        # Create the build script
+        build_script = self._create_build_script(
+            extension_name, extension_type)
 
         # Execute the build script in the SDK container
         if verbose:
-            print_info("Executing sysext image build script.")
+            print_info("Executing image build script.")
 
-        result = container_helper.run_user_command(
+        result = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", build_script],
             target=target_arch,
+            command=build_script,
             rm=True,
             verbose=verbose,
             source_environment=True
@@ -136,82 +139,31 @@ class ExtImageCommand(BaseCommand):
 
         return result
 
-    def _create_confext_image(self, container_helper, container_image, target_arch,
-                              extension_name, verbose):
-        """Create a confext squashfs image."""
-
-        # Create the confext build script
-        build_script = self._create_confext_build_script(extension_name)
-
-        # Execute the build script in the SDK container
-        if verbose:
-            print_info("Executing confext image build script.")
-
-        result = container_helper.run_user_command(
-            container_image=container_image,
-            command=["bash", "-c", build_script],
-            target=target_arch,
-            rm=True,
-            verbose=verbose,
-            source_environment=True
-        )
-
-        return result
-
-    def _create_sysext_build_script(self, extension_name):
-        """Create the sysext image build script."""
+    def _create_build_script(self, extension_name, extension_type):
+        """Create the image build script."""
 
         script = f'''
 set -e
 
 # Common variables
-OUTPUT_DIR="/opt/_avocado/extensions"
 EXT_NAME="{extension_name}"
-OUTPUT_FILE="${{OUTPUT_DIR}}/sysext/${{EXT_NAME}}.raw"
+OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
+OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME.raw"
 
 # Create output directory
-mkdir -p "${{OUTPUT_DIR}}/sysext"
+mkdir -p $OUTPUT_DIR
 
 # Remove existing file if it exists
 rm -f "$OUTPUT_FILE"
 
-# Check if sysext directory exists
-if [ ! -d "$AVOCADO_SDK_SYSROOTS/extensions/${{EXT_NAME}}" ]; then
-    echo "Extension sysroot does not exist: $AVOCADO_SDK_SYSROOTS/extensions/${{EXT_NAME}}."
+# Check if extension directory exists
+if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
+    echo "Extension sysroot does not exist: $AVOCADO_EXT_SYSROOTS/$EXT_NAME."
     exit 1
 fi
 
 # Create squashfs image
-mksquashfs "$AVOCADO_SDK_SYSROOTS/sysext" "$OUTPUT_FILE" -noappend
-'''
-
-        return script
-
-    def _create_confext_build_script(self, extension_name):
-        """Create the confext image build script."""
-
-        script = f'''
-set -e
-
-# Common variables
-OUTPUT_DIR="/opt/_avocado/extensions"
-EXT_NAME="{extension_name}"
-OUTPUT_FILE="${{OUTPUT_DIR}}/confext/${{EXT_NAME}}.raw"
-
-# Create output directory
-mkdir -p "${{OUTPUT_DIR}}/confext"
-
-# Remove existing file if it exists
-rm -f "$OUTPUT_FILE"
-
-# Check if confext directory exists
-if [ ! -d "$AVOCADO_SDK_SYSROOTS/extensions/${{EXT_NAME}}" ]; then
-    echo "Extension sysroot does not exist: $AVOCADO_SDK_SYSROOTS/extensions/${{EXT_NAME}}."
-    exit 1
-fi
-
-# Create squashfs image
-mksquashfs "$AVOCADO_SDK_SYSROOTS/confext" "$OUTPUT_FILE" -noappend
+mksquashfs "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" "$OUTPUT_FILE" -noappend
 '''
 
         return script

@@ -3,9 +3,10 @@ import os
 import sys
 import tomlkit
 from avocado.commands.base import BaseCommand
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.config import load_config
 from avocado.utils.output import print_success, print_error
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class SdkDnfCommand(BaseCommand):
@@ -63,35 +64,28 @@ class SdkDnfCommand(BaseCommand):
                 "Error: No container image specified in config under 'sdk.image'", file=sys.stderr)
             return False
 
-        # Get the target architecture from configuration
-        target = config.get('runtime', {}).get('target')
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target:
             print(
-                "Error: No target architecture specified in config under 'runtime.target'", file=sys.stderr)
+                "Error: No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.", file=sys.stderr)
             return False
 
-        container_helper = SdkContainerHelper()
+        container_helper = SdkContainer()
 
         # Build dnf command
-        dnf_cmd = f"$DNF_SDK_HOST {' '.join(dnf_args)}"
+        command = f"RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF {
+            ' '.join(dnf_args)}"
 
-        # Create the entrypoint script
-        entrypoint_script = container_helper._create_entrypoint_script(
-            target, source_environment=False)
-
-        # Create the complete bash command
-        bash_cmd = [
-            "bash", "-c",
-            entrypoint_script + f"\n# Execute DNF command\n{dnf_cmd}"
-        ]
-
-        # Run the command
-        success = container_helper.runner.run_container_command(
+        # Run the DNF command using the container helper
+        success = container_helper.run_in_container(
             container_image=container_image,
-            command=bash_cmd,
             target=target,
-            interactive=True,
-            tty=True
+            command=[command],
+            source_environment=False,
+            use_entrypoint=True
         )
 
         # Log the result

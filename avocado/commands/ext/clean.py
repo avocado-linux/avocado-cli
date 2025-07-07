@@ -1,8 +1,10 @@
 """Extension clean command implementation."""
+import os
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.output import print_error, print_success, print_info
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class ExtCleanCommand(BaseCommand):
@@ -50,7 +52,13 @@ class ExtCleanCommand(BaseCommand):
 
         # Get runtime config
         runtime_config = config.get("runtime", {})
-        target = runtime_config.get("target", "qemux86-64")
+
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
+        if not target:
+            target = "qemux86-64"  # Default fallback
 
         # Get SDK config
         sdk_config = config.get("sdk", {})
@@ -58,26 +66,26 @@ class ExtCleanCommand(BaseCommand):
             "image", "avocadolinux/sdk:apollo-edge")
 
         # Initialize container helper
-        container_helper = SdkContainerHelper()
+        container_helper = SdkContainer()
 
         # Check if extension sysroot exists
-        sysroot_path = f"${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}"
+        sysroot_path = f"$AVOCADO_EXT_SYSROOTS/{extension}"
         check_cmd = f"test -d {sysroot_path}"
 
         if verbose:
             print_info(f"Checking if sysroot exists for extension '{
                        extension}'.")
 
-        sysroot_exists = container_helper.run_user_command(
+        sysroot_exists = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", check_cmd],
             target=target,
+            command=check_cmd,
             verbose=False,  # Don't show verbose output for the check
             source_environment=False
         )
 
         if not sysroot_exists:
-            print_info(f"No sysroot found for extension '{extension}'.")
+            print_success(f"Sysroot for extension {extension} does not exist.")
             return True
 
         # Remove the extension sysroot
@@ -88,10 +96,10 @@ class ExtCleanCommand(BaseCommand):
         if verbose:
             print_info(f"Running command: {remove_cmd}")
 
-        success = container_helper.run_user_command(
+        success = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", remove_cmd],
             target=target,
+            command=remove_cmd,
             verbose=verbose,
             source_environment=False
         )

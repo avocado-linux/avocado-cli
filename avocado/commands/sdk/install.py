@@ -1,9 +1,10 @@
 """SDK install command implementation."""
 import os
 from avocado.commands.base import BaseCommand
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.output import print_success, print_info, print_error
 from avocado.utils.config import load_config
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class SdkInstallCommand(BaseCommand):
@@ -30,6 +31,12 @@ class SdkInstallCommand(BaseCommand):
             help="Enable verbose output"
         )
 
+        parser.add_argument(
+            "-f", "--force",
+            action="store_true",
+            help="Force the operation to proceed, bypassing warnings or confirmation prompts."
+        )
+
         return parser
 
     def _get_compile_sections_dependencies(self, config):
@@ -51,8 +58,6 @@ class SdkInstallCommand(BaseCommand):
         config_path = args.config
         verbose = args.verbose
 
-        print_info("Installing SDK dependencies.")
-
         # Load the configuration
         config, success = load_config(config_path)
         if not success:
@@ -65,11 +70,16 @@ class SdkInstallCommand(BaseCommand):
                 "No container image specified in config under 'sdk.image'")
             return False
 
-        target = config.get('runtime', {}).get('target')
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target:
             print_error(
-                "No target architecture specified in config under 'runtime.target'")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
             return False
+
+        print_info("Installing SDK dependencies.")
 
         # Get SDK dependencies
         sdk_config = config.get('sdk', {})
@@ -78,21 +88,11 @@ class SdkInstallCommand(BaseCommand):
         # Get compile section dependencies
         compile_dependencies = self._get_compile_sections_dependencies(config)
 
-        if not sdk_dependencies and not compile_dependencies:
-            print_info(
-                "No dependencies found in [sdk.dependencies] or [sdk.compile.*.dependencies].")
-            return True
-
-        overall_success = True
-
         # Use the container helper to run the installation
-        container_helper = SdkContainerHelper()
+        container_helper = SdkContainer()
 
         # Install SDK dependencies (into SDK)
         if sdk_dependencies:
-            print_info(f"Found {len(sdk_dependencies)
-                                } SDK dependencies to install.")
-
             # Build list of packages to install
             sdk_packages = []
             for package_name, version in sdk_dependencies.items():
@@ -105,37 +105,44 @@ class SdkInstallCommand(BaseCommand):
                     sdk_packages.append(f"{package_name}-{version}")
 
             if sdk_packages:
-                print_info(f"Installing {len(sdk_packages)} package(s) into SDK: {
-                           ', '.join(sdk_packages)}.")
+                yes = "-y" if args.force else ""
 
-                # Use the container helper's run_dnf_install method
-                install_success = container_helper.run_dnf_install(
+                command = f"""
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_REPO_CONF \
+    install \
+    {yes} \
+    {' '.join(sdk_packages)}
+"""
+                # Use the container helper's run_in_container method
+                install_success = container_helper.run_in_container(
                     container_image=container_image,
-                    packages=sdk_packages,
                     target=target,
-                    dnf_flags="-y $DNF_SDK_HOST_OPTS",
+                    command=command,
                     verbose=verbose,
-                    source_environment=False,
-                    env_vars={
-                        "RPM_CONFIGDIR": "/opt/_avocado/sdk/usr/lib/rpm"}
+                    source_environment=False
                 )
 
                 if install_success:
                     print_success(
-                        f"Installed {len(sdk_packages)} package(s) into SDK sysroot: {os.getcwd()}/_avocado/sdk.")
+                        f"Installed SDK dependencies.")
                 else:
-                    print_error("Failed to install SDK dependencies.")
-                    overall_success = False
+                    print_error("Failed to install SDK package(s).")
+                    return False
+        else:
+            print_success("No dependencies configured.")
 
         # Install compile section dependencies (into target-dev sysroot)
         if compile_dependencies:
-            print_info(f"Found {len(compile_dependencies)
-                                } compile section(s) with dependencies.")
+            print_info("Installing SDK compile dependencies.")
+            total = len(compile_dependencies)
+            index = 0
 
             for section_name, dependencies in compile_dependencies.items():
-                print_info(f"Installing dependencies for compile section '{
-                           section_name}'.")
-
+                index += 1
                 # Build list of packages to install
                 compile_packages = []
                 for package_name, version in dependencies.items():
@@ -148,26 +155,36 @@ class SdkInstallCommand(BaseCommand):
                         compile_packages.append(f"{package_name}-{version}")
 
                 if compile_packages:
-                    print_info(f"Installing {len(compile_packages)} package(s) into target-dev sysroot: {
-                               ', '.join(compile_packages)}.")
+                    installroot = "${AVOCADO_SDK_PREFIX}/target-sysroot"
+                    yes = "-y" if args.force else ""
+                    command = f"""
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+$DNF_SDK_HOST \
+    --installroot {installroot} \
+    $DNF_SDK_TARGET_REPO_CONF \
+    install \
+    {yes} \
+    {' '.join(compile_packages)}
+"""
 
-                    # Use the container helper's run_dnf_install method with target-dev installroot
-                    install_success = container_helper.run_dnf_install(
+                    print_info(f"Installing ({index}/{total}) {section_name}.")
+
+                    # Use the container helper's run_in_container method with target-dev installroot
+                    install_success = container_helper.run_in_container(
+                        command=command,
                         container_image=container_image,
-                        packages=compile_packages,
                         target=target,
-                        installroot="${AVOCADO_SDK_SYSROOTS}/target-dev",
-                        dnf_flags="-y",
                         verbose=verbose,
                         source_environment=False
                     )
 
-                    if install_success:
-                        print_success(f"Installed {len(compile_packages)} package(s) for section '{
-                                      section_name}' into target-dev sysroot: {os.getcwd()}/_avocado/sdk/sysroots/target-dev.")
-                    else:
+                    if not install_success:
                         print_error(f"Failed to install dependencies for compile section '{
                                     section_name}'.")
-                        overall_success = False
+                        return False
+                else:
+                    print_info(f"({index}/{total}) [sdk.compile.{section_name}.dependencies] no dependencies.")
 
-        return overall_success
+            print_success("Installed SDK compile dependencies.")
+
+        return True

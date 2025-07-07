@@ -1,16 +1,27 @@
 """SDK compile command implementation."""
 import sys
 from avocado.commands.base import BaseCommand
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.config import load_config
 from avocado.utils.output import print_error, print_success, print_info
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class SdkCompileCommand(BaseCommand):
-    """Implementation of the 'sdk compile' command."""
-
     def _get_compile_sections_from_config(self, config):
-        """Get all compile sections from sdk.compile configuration."""
+        """Extract compile sections from configuration.
+
+        This function collects all compile sections under [sdk.compile.*].
+
+        Args:
+            config: The loaded configuration dictionary
+
+        Returns:
+            List of compile section dictionaries, each containing:
+            - name: The section name
+            - script: The compile script path
+            - config: The full section configuration
+        """
         if "sdk" not in config or "compile" not in config["sdk"]:
             return []
 
@@ -62,7 +73,6 @@ class SdkCompileCommand(BaseCommand):
         sections = args.sections if hasattr(args, 'sections') else []
         config_path = args.config
         verbose = args.verbose
-
         # Load configuration
         config, success = load_config(config_path)
         if not success:
@@ -72,7 +82,7 @@ class SdkCompileCommand(BaseCommand):
         compile_sections = self._get_compile_sections_from_config(config)
 
         if not compile_sections:
-            print("No compile sections found in configuration.")
+            print_success("No compile sections configured.")
             return True
 
         # Filter sections if specific ones were requested
@@ -102,15 +112,18 @@ class SdkCompileCommand(BaseCommand):
                 "No container image specified in config under 'sdk.image'")
             return False
 
-        # Get the target architecture from configuration
-        target = config.get('runtime', {}).get('target')
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+
+        target = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target:
             print_error(
-                "No target architecture specified in config under 'runtime.target'")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
             return False
 
-        # Process each compile section
         overall_success = True
+
         for section in compile_sections:
             section_name = section["name"]
             compile_script = section["script"]
@@ -118,25 +131,16 @@ class SdkCompileCommand(BaseCommand):
             print_info(f"Compiling section '{
                 section_name}' with script '{compile_script}'")
 
-            # Use the shared container helper to run the compile script
-            container_helper = SdkContainerHelper()
+            container_helper = SdkContainer()
 
-            # Build a simple command to run the compile script
-            # The container helper will handle all the SDK environment setup
-            compile_command = [
-                "sh", "-c",
-                f"if [ -f '{compile_script}' ]; then " +
-                f"echo 'Running compile script: {compile_script}'; " +
-                f"bash '{compile_script}'; " +
-                f"else echo 'Compile script {compile_script} not found in container /opt.'; " +
-                f"exit 1; fi"
-            ]
+            compile_command = f"if [ -f '{compile_script}' ]; then echo 'Running compile script: {compile_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{ compile_script}'; else echo 'Compile script {compile_script} not found.' && ls -la; exit 1; fi"
 
-            success = container_helper.run_user_command(
+            success = container_helper.run_in_container(
                 container_image=container_image,
-                command=compile_command,
                 target=target,
-                verbose=verbose
+                command=compile_command,
+                verbose=verbose,
+                source_environment=True,
             )
 
             if success:

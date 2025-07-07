@@ -1,0 +1,30 @@
+[runtime.default]
+target = "qemux86-64"
+
+[sdk]
+image = "avocadolinux/sdk:dev"
+
+[sdk.dependencies]
+nativesdk-qemu-system-x86-64 = "*"
+
+[sdk.compile.pingpong]
+compile = "pingpong-compile.sh"
+
+[sdk.compile.pingpong.dependencies]
+libcryptoauth-dev = "*"
+
+[ext.ext-1]
+sysext = true
+confext = true
+
+[ext.ext-1.dependencies]
+cryptoauthlib = "*"
+pingpong = { compile = "pingpong" }
+
+[ext.ext-2]
+sysext = false
+confext = true
+
+[ext.ext-3]
+sysext = true
+confext = false

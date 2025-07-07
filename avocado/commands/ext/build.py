@@ -6,8 +6,9 @@ import tomlkit
 from pathlib import Path
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.output import print_error, print_success, print_info
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class ExtBuildCommand(BaseCommand):
@@ -67,6 +68,10 @@ class ExtBuildCommand(BaseCommand):
         if ext_config.get('confext', False):
             ext_types.append('confext')
 
+        ext_scopes = ext_config.get('scopes', ["system"])
+        sysext_scopes = ext_config.get('sysext_scopes', ext_scopes)
+        confext_scopes = ext_config.get('confext_scopes', ext_scopes)
+
         if not ext_types:
             print_error(
                 f"Extension '{extension_name}' has sysext=false and confext=false. At least one must be true to build.")
@@ -82,15 +87,17 @@ class ExtBuildCommand(BaseCommand):
             print_error("No SDK container image specified in configuration.")
             return False
 
-        # Get runtime configuration
-        runtime_config = config.get('runtime', {})
-        target_arch = runtime_config.get('target')
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target_arch = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target_arch:
-            print_error("No target architecture specified in configuration.")
+            print_error(
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
             return False
 
         # Initialize SDK container helper
-        container_helper = SdkContainerHelper(verbose=verbose)
+        container_helper = SdkContainer(verbose=verbose)
 
         # Build extensions based on configuration
         overall_success = True
@@ -101,12 +108,12 @@ class ExtBuildCommand(BaseCommand):
             if ext_type == 'sysext':
                 build_result = self._build_sysext_extension(
                     container_helper, container_image, target_arch,
-                    extension_name, ext_version, verbose
+                    extension_name, ext_version, sysext_scopes, verbose
                 )
             elif ext_type == 'confext':
                 build_result = self._build_confext_extension(
                     container_helper, container_image, target_arch,
-                    extension_name, ext_version, verbose
+                    extension_name, ext_version, confext_scopes, verbose
                 )
 
             if build_result:
@@ -120,21 +127,21 @@ class ExtBuildCommand(BaseCommand):
         return overall_success
 
     def _build_sysext_extension(self, container_helper, container_image, target_arch,
-                                extension_name, ext_version, verbose):
+                                extension_name, ext_version, ext_scopes, verbose):
         """Build a sysext extension."""
 
         # Create the build script for sysext extension
         build_script = self._create_sysext_build_script(
-            extension_name, ext_version)
+            extension_name, ext_version, ext_scopes)
 
         # Execute the build script in the SDK container
         if verbose:
             print_info(f"Executing sysext extension build script.")
 
-        result = container_helper.run_user_command(
+        result = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", build_script],
             target=target_arch,
+            command=build_script,
             rm=True,
             verbose=verbose,
             source_environment=True
@@ -146,21 +153,21 @@ class ExtBuildCommand(BaseCommand):
         return result
 
     def _build_confext_extension(self, container_helper, container_image, target_arch,
-                                 extension_name, ext_version, verbose):
+                                 extension_name, ext_version, ext_scopes, verbose):
         """Build a confext extension."""
 
         # Create the build script for confext extension
         build_script = self._create_confext_build_script(
-            extension_name, ext_version)
+            extension_name, ext_version, ext_scopes)
 
         # Execute the build script in the SDK container
         if verbose:
             print_info(f"Executing confext extension build script.")
 
-        result = container_helper.run_user_command(
+        result = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", build_script],
             target=target_arch,
+            command=build_script,
             rm=True,
             verbose=verbose,
             source_environment=True
@@ -171,42 +178,40 @@ class ExtBuildCommand(BaseCommand):
 
         return result
 
-    def _create_sysext_build_script(self, extension_name, ext_version):
+    def _create_sysext_build_script(self, extension_name, ext_version, ext_scopes):
         """Create the build script for sysext extension."""
 
         # Common variables
-        ext_id = "avocado"
-
         script = f'''
 set -e
 
-release_dir="$AVOCADO_SDK_SYSROOTS/sysext/usr/lib/extension-release.d"
+release_dir="$AVOCADO_EXT_SYSROOTS/{extension_name}/usr/lib/extension-release.d"
 release_file="$release_dir/extension-release.{extension_name}"
 
 mkdir -p "$release_dir"
-echo "ID={ext_id}" > "$release_file"
+echo "ID={extension_name}" > "$release_file"
 echo "VERSION_ID={ext_version}" >> "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
+echo "SYSEXT_SCOPE={" ".join(ext_scopes)}" >> "$release_file"
 '''
 
         return script
 
-    def _create_confext_build_script(self, extension_name, ext_version):
+    def _create_confext_build_script(self, extension_name, ext_version, ext_scopes):
         """Create the build script for confext extension."""
 
         # Common variables
-        ext_id = "avocado"
-
         script = f'''
 set -e
 
-release_dir="$AVOCADO_SDK_SYSROOTS/confext/etc/extension-release.d"
+release_dir="$AVOCADO_EXT_SYSROOTS/{extension_name}/etc/extension-release.d"
 release_file="$release_dir/extension-release.{extension_name}"
 
 mkdir -p "$release_dir"
-echo "ID={ext_id}" > "$release_file"
+echo "ID={extension_name}" > "$release_file"
 echo "VERSION_ID={ext_version}" >> "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
+echo "CONFEXT_SCOPE={" ".join(ext_scopes)}" >> "$release_file"
 '''
 
         return script

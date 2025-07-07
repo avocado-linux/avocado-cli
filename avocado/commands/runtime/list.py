@@ -1,6 +1,7 @@
 """Runtime list command implementation."""
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
+from avocado.utils.output import print_success
 
 
 class RuntimeListCommand(BaseCommand):
@@ -95,4 +96,5 @@ class RuntimeListCommand(BaseCommand):
         for runtime_name, runtime_value in runtimes:
             print(runtime_name)
 
+        print_success(f"Listed {len(runtimes)} runtime(s).")
         return True

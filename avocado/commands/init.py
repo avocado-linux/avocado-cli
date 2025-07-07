@@ -15,12 +15,7 @@ class InitCommand(BaseCommand):
             help="Initialize a new avocado project"
         )
 
-        # Optional arguments
-        parser.add_argument(
-            "-t", "--target",
-            default="qemux86-64",
-            help="Target architecture/board (default: qemux86-64)"
-        )
+        # No longer need local target argument - uses global target
 
         # Optional argument - the directory to initialize
         parser.add_argument(
@@ -34,7 +29,7 @@ class InitCommand(BaseCommand):
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the init command."""
-        target = args.target
+        target = args.resolved_target or "qemux86-64"  # Use global target with default fallback
         directory = args.directory
 
         # Validate the directory
@@ -56,7 +51,7 @@ class InitCommand(BaseCommand):
 
         try:
             # Create the new configuration template
-            config_content = f'''[runtime]
+            config_content = f'''[runtime.default]
 target = "{target}"
 
 [runtime.default.dependencies]

@@ -3,8 +3,9 @@ import os
 import sys
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
-from avocado.utils.container import SdkContainerHelper
+from avocado.utils.container import SdkContainer
 from avocado.utils.output import print_error, print_success, print_info
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class RuntimeBuildCommand(BaseCommand):
@@ -31,6 +32,12 @@ class RuntimeBuildCommand(BaseCommand):
             help="Enable verbose output"
         )
 
+        parser.add_argument(
+            "-f", "--force",
+            action="store_true",
+            help="Force the operation to proceed, bypassing warnings or confirmation prompts."
+        )
+
         return parser
 
     def execute(self, args, parser=None, unknown=None):
@@ -52,59 +59,65 @@ class RuntimeBuildCommand(BaseCommand):
 
         # Get runtime configuration
         runtime_config = config.get('runtime', {})
-        target_arch = runtime_config.get('target')
+
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        config_target = get_target_from_config(config)
+        target_arch = resolve_target(
+            cli_target=args.resolved_target, config_target=config_target)
         if not target_arch:
-            print_error("No target architecture specified in configuration.")
+            print_error(
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
             return False
 
         print_info("Building runtime images.")
 
         # Initialize SDK container helper
-        container_helper = SdkContainerHelper(verbose=verbose)
+        container_helper = SdkContainer(verbose=verbose)
 
         # First check if the required images package is already installed (silent check)
         dnf_check_script = '''
-$DNF_SDK_HOST --installroot=/opt/_avocado/images list installed avocado-pkg-images >/dev/null 2>&1
+RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST \
+$DNF_SDK_HOST_OPTS \
+$DNF_SDK_TARGET_REPO_CONF \
+--installroot=$AVOCADO_PREFIX/images \
+list installed avocado-pkg-images >/dev/null 2>&1
 '''
 
-        # Use container runner directly to check package status
-        from avocado.utils.container import ContainerRunner
-        container_runner = ContainerRunner(verbose=verbose)
+        # Use container helper to check package status
+        command = dnf_check_script
 
-        # Get the entrypoint script content
-        entrypoint_script = container_helper._create_entrypoint_script(
-            target_arch, True)
-
-        # Create the complete check command
-        check_cmd = ["bash", "-c",
-                     entrypoint_script + "\n" + dnf_check_script]
-
-        package_installed = container_runner.run_container_command(
+        package_installed = container_helper.run_in_container(
             container_image=container_image,
-            command=check_cmd,
             target=target_arch,
-            interactive=False,
+            command=command,
             rm=True
         )
 
         if not package_installed:
             print_info("Installing avocado-pkg-images package.")
+            yes = "-y" if args.force else ""
 
             # Create DNF install script
-            dnf_install_script = '''
-$DNF_SDK_HOST --installroot=/opt/_avocado/images install avocado-pkg-images
+            dnf_install_script = f'''
+RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_TARGET_REPO_CONF \
+    --installroot=$AVOCADO_PREFIX/images \
+    install \
+    {yes} \
+    avocado-pkg-images
 '''
 
-            # Create the complete interactive command
-            interactive_cmd = ["bash", "-c",
-                               entrypoint_script + "\n" + dnf_install_script]
-
-            install_result = container_runner.run_container_command(
+            # Run the DNF install command
+            install_result = container_helper.run_in_container(
                 container_image=container_image,
-                command=interactive_cmd,
                 target=target_arch,
-                interactive=True,
-                rm=True
+                command=dnf_install_script,
+                rm=True,
             )
 
             if not install_result:
@@ -117,7 +130,7 @@ $DNF_SDK_HOST --installroot=/opt/_avocado/images install avocado-pkg-images
 
         # Build var image first
         var_result = self._build_var_image(
-            container_helper, container_image, target_arch, verbose
+            container_helper, container_image, target_arch, config, verbose
         )
 
         if not var_result:
@@ -136,21 +149,21 @@ $DNF_SDK_HOST --installroot=/opt/_avocado/images install avocado-pkg-images
         print_success("Successfully built runtime images.")
         return True
 
-    def _build_var_image(self, container_helper, container_image, target_arch, verbose):
+    def _build_var_image(self, container_helper, container_image, target_arch, config, verbose):
         """Build a var image."""
         print_info("Building var image.")
 
         # Create the var build script
-        build_script = self._create_var_build_script()
+        build_script = self._create_var_build_script(config)
 
         # Execute the build script in the SDK container
         if verbose:
             print_info("Executing var image build script.")
 
-        result = container_helper.run_user_command(
+        result = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", build_script],
             target=target_arch,
+            command=build_script,
             rm=True,
             verbose=verbose,
             source_environment=True
@@ -174,10 +187,10 @@ $DNF_SDK_HOST --installroot=/opt/_avocado/images install avocado-pkg-images
         if verbose:
             print_info("Executing complete image build script.")
 
-        result = container_helper.run_user_command(
+        result = container_helper.run_in_container(
             container_image=container_image,
-            command=["bash", "-c", build_script],
             target=target_arch,
+            command=build_script,
             rm=True,
             verbose=verbose,
             source_environment=True
@@ -190,43 +203,67 @@ $DNF_SDK_HOST --installroot=/opt/_avocado/images install avocado-pkg-images
 
         return result
 
-    def _create_var_build_script(self):
+    def _create_var_build_script(self, config):
         """Create the var image build script."""
+
+        # Build extension symlink commands from config
+        symlink_commands = []
+        ext_config = config.get('ext', {})
+
+        for ext_name, ext_data in ext_config.items():
+            if isinstance(ext_data, dict):
+                is_sysext = ext_data.get('sysext', False)
+                is_confext = ext_data.get('confext', False)
+
+                symlink_commands.append(f'''
+# The output of ext image.
+OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
+# Where in the runtime sysroot the OUTPUT_EXT should be hard linked to.
+RUNTIMES_EXT=$AVOCADO_PREFIX/runtimes/{runtime_name}/var/lib/avocado/extensions/{ext_name}.raw
+# Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a system extension.
+SYSEXT=$AVOCADO_PREFIX/runtimes/{runtime_name}/var/lib/extensions/{ext_name}.raw
+# Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a config extension.
+CONFEXT=$AVOCADO_PREFIX/runtimes/{runtime_name}/var/lib/confexts/{ext_name}.raw
+
+if [ -f "$OUTPUT_EXT" ]; then
+    if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
+        ln $OUTPUT_EXT $RUNTIMES_EXT
+    fi
+else
+    echo "Missing image for extension {ext_name}."
+fi''')
+
+                if is_sysext:
+                    symlink_commands.append("ln -sf $RUNTIMES_EXT $SYSEXT"
+
+                if is_confext:
+                    symlink_commands.append("ln -sf $RUNTIMES_EXT $CONFEXT"
+
+        symlink_section = '\n'.join(
+            symlink_commands) if symlink_commands else '# No extensions configured for symlinking'
 
         script = '''
 set -e
 
-echo "Building var image"
-
 # Common variables
-IMAGES_DIR="/opt/_avocado/images"
-OUTPUT_DIR="/opt/_avocado/extensions"
+IMAGES_DIR="$AVOCADO_PREFIX/images"
+OUTPUT_DIR="$AVOCADO_PREFIX/extensions"
 
 mkdir -p "$IMAGES_DIR"
 
 # Create var sysroot structure
-echo "Creating var sysroot structure..."
-mkdir -p "$AVOCADO_SDK_SYSROOTS/var/lib/extensions"
-mkdir -p "$AVOCADO_SDK_SYSROOTS/var/lib/confexts"
+echo "Creating var sysroot structure."
+mkdir -p "$AVOCADO_PREFIX/var/lib/extensions"
+mkdir -p "$AVOCADO_PREFIX/var/lib/confexts"
+mkdir -p "$AVOCADO_PREFIX/var/lib/avocado/extensions"
 
-# Copy existing extensions into var sysroot if they exist
-echo "Copying system extensions..."
-if ls "${OUTPUT_DIR}/sysext/"*.raw 1> /dev/null 2>&1; then
-    cp -f "${OUTPUT_DIR}/sysext/"*.raw "$AVOCADO_SDK_SYSROOTS/var/lib/extensions/"
-else
-    echo "No system extensions found, skipping..."
-fi
-
-echo "Copying configuration extensions..."
-if ls "${OUTPUT_DIR}/confext/"*.raw 1> /dev/null 2>&1; then
-    cp -f "${OUTPUT_DIR}/confext/"*.raw "$AVOCADO_SDK_SYSROOTS/var/lib/confexts/"
-else
-    echo "No configuration extensions found, skipping..."
-fi
+# Create symlinks based on extension configuration
+echo "Creating extension symlinks."
+''' + symlink_section + '''
 
 # Create btrfs image with extensions and confexts subvolumes
-echo "Creating btrfs image with subvolumes..."
-mkfs.btrfs -r "$AVOCADO_SDK_SYSROOTS/var" \\
+echo "Creating btrfs image with subvolumes."
+mkfs.btrfs -r "$AVOCADO_PREFIX/var" \\
     --subvol rw:lib/extensions \\
     --subvol rw:lib/confexts \\
     -f "${IMAGES_DIR}/avocado-image-var.btrfs"
@@ -245,10 +282,10 @@ set -e
 echo "Building complete system image"
 
 # Common variables
-IMAGES_DIR="/opt/_avocado/images"
-DEPLOY_DIR="${{IMAGES_DIR}}/deploy"
-OUTPUT_PATH="/opt/_avocado/output"
-TMP_PATH="/opt/_avocado/genimage-tmp"
+IMAGES_DIR="$AVOCADO_PREFIX/images"
+DEPLOY_DIR="$IMAGES_DIR/deploy"
+OUTPUT_PATH="$AVOCADO_PREFIX/output"
+TMP_PATH="$AVOCADO_PREFIX/genimage-tmp"
 
 mkdir -p "$IMAGES_DIR"
 mkdir -p "$DEPLOY_DIR"

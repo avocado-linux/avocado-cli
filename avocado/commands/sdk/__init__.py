@@ -6,6 +6,7 @@ from .deps import SdkDepsCommand
 from .compile import SdkCompileCommand  # Added compile command
 from .dnf import SdkDnfCommand
 from .install import SdkInstallCommand
+from .clean import SdkCleanCommand
 
 
 class SdkCommand(BaseCommand):
@@ -18,6 +19,7 @@ class SdkCommand(BaseCommand):
         self.compile_parser = None
         self.dnf_parser = None
         self.install_parser = None
+        self.clean_parser = None
 
     @classmethod
     def register_subparser(cls, subparsers):
@@ -53,6 +55,10 @@ class SdkCommand(BaseCommand):
         install_parser = SdkInstallCommand.register_subparser(sdk_subparsers)
         sdk_parser.install_parser = install_parser
 
+        # SdkCleanCommand
+        clean_parser = SdkCleanCommand.register_subparser(sdk_subparsers)
+        sdk_parser.clean_parser = clean_parser
+
         return sdk_parser
 
     def execute(self, args, parser=None, unknown=None):
@@ -70,7 +76,7 @@ class SdkCommand(BaseCommand):
                 return True  # Return success when showing help
             else:
                 print(
-                    "Available SDK subcommands: 'run', 'deps', 'compile', 'dnf', 'install'", file=sys.stderr)
+                    "Available SDK subcommands: 'run', 'deps', 'compile', 'dnf', 'install', 'clean'", file=sys.stderr)
             return False
 
         # Dispatch to appropriate SDK subcommand
@@ -98,6 +104,11 @@ class SdkCommand(BaseCommand):
         elif args.sdk_subcommand == "install":
             command = SdkInstallCommand()
             sub_parser = getattr(parser, 'install_parser',
+                                 None) if parser else None
+            return command.execute(args, sub_parser, unknown)
+        elif args.sdk_subcommand == "clean":
+            command = SdkCleanCommand()
+            sub_parser = getattr(parser, 'clean_parser',
                                  None) if parser else None
             return command.execute(args, sub_parser, unknown)
         else:

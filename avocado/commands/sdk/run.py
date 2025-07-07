@@ -1,10 +1,12 @@
 """SDK run subcommand implementation."""
+import os
 import sys
 import tomlkit
 from pathlib import Path
 from avocado.commands.base import BaseCommand
-from avocado.utils.container import SdkContainerHelper
-from avocado.utils.output import print_error
+from avocado.utils.container import SdkContainer
+from avocado.utils.output import print_error, print_success
+from avocado.utils.target import resolve_target, get_target_from_config
 
 
 class SdkRunCommand(BaseCommand):
@@ -56,44 +58,17 @@ class SdkRunCommand(BaseCommand):
                 "No container image specified in config under 'sdk.image'")
         return container_image
 
-    def _get_target_architecture(self, config):
-        """Extract target architecture from config."""
-        target_arch = config.get('runtime', {}).get('target')
+    def _get_target_architecture(self, config, resolved_target):
+        """Extract target architecture from resolved target or config."""
+        # Use resolved target (from CLI/env) if available, otherwise fall back to config
+        if resolved_target:
+            return resolved_target
+
+        target_arch = get_target_from_config(config)
         if not target_arch:
             raise ValueError(
-                "No target architecture specified in config under 'runtime.target'")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'")
         return target_arch
-
-    def _run_container(self, container_image, target_arch, args):
-        """Run the container using the shared container utility."""
-        container_helper = SdkContainerHelper()
-
-        if args.name:
-            print(f"Container name: {args.name}")
-
-        if args.interactive:
-            # For interactive mode, run bash
-            return container_helper.run_interactive_shell(
-                container_image=container_image,
-                target=target_arch,
-                container_name=args.name,
-                detach=args.detach,
-                rm=args.rm,
-                verbose=args.verbose,
-                source_environment=False
-            )
-        else:
-            # Run the specified command
-            return container_helper.run_user_command(
-                container_image=container_image,
-                command=args.command,
-                target=target_arch,
-                container_name=args.name,
-                detach=args.detach,
-                rm=args.rm,
-                verbose=args.verbose,
-                source_environment=False
-            )
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the sdk run command."""
@@ -115,8 +90,29 @@ class SdkRunCommand(BaseCommand):
 
             config = self._load_config(args.config)
             container_image = self._get_container_image(config)
-            target_arch = self._get_target_architecture(config)
-            success = self._run_container(container_image, target_arch, args)
+            target_arch = self._get_target_architecture(config, args.resolved_target)
+            container_helper = SdkContainer()
+
+            if args.name:
+                print(f"Container name: {args.name}")
+
+            command = args.command or "bash"
+
+            success = container_helper.run_in_container(
+                container_image=container_image,
+                target=target_arch,
+                command=command,
+                container_name=args.name,
+                detach=args.detach,
+                rm=args.rm,
+                verbose=args.verbose,
+                source_environment=False,
+                interactive=args.interactive
+            )
+
+            if success:
+                print_success("SDK command completed successfully.")
+
             return success
 
         except KeyboardInterrupt:
