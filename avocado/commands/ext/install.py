@@ -199,6 +199,7 @@ $DNF_SDK_HOST \
                     container_image=container_image,
                     target=target,
                     command=command,
+                    interactive=not force,
                     source_environment=False,
                     use_entrypoint=True
                 )
@@ -210,9 +211,10 @@ $DNF_SDK_HOST \
             else:
                 if verbose:
                     print_debug(f"No valid dependencies to install for extension '{
-                               extension}'.")
+                        extension}'.")
         else:
             if verbose:
-                print_debug(f"No dependencies defined for extension '{extension}'.")
+                print_debug(
+                    f"No dependencies defined for extension '{extension}'.")
 
         return True

@@ -90,13 +90,13 @@ class RuntimeBuildCommand(BaseCommand):
         container_helper = SdkContainer(verbose=verbose)
 
         # First check if the required images package is already installed (silent check)
-        dnf_check_script = '''
+        dnf_check_script = f'''
 RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST \
 $DNF_SDK_HOST_OPTS \
 $DNF_SDK_TARGET_REPO_CONF \
---installroot=$AVOCADO_PREFIX/images \
+--installroot=$AVOCADO_PREFIX/runtimes/{runtime_name} \
 list installed avocado-pkg-images >/dev/null 2>&1
 '''
 
@@ -121,12 +121,11 @@ RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
-    --installroot=$AVOCADO_PREFIX/images \
+    --installroot=$AVOCADO_PREFIX/runtimes/{runtime_name} \
     install \
     {yes} \
     avocado-pkg-images
 '''
-
             # Run the DNF install command
             install_result = container_helper.run_in_container(
                 container_image=container_image,
@@ -145,80 +144,29 @@ $DNF_SDK_HOST \
                 "Successfully installed avocado-pkg-images package.")
 
         # Build var image first
-        var_result = self._build_var_image(
-            container_helper, container_image, target_arch, config, verbose, runtime_name
-        )
+        build_script = self._create_build_script(
+            config, target_arch, runtime_name)
 
-        if not var_result:
-            print_error("Failed to build var image.")
-            return False
+        if verbose:
+            print_info("Executing complete image build script.")
 
-        # Build complete image
-        complete_result = self._build_complete_image(
-            container_helper, container_image, target_arch, runtime_name, verbose
+        complete_result = container_helper.run_in_container(
+            container_image=container_image,
+            target=target_arch,
+            command=build_script,
+            rm=True,
+            verbose=verbose,
+            source_environment=True
         )
 
         if not complete_result:
             print_error("Failed to build complete image.")
             return False
 
-        print_success("Successfully built runtime '{runtime_name}'.")
+        print_success(f"Successfully built runtime '{runtime_name}'.")
         return True
 
-    def _build_var_image(self, container_helper, container_image, target_arch, config, verbose, runtime_name):
-        """Build a var image."""
-        print_info("Building var image.")
-
-        # Create the var build script
-        build_script = self._create_var_build_script(config, runtime_name)
-
-        # Execute the build script in the SDK container
-        if verbose:
-            print_info("Executing var image build script.")
-
-        result = container_helper.run_in_container(
-            container_image=container_image,
-            target=target_arch,
-            command=build_script,
-            rm=True,
-            verbose=verbose,
-            source_environment=True
-        )
-
-        if not result:
-            print_error("Failed to build var image.")
-
-        return result
-
-    def _build_complete_image(self, container_helper, container_image, target_arch, runtime_name, verbose):
-        """Build a complete system image."""
-        print_info("Building complete system image.")
-
-        # Create the complete image build script
-        build_script = self._create_complete_image_build_script(target_arch,
-                                                                runtime_name)
-
-        # Execute the build script in the SDK container
-        if verbose:
-            print_info("Executing complete image build script.")
-
-        result = container_helper.run_in_container(
-            container_image=container_image,
-            target=target_arch,
-            command=build_script,
-            rm=True,
-            verbose=verbose,
-            source_environment=True
-        )
-
-        if not result:
-            print_error("Failed to build complete system image.")
-
-        return result
-
-    def _create_var_build_script(self, config, runtime_name):
-        """Create the var image build script."""
-
+    def _create_build_script(self, config, target_arch, runtime_name):
         # Get runtime dependencies to identify required extensions
         runtime_config = config.get('runtime', {}).get(runtime_name, {})
         runtime_deps = runtime_config.get('dependencies', {})
@@ -240,14 +188,14 @@ $DNF_SDK_HOST \
                 is_confext = ext_data.get('confext', False)
 
                 symlink_commands.append(f'''
-# The output of ext image.
+# OUTPUT_EXT - The output of ext image.
+# RUNTIMES_EXT - Where in the runtime sysroot the OUTPUT_EXT should be hard linked to.
+# SYSEXT - Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a system extension.
+# CONFEXT - Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a config extension.
 OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
-# Where in the runtime sysroot the OUTPUT_EXT should be hard linked to.
-RUNTIMES_EXT=$AVOCADO_PREFIX/runtimes/{runtime_name}/var/lib/avocado/extensions/{ext_name}.raw
-# Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a system extension.
-SYSEXT=$AVOCADO_PREFIX/runtimes/{runtime_name}/var/lib/extensions/{ext_name}.raw
-# Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a config extension.
-CONFEXT=$AVOCADO_PREFIX/runtimes/{runtime_name}/var/lib/confexts/{ext_name}.raw
+RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
+SYSEXT=$VAR_DIR/lib/extensions/{ext_name}.raw
+CONFEXT=$VAR_DIR/lib/confexts/{ext_name}.raw
 
 if [ -f "$OUTPUT_EXT" ]; then
     if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
@@ -266,59 +214,34 @@ fi''')
         symlink_section = '\n'.join(
             symlink_commands) if symlink_commands else '# No extensions configured for symlinking'
 
-        script = '''
-set -e
+        script = f'''
+VAR_DIR=$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging
+mkdir -p "$VAR_DIR/lib/extensions"
+mkdir -p "$VAR_DIR/lib/confexts"
+mkdir -p "$VAR_DIR/lib/runtimes/avocado/extensions"
 
-# Common variables
-IMAGES_DIR="$AVOCADO_PREFIX/images"
-OUTPUT_DIR="$AVOCADO_PREFIX/extensions"
+OUTPUT_DIR="$AVOCADO_PREFIX/output/runtimes/{runtime_name}"
+mkdir -p $OUTPUT_DIR
 
-mkdir -p "$IMAGES_DIR"
+echo "Creating symlinks."
+{symlink_section}
 
-# Create var sysroot structure
-echo "Creating var sysroot structure."
-mkdir -p "$AVOCADO_PREFIX/var/lib/extensions"
-mkdir -p "$AVOCADO_PREFIX/var/lib/confexts"
-mkdir -p "$AVOCADO_PREFIX/var/lib/avocado/extensions"
-
-# Create symlinks based on extension configuration
-echo "Creating extension symlinks."
-''' + symlink_section + '''
+# Potential future SDK target hook.
+# echo "Run: avocado-pre-image-var-{target_arch} {runtime_name}"
+# avocado-pre-image-var-{target_arch} {runtime_name}
 
 # Create btrfs image with extensions and confexts subvolumes
 echo "Creating btrfs image with subvolumes."
-mkfs.btrfs -r "$AVOCADO_PREFIX/var" \
+echo "VAR_DIR=$VAR_DIR"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
+mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/extensions \
     --subvol rw:lib/confexts \
-    -f "$IMAGES_DIR/avocado-image-var.btrfs"
+    -f "$OUTPUT_DIR/avocado-image-var.btrfs"
 
-echo "Successfully created var image: $IMAGES_DIR/avocado-image-var.btrfs"
-'''
+echo "Successfully created var image: $OUTPUT_DIR/avocado-image-var.btrfs"
 
-        return script
-
-    def _create_complete_image_build_script(self, target_arch, runtime_name):
-        """Create the complete system image build script."""
-
-        script = f'''
-set -e
-
-echo "Building complete system image"
-
-# Common variables
-IMAGES_DIR="$AVOCADO_PREFIX/images"
-DEPLOY_DIR="$IMAGES_DIR/deploy"
-OUTPUT_PATH="$AVOCADO_PREFIX/output"
-
-mkdir -p "$IMAGES_DIR"
-mkdir -p "$DEPLOY_DIR"
-mkdir -p "$OUTPUT_PATH"
-
-# Copy var image to deploy directory
-echo "Copying var image to deploy directory..."
-cp "${{IMAGES_DIR}}/avocado-image-var.btrfs" "${{DEPLOY_DIR}}/"
-
-echo "Executing target specific build script."
+echo "Run: avocado-build-{target_arch} {runtime_name}"
 avocado-build-{target_arch} {runtime_name}
 '''
 
