@@ -189,8 +189,7 @@ release_dir="$AVOCADO_EXT_SYSROOTS/{extension_name}/usr/lib/extension-release.d"
 release_file="$release_dir/extension-release.{extension_name}"
 
 mkdir -p "$release_dir"
-echo "ID={extension_name}" > "$release_file"
-echo "VERSION_ID={ext_version}" >> "$release_file"
+echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
 echo "SYSEXT_SCOPE={" ".join(ext_scopes)}" >> "$release_file"
 '''
@@ -208,8 +207,7 @@ release_dir="$AVOCADO_EXT_SYSROOTS/{extension_name}/etc/extension-release.d"
 release_file="$release_dir/extension-release.{extension_name}"
 
 mkdir -p "$release_dir"
-echo "ID={extension_name}" > "$release_file"
-echo "VERSION_ID={ext_version}" >> "$release_file"
+echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
 echo "CONFEXT_SCOPE={" ".join(ext_scopes)}" >> "$release_file"
 '''

@@ -188,10 +188,6 @@ $DNF_SDK_HOST \
                 is_confext = ext_data.get('confext', False)
 
                 symlink_commands.append(f'''
-# OUTPUT_EXT - The output of ext image.
-# RUNTIMES_EXT - Where in the runtime sysroot the OUTPUT_EXT should be hard linked to.
-# SYSEXT - Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a system extension.
-# CONFEXT - Where in the runtime sysroot to symlink the RUNTIMES_EXT to as a config extension.
 OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
 RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
 SYSEXT=$VAR_DIR/lib/extensions/{ext_name}.raw
@@ -199,17 +195,19 @@ CONFEXT=$VAR_DIR/lib/confexts/{ext_name}.raw
 
 if [ -f "$OUTPUT_EXT" ]; then
     if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
-        ln $OUTPUT_EXT $RUNTIMES_EXT
+        ln -f $OUTPUT_EXT $RUNTIMES_EXT
     fi
 else
     echo "Missing image for extension {ext_name}."
 fi''')
 
                 if is_sysext:
-                    symlink_commands.append("ln -sf $RUNTIMES_EXT $SYSEXT")
+                    cmd = f"ln -sf /var/lib/avocado/extensions/{ext_name}.raw $SYSEXT"
+                    symlink_commands.append(cmd)
 
                 if is_confext:
-                    symlink_commands.append("ln -sf $RUNTIMES_EXT $CONFEXT")
+                    cmd = f"ln -sf /var/lib/avocado/extensions/{ext_name}.raw $CONFEXT"
+                    symlink_commands.append(cmd)
 
         symlink_section = '\n'.join(
             symlink_commands) if symlink_commands else '# No extensions configured for symlinking'
@@ -218,12 +216,11 @@ fi''')
 VAR_DIR=$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging
 mkdir -p "$VAR_DIR/lib/extensions"
 mkdir -p "$VAR_DIR/lib/confexts"
-mkdir -p "$VAR_DIR/lib/runtimes/avocado/extensions"
+mkdir -p "$VAR_DIR/lib/avocado/extensions"
 
 OUTPUT_DIR="$AVOCADO_PREFIX/output/runtimes/{runtime_name}"
 mkdir -p $OUTPUT_DIR
 
-echo "Creating symlinks."
 {symlink_section}
 
 # Potential future SDK target hook.
@@ -231,17 +228,12 @@ echo "Creating symlinks."
 # avocado-pre-image-var-{target_arch} {runtime_name}
 
 # Create btrfs image with extensions and confexts subvolumes
-echo "Creating btrfs image with subvolumes."
-echo "VAR_DIR=$VAR_DIR"
-echo "OUTPUT_DIR=$OUTPUT_DIR"
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/extensions \
     --subvol rw:lib/confexts \
     -f "$OUTPUT_DIR/avocado-image-var.btrfs"
 
-echo "Successfully created var image: $OUTPUT_DIR/avocado-image-var.btrfs"
-
-echo "Run: avocado-build-{target_arch} {runtime_name}"
+echo -e "\033[34m[INFO]\033[0m Running lifecycle hook 'avocado-build' for '{target_arch}'."
 avocado-build-{target_arch} {runtime_name}
 '''
 

@@ -103,10 +103,6 @@ class ExtImageCommand(BaseCommand):
                 container_helper, container_image, target_arch,
                 extension_name, ext_type, verbose
             )
-            if ext_type == 'sysext':
-                print("sysext")
-            elif ext_type == 'confext':
-                print("confext")
 
             if result:
                 print_success(f"Successfully created {ext_type} image for extension '{
@@ -163,7 +159,11 @@ if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
 fi
 
 # Create squashfs image
-mksquashfs "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" "$OUTPUT_FILE" -noappend
+mksquashfs \
+  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
+  "$OUTPUT_FILE" \
+  -noappend \
+  -no-xattrs
 '''
 
         return script
