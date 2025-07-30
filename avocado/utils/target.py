@@ -1,9 +1,12 @@
 """Target resolution utilities for Avocado CLI."""
+
 import os
 from typing import Optional
 
 
-def resolve_target(cli_target: Optional[str] = None, config_target: Optional[str] = None) -> Optional[str]:
+def resolve_target(
+    cli_target: Optional[str] = None, config_target: Optional[str] = None
+) -> Optional[str]:
     """
     Resolve the target architecture with proper precedence.
 
@@ -24,7 +27,7 @@ def resolve_target(cli_target: Optional[str] = None, config_target: Optional[str
         return cli_target
 
     # Second priority: Environment variable
-    env_target = os.environ.get('AVOCADO_TARGET')
+    env_target = os.environ.get("AVOCADO_TARGET")
     if env_target is not None:
         return env_target
 
@@ -43,7 +46,7 @@ def get_target_from_env() -> Optional[str]:
     Returns:
         Target from AVOCADO_TARGET environment variable or None
     """
-    return os.environ.get('AVOCADO_TARGET')
+    return os.environ.get("AVOCADO_TARGET")
 
 
 def get_target_from_config(config: dict) -> Optional[str]:
@@ -59,10 +62,10 @@ def get_target_from_config(config: dict) -> Optional[str]:
     Returns:
         Target from config or None if not found/ambiguous
     """
-    if not config or 'runtime' not in config:
+    if not config or "runtime" not in config:
         return None
 
-    runtime_section = config['runtime']
+    runtime_section = config["runtime"]
     if not isinstance(runtime_section, dict):
         return None
 
@@ -75,7 +78,7 @@ def get_target_from_config(config: dict) -> Optional[str]:
     # If exactly one runtime configuration, use its target
     if len(runtime_configs) == 1:
         runtime_config = next(iter(runtime_configs.values()))
-        return runtime_config.get('target')
+        return runtime_config.get("target")
 
     # If multiple or no runtime configurations, return None
     return None

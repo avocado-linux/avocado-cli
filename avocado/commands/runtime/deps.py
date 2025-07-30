@@ -1,4 +1,5 @@
 """Runtime deps command implementation."""
+
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
 from avocado.utils.output import print_error, print_success
@@ -47,21 +48,16 @@ class RuntimeDepsCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the runtime deps command's subparser."""
-        parser = subparsers.add_parser(
-            "deps",
-            help="List dependencies for a runtime"
-        )
+        parser = subparsers.add_parser("deps", help="List dependencies for a runtime")
 
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        parser.add_argument(
-            "runtime",
-            help="Runtime name to list dependencies for"
-        )
+        parser.add_argument("runtime", help="Runtime name to list dependencies for")
 
         return parser
 
@@ -77,15 +73,18 @@ class RuntimeDepsCommand(BaseCommand):
 
         # Check if runtime section exists
         if "runtime" not in config:
-            print_error(
-                f"Runtime '{runtime_name}' not found in configuration.")
+            print_error(f"Runtime '{runtime_name}' not found in configuration.")
             return False
         runtime_config = config["runtime"]
 
         # Check if runtime exists and is a dictionary (runtime configuration)
-        if runtime_name not in runtime_config or not isinstance(runtime_config[runtime_name], dict):
-            print_error(f"Runtime '{
-                runtime_name}' not found in configuration.")
+        if runtime_name not in runtime_config or not isinstance(
+            runtime_config[runtime_name], dict
+        ):
+            print_error(
+                f"Runtime '{
+                runtime_name}' not found in configuration."
+            )
             return False
 
         # List dependencies for the runtime

@@ -1,4 +1,5 @@
 """Extension image command implementation."""
+
 import os
 import sys
 from avocado.commands.base import BaseCommand
@@ -15,27 +16,24 @@ class ExtImageCommand(BaseCommand):
     def register_subparser(cls, subparsers):
         """Register the ext image command's subparser."""
         parser = subparsers.add_parser(
-            "image",
-            help="Create squashfs image from system extension"
+            "image", help="Create squashfs image from system extension"
         )
 
         # Add extension name argument - required
         parser.add_argument(
-            "extension",
-            help="Name of the extension to create image for"
+            "extension", help="Name of the extension to create image for"
         )
 
         # Add optional arguments
         parser.add_argument(
-            "--verbose", "-v",
-            action="store_true",
-            help="Enable verbose output"
+            "--verbose", "-v", action="store_true", help="Enable verbose output"
         )
 
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         return parser
@@ -52,41 +50,43 @@ class ExtImageCommand(BaseCommand):
             return False
 
         # Get extension configuration
-        ext_config = config.get('ext', {}).get(extension_name)
+        ext_config = config.get("ext", {}).get(extension_name)
         if not ext_config:
-            print_error(
-                f"Extension '{extension_name}' not found in configuration.")
+            print_error(f"Extension '{extension_name}' not found in configuration.")
             return False
 
         # Get extension types (sysext, confext) from boolean flags
         ext_types = []
-        if ext_config.get('sysext', False):
-            ext_types.append('sysext')
-        if ext_config.get('confext', False):
-            ext_types.append('confext')
+        if ext_config.get("sysext", False):
+            ext_types.append("sysext")
+        if ext_config.get("confext", False):
+            ext_types.append("confext")
 
         if not ext_types:
             print_error(
-                f"Extension '{extension_name}' has sysext=false and confext=false. At least one must be true to create image.")
+                f"Extension '{extension_name}' has sysext=false and confext=false. At least one must be true to create image."
+            )
             return False
 
         # Get SDK configuration
-        sdk_config = config.get('sdk', {})
-        container_image = sdk_config.get('image')
+        sdk_config = config.get("sdk", {})
+        container_image = sdk_config.get("image")
         if not container_image:
             print_error("No SDK container image specified in configuration.")
             return False
 
         # Get runtime configuration
-        runtime_config = config.get('runtime', {})
+        runtime_config = config.get("runtime", {})
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target_arch = resolve_target(
-            cli_target=args.resolved_target, config_target=config_target)
+            cli_target=args.resolved_target, config_target=config_target
+        )
         if not target_arch:
             print_error(
-                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'."
+            )
             return False
 
         # Initialize SDK container helper
@@ -96,29 +96,45 @@ class ExtImageCommand(BaseCommand):
         overall_success = True
 
         for ext_type in ext_types:
-            print_info(f"Creating {ext_type} image for extension '{
-                       extension_name}'.")
+            print_info(
+                f"Creating {ext_type} image for extension '{
+                       extension_name}'."
+            )
 
             result = self._create_image(
-                container_helper, container_image, target_arch,
-                extension_name, ext_type, verbose
+                container_helper,
+                container_image,
+                target_arch,
+                extension_name,
+                ext_type,
+                verbose,
             )
 
             if result:
-                print_success(f"Successfully created {ext_type} image for extension '{
-                              extension_name}'.")
+                print_success(
+                    f"Successfully created {ext_type} image for extension '{
+                              extension_name}'."
+                )
             else:
-                print_error(f"Failed to create {ext_type} image for extension '{
-                            extension_name}'.")
+                print_error(
+                    f"Failed to create {ext_type} image for extension '{
+                            extension_name}'."
+                )
                 overall_success = False
 
         return overall_success
 
-    def _create_image(self, container_helper, container_image, target_arch,
-                      extension_name, extension_type, verbose):
+    def _create_image(
+        self,
+        container_helper,
+        container_image,
+        target_arch,
+        extension_name,
+        extension_type,
+        verbose,
+    ):
         # Create the build script
-        build_script = self._create_build_script(
-            extension_name, extension_type)
+        build_script = self._create_build_script(extension_name, extension_type)
 
         # Execute the build script in the SDK container
         if verbose:
@@ -130,7 +146,7 @@ class ExtImageCommand(BaseCommand):
             command=build_script,
             rm=True,
             verbose=verbose,
-            source_environment=True
+            source_environment=True,
         )
 
         return result
@@ -138,7 +154,7 @@ class ExtImageCommand(BaseCommand):
     def _create_build_script(self, extension_name, extension_type):
         """Create the image build script."""
 
-        script = f'''
+        script = f"""
 set -e
 
 # Common variables
@@ -164,6 +180,6 @@ mksquashfs \
   "$OUTPUT_FILE" \
   -noappend \
   -no-xattrs
-'''
+"""
 
         return script

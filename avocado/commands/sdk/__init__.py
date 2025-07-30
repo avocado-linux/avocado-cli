@@ -1,4 +1,5 @@
 """SDK command group implementation."""
+
 import sys
 from avocado.commands.base import BaseCommand
 from .run import SdkRunCommand
@@ -24,12 +25,11 @@ class SdkCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the sdk command's subparser."""
-        sdk_parser = subparsers.add_parser(
-            "sdk", help="SDK management commands")
+        sdk_parser = subparsers.add_parser("sdk", help="SDK management commands")
         sdk_subparsers = sdk_parser.add_subparsers(
             dest="sdk_subcommand",
             help="SDK subcommands",
-            required=False  # Allow no subcommand to show help
+            required=False,  # Allow no subcommand to show help
         )
 
         # Register SDK subcommands
@@ -70,51 +70,50 @@ class SdkCommand(BaseCommand):
         #     print(f"DEBUG: sdk_subcommand = {args.sdk_subcommand}")
 
         # Check if we have a subcommand
-        if not hasattr(args, 'sdk_subcommand') or args.sdk_subcommand is None:
+        if not hasattr(args, "sdk_subcommand") or args.sdk_subcommand is None:
             if parser:
                 parser.print_help()
                 return True  # Return success when showing help
             else:
                 print(
-                    "Available SDK subcommands: 'run', 'deps', 'compile', 'dnf', 'install', 'clean'", file=sys.stderr)
+                    "Available SDK subcommands: 'run', 'deps', 'compile', 'dnf', 'install', 'clean'",
+                    file=sys.stderr,
+                )
             return False
 
         # Dispatch to appropriate SDK subcommand
         if args.sdk_subcommand == "run":
             command = SdkRunCommand()
             # Pass the specific subparser if the command's execute method needs it
-            sub_parser = getattr(parser, 'run_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "run_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.sdk_subcommand == "deps":
             command = SdkDepsCommand()
-            sub_parser = getattr(parser, 'deps_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "deps_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.sdk_subcommand == "compile":
             command = SdkCompileCommand()
-            sub_parser = getattr(parser, 'compile_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "compile_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.sdk_subcommand == "dnf":
             command = SdkDnfCommand()
-            sub_parser = getattr(parser, 'dnf_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "dnf_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.sdk_subcommand == "install":
             command = SdkInstallCommand()
-            sub_parser = getattr(parser, 'install_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "install_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.sdk_subcommand == "clean":
             command = SdkCleanCommand()
-            sub_parser = getattr(parser, 'clean_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "clean_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         else:
             # This path should ideally not be hit if 'required=True' and subcommands are correctly registered.
-            print(f"Unknown SDK subcommand: {
-                  args.sdk_subcommand}", file=sys.stderr)
+            print(
+                f"Unknown SDK subcommand: {
+                  args.sdk_subcommand}",
+                file=sys.stderr,
+            )
             if parser:
                 parser.print_help()
             return False
@@ -125,4 +124,4 @@ SDK_VERSION = "1.0.0"
 DEFAULT_SDK_PATH = "/opt/avocado-sdk"
 
 # Make SdkCommand easily importable
-__all__ = ['SdkCommand']
+__all__ = ["SdkCommand"]

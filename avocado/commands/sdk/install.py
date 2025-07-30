@@ -1,4 +1,5 @@
 """SDK install command implementation."""
+
 import os
 from avocado.commands.base import BaseCommand
 from avocado.utils.container import SdkContainer
@@ -14,27 +15,26 @@ class SdkInstallCommand(BaseCommand):
     def register_subparser(cls, subparsers):
         """Register the sdk install command's subparser."""
         parser = subparsers.add_parser(
-            "install",
-            help="Install dependencies into the SDK"
+            "install", help="Install dependencies into the SDK"
         )
 
         # Add config file argument
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         parser.add_argument(
-            "-v", "--verbose",
-            action="store_true",
-            help="Enable verbose output"
+            "-v", "--verbose", action="store_true", help="Enable verbose output"
         )
 
         parser.add_argument(
-            "-f", "--force",
+            "-f",
+            "--force",
             action="store_true",
-            help="Force the operation to proceed, bypassing warnings or confirmation prompts."
+            help="Force the operation to proceed, bypassing warnings or confirmation prompts.",
         )
 
         return parser
@@ -64,26 +64,27 @@ class SdkInstallCommand(BaseCommand):
             return False
 
         # Get the SDK image and target from configuration
-        container_image = config.get('sdk', {}).get('image')
+        container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            print_error(
-                "No container image specified in config under 'sdk.image'")
+            print_error("No container image specified in config under 'sdk.image'")
             return False
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
-            cli_target=args.resolved_target, config_target=config_target)
+            cli_target=args.resolved_target, config_target=config_target
+        )
         if not target:
             print_error(
-                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'."
+            )
             return False
 
         print_info("Installing SDK dependencies.")
 
         # Get SDK dependencies
-        sdk_config = config.get('sdk', {})
-        sdk_dependencies = sdk_config.get('dependencies', {})
+        sdk_config = config.get("sdk", {})
+        sdk_dependencies = sdk_config.get("dependencies", {})
 
         # Get compile section dependencies
         compile_dependencies = self._get_compile_sections_dependencies(config)
@@ -128,8 +129,7 @@ $DNF_SDK_HOST \
                 )
 
                 if install_success:
-                    print_success(
-                        f"Installed SDK dependencies.")
+                    print_success(f"Installed SDK dependencies.")
                 else:
                     print_error("Failed to install SDK package(s).")
                     return False
@@ -181,11 +181,15 @@ $DNF_SDK_HOST \
                     )
 
                     if not install_success:
-                        print_error(f"Failed to install dependencies for compile section '{
-                                    section_name}'.")
+                        print_error(
+                            f"Failed to install dependencies for compile section '{
+                                    section_name}'."
+                        )
                         return False
                 else:
-                    print_info(f"({index}/{total}) [sdk.compile.{section_name}.dependencies] no dependencies.")
+                    print_info(
+                        f"({index}/{total}) [sdk.compile.{section_name}.dependencies] no dependencies."
+                    )
 
             print_success("Installed SDK compile dependencies.")
 

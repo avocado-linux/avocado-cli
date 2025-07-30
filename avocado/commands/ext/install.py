@@ -15,34 +15,33 @@ class ExtInstallCommand(BaseCommand):
     def register_subparser(cls, subparsers):
         """Register the ext install command's subparser."""
         parser = subparsers.add_parser(
-            "install",
-            help="Install dependencies into an extension's sysroot"
+            "install", help="Install dependencies into an extension's sysroot"
         )
 
         # Add config file argument
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         parser.add_argument(
-            "-v", "--verbose",
-            action="store_true",
-            help="Enable verbose output"
+            "-v", "--verbose", action="store_true", help="Enable verbose output"
         )
 
         # Add extension name argument - optional
         parser.add_argument(
             "extension",
             nargs="?",
-            help="Name of the extension to install (if not provided, installs all extensions)"
+            help="Name of the extension to install (if not provided, installs all extensions)",
         )
 
         parser.add_argument(
-            "-f", "--force",
+            "-f",
+            "--force",
             action="store_true",
-            help="Force the operation to proceed, bypassing warnings or confirmation prompts."
+            help="Force the operation to proceed, bypassing warnings or confirmation prompts.",
         )
 
         return parser
@@ -61,8 +60,10 @@ class ExtInstallCommand(BaseCommand):
         # Check if ext section exists
         if "ext" not in config:
             if extension is not None:
-                print_error(f"Extension '{
-                            extension}' not found in configuration.")
+                print_error(
+                    f"Extension '{
+                            extension}' not found in configuration."
+                )
                 return False
             else:
                 print_info("No extensions found in configuration.")
@@ -72,8 +73,7 @@ class ExtInstallCommand(BaseCommand):
         if extension is not None:
             # Single extension specified
             if extension not in config["ext"]:
-                print_error(
-                    f"Extension '{extension}' not found in configuration.")
+                print_error(f"Extension '{extension}' not found in configuration.")
                 return False
             extensions_to_install = [extension]
         else:
@@ -83,23 +83,27 @@ class ExtInstallCommand(BaseCommand):
                 print_info("No extensions found in configuration.")
                 return True
 
-        print_info("Installing {} extension(s): {}.".format(
-                   len(extensions_to_install), ', '.join(extensions_to_install)))
+        print_info(
+            "Installing {} extension(s): {}.".format(
+                len(extensions_to_install), ", ".join(extensions_to_install)
+            )
+        )
 
         # Get the SDK image and target from configuration
-        container_image = config.get('sdk', {}).get('image')
+        container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            print_error(
-                "No container image specified in config under 'sdk.image'.")
+            print_error("No container image specified in config under 'sdk.image'.")
             return False
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
-            cli_target=args.resolved_target, config_target=config_target)
+            cli_target=args.resolved_target, config_target=config_target
+        )
         if not target:
             print_error(
-                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
+                "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'."
+            )
             return False
 
         # Use the container helper to run the setup commands
@@ -113,19 +117,35 @@ class ExtInstallCommand(BaseCommand):
             if args.verbose:
                 print_debug(f"Installing ({index}/{total}) {ext_name}.")
 
-            if not self._install_single_extension(config, ext_name, container_helper,
-                                                  container_image, target, verbose,
-                                                  args.force):
+            if not self._install_single_extension(
+                config,
+                ext_name,
+                container_helper,
+                container_image,
+                target,
+                verbose,
+                args.force,
+            ):
                 return False
 
         if len(extensions_to_install) >= 1:
-            print_success(f"Installed {
-                          len(extensions_to_install)} extension(s).")
+            print_success(
+                f"Installed {
+                          len(extensions_to_install)} extension(s)."
+            )
 
         return True
 
-    def _install_single_extension(self, config, extension, container_helper,
-                                  container_image, target, verbose, force):
+    def _install_single_extension(
+        self,
+        config,
+        extension,
+        container_helper,
+        container_image,
+        target,
+        verbose,
+        force,
+    ):
         """Install a single extension."""
         # Create the commands to check and set up the directory structure
         check_command = f"[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]"
@@ -138,7 +158,7 @@ class ExtInstallCommand(BaseCommand):
             target=target,
             command=check_command,
             verbose=verbose,
-            source_environment=False
+            source_environment=False,
         )
 
         if not sysroot_exists:
@@ -148,14 +168,13 @@ class ExtInstallCommand(BaseCommand):
                 target=target,
                 command=setup_command,
                 verbose=verbose,
-                source_environment=False
+                source_environment=False,
             )
 
             if success:
                 print_success(f"Created sysroot for extension '{extension}'.")
             else:
-                print_error(
-                    f"Failed to create sysroot for extension '{extension}'.")
+                print_error(f"Failed to create sysroot for extension '{extension}'.")
                 return False
 
         # Install dependencies if they exist
@@ -167,7 +186,7 @@ class ExtInstallCommand(BaseCommand):
             packages = []
             for package_name, version in dependencies.items():
                 # Skip compile dependencies (identified by dict value with 'compile' key)
-                if isinstance(version, dict) and 'compile' in version:
+                if isinstance(version, dict) and "compile" in version:
                     continue
 
                 if version == "*":
@@ -201,20 +220,22 @@ $DNF_SDK_HOST \
                     command=command,
                     interactive=not force,
                     source_environment=False,
-                    use_entrypoint=True
+                    use_entrypoint=True,
                 )
 
                 if not install_success:
                     print_error(
-                        f"Failed to install dependencies for extension '{extension}'.")
+                        f"Failed to install dependencies for extension '{extension}'."
+                    )
                     return False
             else:
                 if verbose:
-                    print_debug(f"No valid dependencies to install for extension '{
-                        extension}'.")
+                    print_debug(
+                        f"No valid dependencies to install for extension '{
+                        extension}'."
+                    )
         else:
             if verbose:
-                print_debug(
-                    f"No dependencies defined for extension '{extension}'.")
+                print_debug(f"No dependencies defined for extension '{extension}'.")
 
         return True

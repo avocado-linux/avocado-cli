@@ -1,4 +1,5 @@
 """Extension command group implementation."""
+
 import sys
 from avocado.commands.base import BaseCommand
 from .build import ExtBuildCommand
@@ -26,12 +27,11 @@ class ExtCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the ext command's subparser."""
-        ext_parser = subparsers.add_parser(
-            "ext", help="Extension management commands")
+        ext_parser = subparsers.add_parser("ext", help="Extension management commands")
         ext_subparsers = ext_parser.add_subparsers(
             dest="ext_subcommand",
             help="Extension subcommands",
-            required=False  # Allow no subcommand to show help
+            required=False,  # Allow no subcommand to show help
         )
 
         # Register Extension subcommands
@@ -70,54 +70,52 @@ class ExtCommand(BaseCommand):
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext command."""
         # Check if we have a subcommand
-        if not hasattr(args, 'ext_subcommand') or args.ext_subcommand is None:
+        if not hasattr(args, "ext_subcommand") or args.ext_subcommand is None:
             if parser:
                 parser.print_help()
                 return True  # Return success when showing help
             else:
                 print(
-                    "Available extension subcommands: 'install', 'build', 'list', 'deps', 'dnf', 'clean', 'image'", file=sys.stderr)
+                    "Available extension subcommands: 'install', 'build', 'list', 'deps', 'dnf', 'clean', 'image'",
+                    file=sys.stderr,
+                )
             return False
 
         # Dispatch to appropriate Extension subcommand
         if args.ext_subcommand == "install":
             command = ExtInstallCommand()
-            sub_parser = getattr(parser, 'install_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "install_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.ext_subcommand == "build":
             command = ExtBuildCommand()
-            sub_parser = getattr(parser, 'build_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "build_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.ext_subcommand == "list":
             command = ExtListCommand()
-            sub_parser = getattr(parser, 'list_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "list_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.ext_subcommand == "deps":
             command = ExtDepsCommand()
-            sub_parser = getattr(parser, 'deps_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "deps_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.ext_subcommand == "dnf":
             command = ExtDnfCommand()
-            sub_parser = getattr(parser, 'dnf_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "dnf_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.ext_subcommand == "clean":
             command = ExtCleanCommand()
-            sub_parser = getattr(parser, 'clean_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "clean_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.ext_subcommand == "image":
             command = ExtImageCommand()
-            sub_parser = getattr(parser, 'image_parser',
-                                 None) if parser else None
+            sub_parser = getattr(parser, "image_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         else:
-            print(f"Unknown Extension subcommand: {
-                  args.ext_subcommand}", file=sys.stderr)
+            print(
+                f"Unknown Extension subcommand: {
+                  args.ext_subcommand}",
+                file=sys.stderr,
+            )
             if parser:
                 parser.print_help()
             return False
@@ -127,4 +125,4 @@ class ExtCommand(BaseCommand):
 DEFAULT_EXT_DIR = "extensions"
 
 # Make ExtCommand easily importable
-__all__ = ['ExtCommand']
+__all__ = ["ExtCommand"]

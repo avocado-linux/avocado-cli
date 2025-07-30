@@ -1,4 +1,5 @@
 """Clean command implementation."""
+
 import os
 import shutil
 from avocado.commands.base import BaseCommand
@@ -12,8 +13,7 @@ class CleanCommand(BaseCommand):
     def register_subparser(cls, subparsers):
         """Register the clean command's subparser."""
         parser = subparsers.add_parser(
-            "clean",
-            help="Clean the avocado project by removing the _avocado directory"
+            "clean", help="Clean the avocado project by removing the _avocado directory"
         )
 
         # Optional argument - the directory to clean
@@ -21,7 +21,7 @@ class CleanCommand(BaseCommand):
             "directory",
             nargs="?",
             default=".",
-            help="Directory to clean (defaults to current directory)"
+            help="Directory to clean (defaults to current directory)",
         )
 
         return parser

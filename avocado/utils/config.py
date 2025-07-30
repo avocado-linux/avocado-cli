@@ -1,4 +1,5 @@
 """Configuration utilities for Avocado CLI."""
+
 import os
 import tomlkit
 from typing import Dict, Any, Optional, Tuple
@@ -7,6 +8,7 @@ from avocado.utils.output import print_error
 
 class ConfigError(Exception):
     """Custom exception for configuration errors."""
+
     pass
 
 

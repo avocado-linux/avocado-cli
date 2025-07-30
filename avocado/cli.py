@@ -14,17 +14,17 @@ def main():
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(
         description="Avocado CLI tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # Add global target argument
     parser.add_argument(
-        "--target", "-t",
-        help="Target architecture/board (can also be set via AVOCADO_TARGET env var)"
+        "--target",
+        "-t",
+        help="Target architecture/board (can also be set via AVOCADO_TARGET env var)",
     )
 
-    subparsers = parser.add_subparsers(
-        dest="main_command", help="Command to execute")
+    subparsers = parser.add_subparsers(dest="main_command", help="Command to execute")
 
     # Register commands and store their parsers
     sdk_parser = SdkCommand.register_subparser(subparsers)

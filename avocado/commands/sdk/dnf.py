@@ -1,4 +1,5 @@
 """SDK DNF command implementation."""
+
 import os
 import sys
 import tomlkit
@@ -16,22 +17,22 @@ class SdkDnfCommand(BaseCommand):
     def register_subparser(cls, subparsers):
         """Register the sdk dnf command's subparser."""
         parser = subparsers.add_parser(
-            "dnf",
-            help="Run DNF commands in the SDK context"
+            "dnf", help="Run DNF commands in the SDK context"
         )
 
         # Add common arguments
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         # Capture all remaining arguments after -- as dnf command
         parser.add_argument(
             "dnf_args",
             nargs="*",
-            help="DNF command and arguments to execute (use -- to separate from SDK args)"
+            help="DNF command and arguments to execute (use -- to separate from SDK args)",
         )
 
         return parser
@@ -39,13 +40,15 @@ class SdkDnfCommand(BaseCommand):
     def execute(self, args, parser=None, unknown=None):
         """Execute the sdk dnf command."""
         # Add unknown args to dnf_args if they exist
-        dnf_args = getattr(args, 'dnf_args', [])
+        dnf_args = getattr(args, "dnf_args", [])
         if unknown:
             dnf_args.extend(unknown)
 
         if not dnf_args:
             print(
-                "Error: No DNF command specified. Use '--' to separate DNF arguments.", file=sys.stderr)
+                "Error: No DNF command specified. Use '--' to separate DNF arguments.",
+                file=sys.stderr,
+            )
             if parser:
                 parser.print_help()
             return False
@@ -58,19 +61,24 @@ class SdkDnfCommand(BaseCommand):
             return False
 
         # Get the SDK image from configuration
-        container_image = config.get('sdk', {}).get('image')
+        container_image = config.get("sdk", {}).get("image")
         if not container_image:
             print(
-                "Error: No container image specified in config under 'sdk.image'", file=sys.stderr)
+                "Error: No container image specified in config under 'sdk.image'",
+                file=sys.stderr,
+            )
             return False
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
-            cli_target=args.resolved_target, config_target=config_target)
+            cli_target=args.resolved_target, config_target=config_target
+        )
         if not target:
             print(
-                "Error: No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.", file=sys.stderr)
+                "Error: No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.",
+                file=sys.stderr,
+            )
             return False
 
         container_helper = SdkContainer()
@@ -85,7 +93,7 @@ class SdkDnfCommand(BaseCommand):
             target=target,
             command=[command],
             source_environment=False,
-            use_entrypoint=True
+            use_entrypoint=True,
         )
 
         # Log the result
@@ -98,15 +106,16 @@ class SdkDnfCommand(BaseCommand):
 
     def _print_help(self):
         """Print custom help message."""
-        print(
-            "usage: avocado sdk dnf [-h] [-c CONFIG] -- <dnf_args>...")
+        print("usage: avocado sdk dnf [-h] [-c CONFIG] -- <dnf_args>...")
         print()
         print("Run DNF commands in the SDK context")
         print()
         print("options:")
         print("  -h, --help            show this help message and exit")
         print("  -c CONFIG, --config CONFIG")
-        print("                        Path to avocado.toml configuration file (default: avocado.toml)")
+        print(
+            "                        Path to avocado.toml configuration file (default: avocado.toml)"
+        )
         print()
         print("dnf_args:")
         print("  Any DNF command and arguments to execute")

@@ -1,4 +1,5 @@
 """SDK deps command implementation."""
+
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
 from avocado.utils.output import print_success
@@ -17,8 +18,7 @@ class SdkDepsCommand(BaseCommand):
         elif isinstance(package_spec, dict):
             if "version" in package_spec:
                 # Object with version: "package-name = { version = "1.0.0" }"
-                dependencies.append(
-                    ("pkg", package_name, package_spec["version"]))
+                dependencies.append(("pkg", package_name, package_spec["version"]))
             elif "ext" in package_spec:
                 # Extension reference
                 ext_name = package_spec["ext"]
@@ -34,16 +34,22 @@ class SdkDepsCommand(BaseCommand):
                 compile_name = package_spec["compile"]
 
                 # Look for compile dependencies
-                if "sdk" in config and "compile" in config["sdk"] and compile_name in config["sdk"]["compile"]:
+                if (
+                    "sdk" in config
+                    and "compile" in config["sdk"]
+                    and compile_name in config["sdk"]["compile"]
+                ):
                     compile_config = config["sdk"]["compile"][compile_name]
                     if "dependencies" in compile_config:
-                        for dep_name, dep_spec in compile_config["dependencies"].items():
+                        for dep_name, dep_spec in compile_config[
+                            "dependencies"
+                        ].items():
                             if isinstance(dep_spec, str):
-                                dependencies.append(
-                                    ("pkg", dep_name, dep_spec))
+                                dependencies.append(("pkg", dep_name, dep_spec))
                             elif isinstance(dep_spec, dict) and "version" in dep_spec:
                                 dependencies.append(
-                                    ("pkg", dep_name, dep_spec["version"]))
+                                    ("pkg", dep_name, dep_spec["version"])
+                                )
                             # Note: compile dependencies cannot have further compile references
 
         return dependencies
@@ -60,22 +66,28 @@ class SdkDepsCommand(BaseCommand):
             sdk_deps = config["sdk"]["dependencies"]
             for package_name, package_spec in sdk_deps.items():
                 resolved_deps = self._resolve_package_dependencies(
-                    config, package_name, package_spec)
+                    config, package_name, package_spec
+                )
                 all_packages.extend(resolved_deps)
 
         # Process compile dependencies
         if "compile" in config["sdk"]:
             compile_sections = config["sdk"]["compile"]
             for section_name, section_config in compile_sections.items():
-                if isinstance(section_config, dict) and "dependencies" in section_config:
+                if (
+                    isinstance(section_config, dict)
+                    and "dependencies" in section_config
+                ):
                     compile_deps = section_config["dependencies"]
                     for package_name, package_spec in compile_deps.items():
                         if isinstance(package_spec, str):
+                            all_packages.append(("pkg", package_name, package_spec))
+                        elif (
+                            isinstance(package_spec, dict) and "version" in package_spec
+                        ):
                             all_packages.append(
-                                ("pkg", package_name, package_spec))
-                        elif isinstance(package_spec, dict) and "version" in package_spec:
-                            all_packages.append(
-                                ("pkg", package_name, package_spec["version"]))
+                                ("pkg", package_name, package_spec["version"])
+                            )
 
         # Remove duplicates while preserving order
         seen = set()
@@ -93,15 +105,13 @@ class SdkDepsCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the sdk deps command's subparser."""
-        parser = subparsers.add_parser(
-            "deps",
-            help="List SDK dependencies"
-        )
+        parser = subparsers.add_parser("deps", help="List SDK dependencies")
 
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         return parser

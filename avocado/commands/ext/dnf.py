@@ -1,4 +1,5 @@
 """Extension dnf command implementation."""
+
 import sys
 from avocado.commands.base import BaseCommand
 from avocado.utils.container import SdkContainer
@@ -10,7 +11,9 @@ from avocado.utils.target import resolve_target, get_target_from_config
 class ExtDnfCommand(BaseCommand):
     """Implementation of the 'ext dnf' command."""
 
-    def _do_extension_setup(self, config, extension, container_helper, container_image, target, verbose):
+    def _do_extension_setup(
+        self, config, extension, container_helper, container_image, target, verbose
+    ):
         """Perform extension setup for DNF operations."""
         # Check if extension directory structure exists, create it if not
         check_cmd = f"test -d ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}"
@@ -19,7 +22,7 @@ class ExtDnfCommand(BaseCommand):
             target=target,
             command=["bash", "-c", check_cmd],
             verbose=False,  # Don't show verbose output for the check
-            source_environment=False
+            source_environment=False,
         )
 
         if not dir_exists:
@@ -27,7 +30,7 @@ class ExtDnfCommand(BaseCommand):
             setup_commands = [
                 f"mkdir -p ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}/var/lib",
                 f"cp -rf ${{AVOCADO_SDK_SYSROOTS}}/rootfs/var/lib/rpm ${{AVOCADO_SDK_SYSROOTS}}/extensions/{
-                    extension}/var/lib"
+                    extension}/var/lib",
             ]
 
             setup_success = container_helper.run_in_container(
@@ -35,14 +38,13 @@ class ExtDnfCommand(BaseCommand):
                 target=target,
                 command=["bash", "-c", " && ".join(setup_commands)],
                 verbose=verbose,
-                source_environment=False
+                source_environment=False,
             )
 
             if setup_success:
                 print_success(f"Created sysroot for extension '{extension}'.")
             else:
-                print_error(
-                    f"Failed to create sysroot for extension '{extension}'.")
+                print_error(f"Failed to create sysroot for extension '{extension}'.")
                 return False
 
         return True
@@ -51,28 +53,25 @@ class ExtDnfCommand(BaseCommand):
     def register_subparser(cls, subparsers):
         """Register the ext dnf command's subparser."""
         parser = subparsers.add_parser(
-            "dnf",
-            help="Run DNF commands in an extension's context"
+            "dnf", help="Run DNF commands in an extension's context"
         )
 
         # Add common arguments
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         # Extension is now required
-        parser.add_argument(
-            "extension",
-            help="Extension name to operate on"
-        )
+        parser.add_argument("extension", help="Extension name to operate on")
 
         # Capture all remaining arguments after -- as dnf command
         parser.add_argument(
             "dnf_args",
             nargs="*",
-            help="DNF command and arguments to execute (use -- to separate from extension args)"
+            help="DNF command and arguments to execute (use -- to separate from extension args)",
         )
 
         return parser
@@ -80,13 +79,15 @@ class ExtDnfCommand(BaseCommand):
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext dnf command."""
         # Add unknown args to dnf_args if they exist
-        dnf_args = getattr(args, 'dnf_args', [])
+        dnf_args = getattr(args, "dnf_args", [])
         if unknown:
             dnf_args.extend(unknown)
 
         if not dnf_args:
             print(
-                "Error: No DNF command specified. Use '--' to separate DNF arguments.", file=sys.stderr)
+                "Error: No DNF command specified. Use '--' to separate DNF arguments.",
+                file=sys.stderr,
+            )
             if parser:
                 parser.print_help()
             return False
@@ -100,31 +101,40 @@ class ExtDnfCommand(BaseCommand):
             return False
 
         # Get the SDK image from configuration
-        container_image = config.get('sdk', {}).get('image')
+        container_image = config.get("sdk", {}).get("image")
         if not container_image:
             print(
-                "Error: No container image specified in config under 'sdk.image'", file=sys.stderr)
+                "Error: No container image specified in config under 'sdk.image'",
+                file=sys.stderr,
+            )
             return False
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
-            cli_target=args.resolved_target, config_target=config_target)
+            cli_target=args.resolved_target, config_target=config_target
+        )
         if not target:
             print(
-                "Error: No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.", file=sys.stderr)
+                "Error: No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.",
+                file=sys.stderr,
+            )
             return False
 
         container_helper = SdkContainer()
 
         # Check if extension exists in configuration
         if "ext" not in config or extension not in config["ext"]:
-            print_error(f"Extension '{
-                extension}' not found in configuration.")
+            print_error(
+                f"Extension '{
+                extension}' not found in configuration."
+            )
             return False
 
         # Do extension setup first
-        if not self._do_extension_setup(config, extension, container_helper, container_image, target, False):
+        if not self._do_extension_setup(
+            config, extension, container_helper, container_image, target, False
+        ):
             return False
 
         # Build dnf command with extension installroot
@@ -138,7 +148,7 @@ class ExtDnfCommand(BaseCommand):
             target=target,
             command=["bash", "-c", dnf_cmd],
             source_environment=False,
-            use_entrypoint=True
+            use_entrypoint=True,
         )
 
         # Log the result
@@ -151,8 +161,7 @@ class ExtDnfCommand(BaseCommand):
 
     def _print_help(self):
         """Print custom help message."""
-        print(
-            "usage: avocado ext dnf [-h] [-c CONFIG] extension -- <dnf_args>...")
+        print("usage: avocado ext dnf [-h] [-c CONFIG] extension -- <dnf_args>...")
         print()
         print("Execute DNF commands in an extension's context")
         print()
@@ -162,7 +171,9 @@ class ExtDnfCommand(BaseCommand):
         print("options:")
         print("  -h, --help            show this help message and exit")
         print("  -c CONFIG, --config CONFIG")
-        print("                        Path to avocado.toml configuration file (default: avocado.toml)")
+        print(
+            "                        Path to avocado.toml configuration file (default: avocado.toml)"
+        )
         print()
         print("dnf_args:")
         print("  Any DNF command and arguments to execute")

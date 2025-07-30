@@ -1,4 +1,5 @@
 """Extension clean command implementation."""
+
 import os
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
@@ -13,28 +14,21 @@ class ExtCleanCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the ext clean command's subparser."""
-        parser = subparsers.add_parser(
-            "clean",
-            help="Clean an extension's sysroot"
-        )
+        parser = subparsers.add_parser("clean", help="Clean an extension's sysroot")
 
         # Add extension name argument - required
-        parser.add_argument(
-            "extension",
-            help="Name of the extension to clean"
-        )
+        parser.add_argument("extension", help="Name of the extension to clean")
 
         # Add optional arguments
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         parser.add_argument(
-            "--verbose", "-v",
-            action="store_true",
-            help="Enable verbose output"
+            "--verbose", "-v", action="store_true", help="Enable verbose output"
         )
 
         return parser
@@ -56,14 +50,14 @@ class ExtCleanCommand(BaseCommand):
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
-            cli_target=args.resolved_target, config_target=config_target)
+            cli_target=args.resolved_target, config_target=config_target
+        )
         if not target:
             target = "qemux86-64"  # Default fallback
 
         # Get SDK config
         sdk_config = config.get("sdk", {})
-        container_image = sdk_config.get(
-            "image", "avocadolinux/sdk:apollo-edge")
+        container_image = sdk_config.get("image", "avocadolinux/sdk:apollo-edge")
 
         # Initialize container helper
         container_helper = SdkContainer()
@@ -73,15 +67,17 @@ class ExtCleanCommand(BaseCommand):
         check_cmd = f"test -d {sysroot_path}"
 
         if verbose:
-            print_info(f"Checking if sysroot exists for extension '{
-                       extension}'.")
+            print_info(
+                f"Checking if sysroot exists for extension '{
+                       extension}'."
+            )
 
         sysroot_exists = container_helper.run_in_container(
             container_image=container_image,
             target=target,
             command=check_cmd,
             verbose=False,  # Don't show verbose output for the check
-            source_environment=False
+            source_environment=False,
         )
 
         if not sysroot_exists:
@@ -101,13 +97,12 @@ class ExtCleanCommand(BaseCommand):
             target=target,
             command=remove_cmd,
             verbose=verbose,
-            source_environment=False
+            source_environment=False,
         )
 
         if success:
             print_success(f"Cleaned sysroot for extension '{extension}'.")
             return True
         else:
-            print_error(
-                f"Failed to clean sysroot for extension '{extension}'.")
+            print_error(f"Failed to clean sysroot for extension '{extension}'.")
             return False

@@ -1,4 +1,5 @@
 """Runtime list command implementation."""
+
 from avocado.commands.base import BaseCommand
 from avocado.utils.config import load_config
 from avocado.utils.output import print_success
@@ -64,15 +65,13 @@ class RuntimeListCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the runtime list command's subparser."""
-        parser = subparsers.add_parser(
-            "list",
-            help="List runtime names"
-        )
+        parser = subparsers.add_parser("list", help="List runtime names")
 
         parser.add_argument(
-            "-c", "--config",
+            "-c",
+            "--config",
             default="avocado.toml",
-            help="Path to avocado.toml configuration file (default: avocado.toml)"
+            help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
         return parser

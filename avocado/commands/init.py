@@ -1,4 +1,5 @@
 """Init command implementation."""
+
 import os
 from avocado.commands.base import BaseCommand
 from avocado.utils.output import print_error, print_success
@@ -10,10 +11,7 @@ class InitCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the init command's subparser."""
-        parser = subparsers.add_parser(
-            "init",
-            help="Initialize a new avocado project"
-        )
+        parser = subparsers.add_parser("init", help="Initialize a new avocado project")
 
         # No longer need local target argument - uses global target
 
@@ -22,14 +20,16 @@ class InitCommand(BaseCommand):
             "directory",
             nargs="?",
             default=".",
-            help="Directory to initialize (defaults to current directory)"
+            help="Directory to initialize (defaults to current directory)",
         )
 
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the init command."""
-        target = args.resolved_target or "qemux86-64"  # Use global target with default fallback
+        target = (
+            args.resolved_target or "qemux86-64"
+        )  # Use global target with default fallback
         directory = args.directory
 
         # Validate the directory
@@ -37,8 +37,10 @@ class InitCommand(BaseCommand):
             try:
                 os.makedirs(directory)
             except OSError as e:
-                print_error(f"creating directory {
-                    directory}: {str(e)}.")
+                print_error(
+                    f"creating directory {
+                    directory}: {str(e)}."
+                )
                 return False
 
         # Create the avocado.toml file
@@ -51,7 +53,7 @@ class InitCommand(BaseCommand):
 
         try:
             # Create the new configuration template
-            config_content = f'''[runtime.default]
+            config_content = f"""[runtime.default]
 target = "{target}"
 
 [runtime.default.dependencies]
@@ -59,10 +61,10 @@ nativesdk-avocado-images = "*"
 
 [sdk]
 image = "avocadolinux/sdk:apollo-edge"
-'''
+"""
 
             # Write to file
-            with open(toml_path, 'w') as f:
+            with open(toml_path, "w") as f:
                 f.write(config_content)
 
             print_success(f"Created config at {os.path.abspath(toml_path)}.")

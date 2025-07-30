@@ -1,4 +1,5 @@
 """Shared container utility for SDK container operations."""
+
 import os
 import shlex
 import subprocess
@@ -32,8 +33,7 @@ class SdkContainer:
         cmd = ""
 
         if use_entrypoint:
-            entrypoint_script = self._create_entrypoint_script(
-                source_environment)
+            entrypoint_script = self._create_entrypoint_script(source_environment)
             cmd += f"{entrypoint_script}\n"
 
         if command and isinstance(command, list):
@@ -58,7 +58,7 @@ class SdkContainer:
                 container_name=container_name,
                 detach=detach,
                 rm=rm,
-                interactive=interactive
+                interactive=interactive,
             )
 
             return self._execute_container_command(container_cmd, detach, verbose_final)
@@ -76,7 +76,7 @@ class SdkContainer:
         container_name: Optional[str] = None,
         detach: bool = False,
         rm: bool = True,
-        interactive = False,
+        interactive: bool = False,
     ) -> List[str]:
         """Build the complete container command."""
         container_cmd = [self.container_tool, "run"]
@@ -93,10 +93,14 @@ class SdkContainer:
             container_cmd.extend(["-i", "-t"])
 
         # Default volume mounts
-        container_cmd.extend([
-            "-v", f"{self.cwd}:/opt/_avocado/src:ro",
-            "-v", f"{self.cwd}/_avocado:/opt/_avocado:rw"
-        ])
+        container_cmd.extend(
+            [
+                "-v",
+                f"{self.cwd}:/opt/_avocado/src:ro",
+                "-v",
+                f"{self.cwd}/_avocado:/opt/_avocado:rw",
+            ]
+        )
 
         # Environment variables
         if target:
@@ -117,7 +121,9 @@ class SdkContainer:
 
         return container_cmd
 
-    def _execute_container_command(self, container_cmd: List[str], detach: bool = False, verbose: bool = False) -> bool:
+    def _execute_container_command(
+        self, container_cmd: List[str], detach: bool = False, verbose: bool = False
+    ) -> bool:
         try:
             if verbose:
                 print(f"Mounting host directory: {self.cwd} -> /opt\n")
@@ -125,10 +131,13 @@ class SdkContainer:
 
             if detach:
                 result = subprocess.run(
-                    container_cmd, check=True, capture_output=True, text=True)
+                    container_cmd, check=True, capture_output=True, text=True
+                )
                 container_id = result.stdout.strip()
-                print(f"Container started in detached mode with ID: {
-                      container_id}")
+                print(
+                    f"Container started in detached mode with ID: {
+                      container_id}"
+                )
                 return True
             else:
                 result = subprocess.run(container_cmd, check=False)
@@ -136,22 +145,25 @@ class SdkContainer:
 
         except KeyboardInterrupt:
             print(
-                "\nINFO: Keyboard interrupt received. Container process may also be stopping.")
+                "\nINFO: Keyboard interrupt received. Container process may also be stopping."
+            )
             return False
         except subprocess.CalledProcessError as e:
             print_error(f"Container execution failed: {e}")
-            if hasattr(e, 'stdout') and e.stdout:
+            if hasattr(e, "stdout") and e.stdout:
                 print(f"STDOUT: {e.stdout}", file=sys.stderr)
-            if hasattr(e, 'stderr') and e.stderr:
+            if hasattr(e, "stderr") and e.stderr:
                 print(f"STDERR: {e.stderr}", file=sys.stderr)
             return False
         except FileNotFoundError:
-            print_error(f"{
-                self.container_tool} command not found. Is it installed and in your PATH?")
+            print_error(
+                f"{
+                self.container_tool} command not found. Is it installed and in your PATH?"
+            )
             return False
 
     def _create_entrypoint_script(self, source_environment: bool = True) -> str:
-        script = '''
+        script = """
 set -e
 
 # Get codename from environment or os-release
@@ -244,23 +256,18 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
         --installroot ${AVOCADO_SDK_PREFIX}/target-sysroot \
         install \
         packagegroup-core-standalone-sdk-target
-
-    # mkdir -p $AVOCADO_PREFIX/sysext/var/lib
-    # mkdir -p $AVOCADO_PREFIX/confext/var/lib
-    # cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_PREFIX/sysext/var/lib
-    # cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_PREFIX/confext/var/lib
 fi
 
 export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
 
 cd /opt/_avocado/src
-'''
+"""
 
         if source_environment:
-            script += '''
+            script += """
 # Source the environment setup if it exists
 if [ -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     source "${AVOCADO_SDK_PREFIX}/environment-setup"
 fi
-'''
+"""
         return script
