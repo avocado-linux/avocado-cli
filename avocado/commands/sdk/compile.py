@@ -48,7 +48,7 @@ class SdkCompileCommand(BaseCommand):
         parser = subparsers.add_parser("compile", help="Run compile scripts")
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -62,7 +62,13 @@ class SdkCompileCommand(BaseCommand):
         parser.add_argument(
             "sections",
             nargs="*",
-            help="Specific compile sections to run (if not provided, runs all sections)",
+            help="Compile section names (if not provided, compiles all sections)",
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
 
         return parser
@@ -151,6 +157,7 @@ class SdkCompileCommand(BaseCommand):
                 command=compile_command,
                 verbose=verbose,
                 source_environment=True,
+                container_args=getattr(args, 'container_args', None),
             )
 
             if success:

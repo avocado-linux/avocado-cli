@@ -19,9 +19,13 @@ class ExtImageCommand(BaseCommand):
             "image", help="Create squashfs image from system extension"
         )
 
-        # Add extension name argument - required
+        # Extension argument - can be positional or named
+        parser.add_argument("extension", nargs="?", help="Name of the extension to create image for")
         parser.add_argument(
-            "extension", help="Name of the extension to create image for"
+            "-e",
+            "--extension",
+            dest="extension_named",
+            help="Name of the extension to create image for"
         )
 
         # Add optional arguments
@@ -30,17 +34,28 @@ class ExtImageCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
 
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext image command."""
-        extension_name = args.extension
+        # Determine extension name from positional or named argument
+        extension_name = getattr(args, 'extension_named', None) or args.extension
+        if not extension_name:
+            print_error("Extension name is required. Provide it positionally or via -e/--extension.")
+            return False
+
         config_path = args.config
         verbose = args.verbose
 
@@ -90,7 +105,7 @@ class ExtImageCommand(BaseCommand):
             return False
 
         # Initialize SDK container helper
-        container_helper = SdkContainer(verbose=verbose)
+        container_helper = SdkContainer()
 
         # Create images based on configuration
         overall_success = True
@@ -108,6 +123,7 @@ class ExtImageCommand(BaseCommand):
                 extension_name,
                 ext_type,
                 verbose,
+                getattr(args, 'container_args', None),
             )
 
             if result:
@@ -132,6 +148,7 @@ class ExtImageCommand(BaseCommand):
         extension_name,
         extension_type,
         verbose,
+        container_args,
     ):
         # Create the build script
         build_script = self._create_build_script(extension_name, extension_type)
@@ -147,6 +164,7 @@ class ExtImageCommand(BaseCommand):
             rm=True,
             verbose=verbose,
             source_environment=True,
+            container_args=container_args,
         )
 
         return result

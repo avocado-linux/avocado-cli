@@ -92,38 +92,57 @@ class ExtDepsCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        parser.add_argument("extension", help="Extension name to list dependencies for")
+        # Extension argument - can be positional or named
+        parser.add_argument("extension", nargs="?", help="Extension name to list dependencies for")
+        parser.add_argument(
+            "-e",
+            "--extension",
+            dest="extension_named",
+            help="Extension name to list dependencies for"
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
+        )
 
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext deps command."""
         config_path = args.config
-        extension = args.extension
+
+        # Determine extension name from positional or named argument
+        extension_name = getattr(args, 'extension_named', None) or args.extension
+        if not extension_name:
+            print_error("Extension name is required. Provide it positionally or via -e/--extension.")
+            return False
 
         # Load configuration
         config, success = load_config(config_path)
         if not success:
             return False
 
-        # Check if ext section exists
+        # Check if extension section exists
         if "ext" not in config:
-            print_error(f"Extension '{extension}' not found in configuration.")
+            print_error(f"Extension '{extension_name}' not found in configuration.")
             return False
 
-        # Check if extension exists
-        if extension not in config["ext"]:
-            print_error(f"Extension '{extension}' not found in configuration.")
+        # Check if specific extension exists
+        if extension_name not in config["ext"]:
+            print_error(f"Extension '{extension_name}' not found in configuration.")
             return False
 
+        extension_config = config["ext"][extension_name]
         # List dependencies for the extension
-        packages = self._list_packages_from_config(config, extension)
+        packages = self._list_packages_from_config(config, extension_name)
 
         for dep_type, pkg_name, pkg_version in packages:
             print(f"({dep_type}) {pkg_name} ({pkg_version})")

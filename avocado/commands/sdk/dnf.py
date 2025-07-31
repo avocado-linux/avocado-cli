@@ -22,7 +22,7 @@ class SdkDnfCommand(BaseCommand):
 
         # Add common arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -33,6 +33,12 @@ class SdkDnfCommand(BaseCommand):
             "dnf_args",
             nargs="*",
             help="DNF command and arguments to execute (use -- to separate from SDK args)",
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
 
         return parser
@@ -91,9 +97,10 @@ class SdkDnfCommand(BaseCommand):
         success = container_helper.run_in_container(
             container_image=container_image,
             target=target,
-            command=[command],
+            command=["bash", "-c", command],
             source_environment=False,
             use_entrypoint=True,
+            container_args=getattr(args, 'container_args', None),
         )
 
         # Log the result
@@ -106,13 +113,13 @@ class SdkDnfCommand(BaseCommand):
 
     def _print_help(self):
         """Print custom help message."""
-        print("usage: avocado sdk dnf [-h] [-c CONFIG] -- <dnf_args>...")
+        print("usage: avocado sdk dnf [-h] [-C CONFIG] -- <dnf_args>...")
         print()
         print("Run DNF commands in the SDK context")
         print()
         print("options:")
         print("  -h, --help            show this help message and exit")
-        print("  -c CONFIG, --config CONFIG")
+        print("  -C CONFIG, --config CONFIG")
         print(
             "                        Path to avocado.toml configuration file (default: avocado.toml)"
         )

@@ -22,10 +22,13 @@ class ExtBuildCommand(BaseCommand):
             "build", help="Build sysext and/or confext extensions from configuration"
         )
 
-        # Add extension name argument - required
+        # Extension argument - can be positional or named
+        parser.add_argument("extension", nargs="?", help="Name of the extension to build (must be defined in config)")
         parser.add_argument(
-            "extension",
-            help="Name of the extension to build (must be defined in config)",
+            "-e",
+            "--extension",
+            dest="extension_named",
+            help="Name of the extension to build (must be defined in config)"
         )
 
         # Add optional arguments
@@ -34,17 +37,28 @@ class ExtBuildCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
 
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext build command."""
-        extension_name = args.extension
+        # Determine extension name from positional or named argument
+        extension_name = getattr(args, 'extension_named', None) or args.extension
+        if not extension_name:
+            print_error("Extension name is required. Provide it positionally or via -e/--extension.")
+            return False
+
         config_path = args.config
         verbose = args.verbose
 
@@ -98,7 +112,7 @@ class ExtBuildCommand(BaseCommand):
             return False
 
         # Initialize SDK container helper
-        container_helper = SdkContainer(verbose=verbose)
+        container_helper = SdkContainer()
 
         # Build extensions based on configuration
         overall_success = True
@@ -115,6 +129,7 @@ class ExtBuildCommand(BaseCommand):
                     ext_version,
                     sysext_scopes,
                     verbose,
+                    getattr(args, 'container_args', None),
                 )
             elif ext_type == "confext":
                 build_result = self._build_confext_extension(
@@ -125,6 +140,7 @@ class ExtBuildCommand(BaseCommand):
                     ext_version,
                     confext_scopes,
                     verbose,
+                    getattr(args, 'container_args', None),
                 )
 
             if build_result:
@@ -150,6 +166,7 @@ class ExtBuildCommand(BaseCommand):
         ext_version,
         ext_scopes,
         verbose,
+        container_args,
     ):
         """Build a sysext extension."""
 
@@ -169,6 +186,7 @@ class ExtBuildCommand(BaseCommand):
             rm=True,
             verbose=verbose,
             source_environment=True,
+            container_args=container_args,
         )
 
         if verbose:
@@ -185,6 +203,7 @@ class ExtBuildCommand(BaseCommand):
         ext_version,
         ext_scopes,
         verbose,
+        container_args,
     ):
         """Build a confext extension."""
 
@@ -204,6 +223,7 @@ class ExtBuildCommand(BaseCommand):
             rm=True,
             verbose=verbose,
             source_environment=True,
+            container_args=container_args,
         )
 
         if verbose:

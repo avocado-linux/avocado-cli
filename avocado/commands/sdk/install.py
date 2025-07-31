@@ -20,7 +20,7 @@ class SdkInstallCommand(BaseCommand):
 
         # Add config file argument
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -35,6 +35,12 @@ class SdkInstallCommand(BaseCommand):
             "--force",
             action="store_true",
             help="Force the operation to proceed, bypassing warnings or confirmation prompts.",
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
 
         return parser
@@ -126,6 +132,7 @@ $DNF_SDK_HOST \
                     verbose=verbose,
                     source_environment=False,
                     interactive=not args.force,
+                    container_args=getattr(args, 'container_args', None),
                 )
 
                 if install_success:
@@ -178,6 +185,7 @@ $DNF_SDK_HOST \
                         verbose=verbose,
                         source_environment=False,
                         interactive=not args.force,
+                        container_args=getattr(args, 'container_args', None),
                     )
 
                     if not install_success:

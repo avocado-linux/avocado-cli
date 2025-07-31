@@ -51,26 +51,43 @@ class RuntimeDepsCommand(BaseCommand):
         parser = subparsers.add_parser("deps", help="List dependencies for a runtime")
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        parser.add_argument("runtime", help="Runtime name to list dependencies for")
+        # Runtime argument - can be positional or named
+        parser.add_argument("runtime", nargs="?", help="Runtime name to list dependencies for")
+        parser.add_argument(
+            "-r",
+            "--runtime",
+            dest="runtime_named",
+            help="Runtime name to list dependencies for"
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
+        )
 
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the runtime deps command."""
         config_path = args.config
-        runtime_name = args.runtime
+
+        # Determine runtime name from positional or named argument
+        runtime_name = getattr(args, 'runtime_named', None) or args.runtime
+        if not runtime_name:
+            print_error("Runtime name is required. Provide it positionally or via -r/--runtime.")
+            return False
 
         # Load configuration
         config, success = load_config(config_path)
         if not success:
             return False
-
         # Check if runtime section exists
         if "runtime" not in config:
             print_error(f"Runtime '{runtime_name}' not found in configuration.")

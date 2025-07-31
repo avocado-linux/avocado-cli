@@ -16,12 +16,18 @@ class ExtCleanCommand(BaseCommand):
         """Register the ext clean command's subparser."""
         parser = subparsers.add_parser("clean", help="Clean an extension's sysroot")
 
-        # Add extension name argument - required
-        parser.add_argument("extension", help="Name of the extension to clean")
+        # Extension argument - can be positional or named
+        parser.add_argument("extension", nargs="?", help="Name of the extension to clean")
+        parser.add_argument(
+            "-e",
+            "--extension",
+            dest="extension_named",
+            help="Name of the extension to clean"
+        )
 
         # Add optional arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -31,11 +37,22 @@ class ExtCleanCommand(BaseCommand):
             "--verbose", "-v", action="store_true", help="Enable verbose output"
         )
 
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
+        )
+
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext clean command."""
-        extension = args.extension
+        # Determine extension name from positional or named argument
+        extension = getattr(args, 'extension_named', None) or args.extension
+        if not extension:
+            print_error("Extension name is required. Provide it positionally or via -e/--extension.")
+            return False
+
         config_path = args.config
         verbose = args.verbose
 
@@ -76,8 +93,9 @@ class ExtCleanCommand(BaseCommand):
             container_image=container_image,
             target=target,
             command=check_cmd,
-            verbose=False,  # Don't show verbose output for the check
+            verbose=False,
             source_environment=False,
+            container_args=getattr(args, 'container_args', None),
         )
 
         if not sysroot_exists:
@@ -98,6 +116,7 @@ class ExtCleanCommand(BaseCommand):
             command=remove_cmd,
             verbose=verbose,
             source_environment=False,
+            container_args=getattr(args, 'container_args', None),
         )
 
         if success:

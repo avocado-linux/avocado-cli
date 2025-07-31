@@ -20,7 +20,7 @@ class SdkRunCommand(BaseCommand):
             "run", help="Create and run an SDK container"
         )
         run_parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -49,9 +49,14 @@ class SdkRunCommand(BaseCommand):
             "-v", "--verbose", action="store_true", help="Enable verbose output"
         )
         run_parser.add_argument(
-            "command",
+            "-c",
+            "--command",
+            help="Command to run in container. Used if --interactive is not specified.",
+        )
+        run_parser.add_argument(
+            "--container-args",
             nargs="*",
-            help="Command and arguments to run in container. Used if --interactive is not specified.",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
         return run_parser
 
@@ -111,7 +116,7 @@ class SdkRunCommand(BaseCommand):
             # Require either a command or --interactive flag
             if not args.interactive and not args.command:
                 print(
-                    "Error: You must either provide a command or use --interactive (-i).",
+                    "Error: You must either provide --command (-c) or use --interactive (-i).",
                     file=sys.stderr,
                 )
                 if parser:
@@ -138,6 +143,7 @@ class SdkRunCommand(BaseCommand):
                 verbose=args.verbose,
                 source_environment=False,
                 interactive=args.interactive,
+                container_args=getattr(args, 'container_args', None),
             )
 
             if success:
