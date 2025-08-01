@@ -81,6 +81,13 @@ The Avocado CLI is being migrated from Python to Rust to improve performance, re
   - ✅ Proper dependency type identification
   - ✅ Comprehensive unit tests
 
+- **clean**: Clean the avocado project by removing the _avocado directory
+  - ✅ Removes _avocado directory from specified or current directory
+  - ✅ Handles nested directory structures recursively
+  - ✅ Provides informative messages for success, info, and error cases
+  - ✅ Proper error handling for nonexistent directories
+  - ✅ Comprehensive unit tests
+
 ## Usage
 
 ### Building
@@ -117,6 +124,10 @@ cargo build --release
 ./target/release/avocado-cli runtime list
 ./target/release/avocado-cli runtime deps my-runtime
 ./target/release/avocado-cli runtime build my-runtime --verbose --force
+
+# Clean Command
+./target/release/avocado-cli clean
+./target/release/avocado-cli clean my-project-dir
 ```
 
 ### Testing
@@ -133,6 +144,9 @@ cargo test commands::sdk::tests
 
 # Run only runtime command tests
 cargo test commands::runtime::tests
+
+# Run only clean command tests
+cargo test commands::clean::tests
 ```
 
 ## Architecture
@@ -145,6 +159,7 @@ src/
 ├── commands/
 │   ├── mod.rs           # Commands module
 │   ├── init.rs          # Init command implementation
+│   ├── clean.rs         # Clean command implementation
 │   ├── runtime/
 │   │   ├── mod.rs       # Runtime commands module
 │   │   ├── build.rs     # Runtime build command
@@ -197,7 +212,6 @@ src/
 
 ### Planned Commands
 
-- `clean`: Clean build artifacts
 - `ext`: Extension management commands
 
 ### Migration Strategy
