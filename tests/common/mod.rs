@@ -284,6 +284,7 @@ pub fn create_temp_dir() -> PathBuf {
     temp_dir
 }
 
+#[allow(dead_code)]
 pub fn cleanup_temp_dir(temp_dir: &Path) {
     std::fs::remove_dir_all(temp_dir).ok();
 }
