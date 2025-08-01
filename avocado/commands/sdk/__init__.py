@@ -6,7 +6,6 @@ from .run import SdkRunCommand
 from .deps import SdkDepsCommand
 from .compile import SdkCompileCommand  # Added compile command
 from .dnf import SdkDnfCommand
-from .install import SdkInstallCommand
 from .clean import SdkCleanCommand
 
 
@@ -19,7 +18,6 @@ class SdkCommand(BaseCommand):
         self.deps_parser = None
         self.compile_parser = None
         self.dnf_parser = None
-        self.install_parser = None
         self.clean_parser = None
 
     @classmethod
@@ -51,10 +49,6 @@ class SdkCommand(BaseCommand):
         dnf_parser = SdkDnfCommand.register_subparser(sdk_subparsers)
         sdk_parser.dnf_parser = dnf_parser
 
-        # SdkInstallCommand
-        install_parser = SdkInstallCommand.register_subparser(sdk_subparsers)
-        sdk_parser.install_parser = install_parser
-
         # SdkCleanCommand
         clean_parser = SdkCleanCommand.register_subparser(sdk_subparsers)
         sdk_parser.clean_parser = clean_parser
@@ -76,9 +70,7 @@ class SdkCommand(BaseCommand):
                 return True  # Return success when showing help
             else:
                 print(
-                    "Available SDK subcommands: 'run', 'deps', 'compile', 'dnf', 'install', 'clean'",
-                    file=sys.stderr,
-                )
+                    "Available SDK subcommands: 'run', 'deps', 'compile', 'dnf', 'clean'", file=sys.stderr)
             return False
 
         # Dispatch to appropriate SDK subcommand
@@ -98,10 +90,6 @@ class SdkCommand(BaseCommand):
         elif args.sdk_subcommand == "dnf":
             command = SdkDnfCommand()
             sub_parser = getattr(parser, "dnf_parser", None) if parser else None
-            return command.execute(args, sub_parser, unknown)
-        elif args.sdk_subcommand == "install":
-            command = SdkInstallCommand()
-            sub_parser = getattr(parser, "install_parser", None) if parser else None
             return command.execute(args, sub_parser, unknown)
         elif args.sdk_subcommand == "clean":
             command = SdkCleanCommand()
