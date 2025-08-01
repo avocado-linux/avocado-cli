@@ -1,4 +1,3 @@
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,42 +10,13 @@ pub struct TestResult {
     pub exit_code: i32,
 }
 
-/// Get the appropriate command for the CLI (Python or Rust)
+/// Get the appropriate command for the CLI (Rust only)
 fn get_cli_command() -> (String, Vec<String>) {
-    // Check if we should use Rust CLI for certain commands
-    if let Ok(use_rust) = env::var("USE_RUST_CLI") {
-        if use_rust == "1" || use_rust.to_lowercase() == "true" {
-            return (
-                "cargo".to_string(),
-                vec!["run".to_string(), "--".to_string()],
-            );
-        }
-    }
-
-    // Default to Python CLI
-    let python_cmd = get_python_command();
-    (python_cmd, vec!["-m".to_string(), "avocado".to_string()])
-}
-
-/// Get the appropriate Python command for the CLI
-fn get_python_command() -> String {
-    // Try to use the venv Python first, fall back to system python if not available
-    let venv_python = std::env::current_dir()
-        .ok()
-        .map(|dir| dir.join(".venv").join("bin").join("python"))
-        .filter(|path| path.exists());
-
-    match venv_python {
-        Some(path) => path.to_string_lossy().to_string(),
-        None => {
-            // Fall back to system python - check for python3 first, then python
-            if Command::new("python3").arg("--version").output().is_ok() {
-                "python3".to_string()
-            } else {
-                "python".to_string()
-            }
-        }
-    }
+    // Always use Rust CLI via cargo
+    (
+        "cargo".to_string(),
+        vec!["run".to_string(), "--".to_string()],
+    )
 }
 
 /// Execute the CLI with the given arguments and configuration

@@ -9,7 +9,7 @@ board = "raspberry-pi-4"
 [ext.web-server]
 sysext = true
 confext = true
-packages = ["nginx", "certbot", "python3"]
+packages = ["nginx", "certbot", "curl"]
 
 [ext.config-only]
 sysext = false
