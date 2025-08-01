@@ -9,6 +9,7 @@ use commands::ext::{
     ExtInstallCommand, ExtListCommand,
 };
 use commands::init::InitCommand;
+use commands::runtime::{RuntimeBuildCommand, RuntimeDepsCommand, RuntimeListCommand};
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkRunCommand,
@@ -39,6 +40,11 @@ enum Commands {
     Ext {
         #[command(subcommand)]
         command: ExtCommands,
+    },
+    /// Runtime management commands
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
     },
     /// Initialize a new avocado project
     Init {
@@ -120,6 +126,38 @@ enum SdkCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum RuntimeCommands {
+    /// Build a runtime
+    Build {
+        /// Runtime name to build
+        runtime: String,
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// List runtime names
+    List {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+    },
+    /// List dependencies for a runtime
+    Deps {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Runtime name to list dependencies for
+        runtime: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -130,6 +168,29 @@ async fn main() -> Result<()> {
             init_cmd.execute()?;
             Ok(())
         }
+        Commands::Runtime { command } => match command {
+            RuntimeCommands::Build {
+                runtime,
+                config,
+                verbose,
+                force,
+            } => {
+                let build_cmd =
+                    RuntimeBuildCommand::new(runtime, config, verbose, force, cli.target);
+                build_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::List { config } => {
+                let list_cmd = RuntimeListCommand::new(config);
+                list_cmd.execute()?;
+                Ok(())
+            }
+            RuntimeCommands::Deps { config, runtime } => {
+                let deps_cmd = RuntimeDepsCommand::new(config, runtime);
+                deps_cmd.execute()?;
+                Ok(())
+            }
+        },
         Commands::Ext { command } => match command {
             ExtCommands::Install {
                 config,
