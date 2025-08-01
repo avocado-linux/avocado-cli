@@ -4,7 +4,7 @@ import sys
 import argparse
 from avocado.commands.sdk import SdkCommand
 from avocado.commands.ext import ExtCommand
-from avocado.commands.init import InitCommand
+
 from avocado.commands.runtime import RuntimeCommand
 from avocado.commands.clean import CleanCommand
 from avocado.utils.target import resolve_target
@@ -29,7 +29,7 @@ def main():
     # Register commands and store their parsers
     sdk_parser = SdkCommand.register_subparser(subparsers)
     ext_parser = ExtCommand.register_subparser(subparsers)
-    init_parser = InitCommand.register_subparser(subparsers)
+
     runtime_parser = RuntimeCommand.register_subparser(subparsers)
     clean_parser = CleanCommand.register_subparser(subparsers)
 
@@ -57,9 +57,7 @@ def main():
     elif args.main_command == "ext":
         command = ExtCommand()
         success = command.execute(args, ext_parser, unknown)
-    elif args.main_command == "init":
-        command = InitCommand()
-        success = command.execute(args, init_parser, unknown)
+
     elif args.main_command == "runtime":
         command = RuntimeCommand()
         success = command.execute(args, runtime_parser, unknown)
