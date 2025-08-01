@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command as AsyncCommand;
 
-use crate::utils::output::{print_error, print_info};
+use crate::utils::output::{print_error, print_info, OutputLevel};
 
 /// Container helper for SDK operations
 pub struct SdkContainer {
@@ -154,11 +154,14 @@ impl SdkContainer {
         verbose: bool,
     ) -> Result<bool> {
         if verbose {
-            print_info(&format!(
-                "Mounting host directory: {} -> /opt",
-                self.cwd.display()
-            ));
-            print_info(&format!("Container command: {}", container_cmd.join(" ")));
+            print_info(
+                &format!("Mounting host directory: {} -> /opt", self.cwd.display()),
+                OutputLevel::Normal,
+            );
+            print_info(
+                &format!("Container command: {}", container_cmd.join(" ")),
+                OutputLevel::Normal,
+            );
         }
 
         let mut cmd = AsyncCommand::new(&container_cmd[0]);
@@ -173,14 +176,20 @@ impl SdkContainer {
 
             if output.status.success() {
                 let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                print_info(&format!(
-                    "Container started in detached mode with ID: {}",
-                    container_id
-                ));
+                print_info(
+                    &format!(
+                        "Container started in detached mode with ID: {}",
+                        container_id
+                    ),
+                    OutputLevel::Normal,
+                );
                 Ok(true)
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                print_error(&format!("Container execution failed: {}", stderr));
+                print_error(
+                    &format!("Container execution failed: {}", stderr),
+                    OutputLevel::Normal,
+                );
                 Ok(false)
             }
         } else {

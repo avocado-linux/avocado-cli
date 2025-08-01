@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::utils::{
     config::Config,
     container::SdkContainer,
-    output::{print_info, print_success},
+    output::{print_info, print_success, OutputLevel},
     target::resolve_target,
 };
 
@@ -53,7 +53,7 @@ impl SdkInstallCommand {
                 )
             })?;
 
-        print_info("Installing SDK dependencies.");
+        print_info("Installing SDK dependencies.", OutputLevel::Normal);
 
         // Get SDK dependencies
         let sdk_dependencies = config.get_sdk_dependencies();
@@ -99,18 +99,18 @@ $DNF_SDK_HOST \
                     .await?;
 
                 if install_success {
-                    print_success("Installed SDK dependencies.");
+                    print_success("Installed SDK dependencies.", OutputLevel::Normal);
                 } else {
                     return Err(anyhow::anyhow!("Failed to install SDK package(s)."));
                 }
             }
         } else {
-            print_success("No dependencies configured.");
+            print_success("No dependencies configured.", OutputLevel::Normal);
         }
 
         // Install compile section dependencies (into target-dev sysroot)
         if !compile_dependencies.is_empty() {
-            print_info("Installing SDK compile dependencies.");
+            print_info("Installing SDK compile dependencies.", OutputLevel::Normal);
             let total = compile_dependencies.len();
 
             for (index, (section_name, dependencies)) in compile_dependencies.iter().enumerate() {
@@ -134,12 +134,15 @@ $DNF_SDK_HOST \
                         compile_packages.join(" ")
                     );
 
-                    print_info(&format!(
-                        "Installing ({}/{}) {}.",
-                        index + 1,
-                        total,
-                        section_name
-                    ));
+                    print_info(
+                        &format!(
+                            "Installing ({}/{}) compile dependencies for section '{}'",
+                            index + 1,
+                            total,
+                            section_name
+                        ),
+                        OutputLevel::Normal,
+                    );
 
                     // Use the container helper's run_in_container method with target-dev installroot
                     let install_success = container_helper
@@ -160,16 +163,19 @@ $DNF_SDK_HOST \
                         ));
                     }
                 } else {
-                    print_info(&format!(
-                        "({}/{}) [sdk.compile.{}.dependencies] no dependencies.",
-                        index + 1,
-                        total,
-                        section_name
-                    ));
+                    print_info(
+                        &format!(
+                            "({}/{}) [{}] No dependencies configured.",
+                            index + 1,
+                            total,
+                            section_name
+                        ),
+                        OutputLevel::Normal,
+                    );
                 }
             }
 
-            print_success("Installed SDK compile dependencies.");
+            print_success("Installed SDK compile dependencies.", OutputLevel::Normal);
         }
 
         Ok(())

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crate::utils::{
     config::Config,
     container::SdkContainer,
-    output::{print_error, print_info, print_success},
+    output::{print_error, print_info, print_success, OutputLevel},
     target::resolve_target,
 };
 
@@ -54,7 +54,7 @@ impl SdkCompileCommand {
         let compile_sections = self.get_compile_sections_from_config(&config);
 
         if compile_sections.is_empty() {
-            print_success("No compile sections configured.");
+            print_success("No compile sections configured.", OutputLevel::Normal);
             return Ok(());
         }
 
@@ -117,10 +117,13 @@ impl SdkCompileCommand {
         let mut overall_success = true;
 
         for section in &filtered_sections {
-            print_info(&format!(
-                "Compiling section '{}' with script '{}'",
-                section.name, section.script
-            ));
+            print_info(
+                &format!(
+                    "Compiling section '{}' with script '{}'",
+                    section.name, section.script
+                ),
+                OutputLevel::Normal,
+            );
 
             let container_helper = SdkContainer::new().verbose(self.verbose);
 
@@ -141,18 +144,27 @@ impl SdkCompileCommand {
                 .await?;
 
             if success {
-                print_success(&format!("Compiled section '{}'.", section.name));
+                print_success(
+                    &format!("Compiled section '{}'.", section.name),
+                    OutputLevel::Normal,
+                );
             } else {
-                print_error(&format!("Failed to compile section '{}'.", section.name));
+                print_error(
+                    &format!("Failed to compile section '{}'.", section.name),
+                    OutputLevel::Normal,
+                );
                 overall_success = false;
             }
         }
 
         if overall_success {
-            print_success(&format!(
-                "All {} compile section(s) completed successfully!",
-                filtered_sections.len()
-            ));
+            print_success(
+                &format!(
+                    "All {} compile section(s) completed successfully!",
+                    filtered_sections.len()
+                ),
+                OutputLevel::Normal,
+            );
         }
 
         if !overall_success {
