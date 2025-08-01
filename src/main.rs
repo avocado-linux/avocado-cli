@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod utils;
 
+use commands::clean::CleanCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
     ExtInstallCommand, ExtListCommand,
@@ -41,14 +42,19 @@ enum Commands {
         #[command(subcommand)]
         command: ExtCommands,
     },
+    /// Initialize a new avocado project
+    Init {
+        /// Directory to initialize (defaults to current directory)
+        directory: Option<String>,
+    },
     /// Runtime management commands
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommands,
     },
-    /// Initialize a new avocado project
-    Init {
-        /// Directory to initialize (defaults to current directory)
+    /// Clean the avocado project by removing the _avocado directory
+    Clean {
+        /// Directory to clean (defaults to current directory)
         directory: Option<String>,
     },
 }
@@ -166,6 +172,11 @@ async fn main() -> Result<()> {
         Commands::Init { directory } => {
             let init_cmd = InitCommand::new(cli.target, directory);
             init_cmd.execute()?;
+            Ok(())
+        }
+        Commands::Clean { directory } => {
+            let clean_cmd = CleanCommand::new(directory);
+            clean_cmd.execute()?;
             Ok(())
         }
         Commands::Runtime { command } => match command {
