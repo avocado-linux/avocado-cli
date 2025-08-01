@@ -4,10 +4,6 @@ use crate::common::*;
 
 #[test]
 fn qemux86_64() {
-    let file_path = file!();
-    let dir_path = Path::new(file_path).parent().unwrap();
-
-    let workflow_dir = workflow_dir("runtime_from_scratch")
     let workflow_dir = std::env::current_dir()
         .unwrap()
         .join("tests")

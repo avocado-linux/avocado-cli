@@ -1,3 +1,4 @@
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +9,23 @@ pub struct TestResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+/// Get the appropriate command for the CLI (Python or Rust)
+fn get_cli_command() -> (String, Vec<String>) {
+    // Check if we should use Rust CLI for certain commands
+    if let Ok(use_rust) = env::var("USE_RUST_CLI") {
+        if use_rust == "1" || use_rust.to_lowercase() == "true" {
+            return (
+                "cargo".to_string(),
+                vec!["run".to_string(), "--".to_string()],
+            );
+        }
+    }
+
+    // Default to Python CLI
+    let python_cmd = get_python_command();
+    (python_cmd, vec!["-m".to_string(), "avocado".to_string()])
 }
 
 /// Get the appropriate Python command for the CLI
@@ -33,8 +51,13 @@ fn get_python_command() -> String {
 
 /// Execute the CLI with the given arguments and configuration
 fn execute_cli(args: &[&str], working_dir: Option<&Path>) -> TestResult {
-    let mut cmd = Command::new(get_python_command());
-    cmd.arg("-m").arg("avocado").args(args);
+    let (base_cmd, base_args) = get_cli_command();
+    let mut cmd = Command::new(base_cmd);
+
+    for arg in base_args {
+        cmd.arg(arg);
+    }
+    cmd.args(args);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
