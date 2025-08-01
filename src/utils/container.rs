@@ -193,7 +193,7 @@ impl SdkContainer {
     }
 
     /// Create the entrypoint script for SDK initialization
-    fn create_entrypoint_script(&self) -> String {
+    pub fn create_entrypoint_script(&self) -> String {
         r#"
 set -e
 

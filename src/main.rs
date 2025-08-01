@@ -5,12 +5,16 @@ mod commands;
 mod utils;
 
 use commands::init::InitCommand;
-use commands::sdk::SdkInstallCommand;
+use commands::sdk::{
+    SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
+    SdkRunCommand,
+};
 
 #[derive(Parser)]
 #[command(name = "avocado")]
 #[command(about = "Avocado CLI - A command line interface for Avocado")]
 #[command(version)]
+#[command(disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,20 +26,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new avocado project
-    Init {
-        /// Directory to initialize (defaults to current directory)
-        directory: Option<String>,
-    },
     /// SDK related commands
     Sdk {
         #[command(subcommand)]
         command: SdkCommands,
     },
+    /// Initialize a new avocado project
+    Init {
+        /// Directory to initialize (defaults to current directory)
+        directory: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum SdkCommands {
+    /// Create and run an SDK container
+    Run {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Assign a name to the container
+        #[arg(long)]
+        name: Option<String>,
+        /// Run container in background and print container ID
+        #[arg(short, long)]
+        detach: bool,
+        /// Automatically remove the container when it exits
+        #[arg(long)]
+        rm: bool,
+        /// Drop into interactive shell in container
+        #[arg(short, long)]
+        interactive: bool,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Command and arguments to run in container
+        command: Vec<String>,
+    },
+    /// List SDK dependencies
+    Deps {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+    },
+    /// Run compile scripts
+    Compile {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Specific compile sections to run
+        sections: Vec<String>,
+    },
+    /// Run DNF commands in the SDK context
+    Dnf {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// DNF command and arguments to execute
+        dnf_args: Vec<String>,
+    },
     /// Install dependencies into the SDK
     Install {
         /// Path to avocado.toml configuration file
@@ -47,6 +99,15 @@ enum SdkCommands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
+    },
+    /// Remove the SDK directory
+    Clean {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -68,6 +129,52 @@ async fn main() -> Result<()> {
             } => {
                 let install_cmd = SdkInstallCommand::new(config, verbose, force, cli.target);
                 install_cmd.execute().await?;
+                Ok(())
+            }
+            SdkCommands::Run {
+                config,
+                name,
+                detach,
+                rm,
+                interactive,
+                verbose,
+                command,
+            } => {
+                let run_cmd = SdkRunCommand::new(
+                    config,
+                    name,
+                    detach,
+                    rm,
+                    interactive,
+                    verbose,
+                    command,
+                    cli.target,
+                );
+                run_cmd.execute().await?;
+                Ok(())
+            }
+            SdkCommands::Deps { config } => {
+                let deps_cmd = SdkDepsCommand::new(config);
+                deps_cmd.execute()?;
+                Ok(())
+            }
+            SdkCommands::Compile {
+                config,
+                verbose,
+                sections,
+            } => {
+                let compile_cmd = SdkCompileCommand::new(config, verbose, sections, cli.target);
+                compile_cmd.execute().await?;
+                Ok(())
+            }
+            SdkCommands::Dnf { config, dnf_args } => {
+                let dnf_cmd = SdkDnfCommand::new(config, dnf_args, cli.target);
+                dnf_cmd.execute().await?;
+                Ok(())
+            }
+            SdkCommands::Clean { config, verbose } => {
+                let clean_cmd = SdkCleanCommand::new(config, verbose, cli.target);
+                clean_cmd.execute().await?;
                 Ok(())
             }
         },

@@ -36,6 +36,7 @@ pub struct SdkConfig {
 /// Compile configuration for SDK
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompileConfig {
+    pub compile: Option<String>,
     pub dependencies: Option<HashMap<String, toml::Value>>,
 }
 

@@ -17,6 +17,48 @@ The Avocado CLI is being migrated from Python to Rust to improve performance, re
   - ✅ Error handling for existing files and directory creation failures
   - ✅ Comprehensive unit tests
 
+- **sdk install**: Install dependencies into the SDK
+  - ✅ Installs SDK dependencies from configuration
+  - ✅ Installs compile section dependencies into target-dev sysroot
+  - ✅ Supports force mode and verbose output
+  - ✅ Proper error handling and target resolution
+  - ✅ Comprehensive unit tests
+
+- **sdk run**: Create and run an SDK container
+  - ✅ Supports interactive and detached modes
+  - ✅ Container name assignment and auto-removal
+  - ✅ Command execution in SDK environment
+  - ✅ Proper argument validation
+  - ✅ Comprehensive unit tests
+
+- **sdk deps**: List SDK dependencies
+  - ✅ Lists all SDK and compile dependencies
+  - ✅ Resolves package specifications and versions
+  - ✅ Removes duplicates and sorts output
+  - ✅ Supports extension references
+  - ✅ Comprehensive unit tests
+
+- **sdk compile**: Run compile scripts
+  - ✅ Executes compile scripts from configuration
+  - ✅ Supports filtering specific sections
+  - ✅ Proper environment setup in containers
+  - ✅ Error handling for missing scripts
+  - ✅ Comprehensive unit tests
+
+- **sdk dnf**: Run DNF commands in the SDK context
+  - ✅ Executes DNF commands in SDK environment
+  - ✅ Proper environment variable setup
+  - ✅ Interactive command execution
+  - ✅ Error handling and validation
+  - ✅ Comprehensive unit tests
+
+- **sdk clean**: Remove the SDK directory
+  - ✅ Removes SDK directory using container
+  - ✅ Supports verbose output mode
+  - ✅ Proper target resolution
+  - ✅ Error handling and validation
+  - ✅ Comprehensive unit tests
+
 ## Usage
 
 ### Building
@@ -39,6 +81,15 @@ cargo build --release
 
 # Initialize with both custom target and directory
 ./target/release/avocado-cli --target "arm64" init my-arm-project
+
+# SDK Commands
+./target/release/avocado-cli sdk install --verbose --force
+./target/release/avocado-cli sdk run --interactive
+./target/release/avocado-cli sdk run echo "Hello World"
+./target/release/avocado-cli sdk deps
+./target/release/avocado-cli sdk compile app
+./target/release/avocado-cli sdk dnf -- install gcc
+./target/release/avocado-cli sdk clean --verbose
 ```
 
 ### Testing
@@ -49,6 +100,9 @@ cargo test
 
 # Run only init command tests
 cargo test commands::init::tests
+
+# Run only SDK command tests
+cargo test commands::sdk::tests
 ```
 
 ## Architecture
@@ -58,9 +112,23 @@ cargo test commands::init::tests
 ```
 src/
 ├── main.rs              # CLI argument parsing and main entry point
-└── commands/
-    ├── mod.rs           # Commands module
-    └── init.rs          # Init command implementation
+├── commands/
+│   ├── mod.rs           # Commands module
+│   ├── init.rs          # Init command implementation
+│   └── sdk/
+│       ├── mod.rs       # SDK commands module
+│       ├── install.rs   # SDK install command
+│       ├── run.rs       # SDK run command
+│       ├── deps.rs      # SDK deps command
+│       ├── compile.rs   # SDK compile command
+│       ├── dnf.rs       # SDK dnf command
+│       └── clean.rs     # SDK clean command
+└── utils/
+    ├── mod.rs           # Utilities module
+    ├── config.rs        # Configuration handling
+    ├── container.rs     # Container operations
+    ├── output.rs        # Output formatting
+    └── target.rs        # Target resolution
 ```
 
 ### Key Components
@@ -95,9 +163,8 @@ src/
 ### Planned Commands
 
 - `clean`: Clean build artifacts
-- `build`: Build runtime images
+- `build`: Build runtime images  
 - `runtime`: Runtime management commands
-- `sdk`: SDK management commands
 - `ext`: Extension management commands
 
 ### Migration Strategy
@@ -123,6 +190,7 @@ src/
 - `anyhow`: Error handling and context
 - `serde`: Serialization/deserialization
 - `toml`: TOML file handling
+- `tokio`: Async runtime for container operations
 - `tempfile`: Testing utilities (dev dependency)
 
 ### Coding Standards

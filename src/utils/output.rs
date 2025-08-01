@@ -31,9 +31,9 @@ pub fn print_plain(message: &str) {
 
 /// Print a debug message to stderr with gray color (only in debug builds)
 #[allow(dead_code)]
-pub fn print_debug(message: &str) {
+pub fn print_debug(_message: &str) {
     #[cfg(debug_assertions)]
-    eprintln!("\x1b[90mDEBUG:\x1b[0m {}", message);
+    eprintln!("\x1b[90mDEBUG:\x1b[0m {}", _message);
 }
 
 /// Flush stdout to ensure immediate output
