@@ -7,7 +7,7 @@ use tokio::process::Command as AsyncCommand;
 use crate::utils::{
     config::Config,
     container::SdkContainer,
-    output::{print_error, print_success},
+    output::{print_error, print_success, OutputLevel},
     target::resolve_target,
 };
 
@@ -72,9 +72,9 @@ impl SdkDnfCommand {
 
         // Log the result
         if success {
-            print_success("DNF command completed successfully.");
+            print_success("DNF command completed successfully.", OutputLevel::Normal);
         } else {
-            print_error("DNF command failed.");
+            print_error("DNF command failed.", OutputLevel::Normal);
             return Err(anyhow::anyhow!("DNF command failed"));
         }
 

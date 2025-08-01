@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crate::utils::{
     config::Config,
     container::SdkContainer,
-    output::{print_error, print_success},
+    output::{print_error, print_success, OutputLevel},
     target::resolve_target,
 };
 
@@ -121,7 +121,7 @@ impl SdkRunCommand {
         };
 
         if success {
-            print_success("SDK command completed successfully.");
+            print_success("SDK command completed successfully.", OutputLevel::Normal);
         }
 
         Ok(())
@@ -191,7 +191,10 @@ impl SdkRunCommand {
             Ok(true)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            print_error(&format!("Container execution failed: {}", stderr));
+            print_error(
+                &format!("Container execution failed: {}", stderr),
+                OutputLevel::Normal,
+            );
             Ok(false)
         }
     }

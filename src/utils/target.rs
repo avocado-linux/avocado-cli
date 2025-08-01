@@ -1,5 +1,6 @@
 //! Target resolution utilities for Avocado CLI.
 
+use crate::utils::config::Config;
 use std::env;
 
 /// Resolve the target architecture with proper precedence.
@@ -40,6 +41,18 @@ pub fn resolve_target(cli_target: Option<&str>, config_target: Option<&str>) -> 
 /// Target from AVOCADO_TARGET environment variable or None
 pub fn get_target_from_env() -> Option<String> {
     env::var("AVOCADO_TARGET").ok()
+}
+
+/// Get target from configuration.
+///
+/// # Arguments
+/// * `config` - The configuration structure
+///
+/// # Returns
+/// Target from configuration or None
+#[allow(dead_code)]
+pub fn get_target_from_config(config: &Config) -> Option<String> {
+    config.get_target()
 }
 
 #[cfg(test)]

@@ -4,6 +4,10 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod utils;
 
+use commands::ext::{
+    ExtBuildCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
+    ExtInstallCommand, ExtListCommand,
+};
 use commands::init::InitCommand;
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
@@ -30,6 +34,11 @@ enum Commands {
     Sdk {
         #[command(subcommand)]
         command: SdkCommands,
+    },
+    /// Extension related commands
+    Ext {
+        #[command(subcommand)]
+        command: ExtCommands,
     },
     /// Initialize a new avocado project
     Init {
@@ -121,6 +130,66 @@ async fn main() -> Result<()> {
             init_cmd.execute()?;
             Ok(())
         }
+        Commands::Ext { command } => match command {
+            ExtCommands::Install {
+                config,
+                verbose,
+                force,
+                extension,
+            } => {
+                let install_cmd =
+                    ExtInstallCommand::new(extension, config, verbose, force, cli.target);
+                install_cmd.execute().await?;
+                Ok(())
+            }
+            ExtCommands::Build {
+                extension,
+                config,
+                verbose,
+            } => {
+                let build_cmd = ExtBuildCommand::new(extension, config, verbose, cli.target);
+                build_cmd.execute().await?;
+                Ok(())
+            }
+            ExtCommands::List { config } => {
+                let list_cmd = ExtListCommand::new(config);
+                list_cmd.execute()?;
+                Ok(())
+            }
+            ExtCommands::Deps { config, extension } => {
+                let deps_cmd = ExtDepsCommand::new(config, extension);
+                deps_cmd.execute()?;
+                Ok(())
+            }
+            ExtCommands::Dnf {
+                config,
+                verbose,
+                extension,
+                dnf_args,
+            } => {
+                let dnf_cmd = ExtDnfCommand::new(config, extension, dnf_args, verbose, cli.target);
+                dnf_cmd.execute().await?;
+                Ok(())
+            }
+            ExtCommands::Clean {
+                extension,
+                config,
+                verbose,
+            } => {
+                let clean_cmd = ExtCleanCommand::new(extension, config, verbose, cli.target);
+                clean_cmd.execute().await?;
+                Ok(())
+            }
+            ExtCommands::Image {
+                extension,
+                config,
+                verbose,
+            } => {
+                let image_cmd = ExtImageCommand::new(extension, config, verbose, cli.target);
+                image_cmd.execute().await?;
+                Ok(())
+            }
+        },
         Commands::Sdk { command } => match command {
             SdkCommands::Install {
                 config,
@@ -179,4 +248,82 @@ async fn main() -> Result<()> {
             }
         },
     }
+}
+
+#[derive(Subcommand)]
+enum ExtCommands {
+    /// Install dependencies into extension sysroots
+    Install {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Name of the extension to install (if not provided, installs all extensions)
+        extension: Option<String>,
+    },
+    /// Build sysext and/or confext extensions from configuration
+    Build {
+        /// Name of the extension to build (must be defined in config)
+        extension: String,
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// List extension names
+    List {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+    },
+    /// List dependencies for extensions
+    Deps {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Name of the extension to show dependencies for (if not provided, shows all extensions)
+        extension: Option<String>,
+    },
+    /// Run DNF commands in an extension's context
+    Dnf {
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Name of the extension to operate on
+        extension: String,
+        /// DNF command and arguments to execute
+        dnf_args: Vec<String>,
+    },
+    /// Clean an extension's sysroot
+    Clean {
+        /// Name of the extension to clean
+        extension: String,
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Create squashfs image from system extension
+    Image {
+        /// Name of the extension to create image for
+        extension: String,
+        /// Path to avocado.toml configuration file
+        #[arg(short, long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }

@@ -3,7 +3,10 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-use crate::utils::{config::Config, output::print_success};
+use crate::utils::{
+    config::Config,
+    output::{print_success, OutputLevel},
+};
 
 /// Implementation of the 'sdk deps' command.
 pub struct SdkDepsCommand {
@@ -32,7 +35,10 @@ impl SdkDepsCommand {
 
         // Print success message with count
         let count = packages.len();
-        print_success(&format!("Listed {} dependency(s).", count));
+        print_success(
+            &format!("Listed {} dependency(s).", count),
+            OutputLevel::Normal,
+        );
 
         Ok(())
     }
