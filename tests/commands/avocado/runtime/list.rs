@@ -14,5 +14,7 @@ fn test_short_help() {
 
 #[test]
 fn test_runtime_list() {
-    common::assert_cmd(&["runtime", "list"], None, None);
+    let result = common::run_cli_in_temp_with_config(&["runtime", "list"]);
+    // Should complete regardless of whether runtimes exist
+    common::assert_command_completes(&result);
 }

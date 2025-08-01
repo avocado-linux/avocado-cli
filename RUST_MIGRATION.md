@@ -59,6 +59,28 @@ The Avocado CLI is being migrated from Python to Rust to improve performance, re
   - ✅ Error handling and validation
   - ✅ Comprehensive unit tests
 
+- **runtime build**: Build runtime images
+  - ✅ Builds runtime images from configuration
+  - ✅ Installs required avocado-pkg-images package
+  - ✅ Creates btrfs images with extensions and confexts subvolumes
+  - ✅ Supports force mode and verbose output
+  - ✅ Proper extension symlinking and lifecycle hooks
+  - ✅ Comprehensive unit tests
+
+- **runtime list**: List runtime names
+  - ✅ Lists all runtime names from configuration
+  - ✅ Sorted alphabetical output
+  - ✅ Proper count reporting
+  - ✅ Error handling for missing config
+  - ✅ Comprehensive unit tests
+
+- **runtime deps**: List runtime dependencies
+  - ✅ Lists package and extension dependencies
+  - ✅ Resolves extension versions from config
+  - ✅ Sorted output (extensions first, then packages)
+  - ✅ Proper dependency type identification
+  - ✅ Comprehensive unit tests
+
 ## Usage
 
 ### Building
@@ -90,6 +112,11 @@ cargo build --release
 ./target/release/avocado-cli sdk compile app
 ./target/release/avocado-cli sdk dnf -- install gcc
 ./target/release/avocado-cli sdk clean --verbose
+
+# Runtime Commands
+./target/release/avocado-cli runtime list
+./target/release/avocado-cli runtime deps my-runtime
+./target/release/avocado-cli runtime build my-runtime --verbose --force
 ```
 
 ### Testing
@@ -103,6 +130,9 @@ cargo test commands::init::tests
 
 # Run only SDK command tests
 cargo test commands::sdk::tests
+
+# Run only runtime command tests
+cargo test commands::runtime::tests
 ```
 
 ## Architecture
@@ -115,6 +145,11 @@ src/
 ├── commands/
 │   ├── mod.rs           # Commands module
 │   ├── init.rs          # Init command implementation
+│   ├── runtime/
+│   │   ├── mod.rs       # Runtime commands module
+│   │   ├── build.rs     # Runtime build command
+│   │   ├── list.rs      # Runtime list command
+│   │   └── deps.rs      # Runtime deps command
 │   └── sdk/
 │       ├── mod.rs       # SDK commands module
 │       ├── install.rs   # SDK install command
@@ -163,8 +198,6 @@ src/
 ### Planned Commands
 
 - `clean`: Clean build artifacts
-- `build`: Build runtime images  
-- `runtime`: Runtime management commands
 - `ext`: Extension management commands
 
 ### Migration Strategy
