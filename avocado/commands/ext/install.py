@@ -20,7 +20,7 @@ class ExtInstallCommand(BaseCommand):
 
         # Add config file argument
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -36,6 +36,12 @@ class ExtInstallCommand(BaseCommand):
             nargs="?",
             help="Name of the extension to install (if not provided, installs all extensions)",
         )
+        parser.add_argument(
+            "-e",
+            "--extension",
+            dest="extension_named",
+            help="Name of the extension to install (if not provided, installs all extensions)"
+        )
 
         parser.add_argument(
             "-f",
@@ -44,11 +50,24 @@ class ExtInstallCommand(BaseCommand):
             help="Force the operation to proceed, bypassing warnings or confirmation prompts.",
         )
 
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
+        )
+
+        parser.add_argument(
+            "--dnf-args",
+            nargs="*",
+            help="Additional arguments to pass to the dnf install command (e.g., --no-cache, --nogpgcheck)",
+        )
+
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext install command."""
-        extension = args.extension
+        # Determine extension name from positional or named argument
+        extension = getattr(args, 'extension_named', None) or args.extension
         config_path = args.config
         verbose = args.verbose
 
@@ -125,6 +144,8 @@ class ExtInstallCommand(BaseCommand):
                 target,
                 verbose,
                 args.force,
+                getattr(args, 'container_args', None),
+                getattr(args, 'dnf_args', None),
             ):
                 return False
 
@@ -145,6 +166,8 @@ class ExtInstallCommand(BaseCommand):
         target,
         verbose,
         force,
+        container_args,
+        dnf_args,
     ):
         """Install a single extension."""
         # Create the commands to check and set up the directory structure
@@ -159,6 +182,7 @@ class ExtInstallCommand(BaseCommand):
             command=check_command,
             verbose=verbose,
             source_environment=False,
+            container_args=container_args,
         )
 
         if not sysroot_exists:
@@ -169,6 +193,7 @@ class ExtInstallCommand(BaseCommand):
                 command=setup_command,
                 verbose=verbose,
                 source_environment=False,
+                container_args=container_args,
             )
 
             if success:
@@ -198,6 +223,7 @@ class ExtInstallCommand(BaseCommand):
                 # Build DNF install command
                 yes = "-y" if force else ""
                 installroot = f"${{AVOCADO_EXT_SYSROOTS}}/{extension}"
+                dnf_args_str = ' '.join(dnf_args) if dnf_args else ""
                 command = f"""
 RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
@@ -205,6 +231,7 @@ $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
+    {dnf_args_str} \
     install \
     {yes} \
     {' '.join(packages)}
@@ -221,6 +248,7 @@ $DNF_SDK_HOST \
                     interactive=not force,
                     source_environment=False,
                     use_entrypoint=True,
+                    container_args=container_args,
                 )
 
                 if not install_success:

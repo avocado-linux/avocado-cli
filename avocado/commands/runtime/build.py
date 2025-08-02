@@ -17,12 +17,18 @@ class RuntimeBuildCommand(BaseCommand):
         """Register the runtime build command's subparser."""
         parser = subparsers.add_parser("build", help="Build a runtime")
 
-        # Positional arguments
-        parser.add_argument("runtime", help="Runtime name to build")
+        # Runtime argument - can be positional or named
+        parser.add_argument("runtime", nargs="?", help="Runtime name to build")
+        parser.add_argument(
+            "-r",
+            "--runtime",
+            dest="runtime_named",
+            help="Runtime name to build"
+        )
 
         # Optional arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -39,12 +45,26 @@ class RuntimeBuildCommand(BaseCommand):
             help="Force the operation to proceed, bypassing warnings or confirmation prompts.",
         )
 
+        parser.add_argument(
+            "--container-args",
+            nargs=1,
+            action="append",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
+            dest='container_args'
+        )
+
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the runtime build command."""
         config_path = args.config
         verbose = args.verbose
+
+        # Determine runtime name from positional or named argument
+        runtime_name = getattr(args, 'runtime_named', None) or args.runtime
+        if not runtime_name:
+            print_error("Runtime name is required. Provide it positionally or via -r/--runtime.")
+            return False
 
         # Load configuration
         config, success = load_config(config_path)
@@ -61,9 +81,6 @@ class RuntimeBuildCommand(BaseCommand):
         # Get runtime configuration
         runtime_config = config.get("runtime", {})
 
-        # Get the runtime to build
-        runtime_name = args.runtime
-
         # Check if runtime exists
         if runtime_name not in runtime_config:
             print_error(f"Runtime '{runtime_name}' not found in configuration.")
@@ -71,19 +88,19 @@ class RuntimeBuildCommand(BaseCommand):
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = runtime_config[runtime_name].get("target")
-        target_arch = resolve_target(
+        target = resolve_target(
             cli_target=args.resolved_target, config_target=config_target
         )
-        if not target_arch:
+        if not target:
             print_error(
-                f"No target architecture specified for runtime '{runtime_name}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{runtime_name}.target'."
+                f"No target specified for runtime '{runtime_name}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{runtime_name}.target'."
             )
             return False
 
         print_info(f"Building runtime images for '{runtime_name}'.")
 
         # Initialize SDK container helper
-        container_helper = SdkContainer(verbose=verbose)
+        container_helper = SdkContainer()
 
         # First check if the required images package is already installed (silent check)
         dnf_check_script = f"""
@@ -101,9 +118,11 @@ list installed avocado-pkg-images >/dev/null 2>&1
 
         package_installed = container_helper.run_in_container(
             container_image=container_image,
-            target=target_arch,
+            target=target,
             command=command,
             rm=True,
+            verbose=verbose,
+            container_args=getattr(args, 'container_args', None),
         )
 
         if not package_installed:
@@ -125,10 +144,12 @@ $DNF_SDK_HOST \
             # Run the DNF install command
             install_result = container_helper.run_in_container(
                 container_image=container_image,
-                target=target_arch,
+                target=target,
                 command=dnf_install_script,
                 rm=True,
+                verbose=verbose,
                 interactive=not args.force,
+                container_args=getattr(args, 'container_args', None),
             )
 
             if not install_result:
@@ -140,18 +161,19 @@ $DNF_SDK_HOST \
             print_info("avocado-pkg-images already installed.")
 
         # Build var image first
-        build_script = self._create_build_script(config, target_arch, runtime_name)
+        build_script = self._create_build_script(config, target, runtime_name)
 
         if verbose:
             print_info("Executing complete image build script.")
 
         complete_result = container_helper.run_in_container(
             container_image=container_image,
-            target=target_arch,
+            target=target,
             command=build_script,
             rm=True,
             verbose=verbose,
             source_environment=True,
+            container_args=getattr(args, 'container_args', None),
         )
 
         if not complete_result:
@@ -161,7 +183,7 @@ $DNF_SDK_HOST \
         print_success(f"Successfully built runtime '{runtime_name}'.")
         return True
 
-    def _create_build_script(self, config, target_arch, runtime_name):
+    def _create_build_script(self, config, target, runtime_name):
         # Get runtime dependencies to identify required extensions
         runtime_config = config.get("runtime", {}).get(runtime_name, {})
         runtime_deps = runtime_config.get("dependencies", {})
@@ -220,23 +242,20 @@ mkdir -p "$VAR_DIR/lib/extensions"
 mkdir -p "$VAR_DIR/lib/confexts"
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
 
-OUTPUT_DIR="$AVOCADO_PREFIX/output/runtimes/{runtime_name}"
-mkdir -p $OUTPUT_DIR
+DEPLOY_DIR="$AVOCADO_PREFIX/runtimes/{runtime_name}/deploy"
+mkdir -p $DEPLOY_DIR
 
 {symlink_section}
-
-# Potential future SDK target hook.
-# echo "Run: avocado-pre-image-var-{target_arch} {runtime_name}"
-# avocado-pre-image-var-{target_arch} {runtime_name}
 
 # Create btrfs image with extensions and confexts subvolumes
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/extensions \
     --subvol rw:lib/confexts \
-    -f "$OUTPUT_DIR/avocado-image-var.btrfs"
+    -f "$DEPLOY_DIR/avocado-image-var-avocado-{target}.var.img"
 
-echo -e "\033[34m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '{target_arch}'."
-avocado-build-{target_arch} {runtime_name}
+echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '{target}'."
+echo -e "  $(which avocado-build-{target})"
+avocado-build-{target} {runtime_name}
 """
 
         return script

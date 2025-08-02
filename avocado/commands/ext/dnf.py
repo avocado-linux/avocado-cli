@@ -12,11 +12,11 @@ class ExtDnfCommand(BaseCommand):
     """Implementation of the 'ext dnf' command."""
 
     def _do_extension_setup(
-        self, config, extension, container_helper, container_image, target, verbose
+        self, config, extension_name, container_helper, container_image, target, verbose
     ):
         """Perform extension setup for DNF operations."""
         # Check if extension directory structure exists, create it if not
-        check_cmd = f"test -d ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}"
+        check_cmd = f"test -d ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension_name}"
         dir_exists = container_helper.run_in_container(
             container_image=container_image,
             target=target,
@@ -26,11 +26,11 @@ class ExtDnfCommand(BaseCommand):
         )
 
         if not dir_exists:
-            print_info(f"Creating sysroot for extension '{extension}'.")
+            print_info(f"Creating sysroot for extension '{extension_name}'.")
             setup_commands = [
-                f"mkdir -p ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}/var/lib",
+                f"mkdir -p ${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension_name}/var/lib",
                 f"cp -rf ${{AVOCADO_SDK_SYSROOTS}}/rootfs/var/lib/rpm ${{AVOCADO_SDK_SYSROOTS}}/extensions/{
-                    extension}/var/lib",
+                    extension_name}/var/lib",
             ]
 
             setup_success = container_helper.run_in_container(
@@ -42,9 +42,9 @@ class ExtDnfCommand(BaseCommand):
             )
 
             if setup_success:
-                print_success(f"Created sysroot for extension '{extension}'.")
+                print_success(f"Created sysroot for extension '{extension_name}'.")
             else:
-                print_error(f"Failed to create sysroot for extension '{extension}'.")
+                print_error(f"Failed to create sysroot for extension '{extension_name}'.")
                 return False
 
         return True
@@ -58,14 +58,20 @@ class ExtDnfCommand(BaseCommand):
 
         # Add common arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        # Extension is now required
-        parser.add_argument("extension", help="Extension name to operate on")
+        # Extension argument - can be positional or named
+        parser.add_argument("extension", nargs="?", help="Extension name to operate on")
+        parser.add_argument(
+            "-e",
+            "--extension",
+            dest="extension_named",
+            help="Extension name to operate on"
+        )
 
         # Capture all remaining arguments after -- as dnf command
         parser.add_argument(
@@ -74,10 +80,22 @@ class ExtDnfCommand(BaseCommand):
             help="DNF command and arguments to execute (use -- to separate from extension args)",
         )
 
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
+        )
+
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the ext dnf command."""
+        # Determine extension name from positional or named argument
+        extension_name = getattr(args, 'extension_named', None) or args.extension
+        if not extension_name:
+            print_error("Extension name is required. Provide it positionally or via -e/--extension.")
+            return False
+
         # Add unknown args to dnf_args if they exist
         dnf_args = getattr(args, "dnf_args", [])
         if unknown:
@@ -93,7 +111,6 @@ class ExtDnfCommand(BaseCommand):
             return False
 
         config_path = args.config
-        extension = args.extension
 
         # Load configuration
         config, success = load_config(config_path)
@@ -124,21 +141,21 @@ class ExtDnfCommand(BaseCommand):
         container_helper = SdkContainer()
 
         # Check if extension exists in configuration
-        if "ext" not in config or extension not in config["ext"]:
+        if "ext" not in config or extension_name not in config["ext"]:
             print_error(
                 f"Extension '{
-                extension}' not found in configuration."
+                extension_name}' not found in configuration."
             )
             return False
 
         # Do extension setup first
         if not self._do_extension_setup(
-            config, extension, container_helper, container_image, target, False
+            config, extension_name, container_helper, container_image, target, False
         ):
             return False
 
         # Build dnf command with extension installroot
-        installroot = f"${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension}"
+        installroot = f"${{AVOCADO_SDK_SYSROOTS}}/extensions/{extension_name}"
         dnf_cmd = f"$DNF_SDK_HOST --installroot={
             installroot} {' '.join(dnf_args)}"
 
@@ -149,6 +166,7 @@ class ExtDnfCommand(BaseCommand):
             command=["bash", "-c", dnf_cmd],
             source_environment=False,
             use_entrypoint=True,
+            container_args=getattr(args, 'container_args', None),
         )
 
         # Log the result
@@ -161,7 +179,7 @@ class ExtDnfCommand(BaseCommand):
 
     def _print_help(self):
         """Print custom help message."""
-        print("usage: avocado ext dnf [-h] [-c CONFIG] extension -- <dnf_args>...")
+        print("usage: avocado ext dnf [-h] [-C CONFIG] extension -- <dnf_args>...")
         print()
         print("Execute DNF commands in an extension's context")
         print()
@@ -170,7 +188,7 @@ class ExtDnfCommand(BaseCommand):
         print()
         print("options:")
         print("  -h, --help            show this help message and exit")
-        print("  -c CONFIG, --config CONFIG")
+        print("  -C CONFIG, --config CONFIG")
         print(
             "                        Path to avocado.toml configuration file (default: avocado.toml)"
         )

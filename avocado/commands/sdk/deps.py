@@ -108,7 +108,7 @@ class SdkDepsCommand(BaseCommand):
         parser = subparsers.add_parser("deps", help="List SDK dependencies")
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",

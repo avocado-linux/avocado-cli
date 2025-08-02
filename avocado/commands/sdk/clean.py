@@ -19,7 +19,7 @@ class SdkCleanCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -27,6 +27,12 @@ class SdkCleanCommand(BaseCommand):
 
         parser.add_argument(
             "-v", "--verbose", action="store_true", help="Enable verbose output"
+        )
+
+        parser.add_argument(
+            "--container-args",
+            nargs="*",
+            help="Additional arguments to pass to the container runtime (e.g., volume mounts, port mappings)",
         )
 
         return parser
@@ -70,8 +76,9 @@ class SdkCleanCommand(BaseCommand):
             container_image=container_image,
             target=target,
             command=remove_command,
-            verbose=verbose,
             source_environment=False,
+            verbose=verbose,
+            container_args=getattr(args, 'container_args', None),
         )
 
         if success:

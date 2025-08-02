@@ -8,6 +8,34 @@ from typing import List, Dict, Optional, Union
 from avocado.utils.output import print_error
 
 
+def _flatten_container_args(container_args):
+    """Handle container args from action='append' with nargs='*' - flatten nested lists and split shell-quoted args."""
+    if not container_args:
+        return None
+
+    flattened = []
+    for arg_group in container_args:
+        if isinstance(arg_group, list):
+            for arg in arg_group:
+                # Split each argument string using shell-like parsing
+                flattened.extend(shlex.split(arg))
+        else:
+            flattened.extend(shlex.split(arg_group))
+
+    return flattened if flattened else None
+
+
+def _format_command_for_display(entrypoint_script: str, user_command: str, use_entrypoint: bool) -> str:
+    """Format command for display in verbose logging."""
+    if not use_entrypoint:
+        return user_command if user_command else ""
+
+    if not user_command:
+        return "(entrypoint only)"
+
+    return f"(entrypoint omitted)\n{user_command}"
+
+
 class SdkContainer:
     def __init__(self, container_tool: str = "docker", verbose: bool = False):
         self.container_tool = container_tool
@@ -27,22 +55,30 @@ class SdkContainer:
         source_environment: bool = True,
         use_entrypoint: bool = True,
         interactive: bool = False,
+        container_args: Optional[List[str]] = None,
     ) -> bool:
         os.makedirs("_avocado", exist_ok=True)
         bash_cmd = ["bash", "-c"]
         cmd = ""
 
+        # Track components separately for better logging
+        entrypoint_script = ""
+        user_command = ""
+
+        # Flatten container args if they came from multiple --container-args
+        container_args = _flatten_container_args(container_args)
+
         if use_entrypoint:
-            entrypoint_script = self._create_entrypoint_script(source_environment)
+            entrypoint_script = self._create_entrypoint_script(
+                source_environment)
             cmd += f"{entrypoint_script}\n"
 
         if command and isinstance(command, list):
-            cmd += f"{' '.join(command)}"
+            user_command = ' '.join(command)
+            cmd += user_command
         elif command:
-            # escaped_command = ' '.join(shlex.quote(arg) for arg in command)
-            cmd += f"{command}"
-        else:
-            cmd += ""
+            user_command = str(command)
+            cmd += user_command
 
         bash_cmd.append(cmd)
 
@@ -59,9 +95,13 @@ class SdkContainer:
                 detach=detach,
                 rm=rm,
                 interactive=interactive,
+                container_args=container_args,
             )
 
-            return self._execute_container_command(container_cmd, detach, verbose_final)
+            return self._execute_container_command(
+                container_cmd, detach, verbose_final,
+                entrypoint_script, user_command, use_entrypoint
+            )
 
         except Exception as e:
             print_error(f"Container execution failed: {e}")
@@ -77,6 +117,7 @@ class SdkContainer:
         detach: bool = False,
         rm: bool = True,
         interactive: bool = False,
+        container_args: Optional[List[str]] = None,
     ) -> List[str]:
         """Build the complete container command."""
         container_cmd = [self.container_tool, "run"]
@@ -110,6 +151,10 @@ class SdkContainer:
             for key, value in env_vars.items():
                 container_cmd.extend(["-e", f"{key}={value}"])
 
+        # Add custom container arguments if provided
+        if container_args:
+            container_cmd.extend(container_args)
+
         # Add the container image
         container_cmd.append(container_image)
 
@@ -122,12 +167,53 @@ class SdkContainer:
         return container_cmd
 
     def _execute_container_command(
-        self, container_cmd: List[str], detach: bool = False, verbose: bool = False
+        self, container_cmd: List[str], detach: bool = False, verbose: bool = False,
+        entrypoint_script: str = "", user_command: str = "", use_entrypoint: bool = True
     ) -> bool:
         try:
             if verbose:
-                print(f"Mounting host directory: {self.cwd} -> /opt\n")
-                print(f"Container command: {' '.join(container_cmd)}")
+                # Show container command with user command (omitting entrypoint)
+                cmd_parts = container_cmd[:-1] if container_cmd else []
+                display_command = _format_command_for_display(entrypoint_script, user_command, use_entrypoint)
+
+                if container_cmd and len(container_cmd) >= 3 and container_cmd[-3] == "bash" and container_cmd[-2] == "-c":
+                    # If it's bash -c "command", show formatted command
+                    verbose_cmd = cmd_parts[:-2] + ["bash", "-c", display_command]
+                elif container_cmd and isinstance(container_cmd[-1], str):
+                    # If last part is a string command, show formatted command
+                    verbose_cmd = cmd_parts + [display_command]
+                else:
+                    verbose_cmd = container_cmd
+
+                # Format command with proper line breaks and indentation
+                formatted_cmd = []
+                i = 0
+                while i < len(verbose_cmd):
+                    arg = verbose_cmd[i]
+                    if i == 0:
+                        formatted_cmd.append(f"  {arg}")  # docker
+                    elif i == 1:
+                        formatted_cmd.append(f" \\\n    {arg}")  # run
+                    else:
+                        # Check if this is a flag that takes a value
+                        if arg.startswith('-') and i + 1 < len(verbose_cmd) and not verbose_cmd[i + 1].startswith('-'):
+                            # Combine flag with its value
+                            formatted_cmd.append(f" \\\n      {arg} {verbose_cmd[i + 1]}")
+                            i += 1  # Skip the value since we already included it
+                        else:
+                            # For multi-line arguments (like the truncated command), handle them specially
+                            if '\n' in arg:
+                                # Indent each line of the multi-line argument
+                                lines = arg.split('\n')
+                                formatted_lines = [f" \\\n      {lines[0]}"]
+                                for line in lines[1:]:
+                                    formatted_lines.append(f"\n      {line}")
+                                formatted_cmd.append(''.join(formatted_lines))
+                            else:
+                                formatted_cmd.append(f" \\\n      {arg}")
+                    i += 1
+
+                print(f"[DEBUG] Container command:\n{''.join(formatted_cmd)}")
 
             if detach:
                 result = subprocess.run(
@@ -136,7 +222,7 @@ class SdkContainer:
                 container_id = result.stdout.strip()
                 print(
                     f"Container started in detached mode with ID: {
-                      container_id}"
+                        container_id}"
                 )
                 return True
             else:
@@ -158,7 +244,7 @@ class SdkContainer:
         except FileNotFoundError:
             print_error(
                 f"{
-                self.container_tool} command not found. Is it installed and in your PATH?"
+                    self.container_tool} command not found. Is it installed and in your PATH?"
             )
             return False
 

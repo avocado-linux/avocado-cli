@@ -90,7 +90,7 @@ class ExtListCommand(BaseCommand):
         parser = subparsers.add_parser("list", help="List extension names")
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
