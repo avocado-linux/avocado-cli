@@ -2,5 +2,5 @@
 
 Command line interface for Avocado.
 
-- [Usage](docs.avocadolinux.com)
-- [Development](docs/development.md)
+- [Installation](docs/installation.md)
+- [Test](docs/test.md)
