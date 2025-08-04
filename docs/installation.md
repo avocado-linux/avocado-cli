@@ -1,24 +1,45 @@
 # Installation
 
-The Avocado CLI is currently a Python package, which must be installed via Git URL. Installing via Git URL requires a virtual environment.
+The Avocado CLI is a Rust-based command line tool that can be installed using Cargo, Rust's package manager.
 
-_Note: Commands will use `python` and `pip` executables, but they may be `python3` and `pip3` on your system._
+## Prerequisites
 
-## Install with venv and pip
+You'll need to have Rust and Cargo installed on your system. If you don't have Rust installed, you can get it from [rustup.rs](https://rustup.rs/).
 
-You can create a virtual environment using the `venv` module, then installing via pip.
+## Install from Git
 
-```bash
-python -m venv path/to/venv
-source path/to/venv/bin/activate
-
-pip install git+https://github.com/avocado-linux/avocado-cli.git@0.1.0
-```
-
-## Install with pipx
-
-**Alternatively**, installing via [pipx](https://github.com/pypa/pipx) will handle virtual environments for you.
+You can install the latest version directly from the Git repository using Cargo:
 
 ```bash
-pipx install git+https://github.com/avocado-linux/avocado-cli.git@0.1.0
+cargo install --git https://github.com/avocado-framework/avocado-cli.git
 ```
+
+## Install from Source
+
+Alternatively, you can clone the repository and build from source:
+
+```bash
+git clone https://github.com/avocado-framework/avocado-cli.git
+cd avocado-cli
+cargo install --path .
+```
+
+## Verify Installation
+
+After installation, verify that the CLI is working correctly:
+
+```bash
+avocado-cli --version
+```
+
+This should display the version information for the Avocado CLI.
+
+## Updating
+
+To update to the latest version, simply run the install command again:
+
+```bash
+cargo install --git https://github.com/avocado-framework/avocado-cli.git --force
+```
+
+The `--force` flag will overwrite the existing installation.
