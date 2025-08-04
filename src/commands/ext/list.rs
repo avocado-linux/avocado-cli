@@ -13,32 +13,12 @@ impl ExtListCommand {
     }
 
     pub fn execute(&self) -> Result<()> {
-        // Load configuration
         let _config = load_config(&self.config_path)?;
-
-        // Check if ext section exists in the raw TOML
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        let ext_section = match parsed.get("ext") {
-            Some(ext) => ext,
-            None => {
-                return Ok(());
-            }
-        };
-
-        // Get extension names
-        let extensions = match ext_section.as_table() {
-            Some(table) => table.keys().collect::<Vec<_>>(),
-            None => {
-                return Ok(());
-            }
-        };
-
-        // List extension names
-        for ext_name in &extensions {
-            println!("{}", ext_name);
-        }
+        let extensions = self.get_extensions(&parsed);
+        self.display_extensions(&extensions);
 
         print_success(
             &format!("Listed {} extension(s).", extensions.len()),
@@ -48,6 +28,17 @@ impl ExtListCommand {
         Ok(())
     }
 
-    // Note: These helper methods are no longer used in the simplified list command
-    // but are kept for potential future use or reference
+    fn get_extensions(&self, parsed: &toml::Value) -> Vec<String> {
+        parsed
+            .get("ext")
+            .and_then(|ext_section| ext_section.as_table())
+            .map(|table| table.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn display_extensions(&self, extensions: &[String]) {
+        for ext_name in extensions {
+            println!("{}", ext_name);
+        }
+    }
 }

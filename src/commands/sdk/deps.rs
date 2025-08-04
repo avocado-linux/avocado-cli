@@ -22,25 +22,24 @@ impl SdkDepsCommand {
 
     /// Execute the sdk deps command
     pub fn execute(&self) -> Result<()> {
-        // Load the configuration
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
-        // List packages from config
         let packages = self.list_packages_from_config(&config);
+        self.display_packages(&packages);
 
-        for (dep_type, pkg_name, pkg_version) in &packages {
-            println!("({}) {} ({})", dep_type, pkg_name, pkg_version);
-        }
-
-        // Print success message with count
-        let count = packages.len();
         print_success(
-            &format!("Listed {} dependency(s).", count),
+            &format!("Listed {} dependency(s).", packages.len()),
             OutputLevel::Normal,
         );
 
         Ok(())
+    }
+
+    fn display_packages(&self, packages: &[(String, String, String)]) {
+        for (dep_type, pkg_name, pkg_version) in packages {
+            println!("({}) {} ({})", dep_type, pkg_name, pkg_version);
+        }
     }
 
     /// List all packages from SDK dependencies and compile dependencies in config
@@ -48,32 +47,53 @@ impl SdkDepsCommand {
         let mut all_packages = Vec::new();
 
         // Process SDK dependencies
+        self.collect_sdk_dependencies(config, &mut all_packages);
+
+        // Process compile dependencies
+        self.collect_compile_dependencies(config, &mut all_packages);
+
+        self.deduplicate_and_sort(all_packages)
+    }
+
+    fn collect_sdk_dependencies(
+        &self,
+        config: &Config,
+        packages: &mut Vec<(String, String, String)>,
+    ) {
         if let Some(sdk_deps) = config.get_sdk_dependencies() {
             for (package_name, package_spec) in sdk_deps {
                 let resolved_deps =
                     self.resolve_package_dependencies(config, package_name, package_spec);
-                all_packages.extend(resolved_deps);
+                packages.extend(resolved_deps);
             }
         }
+    }
 
-        // Process compile dependencies
+    fn collect_compile_dependencies(
+        &self,
+        config: &Config,
+        packages: &mut Vec<(String, String, String)>,
+    ) {
         let compile_dependencies = config.get_compile_dependencies();
         for (_section_name, dependencies) in compile_dependencies {
             for (package_name, package_spec) in dependencies {
                 let resolved_deps =
                     self.resolve_package_dependencies(config, package_name, package_spec);
-                all_packages.extend(resolved_deps);
+                packages.extend(resolved_deps);
             }
         }
+    }
 
-        // Remove duplicates while preserving order
+    fn deduplicate_and_sort(
+        &self,
+        packages: Vec<(String, String, String)>,
+    ) -> Vec<(String, String, String)> {
         let mut seen = HashSet::new();
         let mut unique_packages = Vec::new();
-        for (dep_type, pkg_name, pkg_version) in all_packages {
-            let pkg_key = (dep_type.clone(), pkg_name.clone(), pkg_version.clone());
-            if !seen.contains(&pkg_key) {
-                seen.insert(pkg_key);
-                unique_packages.push((dep_type, pkg_name, pkg_version));
+
+        for package in packages {
+            if seen.insert(package.clone()) {
+                unique_packages.push(package);
             }
         }
 
@@ -96,38 +116,42 @@ impl SdkDepsCommand {
         package_name: &str,
         package_spec: &toml::Value,
     ) -> Vec<(String, String, String)> {
-        let mut dependencies = Vec::new();
-
         match package_spec {
             toml::Value::String(version) => {
-                // Simple string version: "package-name = version"
-                dependencies.push(("pkg".to_string(), package_name.to_string(), version.clone()));
+                vec![("pkg".to_string(), package_name.to_string(), version.clone())]
             }
-            toml::Value::Table(table) => {
-                if let Some(toml::Value::String(version)) = table.get("version") {
-                    // Object with version: "package-name = { version = "1.0.0" }"
-                    dependencies.push((
-                        "pkg".to_string(),
-                        package_name.to_string(),
-                        version.clone(),
-                    ));
-                } else if let Some(toml::Value::String(ext_name)) = table.get("ext") {
-                    // Extension reference
-                    let version = self.get_extension_version(config, ext_name);
-                    dependencies.push(("ext".to_string(), ext_name.clone(), version));
-                } else if let Some(toml::Value::String(compile_name)) = table.get("compile") {
-                    // Object with compile reference - only install the compile dependencies, not the package itself
-                    let compile_deps = self.get_compile_dependencies(config, compile_name);
-                    dependencies.extend(compile_deps);
-                }
-            }
+            toml::Value::Table(table) => self.resolve_table_dependency(config, package_name, table),
             _ => {
                 // Default case: treat as package with wildcard version
-                dependencies.push(("pkg".to_string(), package_name.to_string(), "*".to_string()));
+                vec![("pkg".to_string(), package_name.to_string(), "*".to_string())]
             }
         }
+    }
 
-        dependencies
+    fn resolve_table_dependency(
+        &self,
+        config: &Config,
+        package_name: &str,
+        table: &toml::Table,
+    ) -> Vec<(String, String, String)> {
+        // Try version first
+        if let Some(toml::Value::String(version)) = table.get("version") {
+            return vec![("pkg".to_string(), package_name.to_string(), version.clone())];
+        }
+
+        // Try extension reference
+        if let Some(toml::Value::String(ext_name)) = table.get("ext") {
+            let version = self.get_extension_version(config, ext_name);
+            return vec![("ext".to_string(), ext_name.clone(), version)];
+        }
+
+        // Try compile reference
+        if let Some(toml::Value::String(compile_name)) = table.get("compile") {
+            return self.get_compile_dependencies(config, compile_name);
+        }
+
+        // Default case
+        vec![("pkg".to_string(), package_name.to_string(), "*".to_string())]
     }
 
     /// Get version for an extension from config
@@ -142,46 +166,37 @@ impl SdkDepsCommand {
         config: &Config,
         compile_name: &str,
     ) -> Vec<(String, String, String)> {
-        let mut dependencies = Vec::new();
+        let compile_deps = config
+            .sdk
+            .as_ref()
+            .and_then(|sdk| sdk.compile.as_ref())
+            .and_then(|compile| compile.get(compile_name))
+            .and_then(|compile_config| compile_config.dependencies.as_ref());
 
-        if let Some(sdk) = &config.sdk {
-            if let Some(compile) = &sdk.compile {
-                if let Some(compile_config) = compile.get(compile_name) {
-                    if let Some(deps) = &compile_config.dependencies {
-                        for (dep_name, dep_spec) in deps {
-                            match dep_spec {
-                                toml::Value::String(version) => {
-                                    dependencies.push((
-                                        "pkg".to_string(),
-                                        dep_name.clone(),
-                                        version.clone(),
-                                    ));
-                                }
-                                toml::Value::Table(table) => {
-                                    if let Some(toml::Value::String(version)) = table.get("version")
-                                    {
-                                        dependencies.push((
-                                            "pkg".to_string(),
-                                            dep_name.clone(),
-                                            version.clone(),
-                                        ));
-                                    }
-                                }
-                                _ => {
-                                    dependencies.push((
-                                        "pkg".to_string(),
-                                        dep_name.clone(),
-                                        "*".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+        let Some(deps) = compile_deps else {
+            return Vec::new();
+        };
+
+        deps.iter()
+            .filter_map(|(dep_name, dep_spec)| self.extract_dependency_version(dep_name, dep_spec))
+            .collect()
+    }
+
+    fn extract_dependency_version(
+        &self,
+        dep_name: &str,
+        dep_spec: &toml::Value,
+    ) -> Option<(String, String, String)> {
+        match dep_spec {
+            toml::Value::String(version) => {
+                Some(("pkg".to_string(), dep_name.to_string(), version.clone()))
             }
+            toml::Value::Table(table) => table
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|version| ("pkg".to_string(), dep_name.to_string(), version.to_string())),
+            _ => Some(("pkg".to_string(), dep_name.to_string(), "*".to_string())),
         }
-
-        dependencies
     }
 }
 

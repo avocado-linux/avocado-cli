@@ -18,70 +18,93 @@ impl ExtDepsCommand {
     }
 
     pub fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
         let _config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        // Check if ext section exists
-        let ext_section = match parsed.get("ext") {
-            Some(ext) => ext,
-            None => {
-                if let Some(extension_name) = &self.extension {
-                    print_error(
-                        &format!("Extension '{}' not found in configuration.", extension_name),
-                        OutputLevel::Normal,
-                    );
-                    return Ok(());
-                } else {
-                    println!("No extensions found in configuration.");
-                    return Ok(());
-                }
-            }
-        };
+        self.get_ext_section(&parsed)?;
+        let extensions_to_process = self.get_extensions_to_process(&parsed)?;
 
-        // Determine which extensions to show dependencies for
-        let extensions_to_process = if let Some(extension_name) = &self.extension {
-            // Single extension specified
-            if !ext_section.as_table().unwrap().contains_key(extension_name) {
+        self.display_dependencies(&parsed, &extensions_to_process);
+        Ok(())
+    }
+
+    fn get_ext_section(&self, parsed: &toml::Value) -> Result<()> {
+        match parsed.get("ext") {
+            Some(_) => Ok(()),
+            None => {
+                self.handle_no_extensions();
+                Err(anyhow::anyhow!("No ext section found"))
+            }
+        }
+    }
+
+    fn get_extensions_to_process(&self, parsed: &toml::Value) -> Result<Vec<String>> {
+        let ext_section = parsed
+            .get("ext")
+            .ok_or_else(|| anyhow::anyhow!("No ext section found"))?;
+        let ext_table = ext_section
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("Invalid ext section format"))?;
+
+        match &self.extension {
+            Some(extension_name) => {
+                if !ext_table.contains_key(extension_name) {
+                    self.print_extension_not_found(extension_name);
+                    return Err(anyhow::anyhow!("Extension not found"));
+                }
+                Ok(vec![extension_name.clone()])
+            }
+            None => Ok(ext_table.keys().cloned().collect()),
+        }
+    }
+
+    fn handle_no_extensions(&self) {
+        match &self.extension {
+            Some(extension_name) => {
                 print_error(
                     &format!("Extension '{}' not found in configuration.", extension_name),
                     OutputLevel::Normal,
                 );
-                return Ok(());
             }
-            vec![extension_name.clone()]
-        } else {
-            // No extension specified - show all extensions
-            match ext_section.as_table() {
-                Some(table) => table.keys().cloned().collect(),
-                None => vec![],
+            None => {
+                println!("No extensions found in configuration.");
             }
-        };
+        }
+    }
 
-        if extensions_to_process.is_empty() {
+    fn print_extension_not_found(&self, extension_name: &str) {
+        print_error(
+            &format!("Extension '{}' not found in configuration.", extension_name),
+            OutputLevel::Normal,
+        );
+    }
+
+    fn display_dependencies(&self, parsed: &toml::Value, extensions: &[String]) {
+        if extensions.is_empty() {
             println!("No extensions found in configuration.");
-            return Ok(());
+            return;
         }
 
-        // Show dependencies for each extension
-        for ext_name in &extensions_to_process {
+        for ext_name in extensions {
             println!("Extension: {}", ext_name);
 
-            let dependencies = self.list_packages_from_config(&parsed, ext_name);
-
-            if dependencies.is_empty() {
-                println!("  No dependencies");
-            } else {
-                for (dep_type, pkg_name, pkg_version) in dependencies {
-                    let type_prefix = if dep_type == "ext" { "ext:" } else { "pkg:" };
-                    println!("  {}{} = {}", type_prefix, pkg_name, pkg_version);
-                }
-            }
+            let dependencies = self.list_packages_from_config(parsed, ext_name);
+            self.print_dependencies(&dependencies);
             println!();
         }
+    }
 
-        Ok(())
+    fn print_dependencies(&self, dependencies: &[(String, String, String)]) {
+        if dependencies.is_empty() {
+            println!("  No dependencies");
+            return;
+        }
+
+        for (dep_type, pkg_name, pkg_version) in dependencies {
+            let type_prefix = if dep_type == "ext" { "ext:" } else { "pkg:" };
+            println!("  {}{} = {}", type_prefix, pkg_name, pkg_version);
+        }
     }
 
     fn resolve_package_dependencies(
@@ -90,86 +113,93 @@ impl ExtDepsCommand {
         package_name: &str,
         package_spec: &toml::Value,
     ) -> Vec<(String, String, String)> {
-        let mut dependencies = Vec::new();
-
         match package_spec {
             toml::Value::String(version) => {
-                // Simple string version: "package-name = version"
-                dependencies.push(("pkg".to_string(), package_name.to_string(), version.clone()));
+                vec![("pkg".to_string(), package_name.to_string(), version.clone())]
             }
             toml::Value::Table(spec_map) => {
-                if let Some(version) = spec_map.get("version") {
-                    if let toml::Value::String(version_str) = version {
-                        // Object with version: "package-name = { version = "1.0.0" }"
-                        dependencies.push((
-                            "pkg".to_string(),
-                            package_name.to_string(),
-                            version_str.clone(),
-                        ));
-                    }
-                } else if let Some(ext_ref) = spec_map.get("ext") {
-                    if let toml::Value::String(ext_name) = ext_ref {
-                        // Extension reference
-                        let mut version = "*".to_string();
-                        if let Some(ext_section) = config.get("ext") {
-                            if let Some(ext_config) = ext_section.get(ext_name) {
-                                if let Some(ext_version) = ext_config.get("version") {
-                                    if let toml::Value::String(version_str) = ext_version {
-                                        version = version_str.clone();
-                                    }
-                                }
-                            }
-                        }
-                        dependencies.push(("ext".to_string(), ext_name.clone(), version));
-                    }
-                } else if let Some(compile_ref) = spec_map.get("compile") {
-                    if let toml::Value::String(compile_name) = compile_ref {
-                        // Object with compile reference - only list the compile dependencies
-                        if let Some(sdk_section) = config.get("sdk") {
-                            if let Some(compile_section) = sdk_section.get("compile") {
-                                if let Some(compile_config) = compile_section.get(compile_name) {
-                                    if let Some(compile_deps) = compile_config.get("dependencies") {
-                                        if let toml::Value::Table(deps_map) = compile_deps {
-                                            for (dep_name, dep_spec) in deps_map {
-                                                match dep_spec {
-                                                    toml::Value::String(dep_version) => {
-                                                        dependencies.push((
-                                                            "pkg".to_string(),
-                                                            dep_name.clone(),
-                                                            dep_version.clone(),
-                                                        ));
-                                                    }
-                                                    toml::Value::Table(dep_spec_map) => {
-                                                        if let Some(dep_version) =
-                                                            dep_spec_map.get("version")
-                                                        {
-                                                            if let toml::Value::String(
-                                                                version_str,
-                                                            ) = dep_version
-                                                            {
-                                                                dependencies.push((
-                                                                    "pkg".to_string(),
-                                                                    dep_name.clone(),
-                                                                    version_str.clone(),
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                self.resolve_table_dependency(config, package_name, spec_map)
             }
-            _ => {}
+            _ => Vec::new(),
+        }
+    }
+
+    fn resolve_table_dependency(
+        &self,
+        config: &toml::Value,
+        package_name: &str,
+        spec_map: &toml::Table,
+    ) -> Vec<(String, String, String)> {
+        // Try version first
+        if let Some(toml::Value::String(version)) = spec_map.get("version") {
+            return vec![("pkg".to_string(), package_name.to_string(), version.clone())];
         }
 
-        dependencies
+        // Try extension reference
+        if let Some(toml::Value::String(ext_name)) = spec_map.get("ext") {
+            return self.resolve_extension_dependency(config, ext_name);
+        }
+
+        // Try compile reference
+        if let Some(toml::Value::String(compile_name)) = spec_map.get("compile") {
+            return self.resolve_compile_dependencies(config, compile_name);
+        }
+
+        Vec::new()
+    }
+
+    fn resolve_extension_dependency(
+        &self,
+        config: &toml::Value,
+        ext_name: &str,
+    ) -> Vec<(String, String, String)> {
+        let version = config
+            .get("ext")
+            .and_then(|ext_section| ext_section.get(ext_name))
+            .and_then(|ext_config| ext_config.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+
+        vec![("ext".to_string(), ext_name.to_string(), version.to_string())]
+    }
+
+    fn resolve_compile_dependencies(
+        &self,
+        config: &toml::Value,
+        compile_name: &str,
+    ) -> Vec<(String, String, String)> {
+        let compile_deps = config
+            .get("sdk")
+            .and_then(|sdk| sdk.get("compile"))
+            .and_then(|compile| compile.get(compile_name))
+            .and_then(|compile_config| compile_config.get("dependencies"))
+            .and_then(|deps| deps.as_table());
+
+        let Some(deps_table) = compile_deps else {
+            return Vec::new();
+        };
+
+        deps_table
+            .iter()
+            .filter_map(|(dep_name, dep_spec)| self.extract_dependency_version(dep_name, dep_spec))
+            .collect()
+    }
+
+    fn extract_dependency_version(
+        &self,
+        dep_name: &str,
+        dep_spec: &toml::Value,
+    ) -> Option<(String, String, String)> {
+        match dep_spec {
+            toml::Value::String(version) => {
+                Some(("pkg".to_string(), dep_name.to_string(), version.clone()))
+            }
+            toml::Value::Table(spec_map) => spec_map
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|version| ("pkg".to_string(), dep_name.to_string(), version.to_string())),
+            _ => None,
+        }
     }
 
     fn list_packages_from_config(
@@ -177,40 +207,34 @@ impl ExtDepsCommand {
         config: &toml::Value,
         extension: &str,
     ) -> Vec<(String, String, String)> {
-        let mut all_packages = Vec::new();
+        let dependencies = config
+            .get("ext")
+            .and_then(|ext_section| ext_section.get(extension))
+            .and_then(|ext_config| ext_config.get("dependencies"))
+            .and_then(|deps| deps.as_table());
 
-        // Check if ext section exists and contains the extension
-        if let Some(ext_section) = config.get("ext") {
-            if let Some(ext_config) = ext_section.get(extension) {
-                // Look for dependencies section
-                if let Some(dependencies) = ext_config.get("dependencies") {
-                    if let toml::Value::Table(deps_map) = dependencies {
-                        for (package_name, package_spec) in deps_map {
-                            let resolved_deps = self.resolve_package_dependencies(
-                                config,
-                                package_name,
-                                package_spec,
-                            );
-                            all_packages.extend(resolved_deps);
-                        }
-                    }
-                }
-            }
-        }
+        let Some(deps_table) = dependencies else {
+            return Vec::new();
+        };
 
+        let mut all_packages: Vec<_> = deps_table
+            .iter()
+            .flat_map(|(package_name, package_spec)| {
+                self.resolve_package_dependencies(config, package_name, package_spec)
+            })
+            .collect();
+
+        self.deduplicate_and_sort(&mut all_packages);
+        all_packages
+    }
+
+    fn deduplicate_and_sort(&self, packages: &mut Vec<(String, String, String)>) {
         // Remove duplicates while preserving order
         let mut seen = HashSet::new();
-        let mut unique_packages = Vec::new();
-        for (dep_type, pkg_name, pkg_version) in all_packages {
-            let pkg_key = (dep_type.clone(), pkg_name.clone(), pkg_version.clone());
-            if !seen.contains(&pkg_key) {
-                seen.insert(pkg_key);
-                unique_packages.push((dep_type, pkg_name, pkg_version));
-            }
-        }
+        packages.retain(|pkg| seen.insert(pkg.clone()));
 
         // Sort: extensions first, then packages, both alphabetically
-        unique_packages.sort_by(|a, b| {
+        packages.sort_by(|a, b| {
             let a_is_ext = a.0 == "ext";
             let b_is_ext = b.0 == "ext";
             match (a_is_ext, b_is_ext) {
@@ -219,7 +243,5 @@ impl ExtDepsCommand {
                 _ => a.1.cmp(&b.1),
             }
         });
-
-        unique_packages
     }
 }

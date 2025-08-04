@@ -18,35 +18,38 @@ impl RuntimeDepsCommand {
     }
 
     pub fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
         let _config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        // Check if runtime section exists
-        let runtime_config = parsed
-            .get("runtime")
-            .context("No runtime configuration found")?;
-
-        // Check if runtime exists
-        let _runtime_spec = runtime_config.get(&self.runtime_name).with_context(|| {
-            format!("Runtime '{}' not found in configuration", self.runtime_name)
-        })?;
-
-        // List dependencies for the runtime
+        self.validate_runtime_exists(&parsed)?;
         let dependencies = self.list_runtime_dependencies(&parsed, &self.runtime_name)?;
 
-        for (dep_type, dep_name, dep_version) in &dependencies {
-            println!("({}) {} ({})", dep_type, dep_name, dep_version);
-        }
-
-        // Print success message with count
+        self.display_dependencies(&dependencies);
         print_success(
             &format!("Listed {} dependency(s).", dependencies.len()),
             OutputLevel::Normal,
         );
 
         Ok(())
+    }
+
+    fn validate_runtime_exists(&self, parsed: &toml::Value) -> Result<()> {
+        let runtime_config = parsed
+            .get("runtime")
+            .context("No runtime configuration found")?;
+
+        runtime_config.get(&self.runtime_name).with_context(|| {
+            format!("Runtime '{}' not found in configuration", self.runtime_name)
+        })?;
+
+        Ok(())
+    }
+
+    fn display_dependencies(&self, dependencies: &[(String, String, String)]) {
+        for (dep_type, dep_name, dep_version) in dependencies {
+            println!("({}) {} ({})", dep_type, dep_name, dep_version);
+        }
     }
 
     fn list_runtime_dependencies(
@@ -62,49 +65,72 @@ impl RuntimeDepsCommand {
             .get(runtime_name)
             .with_context(|| format!("Runtime '{}' not found", runtime_name))?;
 
-        let binding = toml::map::Map::new();
-        let runtime_deps = runtime_spec
-            .get("dependencies")
-            .and_then(|v| v.as_table())
-            .unwrap_or(&binding);
+        let runtime_deps = runtime_spec.get("dependencies").and_then(|v| v.as_table());
 
         let mut dependencies = Vec::new();
 
-        for (dep_name, dep_spec) in runtime_deps {
-            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                // This is an extension reference
-                let mut version = "*".to_string();
-
-                // Get version from extension config if available
-                if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_table()) {
-                    if let Some(ext_spec) = ext_config.get(ext_name) {
-                        if let Some(ext_version) = ext_spec.get("version").and_then(|v| v.as_str())
-                        {
-                            version = ext_version.to_string();
-                        }
-                    }
+        if let Some(deps_table) = runtime_deps {
+            for (dep_name, dep_spec) in deps_table {
+                if let Some(dependency) = self.resolve_dependency(parsed, dep_name, dep_spec) {
+                    dependencies.push(dependency);
                 }
-
-                dependencies.push(("ext".to_string(), ext_name.to_string(), version));
-            } else {
-                // This is a package
-                let version = dep_spec
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("*")
-                    .to_string();
-                dependencies.push(("pkg".to_string(), dep_name.clone(), version));
             }
         }
 
-        // Sort: extensions first, then packages, both alphabetically
+        self.sort_dependencies(&mut dependencies);
+        Ok(dependencies)
+    }
+
+    fn resolve_dependency(
+        &self,
+        parsed: &toml::Value,
+        dep_name: &str,
+        dep_spec: &toml::Value,
+    ) -> Option<(String, String, String)> {
+        // Try to resolve as extension reference first
+        if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+            return Some(self.resolve_extension_dependency(parsed, ext_name));
+        }
+
+        // Otherwise treat as package dependency
+        Some(self.resolve_package_dependency(dep_name, dep_spec))
+    }
+
+    fn resolve_extension_dependency(
+        &self,
+        parsed: &toml::Value,
+        ext_name: &str,
+    ) -> (String, String, String) {
+        let version = parsed
+            .get("ext")
+            .and_then(|ext_config| ext_config.as_table())
+            .and_then(|ext_table| ext_table.get(ext_name))
+            .and_then(|ext_spec| ext_spec.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+
+        ("ext".to_string(), ext_name.to_string(), version.to_string())
+    }
+
+    fn resolve_package_dependency(
+        &self,
+        dep_name: &str,
+        dep_spec: &toml::Value,
+    ) -> (String, String, String) {
+        let version = dep_spec
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+
+        ("pkg".to_string(), dep_name.to_string(), version.to_string())
+    }
+
+    fn sort_dependencies(&self, dependencies: &mut Vec<(String, String, String)>) {
         dependencies.sort_by(|a, b| match (a.0.as_str(), b.0.as_str()) {
             ("ext", "pkg") => std::cmp::Ordering::Less,
             ("pkg", "ext") => std::cmp::Ordering::Greater,
             _ => a.1.cmp(&b.1),
         });
-
-        Ok(dependencies)
     }
 }
 
