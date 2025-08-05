@@ -244,7 +244,7 @@ compile = "lib_build.sh"
 dependencies = { make = "*" }
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, "{}", config_content).unwrap();
+        write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
         let sections = cmd.get_compile_sections_from_config(&config);
@@ -278,7 +278,7 @@ compile = "build.sh"
 dependencies = { gcc = "*" }
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, "{}", config_content).unwrap();
+        write!(temp_file, "{config_content}").unwrap();
 
         // This should work if we had a valid config file path
         // For now, we'll just test the structure

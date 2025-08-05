@@ -1,7 +1,7 @@
 [sdk]
 image = "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime]
+[runtime.default]
 target = "x86_64-unknown-linux-gnu"
 
 [ext.test-both]

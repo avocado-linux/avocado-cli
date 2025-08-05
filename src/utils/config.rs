@@ -142,7 +142,7 @@ dependencies = { gcc = "*" }
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, "{}", config_content).unwrap();
+        write!(temp_file, "{config_content}").unwrap();
 
         let config = Config::load(temp_file.path()).unwrap();
 
@@ -165,7 +165,7 @@ dependencies = { gcc = "*" }
     fn test_invalid_toml() {
         let invalid_content = "invalid toml content [[[";
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, "{}", invalid_content).unwrap();
+        write!(temp_file, "{invalid_content}").unwrap();
 
         let result = Config::load(temp_file.path());
         assert!(result.is_err());

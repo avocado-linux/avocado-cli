@@ -94,7 +94,7 @@ pub fn generate_temp_dir_name() -> String {
         .unwrap_or("test")
         .replace("::", "_");
 
-    format!("{}_{}_{}", thread_name, pid, timestamp)
+    format!("{thread_name}_{pid}_{timestamp}")
 }
 
 /// Core function that handles all CLI execution variations

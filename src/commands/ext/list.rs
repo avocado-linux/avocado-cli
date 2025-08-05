@@ -38,7 +38,7 @@ impl ExtListCommand {
 
     fn display_extensions(&self, extensions: &[String]) {
         for ext_name in extensions {
-            println!("{}", ext_name);
+            println!("{ext_name}");
         }
     }
 }

@@ -112,12 +112,12 @@ impl ExtDnfCommand {
         let container_helper = SdkContainer::new();
 
         // Perform extension setup first
-        self.setup_extension_environment(parsed, &container_helper, &container_image, target)
+        self.setup_extension_environment(parsed, &container_helper, container_image, target)
             .await?;
 
         // Build and execute DNF command
         let dnf_command = self.build_dnf_command();
-        self.run_dnf_command(&container_helper, &container_image, target, &dnf_command)
+        self.run_dnf_command(&container_helper, container_image, target, &dnf_command)
             .await
     }
 
@@ -204,7 +204,7 @@ impl ExtDnfCommand {
     ) -> Result<()> {
         if self.verbose {
             print_info(
-                &format!("Running DNF command: {}", dnf_command),
+                &format!("Running DNF command: {dnf_command}"),
                 OutputLevel::Normal,
             );
         }
@@ -240,10 +240,9 @@ RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
-    --installroot={} \
-    {}
-"#,
-            installroot, dnf_args_str
+    --installroot={installroot} \
+    {dnf_args_str}
+"#
         )
     }
 }

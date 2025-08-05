@@ -110,7 +110,7 @@ impl SdkDnfCommand {
 
         // Add environment variables
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", target));
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
 
         // Add the container image
         container_cmd.push(container_image.to_string());

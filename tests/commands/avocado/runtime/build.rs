@@ -26,8 +26,7 @@ fn test_runtime_build_with_target() {
 
 #[test]
 fn test_runtime_build_missing_target() {
-    let result =
-        common::run_cli_in_temp_with_config(&["runtime", "build", "nonexistent-target"]);
+    let result = common::run_cli_in_temp_with_config(&["runtime", "build", "nonexistent-target"]);
     // Should complete (may succeed or fail depending on validation)
     common::assert_command_completes(&result);
 }

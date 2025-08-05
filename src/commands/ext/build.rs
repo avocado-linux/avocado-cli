@@ -227,7 +227,7 @@ impl ExtBuildCommand {
 
         if self.verbose {
             print_info(
-                &format!("Sysext build script execution returned: {}.", result),
+                &format!("Sysext build script execution returned: {result}."),
                 OutputLevel::Normal,
             );
         }
@@ -267,7 +267,7 @@ impl ExtBuildCommand {
 
         if self.verbose {
             print_info(
-                &format!("Confext build script execution returned: {}.", result),
+                &format!("Confext build script execution returned: {result}."),
                 OutputLevel::Normal,
             );
         }

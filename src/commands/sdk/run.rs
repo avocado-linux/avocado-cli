@@ -31,6 +31,7 @@ pub struct SdkRunCommand {
 
 impl SdkRunCommand {
     /// Create a new SdkRunCommand instance
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_path: String,
         name: Option<String>,
@@ -88,7 +89,7 @@ impl SdkRunCommand {
             })?;
 
         if let Some(ref name) = self.name {
-            println!("Container name: {}", name);
+            println!("Container name: {name}");
         }
 
         // Build the command to execute
@@ -165,7 +166,7 @@ impl SdkRunCommand {
 
         // Add environment variables
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", target));
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
 
         // Add the container image
         container_cmd.push(container_image.to_string());
@@ -184,15 +185,12 @@ impl SdkRunCommand {
 
         if output.status.success() {
             let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            println!(
-                "Container started in detached mode with ID: {}",
-                container_id
-            );
+            println!("Container started in detached mode with ID: {container_id}");
             Ok(true)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             print_error(
-                &format!("Container execution failed: {}", stderr),
+                &format!("Container execution failed: {stderr}"),
                 OutputLevel::Normal,
             );
             Ok(false)

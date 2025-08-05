@@ -1,0 +1,14 @@
+name: Pull Request
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Run Tests
+    uses: ./.github/workflows/test-reusable.yml
+
+  security:
+    name: Security Audit
+    uses: ./.github/workflows/security-reusable.yml

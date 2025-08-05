@@ -41,7 +41,7 @@ impl InitCommand {
         // Validate and create directory if it doesn't exist
         if !Path::new(directory).exists() {
             fs::create_dir_all(directory)
-                .with_context(|| format!("Failed to create directory '{}'", directory))?;
+                .with_context(|| format!("Failed to create directory '{directory}'"))?;
         }
 
         // Create the avocado.toml file path
@@ -58,15 +58,14 @@ impl InitCommand {
         // Create the configuration content
         let config_content = format!(
             r#"[runtime.default]
-target = "{}"
+target = "{target}"
 
 [runtime.default.dependencies]
 nativesdk-avocado-images = "*"
 
 [sdk]
 image = "avocadolinux/sdk:apollo-edge"
-"#,
-            target
+"#
         );
 
         // Write the configuration file

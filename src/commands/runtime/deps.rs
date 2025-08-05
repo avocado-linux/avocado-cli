@@ -48,7 +48,7 @@ impl RuntimeDepsCommand {
 
     fn display_dependencies(&self, dependencies: &[(String, String, String)]) {
         for (dep_type, dep_name, dep_version) in dependencies {
-            println!("({}) {} ({})", dep_type, dep_name, dep_version);
+            println!("({dep_type}) {dep_name} ({dep_version})");
         }
     }
 
@@ -63,7 +63,7 @@ impl RuntimeDepsCommand {
 
         let runtime_spec = runtime_config
             .get(runtime_name)
-            .with_context(|| format!("Runtime '{}' not found", runtime_name))?;
+            .with_context(|| format!("Runtime '{runtime_name}' not found"))?;
 
         let runtime_deps = runtime_spec.get("dependencies").and_then(|v| v.as_table());
 
@@ -125,7 +125,7 @@ impl RuntimeDepsCommand {
         ("pkg".to_string(), dep_name.to_string(), version.to_string())
     }
 
-    fn sort_dependencies(&self, dependencies: &mut Vec<(String, String, String)>) {
+    fn sort_dependencies(&self, dependencies: &mut [(String, String, String)]) {
         dependencies.sort_by(|a, b| match (a.0.as_str(), b.0.as_str()) {
             ("ext", "pkg") => std::cmp::Ordering::Less,
             ("pkg", "ext") => std::cmp::Ordering::Greater,

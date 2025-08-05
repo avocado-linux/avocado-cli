@@ -63,7 +63,7 @@ impl ExtDepsCommand {
         match &self.extension {
             Some(extension_name) => {
                 print_error(
-                    &format!("Extension '{}' not found in configuration.", extension_name),
+                    &format!("Extension '{extension_name}' not found in configuration."),
                     OutputLevel::Normal,
                 );
             }
@@ -75,7 +75,7 @@ impl ExtDepsCommand {
 
     fn print_extension_not_found(&self, extension_name: &str) {
         print_error(
-            &format!("Extension '{}' not found in configuration.", extension_name),
+            &format!("Extension '{extension_name}' not found in configuration."),
             OutputLevel::Normal,
         );
     }
@@ -87,7 +87,7 @@ impl ExtDepsCommand {
         }
 
         for ext_name in extensions {
-            println!("Extension: {}", ext_name);
+            println!("Extension: {ext_name}");
 
             let dependencies = self.list_packages_from_config(parsed, ext_name);
             self.print_dependencies(&dependencies);
@@ -103,7 +103,7 @@ impl ExtDepsCommand {
 
         for (dep_type, pkg_name, pkg_version) in dependencies {
             let type_prefix = if dep_type == "ext" { "ext:" } else { "pkg:" };
-            println!("  {}{} = {}", type_prefix, pkg_name, pkg_version);
+            println!("  {type_prefix}{pkg_name} = {pkg_version}");
         }
     }
 

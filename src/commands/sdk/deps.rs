@@ -38,7 +38,7 @@ impl SdkDepsCommand {
 
     fn display_packages(&self, packages: &[(String, String, String)]) {
         for (dep_type, pkg_name, pkg_version) in packages {
-            println!("({}) {} ({})", dep_type, pkg_name, pkg_version);
+            println!("({dep_type}) {pkg_name} ({pkg_version})");
         }
     }
 
@@ -225,7 +225,7 @@ image = "test-image"
 cmake = "*"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, "{}", config_content).unwrap();
+        write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
         // Test string version
@@ -279,7 +279,7 @@ gcc = "11.0.0"
 dependencies = { make = "4.3" }
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, "{}", config_content).unwrap();
+        write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
         let packages = cmd.list_packages_from_config(&config);

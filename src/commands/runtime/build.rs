@@ -232,32 +232,29 @@ $DNF_SDK_HOST \
 
                     symlink_commands.push(format!(
                         r#"
-OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{}.raw
-RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{}.raw
-SYSEXT=$VAR_DIR/lib/extensions/{}.raw
-CONFEXT=$VAR_DIR/lib/confexts/{}.raw
+OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
+RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
+SYSEXT=$VAR_DIR/lib/extensions/{ext_name}.raw
+CONFEXT=$VAR_DIR/lib/confexts/{ext_name}.raw
 
 if [ -f "$OUTPUT_EXT" ]; then
     if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
         ln -f $OUTPUT_EXT $RUNTIMES_EXT
     fi
 else
-    echo "Missing image for extension {}."
-fi"#,
-                        ext_name, ext_name, ext_name, ext_name, ext_name
+    echo "Missing image for extension {ext_name}."
+fi"#
                     ));
 
                     if is_sysext {
                         symlink_commands.push(format!(
-                            "ln -sf /var/lib/avocado/extensions/{}.raw $SYSEXT",
-                            ext_name
+                            "ln -sf /var/lib/avocado/extensions/{ext_name}.raw $SYSEXT"
                         ));
                     }
 
                     if is_confext {
                         symlink_commands.push(format!(
-                            "ln -sf /var/lib/avocado/extensions/{}.raw $CONFEXT",
-                            ext_name
+                            "ln -sf /var/lib/avocado/extensions/{ext_name}.raw $CONFEXT"
                         ));
                     }
                 }
@@ -314,14 +311,6 @@ avocado-build-{} {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
-        let config_path = temp_dir.path().join("avocado.toml");
-        fs::write(&config_path, content).unwrap();
-        config_path.to_string_lossy().to_string()
-    }
 
     #[test]
     fn test_new() {

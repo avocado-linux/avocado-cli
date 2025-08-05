@@ -93,6 +93,7 @@ impl SdkContainer {
     }
 
     /// Build the complete container command
+    #[allow(clippy::too_many_arguments)]
     fn build_container_command(
         &self,
         container_image: &str,
@@ -128,13 +129,13 @@ impl SdkContainer {
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}/_avocado:/opt/_avocado:rw", self.cwd.display()));
 
-        // Environment variables
+        // Add environment variables
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", target));
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
 
         for (key, value) in env_vars {
             container_cmd.push("-e".to_string());
-            container_cmd.push(format!("{}={}", key, value));
+            container_cmd.push(format!("{key}={value}"));
         }
 
         // Add the container image
@@ -177,17 +178,14 @@ impl SdkContainer {
             if output.status.success() {
                 let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 print_info(
-                    &format!(
-                        "Container started in detached mode with ID: {}",
-                        container_id
-                    ),
+                    &format!("Container started in detached mode with ID: {container_id}"),
                     OutputLevel::Normal,
                 );
                 Ok(true)
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 print_error(
-                    &format!("Container execution failed: {}", stderr),
+                    &format!("Container execution failed: {stderr}"),
                     OutputLevel::Normal,
                 );
                 Ok(false)

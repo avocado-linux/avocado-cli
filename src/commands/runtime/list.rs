@@ -26,7 +26,7 @@ impl RuntimeListCommand {
             runtimes.sort();
 
             for runtime_name in &runtimes {
-                println!("{}", runtime_name);
+                println!("{runtime_name}");
             }
 
             print_success(

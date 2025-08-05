@@ -191,7 +191,7 @@ $DNF_SDK_HOST \
                     packages.push(package_name.clone());
                 }
                 toml::Value::String(v) => {
-                    packages.push(format!("{}-{}", package_name, v));
+                    packages.push(format!("{package_name}-{v}"));
                 }
                 toml::Value::Table(_) => {
                     // Handle dictionary version format like {'core2_64': '*'}

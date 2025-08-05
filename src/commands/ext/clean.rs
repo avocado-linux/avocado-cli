@@ -110,14 +110,14 @@ impl ExtCleanCommand {
 
         if self.verbose {
             print_info(
-                &format!("Running command: {}", clean_command),
+                &format!("Running command: {clean_command}"),
                 OutputLevel::Normal,
             );
         }
 
         let success = container_helper
             .run_in_container(
-                &container_image,
+                container_image,
                 target,
                 &clean_command,
                 self.verbose,

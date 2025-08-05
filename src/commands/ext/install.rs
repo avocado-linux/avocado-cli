@@ -61,7 +61,7 @@ impl ExtInstallCommand {
             // Single extension specified
             if !ext_section.as_table().unwrap().contains_key(extension_name) {
                 print_error(
-                    &format!("Extension '{}' not found in configuration.", extension_name),
+                    &format!("Extension '{extension_name}' not found in configuration."),
                     OutputLevel::Normal,
                 );
                 return Ok(());
@@ -166,10 +166,9 @@ impl ExtInstallCommand {
         target: &str,
     ) -> Result<bool> {
         // Create the commands to check and set up the directory structure
-        let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{} ]", extension);
+        let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
         let setup_command = format!(
-            "mkdir -p ${{AVOCADO_EXT_SYSROOTS}}/{}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm ${{AVOCADO_EXT_SYSROOTS}}/{}/var/lib",
-            extension, extension
+            "mkdir -p ${{AVOCADO_EXT_SYSROOTS}}/{extension}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm ${{AVOCADO_EXT_SYSROOTS}}/{extension}/var/lib"
         );
 
         // First check if the sysroot already exists
@@ -199,12 +198,12 @@ impl ExtInstallCommand {
 
             if success {
                 print_success(
-                    &format!("Created sysroot for extension '{}'.", extension),
+                    &format!("Created sysroot for extension '{extension}'."),
                     OutputLevel::Normal,
                 );
             } else {
                 print_error(
-                    &format!("Failed to create sysroot for extension '{}'.", extension),
+                    &format!("Failed to create sysroot for extension '{extension}'."),
                     OutputLevel::Normal,
                 );
                 return Ok(false);
@@ -231,7 +230,7 @@ impl ExtInstallCommand {
                         if version == "*" {
                             packages.push(package_name.clone());
                         } else {
-                            packages.push(format!("{}-{}", package_name, version));
+                            packages.push(format!("{package_name}-{version}"));
                         }
                     }
                     toml::Value::Table(spec_map) => {
@@ -239,7 +238,7 @@ impl ExtInstallCommand {
                             if version == "*" {
                                 packages.push(package_name.clone());
                             } else {
-                                packages.push(format!("{}-{}", package_name, version));
+                                packages.push(format!("{package_name}-{version}"));
                             }
                         }
                     }
@@ -250,7 +249,7 @@ impl ExtInstallCommand {
             if !packages.is_empty() {
                 // Build DNF install command
                 let yes = if self.force { "-y" } else { "" };
-                let installroot = format!("${{AVOCADO_EXT_SYSROOTS}}/{}", extension);
+                let installroot = format!("${{AVOCADO_EXT_SYSROOTS}}/{extension}");
                 let command = format!(
                     r#"
 RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
@@ -269,10 +268,7 @@ $DNF_SDK_HOST \
                 );
 
                 if self.verbose {
-                    print_info(
-                        &format!("Running command: {}", command),
-                        OutputLevel::Normal,
-                    );
+                    print_info(&format!("Running command: {command}"), OutputLevel::Normal);
                 }
 
                 // Run the DNF install command
@@ -289,26 +285,20 @@ $DNF_SDK_HOST \
 
                 if !install_success {
                     print_error(
-                        &format!(
-                            "Failed to install dependencies for extension '{}'.",
-                            extension
-                        ),
+                        &format!("Failed to install dependencies for extension '{extension}'."),
                         OutputLevel::Normal,
                     );
                     return Ok(false);
                 }
             } else if self.verbose {
                 print_debug(
-                    &format!(
-                        "No valid dependencies to install for extension '{}'.",
-                        extension
-                    ),
+                    &format!("No valid dependencies found for extension '{extension}'."),
                     OutputLevel::Normal,
                 );
             }
         } else if self.verbose {
             print_debug(
-                &format!("No dependencies defined for extension '{}'.", extension),
+                &format!("No dependencies defined for extension '{extension}'."),
                 OutputLevel::Normal,
             );
         }
