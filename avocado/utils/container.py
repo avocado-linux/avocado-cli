@@ -27,6 +27,7 @@ class SdkContainer:
         source_environment: bool = True,
         use_entrypoint: bool = True,
         interactive: bool = False,
+        repo_url: Optional[str] = None,
     ) -> bool:
         os.makedirs("_avocado", exist_ok=True)
         bash_cmd = ["bash", "-c"]
@@ -50,6 +51,12 @@ class SdkContainer:
         verbose_final = verbose or self.verbose
 
         try:
+            # If a repo_url is provided, add it to the environment variables
+            if repo_url:
+                if env_vars is None:
+                    env_vars = {}
+                env_vars["AVOCADO_SDK_REPO_URL"] = repo_url
+
             container_cmd = self._build_container_command(
                 container_image=container_image,
                 command=bash_cmd,
@@ -177,6 +184,13 @@ else
     CODENAME=${CODENAME:-dev}
 fi
 
+# Get repo url from environment or default to prod
+if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
+    REPO_URL="$AVOCADO_SDK_REPO_URL"
+else
+    REPO_URL="https://repo.avocadolinux.org"
+fi
+
 export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_SDK_TARGET}"
 export AVOCADO_SDK_PREFIX="${AVOCADO_PREFIX}/sdk"
 export AVOCADO_EXT_SYSROOTS="${AVOCADO_PREFIX}/extensions"
@@ -211,6 +225,14 @@ export DNF_SDK_TARGET_REPO_CONF="\
 "
 
 export RPM_NO_CHROOT_FOR_SCRIPTS=1
+
+mkdir -p /etc/dnf/vars
+mkdir -p ${AVOCADO_SDK_PREFIX}/etc/dnf/vars
+mkdir -p ${AVOCADO_SDK_PREFIX}/target-repoconf/etc/dnf/vars
+
+echo "${REPO_URL}" > /etc/dnf/vars/repo_url
+echo "${REPO_URL}" > ${DNF_SDK_HOST_PREFIX}/etc/dnf/vars/repo_url
+echo "${REPO_URL}" > ${DNF_SDK_TARGET_PREFIX}/etc/dnf/vars/repo_url
 
 if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     echo "[INFO] Initializing Avocado SDK."

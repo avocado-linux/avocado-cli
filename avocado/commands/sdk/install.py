@@ -69,6 +69,9 @@ class SdkInstallCommand(BaseCommand):
             print_error("No container image specified in config under 'sdk.image'")
             return False
 
+        # Get repo_url from config, if it exists
+        repo_url = config.get("sdk", {}).get("repo_url")
+
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
@@ -126,6 +129,7 @@ $DNF_SDK_HOST \
                     verbose=verbose,
                     source_environment=False,
                     interactive=not args.force,
+                    repo_url=repo_url,
                 )
 
                 if install_success:
@@ -178,6 +182,7 @@ $DNF_SDK_HOST \
                         verbose=verbose,
                         source_environment=False,
                         interactive=not args.force,
+                        repo_url=repo_url,
                     )
 
                     if not install_success:

@@ -117,6 +117,9 @@ class SdkCompileCommand(BaseCommand):
             print_error("No container image specified in config under 'sdk.image'")
             return False
 
+        # Get repo_url from config, if it exists
+        repo_url = config.get("sdk", {}).get("repo_url")
+
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
 
@@ -151,6 +154,7 @@ class SdkCompileCommand(BaseCommand):
                 command=compile_command,
                 verbose=verbose,
                 source_environment=True,
+                repo_url=repo_url,
             )
 
             if success:

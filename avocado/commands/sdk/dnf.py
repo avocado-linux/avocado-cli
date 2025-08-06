@@ -3,6 +3,8 @@
 import os
 import sys
 import tomlkit
+
+
 from avocado.commands.base import BaseCommand
 from avocado.utils.container import SdkContainer
 from avocado.utils.config import load_config
@@ -69,6 +71,9 @@ class SdkDnfCommand(BaseCommand):
             )
             return False
 
+        # Get repo_url from config, if it exists
+        repo_url = config.get("sdk", {}).get("repo_url")
+
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
@@ -94,6 +99,7 @@ class SdkDnfCommand(BaseCommand):
             command=[command],
             source_environment=False,
             use_entrypoint=True,
+            repo_url=repo_url,
         )
 
         # Log the result

@@ -47,6 +47,9 @@ class SdkCleanCommand(BaseCommand):
             print_error("No container image specified in config under 'sdk.image'")
             return False
 
+        # Get repo_url from config, if it exists
+        repo_url = config.get("sdk", {}).get("repo_url")
+
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
         target = resolve_target(
@@ -72,6 +75,7 @@ class SdkCleanCommand(BaseCommand):
             command=remove_command,
             verbose=verbose,
             source_environment=False,
+            repo_url=repo_url,
         )
 
         if success:
