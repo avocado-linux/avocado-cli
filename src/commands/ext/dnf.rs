@@ -129,7 +129,7 @@ impl ExtDnfCommand {
         target: &str,
     ) -> Result<()> {
         let check_cmd = format!(
-            "test -d ${{AVOCADO_SDK_SYSROOTS}}/extensions/{}",
+            "test -d $AVOCADO_SDK_SYSROOTS/extensions/{}",
             self.extension
         );
 
@@ -159,7 +159,7 @@ impl ExtDnfCommand {
         target: &str,
     ) -> Result<()> {
         let setup_cmd = format!(
-            "mkdir -p ${{AVOCADO_EXT_SYSROOTS}}/{}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm ${{AVOCADO_EXT_SYSROOTS}}/{}/var/lib",
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{}/var/lib",
             self.extension, self.extension
         );
 
@@ -230,7 +230,7 @@ impl ExtDnfCommand {
     }
 
     fn build_dnf_command(&self) -> String {
-        let installroot = format!("${{AVOCADO_EXT_SYSROOTS}}/{}", self.extension);
+        let installroot = format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension);
         let dnf_args_str = self.dnf_args.join(" ");
 
         format!(

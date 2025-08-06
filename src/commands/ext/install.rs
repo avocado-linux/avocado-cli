@@ -168,7 +168,7 @@ impl ExtInstallCommand {
         // Create the commands to check and set up the directory structure
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
         let setup_command = format!(
-            "mkdir -p ${{AVOCADO_EXT_SYSROOTS}}/{extension}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm ${{AVOCADO_EXT_SYSROOTS}}/{extension}/var/lib"
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
         );
 
         // First check if the sysroot already exists
@@ -249,7 +249,7 @@ impl ExtInstallCommand {
             if !packages.is_empty() {
                 // Build DNF install command
                 let yes = if self.force { "-y" } else { "" };
-                let installroot = format!("${{AVOCADO_EXT_SYSROOTS}}/{extension}");
+                let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension}");
                 let command = format!(
                     r#"
 RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
