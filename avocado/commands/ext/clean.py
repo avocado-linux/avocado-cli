@@ -14,14 +14,15 @@ class ExtCleanCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the ext clean command's subparser."""
-        parser = subparsers.add_parser("clean", help="Clean an extension's sysroot")
+        parser = subparsers.add_parser(
+            "clean", help="Clean an extension's sysroot")
 
         # Add extension name argument - required
         parser.add_argument("extension", help="Name of the extension to clean")
 
         # Add optional arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -57,7 +58,8 @@ class ExtCleanCommand(BaseCommand):
 
         # Get SDK config
         sdk_config = config.get("sdk", {})
-        container_image = sdk_config.get("image", "avocadolinux/sdk:apollo-edge")
+        container_image = sdk_config.get(
+            "image", "avocadolinux/sdk:apollo-edge")
 
         # Initialize container helper
         container_helper = SdkContainer()
@@ -69,7 +71,7 @@ class ExtCleanCommand(BaseCommand):
         if verbose:
             print_info(
                 f"Checking if sysroot exists for extension '{
-                       extension}'."
+                    extension}'."
             )
 
         sysroot_exists = container_helper.run_in_container(
@@ -104,5 +106,6 @@ class ExtCleanCommand(BaseCommand):
             print_success(f"Cleaned sysroot for extension '{extension}'.")
             return True
         else:
-            print_error(f"Failed to clean sysroot for extension '{extension}'.")
+            print_error(
+                f"Failed to clean sysroot for extension '{extension}'.")
             return False

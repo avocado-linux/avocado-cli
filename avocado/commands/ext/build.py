@@ -34,7 +34,7 @@ class ExtBuildCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -56,7 +56,8 @@ class ExtBuildCommand(BaseCommand):
         # Get extension configuration
         ext_config = config.get("ext", {}).get(extension_name)
         if not ext_config:
-            print_error(f"Extension '{extension_name}' not found in configuration.")
+            print_error(
+                f"Extension '{extension_name}' not found in configuration.")
             return False
 
         # Get extension types (sysext, confext) from boolean flags
@@ -72,7 +73,8 @@ class ExtBuildCommand(BaseCommand):
 
         if not ext_types:
             print_error(
-                f"Extension '{extension_name}' has sysext=false and confext=false. At least one must be true to build."
+                f"Extension '{
+                    extension_name}' has sysext=false and confext=false. At least one must be true to build."
             )
             return False
 
@@ -130,12 +132,12 @@ class ExtBuildCommand(BaseCommand):
             if build_result:
                 print_success(
                     f"Successfully built {
-                              ext_type} extension '{extension_name}'."
+                        ext_type} extension '{extension_name}'."
                 )
             else:
                 print_error(
                     f"Failed to build {
-                            ext_type} extension '{extension_name}'."
+                        ext_type} extension '{extension_name}'."
                 )
                 overall_success = False
 

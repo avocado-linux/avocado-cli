@@ -20,7 +20,7 @@ class ExtInstallCommand(BaseCommand):
 
         # Add config file argument
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -62,7 +62,7 @@ class ExtInstallCommand(BaseCommand):
             if extension is not None:
                 print_error(
                     f"Extension '{
-                            extension}' not found in configuration."
+                        extension}' not found in configuration."
                 )
                 return False
             else:
@@ -73,7 +73,8 @@ class ExtInstallCommand(BaseCommand):
         if extension is not None:
             # Single extension specified
             if extension not in config["ext"]:
-                print_error(f"Extension '{extension}' not found in configuration.")
+                print_error(
+                    f"Extension '{extension}' not found in configuration.")
                 return False
             extensions_to_install = [extension]
         else:
@@ -92,7 +93,8 @@ class ExtInstallCommand(BaseCommand):
         # Get the SDK image and target from configuration
         container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            print_error("No container image specified in config under 'sdk.image'.")
+            print_error(
+                "No container image specified in config under 'sdk.image'.")
             return False
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
@@ -131,7 +133,7 @@ class ExtInstallCommand(BaseCommand):
         if len(extensions_to_install) >= 1:
             print_success(
                 f"Installed {
-                          len(extensions_to_install)} extension(s)."
+                    len(extensions_to_install)} extension(s)."
             )
 
         return True
@@ -149,8 +151,8 @@ class ExtInstallCommand(BaseCommand):
         """Install a single extension."""
         # Create the commands to check and set up the directory structure
         check_command = f"[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]"
-        setup_command = f"mkdir -p ${{AVOCADO_EXT_SYSROOTS}}/{
-            extension}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm ${{AVOCADO_EXT_SYSROOTS}}/{extension}/var/lib"
+        setup_command = f"mkdir -p $AVOCADO_EXT_SYSROOTS/{
+            extension}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
 
         # First check if the sysroot already exists
         sysroot_exists = container_helper.run_in_container(
@@ -174,7 +176,8 @@ class ExtInstallCommand(BaseCommand):
             if success:
                 print_success(f"Created sysroot for extension '{extension}'.")
             else:
-                print_error(f"Failed to create sysroot for extension '{extension}'.")
+                print_error(
+                    f"Failed to create sysroot for extension '{extension}'.")
                 return False
 
         # Install dependencies if they exist
@@ -225,17 +228,19 @@ $DNF_SDK_HOST \
 
                 if not install_success:
                     print_error(
-                        f"Failed to install dependencies for extension '{extension}'."
+                        f"Failed to install dependencies for extension '{
+                            extension}'."
                     )
                     return False
             else:
                 if verbose:
                     print_debug(
                         f"No valid dependencies to install for extension '{
-                        extension}'."
+                            extension}'."
                     )
         else:
             if verbose:
-                print_debug(f"No dependencies defined for extension '{extension}'.")
+                print_debug(
+                    f"No dependencies defined for extension '{extension}'.")
 
         return True

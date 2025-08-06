@@ -28,13 +28,16 @@ class SdkContainer:
         use_entrypoint: bool = True,
         interactive: bool = False,
         repo_url: Optional[str] = None,
+        repo_release: Optional[str] = None,
+        container_args: Optional[List[str]] = None,
     ) -> bool:
         os.makedirs("_avocado", exist_ok=True)
         bash_cmd = ["bash", "-c"]
         cmd = ""
 
         if use_entrypoint:
-            entrypoint_script = self._create_entrypoint_script(source_environment)
+            entrypoint_script = self._create_entrypoint_script(
+                source_environment)
             cmd += f"{entrypoint_script}\n"
 
         if command and isinstance(command, list):
@@ -57,6 +60,12 @@ class SdkContainer:
                     env_vars = {}
                 env_vars["AVOCADO_SDK_REPO_URL"] = repo_url
 
+            # If a repo_url is provided, add it to the environment variables
+            if repo_release:
+                if env_vars is None:
+                    env_vars = {}
+                env_vars["AVOCADO_SDK_REPO_RELEASE"] = repo_release
+
             container_cmd = self._build_container_command(
                 container_image=container_image,
                 command=bash_cmd,
@@ -66,6 +75,7 @@ class SdkContainer:
                 detach=detach,
                 rm=rm,
                 interactive=interactive,
+                container_args=container_args,
             )
 
             return self._execute_container_command(container_cmd, detach, verbose_final)
@@ -84,6 +94,7 @@ class SdkContainer:
         detach: bool = False,
         rm: bool = True,
         interactive: bool = False,
+        container_args: Optional[List[str]] = None,
     ) -> List[str]:
         """Build the complete container command."""
         container_cmd = [self.container_tool, "run"]
@@ -117,6 +128,10 @@ class SdkContainer:
             for key, value in env_vars.items():
                 container_cmd.extend(["-e", f"{key}={value}"])
 
+        # Add additional container arguments if provided
+        if container_args:
+            container_cmd.extend(container_args)
+
         # Add the container image
         container_cmd.append(container_image)
 
@@ -143,7 +158,7 @@ class SdkContainer:
                 container_id = result.stdout.strip()
                 print(
                     f"Container started in detached mode with ID: {
-                      container_id}"
+                        container_id}"
                 )
                 return True
             else:
@@ -165,24 +180,13 @@ class SdkContainer:
         except FileNotFoundError:
             print_error(
                 f"{
-                self.container_tool} command not found. Is it installed and in your PATH?"
+                    self.container_tool} command not found. Is it installed and in your PATH?"
             )
             return False
 
     def _create_entrypoint_script(self, source_environment: bool = True) -> str:
         script = """
 set -e
-
-# Get codename from environment or os-release
-if [ -n "$AVOCADO_SDK_CODENAME" ]; then
-    CODENAME="$AVOCADO_SDK_CODENAME"
-else
-    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found
-    if [ -f /etc/os-release ]; then
-        CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
-    fi
-    CODENAME=${CODENAME:-dev}
-fi
 
 # Get repo url from environment or default to prod
 if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
@@ -191,6 +195,23 @@ else
     REPO_URL="https://repo.avocadolinux.org"
 fi
 
+echo $REPO_URL
+
+# Get repo release from environment or default to prod
+if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
+    REPO_RELEASE="$AVOCADO_SDK_REPO_RELEASE"
+else
+    REPO_RELEASE="https://repo.avocadolinux.org"
+
+    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found
+    if [ -f /etc/os-release ]; then
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    fi
+    REPO_RELEASE=${REPO_RELEASE:-dev}
+fi
+
+echo $REPO_RELEASE
+
 export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_SDK_TARGET}"
 export AVOCADO_SDK_PREFIX="${AVOCADO_PREFIX}/sdk"
 export AVOCADO_EXT_SYSROOTS="${AVOCADO_PREFIX}/extensions"
@@ -198,7 +219,7 @@ export DNF_SDK_HOST_PREFIX="${AVOCADO_SDK_PREFIX}"
 export DNF_SDK_TARGET_PREFIX="${AVOCADO_SDK_PREFIX}/target-repoconf"
 export DNF_SDK_HOST="\
 dnf \
---releasever="$CODENAME" \
+--releasever="$REPO_RELEASE" \
 --best \
 --setopt=tsflags=noscripts \
 "

@@ -24,31 +24,33 @@ class SdkDnfCommand(BaseCommand):
 
         # Add common arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        # Capture all remaining arguments after -- as dnf command
+        # Command is now required as a flag
         parser.add_argument(
-            "dnf_args",
+            "-c",
+            "--command",
             nargs="*",
-            help="DNF command and arguments to execute (use -- to separate from SDK args)",
+            required=True,
+            help="DNF command and arguments to execute",
         )
 
         return parser
 
     def execute(self, args, parser=None, unknown=None):
         """Execute the sdk dnf command."""
-        # Add unknown args to dnf_args if they exist
-        dnf_args = getattr(args, "dnf_args", [])
+        # Get command args from -c/--command flag
+        command_args = getattr(args, "command", [])
         if unknown:
-            dnf_args.extend(unknown)
+            command_args.extend(unknown)
 
-        if not dnf_args:
+        if not command_args:
             print(
-                "Error: No DNF command specified. Use '--' to separate DNF arguments.",
+                "Error: No DNF command specified.",
                 file=sys.stderr,
             )
             if parser:
@@ -73,6 +75,7 @@ class SdkDnfCommand(BaseCommand):
 
         # Get repo_url from config, if it exists
         repo_url = config.get("sdk", {}).get("repo_url")
+        repo_release = config.get("sdk", {}).get("repo_release")
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
@@ -90,7 +93,7 @@ class SdkDnfCommand(BaseCommand):
 
         # Build dnf command
         command = f"RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF {
-            ' '.join(dnf_args)}"
+            ' '.join(command_args)}"
 
         # Run the DNF command using the container helper
         success = container_helper.run_in_container(
@@ -100,6 +103,7 @@ class SdkDnfCommand(BaseCommand):
             source_environment=False,
             use_entrypoint=True,
             repo_url=repo_url,
+            repo_release=config.get("sdk", {}).get("repo_release"),
         )
 
         # Log the result
@@ -112,24 +116,23 @@ class SdkDnfCommand(BaseCommand):
 
     def _print_help(self):
         """Print custom help message."""
-        print("usage: avocado sdk dnf [-h] [-c CONFIG] -- <dnf_args>...")
+        print("usage: avocado sdk dnf [-h] [-C CONFIG] -c COMMAND...")
         print()
         print("Run DNF commands in the SDK context")
         print()
         print("options:")
         print("  -h, --help            show this help message and exit")
-        print("  -c CONFIG, --config CONFIG")
+        print("  -C CONFIG, --config CONFIG")
         print(
             "                        Path to avocado.toml configuration file (default: avocado.toml)"
         )
+        print("  -c COMMAND, --command COMMAND")
+        print("                        DNF command and arguments to execute (required)")
         print()
-        print("dnf_args:")
-        print("  Any DNF command and arguments to execute")
-        print("  Note: Use '--' to separate DNF arguments from SDK arguments")
         print()
         print("Examples:")
-        print("  avocado sdk dnf -- repolist --enabled")
-        print("  avocado sdk dnf -- search python")
-        print("  avocado sdk dnf -- install gcc make")
-        print("  avocado sdk dnf -- --reinstall install cmake")
-        print("  avocado sdk dnf -- list installed")
+        print("  avocado sdk dnf -c repolist --enabled")
+        print("  avocado sdk dnf -c search python")
+        print("  avocado sdk dnf -c install gcc make")
+        print("  avocado sdk dnf -c --reinstall install cmake")
+        print("  avocado sdk dnf -c list installed")

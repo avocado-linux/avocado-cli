@@ -20,7 +20,7 @@ class SdkRunCommand(BaseCommand):
             "run", help="Create and run an SDK container"
         )
         run_parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -49,7 +49,8 @@ class SdkRunCommand(BaseCommand):
             "-v", "--verbose", action="store_true", help="Enable verbose output"
         )
         run_parser.add_argument(
-            "command",
+            "-c",
+            "--command",
             nargs="*",
             help="Command and arguments to run in container. Used if --interactive is not specified.",
         )
@@ -66,13 +67,13 @@ class SdkRunCommand(BaseCommand):
         except FileNotFoundError:
             print_error(
                 f"Config file not found at {
-                abs_config_path}"
+                    abs_config_path}"
             )
             raise
         except Exception as e:
             print_error(
                 f"loading config file {
-                abs_config_path}: {e}"
+                    abs_config_path}: {e}"
             )
             raise
 
@@ -80,7 +81,8 @@ class SdkRunCommand(BaseCommand):
         """Extract container image from config."""
         container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            raise ValueError("No container image specified in config under 'sdk.image'")
+            raise ValueError(
+                "No container image specified in config under 'sdk.image'")
         return container_image
 
     def _get_target_architecture(self, config, resolved_target):
@@ -120,8 +122,13 @@ class SdkRunCommand(BaseCommand):
 
             config = self._load_config(args.config)
             container_image = self._get_container_image(config)
-            target_arch = self._get_target_architecture(config, args.resolved_target)
+            target_arch = self._get_target_architecture(
+                config, args.resolved_target)
             container_helper = SdkContainer()
+
+            # Get repo_url from config, if it exists
+            repo_url = config.get("sdk", {}).get("repo_url")
+            repo_release = config.get("sdk", {}).get("repo_release")
 
             if args.name:
                 print(f"Container name: {args.name}")
@@ -138,6 +145,8 @@ class SdkRunCommand(BaseCommand):
                 verbose=args.verbose,
                 source_environment=False,
                 interactive=args.interactive,
+                repo_url=repo_url,
+                repo_release=repo_release,
             )
 
             if success:
@@ -158,6 +167,6 @@ class SdkRunCommand(BaseCommand):
         except Exception as e:
             print_error(
                 f"An unexpected error occurred in 'sdk run': {
-                e}"
+                    e}"
             )
             return False

@@ -20,7 +20,7 @@ class SdkInstallCommand(BaseCommand):
 
         # Add config file argument
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -66,11 +66,13 @@ class SdkInstallCommand(BaseCommand):
         # Get the SDK image and target from configuration
         container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            print_error("No container image specified in config under 'sdk.image'")
+            print_error(
+                "No container image specified in config under 'sdk.image'")
             return False
 
         # Get repo_url from config, if it exists
         repo_url = config.get("sdk", {}).get("repo_url")
+        repo_release = config.get("sdk", {}).get("repo_release")
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
@@ -130,6 +132,7 @@ $DNF_SDK_HOST \
                     source_environment=False,
                     interactive=not args.force,
                     repo_url=repo_url,
+                    repo_release=repo_release,
                 )
 
                 if install_success:
@@ -183,17 +186,19 @@ $DNF_SDK_HOST \
                         source_environment=False,
                         interactive=not args.force,
                         repo_url=repo_url,
+                        repo_release_=repo_release_,
                     )
 
                     if not install_success:
                         print_error(
                             f"Failed to install dependencies for compile section '{
-                                    section_name}'."
+                                section_name}'."
                         )
                         return False
                 else:
                     print_info(
-                        f"({index}/{total}) [sdk.compile.{section_name}.dependencies] no dependencies."
+                        f"({index}/{total}) [sdk.compile.{
+                            section_name}.dependencies] no dependencies."
                     )
 
             print_success("Installed SDK compile dependencies.")

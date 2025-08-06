@@ -22,7 +22,7 @@ class RuntimeBuildCommand(BaseCommand):
 
         # Optional arguments
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -66,7 +66,8 @@ class RuntimeBuildCommand(BaseCommand):
 
         # Check if runtime exists
         if runtime_name not in runtime_config:
-            print_error(f"Runtime '{runtime_name}' not found in configuration.")
+            print_error(
+                f"Runtime '{runtime_name}' not found in configuration.")
             return False
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
@@ -76,7 +77,8 @@ class RuntimeBuildCommand(BaseCommand):
         )
         if not target_arch:
             print_error(
-                f"No target architecture specified for runtime '{runtime_name}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{runtime_name}.target'."
+                f"No target architecture specified for runtime '{
+                    runtime_name}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{runtime_name}.target'."
             )
             return False
 
@@ -140,7 +142,8 @@ $DNF_SDK_HOST \
             print_info("avocado-pkg-images already installed.")
 
         # Build var image first
-        build_script = self._create_build_script(config, target_arch, runtime_name)
+        build_script = self._create_build_script(
+            config, target_arch, runtime_name)
 
         if verbose:
             print_info("Executing complete image build script.")

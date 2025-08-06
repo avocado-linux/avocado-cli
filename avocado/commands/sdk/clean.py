@@ -19,7 +19,7 @@ class SdkCleanCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -44,11 +44,13 @@ class SdkCleanCommand(BaseCommand):
         # Get the SDK image and target from configuration
         container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            print_error("No container image specified in config under 'sdk.image'")
+            print_error(
+                "No container image specified in config under 'sdk.image'")
             return False
 
         # Get repo_url from config, if it exists
         repo_url = config.get("sdk", {}).get("repo_url")
+        repo_release = config.get("sdk", {}).get("repo_release")
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
@@ -76,6 +78,7 @@ class SdkCleanCommand(BaseCommand):
             verbose=verbose,
             source_environment=False,
             repo_url=repo_url,
+            repo_release=config.get("sdk", {}).get("repo_release"),
         )
 
         if success:

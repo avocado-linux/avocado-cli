@@ -30,7 +30,7 @@ class ExtImageCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -52,7 +52,8 @@ class ExtImageCommand(BaseCommand):
         # Get extension configuration
         ext_config = config.get("ext", {}).get(extension_name)
         if not ext_config:
-            print_error(f"Extension '{extension_name}' not found in configuration.")
+            print_error(
+                f"Extension '{extension_name}' not found in configuration.")
             return False
 
         # Get extension types (sysext, confext) from boolean flags
@@ -64,7 +65,8 @@ class ExtImageCommand(BaseCommand):
 
         if not ext_types:
             print_error(
-                f"Extension '{extension_name}' has sysext=false and confext=false. At least one must be true to create image."
+                f"Extension '{
+                    extension_name}' has sysext=false and confext=false. At least one must be true to create image."
             )
             return False
 
@@ -98,7 +100,7 @@ class ExtImageCommand(BaseCommand):
         for ext_type in ext_types:
             print_info(
                 f"Creating {ext_type} image for extension '{
-                       extension_name}'."
+                    extension_name}'."
             )
 
             result = self._create_image(
@@ -113,12 +115,12 @@ class ExtImageCommand(BaseCommand):
             if result:
                 print_success(
                     f"Successfully created {ext_type} image for extension '{
-                              extension_name}'."
+                        extension_name}'."
                 )
             else:
                 print_error(
                     f"Failed to create {ext_type} image for extension '{
-                            extension_name}'."
+                        extension_name}'."
                 )
                 overall_success = False
 
@@ -134,7 +136,8 @@ class ExtImageCommand(BaseCommand):
         verbose,
     ):
         # Create the build script
-        build_script = self._create_build_script(extension_name, extension_type)
+        build_script = self._create_build_script(
+            extension_name, extension_type)
 
         # Execute the build script in the SDK container
         if verbose:

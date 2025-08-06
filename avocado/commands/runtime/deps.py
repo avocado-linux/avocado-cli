@@ -48,16 +48,18 @@ class RuntimeDepsCommand(BaseCommand):
     @classmethod
     def register_subparser(cls, subparsers):
         """Register the runtime deps command's subparser."""
-        parser = subparsers.add_parser("deps", help="List dependencies for a runtime")
+        parser = subparsers.add_parser(
+            "deps", help="List dependencies for a runtime")
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        parser.add_argument("runtime", help="Runtime name to list dependencies for")
+        parser.add_argument(
+            "runtime", help="Runtime name to list dependencies for")
 
         return parser
 
@@ -73,7 +75,8 @@ class RuntimeDepsCommand(BaseCommand):
 
         # Check if runtime section exists
         if "runtime" not in config:
-            print_error(f"Runtime '{runtime_name}' not found in configuration.")
+            print_error(
+                f"Runtime '{runtime_name}' not found in configuration.")
             return False
         runtime_config = config["runtime"]
 
@@ -83,7 +86,7 @@ class RuntimeDepsCommand(BaseCommand):
         ):
             print_error(
                 f"Runtime '{
-                runtime_name}' not found in configuration."
+                    runtime_name}' not found in configuration."
             )
             return False
 

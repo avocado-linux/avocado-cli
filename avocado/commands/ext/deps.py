@@ -18,7 +18,8 @@ class ExtDepsCommand(BaseCommand):
         elif isinstance(package_spec, dict):
             if "version" in package_spec:
                 # Object with version: "package-name = { version = "1.0.0" }"
-                dependencies.append(("pkg", package_name, package_spec["version"]))
+                dependencies.append(
+                    ("pkg", package_name, package_spec["version"]))
             elif "ext" in package_spec:
                 # Extension reference
                 ext_name = package_spec["ext"]
@@ -45,7 +46,8 @@ class ExtDepsCommand(BaseCommand):
                             "dependencies"
                         ].items():
                             if isinstance(dep_spec, str):
-                                dependencies.append(("pkg", dep_name, dep_spec))
+                                dependencies.append(
+                                    ("pkg", dep_name, dep_spec))
                             elif isinstance(dep_spec, dict) and "version" in dep_spec:
                                 dependencies.append(
                                     ("pkg", dep_name, dep_spec["version"])
@@ -92,13 +94,14 @@ class ExtDepsCommand(BaseCommand):
         )
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
         )
 
-        parser.add_argument("extension", help="Extension name to list dependencies for")
+        parser.add_argument(
+            "extension", help="Extension name to list dependencies for")
 
         return parser
 

@@ -48,7 +48,7 @@ class SdkCompileCommand(BaseCommand):
         parser = subparsers.add_parser("compile", help="Run compile scripts")
 
         parser.add_argument(
-            "-c",
+            "-C",
             "--config",
             default="avocado.toml",
             help="Path to avocado.toml configuration file (default: avocado.toml)",
@@ -87,17 +87,18 @@ class SdkCompileCommand(BaseCommand):
         # Filter sections if specific ones were requested
         if sections:
             requested_sections = set(sections)
-            available_sections = {section["name"] for section in compile_sections}
+            available_sections = {section["name"]
+                                  for section in compile_sections}
             missing_sections = requested_sections - available_sections
 
             if missing_sections:
                 print_error(
                     f"The following compile sections were not found: {
-                    ', '.join(missing_sections)}"
+                        ', '.join(missing_sections)}"
                 )
                 print(
                     f"Available sections: {', '.join(
-                    available_sections)}",
+                        available_sections)}",
                     file=sys.stderr,
                 )
                 return False
@@ -108,17 +109,19 @@ class SdkCompileCommand(BaseCommand):
 
         print(
             f"Found {len(compile_sections)} compile section(s) to process: {
-              ', '.join([s['name'] for s in compile_sections])}"
+                ', '.join([s['name'] for s in compile_sections])}"
         )
 
         # Get the SDK image from configuration
         container_image = config.get("sdk", {}).get("image")
         if not container_image:
-            print_error("No container image specified in config under 'sdk.image'")
+            print_error(
+                "No container image specified in config under 'sdk.image'")
             return False
 
         # Get repo_url from config, if it exists
         repo_url = config.get("sdk", {}).get("repo_url")
+        repo_release = config.get("sdk", {}).get("repo_release")
 
         # Use resolved target (from CLI/env) if available, otherwise fall back to config
         config_target = get_target_from_config(config)
@@ -140,7 +143,7 @@ class SdkCompileCommand(BaseCommand):
 
             print_info(
                 f"Compiling section '{
-                section_name}' with script '{compile_script}'"
+                    section_name}' with script '{compile_script}'"
             )
 
             container_helper = SdkContainer()
@@ -155,6 +158,7 @@ class SdkCompileCommand(BaseCommand):
                 verbose=verbose,
                 source_environment=True,
                 repo_url=repo_url,
+                repo_release=config.get("sdk", {}).get("repo_release"),
             )
 
             if success:
@@ -162,14 +166,14 @@ class SdkCompileCommand(BaseCommand):
             else:
                 print_error(
                     f"Failed to compile section '{
-                    section_name}'."
+                        section_name}'."
                 )
                 overall_success = False
 
         if overall_success:
             print_success(
                 f"All {len(compile_sections)
-                                 } compile section(s) completed successfully!"
+                       } compile section(s) completed successfully!"
             )
 
         return overall_success
