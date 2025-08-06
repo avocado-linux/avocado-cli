@@ -100,9 +100,9 @@ list installed avocado-pkg-images >/dev/null 2>&1
                 container_image,
                 &target_arch,
                 &dnf_check_script,
-                true,  // rm
-                false, // interactive
-                false, // source_environment
+                self.verbose, // verbose
+                false,        // source_environment (simple check doesn't need full env)
+                false,        // interactive (non-interactive check)
             )
             .await
             .unwrap_or(false);
@@ -136,9 +136,9 @@ $DNF_SDK_HOST \
                     container_image,
                     &target_arch,
                     &dnf_install_script,
-                    true,        // rm
-                    !self.force, // interactive (opposite of force)
-                    false,       // source_environment
+                    self.verbose, // verbose
+                    true,         // source_environment (need environment for DNF)
+                    !self.force,  // interactive (opposite of force)
                 )
                 .await
                 .context("Failed to install avocado-pkg-images package")?;
@@ -172,9 +172,9 @@ $DNF_SDK_HOST \
                 container_image,
                 &target_arch,
                 &build_script,
-                true,  // rm
-                false, // interactive
-                true,  // source_environment
+                self.verbose, // verbose
+                true,         // source_environment (need environment for build)
+                false,        // interactive (build script runs non-interactively)
             )
             .await
             .context("Failed to build complete image")?;

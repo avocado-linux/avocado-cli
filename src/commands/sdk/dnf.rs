@@ -118,7 +118,7 @@ impl SdkDnfCommand {
         // Use entrypoint to set up environment, then run DNF command
         let full_command = format!(
             "{}\n{}",
-            container_helper.create_entrypoint_script(),
+            container_helper.create_entrypoint_script(true),
             command
         );
 

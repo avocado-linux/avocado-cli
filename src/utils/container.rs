@@ -66,10 +66,9 @@ impl SdkContainer {
         // Build the complete command
         let mut full_command = String::new();
 
-        if source_environment {
-            full_command.push_str(&self.create_entrypoint_script());
-            full_command.push('\n');
-        }
+        // Always include the entrypoint script for environment setup, but conditionally source the environment-setup file
+        full_command.push_str(&self.create_entrypoint_script(source_environment));
+        full_command.push('\n');
 
         full_command.push_str(command);
 
@@ -200,8 +199,8 @@ impl SdkContainer {
     }
 
     /// Create the entrypoint script for SDK initialization
-    pub fn create_entrypoint_script(&self) -> String {
-        r#"
+    pub fn create_entrypoint_script(&self, source_environment: bool) -> String {
+        let mut script = r#"
 set -e
 
 # Get codename from environment or os-release
@@ -294,22 +293,26 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
         --installroot ${AVOCADO_SDK_PREFIX}/target-sysroot \
         install \
         packagegroup-core-standalone-sdk-target
-
-    # mkdir -p $AVOCADO_PREFIX/sysext/var/lib
-    # mkdir -p $AVOCADO_PREFIX/confext/var/lib
-    # cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_PREFIX/sysext/var/lib
-    # cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_PREFIX/confext/var/lib
 fi
 
 export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
 
 cd /opt/_avocado/src
+"#.to_string();
 
+        // Conditionally add environment sourcing based on the source_environment parameter
+        if source_environment {
+            script.push_str(
+                r#"
 # Source the environment setup if it exists
 if [ -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     source "${AVOCADO_SDK_PREFIX}/environment-setup"
 fi
-"#.to_string()
+"#,
+            );
+        }
+
+        script
     }
 }
 
@@ -366,7 +369,7 @@ mod tests {
     #[test]
     fn test_entrypoint_script() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script();
+        let script = container.create_entrypoint_script(true);
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
