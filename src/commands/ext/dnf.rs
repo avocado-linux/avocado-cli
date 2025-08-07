@@ -11,6 +11,8 @@ pub struct ExtDnfCommand {
     command: Vec<String>,
     verbose: bool,
     target: Option<String>,
+    container_args: Option<Vec<String>>,
+    dnf_args: Option<Vec<String>>,
 }
 
 impl ExtDnfCommand {
@@ -20,6 +22,8 @@ impl ExtDnfCommand {
         command: Vec<String>,
         verbose: bool,
         target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             config_path,
@@ -27,6 +31,8 @@ impl ExtDnfCommand {
             command,
             verbose,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -164,6 +170,8 @@ impl ExtDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let dir_exists = container_helper.run_in_container(config).await?;
@@ -205,6 +213,8 @@ impl ExtDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let setup_success = container_helper.run_in_container(config).await?;
@@ -255,6 +265,8 @@ impl ExtDnfCommand {
             interactive: true,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let success = container_helper.run_in_container(config).await?;
@@ -270,7 +282,12 @@ impl ExtDnfCommand {
 
     fn build_dnf_command(&self) -> String {
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension);
-        let dnf_args_str = self.command.join(" ");
+        let command_args_str = self.command.join(" ");
+        let dnf_args_str = if let Some(args) = &self.dnf_args {
+            format!(" {} ", args.join(" "))
+        } else {
+            String::new()
+        };
 
         format!(
             r#"
@@ -280,7 +297,8 @@ $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
-    {dnf_args_str}
+    {dnf_args_str} \
+    {command_args_str}
 "#
         )
     }

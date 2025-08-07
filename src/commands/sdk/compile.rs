@@ -26,6 +26,10 @@ pub struct SdkCompileCommand {
     pub sections: Vec<String>,
     /// Global target architecture
     pub target: Option<String>,
+    /// Additional arguments to pass to the container runtime
+    pub container_args: Option<Vec<String>>,
+    /// Additional arguments to pass to DNF commands
+    pub dnf_args: Option<Vec<String>>,
 }
 
 impl SdkCompileCommand {
@@ -35,12 +39,16 @@ impl SdkCompileCommand {
         verbose: bool,
         sections: Vec<String>,
         target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             config_path,
             verbose,
             sections,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -139,6 +147,8 @@ impl SdkCompileCommand {
                 verbose: self.verbose,
                 source_environment: true,
                 interactive: false,
+                container_args: self.container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(config).await?;
@@ -219,6 +229,8 @@ mod tests {
             true,
             vec!["app".to_string()],
             Some("test-target".to_string()),
+            None,
+            None,
         );
 
         assert_eq!(cmd.config_path, "config.toml");
@@ -229,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_get_compile_sections_from_config() {
-        let cmd = SdkCompileCommand::new("test.toml".to_string(), false, vec![], None);
+        let cmd = SdkCompileCommand::new("test.toml".to_string(), false, vec![], None, None, None);
 
         let config_content = r#"
 [sdk]
@@ -267,6 +279,8 @@ dependencies = { make = "*" }
             false,
             vec!["nonexistent".to_string()],
             None,
+            None,
+            None,
         );
 
         let config_content = r#"
@@ -287,7 +301,7 @@ dependencies = { gcc = "*" }
 
     #[test]
     fn test_find_compile_script_in_section() {
-        let cmd = SdkCompileCommand::new("test.toml".to_string(), false, vec![], None);
+        let cmd = SdkCompileCommand::new("test.toml".to_string(), false, vec![], None, None, None);
 
         // Test section with compile script
         let mut deps = std::collections::HashMap::new();

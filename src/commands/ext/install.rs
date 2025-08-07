@@ -11,6 +11,8 @@ pub struct ExtInstallCommand {
     verbose: bool,
     force: bool,
     target: Option<String>,
+    container_args: Option<Vec<String>>,
+    dnf_args: Option<Vec<String>>,
 }
 
 impl ExtInstallCommand {
@@ -20,6 +22,8 @@ impl ExtInstallCommand {
         verbose: bool,
         force: bool,
         target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             extension,
@@ -27,6 +31,8 @@ impl ExtInstallCommand {
             verbose,
             force,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -190,6 +196,8 @@ impl ExtInstallCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let sysroot_exists = container_helper.run_in_container(run_config).await?;
@@ -205,6 +213,8 @@ impl ExtInstallCommand {
                 interactive: false,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
+                container_args: self.container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(run_config).await?;
@@ -263,6 +273,11 @@ impl ExtInstallCommand {
                 // Build DNF install command
                 let yes = if self.force { "-y" } else { "" };
                 let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension}");
+                let dnf_args_str = if let Some(args) = &self.dnf_args {
+                    format!(" {} ", args.join(" "))
+                } else {
+                    String::new()
+                };
                 let command = format!(
                     r#"
 RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
@@ -271,11 +286,13 @@ $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={} \
+    {} \
     install \
     {} \
     {}
 "#,
                     installroot,
+                    dnf_args_str,
                     yes,
                     packages.join(" ")
                 );
@@ -294,6 +311,8 @@ $DNF_SDK_HOST \
                     interactive: !self.force,  // interactive if not forced
                     repo_url: repo_url.cloned(),
                     repo_release: repo_release.cloned(),
+                    container_args: self.container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
                     ..Default::default()
                 };
                 let install_success = container_helper.run_in_container(run_config).await?;

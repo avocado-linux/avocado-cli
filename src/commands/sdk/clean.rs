@@ -17,15 +17,27 @@ pub struct SdkCleanCommand {
     pub verbose: bool,
     /// Global target architecture
     pub target: Option<String>,
+    /// Additional arguments to pass to the container runtime
+    pub container_args: Option<Vec<String>>,
+    /// Additional arguments to pass to DNF commands
+    pub dnf_args: Option<Vec<String>>,
 }
 
 impl SdkCleanCommand {
     /// Create a new SdkCleanCommand instance
-    pub fn new(config_path: String, verbose: bool, target: Option<String>) -> Self {
+    pub fn new(
+        config_path: String,
+        verbose: bool,
+        target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
+    ) -> Self {
         Self {
             config_path,
             verbose,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -68,6 +80,8 @@ impl SdkCleanCommand {
             verbose: self.verbose,
             source_environment: false, // don't source environment
             interactive: false,
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let success = container_helper.run_in_container(config).await?;
@@ -93,6 +107,8 @@ mod tests {
             "config.toml".to_string(),
             true,
             Some("test-target".to_string()),
+            None,
+            None,
         );
 
         assert_eq!(cmd.config_path, "config.toml");
@@ -102,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_new_minimal() {
-        let cmd = SdkCleanCommand::new("config.toml".to_string(), false, None);
+        let cmd = SdkCleanCommand::new("config.toml".to_string(), false, None, None, None);
 
         assert_eq!(cmd.config_path, "config.toml");
         assert!(!cmd.verbose);

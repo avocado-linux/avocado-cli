@@ -27,6 +27,10 @@ pub struct SdkRunCommand {
     pub command: Option<Vec<String>>,
     /// Global target architecture
     pub target: Option<String>,
+    /// Additional arguments to pass to the container runtime
+    pub container_args: Option<Vec<String>>,
+    /// Additional arguments to pass to DNF commands
+    pub dnf_args: Option<Vec<String>>,
 }
 
 impl SdkRunCommand {
@@ -41,6 +45,8 @@ impl SdkRunCommand {
         verbose: bool,
         command: Option<Vec<String>>,
         target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             config_path,
@@ -51,6 +57,8 @@ impl SdkRunCommand {
             verbose,
             command,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -116,6 +124,7 @@ impl SdkRunCommand {
                 verbose: self.verbose,
                 source_environment: false, // don't source environment
                 interactive: false,        // not interactive
+                container_args: self.container_args.clone(),
                 ..Default::default()
             };
             container_helper.run_in_container(config).await?
@@ -211,6 +220,8 @@ impl SdkRunCommand {
             verbose: self.verbose,
             source_environment: false,
             interactive: true,
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         container_helper.run_in_container(config).await
@@ -232,6 +243,8 @@ mod tests {
             true,
             Some(vec!["echo".to_string(), "test".to_string()]),
             Some("test-target".to_string()),
+            None,
+            None,
         );
 
         assert_eq!(cmd.config_path, "config.toml");
@@ -258,6 +271,8 @@ mod tests {
             false,
             None,
             None,
+            None,
+            None,
         );
 
         let result = cmd.execute().await;
@@ -278,6 +293,8 @@ mod tests {
             false, // not interactive
             false,
             None, // no command
+            None,
+            None,
             None,
         );
 

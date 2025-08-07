@@ -10,6 +10,8 @@ pub struct ExtCleanCommand {
     config_path: String,
     verbose: bool,
     target: Option<String>,
+    container_args: Option<Vec<String>>,
+    dnf_args: Option<Vec<String>>,
 }
 
 impl ExtCleanCommand {
@@ -18,12 +20,16 @@ impl ExtCleanCommand {
         config_path: String,
         verbose: bool,
         target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             extension,
             config_path,
             verbose,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -122,6 +128,8 @@ impl ExtCleanCommand {
             verbose: self.verbose,
             source_environment: false, // don't source environment
             interactive: false,
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let success = container_helper.run_in_container(config).await?;

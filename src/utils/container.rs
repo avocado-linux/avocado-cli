@@ -27,6 +27,7 @@ pub struct RunConfig {
     pub repo_url: Option<String>,
     pub repo_release: Option<String>,
     pub container_args: Option<Vec<String>>,
+    pub dnf_args: Option<Vec<String>>,
 }
 
 impl Default for RunConfig {
@@ -46,6 +47,7 @@ impl Default for RunConfig {
             repo_url: None,
             repo_release: None,
             container_args: None,
+            dnf_args: None,
         }
     }
 }
@@ -102,6 +104,9 @@ impl SdkContainer {
         }
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
+        }
+        if let Some(dnf_args) = &config.dnf_args {
+            env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
 
         // Build the complete command
@@ -291,6 +296,7 @@ dnf \
 --releasever="$REPO_RELEASE" \
 --best \
 --setopt=tsflags=noscripts \
+${AVOCADO_DNF_ARGS:-} \
 "
 
 export DNF_SDK_HOST_OPTS="\

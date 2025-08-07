@@ -17,15 +17,27 @@ pub struct SdkDnfCommand {
     pub command: Vec<String>,
     /// Global target architecture
     pub target: Option<String>,
+    /// Additional arguments to pass to the container runtime
+    pub container_args: Option<Vec<String>>,
+    /// Additional arguments to pass to DNF commands
+    pub dnf_args: Option<Vec<String>>,
 }
 
 impl SdkDnfCommand {
     /// Create a new SdkDnfCommand instance
-    pub fn new(config_path: String, command: Vec<String>, target: Option<String>) -> Self {
+    pub fn new(
+        config_path: String,
+        command: Vec<String>,
+        target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
+    ) -> Self {
         Self {
             config_path,
             command,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -62,8 +74,14 @@ impl SdkDnfCommand {
         let container_helper = SdkContainer::new();
 
         // Build DNF command
+        let dnf_args_str = if let Some(args) = &self.dnf_args {
+            format!(" {} ", args.join(" "))
+        } else {
+            String::new()
+        };
         let command = format!(
-            "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF {}",
+            "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF {} {}",
+            dnf_args_str,
             self.command.join(" ")
         );
 
@@ -110,6 +128,8 @@ impl SdkDnfCommand {
             interactive: true,        // allow user input for DNF prompts
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         container_helper.run_in_container(config).await
@@ -126,6 +146,8 @@ mod tests {
             "config.toml".to_string(),
             vec!["install".to_string(), "gcc".to_string()],
             Some("test-target".to_string()),
+            None,
+            None,
         );
 
         assert_eq!(cmd.config_path, "config.toml");
@@ -135,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_command() {
-        let cmd = SdkDnfCommand::new("config.toml".to_string(), vec![], None);
+        let cmd = SdkDnfCommand::new("config.toml".to_string(), vec![], None, None, None);
 
         let result = cmd.execute().await;
         assert!(result.is_err());

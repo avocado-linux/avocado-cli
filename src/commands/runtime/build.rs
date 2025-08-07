@@ -13,6 +13,8 @@ pub struct RuntimeBuildCommand {
     verbose: bool,
     force: bool,
     target: Option<String>,
+    container_args: Option<Vec<String>>,
+    dnf_args: Option<Vec<String>>,
 }
 
 impl RuntimeBuildCommand {
@@ -22,6 +24,8 @@ impl RuntimeBuildCommand {
         verbose: bool,
         force: bool,
         target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             runtime_name,
@@ -29,6 +33,8 @@ impl RuntimeBuildCommand {
             verbose,
             force,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -102,6 +108,8 @@ list installed avocado-pkg-images >/dev/null 2>&1
             verbose: self.verbose,
             source_environment: false, // simple check doesn't need full env
             interactive: false,
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let package_installed = container_helper
@@ -115,6 +123,11 @@ list installed avocado-pkg-images >/dev/null 2>&1
                 OutputLevel::Normal,
             );
             let yes = if self.force { "-y" } else { "" };
+            let dnf_args_str = if let Some(args) = &self.dnf_args {
+                format!(" {} ", args.join(" "))
+            } else {
+                String::new()
+            };
 
             // Create DNF install script
             let dnf_install_script = format!(
@@ -125,11 +138,12 @@ $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot=$AVOCADO_PREFIX/runtimes/{} \
+    {} \
     install \
     {} \
     avocado-pkg-images
 "#,
-                self.runtime_name, yes
+                self.runtime_name, dnf_args_str, yes
             );
 
             // Run the DNF install command
@@ -140,6 +154,8 @@ $DNF_SDK_HOST \
                 verbose: self.verbose,
                 source_environment: true, // need environment for DNF
                 interactive: !self.force,
+                container_args: self.container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
                 ..Default::default()
             };
             let install_result = container_helper
@@ -178,6 +194,8 @@ $DNF_SDK_HOST \
             verbose: self.verbose,
             source_environment: true, // need environment for build
             interactive: false,       // build script runs non-interactively
+            container_args: self.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
         let complete_result = container_helper
@@ -326,6 +344,8 @@ mod tests {
             false,
             false,
             Some("x86_64".to_string()),
+            None,
+            None,
         );
 
         assert_eq!(cmd.runtime_name, "test-runtime");
@@ -354,6 +374,8 @@ test-dep = { ext = "test-ext" }
             false,
             false,
             Some("x86_64".to_string()),
+            None,
+            None,
         );
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
@@ -387,6 +409,8 @@ confext = false
             false,
             false,
             Some("x86_64".to_string()),
+            None,
+            None,
         );
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();

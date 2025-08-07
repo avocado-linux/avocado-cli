@@ -20,16 +20,29 @@ pub struct SdkInstallCommand {
     pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
+    /// Additional arguments to pass to the container runtime
+    pub container_args: Option<Vec<String>>,
+    /// Additional arguments to pass to DNF commands
+    pub dnf_args: Option<Vec<String>>,
 }
 
 impl SdkInstallCommand {
     /// Create a new SdkInstallCommand instance
-    pub fn new(config_path: String, verbose: bool, force: bool, target: Option<String>) -> Self {
+    pub fn new(
+        config_path: String,
+        verbose: bool,
+        force: bool,
+        target: Option<String>,
+        container_args: Option<Vec<String>>,
+        dnf_args: Option<Vec<String>>,
+    ) -> Self {
         Self {
             config_path,
             verbose,
             force,
             target,
+            container_args,
+            dnf_args,
         }
     }
 
@@ -70,6 +83,11 @@ impl SdkInstallCommand {
 
             if !sdk_packages.is_empty() {
                 let yes = if self.force { "-y" } else { "" };
+                let dnf_args_str = if let Some(args) = &self.dnf_args {
+                    format!(" {} ", args.join(" "))
+                } else {
+                    String::new()
+                };
 
                 let command = format!(
                     r#"
@@ -78,10 +96,12 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_REPO_CONF \
+    {} \
     install \
     {} \
     {}
 "#,
+                    dnf_args_str,
                     yes,
                     sdk_packages.join(" ")
                 );
@@ -94,6 +114,8 @@ $DNF_SDK_HOST \
                     verbose: self.verbose,
                     source_environment: true,
                     interactive: !self.force,
+                    container_args: self.container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
                     ..Default::default()
                 };
                 let install_success = container_helper.run_in_container(config).await?;
@@ -119,17 +141,24 @@ $DNF_SDK_HOST \
                 if !compile_packages.is_empty() {
                     let installroot = "${AVOCADO_SDK_PREFIX}/target-sysroot";
                     let yes = if self.force { "-y" } else { "" };
+                    let dnf_args_str = if let Some(args) = &self.dnf_args {
+                        format!(" {} ", args.join(" "))
+                    } else {
+                        String::new()
+                    };
                     let command = format!(
                         r#"
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     --installroot {} \
     $DNF_SDK_TARGET_REPO_CONF \
+    {} \
     install \
     {} \
     {}
 "#,
                         installroot,
+                        dnf_args_str,
                         yes,
                         compile_packages.join(" ")
                     );
@@ -152,6 +181,8 @@ $DNF_SDK_HOST \
                         verbose: self.verbose,
                         source_environment: true,
                         interactive: !self.force,
+                        container_args: self.container_args.clone(),
+                        dnf_args: self.dnf_args.clone(),
                         ..Default::default()
                     };
                     let install_success = container_helper.run_in_container(config).await?;
@@ -215,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_build_package_list() {
-        let cmd = SdkInstallCommand::new("test.toml".to_string(), false, false, None);
+        let cmd = SdkInstallCommand::new("test.toml".to_string(), false, false, None, None, None);
 
         let mut deps = HashMap::new();
         deps.insert("package1".to_string(), Value::String("*".to_string()));
@@ -237,6 +268,8 @@ mod tests {
             true,
             false,
             Some("test-target".to_string()),
+            None,
+            None,
         );
 
         assert_eq!(cmd.config_path, "config.toml");
