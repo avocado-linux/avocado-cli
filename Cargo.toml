@@ -1,5 +1,5 @@
 [package]
-name = "avocado-cli"
+name = "avocado"
 version = "0.2.0"
 edition = "2021"
 description = "Command line interface for Avocado."

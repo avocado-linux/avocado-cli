@@ -10,7 +10,9 @@ use commands::ext::{
     ExtInstallCommand, ExtListCommand,
 };
 use commands::init::InitCommand;
-use commands::runtime::{RuntimeBuildCommand, RuntimeDepsCommand, RuntimeListCommand};
+use commands::runtime::{
+    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeListCommand, RuntimeProvisionCommand,
+};
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkRunCommand,
@@ -85,7 +87,7 @@ enum SdkCommands {
         #[arg(short = 'c', long = "command", num_args = 0.., allow_hyphen_values = true)]
         command: Option<Vec<String>>,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -114,7 +116,7 @@ enum SdkCommands {
         /// Specific compile sections to run
         sections: Vec<String>,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -129,7 +131,7 @@ enum SdkCommands {
         #[arg(short = 'c', long = "command", required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -147,7 +149,7 @@ enum SdkCommands {
         #[arg(short, long)]
         force: bool,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -162,7 +164,7 @@ enum SdkCommands {
         #[arg(short, long)]
         verbose: bool,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -187,11 +189,25 @@ enum RuntimeCommands {
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+    /// Provision a runtime
+    Provision {
+        /// Runtime name to provision
+        runtime: String,
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
     },
     /// List runtime names
     List {
@@ -244,6 +260,17 @@ async fn main() -> Result<()> {
                     dnf_args,
                 );
                 build_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::Provision {
+                runtime,
+                config,
+                verbose,
+                force,
+            } => {
+                let provision_cmd =
+                    RuntimeProvisionCommand::new(runtime, config, verbose, force, cli.target);
+                provision_cmd.execute().await?;
                 Ok(())
             }
             RuntimeCommands::List { config } => {
@@ -478,7 +505,7 @@ enum ExtCommands {
         #[arg(short = 'e', long = "extension")]
         extension: Option<String>,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -496,7 +523,7 @@ enum ExtCommands {
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -532,7 +559,7 @@ enum ExtCommands {
         #[arg(short = 'c', long = "command", required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -550,7 +577,7 @@ enum ExtCommands {
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -568,7 +595,7 @@ enum ExtCommands {
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
         /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-args", num_args = 0.., allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        #[arg(long = "container-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-args", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]

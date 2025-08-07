@@ -193,7 +193,9 @@ impl SdkContainer {
 
         // Add additional container arguments if provided
         if let Some(args) = container_args {
-            container_cmd.extend(args.iter().cloned());
+            for arg in args {
+                container_cmd.extend(Self::parse_container_arg(arg));
+            }
         }
 
         // Add the container image
@@ -395,6 +397,44 @@ fi
 
         script
     }
+
+    /// Parse a container argument, splitting on spaces while respecting quotes
+    fn parse_container_arg(arg: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut chars = arg.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    in_quotes = !in_quotes;
+                }
+                ' ' if !in_quotes => {
+                    if !current.is_empty() {
+                        result.push(current.trim().to_string());
+                        current.clear();
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            result.push(current.trim().to_string());
+        }
+
+        // If no spaces were found and no quotes, return the original string
+        if result.len() == 1 && result[0] == arg {
+            vec![arg.to_string()]
+        } else if result.is_empty() {
+            vec![arg.to_string()]
+        } else {
+            result
+        }
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +495,32 @@ mod tests {
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
+    }
+
+    #[test]
+    fn test_parse_container_arg_single() {
+        let result = SdkContainer::parse_container_arg("--rm");
+        assert_eq!(result, vec!["--rm"]);
+    }
+
+    #[test]
+    fn test_parse_container_arg_with_spaces() {
+        let result = SdkContainer::parse_container_arg("-v /host:/container");
+        assert_eq!(result, vec!["-v", "/host:/container"]);
+    }
+
+    #[test]
+    fn test_parse_container_arg_with_quotes() {
+        let result = SdkContainer::parse_container_arg("-v \"/path with spaces:/container\"");
+        assert_eq!(result, vec!["-v", "/path with spaces:/container"]);
+    }
+
+    #[test]
+    fn test_parse_container_arg_complex() {
+        let result = SdkContainer::parse_container_arg("-e \"VAR=value with spaces\" --name test");
+        assert_eq!(
+            result,
+            vec!["-e", "VAR=value with spaces", "--name", "test"]
+        );
     }
 }

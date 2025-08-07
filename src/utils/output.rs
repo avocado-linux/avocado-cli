@@ -13,23 +13,23 @@ pub enum OutputLevel {
 
 /// Print an error message to stderr with red color
 pub fn print_error(message: &str, _level: OutputLevel) {
-    eprintln!("\x1b[31mERROR:\x1b[0m {message}");
+    eprintln!("\x1b[91m[ERROR]\x1b[0m {message}");
 }
 
 /// Print a success message to stdout with green color
 pub fn print_success(message: &str, _level: OutputLevel) {
-    println!("\x1b[32mSUCCESS:\x1b[0m {message}");
+    println!("\x1b[92m[SUCCESS]\x1b[0m {message}");
 }
 
 /// Print an info message to stdout with blue color
 pub fn print_info(message: &str, _level: OutputLevel) {
-    println!("\x1b[34mINFO:\x1b[0m {message}");
+    println!("\x1b[94m[INFO]\x1b[0m {message}");
 }
 
 /// Print a warning message to stdout with yellow color
 #[allow(dead_code)]
 pub fn print_warning(message: &str, _level: OutputLevel) {
-    println!("\x1b[33mWARNING:\x1b[0m {message}");
+    println!("\x1b[93m[WARNING]\x1b[0m {message}");
 }
 
 /// Print a message without any color formatting
@@ -41,7 +41,7 @@ pub fn print_plain(message: &str, _level: OutputLevel) {
 /// Print a debug message to stderr with gray color (only in debug builds)
 pub fn print_debug(message: &str, _level: OutputLevel) {
     #[cfg(debug_assertions)]
-    eprintln!("\x1b[90mDEBUG:\x1b[0m {message}");
+    eprintln!("\x1b[90m[DEBUG]\x1b[0m {message}");
 }
 
 /// Flush stdout to ensure immediate output
