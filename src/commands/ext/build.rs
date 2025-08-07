@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::utils::config::load_config;
-use crate::utils::container::SdkContainer;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
 
@@ -214,16 +214,16 @@ impl ExtBuildCommand {
             );
         }
 
-        let result = container_helper
-            .run_in_container(
-                container_image,
-                target_arch,
-                &build_script,
-                self.verbose,
-                true,  // source environment
-                false, // not interactive
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command: build_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            ..Default::default()
+        };
+        let result = container_helper.run_in_container(config).await?;
 
         if self.verbose {
             print_info(
@@ -254,16 +254,16 @@ impl ExtBuildCommand {
             );
         }
 
-        let result = container_helper
-            .run_in_container(
-                container_image,
-                target_arch,
-                &build_script,
-                self.verbose,
-                true,  // source environment
-                false, // not interactive
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command: build_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            ..Default::default()
+        };
+        let result = container_helper.run_in_container(config).await?;
 
         if self.verbose {
             print_info(

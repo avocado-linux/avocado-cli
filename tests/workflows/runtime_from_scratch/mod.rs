@@ -12,7 +12,7 @@ fn qemux86_64() {
 
     assert_cmds(
         &[
-            &["sdk", "run", "-v", "--", ":"],
+            &["sdk", "run", "-v", "-c", ":"],
             // &["sdk", "install", "-f"],
             // &["sdk", "compile"],
             // &["ext", "install", "ext-1"],

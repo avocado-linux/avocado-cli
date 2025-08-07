@@ -14,14 +14,14 @@ fn test_short_help() {
 
 #[test]
 fn test_sdk_run_echo() {
-    let result = common::run_cli_in_temp(&["sdk", "run", "echo", "test"]);
+    let result = common::run_cli_in_temp(&["sdk", "run", "-c", "echo", "test"]);
     // May fail due to container access, but should complete
     common::assert_command_completes(&result);
 }
 
 #[test]
 fn test_sdk_run_simple_command() {
-    let result = common::run_cli_in_temp(&["sdk", "run", "true"]);
+    let result = common::run_cli_in_temp(&["sdk", "run", "-c", "true"]);
     // May fail due to container access, but should complete
     common::assert_command_completes(&result);
 }

@@ -10,6 +10,46 @@ use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
 
+/// Configuration for running commands in containers
+#[derive(Debug, Clone)]
+pub struct RunConfig {
+    pub container_image: String,
+    pub target: String,
+    pub command: String,
+    pub container_name: Option<String>,
+    pub detach: bool,
+    pub rm: bool,
+    pub env_vars: Option<HashMap<String, String>>,
+    pub verbose: bool,
+    pub source_environment: bool,
+    pub use_entrypoint: bool,
+    pub interactive: bool,
+    pub repo_url: Option<String>,
+    pub repo_release: Option<String>,
+    pub container_args: Option<Vec<String>>,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            container_image: String::new(),
+            target: String::new(),
+            command: String::new(),
+            container_name: None,
+            detach: false,
+            rm: true,
+            env_vars: None,
+            verbose: false,
+            source_environment: true,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url: None,
+            repo_release: None,
+            container_args: None,
+        }
+    }
+}
+
 /// Container helper for SDK operations
 pub struct SdkContainer {
     pub container_tool: String,
@@ -50,45 +90,53 @@ impl SdkContainer {
     }
 
     /// Run a command in the container
-    pub async fn run_in_container(
-        &self,
-        container_image: &str,
-        target: &str,
-        command: &str,
-        verbose: bool,
-        source_environment: bool,
-        interactive: bool,
-    ) -> Result<bool> {
+    pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
         // Create _avocado directory
         let avocado_dir = self.cwd.join("_avocado");
         fs::create_dir_all(&avocado_dir).with_context(|| "Failed to create _avocado directory")?;
 
+        // Build environment variables
+        let mut env_vars = config.env_vars.unwrap_or_default();
+        if let Some(url) = &config.repo_url {
+            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
+        }
+        if let Some(release) = &config.repo_release {
+            env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
+        }
+
         // Build the complete command
         let mut full_command = String::new();
 
-        // Always include the entrypoint script for environment setup, but conditionally source the environment-setup file
-        full_command.push_str(&self.create_entrypoint_script(source_environment));
-        full_command.push('\n');
+        // Conditionally include the entrypoint script
+        if config.use_entrypoint {
+            full_command.push_str(&self.create_entrypoint_script(config.source_environment));
+            full_command.push('\n');
+        }
 
-        full_command.push_str(command);
+        full_command.push_str(&config.command);
 
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
         // Build container command
         let container_cmd = self.build_container_command(
-            container_image,
+            &config.container_image,
             &bash_cmd,
-            target,
-            &HashMap::new(),
-            None,
-            false,
-            true,
-            interactive,
+            &config.target,
+            &env_vars,
+            config.container_name.as_deref(),
+            config.detach,
+            config.rm,
+            config.interactive,
+            config.container_args.as_deref(),
         )?;
 
         // Execute the command
-        self.execute_container_command(&container_cmd, false, verbose || self.verbose)
-            .await
+        self.execute_container_command(
+            &container_cmd,
+            config.detach,
+            config.verbose || self.verbose,
+        )
+        .await
     }
 
     /// Build the complete container command
@@ -103,6 +151,7 @@ impl SdkContainer {
         detach: bool,
         rm: bool,
         interactive: bool,
+        container_args: Option<&[String]>,
     ) -> Result<Vec<String>> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
@@ -135,6 +184,11 @@ impl SdkContainer {
         for (key, value) in env_vars {
             container_cmd.push("-e".to_string());
             container_cmd.push(format!("{key}={value}"));
+        }
+
+        // Add additional container arguments if provided
+        if let Some(args) = container_args {
+            container_cmd.extend(args.iter().cloned());
         }
 
         // Add the container image
@@ -203,16 +257,29 @@ impl SdkContainer {
         let mut script = r#"
 set -e
 
-# Get codename from environment or os-release
-if [ -n "$AVOCADO_SDK_CODENAME" ]; then
-    CODENAME="$AVOCADO_SDK_CODENAME"
+# Get repo url from environment or default to prod
+if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
+    REPO_URL="$AVOCADO_SDK_REPO_URL"
 else
+    REPO_URL="https://repo.avocadolinux.org"
+fi
+
+echo "[INFO] Using repo URL: '$REPO_URL'"
+
+# Get repo release from environment or default to prod
+if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
+    REPO_RELEASE="$AVOCADO_SDK_REPO_RELEASE"
+else
+    REPO_RELEASE="https://repo.avocadolinux.org"
+
     # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found
     if [ -f /etc/os-release ]; then
-        CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
     fi
-    CODENAME=${CODENAME:-dev}
+    REPO_RELEASE=${REPO_RELEASE:-dev}
 fi
+
+echo "[INFO] Using repo release: '$REPO_RELEASE'"
 
 export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_SDK_TARGET}"
 export AVOCADO_SDK_PREFIX="${AVOCADO_PREFIX}/sdk"
@@ -221,7 +288,7 @@ export DNF_SDK_HOST_PREFIX="${AVOCADO_SDK_PREFIX}"
 export DNF_SDK_TARGET_PREFIX="${AVOCADO_SDK_PREFIX}/target-repoconf"
 export DNF_SDK_HOST="\
 dnf \
---releasever="$CODENAME" \
+--releasever="$REPO_RELEASE" \
 --best \
 --setopt=tsflags=noscripts \
 "
@@ -248,6 +315,14 @@ export DNF_SDK_TARGET_REPO_CONF="\
 "
 
 export RPM_NO_CHROOT_FOR_SCRIPTS=1
+
+mkdir -p /etc/dnf/vars
+mkdir -p ${AVOCADO_SDK_PREFIX}/etc/dnf/vars
+mkdir -p ${AVOCADO_SDK_PREFIX}/target-repoconf/etc/dnf/vars
+
+echo "${REPO_URL}" > /etc/dnf/vars/repo_url
+echo "${REPO_URL}" > ${DNF_SDK_HOST_PREFIX}/etc/dnf/vars/repo_url
+echo "${REPO_URL}" > ${DNF_SDK_TARGET_PREFIX}/etc/dnf/vars/repo_url
 
 if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     echo "[INFO] Initializing Avocado SDK."
@@ -354,6 +429,7 @@ mod tests {
             false,
             true,
             false,
+            None,
         );
 
         assert!(result.is_ok());

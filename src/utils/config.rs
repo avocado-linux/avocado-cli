@@ -31,6 +31,8 @@ pub struct SdkConfig {
     pub image: Option<String>,
     pub dependencies: Option<HashMap<String, toml::Value>>,
     pub compile: Option<HashMap<String, CompileConfig>>,
+    pub repo_url: Option<String>,
+    pub repo_release: Option<String>,
 }
 
 /// Compile configuration for SDK
@@ -73,6 +75,16 @@ impl Config {
     /// Get SDK dependencies
     pub fn get_sdk_dependencies(&self) -> Option<&HashMap<String, toml::Value>> {
         self.sdk.as_ref()?.dependencies.as_ref()
+    }
+
+    /// Get the SDK repo URL from configuration
+    pub fn get_sdk_repo_url(&self) -> Option<&String> {
+        self.sdk.as_ref()?.repo_url.as_ref()
+    }
+
+    /// Get the SDK repo release from configuration
+    pub fn get_sdk_repo_release(&self) -> Option<&String> {
+        self.sdk.as_ref()?.repo_release.as_ref()
     }
 
     /// Get compile section dependencies

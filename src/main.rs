@@ -82,7 +82,8 @@ enum SdkCommands {
         #[arg(short, long)]
         verbose: bool,
         /// Command and arguments to run in container
-        command: Vec<String>,
+        #[arg(short = 'c', long = "command", num_args = 0.., allow_hyphen_values = true)]
+        command: Option<Vec<String>>,
     },
     /// List SDK dependencies
     Deps {
@@ -107,7 +108,8 @@ enum SdkCommands {
         #[arg(short = 'C', long, default_value = "avocado.toml")]
         config: String,
         /// DNF command and arguments to execute
-        dnf_args: Vec<String>,
+        #[arg(short = 'c', long = "command", required = true, num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Install dependencies into the SDK
     Install {
@@ -237,9 +239,9 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 extension,
-                dnf_args,
+                command,
             } => {
-                let dnf_cmd = ExtDnfCommand::new(config, extension, dnf_args, verbose, cli.target);
+                let dnf_cmd = ExtDnfCommand::new(config, extension, command, verbose, cli.target);
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -308,8 +310,8 @@ async fn main() -> Result<()> {
                 compile_cmd.execute().await?;
                 Ok(())
             }
-            SdkCommands::Dnf { config, dnf_args } => {
-                let dnf_cmd = SdkDnfCommand::new(config, dnf_args, cli.target);
+            SdkCommands::Dnf { config, command } => {
+                let dnf_cmd = SdkDnfCommand::new(config, command, cli.target);
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -372,9 +374,11 @@ enum ExtCommands {
         #[arg(short, long)]
         verbose: bool,
         /// Name of the extension to operate on
+        #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
         /// DNF command and arguments to execute
-        dnf_args: Vec<String>,
+        #[arg(short = 'c', long = "command", required = true, num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Clean an extension's sysroot
     Clean {

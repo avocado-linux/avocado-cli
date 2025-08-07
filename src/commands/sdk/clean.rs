@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::utils::{
     config::Config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     target::resolve_target,
 };
@@ -61,16 +61,16 @@ impl SdkCleanCommand {
         }
 
         let remove_command = "rm -rf $AVOCADO_SDK_PREFIX";
-        let success = container_helper
-            .run_in_container(
-                container_image,
-                &target,
-                remove_command,
-                self.verbose,
-                false, // don't source environment
-                false,
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: remove_command.to_string(),
+            verbose: self.verbose,
+            source_environment: false, // don't source environment
+            interactive: false,
+            ..Default::default()
+        };
+        let success = container_helper.run_in_container(config).await?;
 
         if success {
             print_success("Successfully removed SDK directory.", OutputLevel::Normal);

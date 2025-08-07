@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-use crate::utils::config::load_config;
-use crate::utils::container::SdkContainer;
+use crate::utils::config::Config;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
 
@@ -32,9 +32,13 @@ impl ExtInstallCommand {
 
     pub async fn execute(&self) -> Result<()> {
         // Load the configuration and parse raw TOML
-        let _config = load_config(&self.config_path)?;
+        let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
+
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
 
         // Check if ext section exists
         let ext_section = match parsed.get("ext") {
@@ -137,6 +141,8 @@ impl ExtInstallCommand {
                     &container_helper,
                     container_image,
                     &target,
+                    repo_url,
+                    repo_release,
                 )
                 .await?
             {
@@ -157,6 +163,7 @@ impl ExtInstallCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn install_single_extension(
         &self,
         config: &toml::Value,
@@ -164,6 +171,8 @@ impl ExtInstallCommand {
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<bool> {
         // Create the commands to check and set up the directory structure
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
@@ -172,29 +181,33 @@ impl ExtInstallCommand {
         );
 
         // First check if the sysroot already exists
-        let sysroot_exists = container_helper
-            .run_in_container(
-                container_image,
-                target,
-                &check_command,
-                self.verbose,
-                false, // don't source environment
-                false, // not interactive
-            )
-            .await?;
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: check_command,
+            verbose: self.verbose,
+            source_environment: false, // don't source environment
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        let sysroot_exists = container_helper.run_in_container(run_config).await?;
 
         if !sysroot_exists {
             // Create the sysroot
-            let success = container_helper
-                .run_in_container(
-                    container_image,
-                    target,
-                    &setup_command,
-                    self.verbose,
-                    false, // don't source environment
-                    false, // not interactive
-                )
-                .await?;
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: setup_command,
+                verbose: self.verbose,
+                source_environment: false, // don't source environment
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                ..Default::default()
+            };
+            let success = container_helper.run_in_container(run_config).await?;
 
             if success {
                 print_success(
@@ -272,16 +285,18 @@ $DNF_SDK_HOST \
                 }
 
                 // Run the DNF install command
-                let install_success = container_helper
-                    .run_in_container(
-                        container_image,
-                        target,
-                        &command,
-                        self.verbose,
-                        false,       // don't source environment
-                        !self.force, // interactive if not forced
-                    )
-                    .await?;
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.to_string(),
+                    command,
+                    verbose: self.verbose,
+                    source_environment: false, // don't source environment
+                    interactive: !self.force,  // interactive if not forced
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
+                    ..Default::default()
+                };
+                let install_success = container_helper.run_in_container(run_config).await?;
 
                 if !install_success {
                     print_error(

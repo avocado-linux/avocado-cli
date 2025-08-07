@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::utils::config::load_config;
-use crate::utils::container::SdkContainer;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
 
@@ -115,16 +115,16 @@ impl ExtCleanCommand {
             );
         }
 
-        let success = container_helper
-            .run_in_container(
-                container_image,
-                target,
-                &clean_command,
-                self.verbose,
-                false, // don't source environment
-                false, // not interactive
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: clean_command,
+            verbose: self.verbose,
+            source_environment: false, // don't source environment
+            interactive: false,
+            ..Default::default()
+        };
+        let success = container_helper.run_in_container(config).await?;
 
         if success {
             print_success(

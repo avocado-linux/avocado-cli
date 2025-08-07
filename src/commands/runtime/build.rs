@@ -1,6 +1,6 @@
 use crate::utils::{
     config::load_config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     target::resolve_target,
 };
@@ -95,15 +95,17 @@ list installed avocado-pkg-images >/dev/null 2>&1
         );
 
         // Use container helper to check package status
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.clone(),
+            command: dnf_check_script,
+            verbose: self.verbose,
+            source_environment: false, // simple check doesn't need full env
+            interactive: false,
+            ..Default::default()
+        };
         let package_installed = container_helper
-            .run_in_container(
-                container_image,
-                &target_arch,
-                &dnf_check_script,
-                self.verbose, // verbose
-                false,        // source_environment (simple check doesn't need full env)
-                false,        // interactive (non-interactive check)
-            )
+            .run_in_container(config)
             .await
             .unwrap_or(false);
 
@@ -131,15 +133,17 @@ $DNF_SDK_HOST \
             );
 
             // Run the DNF install command
+            let config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: dnf_install_script,
+                verbose: self.verbose,
+                source_environment: true, // need environment for DNF
+                interactive: !self.force,
+                ..Default::default()
+            };
             let install_result = container_helper
-                .run_in_container(
-                    container_image,
-                    &target_arch,
-                    &dnf_install_script,
-                    self.verbose, // verbose
-                    true,         // source_environment (need environment for DNF)
-                    !self.force,  // interactive (opposite of force)
-                )
+                .run_in_container(config)
                 .await
                 .context("Failed to install avocado-pkg-images package")?;
 
@@ -167,15 +171,17 @@ $DNF_SDK_HOST \
             );
         }
 
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.clone(),
+            command: build_script,
+            verbose: self.verbose,
+            source_environment: true, // need environment for build
+            interactive: false,       // build script runs non-interactively
+            ..Default::default()
+        };
         let complete_result = container_helper
-            .run_in_container(
-                container_image,
-                &target_arch,
-                &build_script,
-                self.verbose, // verbose
-                true,         // source_environment (need environment for build)
-                false,        // interactive (build script runs non-interactively)
-            )
+            .run_in_container(config)
             .await
             .context("Failed to build complete image")?;
 

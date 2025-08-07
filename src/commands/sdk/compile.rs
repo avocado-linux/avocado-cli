@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::utils::{
     config::Config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     target::resolve_target,
 };
@@ -132,16 +132,16 @@ impl SdkCompileCommand {
                 section.script, section.script, section.script, section.script
             );
 
-            let success = container_helper
-                .run_in_container(
-                    container_image,
-                    &target,
-                    &compile_command,
-                    self.verbose,
-                    true, // source_environment
-                    false,
-                )
-                .await?;
+            let config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: compile_command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                ..Default::default()
+            };
+            let success = container_helper.run_in_container(config).await?;
 
             if success {
                 print_success(

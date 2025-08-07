@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::utils::{
     config::Config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     target::resolve_target,
 };
@@ -87,16 +87,16 @@ $DNF_SDK_HOST \
                 );
 
                 // Use the container helper's run_in_container method
-                let install_success = container_helper
-                    .run_in_container(
-                        container_image,
-                        &target,
-                        &command,
-                        self.verbose,
-                        true,
-                        !self.force,
-                    )
-                    .await?;
+                let config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.clone(),
+                    command,
+                    verbose: self.verbose,
+                    source_environment: true,
+                    interactive: !self.force,
+                    ..Default::default()
+                };
+                let install_success = container_helper.run_in_container(config).await?;
 
                 if install_success {
                     print_success("Installed SDK dependencies.", OutputLevel::Normal);
@@ -145,16 +145,16 @@ $DNF_SDK_HOST \
                     );
 
                     // Use the container helper's run_in_container method with target-dev installroot
-                    let install_success = container_helper
-                        .run_in_container(
-                            container_image,
-                            &target,
-                            &command,
-                            self.verbose,
-                            true,
-                            !self.force,
-                        )
-                        .await?;
+                    let config = RunConfig {
+                        container_image: container_image.to_string(),
+                        target: target.clone(),
+                        command,
+                        verbose: self.verbose,
+                        source_environment: true,
+                        interactive: !self.force,
+                        ..Default::default()
+                    };
+                    let install_success = container_helper.run_in_container(config).await?;
 
                     if !install_success {
                         return Err(anyhow::anyhow!(

@@ -1,14 +1,14 @@
 use anyhow::Result;
 
-use crate::utils::config::load_config;
-use crate::utils::container::SdkContainer;
+use crate::utils::config::Config;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
 
 pub struct ExtDnfCommand {
     config_path: String,
     extension: String,
-    dnf_args: Vec<String>,
+    command: Vec<String>,
     verbose: bool,
     target: Option<String>,
 }
@@ -17,21 +17,21 @@ impl ExtDnfCommand {
     pub fn new(
         config_path: String,
         extension: String,
-        dnf_args: Vec<String>,
+        command: Vec<String>,
         verbose: bool,
         target: Option<String>,
     ) -> Self {
         Self {
             config_path,
             extension,
-            dnf_args,
+            command,
             verbose,
             target,
         }
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let _config = load_config(&self.config_path)?;
+        let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
@@ -39,7 +39,11 @@ impl ExtDnfCommand {
         let container_image = self.get_container_image(&parsed)?;
         let target = self.resolve_target_architecture(&parsed)?;
 
-        self.execute_dnf_command(&parsed, &container_image, &target)
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
+        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release)
             .await
     }
 
@@ -108,17 +112,33 @@ impl ExtDnfCommand {
         parsed: &toml::Value,
         container_image: &str,
         target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<()> {
         let container_helper = SdkContainer::new();
 
         // Perform extension setup first
-        self.setup_extension_environment(parsed, &container_helper, container_image, target)
-            .await?;
+        self.setup_extension_environment(
+            parsed,
+            &container_helper,
+            container_image,
+            target,
+            repo_url,
+            repo_release,
+        )
+        .await?;
 
         // Build and execute DNF command
         let dnf_command = self.build_dnf_command();
-        self.run_dnf_command(&container_helper, container_image, target, &dnf_command)
-            .await
+        self.run_dnf_command(
+            &container_helper,
+            container_image,
+            target,
+            &dnf_command,
+            repo_url,
+            repo_release,
+        )
+        .await
     }
 
     async fn setup_extension_environment(
@@ -127,26 +147,37 @@ impl ExtDnfCommand {
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<()> {
         let check_cmd = format!(
             "test -d $AVOCADO_SDK_SYSROOTS/extensions/{}",
             self.extension
         );
 
-        let dir_exists = container_helper
-            .run_in_container(
-                container_image,
-                target,
-                &check_cmd,
-                self.verbose,
-                false, // don't source environment
-                false, // not interactive
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: check_cmd,
+            verbose: self.verbose,
+            source_environment: false, // don't source environment
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        let dir_exists = container_helper.run_in_container(config).await?;
 
         if !dir_exists {
-            self.create_extension_directory(container_helper, container_image, target)
-                .await?;
+            // TODO: does this actually need the repo release + url ??
+            self.create_extension_directory(
+                container_helper,
+                container_image,
+                target,
+                repo_url,
+                repo_release,
+            )
+            .await?;
         }
 
         Ok(())
@@ -157,22 +188,26 @@ impl ExtDnfCommand {
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<()> {
         let setup_cmd = format!(
             "mkdir -p $AVOCADO_EXT_SYSROOTS/{}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{}/var/lib",
             self.extension, self.extension
         );
 
-        let setup_success = container_helper
-            .run_in_container(
-                container_image,
-                target,
-                &setup_cmd,
-                self.verbose,
-                false, // don't source environment
-                false, // not interactive
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: setup_cmd,
+            verbose: self.verbose,
+            source_environment: false, // don't source environment
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        let setup_success = container_helper.run_in_container(config).await?;
 
         if !setup_success {
             print_error(
@@ -201,6 +236,8 @@ impl ExtDnfCommand {
         container_image: &str,
         target: &str,
         dnf_command: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<()> {
         if self.verbose {
             print_info(
@@ -209,16 +246,18 @@ impl ExtDnfCommand {
             );
         }
 
-        let success = container_helper
-            .run_in_container(
-                container_image,
-                target,
-                dnf_command,
-                self.verbose,
-                false, // don't source environment
-                true,  // interactive
-            )
-            .await?;
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: dnf_command.to_string(),
+            verbose: self.verbose,
+            source_environment: false, // don't source environment
+            interactive: true,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        let success = container_helper.run_in_container(config).await?;
 
         if success {
             print_success("DNF command completed successfully.", OutputLevel::Normal);
@@ -231,7 +270,7 @@ impl ExtDnfCommand {
 
     fn build_dnf_command(&self) -> String {
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension);
-        let dnf_args_str = self.dnf_args.join(" ");
+        let dnf_args_str = self.command.join(" ");
 
         format!(
             r#"

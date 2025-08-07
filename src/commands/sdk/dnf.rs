@@ -1,12 +1,10 @@
 //! SDK DNF command implementation.
 
 use anyhow::{Context, Result};
-use std::process::Stdio;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::{
     config::Config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     output::{print_error, print_success, OutputLevel},
     target::resolve_target,
 };
@@ -16,26 +14,26 @@ pub struct SdkDnfCommand {
     /// Path to configuration file
     pub config_path: String,
     /// DNF command and arguments to execute
-    pub dnf_args: Vec<String>,
+    pub command: Vec<String>,
     /// Global target architecture
     pub target: Option<String>,
 }
 
 impl SdkDnfCommand {
     /// Create a new SdkDnfCommand instance
-    pub fn new(config_path: String, dnf_args: Vec<String>, target: Option<String>) -> Self {
+    pub fn new(config_path: String, command: Vec<String>, target: Option<String>) -> Self {
         Self {
             config_path,
-            dnf_args,
+            command,
             target,
         }
     }
 
     /// Execute the sdk dnf command
     pub async fn execute(&self) -> Result<()> {
-        if self.dnf_args.is_empty() {
+        if self.command.is_empty() {
             return Err(anyhow::anyhow!(
-                "No DNF command specified. Use '--' to separate DNF arguments."
+                "No DNF command specified. Use --command (-c) to provide DNF arguments."
             ));
         }
 
@@ -47,6 +45,10 @@ impl SdkDnfCommand {
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
         })?;
+
+        // Get repo_url and repo_release from config, if they exist
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
 
         // Resolve target with proper precedence
         let config_target = config.get_target();
@@ -62,12 +64,19 @@ impl SdkDnfCommand {
         // Build DNF command
         let command = format!(
             "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF {}",
-            self.dnf_args.join(" ")
+            self.command.join(" ")
         );
 
         // Run the DNF command using the container helper
         let success = self
-            .run_dnf_command(&container_helper, container_image, &target, &command)
+            .run_dnf_command(
+                &container_helper,
+                container_image,
+                &target,
+                &command,
+                repo_url,
+                repo_release,
+            )
             .await?;
 
         // Log the result
@@ -88,54 +97,22 @@ impl SdkDnfCommand {
         container_image: &str,
         target: &str,
         command: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<bool> {
-        // Build container command with entrypoint
-        let mut container_cmd = vec![
-            container_helper.container_tool.clone(),
-            "run".to_string(),
-            "--rm".to_string(),
-        ];
-
-        // Add volume mounts
-        container_cmd.push("-v".to_string());
-        container_cmd.push(format!(
-            "{}:/opt/_avocado/src:ro",
-            container_helper.cwd.display()
-        ));
-        container_cmd.push("-v".to_string());
-        container_cmd.push(format!(
-            "{}/_avocado:/opt/_avocado:rw",
-            container_helper.cwd.display()
-        ));
-
-        // Add environment variables
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
-
-        // Add the container image
-        container_cmd.push(container_image.to_string());
-
-        // Use entrypoint to set up environment, then run DNF command
-        let full_command = format!(
-            "{}\n{}",
-            container_helper.create_entrypoint_script(true),
-            command
-        );
-
-        container_cmd.push("bash".to_string());
-        container_cmd.push("-c".to_string());
-        container_cmd.push(full_command);
-
-        // Execute the command
-        let status = AsyncCommand::new(&container_cmd[0])
-            .args(&container_cmd[1..])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-            .with_context(|| "Failed to execute DNF container command")?;
-
-        Ok(status.success())
+        // Use the container helper's method with repo URL and release support
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: command.to_string(),
+            verbose: true,
+            source_environment: true, // need environment for DNF
+            interactive: true,        // allow user input for DNF prompts
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        container_helper.run_in_container(config).await
     }
 }
 
@@ -152,12 +129,12 @@ mod tests {
         );
 
         assert_eq!(cmd.config_path, "config.toml");
-        assert_eq!(cmd.dnf_args, vec!["install", "gcc"]);
+        assert_eq!(cmd.command, vec!["install", "gcc"]);
         assert_eq!(cmd.target, Some("test-target".to_string()));
     }
 
     #[tokio::test]
-    async fn test_empty_dnf_args() {
+    async fn test_empty_command() {
         let cmd = SdkDnfCommand::new("config.toml".to_string(), vec![], None);
 
         let result = cmd.execute().await;

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::utils::{
     config::Config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     output::{print_error, print_success, OutputLevel},
     target::resolve_target,
 };
@@ -24,7 +24,7 @@ pub struct SdkRunCommand {
     /// Enable verbose output
     pub verbose: bool,
     /// Command and arguments to run in container
-    pub command: Vec<String>,
+    pub command: Option<Vec<String>>,
     /// Global target architecture
     pub target: Option<String>,
 }
@@ -39,7 +39,7 @@ impl SdkRunCommand {
         rm: bool,
         interactive: bool,
         verbose: bool,
-        command: Vec<String>,
+        command: Option<Vec<String>>,
         target: Option<String>,
     ) -> Self {
         Self {
@@ -64,9 +64,9 @@ impl SdkRunCommand {
         }
 
         // Require either a command or --interactive flag
-        if !self.interactive && self.command.is_empty() {
+        if !self.interactive && self.command.is_none() {
             return Err(anyhow::anyhow!(
-                "You must either provide a command or use --interactive (-i)."
+                "You must either provide a --command (-c) or use --interactive (-i)."
             ));
         }
 
@@ -93,10 +93,10 @@ impl SdkRunCommand {
         }
 
         // Build the command to execute
-        let command = if self.command.is_empty() {
-            "bash".to_string()
+        let command = if let Some(ref cmd) = self.command {
+            cmd.join(" ")
         } else {
-            self.command.join(" ")
+            "bash".to_string()
         };
 
         // Use the container helper to run the command
@@ -109,16 +109,16 @@ impl SdkRunCommand {
             self.run_interactive_container(&container_helper, container_image, &target)
                 .await?
         } else {
-            container_helper
-                .run_in_container(
-                    container_image,
-                    &target,
-                    &command,
-                    self.verbose,
-                    false,
-                    false,
-                )
-                .await?
+            let config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: command.clone(),
+                verbose: self.verbose,
+                source_environment: false, // don't source environment
+                interactive: false,        // not interactive
+                ..Default::default()
+            };
+            container_helper.run_in_container(config).await?
         };
 
         if success {
@@ -204,9 +204,16 @@ impl SdkRunCommand {
         container_image: &str,
         target: &str,
     ) -> Result<bool> {
-        container_helper
-            .run_in_container(container_image, target, "bash", self.verbose, false, true)
-            .await
+        let config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: "bash".to_string(),
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: true,
+            ..Default::default()
+        };
+        container_helper.run_in_container(config).await
     }
 }
 
@@ -223,7 +230,7 @@ mod tests {
             true,
             false,
             true,
-            vec!["echo".to_string(), "test".to_string()],
+            Some(vec!["echo".to_string(), "test".to_string()]),
             Some("test-target".to_string()),
         );
 
@@ -233,7 +240,10 @@ mod tests {
         assert!(cmd.rm);
         assert!(!cmd.interactive);
         assert!(cmd.verbose);
-        assert_eq!(cmd.command, vec!["echo", "test"]);
+        assert_eq!(
+            cmd.command,
+            Some(vec!["echo".to_string(), "test".to_string()])
+        );
         assert_eq!(cmd.target, Some("test-target".to_string()));
     }
 
@@ -246,7 +256,7 @@ mod tests {
             false,
             true, // interactive
             false,
-            vec![],
+            None,
             None,
         );
 
@@ -267,7 +277,7 @@ mod tests {
             false,
             false, // not interactive
             false,
-            vec![], // no command
+            None, // no command
             None,
         );
 
@@ -276,6 +286,6 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("You must either provide a command"));
+            .contains("You must either provide a --command"));
     }
 }
