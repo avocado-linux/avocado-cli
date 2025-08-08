@@ -35,9 +35,12 @@ impl ExtBuildCommand {
 
     pub async fn execute(&self) -> Result<()> {
         // Load configuration and parse raw TOML
-        let _config = load_config(&self.config_path)?;
+        let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
 
         // Get extension configuration
         let ext_config = parsed
@@ -156,6 +159,8 @@ impl ExtBuildCommand {
                         &target_arch,
                         ext_version,
                         &sysext_scopes,
+                        repo_url,
+                        repo_release,
                     )
                     .await?
                 }
@@ -166,6 +171,8 @@ impl ExtBuildCommand {
                         &target_arch,
                         ext_version,
                         &confext_scopes,
+                        repo_url,
+                        repo_release,
                     )
                     .await?
                 }
@@ -201,6 +208,7 @@ impl ExtBuildCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_sysext_extension(
         &self,
         container_helper: &SdkContainer,
@@ -208,6 +216,8 @@ impl ExtBuildCommand {
         target_arch: &str,
         ext_version: &str,
         ext_scopes: &[String],
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<bool> {
         // Create the build script for sysext extension
         let build_script = self.create_sysext_build_script(ext_version, ext_scopes);
@@ -227,6 +237,8 @@ impl ExtBuildCommand {
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
@@ -243,6 +255,7 @@ impl ExtBuildCommand {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_confext_extension(
         &self,
         container_helper: &SdkContainer,
@@ -250,6 +263,8 @@ impl ExtBuildCommand {
         target_arch: &str,
         ext_version: &str,
         ext_scopes: &[String],
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<bool> {
         // Create the build script for confext extension
         let build_script = self.create_confext_build_script(ext_version, ext_scopes);
@@ -269,6 +284,8 @@ impl ExtBuildCommand {
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

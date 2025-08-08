@@ -35,9 +35,12 @@ impl ExtImageCommand {
 
     pub async fn execute(&self) -> Result<()> {
         // Load configuration and parse raw TOML
-        let _config = load_config(&self.config_path)?;
+        let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
 
         // Get extension configuration
         let ext_config = parsed
@@ -113,7 +116,14 @@ impl ExtImageCommand {
             );
 
             let result = self
-                .create_image(&container_helper, container_image, &target_arch, ext_type)
+                .create_image(
+                    &container_helper,
+                    container_image,
+                    &target_arch,
+                    ext_type,
+                    repo_url,
+                    repo_release,
+                )
                 .await?;
 
             if result {
@@ -151,6 +161,8 @@ impl ExtImageCommand {
         container_image: &str,
         target_arch: &str,
         extension_type: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<bool> {
         // Create the build script
         let build_script = self.create_build_script(extension_type);
@@ -167,6 +179,8 @@ impl ExtImageCommand {
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

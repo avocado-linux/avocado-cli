@@ -200,7 +200,7 @@ impl ExtDnfCommand {
         repo_release: Option<&String>,
     ) -> Result<()> {
         let setup_cmd = format!(
-            "mkdir -p $AVOCADO_EXT_SYSROOTS/{}/var/lib && cp -rf ${{AVOCADO_PREFIX}}/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{}/var/lib",
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{}/var/lib",
             self.extension, self.extension
         );
 

@@ -40,9 +40,12 @@ impl RuntimeBuildCommand {
 
     pub async fn execute(&self) -> Result<()> {
         // Load configuration and parse raw TOML
-        let _config = load_config(&self.config_path)?;
+        let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
 
         // Get SDK configuration
         let sdk_config = parsed.get("sdk").context("No SDK configuration found")?;
@@ -108,6 +111,8 @@ list installed avocado-pkg-images >/dev/null 2>&1
             verbose: self.verbose,
             source_environment: false, // simple check doesn't need full env
             interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
@@ -154,6 +159,8 @@ $DNF_SDK_HOST \
                 verbose: self.verbose,
                 source_environment: true, // need environment for DNF
                 interactive: !self.force,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
                 container_args: self.container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 ..Default::default()
@@ -194,6 +201,8 @@ $DNF_SDK_HOST \
             verbose: self.verbose,
             source_environment: true, // need environment for build
             interactive: false,       // build script runs non-interactively
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

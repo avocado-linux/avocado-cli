@@ -52,6 +52,10 @@ impl SdkCleanCommand {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
         })?;
 
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
         // Resolve target with proper precedence
         let config_target = config.get_target();
         let target = resolve_target(self.target.as_deref(), config_target.as_deref())
@@ -80,6 +84,8 @@ impl SdkCleanCommand {
             verbose: self.verbose,
             source_environment: false, // don't source environment
             interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

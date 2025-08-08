@@ -82,6 +82,10 @@ impl SdkRunCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
         // Get the SDK image from configuration
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
@@ -114,8 +118,14 @@ impl SdkRunCommand {
             self.run_detached_container(&container_helper, container_image, &target, &command)
                 .await?
         } else if self.interactive {
-            self.run_interactive_container(&container_helper, container_image, &target)
-                .await?
+            self.run_interactive_container(
+                &container_helper,
+                container_image,
+                &target,
+                repo_url,
+                repo_release,
+            )
+            .await?
         } else {
             let config = RunConfig {
                 container_image: container_image.to_string(),
@@ -124,6 +134,8 @@ impl SdkRunCommand {
                 verbose: self.verbose,
                 source_environment: false, // don't source environment
                 interactive: false,        // not interactive
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
                 container_args: self.container_args.clone(),
                 ..Default::default()
             };
@@ -212,6 +224,8 @@ impl SdkRunCommand {
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
     ) -> Result<bool> {
         let config = RunConfig {
             container_image: container_image.to_string(),
@@ -220,6 +234,8 @@ impl SdkRunCommand {
             verbose: self.verbose,
             source_environment: false,
             interactive: true,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

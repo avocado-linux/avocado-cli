@@ -112,7 +112,7 @@ impl ExtCleanCommand {
         );
 
         let container_helper = SdkContainer::new();
-        let clean_command = format!("rm -rf ${{AVOCADO_EXT_SYSROOTS}}/{}", self.extension);
+        let clean_command = format!("rm -rf $AVOCADO_EXT_SYSROOTS/{}", self.extension);
 
         if self.verbose {
             print_info(

@@ -74,6 +74,10 @@ impl SdkInstallCommand {
         // Get compile section dependencies
         let compile_dependencies = config.get_compile_dependencies();
 
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
         // Use the container helper to run the installation
         let container_helper = SdkContainer::new().verbose(self.verbose);
 
@@ -114,6 +118,8 @@ $DNF_SDK_HOST \
                     verbose: self.verbose,
                     source_environment: true,
                     interactive: !self.force,
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
                     container_args: self.container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     ..Default::default()
@@ -181,6 +187,8 @@ $DNF_SDK_HOST \
                         verbose: self.verbose,
                         source_environment: true,
                         interactive: !self.force,
+                        repo_url: repo_url.cloned(),
+                        repo_release: repo_release.cloned(),
                         container_args: self.container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
                         ..Default::default()
