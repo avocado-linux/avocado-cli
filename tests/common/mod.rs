@@ -60,7 +60,7 @@ fn insert_config_flag(args: &[&str], config_path: &str) -> Vec<String> {
     }
 
     // Insert config flag
-    new_args.push("-c".to_string());
+    new_args.push("-C".to_string());
     new_args.push(config_path.to_string());
 
     // Add remaining args
