@@ -10,7 +10,9 @@ use commands::ext::{
     ExtInstallCommand, ExtListCommand,
 };
 use commands::init::InitCommand;
-use commands::runtime::{RuntimeBuildCommand, RuntimeDepsCommand, RuntimeListCommand};
+use commands::runtime::{
+    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeListCommand, RuntimeProvisionCommand,
+};
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkRunCommand,
@@ -193,6 +195,27 @@ enum RuntimeCommands {
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
     },
+    /// Provision a runtime
+    Provision {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Runtime name to provision
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
     /// List runtime names
     List {
         /// Path to avocado.toml configuration file
@@ -244,6 +267,26 @@ async fn main() -> Result<()> {
                     dnf_args,
                 );
                 build_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::Provision {
+                runtime,
+                config,
+                verbose,
+                force,
+                container_args,
+                dnf_args,
+            } => {
+                let provision_cmd = RuntimeProvisionCommand::new(
+                    runtime,
+                    config,
+                    verbose,
+                    force,
+                    cli.target,
+                    container_args,
+                    dnf_args,
+                );
+                provision_cmd.execute().await?;
                 Ok(())
             }
             RuntimeCommands::List { config } => {

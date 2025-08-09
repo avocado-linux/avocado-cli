@@ -3,6 +3,7 @@
 pub mod build;
 pub mod deps;
 pub mod list;
+pub mod provision;
 
 use crate::common;
 

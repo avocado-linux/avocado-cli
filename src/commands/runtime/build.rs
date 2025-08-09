@@ -322,7 +322,7 @@ mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/confexts \
     -f "$OUTPUT_DIR/avocado-image-var.btrfs"
 
-echo -e "\033[34m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '{}'."
+echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '{}'."
 avocado-build-{} {}
 "#,
             self.runtime_name,
