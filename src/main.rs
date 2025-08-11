@@ -11,7 +11,7 @@ use commands::ext::{
 };
 use commands::init::InitCommand;
 use commands::runtime::{
-    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
+    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
@@ -252,6 +252,27 @@ enum RuntimeCommands {
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
     },
+    /// Run DNF commands in a runtime's context
+    Dnf {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Name of the runtime to operate on
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// DNF command and arguments to execute
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
 }
 
 #[tokio::main]
@@ -337,6 +358,26 @@ async fn main() -> Result<()> {
             RuntimeCommands::Deps { config, runtime } => {
                 let deps_cmd = RuntimeDepsCommand::new(config, runtime);
                 deps_cmd.execute()?;
+                Ok(())
+            }
+            RuntimeCommands::Dnf {
+                config,
+                verbose,
+                runtime,
+                command,
+                container_args,
+                dnf_args,
+            } => {
+                let dnf_cmd = RuntimeDnfCommand::new(
+                    config,
+                    runtime,
+                    command,
+                    verbose,
+                    cli.target,
+                    container_args,
+                    dnf_args,
+                );
+                dnf_cmd.execute().await?;
                 Ok(())
             }
         },

@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod deps;
+pub mod dnf;
 pub mod install;
 pub mod list;
 pub mod provision;
