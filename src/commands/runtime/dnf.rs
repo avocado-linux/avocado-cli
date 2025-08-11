@@ -214,10 +214,7 @@ impl RuntimeDnfCommand {
 
         if !setup_success {
             print_error(
-                &format!(
-                    "Failed to set up runtime directory for '{}'.",
-                    self.runtime
-                ),
+                &format!("Failed to set up runtime directory for '{}'.", self.runtime),
                 OutputLevel::Normal,
             );
             return Err(anyhow::anyhow!("Failed to create runtime directory"));
@@ -337,7 +334,10 @@ mod tests {
         assert_eq!(cmd.command, vec!["install", "gcc"]);
         assert!(cmd.verbose);
         assert_eq!(cmd.target, None);
-        assert_eq!(cmd.container_args, Some(vec!["--cap-add=SYS_ADMIN".to_string()]));
+        assert_eq!(
+            cmd.container_args,
+            Some(vec!["--cap-add=SYS_ADMIN".to_string()])
+        );
         assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
     }
 

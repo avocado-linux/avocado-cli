@@ -14,7 +14,11 @@ fn test_short_help() {
 
 #[test]
 fn test_install_missing_config() {
-    common::refute_cmd(&["runtime", "install", "-C", "nonexistent.toml"], None, None);
+    common::refute_cmd(
+        &["runtime", "install", "-C", "nonexistent.toml"],
+        None,
+        None,
+    );
 }
 
 #[test]
@@ -38,13 +42,26 @@ fn test_install_with_force() {
 #[test]
 fn test_install_with_container_args() {
     // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["runtime", "install", "--container-arg", "--cap-add=SYS_ADMIN"], None, None);
+    common::refute_cmd(
+        &[
+            "runtime",
+            "install",
+            "--container-arg",
+            "--cap-add=SYS_ADMIN",
+        ],
+        None,
+        None,
+    );
 }
 
 #[test]
 fn test_install_with_dnf_args() {
     // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["runtime", "install", "--dnf-arg", "--nogpgcheck"], None, None);
+    common::refute_cmd(
+        &["runtime", "install", "--dnf-arg", "--nogpgcheck"],
+        None,
+        None,
+    );
 }
 
 #[test]

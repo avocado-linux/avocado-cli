@@ -11,7 +11,8 @@ use commands::ext::{
 };
 use commands::init::InitCommand;
 use commands::runtime::{
-    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
+    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeDnfCommand, RuntimeInstallCommand,
+    RuntimeListCommand, RuntimeProvisionCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,

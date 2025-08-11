@@ -69,7 +69,11 @@ impl RuntimeInstallCommand {
         // Determine which runtimes to install dependencies for
         let runtimes_to_install = if let Some(runtime_name) = &self.runtime {
             // Single runtime specified
-            if !runtime_section.as_table().unwrap().contains_key(runtime_name) {
+            if !runtime_section
+                .as_table()
+                .unwrap()
+                .contains_key(runtime_name)
+            {
                 print_error(
                     &format!("Runtime '{runtime_name}' not found in configuration."),
                     OutputLevel::Normal,
@@ -86,7 +90,10 @@ impl RuntimeInstallCommand {
         };
 
         if runtimes_to_install.is_empty() {
-            print_info("No runtimes to install dependencies for.", OutputLevel::Normal);
+            print_info(
+                "No runtimes to install dependencies for.",
+                OutputLevel::Normal,
+            );
             return Ok(());
         }
 
@@ -266,7 +273,10 @@ impl RuntimeInstallCommand {
 
             if !packages.is_empty() {
                 print_info(
-                    &format!("Installing {} package(s) for runtime '{runtime}'", packages.len()),
+                    &format!(
+                        "Installing {} package(s) for runtime '{runtime}'",
+                        packages.len()
+                    ),
                     OutputLevel::Normal,
                 );
 
@@ -472,7 +482,10 @@ gcc = "11.0"
         // Should fail without SDK configuration
         let result = cmd.execute().await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No SDK configuration found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No SDK configuration found"));
     }
 
     #[tokio::test]
@@ -503,7 +516,10 @@ gcc = "11.0"
         // Should fail without container image
         let result = cmd.execute().await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No SDK container image specified"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No SDK container image specified"));
     }
 
     #[test]
@@ -631,7 +647,10 @@ gcc = "*"
             Some(vec!["--nogpgcheck".to_string()]),
         );
 
-        assert_eq!(cmd.container_args, Some(vec!["--cap-add=SYS_ADMIN".to_string()]));
+        assert_eq!(
+            cmd.container_args,
+            Some(vec!["--cap-add=SYS_ADMIN".to_string()])
+        );
         assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
         assert!(cmd.verbose);
         assert!(cmd.force);
