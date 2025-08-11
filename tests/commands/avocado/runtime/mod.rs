@@ -1,6 +1,7 @@
 //! Tests for runtime command.
 
 pub mod build;
+pub mod clean;
 pub mod deps;
 pub mod dnf;
 pub mod install;

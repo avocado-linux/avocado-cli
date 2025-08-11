@@ -11,8 +11,8 @@ use commands::ext::{
 };
 use commands::init::InitCommand;
 use commands::runtime::{
-    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeDnfCommand, RuntimeInstallCommand,
-    RuntimeListCommand, RuntimeProvisionCommand,
+    RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDepsCommand, RuntimeDnfCommand,
+    RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
@@ -274,6 +274,24 @@ enum RuntimeCommands {
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
     },
+    /// Clean runtime installroot directory
+    Clean {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Name of the runtime to clean
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
 }
 
 #[tokio::main]
@@ -379,6 +397,24 @@ async fn main() -> Result<()> {
                     dnf_args,
                 );
                 dnf_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::Clean {
+                config,
+                verbose,
+                runtime,
+                container_args,
+                dnf_args,
+            } => {
+                let clean_cmd = RuntimeCleanCommand::new(
+                    runtime,
+                    config,
+                    verbose,
+                    cli.target,
+                    container_args,
+                    dnf_args,
+                );
+                clean_cmd.execute().await?;
                 Ok(())
             }
         },

@@ -1,4 +1,5 @@
 pub mod build;
+pub mod clean;
 pub mod deps;
 pub mod dnf;
 pub mod install;
@@ -6,6 +7,7 @@ pub mod list;
 pub mod provision;
 
 pub use build::RuntimeBuildCommand;
+pub use clean::RuntimeCleanCommand;
 pub use deps::RuntimeDepsCommand;
 pub use dnf::RuntimeDnfCommand;
 pub use install::RuntimeInstallCommand;
