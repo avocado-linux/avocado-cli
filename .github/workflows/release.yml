@@ -35,14 +35,20 @@ jobs:
           TAG_VERSION="${{ steps.get-version.outputs.version }}"
           CARGO_VERSION="${{ steps.cargo-version.outputs.cargo-version }}"
 
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+          # Extract base version (before any pre-release identifier)
+          TAG_BASE_VERSION=$(echo "$TAG_VERSION" | sed 's/-.*$//')
+          CARGO_BASE_VERSION=$(echo "$CARGO_VERSION" | sed 's/-.*$//')
+
+          if [ "$TAG_BASE_VERSION" != "$CARGO_BASE_VERSION" ]; then
             echo "❌ Version mismatch!"
-            echo "Tag version: $TAG_VERSION"
-            echo "Cargo.toml version: $CARGO_VERSION"
-            echo "Please ensure the tag matches the version in Cargo.toml"
+            echo "Tag version: $TAG_VERSION (base: $TAG_BASE_VERSION)"
+            echo "Cargo.toml version: $CARGO_VERSION (base: $CARGO_BASE_VERSION)"
+            echo "Please ensure the base version in the tag matches Cargo.toml"
             exit 1
           else
-            echo "✅ Versions match: $TAG_VERSION"
+            echo "✅ Base versions match: $TAG_BASE_VERSION"
+            echo "Tag version: $TAG_VERSION"
+            echo "Cargo.toml version: $CARGO_VERSION"
           fi
 
   test:
@@ -147,29 +153,3 @@ jobs:
             avocado-cli-macos-aarch64/avocado-cli
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  publish-crates-io:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    needs: [validate-version, create-release]
-    if: ${{ !contains(needs.validate-version.outputs.version, '-') }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: publish-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
