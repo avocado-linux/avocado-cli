@@ -57,14 +57,30 @@ impl InitCommand {
 
         // Create the configuration content
         let config_content = format!(
-            r#"[runtime.default]
+            r#"[runtime.dev]
 target = "{target}"
 
-[runtime.default.dependencies]
-nativesdk-avocado-images = "*"
+[runtime.dev.dependencies]
+avocado-img-bootfiles = "*"
+avocado-img-rootfs = "*"
+avocado-img-initramfs = "*"
+avocado-dev = {{ ext = "avocado-dev" }}
 
 [sdk]
 image = "avocadolinux/sdk:apollo-edge"
+
+[sdk.dependencies]
+nativesdk-qemu-system-x86-64 = "*"
+
+[ext.avocado-dev]
+sysext = true
+confext = true
+
+[ext.avocado-dev.dependencies]
+avocado-hitl = "*"
+
+[ext.avocado-dev.sdk.dependencies]
+nativesdk-avocado-hitl = "*"
 "#
         );
 
@@ -110,8 +126,18 @@ mod tests {
 
         let content = fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("target = \"qemux86-64\""));
-        assert!(content.contains("nativesdk-avocado-images = \"*\""));
+        assert!(content.contains("[runtime.dev]"));
+        assert!(content.contains("avocado-img-bootfiles = \"*\""));
+        assert!(content.contains("avocado-img-rootfs = \"*\""));
+        assert!(content.contains("avocado-img-initramfs = \"*\""));
+        assert!(content.contains("avocado-dev = { ext = \"avocado-dev\" }"));
         assert!(content.contains("image = \"avocadolinux/sdk:apollo-edge\""));
+        assert!(content.contains("nativesdk-qemu-system-x86-64 = \"*\""));
+        assert!(content.contains("[ext.avocado-dev]"));
+        assert!(content.contains("sysext = true"));
+        assert!(content.contains("confext = true"));
+        assert!(content.contains("avocado-hitl = \"*\""));
+        assert!(content.contains("nativesdk-avocado-hitl = \"*\""));
     }
 
     #[test]

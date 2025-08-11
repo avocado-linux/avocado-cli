@@ -11,7 +11,6 @@ pub struct RuntimeBuildCommand {
     runtime_name: String,
     config_path: String,
     verbose: bool,
-    force: bool,
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
@@ -22,7 +21,6 @@ impl RuntimeBuildCommand {
         runtime_name: String,
         config_path: String,
         verbose: bool,
-        force: bool,
         target: Option<String>,
         container_args: Option<Vec<String>>,
         dnf_args: Option<Vec<String>>,
@@ -31,7 +29,6 @@ impl RuntimeBuildCommand {
             runtime_name,
             config_path,
             verbose,
-            force,
             target,
             container_args,
             dnf_args,
@@ -88,101 +85,6 @@ impl RuntimeBuildCommand {
 
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
-
-        // First check if the required images package is already installed (silent check)
-        let dnf_check_script = format!(
-            r#"
-RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
-RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-$DNF_SDK_HOST \
-$DNF_SDK_HOST_OPTS \
-$DNF_SDK_TARGET_REPO_CONF \
---installroot=$AVOCADO_PREFIX/runtimes/{} \
-list installed avocado-pkg-images >/dev/null 2>&1
-"#,
-            self.runtime_name
-        );
-
-        // Use container helper to check package status
-        let config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target_arch.clone(),
-            command: dnf_check_script,
-            verbose: self.verbose,
-            source_environment: false, // simple check doesn't need full env
-            interactive: false,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            ..Default::default()
-        };
-        let package_installed = container_helper
-            .run_in_container(config)
-            .await
-            .unwrap_or(false);
-
-        if !package_installed {
-            print_info(
-                "Installing avocado-pkg-images package.",
-                OutputLevel::Normal,
-            );
-            let yes = if self.force { "-y" } else { "" };
-            let dnf_args_str = if let Some(args) = &self.dnf_args {
-                format!(" {} ", args.join(" "))
-            } else {
-                String::new()
-            };
-
-            // Create DNF install script
-            let dnf_install_script = format!(
-                r#"
-RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
-RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-$DNF_SDK_HOST \
-    $DNF_SDK_HOST_OPTS \
-    $DNF_SDK_TARGET_REPO_CONF \
-    --installroot=$AVOCADO_PREFIX/runtimes/{} \
-    {} \
-    install \
-    {} \
-    avocado-pkg-images
-"#,
-                self.runtime_name, dnf_args_str, yes
-            );
-
-            // Run the DNF install command
-            let config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target_arch.clone(),
-                command: dnf_install_script,
-                verbose: self.verbose,
-                source_environment: true, // need environment for DNF
-                interactive: !self.force,
-                repo_url: repo_url.cloned(),
-                repo_release: repo_release.cloned(),
-                container_args: self.container_args.clone(),
-                dnf_args: self.dnf_args.clone(),
-                ..Default::default()
-            };
-            let install_result = container_helper
-                .run_in_container(config)
-                .await
-                .context("Failed to install avocado-pkg-images package")?;
-
-            if !install_result {
-                return Err(anyhow::anyhow!(
-                    "Failed to install avocado-pkg-images package"
-                ));
-            }
-
-            print_success(
-                "Successfully installed avocado-pkg-images package.",
-                OutputLevel::Normal,
-            );
-        } else {
-            print_info("avocado-pkg-images already installed.", OutputLevel::Normal);
-        }
 
         // Build var image
         let build_script = self.create_build_script(&parsed, &target_arch)?;
@@ -351,7 +253,6 @@ mod tests {
             "test-runtime".to_string(),
             "avocado.toml".to_string(),
             false,
-            false,
             Some("x86_64".to_string()),
             None,
             None,
@@ -360,7 +261,6 @@ mod tests {
         assert_eq!(cmd.runtime_name, "test-runtime");
         assert_eq!(cmd.config_path, "avocado.toml");
         assert!(!cmd.verbose);
-        assert!(!cmd.force);
         assert_eq!(cmd.target, Some("x86_64".to_string()));
     }
 
@@ -380,7 +280,6 @@ test-dep = { ext = "test-ext" }
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
             "avocado.toml".to_string(),
-            false,
             false,
             Some("x86_64".to_string()),
             None,
@@ -415,7 +314,6 @@ confext = false
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
             "avocado.toml".to_string(),
-            false,
             false,
             Some("x86_64".to_string()),
             None,
