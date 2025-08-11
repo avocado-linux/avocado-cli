@@ -11,7 +11,7 @@ use commands::ext::{
 };
 use commands::init::InitCommand;
 use commands::runtime::{
-    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeListCommand, RuntimeProvisionCommand,
+    RuntimeBuildCommand, RuntimeDepsCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
@@ -174,6 +174,27 @@ enum SdkCommands {
 
 #[derive(Subcommand)]
 enum RuntimeCommands {
+    /// Install dependencies into runtime installroots
+    Install {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
     /// Build a runtime
     Build {
         /// Path to avocado.toml configuration file
@@ -249,7 +270,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Runtime { command } => match command {
-            RuntimeCommands::Build {
+            RuntimeCommands::Install {
                 runtime,
                 config,
                 verbose,
@@ -257,11 +278,30 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let build_cmd = RuntimeBuildCommand::new(
+                let install_cmd = RuntimeInstallCommand::new(
                     runtime,
                     config,
                     verbose,
                     force,
+                    cli.target,
+                    container_args,
+                    dnf_args,
+                );
+                install_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::Build {
+                runtime,
+                config,
+                verbose,
+                force: _,
+                container_args,
+                dnf_args,
+            } => {
+                let build_cmd = RuntimeBuildCommand::new(
+                    runtime,
+                    config,
+                    verbose,
                     cli.target,
                     container_args,
                     dnf_args,

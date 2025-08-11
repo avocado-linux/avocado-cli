@@ -41,6 +41,9 @@ Thumbs.db
 coverage/
 *.profraw
 
+# Avocado state directories
+_avocado/
+
 # Documentation build
 docs/_build/
 /site
