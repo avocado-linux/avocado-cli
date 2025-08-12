@@ -76,7 +76,8 @@ impl SdkInstallCommand {
         let sdk_dependencies = config.get_sdk_dependencies();
 
         // Get extension SDK dependencies
-        let extension_sdk_dependencies = config.get_extension_sdk_dependencies(&config_content)
+        let extension_sdk_dependencies = config
+            .get_extension_sdk_dependencies(&config_content)
             .with_context(|| "Failed to parse extension SDK dependencies")?;
 
         // Get compile section dependencies
@@ -101,7 +102,7 @@ impl SdkInstallCommand {
         for (ext_name, ext_deps) in &extension_sdk_dependencies {
             if self.verbose {
                 print_info(
-                    &format!("Adding SDK dependencies from extension '{}'", ext_name),
+                    &format!("Adding SDK dependencies from extension '{ext_name}'"),
                     OutputLevel::Normal,
                 );
             }

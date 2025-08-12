@@ -204,39 +204,33 @@ fi"#
 
         let script = format!(
             r#"
-VAR_DIR=$AVOCADO_PREFIX/runtimes/{}/var-staging
+# Set common variables
+RUNTIME_NAME="{}"
+TARGET_ARCH="{}"
+
+VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/extensions"
 mkdir -p "$VAR_DIR/lib/confexts"
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
 
-OUTPUT_DIR="$AVOCADO_PREFIX/output/runtimes/{}"
+OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
 
 {}
 
 # Potential future SDK target hook.
-# echo "Run: avocado-pre-image-var-{} {}"
-# avocado-pre-image-var-{} {}
+# echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
+# avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME
 
 # Create btrfs image with extensions and confexts subvolumes
 mkfs.btrfs -r "$VAR_DIR" \
-    --subvol rw:lib/extensions \
-    --subvol rw:lib/confexts \
-    -f "$OUTPUT_DIR/avocado-image-var.btrfs"
+    --subvol rw:lib/avocado/extensions \
+    -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 
-echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '{}'."
-avocado-build-{} {}
+echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
+avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
-            self.runtime_name,
-            self.runtime_name,
-            symlink_section,
-            target_arch,
-            self.runtime_name,
-            target_arch,
-            self.runtime_name,
-            target_arch,
-            target_arch,
-            self.runtime_name
+            self.runtime_name, target_arch, symlink_section
         );
 
         Ok(script)
@@ -288,8 +282,10 @@ test-dep = { ext = "test-ext" }
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
-        assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/test-runtime/var-staging"));
-        assert!(script.contains("avocado-build-x86_64 test-runtime"));
+        assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
+        assert!(script.contains("TARGET_ARCH=\"x86_64\""));
+        assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
+        assert!(script.contains("avocado-build-$TARGET_ARCH $RUNTIME_NAME"));
         assert!(script.contains("mkfs.btrfs"));
     }
 

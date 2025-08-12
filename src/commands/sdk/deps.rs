@@ -8,6 +8,9 @@ use crate::utils::{
     output::{print_success, OutputLevel},
 };
 
+/// Type alias for dependency sections: section name -> list of (dep_type, pkg_name, pkg_version)
+type DependencySections = HashMap<String, Vec<(String, String, String)>>;
+
 /// Implementation of the 'sdk deps' command.
 pub struct SdkDepsCommand {
     /// Path to configuration file
@@ -33,14 +36,14 @@ impl SdkDepsCommand {
         let total_count = self.display_packages_by_section(&sections);
 
         print_success(
-            &format!("Listed {} dependency(s).", total_count),
+            &format!("Listed {total_count} dependency(s)."),
             OutputLevel::Normal,
         );
 
         Ok(())
     }
 
-    fn display_packages_by_section(&self, sections: &HashMap<String, Vec<(String, String, String)>>) -> usize {
+    fn display_packages_by_section(&self, sections: &DependencySections) -> usize {
         let mut total_count = 0;
         let mut first_section = true;
 
@@ -59,7 +62,7 @@ impl SdkDepsCommand {
                     }
                     first_section = false;
 
-                    println!("\x1b[1;37m{}\x1b[0m", section_name);
+                    println!("\x1b[1;37m{section_name}\x1b[0m");
                     for (dep_type, pkg_name, pkg_version) in packages {
                         println!("({dep_type}) {pkg_name} ({pkg_version})");
                         total_count += 1;
@@ -82,7 +85,7 @@ impl SdkDepsCommand {
                 }
                 first_section = false;
 
-                println!("\x1b[1;37m{}\x1b[0m", section_name);
+                println!("\x1b[1;37m{section_name}\x1b[0m");
                 for (dep_type, pkg_name, pkg_version) in packages {
                     println!("({dep_type}) {pkg_name} ({pkg_version})");
                     total_count += 1;
@@ -94,7 +97,11 @@ impl SdkDepsCommand {
     }
 
     /// List all packages grouped by section
-    fn list_packages_by_section(&self, config: &Config, config_content: &str) -> Result<HashMap<String, Vec<(String, String, String)>>> {
+    fn list_packages_by_section(
+        &self,
+        config: &Config,
+        config_content: &str,
+    ) -> Result<DependencySections> {
         let mut sections = HashMap::new();
 
         // Process SDK dependencies
@@ -120,7 +127,9 @@ impl SdkDepsCommand {
         sections: &mut HashMap<String, Vec<(String, String, String)>>,
     ) {
         if let Some(sdk_deps) = config.get_sdk_dependencies() {
-            let section_packages = sections.entry("SDK Dependencies".to_string()).or_insert_with(Vec::new);
+            let section_packages = sections
+                .entry("SDK Dependencies".to_string())
+                .or_default();
             for (package_name, package_spec) in sdk_deps {
                 let resolved_deps =
                     self.resolve_package_dependencies(config, package_name, package_spec);
@@ -138,8 +147,8 @@ impl SdkDepsCommand {
         let extension_sdk_deps = config.get_extension_sdk_dependencies(config_content)?;
 
         for (ext_name, dependencies) in extension_sdk_deps {
-            let section_name = format!("Extension SDK Dependencies ({})", ext_name);
-            let section_packages = sections.entry(section_name).or_insert_with(Vec::new);
+            let section_name = format!("Extension SDK Dependencies ({ext_name})");
+            let section_packages = sections.entry(section_name).or_default();
             for (package_name, package_spec) in dependencies {
                 let resolved_deps =
                     self.resolve_package_dependencies(config, &package_name, &package_spec);
@@ -156,7 +165,9 @@ impl SdkDepsCommand {
     ) {
         let compile_dependencies = config.get_compile_dependencies();
         if !compile_dependencies.is_empty() {
-            let section_packages = sections.entry("Compile Dependencies".to_string()).or_insert_with(Vec::new);
+            let section_packages = sections
+                .entry("Compile Dependencies".to_string())
+                .or_default();
             for (_section_name, dependencies) in compile_dependencies {
                 for (package_name, package_spec) in dependencies {
                     let resolved_deps =
@@ -340,7 +351,9 @@ dependencies = { make = "4.3" }
         write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
-        let sections = cmd.list_packages_by_section(&config, config_content).unwrap();
+        let sections = cmd
+            .list_packages_by_section(&config, config_content)
+            .unwrap();
 
         // Should have 2 sections: SDK Dependencies and Compile Dependencies
         assert_eq!(sections.len(), 2);
@@ -348,14 +361,16 @@ dependencies = { make = "4.3" }
         // Check SDK Dependencies section
         let sdk_packages = sections.get("SDK Dependencies").unwrap();
         assert_eq!(sdk_packages.len(), 2);
-        let sdk_package_names: Vec<&String> = sdk_packages.iter().map(|(_, name, _)| name).collect();
+        let sdk_package_names: Vec<&String> =
+            sdk_packages.iter().map(|(_, name, _)| name).collect();
         assert!(sdk_package_names.contains(&&"cmake".to_string()));
         assert!(sdk_package_names.contains(&&"gcc".to_string()));
 
         // Check Compile Dependencies section
         let compile_packages = sections.get("Compile Dependencies").unwrap();
         assert_eq!(compile_packages.len(), 1);
-        let compile_package_names: Vec<&String> = compile_packages.iter().map(|(_, name, _)| name).collect();
+        let compile_package_names: Vec<&String> =
+            compile_packages.iter().map(|(_, name, _)| name).collect();
         assert!(compile_package_names.contains(&&"make".to_string()));
     }
 
@@ -388,7 +403,9 @@ nativesdk-avocado-hitl = "*"
         write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
-        let sections = cmd.list_packages_by_section(&config, config_content).unwrap();
+        let sections = cmd
+            .list_packages_by_section(&config, config_content)
+            .unwrap();
 
         // Should have 3 sections: SDK Dependencies and 2 Extension sections
         assert_eq!(sections.len(), 3);
@@ -396,19 +413,26 @@ nativesdk-avocado-hitl = "*"
         // Check SDK Dependencies section
         let sdk_packages = sections.get("SDK Dependencies").unwrap();
         assert_eq!(sdk_packages.len(), 1);
-        let sdk_package_names: Vec<&String> = sdk_packages.iter().map(|(_, name, _)| name).collect();
+        let sdk_package_names: Vec<&String> =
+            sdk_packages.iter().map(|(_, name, _)| name).collect();
         assert!(sdk_package_names.contains(&&"cmake".to_string()));
 
         // Check first extension
-        let ext1_packages = sections.get("Extension SDK Dependencies (avocado-dev)").unwrap();
+        let ext1_packages = sections
+            .get("Extension SDK Dependencies (avocado-dev)")
+            .unwrap();
         assert_eq!(ext1_packages.len(), 1);
-        let ext1_package_names: Vec<&String> = ext1_packages.iter().map(|(_, name, _)| name).collect();
+        let ext1_package_names: Vec<&String> =
+            ext1_packages.iter().map(|(_, name, _)| name).collect();
         assert!(ext1_package_names.contains(&&"nativesdk-avocado-hitl".to_string()));
 
         // Check second extension
-        let ext2_packages = sections.get("Extension SDK Dependencies (avocado-dev1)").unwrap();
+        let ext2_packages = sections
+            .get("Extension SDK Dependencies (avocado-dev1)")
+            .unwrap();
         assert_eq!(ext2_packages.len(), 1);
-        let ext2_package_names: Vec<&String> = ext2_packages.iter().map(|(_, name, _)| name).collect();
+        let ext2_package_names: Vec<&String> =
+            ext2_packages.iter().map(|(_, name, _)| name).collect();
         assert!(ext2_package_names.contains(&&"nativesdk-avocado-hitl".to_string()));
     }
 }

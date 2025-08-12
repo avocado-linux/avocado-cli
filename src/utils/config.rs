@@ -67,8 +67,8 @@ impl Config {
 
     /// Load configuration from a TOML string
     pub fn load_from_str(content: &str) -> Result<Self> {
-        let config: Config = toml::from_str(content)
-            .with_context(|| "Failed to parse TOML configuration")?;
+        let config: Config =
+            toml::from_str(content).with_context(|| "Failed to parse TOML configuration")?;
 
         Ok(config)
     }
@@ -112,9 +112,12 @@ impl Config {
 
     /// Get extension SDK dependencies from configuration
     /// Returns a HashMap where keys are extension names and values are their SDK dependencies
-    pub fn get_extension_sdk_dependencies(&self, config_content: &str) -> Result<HashMap<String, HashMap<String, toml::Value>>> {
-        let parsed: toml::Value = toml::from_str(config_content)
-            .with_context(|| "Failed to parse TOML configuration")?;
+    pub fn get_extension_sdk_dependencies(
+        &self,
+        config_content: &str,
+    ) -> Result<HashMap<String, HashMap<String, toml::Value>>> {
+        let parsed: toml::Value =
+            toml::from_str(config_content).with_context(|| "Failed to parse TOML configuration")?;
 
         let mut extension_sdk_deps = HashMap::new();
 
@@ -234,20 +237,37 @@ nativesdk-tool = "*"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
-        let extension_deps = config.get_extension_sdk_dependencies(config_content).unwrap();
+        let extension_deps = config
+            .get_extension_sdk_dependencies(config_content)
+            .unwrap();
 
         assert_eq!(extension_deps.len(), 2);
 
         // Check avocado-dev extension dependencies
         let avocado_dev_deps = extension_deps.get("avocado-dev").unwrap();
         assert_eq!(avocado_dev_deps.len(), 2);
-        assert_eq!(avocado_dev_deps.get("nativesdk-avocado-hitl").unwrap().as_str(), Some("*"));
-        assert_eq!(avocado_dev_deps.get("nativesdk-something-else").unwrap().as_str(), Some("1.2.3"));
+        assert_eq!(
+            avocado_dev_deps
+                .get("nativesdk-avocado-hitl")
+                .unwrap()
+                .as_str(),
+            Some("*")
+        );
+        assert_eq!(
+            avocado_dev_deps
+                .get("nativesdk-something-else")
+                .unwrap()
+                .as_str(),
+            Some("1.2.3")
+        );
 
         // Check another-ext extension dependencies
         let another_ext_deps = extension_deps.get("another-ext").unwrap();
         assert_eq!(another_ext_deps.len(), 1);
-        assert_eq!(another_ext_deps.get("nativesdk-tool").unwrap().as_str(), Some("*"));
+        assert_eq!(
+            another_ext_deps.get("nativesdk-tool").unwrap().as_str(),
+            Some("*")
+        );
     }
 
     #[test]
