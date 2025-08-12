@@ -52,6 +52,10 @@ impl SdkInstallCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
+        // Read the config file content for extension parsing
+        let config_content = std::fs::read_to_string(&self.config_path)
+            .with_context(|| format!("Failed to read config file {}", self.config_path))?;
+
         // Get the SDK image from configuration
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
@@ -71,6 +75,10 @@ impl SdkInstallCommand {
         // Get SDK dependencies
         let sdk_dependencies = config.get_sdk_dependencies();
 
+        // Get extension SDK dependencies
+        let extension_sdk_dependencies = config.get_extension_sdk_dependencies(&config_content)
+            .with_context(|| "Failed to parse extension SDK dependencies")?;
+
         // Get compile section dependencies
         let compile_dependencies = config.get_compile_dependencies();
 
@@ -82,19 +90,35 @@ impl SdkInstallCommand {
         let container_helper = SdkContainer::new().verbose(self.verbose);
 
         // Install SDK dependencies (into SDK)
+        let mut sdk_packages = Vec::new();
+
+        // Add regular SDK dependencies
         if let Some(dependencies) = sdk_dependencies {
-            let sdk_packages = self.build_package_list(dependencies);
+            sdk_packages.extend(self.build_package_list(dependencies));
+        }
 
-            if !sdk_packages.is_empty() {
-                let yes = if self.force { "-y" } else { "" };
-                let dnf_args_str = if let Some(args) = &self.dnf_args {
-                    format!(" {} ", args.join(" "))
-                } else {
-                    String::new()
-                };
+        // Add extension SDK dependencies to the package list
+        for (ext_name, ext_deps) in &extension_sdk_dependencies {
+            if self.verbose {
+                print_info(
+                    &format!("Adding SDK dependencies from extension '{}'", ext_name),
+                    OutputLevel::Normal,
+                );
+            }
+            let ext_packages = self.build_package_list(ext_deps);
+            sdk_packages.extend(ext_packages);
+        }
 
-                let command = format!(
-                    r#"
+        if !sdk_packages.is_empty() {
+            let yes = if self.force { "-y" } else { "" };
+            let dnf_args_str = if let Some(args) = &self.dnf_args {
+                format!(" {} ", args.join(" "))
+            } else {
+                String::new()
+            };
+
+            let command = format!(
+                r#"
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 $DNF_SDK_HOST \
@@ -105,32 +129,31 @@ $DNF_SDK_HOST \
     {} \
     {}
 "#,
-                    dnf_args_str,
-                    yes,
-                    sdk_packages.join(" ")
-                );
+                dnf_args_str,
+                yes,
+                sdk_packages.join(" ")
+            );
 
-                // Use the container helper's run_in_container method
-                let config = RunConfig {
-                    container_image: container_image.to_string(),
-                    target: target.clone(),
-                    command,
-                    verbose: self.verbose,
-                    source_environment: true,
-                    interactive: !self.force,
-                    repo_url: repo_url.cloned(),
-                    repo_release: repo_release.cloned(),
-                    container_args: self.container_args.clone(),
-                    dnf_args: self.dnf_args.clone(),
-                    ..Default::default()
-                };
-                let install_success = container_helper.run_in_container(config).await?;
+            // Use the container helper's run_in_container method
+            let config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: !self.force,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: self.container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+            let install_success = container_helper.run_in_container(config).await?;
 
-                if install_success {
-                    print_success("Installed SDK dependencies.", OutputLevel::Normal);
-                } else {
-                    return Err(anyhow::anyhow!("Failed to install SDK package(s)."));
-                }
+            if install_success {
+                print_success("Installed SDK dependencies.", OutputLevel::Normal);
+            } else {
+                return Err(anyhow::anyhow!("Failed to install SDK package(s)."));
             }
         } else {
             print_success("No dependencies configured.", OutputLevel::Normal);

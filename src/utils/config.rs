@@ -61,8 +61,14 @@ impl Config {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        Self::load_from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    }
+
+    /// Load configuration from a TOML string
+    pub fn load_from_str(content: &str) -> Result<Self> {
+        let config: Config = toml::from_str(content)
+            .with_context(|| "Failed to parse TOML configuration")?;
 
         Ok(config)
     }
@@ -102,6 +108,39 @@ impl Config {
         }
 
         compile_deps
+    }
+
+    /// Get extension SDK dependencies from configuration
+    /// Returns a HashMap where keys are extension names and values are their SDK dependencies
+    pub fn get_extension_sdk_dependencies(&self, config_content: &str) -> Result<HashMap<String, HashMap<String, toml::Value>>> {
+        let parsed: toml::Value = toml::from_str(config_content)
+            .with_context(|| "Failed to parse TOML configuration")?;
+
+        let mut extension_sdk_deps = HashMap::new();
+
+        if let Some(ext_section) = parsed.get("ext") {
+            if let Some(ext_table) = ext_section.as_table() {
+                for (ext_name, ext_config) in ext_table {
+                    if let Some(ext_config_table) = ext_config.as_table() {
+                        if let Some(sdk_section) = ext_config_table.get("sdk") {
+                            if let Some(sdk_table) = sdk_section.as_table() {
+                                if let Some(dependencies) = sdk_table.get("dependencies") {
+                                    if let Some(deps_table) = dependencies.as_table() {
+                                        let deps_map: HashMap<String, toml::Value> = deps_table
+                                            .iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect();
+                                        extension_sdk_deps.insert(ext_name.clone(), deps_map);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(extension_sdk_deps)
     }
 
     /// Get target from configuration
@@ -171,6 +210,44 @@ dependencies = { gcc = "*" }
     fn test_load_nonexistent_config() {
         let result = Config::load("nonexistent.toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extension_sdk_dependencies() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+
+[ext.avocado-dev]
+sysext = true
+confext = true
+
+[ext.avocado-dev.sdk.dependencies]
+nativesdk-avocado-hitl = "*"
+nativesdk-something-else = "1.2.3"
+
+[ext.another-ext]
+sysext = true
+
+[ext.another-ext.sdk.dependencies]
+nativesdk-tool = "*"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+        let extension_deps = config.get_extension_sdk_dependencies(config_content).unwrap();
+
+        assert_eq!(extension_deps.len(), 2);
+
+        // Check avocado-dev extension dependencies
+        let avocado_dev_deps = extension_deps.get("avocado-dev").unwrap();
+        assert_eq!(avocado_dev_deps.len(), 2);
+        assert_eq!(avocado_dev_deps.get("nativesdk-avocado-hitl").unwrap().as_str(), Some("*"));
+        assert_eq!(avocado_dev_deps.get("nativesdk-something-else").unwrap().as_str(), Some("1.2.3"));
+
+        // Check another-ext extension dependencies
+        let another_ext_deps = extension_deps.get("another-ext").unwrap();
+        assert_eq!(another_ext_deps.len(), 1);
+        assert_eq!(another_ext_deps.get("nativesdk-tool").unwrap().as_str(), Some("*"));
     }
 
     #[test]
