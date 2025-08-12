@@ -280,7 +280,6 @@ impl ExtInstallCommand {
                 };
                 let command = format!(
                     r#"
-RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
