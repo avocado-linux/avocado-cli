@@ -70,24 +70,24 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: avocado-cli
-            asset_name: avocado-cli-linux-x86_64
+            artifact_name: avocado
+            asset_name: avocado-linux-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            artifact_name: avocado-cli
-            asset_name: avocado-cli-linux-x86_64-musl
+            artifact_name: avocado
+            asset_name: avocado-linux-x86_64-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: avocado-cli.exe
-            asset_name: avocado-cli-windows-x86_64.exe
+            artifact_name: avocado.exe
+            asset_name: avocado-windows-x86_64.exe
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: avocado-cli
-            asset_name: avocado-cli-macos-x86_64
+            artifact_name: avocado
+            asset_name: avocado-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: avocado-cli
-            asset_name: avocado-cli-macos-aarch64
+            artifact_name: avocado
+            asset_name: avocado-macos-aarch64
 
     steps:
       - name: Checkout code
@@ -146,10 +146,10 @@ jobs:
           prerelease: ${{ contains(needs.validate-version.outputs.version, '-') }}
           generate_release_notes: true
           files: |
-            avocado-cli-linux-x86_64/avocado-cli
-            avocado-cli-linux-x86_64-musl/avocado-cli
-            avocado-cli-windows-x86_64.exe/avocado-cli.exe
-            avocado-cli-macos-x86_64/avocado-cli
-            avocado-cli-macos-aarch64/avocado-cli
+            avocado-linux-x86_64/avocado
+            avocado-linux-x86_64-musl/avocado
+            avocado-windows-x86_64.exe/avocado.exe
+            avocado-macos-x86_64/avocado
+            avocado-macos-aarch64/avocado
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
