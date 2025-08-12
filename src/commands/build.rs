@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-use crate::commands::{ext::ExtBuildCommand, runtime::RuntimeBuildCommand, sdk::SdkCompileCommand};
+use crate::commands::{ext::{ExtBuildCommand, ExtImageCommand}, runtime::RuntimeBuildCommand, sdk::SdkCompileCommand};
 use crate::utils::{
     config::Config,
     output::{print_info, print_success, OutputLevel},
@@ -103,7 +103,7 @@ impl BuildCommand {
         }
 
         // Step 2: Build extensions
-        print_info("Step 2/3: Building extensions", OutputLevel::Normal);
+        print_info("Step 2/4: Building extensions", OutputLevel::Normal);
         if !required_extensions.is_empty() {
             for extension in &required_extensions {
                 if self.verbose {
@@ -130,14 +130,42 @@ impl BuildCommand {
             print_info("No extensions to build.", OutputLevel::Normal);
         }
 
-        // Step 3: Build runtimes
+        // Step 3: Create extension images
+        print_info("Step 3/4: Creating extension images", OutputLevel::Normal);
+        if !required_extensions.is_empty() {
+            for extension in &required_extensions {
+                if self.verbose {
+                    print_info(
+                        &format!("Creating image for extension '{extension}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+
+                let ext_image_cmd = ExtImageCommand::new(
+                    extension.clone(),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                );
+                ext_image_cmd
+                    .execute()
+                    .await
+                    .with_context(|| format!("Failed to create image for extension '{extension}'"))?;
+            }
+        } else {
+            print_info("No extension images to create.", OutputLevel::Normal);
+        }
+
+        // Step 4: Build runtimes
         if let Some(ref runtime_name) = self.runtime {
             print_info(
-                &format!("Step 3/3: Building runtime '{runtime_name}'"),
+                &format!("Step 4/4: Building runtime '{runtime_name}'"),
                 OutputLevel::Normal,
             );
         } else {
-            print_info("Step 3/3: Building all runtimes", OutputLevel::Normal);
+            print_info("Step 4/4: Building all runtimes", OutputLevel::Normal);
         }
 
         for runtime_name in &runtimes_to_build {
