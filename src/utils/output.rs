@@ -39,9 +39,9 @@ pub fn print_plain(message: &str, _level: OutputLevel) {
 }
 
 /// Print a debug message to stderr with gray color (only in debug builds)
-pub fn print_debug(message: &str, _level: OutputLevel) {
+pub fn print_debug(_message: &str, _level: OutputLevel) {
     #[cfg(debug_assertions)]
-    eprintln!("\x1b[90m[DEBUG]\x1b[0m {message}");
+    eprintln!("\x1b[90m[DEBUG]\x1b[0m {_message}");
 }
 
 /// Flush stdout to ensure immediate output
