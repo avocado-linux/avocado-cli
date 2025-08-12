@@ -23,6 +23,8 @@ pub struct SdkRunCommand {
     pub interactive: bool,
     /// Enable verbose output
     pub verbose: bool,
+    /// Source the avocado SDK environment before running command
+    pub env: bool,
     /// Command and arguments to run in container
     pub command: Option<Vec<String>>,
     /// Global target architecture
@@ -43,6 +45,7 @@ impl SdkRunCommand {
         rm: bool,
         interactive: bool,
         verbose: bool,
+        env: bool,
         command: Option<Vec<String>>,
         target: Option<String>,
         container_args: Option<Vec<String>>,
@@ -55,6 +58,7 @@ impl SdkRunCommand {
             rm,
             interactive,
             verbose,
+            env,
             command,
             target,
             container_args,
@@ -106,7 +110,14 @@ impl SdkRunCommand {
 
         // Build the command to execute
         let command = if let Some(ref cmd) = self.command {
-            cmd.join(" ")
+            let user_command = cmd.join(" ");
+            if self.env {
+                format!(". avocado-env && {user_command}")
+            } else {
+                user_command
+            }
+        } else if self.env {
+            ". avocado-env && bash".to_string()
         } else {
             "bash".to_string()
         };
@@ -257,6 +268,7 @@ mod tests {
             true,
             false,
             true,
+            false, // env
             Some(vec!["echo".to_string(), "test".to_string()]),
             Some("test-target".to_string()),
             None,
@@ -285,6 +297,7 @@ mod tests {
             false,
             true, // interactive
             false,
+            false, // env
             None,
             None,
             None,
@@ -308,7 +321,8 @@ mod tests {
             false,
             false, // not interactive
             false,
-            None, // no command
+            false, // env
+            None,  // no command
             None,
             None,
             None,
@@ -320,5 +334,54 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("You must either provide a --command"));
+    }
+
+    #[test]
+    fn test_env_flag_command_building() {
+        // Test with env flag and command
+        let cmd = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            true, // env = true
+            Some(vec![
+                "vm".to_string(),
+                "--mem".to_string(),
+                "512".to_string(),
+            ]),
+            None,
+            None,
+            None,
+        );
+
+        assert!(cmd.env);
+        assert_eq!(
+            cmd.command,
+            Some(vec![
+                "vm".to_string(),
+                "--mem".to_string(),
+                "512".to_string()
+            ])
+        );
+
+        // Test without env flag
+        let cmd_no_env = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false, // env = false
+            Some(vec!["echo".to_string(), "test".to_string()]),
+            None,
+            None,
+            None,
+        );
+
+        assert!(!cmd_no_env.env);
     }
 }

@@ -127,9 +127,7 @@ impl SdkDepsCommand {
         sections: &mut HashMap<String, Vec<(String, String, String)>>,
     ) {
         if let Some(sdk_deps) = config.get_sdk_dependencies() {
-            let section_packages = sections
-                .entry("SDK Dependencies".to_string())
-                .or_default();
+            let section_packages = sections.entry("SDK Dependencies".to_string()).or_default();
             for (package_name, package_spec) in sdk_deps {
                 let resolved_deps =
                     self.resolve_package_dependencies(config, package_name, package_spec);

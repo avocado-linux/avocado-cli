@@ -84,6 +84,9 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// Source the avocado SDK environment before running command
+        #[arg(short, long)]
+        env: bool,
         /// Command and arguments to run in container
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -550,6 +553,7 @@ async fn main() -> Result<()> {
                 rm,
                 interactive,
                 verbose,
+                env,
                 command,
                 container_args,
                 dnf_args,
@@ -566,6 +570,7 @@ async fn main() -> Result<()> {
                     rm,
                     interactive,
                     verbose,
+                    env,
                     cmd,
                     cli.target,
                     container_args,
