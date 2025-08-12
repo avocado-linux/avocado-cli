@@ -10,6 +10,7 @@ use commands::ext::{
     ExtInstallCommand, ExtListCommand,
 };
 use commands::init::InitCommand;
+use commands::install::InstallCommand;
 use commands::runtime::{
     RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDepsCommand, RuntimeDnfCommand,
     RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
@@ -59,6 +60,27 @@ enum Commands {
     Clean {
         /// Directory to clean (defaults to current directory)
         directory: Option<String>,
+    },
+    /// Install all components (SDK, extensions, and runtime dependencies)
+    Install {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
     },
 }
 
@@ -310,6 +332,26 @@ async fn main() -> Result<()> {
         Commands::Clean { directory } => {
             let clean_cmd = CleanCommand::new(directory);
             clean_cmd.execute()?;
+            Ok(())
+        }
+        Commands::Install {
+            config,
+            verbose,
+            force,
+            runtime,
+            container_args,
+            dnf_args,
+        } => {
+            let install_cmd = InstallCommand::new(
+                config,
+                verbose,
+                force,
+                runtime,
+                cli.target,
+                container_args,
+                dnf_args,
+            );
+            install_cmd.execute().await?;
             Ok(())
         }
         Commands::Runtime { command } => match command {
