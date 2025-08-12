@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod commands;
 mod utils;
 
+use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
@@ -73,6 +74,24 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
         /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Build all components (SDK compile, extensions, and runtime images)
+    Build {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Runtime name to build (if not provided, builds all runtimes)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
         /// Additional arguments to pass to the container runtime
@@ -352,6 +371,24 @@ async fn main() -> Result<()> {
                 dnf_args,
             );
             install_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Build {
+            config,
+            verbose,
+            runtime,
+            container_args,
+            dnf_args,
+        } => {
+            let build_cmd = BuildCommand::new(
+                config,
+                verbose,
+                runtime,
+                cli.target,
+                container_args,
+                dnf_args,
+            );
+            build_cmd.execute().await?;
             Ok(())
         }
         Commands::Runtime { command } => match command {
