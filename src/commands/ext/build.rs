@@ -299,15 +299,24 @@ set -e
 
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/extension-release.d"
 release_file="$release_dir/extension-release.{}"
+modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
 
 mkdir -p "$release_dir"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
 echo "SYSEXT_SCOPE={}" >> "$release_file"
+
+# Check if extension includes kernel modules and add AVOCADO_ON_MERGE if needed
+if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.gz" 2>/dev/null | head -n 1)" ]; then
+    echo "AVOCADO_ON_MERGE=depmod" >> "$release_file"
+    echo "Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=depmod to release file"
+fi
 "#,
             self.extension,
             self.extension,
-            ext_scopes.join(" ")
+            self.extension,
+            ext_scopes.join(" "),
+            self.extension
         )
     }
 
@@ -328,5 +337,124 @@ echo "CONFEXT_SCOPE={}" >> "$release_file"
             self.extension,
             ext_scopes.join(" ")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_sysext_build_script_basic() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()]);
+
+        // Print the actual script for debugging
+        // println!("Generated sysext build script:\n{}", script);
+
+        assert!(script.contains(
+            "release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/extension-release.d\""
+        ));
+        assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext\""));
+        assert!(script.contains("modules_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/modules\""));
+        assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
+        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
+        assert!(script.contains("echo \"SYSEXT_SCOPE=system\" >> \"$release_file\""));
+        assert!(script.contains(
+            "if [ -d \"$modules_dir\" ] && [ -n \"$(find \"$modules_dir\" -name \"*.ko\""
+        ));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=depmod\" >> \"$release_file\""));
+        assert!(script.contains("Found kernel modules in extension 'test-ext'"));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_basic() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()]);
+
+        assert!(script
+            .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
+        assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext\""));
+        assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
+        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
+        assert!(script.contains("echo \"CONFEXT_SCOPE=system\" >> \"$release_file\""));
+        // Confext should NOT include kernel module detection
+        assert!(!script.contains("modules_dir"));
+        assert!(!script.contains("AVOCADO_ON_MERGE=depmod"));
+        assert!(!script.contains("Found kernel modules"));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_multiple_scopes() {
+        let cmd = ExtBuildCommand {
+            extension: "multi-scope-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script =
+            cmd.create_sysext_build_script("2.0", &["system".to_string(), "portable".to_string()]);
+
+        assert!(script.contains("echo \"SYSEXT_SCOPE=system portable\" >> \"$release_file\""));
+        assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/usr/lib/extension-release.d"));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_multiple_scopes() {
+        let cmd = ExtBuildCommand {
+            extension: "multi-scope-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script =
+            cmd.create_confext_build_script("2.0", &["system".to_string(), "portable".to_string()]);
+
+        assert!(script.contains("echo \"CONFEXT_SCOPE=system portable\" >> \"$release_file\""));
+        assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/etc/extension-release.d"));
+    }
+
+    #[test]
+    fn test_kernel_module_detection_pattern() {
+        let cmd = ExtBuildCommand {
+            extension: "kernel-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()]);
+
+        // Verify the find command looks for common kernel module extensions
+        assert!(script.contains("-name \"*.ko\""));
+        assert!(script.contains("-name \"*.ko.xz\""));
+        assert!(script.contains("-name \"*.ko.gz\""));
+        // Verify the conditional structure
+        assert!(script.contains("if [ -d \"$modules_dir\" ] && [ -n \"$(find"));
+        assert!(script.contains("2>/dev/null | head -n 1)\" ]; then"));
     }
 }

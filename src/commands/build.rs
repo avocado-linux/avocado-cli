@@ -3,7 +3,11 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
-use crate::commands::{ext::{ExtBuildCommand, ExtImageCommand}, runtime::RuntimeBuildCommand, sdk::SdkCompileCommand};
+use crate::commands::{
+    ext::{ExtBuildCommand, ExtImageCommand},
+    runtime::RuntimeBuildCommand,
+    sdk::SdkCompileCommand,
+};
 use crate::utils::{
     config::Config,
     output::{print_info, print_success, OutputLevel},
@@ -149,10 +153,9 @@ impl BuildCommand {
                     self.container_args.clone(),
                     self.dnf_args.clone(),
                 );
-                ext_image_cmd
-                    .execute()
-                    .await
-                    .with_context(|| format!("Failed to create image for extension '{extension}'"))?;
+                ext_image_cmd.execute().await.with_context(|| {
+                    format!("Failed to create image for extension '{extension}'")
+                })?;
             }
         } else {
             print_info("No extension images to create.", OutputLevel::Normal);
