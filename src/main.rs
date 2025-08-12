@@ -12,6 +12,7 @@ use commands::ext::{
 };
 use commands::init::InitCommand;
 use commands::install::InstallCommand;
+use commands::provision::ProvisionCommand;
 use commands::runtime::{
     RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDepsCommand, RuntimeDnfCommand,
     RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
@@ -94,6 +95,27 @@ enum Commands {
         /// Runtime name to build (if not provided, builds all runtimes)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Provision a runtime (shortcut for 'runtime provision')
+    Provision {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Runtime name to provision
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -389,6 +411,26 @@ async fn main() -> Result<()> {
                 dnf_args,
             );
             build_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Provision {
+            config,
+            verbose,
+            force,
+            runtime,
+            container_args,
+            dnf_args,
+        } => {
+            let provision_cmd = ProvisionCommand::new(
+                runtime,
+                config,
+                verbose,
+                force,
+                cli.target,
+                container_args,
+                dnf_args,
+            );
+            provision_cmd.execute().await?;
             Ok(())
         }
         Commands::Runtime { command } => match command {
