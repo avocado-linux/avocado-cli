@@ -133,6 +133,7 @@ impl SdkRunCommand {
                 &container_helper,
                 container_image,
                 &target,
+                &command,
                 repo_url,
                 repo_release,
             )
@@ -235,15 +236,16 @@ impl SdkRunCommand {
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
+        command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
     ) -> Result<bool> {
         let config = RunConfig {
             container_image: container_image.to_string(),
             target: target.to_string(),
-            command: "bash".to_string(),
+            command: command.to_string(),
             verbose: self.verbose,
-            source_environment: false,
+            source_environment: self.env,
             interactive: true,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
@@ -286,6 +288,28 @@ mod tests {
             Some(vec!["echo".to_string(), "test".to_string()])
         );
         assert_eq!(cmd.target, Some("test-target".to_string()));
+    }
+
+    #[test]
+    fn test_interactive_with_env_and_command() {
+        let cmd = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false, // detach
+            false, // rm
+            true,  // interactive
+            false, // verbose
+            true,  // env
+            Some(vec!["ls".to_string(), "-la".to_string()]),
+            Some("test-target".to_string()),
+            None,
+            None,
+        );
+
+        // Verify that the command struct stores the values correctly
+        assert!(cmd.interactive);
+        assert!(cmd.env);
+        assert_eq!(cmd.command, Some(vec!["ls".to_string(), "-la".to_string()]));
     }
 
     #[tokio::test]
