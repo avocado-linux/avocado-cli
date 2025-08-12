@@ -73,8 +73,7 @@ image = "avocadolinux/sdk:apollo-edge"
 nativesdk-qemu-system-x86-64 = "*"
 
 [ext.avocado-dev]
-sysext = true
-confext = true
+types = ["sysext", "confext"]
 
 [ext.avocado-dev.dependencies]
 avocado-hitl = "*"
@@ -134,8 +133,7 @@ mod tests {
         assert!(content.contains("image = \"avocadolinux/sdk:apollo-edge\""));
         assert!(content.contains("nativesdk-qemu-system-x86-64 = \"*\""));
         assert!(content.contains("[ext.avocado-dev]"));
-        assert!(content.contains("sysext = true"));
-        assert!(content.contains("confext = true"));
+        assert!(content.contains("types = [\"sysext\", \"confext\"]"));
         assert!(content.contains("avocado-hitl = \"*\""));
         assert!(content.contains("nativesdk-avocado-hitl = \"*\""));
     }

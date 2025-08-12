@@ -384,15 +384,13 @@ image = "test-image"
 cmake = "*"
 
 [ext.avocado-dev]
-sysext = true
-confext = true
+types = ["sysext", "confext"]
 
 [ext.avocado-dev.sdk.dependencies]
 nativesdk-avocado-hitl = "*"
 
 [ext.avocado-dev1]
-sysext = true
-confext = true
+types = ["sysext", "confext"]
 
 [ext.avocado-dev1.sdk.dependencies]
 nativesdk-avocado-hitl = "*"

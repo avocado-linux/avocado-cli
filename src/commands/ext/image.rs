@@ -50,26 +50,16 @@ impl ExtImageCommand {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
-        // Get extension types (sysext, confext) from boolean flags
-        let mut ext_types = Vec::new();
-        if ext_config
-            .get("sysext")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            ext_types.push("sysext");
-        }
-        if ext_config
-            .get("confext")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            ext_types.push("confext");
-        }
+        // Get extension types from the types array
+        let ext_types = ext_config
+            .get("types")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
 
         if ext_types.is_empty() {
             return Err(anyhow::anyhow!(
-                "Extension '{}' has sysext=false and confext=false. At least one must be true to create image.",
+                "Extension '{}' has no types specified. The 'types' array must contain at least one of: 'sysext', 'confext'.",
                 self.extension
             ));
         }

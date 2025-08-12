@@ -141,11 +141,26 @@ impl RuntimeBuildCommand {
             .and_then(|v| v.as_table())
             .unwrap_or(&binding);
 
-        // Extract extension names from runtime dependencies
+        // Extract extension names and any type overrides from runtime dependencies
         let mut required_extensions = HashSet::new();
+        let mut extension_type_overrides: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
         for (_dep_name, dep_spec) in runtime_deps {
             if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
                 required_extensions.insert(ext_name.to_string());
+
+                // Check if the runtime dependency specifies custom types
+                if let Some(types) = dep_spec.get("types").and_then(|v| v.as_array()) {
+                    let type_strings: Vec<String> = types
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect();
+                    if !type_strings.is_empty() {
+                        extension_type_overrides.insert(ext_name.to_string(), type_strings);
+                    }
+                }
             }
         }
 
@@ -156,14 +171,37 @@ impl RuntimeBuildCommand {
             for (ext_name, ext_data) in ext_config {
                 // Only process extensions that are required by this runtime
                 if required_extensions.contains(ext_name) {
-                    let is_sysext = ext_data
-                        .get("sysext")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let is_confext = ext_data
-                        .get("confext")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    // Get extension types from the extension definition
+                    let ext_supported_types = ext_data
+                        .get("types")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+
+                    // Determine which types to actually use
+                    let types_to_use = if let Some(override_types) =
+                        extension_type_overrides.get(ext_name)
+                    {
+                        // Validate that runtime dependency doesn't request unsupported types
+                        let mut validated_types = Vec::new();
+                        for requested_type in override_types {
+                            if ext_supported_types.contains(&requested_type.as_str()) {
+                                validated_types.push(requested_type.as_str());
+                            } else {
+                                // Print warning but continue processing
+                                eprintln!(
+                                    "Warning: Runtime dependency for extension '{ext_name}' requests type '{requested_type}' which is not supported by the extension. Supported types: {ext_supported_types:?}"
+                                );
+                            }
+                        }
+                        validated_types
+                    } else {
+                        // Use extension's default types
+                        ext_supported_types
+                    };
+
+                    let is_sysext = types_to_use.contains(&"sysext");
+                    let is_confext = types_to_use.contains(&"confext");
 
                     symlink_commands.push(format!(
                         r#"
@@ -303,8 +341,7 @@ test-dep = { ext = "test-ext" }
 
 [ext.test-ext]
 version = "1.0"
-sysext = true
-confext = false
+types = ["sysext"]
 "#;
         let parsed: toml::Value = toml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
@@ -320,5 +357,72 @@ confext = false
 
         assert!(script.contains("test-ext.raw"));
         assert!(script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw"));
+    }
+
+    #[test]
+    fn test_create_build_script_with_type_overrides() {
+        let config_content = r#"
+[sdk]
+image = "test-image"
+
+[runtime.test-runtime]
+target = "x86_64"
+
+[runtime.test-runtime.dependencies]
+test-dep = { ext = "test-ext", types = ["sysext"] }
+
+[ext.test-ext]
+version = "1.0"
+types = ["sysext", "confext"]
+"#;
+        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            "avocado.toml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
+
+        // Should include sysext symlink (as specified in runtime dependency)
+        assert!(script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
+        // Should NOT include confext symlink (not requested by runtime)
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
+    }
+
+    #[test]
+    fn test_create_build_script_no_type_override_uses_extension_defaults() {
+        let config_content = r#"
+[sdk]
+image = "test-image"
+
+[runtime.test-runtime]
+target = "x86_64"
+
+[runtime.test-runtime.dependencies]
+test-dep = { ext = "test-ext" }
+
+[ext.test-ext]
+version = "1.0"
+types = ["confext"]
+"#;
+        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            "avocado.toml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
+
+        // Should use extension's default types (confext only)
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
+        assert!(script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
     }
 }

@@ -222,15 +222,14 @@ dependencies = { gcc = "*" }
 image = "avocadolinux/sdk:apollo-edge"
 
 [ext.avocado-dev]
-sysext = true
-confext = true
+types = ["sysext", "confext"]
 
 [ext.avocado-dev.sdk.dependencies]
 nativesdk-avocado-hitl = "*"
 nativesdk-something-else = "1.2.3"
 
 [ext.another-ext]
-sysext = true
+types = ["sysext"]
 
 [ext.another-ext.sdk.dependencies]
 nativesdk-tool = "*"

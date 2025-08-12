@@ -160,8 +160,7 @@ app-ext = { ext = "my-extension" }
 
 [ext.my-extension]
 version = "2.0"
-sysext = true
-confext = false
+types = ["sysext"]
 "#
     }
 
