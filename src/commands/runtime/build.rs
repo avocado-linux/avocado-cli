@@ -168,47 +168,13 @@ impl RuntimeBuildCommand {
         let mut symlink_commands = Vec::new();
 
         if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_table()) {
-            for (ext_name, ext_data) in ext_config {
+            for (ext_name, _ext_data) in ext_config {
                 // Only process extensions that are required by this runtime
                 if required_extensions.contains(ext_name) {
-                    // Get extension types from the extension definition
-                    let ext_supported_types = ext_data
-                        .get("types")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                        .unwrap_or_default();
-
-                    // Determine which types to actually use
-                    let types_to_use = if let Some(override_types) =
-                        extension_type_overrides.get(ext_name)
-                    {
-                        // Validate that runtime dependency doesn't request unsupported types
-                        let mut validated_types = Vec::new();
-                        for requested_type in override_types {
-                            if ext_supported_types.contains(&requested_type.as_str()) {
-                                validated_types.push(requested_type.as_str());
-                            } else {
-                                // Print warning but continue processing
-                                eprintln!(
-                                    "Warning: Runtime dependency for extension '{ext_name}' requests type '{requested_type}' which is not supported by the extension. Supported types: {ext_supported_types:?}"
-                                );
-                            }
-                        }
-                        validated_types
-                    } else {
-                        // Use extension's default types
-                        ext_supported_types
-                    };
-
-                    let is_sysext = types_to_use.contains(&"sysext");
-                    let is_confext = types_to_use.contains(&"confext");
-
                     symlink_commands.push(format!(
                         r#"
 OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
 RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
-SYSEXT=$VAR_DIR/lib/extensions/{ext_name}.raw
-CONFEXT=$VAR_DIR/lib/confexts/{ext_name}.raw
 
 if [ -f "$OUTPUT_EXT" ]; then
     if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
@@ -218,18 +184,6 @@ else
     echo "Missing image for extension {ext_name}."
 fi"#
                     ));
-
-                    if is_sysext {
-                        symlink_commands.push(format!(
-                            "ln -sf /var/lib/avocado/extensions/{ext_name}.raw $SYSEXT"
-                        ));
-                    }
-
-                    if is_confext {
-                        symlink_commands.push(format!(
-                            "ln -sf /var/lib/avocado/extensions/{ext_name}.raw $CONFEXT"
-                        ));
-                    }
                 }
             }
         }
@@ -247,8 +201,6 @@ RUNTIME_NAME="{}"
 TARGET_ARCH="{}"
 
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
-mkdir -p "$VAR_DIR/lib/extensions"
-mkdir -p "$VAR_DIR/lib/confexts"
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
 
 OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
@@ -356,7 +308,9 @@ types = ["sysext"]
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
         assert!(script.contains("test-ext.raw"));
-        assert!(script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw"));
+        // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext.raw"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext.raw"));
     }
 
     #[test]
@@ -387,9 +341,11 @@ types = ["sysext", "confext"]
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
-        // Should include sysext symlink (as specified in runtime dependency)
-        assert!(script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
-        // Should NOT include confext symlink (not requested by runtime)
+        // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext.raw"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext.raw"));
+        // Should NOT include symlinks to systemd directories (runtime will handle this)
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
         assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
     }
 
@@ -421,8 +377,11 @@ types = ["confext"]
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
-        // Should use extension's default types (confext only)
+        // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext.raw"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext.raw"));
+        // Should NOT include symlinks to systemd directories (runtime will handle this)
         assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
-        assert!(script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
     }
 }
