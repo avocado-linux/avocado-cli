@@ -99,19 +99,69 @@ impl Config {
         self.sdk.as_ref()?.container_args.as_ref()
     }
 
-    /// Merge SDK container args from config with CLI args
+        /// Expand environment variables in a string
+    fn expand_env_vars(input: &str) -> String {
+        let mut result = input.to_string();
+
+        // Find and replace $VAR and ${VAR} patterns
+        while let Some(start) = result.find('$') {
+            let after_dollar = &result[start + 1..];
+
+            let (var_name, end_pos) = if after_dollar.starts_with('{') {
+                // Handle ${VAR} format
+                if let Some(close_brace) = after_dollar.find('}') {
+                    let var_name = &after_dollar[1..close_brace];
+                    (var_name, start + close_brace + 2)
+                } else {
+                    // Malformed ${VAR without closing brace, skip this $
+                    result.replace_range(start..start + 1, "\\$");
+                    continue;
+                }
+            } else {
+                // Handle $VAR format (alphanumeric + underscore)
+                let var_end = after_dollar
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(after_dollar.len());
+
+                if var_end == 0 {
+                    // Just a lone $, skip it
+                    result.replace_range(start..start + 1, "\\$");
+                    continue;
+                }
+
+                let var_name = &after_dollar[..var_end];
+                (var_name, start + var_end + 1)
+            };
+
+            // Get the environment variable value
+            let var_value = std::env::var(var_name).unwrap_or_default();
+
+            // Replace the variable reference with its value
+            let pattern_start = start;
+            result.replace_range(pattern_start..end_pos, &var_value);
+        }
+
+        // Unescape any literal $ that were escaped
+        result.replace("\\$", "$")
+    }
+
+    /// Merge SDK container args from config with CLI args, expanding environment variables
     /// Returns a new Vec containing config args first, then CLI args
     pub fn merge_sdk_container_args(&self, cli_args: Option<&Vec<String>>) -> Option<Vec<String>> {
         let config_args = self.get_sdk_container_args();
 
         match (config_args, cli_args) {
             (Some(config), Some(cli)) => {
-                let mut merged = config.clone();
-                merged.extend(cli.clone());
+                let mut merged = config.iter().map(|arg| Self::expand_env_vars(arg)).collect::<Vec<_>>();
+                merged.extend(cli.iter().map(|arg| Self::expand_env_vars(arg)));
                 Some(merged)
             }
-            (Some(config), None) => Some(config.clone()),
-            (None, Some(cli)) => Some(cli.clone()),
+            (Some(config), None) => {
+                Some(config.iter().map(|arg| Self::expand_env_vars(arg)).collect())
+            }
+            (None, Some(cli)) => {
+                Some(cli.iter().map(|arg| Self::expand_env_vars(arg)).collect())
+            }
             (None, None) => None,
         }
     }
@@ -321,12 +371,12 @@ container_args = ["--network=$USER-avocado", "--privileged"]
         assert_eq!(args[1], "--privileged");
     }
 
-    #[test]
+        #[test]
     fn test_merge_sdk_container_args() {
         let config_content = r#"
 [sdk]
 image = "avocadolinux/sdk:apollo-edge"
-container_args = ["--network=$USER-avocado", "--privileged"]
+container_args = ["--network=host", "--privileged"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -338,18 +388,18 @@ container_args = ["--network=$USER-avocado", "--privileged"]
         assert!(merged.is_some());
         let merged_args = merged.unwrap();
         assert_eq!(merged_args.len(), 4);
-        assert_eq!(merged_args[0], "--network=$USER-avocado");
+        assert_eq!(merged_args[0], "--network=host");
         assert_eq!(merged_args[1], "--privileged");
         assert_eq!(merged_args[2], "--cap-add=SYS_ADMIN");
         assert_eq!(merged_args[3], "--rm");
     }
 
-    #[test]
+        #[test]
     fn test_merge_sdk_container_args_config_only() {
         let config_content = r#"
 [sdk]
 image = "avocadolinux/sdk:apollo-edge"
-container_args = ["--network=$USER-avocado"]
+container_args = ["--network=host"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -360,7 +410,7 @@ container_args = ["--network=$USER-avocado"]
         assert!(merged.is_some());
         let merged_args = merged.unwrap();
         assert_eq!(merged_args.len(), 1);
-        assert_eq!(merged_args[0], "--network=$USER-avocado");
+        assert_eq!(merged_args[0], "--network=host");
     }
 
     #[test]
@@ -382,7 +432,7 @@ image = "avocadolinux/sdk:apollo-edge"
         assert_eq!(merged_args[0], "--cap-add=SYS_ADMIN");
     }
 
-    #[test]
+        #[test]
     fn test_merge_sdk_container_args_none() {
         let config_content = r#"
 [sdk]
@@ -395,5 +445,64 @@ image = "avocadolinux/sdk:apollo-edge"
         let merged = config.merge_sdk_container_args(None);
 
         assert!(merged.is_none());
+    }
+
+    #[test]
+    fn test_expand_env_vars() {
+        // Set up test environment variables
+        std::env::set_var("TEST_USER", "testuser");
+        std::env::set_var("TEST_NETWORK", "mynetwork");
+
+        // Test $VAR format
+        let result = Config::expand_env_vars("--network=$TEST_USER-avocado");
+        assert_eq!(result, "--network=testuser-avocado");
+
+        // Test ${VAR} format
+        let result = Config::expand_env_vars("--network=${TEST_NETWORK}");
+        assert_eq!(result, "--network=mynetwork");
+
+        // Test mixed formats
+        let result = Config::expand_env_vars("--arg=$TEST_USER-${TEST_NETWORK}");
+        assert_eq!(result, "--arg=testuser-mynetwork");
+
+        // Test undefined variable (should become empty string)
+        let result = Config::expand_env_vars("--network=$UNDEFINED_VAR-test");
+        assert_eq!(result, "--network=-test");
+
+        // Test no variables
+        let result = Config::expand_env_vars("--privileged");
+        assert_eq!(result, "--privileged");
+
+        // Clean up
+        std::env::remove_var("TEST_USER");
+        std::env::remove_var("TEST_NETWORK");
+    }
+
+    #[test]
+    fn test_merge_sdk_container_args_with_env_expansion() {
+        // Set up test environment variable
+        std::env::set_var("TEST_USER", "myuser");
+
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+container_args = ["--network=$TEST_USER-avocado", "--privileged"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test merging with environment variable expansion
+        let cli_args = vec!["--cap-add=$TEST_USER".to_string()];
+        let merged = config.merge_sdk_container_args(Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 3);
+        assert_eq!(merged_args[0], "--network=myuser-avocado");
+        assert_eq!(merged_args[1], "--privileged");
+        assert_eq!(merged_args[2], "--cap-add=myuser");
+
+        // Clean up
+        std::env::remove_var("TEST_USER");
     }
 }
