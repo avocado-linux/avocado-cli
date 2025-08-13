@@ -219,7 +219,7 @@ impl BuildCommand {
         }
     }
 
-    /// Find all extensions required by the specified runtimes
+    /// Find all extensions required by the specified runtimes, or all extensions if no runtime specified
     fn find_required_extensions(
         &self,
         parsed: &toml::Value,
@@ -227,17 +227,27 @@ impl BuildCommand {
     ) -> Result<Vec<String>> {
         let mut required_extensions = HashSet::new();
 
-        let runtime_section = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
+        // If no specific runtime is provided, build all extensions
+        if self.runtime.is_none() {
+            if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
+                for ext_name in ext_section.keys() {
+                    required_extensions.insert(ext_name.clone());
+                }
+            }
+        } else {
+            // Only build extensions needed by the specified runtimes
+            let runtime_section = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
 
-        for runtime_name in runtimes {
-            if let Some(runtime_config) = runtime_section.get(runtime_name) {
-                if let Some(dependencies) = runtime_config
-                    .get("dependencies")
-                    .and_then(|d| d.as_table())
-                {
-                    for (_dep_name, dep_spec) in dependencies {
-                        if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                            required_extensions.insert(ext_name.to_string());
+            for runtime_name in runtimes {
+                if let Some(runtime_config) = runtime_section.get(runtime_name) {
+                    if let Some(dependencies) = runtime_config
+                        .get("dependencies")
+                        .and_then(|d| d.as_table())
+                    {
+                        for (_dep_name, dep_spec) in dependencies {
+                            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                required_extensions.insert(ext_name.to_string());
+                            }
                         }
                     }
                 }
@@ -249,7 +259,7 @@ impl BuildCommand {
         Ok(extensions)
     }
 
-    /// Find SDK compile sections needed for the required extensions
+    /// Find SDK compile sections needed for the required extensions, or all sections if no runtime specified
     fn find_sdk_compile_sections(
         &self,
         config: &Config,
@@ -257,33 +267,41 @@ impl BuildCommand {
     ) -> Result<Vec<String>> {
         let mut needed_sections = HashSet::new();
 
-        // Get extension SDK dependencies
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let extension_sdk_dependencies = config
-            .get_extension_sdk_dependencies(&content)
-            .with_context(|| "Failed to parse extension SDK dependencies")?;
-
-        // For each required extension, check if it has SDK dependencies that need compilation
-        for extension in required_extensions {
-            if let Some(_ext_deps) = extension_sdk_dependencies.get(extension) {
-                // If the extension has SDK dependencies, we might need to compile them
-                // For now, we'll check if there are compile sections defined and add them all
-                // In a more sophisticated implementation, we'd analyze which specific sections
-                // are needed based on the extension's SDK dependencies
-                if self.verbose {
-                    print_info(
-                        &format!("Extension '{extension}' has SDK dependencies"),
-                        OutputLevel::Normal,
-                    );
-                }
-            }
-        }
-
-        // Get compile sections from config - we'll compile all of them if any extensions need SDK code
-        if !required_extensions.is_empty() {
+        // If no specific runtime is provided, compile all SDK sections
+        if self.runtime.is_none() {
             let compile_dependencies = config.get_compile_dependencies();
             for section_name in compile_dependencies.keys() {
                 needed_sections.insert(section_name.clone());
+            }
+        } else {
+            // Only compile sections needed by the required extensions
+            let content = std::fs::read_to_string(&self.config_path)?;
+            let extension_sdk_dependencies = config
+                .get_extension_sdk_dependencies(&content)
+                .with_context(|| "Failed to parse extension SDK dependencies")?;
+
+            // For each required extension, check if it has SDK dependencies that need compilation
+            for extension in required_extensions {
+                if let Some(_ext_deps) = extension_sdk_dependencies.get(extension) {
+                    // If the extension has SDK dependencies, we might need to compile them
+                    // For now, we'll check if there are compile sections defined and add them all
+                    // In a more sophisticated implementation, we'd analyze which specific sections
+                    // are needed based on the extension's SDK dependencies
+                    if self.verbose {
+                        print_info(
+                            &format!("Extension '{extension}' has SDK dependencies"),
+                            OutputLevel::Normal,
+                        );
+                    }
+                }
+            }
+
+            // Get compile sections from config - we'll compile all of them if any extensions need SDK code
+            if !required_extensions.is_empty() {
+                let compile_dependencies = config.get_compile_dependencies();
+                for section_name in compile_dependencies.keys() {
+                    needed_sections.insert(section_name.clone());
+                }
             }
         }
 

@@ -81,19 +81,36 @@ impl InstallCommand {
             "Step 2/3: Installing extension dependencies",
             OutputLevel::Normal,
         );
-        let ext_install_cmd = ExtInstallCommand::new(
-            None, // Install all extensions
-            self.config_path.clone(),
-            self.verbose,
-            self.force,
-            self.target.clone(),
-            self.container_args.clone(),
-            self.dnf_args.clone(),
-        );
-        ext_install_cmd
-            .execute()
-            .await
-            .with_context(|| "Failed to install extension dependencies")?;
+
+        // Determine which extensions to install based on runtime dependencies
+        let extensions_to_install = self.find_required_extensions(&_config, &self.config_path)?;
+
+        if !extensions_to_install.is_empty() {
+            for extension in &extensions_to_install {
+                if self.verbose {
+                    print_info(
+                        &format!("Installing extension dependencies for '{extension}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+
+                let ext_install_cmd = ExtInstallCommand::new(
+                    Some(extension.clone()),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                );
+                ext_install_cmd
+                    .execute()
+                    .await
+                    .with_context(|| format!("Failed to install extension dependencies for '{extension}'"))?;
+            }
+        } else {
+            print_info("No extension dependencies to install.", OutputLevel::Normal);
+        }
 
         // 3. Install runtime dependencies
         if let Some(ref runtime_name) = self.runtime {
@@ -126,6 +143,48 @@ impl InstallCommand {
             OutputLevel::Normal,
         );
         Ok(())
+    }
+
+    /// Find all extensions required by the runtime, or all extensions if no runtime specified
+    fn find_required_extensions(&self, _config: &Config, config_path: &str) -> Result<Vec<String>> {
+        use std::collections::HashSet;
+
+        let mut required_extensions = HashSet::new();
+
+        // Read and parse the configuration file
+        let content = std::fs::read_to_string(config_path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+
+        // If no specific runtime is provided, install all extensions
+        if self.runtime.is_none() {
+            if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
+                for ext_name in ext_section.keys() {
+                    required_extensions.insert(ext_name.clone());
+                }
+            }
+        } else {
+            // Only install extensions needed by the specified runtime
+            if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_table()) {
+                if let Some(runtime_name) = &self.runtime {
+                    if let Some(runtime_config) = runtime_section.get(runtime_name) {
+                        if let Some(dependencies) = runtime_config
+                            .get("dependencies")
+                            .and_then(|d| d.as_table())
+                        {
+                            for (_dep_name, dep_spec) in dependencies {
+                                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                    required_extensions.insert(ext_name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut extensions: Vec<String> = required_extensions.into_iter().collect();
+        extensions.sort();
+        Ok(extensions)
     }
 }
 

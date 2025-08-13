@@ -10,6 +10,7 @@ use commands::ext::{
     ExtBuildCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
     ExtInstallCommand, ExtListCommand,
 };
+use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
 use commands::install::InstallCommand;
 use commands::provision::ProvisionCommand;
@@ -57,6 +58,11 @@ enum Commands {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommands,
+    },
+    /// Hardware-in-the-loop testing commands
+    Hitl {
+        #[command(subcommand)]
+        command: HitlCommands,
     },
     /// Clean the avocado project by removing the _avocado directory
     Clean {
@@ -648,6 +654,27 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Hitl { command } => match command {
+            HitlCommands::Server {
+                config_path,
+                extensions,
+                container_args,
+                dnf_args,
+                target,
+                verbose,
+            } => {
+                let hitl_cmd = HitlServerCommand {
+                    config_path,
+                    extensions,
+                    container_args,
+                    dnf_args,
+                    target: target.or(cli.target),
+                    verbose,
+                };
+                hitl_cmd.execute().await?;
+                Ok(())
+            }
+        },
         Commands::Sdk { command } => match command {
             SdkCommands::Install {
                 config,
@@ -865,5 +892,30 @@ enum ExtCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HitlCommands {
+    /// Start a HITL server container with preconfigured settings
+    Server {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config_path: String,
+        /// Extensions to create NFS exports for
+        #[arg(short, long = "extension")]
+        extensions: Vec<String>,
+        /// Additional container arguments
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+        /// Target to build for
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
