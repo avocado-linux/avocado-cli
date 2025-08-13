@@ -50,8 +50,15 @@ impl RuntimeDnfCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
-        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release, &merged_container_args)
-            .await
+        self.execute_dnf_command(
+            &parsed,
+            &container_image,
+            &target,
+            repo_url,
+            repo_release,
+            &merged_container_args,
+        )
+        .await
     }
 
     fn validate_runtime_exists(&self, parsed: &toml::Value) -> Result<()> {

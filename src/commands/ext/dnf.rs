@@ -50,8 +50,15 @@ impl ExtDnfCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
-        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release, &merged_container_args)
-            .await
+        self.execute_dnf_command(
+            &parsed,
+            &container_image,
+            &target,
+            repo_url,
+            repo_release,
+            &merged_container_args,
+        )
+        .await
     }
 
     fn validate_extension_exists(&self, parsed: &toml::Value) -> Result<()> {
@@ -163,10 +170,7 @@ impl ExtDnfCommand {
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
-        let check_cmd = format!(
-            "test -d $AVOCADO_EXT_SYSROOTS/{}",
-            self.extension
-        );
+        let check_cmd = format!("test -d $AVOCADO_EXT_SYSROOTS/{}", self.extension);
 
         let config = RunConfig {
             container_image: container_image.to_string(),
