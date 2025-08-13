@@ -43,6 +43,7 @@ coverage/
 
 # Avocado state directories
 _avocado/
+.avocado-state
 
 # Documentation build
 docs/_build/

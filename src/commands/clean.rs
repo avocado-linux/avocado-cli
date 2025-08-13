@@ -3,14 +3,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::volume::{VolumeManager, VolumeState};
 
-/// Command to clean the avocado project by removing the _avocado directory.
+/// Command to clean the avocado project by removing docker volumes and state files.
 ///
-/// This command removes the `_avocado` directory from the specified directory,
-/// which contains build artifacts and temporary files created by the Avocado build system.
+/// This command removes docker volumes and `.avocado-state` files created by the Avocado build system.
 pub struct CleanCommand {
     /// Directory to clean (defaults to current directory)
     directory: Option<String>,
+    /// Whether to also remove docker volumes
+    volumes: bool,
+    /// Container tool to use (docker/podman)
+    container_tool: String,
+    /// Verbose output
+    verbose: bool,
 }
 
 impl CleanCommand {
@@ -18,21 +24,35 @@ impl CleanCommand {
     ///
     /// # Arguments
     /// * `directory` - Optional directory path to clean (defaults to current directory)
-    pub fn new(directory: Option<String>) -> Self {
-        Self { directory }
+    /// * `volumes` - Whether to clean docker volumes
+    /// * `container_tool` - Container tool to use (docker/podman)
+    /// * `verbose` - Enable verbose output
+    pub fn new(
+        directory: Option<String>,
+        volumes: bool,
+        container_tool: Option<String>,
+        verbose: bool,
+    ) -> Self {
+        Self {
+            directory,
+            volumes,
+            container_tool: container_tool.unwrap_or_else(|| "docker".to_string()),
+            verbose,
+        }
     }
 
-    /// Executes the clean command, removing the _avocado directory.
+    /// Executes the clean command, removing volumes, state files, and optionally legacy directories.
     ///
     /// # Returns
-    /// * `Ok(())` if the cleaning was successful or if no _avocado directory exists
+    /// * `Ok(())` if the cleaning was successful
     /// * `Err` if there was an error during cleaning
     ///
     /// # Errors
     /// This function will return an error if:
     /// * The specified directory does not exist
-    /// * The _avocado directory cannot be removed due to permissions or other I/O errors
-    pub fn execute(&self) -> Result<()> {
+    /// * Docker volumes cannot be removed
+    /// * State files cannot be removed due to permissions or other I/O errors
+    pub async fn execute(&self) -> Result<()> {
         let directory = self.directory.as_deref().unwrap_or(".");
 
         // Resolve the full path to the directory
@@ -53,36 +73,69 @@ impl CleanCommand {
             anyhow::bail!("Directory '{}' does not exist", directory_path.display());
         }
 
-        // Path to the _avocado directory
-        let avocado_dir = directory_path.join("_avocado");
-
-        // Check if _avocado directory exists
-        if !avocado_dir.exists() {
-            print_info(
-                &format!(
-                    "No _avocado directory found in '{}'.",
-                    directory_path.display()
-                ),
-                OutputLevel::Normal,
-            );
-            return Ok(());
+        // Clean docker volume if requested
+        if self.volumes {
+            self.clean_volume(&directory_path).await?;
         }
 
-        // Remove the _avocado directory
-        fs::remove_dir_all(&avocado_dir).with_context(|| {
-            format!(
-                "Failed to remove _avocado directory: {}",
-                avocado_dir.display()
-            )
-        })?;
+        // Clean state file
+        self.clean_state_file(&directory_path)?;
 
-        print_success(
-            &format!(
-                "Removed _avocado directory from '{}'.",
-                directory_path.display()
-            ),
-            OutputLevel::Normal,
-        );
+        Ok(())
+    }
+
+    /// Clean docker volume associated with the directory
+    async fn clean_volume(&self, directory_path: &Path) -> Result<()> {
+        // Try to load existing volume state
+        if let Some(volume_state) = VolumeState::load_from_dir(directory_path)? {
+            let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+
+            if self.verbose {
+                print_info(
+                    &format!("Removing docker volume: {}", volume_state.volume_name),
+                    OutputLevel::Normal,
+                );
+            }
+
+            volume_manager.remove_volume(&volume_state.volume_name).await.with_context(|| {
+                format!("Failed to remove volume: {}", volume_state.volume_name)
+            })?;
+
+            print_success(
+                &format!("Removed docker volume: {}", volume_state.volume_name),
+                OutputLevel::Normal,
+            );
+        } else {
+            if self.verbose {
+                print_info(
+                    "No volume state found, skipping volume cleanup.",
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clean .avocado-state file
+    fn clean_state_file(&self, directory_path: &Path) -> Result<()> {
+        let state_file = directory_path.join(".avocado-state");
+
+        if state_file.exists() {
+            fs::remove_file(&state_file).with_context(|| {
+                format!("Failed to remove state file: {}", state_file.display())
+            })?;
+
+            print_success(
+                &format!("Removed state file: {}", state_file.display()),
+                OutputLevel::Normal,
+            );
+        } else if self.verbose {
+            print_info(
+                "No .avocado-state file found.",
+                OutputLevel::Normal,
+            );
+        }
 
         Ok(())
     }
@@ -94,50 +147,37 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_clean_removes_avocado_directory() {
+    #[tokio::test]
+    async fn test_clean_no_state_file() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
 
-        // Create an _avocado directory
-        let avocado_dir = temp_path.join("_avocado");
-        fs::create_dir(&avocado_dir).unwrap();
+        // Execute clean command without state file
+        let clean_cmd = CleanCommand::new(
+            Some(temp_path.to_str().unwrap().to_string()),
+            false,
+            None,
+            false,
+        );
+        let result = clean_cmd.execute().await;
 
-        // Create some content in the _avocado directory
-        fs::write(avocado_dir.join("test_file.txt"), "test content").unwrap();
-
-        // Verify it exists before cleaning
-        assert!(avocado_dir.exists());
-
-        // Execute clean command
-        let clean_cmd = CleanCommand::new(Some(temp_path.to_str().unwrap().to_string()));
-        let result = clean_cmd.execute();
-
-        assert!(result.is_ok());
-        assert!(!avocado_dir.exists());
-    }
-
-    #[test]
-    fn test_clean_no_avocado_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
-
-        // Execute clean command without _avocado directory
-        let clean_cmd = CleanCommand::new(Some(temp_path.to_str().unwrap().to_string()));
-        let result = clean_cmd.execute();
-
-        // Should succeed even if no _avocado directory exists
+        // Should succeed even if no state file exists
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_clean_nonexistent_directory() {
+    #[tokio::test]
+    async fn test_clean_nonexistent_directory() {
         let temp_dir = TempDir::new().unwrap();
         let nonexistent_path = temp_dir.path().join("nonexistent");
 
         // Execute clean command on nonexistent directory
-        let clean_cmd = CleanCommand::new(Some(nonexistent_path.to_str().unwrap().to_string()));
-        let result = clean_cmd.execute();
+        let clean_cmd = CleanCommand::new(
+            Some(nonexistent_path.to_str().unwrap().to_string()),
+            false,
+            None,
+            false,
+        );
+        let result = clean_cmd.execute().await;
 
         // Should fail for nonexistent directory
         assert!(result.is_err());
@@ -146,37 +186,35 @@ mod tests {
     #[test]
     fn test_clean_default_directory() {
         // Test with None (current directory)
-        let clean_cmd = CleanCommand::new(None);
+        let clean_cmd = CleanCommand::new(None, false, None, false);
 
         // This test just ensures the command can be created with None
         // We don't execute it since it would try to clean the actual current directory
         assert_eq!(clean_cmd.directory, None);
     }
 
-    #[test]
-    fn test_clean_removes_nested_structure() {
+    #[tokio::test]
+    async fn test_clean_state_file() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
 
-        // Create a nested structure in _avocado directory
-        let avocado_dir = temp_path.join("_avocado");
-        let nested_dir = avocado_dir.join("subdir");
-        fs::create_dir_all(&nested_dir).unwrap();
+        // Create a .avocado-state file
+        let state_file = temp_path.join(".avocado-state");
+        fs::write(&state_file, "test state").unwrap();
 
-        // Create files in nested structure
-        fs::write(avocado_dir.join("root_file.txt"), "root content").unwrap();
-        fs::write(nested_dir.join("nested_file.txt"), "nested content").unwrap();
-
-        // Verify structure exists
-        assert!(avocado_dir.exists());
-        assert!(nested_dir.exists());
+        // Verify it exists before cleaning
+        assert!(state_file.exists());
 
         // Execute clean command
-        let clean_cmd = CleanCommand::new(Some(temp_path.to_str().unwrap().to_string()));
-        let result = clean_cmd.execute();
+        let clean_cmd = CleanCommand::new(
+            Some(temp_path.to_str().unwrap().to_string()),
+            false,
+            None,
+            false,
+        );
+        let result = clean_cmd.execute().await;
 
         assert!(result.is_ok());
-        assert!(!avocado_dir.exists());
-        assert!(!nested_dir.exists());
+        assert!(!state_file.exists());
     }
 }

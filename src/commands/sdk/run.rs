@@ -7,6 +7,7 @@ use crate::utils::{
     container::{RunConfig, SdkContainer},
     output::{print_error, print_success, OutputLevel},
     target::resolve_target,
+    volume::VolumeManager,
 };
 
 /// Implementation of the 'sdk run' command.
@@ -172,6 +173,9 @@ impl SdkRunCommand {
         target: &str,
         command: &str,
     ) -> Result<bool> {
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(container_helper.container_tool.clone(), false);
+        let volume_state = volume_manager.get_or_create_volume(&container_helper.cwd).await?;
         // Build container command for detached mode
         let mut container_cmd = vec![
             container_helper.container_tool.clone(),
@@ -188,16 +192,16 @@ impl SdkRunCommand {
             container_cmd.push(name.clone());
         }
 
-        // Add volume mounts
+        // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
         container_cmd.push(format!(
-            "{}:/opt/_avocado/src:rw",
+            "{}:/opt/src:rw",
             container_helper.cwd.display()
         ));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!(
-            "{}/_avocado:/opt/_avocado:rw",
-            container_helper.cwd.display()
+            "{}:/opt/_avocado:rw",
+            volume_state.volume_name
         ));
 
         // Add environment variables

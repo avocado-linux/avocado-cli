@@ -3,12 +3,12 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
+use crate::utils::volume::{VolumeManager, VolumeState};
 
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
@@ -93,9 +93,9 @@ impl SdkContainer {
 
     /// Run a command in the container
     pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
-        // Create _avocado directory
-        let avocado_dir = self.cwd.join("_avocado");
-        fs::create_dir_all(&avocado_dir).with_context(|| "Failed to create _avocado directory")?;
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
 
         // Build environment variables
         let mut env_vars = config.env_vars.unwrap_or_default();
@@ -141,7 +141,7 @@ impl SdkContainer {
 
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
-        // Build container command
+        // Build container command with volume state
         let container_cmd = self.build_container_command(
             &config.container_image,
             &bash_cmd,
@@ -152,6 +152,7 @@ impl SdkContainer {
             config.rm,
             config.interactive,
             config.container_args.as_deref(),
+            &volume_state,
         )?;
 
         // Execute the command
@@ -176,6 +177,7 @@ impl SdkContainer {
         rm: bool,
         interactive: bool,
         container_args: Option<&[String]>,
+        volume_state: &VolumeState,
     ) -> Result<Vec<String>> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
@@ -195,11 +197,11 @@ impl SdkContainer {
             container_cmd.push("-t".to_string());
         }
 
-        // Default volume mounts
+        // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/_avocado/src:rw", self.cwd.display()));
+        container_cmd.push(format!("{}:/opt/src:rw", self.cwd.display()));
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}/_avocado:/opt/_avocado:rw", self.cwd.display()));
+        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 
         // Add environment variables
         container_cmd.push("-e".to_string());
@@ -235,7 +237,7 @@ impl SdkContainer {
     ) -> Result<bool> {
         if verbose {
             print_info(
-                &format!("Mounting host directory: {} -> /opt", self.cwd.display()),
+                &format!("Mounting source directory: {} -> /opt/src", self.cwd.display()),
                 OutputLevel::Normal,
             );
             print_info(
@@ -399,7 +401,7 @@ fi
 
 export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
 
-cd /opt/_avocado/src
+cd /opt/src
 "#.to_string();
 
         // Conditionally add environment sourcing based on the source_environment parameter
@@ -479,9 +481,11 @@ mod tests {
 
     #[test]
     fn test_build_container_command() {
+        use crate::utils::volume::VolumeState;
         let container = SdkContainer::new();
         let command = vec!["echo".to_string(), "test".to_string()];
         let env_vars = HashMap::new();
+        let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
 
         let result = container.build_container_command(
             "test-image",
@@ -493,6 +497,7 @@ mod tests {
             true,
             false,
             None,
+            &volume_state,
         );
 
         assert!(result.is_ok());

@@ -66,10 +66,19 @@ enum Commands {
         #[command(subcommand)]
         command: HitlCommands,
     },
-    /// Clean the avocado project by removing the _avocado directory
+    /// Clean the avocado project by removing docker volumes and state files
     Clean {
         /// Directory to clean (defaults to current directory)
         directory: Option<String>,
+        /// Skip cleaning docker volumes (volumes are cleaned by default)
+        #[arg(long)]
+        skip_volumes: bool,
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker")]
+        container_tool: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Install all components (SDK, extensions, and runtime dependencies)
     Install {
@@ -432,9 +441,9 @@ async fn main() -> Result<()> {
             init_cmd.execute()?;
             Ok(())
         }
-        Commands::Clean { directory } => {
-            let clean_cmd = CleanCommand::new(directory);
-            clean_cmd.execute()?;
+        Commands::Clean { directory, skip_volumes, container_tool, verbose } => {
+            let clean_cmd = CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose);
+            clean_cmd.execute().await?;
             Ok(())
         }
         Commands::Install {
