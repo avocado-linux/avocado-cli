@@ -194,7 +194,7 @@ impl SdkContainer {
 
         // Default volume mounts
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/_avocado/src:ro", self.cwd.display()));
+        container_cmd.push(format!("{}:/opt/_avocado/src:rw", self.cwd.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}/_avocado:/opt/_avocado:rw", self.cwd.display()));
 

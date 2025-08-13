@@ -191,7 +191,7 @@ impl SdkRunCommand {
         // Add volume mounts
         container_cmd.push("-v".to_string());
         container_cmd.push(format!(
-            "{}:/opt/_avocado/src:ro",
+            "{}:/opt/_avocado/src:rw",
             container_helper.cwd.display()
         ));
         container_cmd.push("-v".to_string());
