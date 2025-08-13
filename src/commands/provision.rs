@@ -52,7 +52,7 @@ impl ProvisionCommand {
             self.verbose,
             self.force,
             self.target.clone(),
-            self.container_args.clone(),
+            crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
             self.dnf_args.clone(),
         );
 

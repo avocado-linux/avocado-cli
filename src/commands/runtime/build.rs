@@ -40,6 +40,10 @@ impl RuntimeBuildCommand {
         let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
+
+        // Process container args with environment variable expansion
+        let processed_container_args = crate::utils::config::Config::process_container_args(self.container_args.as_ref());
+
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
@@ -105,7 +109,7 @@ impl RuntimeBuildCommand {
             interactive: false,       // build script runs non-interactively
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
+            container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

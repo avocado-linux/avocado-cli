@@ -52,8 +52,8 @@ impl InstallCommand {
 
     /// Execute the install command
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration to check what components exist
-        let _config = Config::load(&self.config_path)
+                // Load the configuration to check what components exist
+        let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
         print_info(
@@ -83,7 +83,7 @@ impl InstallCommand {
         );
 
         // Determine which extensions to install based on runtime dependencies
-        let extensions_to_install = self.find_required_extensions(&_config, &self.config_path)?;
+        let extensions_to_install = self.find_required_extensions(&config, &self.config_path)?;
 
         if !extensions_to_install.is_empty() {
             for extension in &extensions_to_install {
@@ -130,7 +130,7 @@ impl InstallCommand {
             self.verbose,
             self.force,
             self.target.clone(),
-            self.container_args.clone(),
+            self.container_args.clone(),  // Pass original CLI args, let RuntimeInstallCommand merge with config
             self.dnf_args.clone(),
         );
         runtime_install_cmd

@@ -128,7 +128,7 @@ impl ExtCleanCommand {
             verbose: self.verbose,
             source_environment: false, // don't source environment
             interactive: false,
-            container_args: self.container_args.clone(),
+            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

@@ -57,6 +57,8 @@ impl BuildCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
+
+
         print_info(
             "Starting comprehensive build process...",
             OutputLevel::Normal,

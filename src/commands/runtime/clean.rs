@@ -127,7 +127,7 @@ impl RuntimeCleanCommand {
             interactive: false,
             repo_url: None,
             repo_release: None,
-            container_args: self.container_args.clone(),
+            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

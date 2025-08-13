@@ -170,7 +170,7 @@ impl ExtDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
+            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -213,7 +213,7 @@ impl ExtDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
+            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -265,7 +265,7 @@ impl ExtDnfCommand {
             interactive: true,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
+            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

@@ -42,6 +42,13 @@ impl ExtInstallCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
+        // Merge container args from config and CLI (similar to SDK commands)
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+
+
+
+
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
@@ -149,6 +156,7 @@ impl ExtInstallCommand {
                     &target,
                     repo_url,
                     repo_release,
+                    &merged_container_args,
                 )
                 .await?
             {
@@ -179,6 +187,7 @@ impl ExtInstallCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Create the commands to check and set up the directory structure
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
@@ -196,7 +205,7 @@ impl ExtInstallCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -213,7 +222,7 @@ impl ExtInstallCommand {
                 interactive: false,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
-                container_args: self.container_args.clone(),
+                container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 ..Default::default()
             };
@@ -310,7 +319,7 @@ $DNF_SDK_HOST \
                     interactive: !self.force,  // interactive if not forced
                     repo_url: repo_url.cloned(),
                     repo_release: repo_release.cloned(),
-                    container_args: self.container_args.clone(),
+                    container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     ..Default::default()
                 };

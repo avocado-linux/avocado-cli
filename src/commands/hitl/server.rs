@@ -101,9 +101,12 @@ impl HitlServerCommand {
             "--init".to_string(),
         ];
 
-        // Add any additional container arguments
+        // Add any additional container arguments with environment variable expansion
         if let Some(ref additional_args) = self.container_args {
-            container_args.extend(additional_args.clone());
+            let processed_args = Config::process_container_args(Some(additional_args));
+            if let Some(processed) = processed_args {
+                container_args.extend(processed);
+            }
         }
 
         // Generate NFS export setup commands

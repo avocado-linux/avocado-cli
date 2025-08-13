@@ -99,8 +99,8 @@ impl Config {
         self.sdk.as_ref()?.container_args.as_ref()
     }
 
-        /// Expand environment variables in a string
-    fn expand_env_vars(input: &str) -> String {
+            /// Expand environment variables in a string
+    pub fn expand_env_vars(input: &str) -> String {
         let mut result = input.to_string();
 
         // Find and replace $VAR and ${VAR} patterns
@@ -145,23 +145,27 @@ impl Config {
         result.replace("\\$", "$")
     }
 
-    /// Merge SDK container args from config with CLI args, expanding environment variables
+    /// Process container args by expanding environment variables
+    /// This is a universal function that can be used by any command
+    pub fn process_container_args(args: Option<&Vec<String>>) -> Option<Vec<String>> {
+        args.map(|args_vec| {
+            args_vec.iter().map(|arg| Self::expand_env_vars(arg)).collect()
+        })
+    }
+
+        /// Merge SDK container args from config with CLI args, expanding environment variables
     /// Returns a new Vec containing config args first, then CLI args
     pub fn merge_sdk_container_args(&self, cli_args: Option<&Vec<String>>) -> Option<Vec<String>> {
         let config_args = self.get_sdk_container_args();
 
         match (config_args, cli_args) {
             (Some(config), Some(cli)) => {
-                let mut merged = config.iter().map(|arg| Self::expand_env_vars(arg)).collect::<Vec<_>>();
-                merged.extend(cli.iter().map(|arg| Self::expand_env_vars(arg)));
+                let mut merged = Self::process_container_args(Some(config)).unwrap_or_default();
+                merged.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
                 Some(merged)
             }
-            (Some(config), None) => {
-                Some(config.iter().map(|arg| Self::expand_env_vars(arg)).collect())
-            }
-            (None, Some(cli)) => {
-                Some(cli.iter().map(|arg| Self::expand_env_vars(arg)).collect())
-            }
+            (Some(config), None) => Self::process_container_args(Some(config)),
+            (None, Some(cli)) => Self::process_container_args(Some(cli)),
             (None, None) => None,
         }
     }
@@ -478,7 +482,7 @@ image = "avocadolinux/sdk:apollo-edge"
         std::env::remove_var("TEST_NETWORK");
     }
 
-    #[test]
+        #[test]
     fn test_merge_sdk_container_args_with_env_expansion() {
         // Set up test environment variable
         std::env::set_var("TEST_USER", "myuser");
@@ -504,5 +508,33 @@ container_args = ["--network=$TEST_USER-avocado", "--privileged"]
 
         // Clean up
         std::env::remove_var("TEST_USER");
+    }
+
+    #[test]
+    fn test_process_container_args() {
+        // Set up test environment variable
+        std::env::set_var("TEST_VAR", "testvalue");
+
+        let args = vec![
+            "--network=$TEST_VAR-net".to_string(),
+            "--env=HOME=${HOME}".to_string(),
+            "--privileged".to_string(),
+        ];
+
+        let processed = Config::process_container_args(Some(&args));
+
+        assert!(processed.is_some());
+        let processed_args = processed.unwrap();
+        assert_eq!(processed_args.len(), 3);
+        assert_eq!(processed_args[0], "--network=testvalue-net");
+        assert!(processed_args[1].starts_with("--env=HOME="));
+        assert_eq!(processed_args[2], "--privileged");
+
+        // Test with None
+        let no_args = Config::process_container_args(None);
+        assert!(no_args.is_none());
+
+        // Clean up
+        std::env::remove_var("TEST_VAR");
     }
 }
