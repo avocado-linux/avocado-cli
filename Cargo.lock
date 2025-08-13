@@ -105,6 +105,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "indicatif",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

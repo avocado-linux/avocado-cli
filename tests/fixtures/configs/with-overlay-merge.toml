@@ -1,0 +1,14 @@
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime.default]
+target = "x86_64-unknown-linux-gnu"
+
+[ext.peridio]
+types = ["sysext", "confext"]
+overlay = {dir = "peridio-overlay", mode = "merge"}
+
+# Also test backward compatibility
+[ext.legacy]
+types = ["sysext"]
+overlay = "legacy-overlay"

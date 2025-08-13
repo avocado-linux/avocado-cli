@@ -4,6 +4,18 @@ use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
 
+#[derive(Debug, Clone)]
+struct OverlayConfig {
+    dir: String,
+    mode: OverlayMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OverlayMode {
+    Merge,  // Default: rsync -a (safe merging)
+    Opaque, // cp -r (replace directory contents)
+}
+
 pub struct ExtBuildCommand {
     extension: String,
     config_path: String,
@@ -106,11 +118,38 @@ impl ExtBuildCommand {
             .and_then(|v| v.as_str())
             .unwrap_or("0.1.0");
 
-        // Get overlay directory
-        let overlay_dir = ext_config
+        // Get overlay configuration
+        let overlay_config = ext_config
             .get("overlay")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(|v| {
+                if let Some(dir_str) = v.as_str() {
+                    // Simple string format: overlay = "directory"
+                    OverlayConfig {
+                        dir: dir_str.to_string(),
+                        mode: OverlayMode::Merge, // Default to merge mode
+                    }
+                } else if let Some(table) = v.as_table() {
+                    // Table format: overlay = {dir = "directory", mode = "opaque"}
+                    let dir = table
+                        .get("dir")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("overlay")
+                        .to_string();
+
+                    let mode = match table.get("mode").and_then(|m| m.as_str()) {
+                        Some("opaque") => OverlayMode::Opaque,
+                        _ => OverlayMode::Merge, // Default to merge mode
+                    };
+
+                    OverlayConfig { dir, mode }
+                } else {
+                    // Fallback for invalid format
+                    OverlayConfig {
+                        dir: "overlay".to_string(),
+                        mode: OverlayMode::Merge,
+                    }
+                }
+            });
 
         // Get SDK configuration
         let container_image = parsed
@@ -158,7 +197,7 @@ impl ExtBuildCommand {
                         &target_arch,
                         ext_version,
                         &sysext_scopes,
-                        overlay_dir.as_deref(),
+                        overlay_config.as_ref(),
                         repo_url,
                         repo_release,
                         &processed_container_args,
@@ -172,7 +211,7 @@ impl ExtBuildCommand {
                         &target_arch,
                         ext_version,
                         &confext_scopes,
-                        overlay_dir.as_deref(),
+                        overlay_config.as_ref(),
                         repo_url,
                         repo_release,
                         &processed_container_args,
@@ -219,13 +258,13 @@ impl ExtBuildCommand {
         target_arch: &str,
         ext_version: &str,
         ext_scopes: &[String],
-        overlay_dir: Option<&str>,
+        overlay_config: Option<&OverlayConfig>,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Create the build script for sysext extension
-        let build_script = self.create_sysext_build_script(ext_version, ext_scopes, overlay_dir);
+        let build_script = self.create_sysext_build_script(ext_version, ext_scopes, overlay_config);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -268,13 +307,13 @@ impl ExtBuildCommand {
         target_arch: &str,
         ext_version: &str,
         ext_scopes: &[String],
-        overlay_dir: Option<&str>,
+        overlay_config: Option<&OverlayConfig>,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Create the build script for confext extension
-        let build_script = self.create_confext_build_script(ext_version, ext_scopes, overlay_dir);
+        let build_script = self.create_confext_build_script(ext_version, ext_scopes, overlay_config);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -309,20 +348,36 @@ impl ExtBuildCommand {
         Ok(result)
     }
 
-    fn create_sysext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_dir: Option<&str>) -> String {
-        let overlay_section = if let Some(overlay) = overlay_dir {
-            format!(
-                r#"
-# Copy overlay directory to extension sysroot
+    fn create_sysext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_config: Option<&OverlayConfig>) -> String {
+        let overlay_section = if let Some(overlay_config) = overlay_config {
+            match overlay_config.mode {
+                OverlayMode::Merge => format!(
+                    r#"
+# Merge overlay directory into extension sysroot
 if [ -d "/opt/src/{}" ]; then
-    echo "Copying overlay directory '{}' to extension sysroot"
+    echo "Merging overlay directory '{}' into extension sysroot"
+    # Use rsync to merge directories and preserve existing structure
+    rsync -a /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+else
+    echo "Warning: Overlay directory '{}' not found in source"
+fi
+"#,
+                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
+                ),
+                OverlayMode::Opaque => format!(
+                    r#"
+# Copy overlay directory to extension sysroot (opaque mode)
+if [ -d "/opt/src/{}" ]; then
+    echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
+    # Use cp -r to replace directory contents completely
     cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
 else
     echo "Warning: Overlay directory '{}' not found in source"
 fi
 "#,
-                overlay, overlay, overlay, self.extension, overlay
-            )
+                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
+                ),
+            }
         } else {
             String::new()
         };
@@ -355,20 +410,36 @@ fi
         )
     }
 
-    fn create_confext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_dir: Option<&str>) -> String {
-        let overlay_section = if let Some(overlay) = overlay_dir {
-            format!(
-                r#"
-# Copy overlay directory to extension sysroot
+    fn create_confext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_config: Option<&OverlayConfig>) -> String {
+        let overlay_section = if let Some(overlay_config) = overlay_config {
+            match overlay_config.mode {
+                OverlayMode::Merge => format!(
+                    r#"
+# Merge overlay directory into extension sysroot
 if [ -d "/opt/src/{}" ]; then
-    echo "Copying overlay directory '{}' to extension sysroot"
+    echo "Merging overlay directory '{}' into extension sysroot"
+    # Use rsync to merge directories and preserve existing structure
+    rsync -a /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+else
+    echo "Warning: Overlay directory '{}' not found in source"
+fi
+"#,
+                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
+                ),
+                OverlayMode::Opaque => format!(
+                    r#"
+# Copy overlay directory to extension sysroot (opaque mode)
+if [ -d "/opt/src/{}" ]; then
+    echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
+    # Use cp -r to replace directory contents completely
     cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
 else
     echo "Warning: Overlay directory '{}' not found in source"
 fi
 "#,
-                overlay, overlay, overlay, self.extension, overlay
-            )
+                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
+                ),
+            }
         } else {
             String::new()
         };
@@ -522,13 +593,17 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some("peridio"));
+        let overlay_config = OverlayConfig {
+            dir: "peridio".to_string(),
+            mode: OverlayMode::Merge,
+        };
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
 
-        // Verify overlay copying commands are present
-        assert!(script.contains("# Copy overlay directory to extension sysroot"));
+        // Verify overlay merging commands are present
+        assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
-        assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot\""));
-        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot\""));
+        assert!(script.contains("rsync -a /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
         assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
     }
 
@@ -543,13 +618,67 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some("peridio"));
+        let overlay_config = OverlayConfig {
+            dir: "peridio".to_string(),
+            mode: OverlayMode::Merge,
+        };
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
 
-        // Verify overlay copying commands are present
-        assert!(script.contains("# Copy overlay directory to extension sysroot"));
+        // Verify overlay merging commands are present
+        assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
-        assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot\""));
-        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot\""));
+        assert!(script.contains("rsync -a /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
+    }
+
+    #[test]
+    fn test_sysext_overlay_opaque_mode() {
+        let cmd = ExtBuildCommand {
+            extension: "opaque-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let overlay_config = OverlayConfig {
+            dir: "peridio".to_string(),
+            mode: OverlayMode::Opaque,
+        };
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
+
+        // Verify overlay opaque mode commands are present
+        assert!(script.contains("# Copy overlay directory to extension sysroot (opaque mode)"));
+        assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
+        assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""));
+        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
+        assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
+    }
+
+    #[test]
+    fn test_confext_overlay_opaque_mode() {
+        let cmd = ExtBuildCommand {
+            extension: "opaque-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let overlay_config = OverlayConfig {
+            dir: "peridio".to_string(),
+            mode: OverlayMode::Opaque,
+        };
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
+
+        // Verify overlay opaque mode commands are present
+        assert!(script.contains("# Copy overlay directory to extension sysroot (opaque mode)"));
+        assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
+        assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""));
+        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
         assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
     }
 
@@ -567,9 +696,11 @@ mod tests {
         let script_sysext = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
         let script_confext = cmd.create_confext_build_script("1.0", &["system".to_string()], None);
 
-        // Verify no overlay copying commands are present
+        // Verify no overlay merging commands are present
+        assert!(!script_sysext.contains("Merge overlay directory"));
         assert!(!script_sysext.contains("Copy overlay directory"));
         assert!(!script_sysext.contains("/opt/src/"));
+        assert!(!script_confext.contains("Merge overlay directory"));
         assert!(!script_confext.contains("Copy overlay directory"));
         assert!(!script_confext.contains("/opt/src/"));
     }

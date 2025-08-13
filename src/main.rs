@@ -8,7 +8,7 @@ mod utils;
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::ext::{
-    ExtBuildCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
+    ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
     ExtInstallCommand, ExtListCommand,
 };
 use commands::hitl::HitlServerCommand;
@@ -666,6 +666,25 @@ async fn main() -> Result<()> {
                 build_cmd.execute().await?;
                 Ok(())
             }
+            ExtCommands::Checkout {
+                config,
+                verbose,
+                extension,
+                ext_path,
+                src_path,
+                container_tool,
+            } => {
+                let checkout_cmd = ExtCheckoutCommand::new(
+                    extension,
+                    ext_path,
+                    src_path,
+                    config,
+                    verbose,
+                    container_tool,
+                );
+                checkout_cmd.execute().await?;
+                Ok(())
+            }
             ExtCommands::List { config } => {
                 let list_cmd = ExtListCommand::new(config);
                 list_cmd.execute()?;
@@ -955,6 +974,27 @@ enum ExtCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+    /// Check out files from extension sysroot to source directory
+    Checkout {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Name of the extension to checkout from
+        #[arg(short = 'e', long = "extension", required = true)]
+        extension: String,
+        /// Path within the extension sysroot to checkout (e.g., /etc/config.json or /etc for directory)
+        #[arg(long = "ext-path", required = true)]
+        ext_path: String,
+        /// Destination path in source directory (relative to src root)
+        #[arg(long = "src-path", required = true)]
+        src_path: String,
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker")]
+        container_tool: String,
     },
     /// Create squashfs image from system extension
     Image {
