@@ -106,6 +106,12 @@ impl ExtBuildCommand {
             .and_then(|v| v.as_str())
             .unwrap_or("0.1.0");
 
+        // Get overlay directory
+        let overlay_dir = ext_config
+            .get("overlay")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         // Get SDK configuration
         let container_image = parsed
             .get("sdk")
@@ -152,6 +158,7 @@ impl ExtBuildCommand {
                         &target_arch,
                         ext_version,
                         &sysext_scopes,
+                        overlay_dir.as_deref(),
                         repo_url,
                         repo_release,
                         &processed_container_args,
@@ -165,6 +172,7 @@ impl ExtBuildCommand {
                         &target_arch,
                         ext_version,
                         &confext_scopes,
+                        overlay_dir.as_deref(),
                         repo_url,
                         repo_release,
                         &processed_container_args,
@@ -211,12 +219,13 @@ impl ExtBuildCommand {
         target_arch: &str,
         ext_version: &str,
         ext_scopes: &[String],
+        overlay_dir: Option<&str>,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Create the build script for sysext extension
-        let build_script = self.create_sysext_build_script(ext_version, ext_scopes);
+        let build_script = self.create_sysext_build_script(ext_version, ext_scopes, overlay_dir);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -259,12 +268,13 @@ impl ExtBuildCommand {
         target_arch: &str,
         ext_version: &str,
         ext_scopes: &[String],
+        overlay_dir: Option<&str>,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Create the build script for confext extension
-        let build_script = self.create_confext_build_script(ext_version, ext_scopes);
+        let build_script = self.create_confext_build_script(ext_version, ext_scopes, overlay_dir);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -299,11 +309,28 @@ impl ExtBuildCommand {
         Ok(result)
     }
 
-    fn create_sysext_build_script(&self, _ext_version: &str, ext_scopes: &[String]) -> String {
+    fn create_sysext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_dir: Option<&str>) -> String {
+        let overlay_section = if let Some(overlay) = overlay_dir {
+            format!(
+                r#"
+# Copy overlay directory to extension sysroot
+if [ -d "/opt/src/{}" ]; then
+    echo "Copying overlay directory '{}' to extension sysroot"
+    cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+else
+    echo "Warning: Overlay directory '{}' not found in source"
+fi
+"#,
+                overlay, overlay, overlay, self.extension, overlay
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             r#"
 set -e
-
+{}
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/extension-release.d"
 release_file="$release_dir/extension-release.{}"
 modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
@@ -319,6 +346,7 @@ if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*
     echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=depmod to release file"
 fi
 "#,
+            overlay_section,
             self.extension,
             self.extension,
             self.extension,
@@ -327,11 +355,28 @@ fi
         )
     }
 
-    fn create_confext_build_script(&self, _ext_version: &str, ext_scopes: &[String]) -> String {
+    fn create_confext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_dir: Option<&str>) -> String {
+        let overlay_section = if let Some(overlay) = overlay_dir {
+            format!(
+                r#"
+# Copy overlay directory to extension sysroot
+if [ -d "/opt/src/{}" ]; then
+    echo "Copying overlay directory '{}' to extension sysroot"
+    cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+else
+    echo "Warning: Overlay directory '{}' not found in source"
+fi
+"#,
+                overlay, overlay, overlay, self.extension, overlay
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             r#"
 set -e
-
+{}
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/extension-release.d"
 release_file="$release_dir/extension-release.{}"
 
@@ -340,6 +385,7 @@ echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
 echo "CONFEXT_SCOPE={}" >> "$release_file"
 "#,
+            overlay_section,
             self.extension,
             self.extension,
             ext_scopes.join(" ")
@@ -362,7 +408,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()]);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
 
         // Print the actual script for debugging
         // println!("Generated sysext build script:\n{}", script);
@@ -393,7 +439,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0", &["system".to_string()]);
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None);
 
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
@@ -419,7 +465,7 @@ mod tests {
         };
 
         let script =
-            cmd.create_sysext_build_script("2.0", &["system".to_string(), "portable".to_string()]);
+            cmd.create_sysext_build_script("2.0", &["system".to_string(), "portable".to_string()], None);
 
         assert!(script.contains("echo \"SYSEXT_SCOPE=system portable\" >> \"$release_file\""));
         assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/usr/lib/extension-release.d"));
@@ -437,7 +483,7 @@ mod tests {
         };
 
         let script =
-            cmd.create_confext_build_script("2.0", &["system".to_string(), "portable".to_string()]);
+            cmd.create_confext_build_script("2.0", &["system".to_string(), "portable".to_string()], None);
 
         assert!(script.contains("echo \"CONFEXT_SCOPE=system portable\" >> \"$release_file\""));
         assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/etc/extension-release.d"));
@@ -454,7 +500,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()]);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
 
         // Verify the find command looks for common kernel module extensions
         assert!(script.contains("-name \"*.ko\""));
@@ -463,5 +509,68 @@ mod tests {
         // Verify the conditional structure
         assert!(script.contains("if [ -d \"$modules_dir\" ] && [ -n \"$(find"));
         assert!(script.contains("2>/dev/null | head -n 1)\" ]; then"));
+    }
+
+    #[test]
+    fn test_sysext_overlay_functionality() {
+        let cmd = ExtBuildCommand {
+            extension: "overlay-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some("peridio"));
+
+        // Verify overlay copying commands are present
+        assert!(script.contains("# Copy overlay directory to extension sysroot"));
+        assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
+        assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot\""));
+        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
+    }
+
+    #[test]
+    fn test_confext_overlay_functionality() {
+        let cmd = ExtBuildCommand {
+            extension: "overlay-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some("peridio"));
+
+        // Verify overlay copying commands are present
+        assert!(script.contains("# Copy overlay directory to extension sysroot"));
+        assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
+        assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot\""));
+        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
+    }
+
+    #[test]
+    fn test_no_overlay_functionality() {
+        let cmd = ExtBuildCommand {
+            extension: "no-overlay-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script_sysext = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
+        let script_confext = cmd.create_confext_build_script("1.0", &["system".to_string()], None);
+
+        // Verify no overlay copying commands are present
+        assert!(!script_sysext.contains("Copy overlay directory"));
+        assert!(!script_sysext.contains("/opt/src/"));
+        assert!(!script_confext.contains("Copy overlay directory"));
+        assert!(!script_confext.contains("/opt/src/"));
     }
 }
