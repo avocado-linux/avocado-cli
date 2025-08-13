@@ -45,10 +45,6 @@ impl ExtInstallCommand {
         // Merge container args from config and CLI (similar to SDK commands)
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
-
-
-
-
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();

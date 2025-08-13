@@ -254,7 +254,7 @@ mod tests {
         assert!(!commands.contains("NFS_Port ="));
     }
 
-        #[test]
+    #[test]
     fn test_generate_export_setup_commands_with_port() {
         let cmd = HitlServerCommand {
             config_path: "test.toml".to_string(),
@@ -289,7 +289,8 @@ mod tests {
 
         // Should include port update commands and debug message
         assert!(commands.contains("NFS_Port = 3049"));
-        assert!(commands.contains("[DEBUG] Updated NFS_Port to 3049 in NFS_Core_Param block in hitl-nfs.conf"));
+        assert!(commands
+            .contains("[DEBUG] Updated NFS_Port to 3049 in NFS_Core_Param block in hitl-nfs.conf"));
     }
 
     #[test]

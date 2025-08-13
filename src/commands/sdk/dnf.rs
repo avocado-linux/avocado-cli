@@ -113,6 +113,7 @@ impl SdkDnfCommand {
     }
 
     /// Run DNF command using container with entrypoint
+    #[allow(clippy::too_many_arguments)]
     async fn run_dnf_command(
         &self,
         container_helper: &SdkContainer,
@@ -133,7 +134,7 @@ impl SdkDnfCommand {
             interactive: true,        // allow user input for DNF prompts
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: container_args.map(|v| v.clone()),
+            container_args: container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

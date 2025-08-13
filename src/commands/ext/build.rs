@@ -1,6 +1,5 @@
 use anyhow::Result;
 
-
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
@@ -40,7 +39,8 @@ impl ExtBuildCommand {
         let parsed: toml::Value = toml::from_str(&content)?;
 
         // Merge container args from config and CLI (similar to SDK commands)
-        let processed_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+        let processed_container_args =
+            config.merge_sdk_container_args(self.container_args.as_ref());
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();

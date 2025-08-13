@@ -164,7 +164,9 @@ impl RuntimeDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
+            container_args: crate::utils::config::Config::process_container_args(
+                self.container_args.as_ref(),
+            ),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -206,7 +208,9 @@ impl RuntimeDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
+            container_args: crate::utils::config::Config::process_container_args(
+                self.container_args.as_ref(),
+            ),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -255,7 +259,9 @@ impl RuntimeDnfCommand {
             interactive: true,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
+            container_args: crate::utils::config::Config::process_container_args(
+                self.container_args.as_ref(),
+            ),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

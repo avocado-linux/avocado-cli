@@ -1,6 +1,5 @@
 use anyhow::Result;
 
-
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
@@ -150,6 +149,7 @@ impl ExtImageCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_image(
         &self,
         container_helper: &SdkContainer,

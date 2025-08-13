@@ -99,7 +99,7 @@ impl Config {
         self.sdk.as_ref()?.container_args.as_ref()
     }
 
-            /// Expand environment variables in a string
+    /// Expand environment variables in a string
     pub fn expand_env_vars(input: &str) -> String {
         let mut result = input.to_string();
 
@@ -149,11 +149,14 @@ impl Config {
     /// This is a universal function that can be used by any command
     pub fn process_container_args(args: Option<&Vec<String>>) -> Option<Vec<String>> {
         args.map(|args_vec| {
-            args_vec.iter().map(|arg| Self::expand_env_vars(arg)).collect()
+            args_vec
+                .iter()
+                .map(|arg| Self::expand_env_vars(arg))
+                .collect()
         })
     }
 
-        /// Merge SDK container args from config with CLI args, expanding environment variables
+    /// Merge SDK container args from config with CLI args, expanding environment variables
     /// Returns a new Vec containing config args first, then CLI args
     pub fn merge_sdk_container_args(&self, cli_args: Option<&Vec<String>>) -> Option<Vec<String>> {
         let config_args = self.get_sdk_container_args();
@@ -375,7 +378,7 @@ container_args = ["--network=$USER-avocado", "--privileged"]
         assert_eq!(args[1], "--privileged");
     }
 
-        #[test]
+    #[test]
     fn test_merge_sdk_container_args() {
         let config_content = r#"
 [sdk]
@@ -398,7 +401,7 @@ container_args = ["--network=host", "--privileged"]
         assert_eq!(merged_args[3], "--rm");
     }
 
-        #[test]
+    #[test]
     fn test_merge_sdk_container_args_config_only() {
         let config_content = r#"
 [sdk]
@@ -436,7 +439,7 @@ image = "avocadolinux/sdk:apollo-edge"
         assert_eq!(merged_args[0], "--cap-add=SYS_ADMIN");
     }
 
-        #[test]
+    #[test]
     fn test_merge_sdk_container_args_none() {
         let config_content = r#"
 [sdk]
@@ -482,7 +485,7 @@ image = "avocadolinux/sdk:apollo-edge"
         std::env::remove_var("TEST_NETWORK");
     }
 
-        #[test]
+    #[test]
     fn test_merge_sdk_container_args_with_env_expansion() {
         // Set up test environment variable
         std::env::set_var("TEST_USER", "myuser");

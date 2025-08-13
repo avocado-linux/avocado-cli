@@ -99,7 +99,9 @@ impl RuntimeProvisionCommand {
             verbose: self.verbose,
             source_environment: true,
             interactive: !self.force,
-            container_args: crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
+            container_args: crate::utils::config::Config::process_container_args(
+                self.container_args.as_ref(),
+            ),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

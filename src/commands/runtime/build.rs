@@ -42,7 +42,8 @@ impl RuntimeBuildCommand {
         let parsed: toml::Value = toml::from_str(&content)?;
 
         // Process container args with environment variable expansion
-        let processed_container_args = crate::utils::config::Config::process_container_args(self.container_args.as_ref());
+        let processed_container_args =
+            crate::utils::config::Config::process_container_args(self.container_args.as_ref());
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();

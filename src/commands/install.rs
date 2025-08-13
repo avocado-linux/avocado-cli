@@ -52,7 +52,7 @@ impl InstallCommand {
 
     /// Execute the install command
     pub async fn execute(&self) -> Result<()> {
-                // Load the configuration to check what components exist
+        // Load the configuration to check what components exist
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
@@ -103,10 +103,9 @@ impl InstallCommand {
                     self.container_args.clone(),
                     self.dnf_args.clone(),
                 );
-                ext_install_cmd
-                    .execute()
-                    .await
-                    .with_context(|| format!("Failed to install extension dependencies for '{extension}'"))?;
+                ext_install_cmd.execute().await.with_context(|| {
+                    format!("Failed to install extension dependencies for '{extension}'")
+                })?;
             }
         } else {
             print_info("No extension dependencies to install.", OutputLevel::Normal);
@@ -130,7 +129,7 @@ impl InstallCommand {
             self.verbose,
             self.force,
             self.target.clone(),
-            self.container_args.clone(),  // Pass original CLI args, let RuntimeInstallCommand merge with config
+            self.container_args.clone(), // Pass original CLI args, let RuntimeInstallCommand merge with config
             self.dnf_args.clone(),
         );
         runtime_install_cmd
@@ -172,7 +171,8 @@ impl InstallCommand {
                             .and_then(|d| d.as_table())
                         {
                             for (_dep_name, dep_spec) in dependencies {
-                                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str())
+                                {
                                     required_extensions.insert(ext_name.to_string());
                                 }
                             }
