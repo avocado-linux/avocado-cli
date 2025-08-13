@@ -58,6 +58,9 @@ impl SdkCompileCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
+        // Merge container args from config with CLI args
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
         // Get compile sections from config
         let compile_sections = self.get_compile_sections_from_config(&config);
 
@@ -153,7 +156,7 @@ impl SdkCompileCommand {
                 interactive: false,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
-                container_args: self.container_args.clone(),
+                container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 ..Default::default()
             };

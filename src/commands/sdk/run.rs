@@ -90,6 +90,9 @@ impl SdkRunCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
+        // Merge container args from config with CLI args
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
         // Get the SDK image from configuration
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
@@ -148,7 +151,7 @@ impl SdkRunCommand {
                 interactive: false,        // not interactive
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
-                container_args: self.container_args.clone(),
+                container_args: merged_container_args.clone(),
                 ..Default::default()
             };
             container_helper.run_in_container(config).await?

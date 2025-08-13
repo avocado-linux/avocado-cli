@@ -52,6 +52,9 @@ impl SdkInstallCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
+        // Merge container args from config with CLI args
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
         // Read the config file content for extension parsing
         let config_content = std::fs::read_to_string(&self.config_path)
             .with_context(|| format!("Failed to read config file {}", self.config_path))?;
@@ -145,7 +148,7 @@ $DNF_SDK_HOST \
                 interactive: !self.force,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
-                container_args: self.container_args.clone(),
+                container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 ..Default::default()
             };
@@ -213,7 +216,7 @@ $DNF_SDK_HOST \
                         interactive: !self.force,
                         repo_url: repo_url.cloned(),
                         repo_release: repo_release.cloned(),
-                        container_args: self.container_args.clone(),
+                        container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
                         ..Default::default()
                     };

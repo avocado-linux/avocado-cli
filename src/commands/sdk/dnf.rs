@@ -62,6 +62,9 @@ impl SdkDnfCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
+        // Merge container args from config with CLI args
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
         // Resolve target with proper precedence
         let config_target = config.get_target();
         let target = resolve_target(self.target.as_deref(), config_target.as_deref())
@@ -94,6 +97,7 @@ impl SdkDnfCommand {
                 &command,
                 repo_url,
                 repo_release,
+                merged_container_args.as_ref(),
             )
             .await?;
 
@@ -117,6 +121,7 @@ impl SdkDnfCommand {
         command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        container_args: Option<&Vec<String>>,
     ) -> Result<bool> {
         // Use the container helper's method with repo URL and release support
         let config = RunConfig {
@@ -128,7 +133,7 @@ impl SdkDnfCommand {
             interactive: true,        // allow user input for DNF prompts
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
+            container_args: container_args.map(|v| v.clone()),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };

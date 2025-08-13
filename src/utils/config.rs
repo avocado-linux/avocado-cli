@@ -33,6 +33,7 @@ pub struct SdkConfig {
     pub compile: Option<HashMap<String, CompileConfig>>,
     pub repo_url: Option<String>,
     pub repo_release: Option<String>,
+    pub container_args: Option<Vec<String>>,
 }
 
 /// Compile configuration for SDK
@@ -91,6 +92,28 @@ impl Config {
     /// Get the SDK repo release from configuration
     pub fn get_sdk_repo_release(&self) -> Option<&String> {
         self.sdk.as_ref()?.repo_release.as_ref()
+    }
+
+    /// Get the SDK container args from configuration
+    pub fn get_sdk_container_args(&self) -> Option<&Vec<String>> {
+        self.sdk.as_ref()?.container_args.as_ref()
+    }
+
+    /// Merge SDK container args from config with CLI args
+    /// Returns a new Vec containing config args first, then CLI args
+    pub fn merge_sdk_container_args(&self, cli_args: Option<&Vec<String>>) -> Option<Vec<String>> {
+        let config_args = self.get_sdk_container_args();
+
+        match (config_args, cli_args) {
+            (Some(config), Some(cli)) => {
+                let mut merged = config.clone();
+                merged.extend(cli.clone());
+                Some(merged)
+            }
+            (Some(config), None) => Some(config.clone()),
+            (None, Some(cli)) => Some(cli.clone()),
+            (None, None) => None,
+        }
     }
 
     /// Get compile section dependencies
@@ -277,5 +300,100 @@ nativesdk-tool = "*"
 
         let result = Config::load(temp_file.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sdk_container_args() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+container_args = ["--network=$USER-avocado", "--privileged"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test getting container args
+        let container_args = config.get_sdk_container_args();
+        assert!(container_args.is_some());
+        let args = container_args.unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--network=$USER-avocado");
+        assert_eq!(args[1], "--privileged");
+    }
+
+    #[test]
+    fn test_merge_sdk_container_args() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+container_args = ["--network=$USER-avocado", "--privileged"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test merging with CLI args
+        let cli_args = vec!["--cap-add=SYS_ADMIN".to_string(), "--rm".to_string()];
+        let merged = config.merge_sdk_container_args(Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 4);
+        assert_eq!(merged_args[0], "--network=$USER-avocado");
+        assert_eq!(merged_args[1], "--privileged");
+        assert_eq!(merged_args[2], "--cap-add=SYS_ADMIN");
+        assert_eq!(merged_args[3], "--rm");
+    }
+
+    #[test]
+    fn test_merge_sdk_container_args_config_only() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+container_args = ["--network=$USER-avocado"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test with no CLI args
+        let merged = config.merge_sdk_container_args(None);
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 1);
+        assert_eq!(merged_args[0], "--network=$USER-avocado");
+    }
+
+    #[test]
+    fn test_merge_sdk_container_args_cli_only() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test with only CLI args
+        let cli_args = vec!["--cap-add=SYS_ADMIN".to_string()];
+        let merged = config.merge_sdk_container_args(Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 1);
+        assert_eq!(merged_args[0], "--cap-add=SYS_ADMIN");
+    }
+
+    #[test]
+    fn test_merge_sdk_container_args_none() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test with no config args and no CLI args
+        let merged = config.merge_sdk_container_args(None);
+
+        assert!(merged.is_none());
     }
 }
