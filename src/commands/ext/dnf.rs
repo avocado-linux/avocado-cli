@@ -38,6 +38,7 @@ impl ExtDnfCommand {
 
     pub async fn execute(&self) -> Result<()> {
         let config = Config::load(&self.config_path)?;
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
@@ -49,7 +50,7 @@ impl ExtDnfCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
-        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release)
+        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release, &merged_container_args)
             .await
     }
 
@@ -113,6 +114,7 @@ impl ExtDnfCommand {
             .map(|s| s.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dnf_command(
         &self,
         parsed: &toml::Value,
@@ -120,6 +122,7 @@ impl ExtDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let container_helper = SdkContainer::new();
 
@@ -131,6 +134,7 @@ impl ExtDnfCommand {
             target,
             repo_url,
             repo_release,
+            merged_container_args,
         )
         .await?;
 
@@ -143,10 +147,12 @@ impl ExtDnfCommand {
             &dnf_command,
             repo_url,
             repo_release,
+            merged_container_args,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn setup_extension_environment(
         &self,
         _config: &toml::Value,
@@ -155,9 +161,10 @@ impl ExtDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let check_cmd = format!(
-            "test -d $AVOCADO_SDK_SYSROOTS/extensions/{}",
+            "test -d $AVOCADO_EXT_SYSROOTS/{}",
             self.extension
         );
 
@@ -170,9 +177,7 @@ impl ExtDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
-            ),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -186,6 +191,7 @@ impl ExtDnfCommand {
                 target,
                 repo_url,
                 repo_release,
+                merged_container_args,
             )
             .await?;
         }
@@ -193,6 +199,7 @@ impl ExtDnfCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_extension_directory(
         &self,
         container_helper: &SdkContainer,
@@ -200,6 +207,7 @@ impl ExtDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let setup_cmd = format!(
             "mkdir -p $AVOCADO_EXT_SYSROOTS/{}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{}/var/lib",
@@ -215,9 +223,7 @@ impl ExtDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
-            ),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -244,6 +250,7 @@ impl ExtDnfCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_dnf_command(
         &self,
         container_helper: &SdkContainer,
@@ -252,6 +259,7 @@ impl ExtDnfCommand {
         dnf_command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         if self.verbose {
             print_info(
@@ -269,9 +277,7 @@ impl ExtDnfCommand {
             interactive: true,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
-            ),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -297,10 +303,8 @@ impl ExtDnfCommand {
 
         format!(
             r#"
-RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
-    $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
     {dnf_args_str} \

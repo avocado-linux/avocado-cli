@@ -38,6 +38,7 @@ impl RuntimeDnfCommand {
 
     pub async fn execute(&self) -> Result<()> {
         let config = Config::load(&self.config_path)?;
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
@@ -49,7 +50,7 @@ impl RuntimeDnfCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
-        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release)
+        self.execute_dnf_command(&parsed, &container_image, &target, repo_url, repo_release, &merged_container_args)
             .await
     }
 
@@ -110,6 +111,7 @@ impl RuntimeDnfCommand {
             .map(|s| s.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dnf_command(
         &self,
         parsed: &toml::Value,
@@ -117,6 +119,7 @@ impl RuntimeDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let container_helper = SdkContainer::new();
 
@@ -128,6 +131,7 @@ impl RuntimeDnfCommand {
             target,
             repo_url,
             repo_release,
+            merged_container_args,
         )
         .await?;
 
@@ -140,10 +144,12 @@ impl RuntimeDnfCommand {
             &dnf_command,
             repo_url,
             repo_release,
+            merged_container_args,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn setup_runtime_environment(
         &self,
         _config: &toml::Value,
@@ -152,6 +158,7 @@ impl RuntimeDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let check_cmd = format!("test -d $AVOCADO_PREFIX/runtimes/{}", self.runtime);
 
@@ -164,9 +171,7 @@ impl RuntimeDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
-            ),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -179,6 +184,7 @@ impl RuntimeDnfCommand {
                 target,
                 repo_url,
                 repo_release,
+                merged_container_args,
             )
             .await?;
         }
@@ -186,6 +192,7 @@ impl RuntimeDnfCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_runtime_directory(
         &self,
         container_helper: &SdkContainer,
@@ -193,6 +200,7 @@ impl RuntimeDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let setup_cmd = format!(
             "mkdir -p $AVOCADO_PREFIX/runtimes/{}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_PREFIX/runtimes/{}/var/lib",
@@ -208,9 +216,7 @@ impl RuntimeDnfCommand {
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
-            ),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -234,6 +240,7 @@ impl RuntimeDnfCommand {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_dnf_command(
         &self,
         container_helper: &SdkContainer,
@@ -242,6 +249,7 @@ impl RuntimeDnfCommand {
         dnf_command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         if self.verbose {
             print_info(
@@ -259,9 +267,7 @@ impl RuntimeDnfCommand {
             interactive: true,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
-            ),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
         };
@@ -287,10 +293,8 @@ impl RuntimeDnfCommand {
 
         format!(
             r#"
-RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST \
-    $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
     {dnf_args_str} \
@@ -364,7 +368,7 @@ mod tests {
         assert!(dnf_command.contains("--installroot=$AVOCADO_PREFIX/runtimes/test-runtime"));
         assert!(dnf_command.contains("list installed"));
         assert!(dnf_command.contains("--nogpgcheck"));
-        assert!(dnf_command.contains("RPM_CONFIGDIR"));
+        assert!(dnf_command.contains("RPM_ETCCONFIGDIR"));
         assert!(dnf_command.contains("$DNF_SDK_HOST"));
     }
 

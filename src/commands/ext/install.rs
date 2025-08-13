@@ -287,7 +287,6 @@ impl ExtInstallCommand {
                     r#"
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
-    $DNF_SDK_HOST_OPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={} \
     {} \
