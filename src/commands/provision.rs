@@ -1,11 +1,12 @@
 //! Provision command implementation that acts as a shortcut to runtime provision.
 
 use anyhow::Result;
+use std::collections::HashMap;
 
 use crate::commands::runtime::RuntimeProvisionCommand;
 
-/// Implementation of the 'provision' command that calls through to runtime provision.
-pub struct ProvisionCommand {
+/// Configuration for provision command
+pub struct ProvisionConfig {
     /// Runtime name to provision
     pub runtime: String,
     /// Path to configuration file
@@ -16,44 +17,42 @@ pub struct ProvisionCommand {
     pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
+    /// Environment variables to pass to the provision process
+    pub env_vars: Option<HashMap<String, String>>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
 }
 
+/// Implementation of the 'provision' command that calls through to runtime provision.
+pub struct ProvisionCommand {
+    config: ProvisionConfig,
+}
+
 impl ProvisionCommand {
     /// Create a new ProvisionCommand instance
-    pub fn new(
-        runtime: String,
-        config_path: String,
-        verbose: bool,
-        force: bool,
-        target: Option<String>,
-        container_args: Option<Vec<String>>,
-        dnf_args: Option<Vec<String>>,
-    ) -> Self {
-        Self {
-            runtime,
-            config_path,
-            verbose,
-            force,
-            target,
-            container_args,
-            dnf_args,
-        }
+    pub fn new(config: ProvisionConfig) -> Self {
+        Self { config }
     }
 
     /// Execute the provision command by calling runtime provision
     pub async fn execute(&self) -> Result<()> {
+        let processed_container_args = crate::utils::config::Config::process_container_args(
+            self.config.container_args.as_ref(),
+        );
+
         let runtime_provision_cmd = RuntimeProvisionCommand::new(
-            self.runtime.clone(),
-            self.config_path.clone(),
-            self.verbose,
-            self.force,
-            self.target.clone(),
-            crate::utils::config::Config::process_container_args(self.container_args.as_ref()),
-            self.dnf_args.clone(),
+            crate::commands::runtime::provision::RuntimeProvisionConfig {
+                runtime_name: self.config.runtime.clone(),
+                config_path: self.config.config_path.clone(),
+                verbose: self.config.verbose,
+                force: self.config.force,
+                target: self.config.target.clone(),
+                env_vars: self.config.env_vars.clone(),
+                container_args: processed_container_args,
+                dnf_args: self.config.dnf_args.clone(),
+            },
         );
 
         runtime_provision_cmd.execute().await
@@ -66,43 +65,79 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let cmd = ProvisionCommand::new(
-            "my-runtime".to_string(),
-            "avocado.toml".to_string(),
-            true,
-            false,
-            Some("x86_64".to_string()),
-            Some(vec!["--privileged".to_string()]),
-            Some(vec!["--nogpgcheck".to_string()]),
-        );
+        let mut env_vars = HashMap::new();
+        env_vars.insert("TEST_VAR".to_string(), "test_value".to_string());
 
-        assert_eq!(cmd.runtime, "my-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
-        assert!(cmd.verbose);
-        assert!(!cmd.force);
-        assert_eq!(cmd.target, Some("x86_64".to_string()));
-        assert_eq!(cmd.container_args, Some(vec!["--privileged".to_string()]));
-        assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
+        let config = ProvisionConfig {
+            runtime: "my-runtime".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: true,
+            force: false,
+            target: Some("x86_64".to_string()),
+            env_vars: Some(env_vars.clone()),
+            container_args: Some(vec!["--privileged".to_string()]),
+            dnf_args: Some(vec!["--nogpgcheck".to_string()]),
+        };
+        let cmd = ProvisionCommand::new(config);
+
+        assert_eq!(cmd.config.runtime, "my-runtime");
+        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert!(cmd.config.verbose);
+        assert!(!cmd.config.force);
+        assert_eq!(cmd.config.target, Some("x86_64".to_string()));
+        assert_eq!(cmd.config.env_vars, Some(env_vars));
+        assert_eq!(
+            cmd.config.container_args,
+            Some(vec!["--privileged".to_string()])
+        );
+        assert_eq!(cmd.config.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
     }
 
     #[test]
     fn test_new_minimal() {
-        let cmd = ProvisionCommand::new(
-            "test-runtime".to_string(),
-            "config.toml".to_string(),
-            false,
-            true,
-            None,
-            None,
-            None,
+        let config = ProvisionConfig {
+            runtime: "test-runtime".to_string(),
+            config_path: "config.toml".to_string(),
+            verbose: false,
+            force: true,
+            target: None,
+            env_vars: None,
+            container_args: None,
+            dnf_args: None,
+        };
+        let cmd = ProvisionCommand::new(config);
+
+        assert_eq!(cmd.config.runtime, "test-runtime");
+        assert_eq!(cmd.config.config_path, "config.toml");
+        assert!(!cmd.config.verbose);
+        assert!(cmd.config.force);
+        assert_eq!(cmd.config.target, None);
+        assert_eq!(cmd.config.env_vars, None);
+        assert_eq!(cmd.config.container_args, None);
+        assert_eq!(cmd.config.dnf_args, None);
+    }
+
+    #[test]
+    fn test_new_with_provision_profile() {
+        let mut expected_env = HashMap::new();
+        expected_env.insert(
+            "AVOCADO_PROVISION_PROFILE".to_string(),
+            "production".to_string(),
         );
 
-        assert_eq!(cmd.runtime, "test-runtime");
-        assert_eq!(cmd.config_path, "config.toml");
-        assert!(!cmd.verbose);
-        assert!(cmd.force);
-        assert_eq!(cmd.target, None);
-        assert_eq!(cmd.container_args, None);
-        assert_eq!(cmd.dnf_args, None);
+        let config = ProvisionConfig {
+            runtime: "my-runtime".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            force: false,
+            target: None,
+            env_vars: Some(expected_env.clone()),
+            container_args: None,
+            dnf_args: None,
+        };
+        let cmd = ProvisionCommand::new(config);
+
+        assert_eq!(cmd.config.runtime, "my-runtime");
+        assert_eq!(cmd.config.env_vars, Some(expected_env));
     }
 }

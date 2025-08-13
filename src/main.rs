@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 
 mod commands;
 mod utils;
@@ -129,6 +130,12 @@ enum Commands {
         /// Runtime name to provision
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Provision profile to use
+        #[arg(long = "provision-profile")]
+        provision_profile: Option<String>,
+        /// Environment variables to pass to the provision process
+        #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
+        env: Option<Vec<String>>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -310,6 +317,12 @@ enum RuntimeCommands {
         /// Runtime name to provision
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Provision profile to use
+        #[arg(long = "provision-profile")]
+        provision_profile: Option<String>,
+        /// Environment variables to pass to the provision process
+        #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
+        env: Option<Vec<String>>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -371,6 +384,42 @@ enum RuntimeCommands {
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
     },
+}
+
+/// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
+fn parse_env_vars(env_args: Option<&Vec<String>>) -> Option<HashMap<String, String>> {
+    env_args.map(|args| {
+        args.iter()
+            .filter_map(|arg| {
+                let parts: Vec<&str> = arg.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    eprintln!("[WARNING] Invalid environment variable format: '{arg}'. Expected 'KEY=VALUE'.");
+                    None
+                }
+            })
+            .collect()
+    })
+}
+
+/// Combine provision profile and env vars into a single HashMap
+fn build_env_vars(
+    provision_profile: Option<&String>,
+    env_args: Option<&Vec<String>>,
+) -> Option<HashMap<String, String>> {
+    let mut env_vars = parse_env_vars(env_args).unwrap_or_default();
+    println!("env_vars: {env_vars:?}");
+
+    if let Some(profile) = provision_profile {
+        env_vars.insert("AVOCADO_PROVISION_PROFILE".to_string(), profile.clone());
+    }
+
+    if env_vars.is_empty() {
+        None
+    } else {
+        Some(env_vars)
+    }
 }
 
 #[tokio::main]
@@ -436,18 +485,22 @@ async fn main() -> Result<()> {
             verbose,
             force,
             runtime,
+            provision_profile,
+            env,
             container_args,
             dnf_args,
         } => {
-            let provision_cmd = ProvisionCommand::new(
-                runtime,
-                config,
-                verbose,
-                force,
-                cli.target,
-                container_args,
-                dnf_args,
-            );
+            let provision_cmd =
+                ProvisionCommand::new(crate::commands::provision::ProvisionConfig {
+                    runtime,
+                    config_path: config,
+                    verbose,
+                    force,
+                    target: cli.target,
+                    env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                    container_args,
+                    dnf_args,
+                });
             provision_cmd.execute().await?;
             Ok(())
         }
@@ -496,17 +549,22 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force,
+                provision_profile,
+                env,
                 container_args,
                 dnf_args,
             } => {
                 let provision_cmd = RuntimeProvisionCommand::new(
-                    runtime,
-                    config,
-                    verbose,
-                    force,
-                    cli.target,
-                    container_args,
-                    dnf_args,
+                    crate::commands::runtime::provision::RuntimeProvisionConfig {
+                        runtime_name: runtime,
+                        config_path: config,
+                        verbose,
+                        force,
+                        target: cli.target,
+                        env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                        container_args,
+                        dnf_args,
+                    },
                 );
                 provision_cmd.execute().await?;
                 Ok(())
@@ -935,4 +993,111 @@ enum HitlCommands {
         #[arg(short, long)]
         port: Option<u16>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_env_vars() {
+        let env_args = vec![
+            "KEY1=value1".to_string(),
+            "KEY2=value2".to_string(),
+            "COMPLEX_KEY=value with spaces".to_string(),
+        ];
+
+        let result = parse_env_vars(Some(&env_args)).unwrap();
+
+        assert_eq!(result.get("KEY1"), Some(&"value1".to_string()));
+        assert_eq!(result.get("KEY2"), Some(&"value2".to_string()));
+        assert_eq!(
+            result.get("COMPLEX_KEY"),
+            Some(&"value with spaces".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_env_vars_invalid_format() {
+        let env_args = vec![
+            "VALID_KEY=valid_value".to_string(),
+            "INVALID_FORMAT".to_string(),
+            "ANOTHER_VALID=another_value".to_string(),
+        ];
+
+        let result = parse_env_vars(Some(&env_args)).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("VALID_KEY"), Some(&"valid_value".to_string()));
+        assert_eq!(
+            result.get("ANOTHER_VALID"),
+            Some(&"another_value".to_string())
+        );
+        assert_eq!(result.get("INVALID_FORMAT"), None);
+    }
+
+    #[test]
+    fn test_parse_env_vars_empty() {
+        let result = parse_env_vars(None);
+        assert_eq!(result, None);
+
+        let empty_vec = vec![];
+        let result = parse_env_vars(Some(&empty_vec));
+        assert_eq!(result, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn test_build_env_vars_with_provision_profile_only() {
+        let result = build_env_vars(Some(&"production".to_string()), None).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.get("AVOCADO_PROVISION_PROFILE"),
+            Some(&"production".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_env_vars_with_env_args_only() {
+        let env_args = vec!["CUSTOM_VAR=custom_value".to_string()];
+
+        let result = build_env_vars(None, Some(&env_args)).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get("CUSTOM_VAR"), Some(&"custom_value".to_string()));
+    }
+
+    #[test]
+    fn test_build_env_vars_combined() {
+        let env_args = vec![
+            "AVOCADO_DEVICE_ID=device123".to_string(),
+            "AVOCADO_DEVICE_CERT=cert_data".to_string(),
+        ];
+
+        let result = build_env_vars(Some(&"staging".to_string()), Some(&env_args)).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result.get("AVOCADO_PROVISION_PROFILE"),
+            Some(&"staging".to_string())
+        );
+        assert_eq!(
+            result.get("AVOCADO_DEVICE_ID"),
+            Some(&"device123".to_string())
+        );
+        assert_eq!(
+            result.get("AVOCADO_DEVICE_CERT"),
+            Some(&"cert_data".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_env_vars_empty() {
+        let result = build_env_vars(None, None);
+        assert_eq!(result, None);
+
+        let empty_vec = vec![];
+        let result = build_env_vars(None, Some(&empty_vec));
+        assert_eq!(result, None);
+    }
 }

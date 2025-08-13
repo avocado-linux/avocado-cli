@@ -5,42 +5,32 @@ use crate::utils::{
     target::resolve_target,
 };
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+pub struct RuntimeProvisionConfig {
+    pub runtime_name: String,
+    pub config_path: String,
+    pub verbose: bool,
+    pub force: bool,
+    pub target: Option<String>,
+    pub env_vars: Option<HashMap<String, String>>,
+    pub container_args: Option<Vec<String>>,
+    pub dnf_args: Option<Vec<String>>,
+}
 
 pub struct RuntimeProvisionCommand {
-    runtime_name: String,
-    config_path: String,
-    verbose: bool,
-    force: bool,
-    target: Option<String>,
-    container_args: Option<Vec<String>>,
-    dnf_args: Option<Vec<String>>,
+    config: RuntimeProvisionConfig,
 }
 
 impl RuntimeProvisionCommand {
-    pub fn new(
-        runtime_name: String,
-        config_path: String,
-        verbose: bool,
-        force: bool,
-        target: Option<String>,
-        container_args: Option<Vec<String>>,
-        dnf_args: Option<Vec<String>>,
-    ) -> Self {
-        Self {
-            runtime_name,
-            config_path,
-            verbose,
-            force,
-            target,
-            container_args,
-            dnf_args,
-        }
+    pub fn new(config: RuntimeProvisionConfig) -> Self {
+        Self { config }
     }
 
     pub async fn execute(&self) -> Result<()> {
         // Load configuration and parse raw TOML
-        let _config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
+        let _config = load_config(&self.config.config_path)?;
+        let content = std::fs::read_to_string(&self.config.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
         // Get SDK configuration
@@ -57,9 +47,14 @@ impl RuntimeProvisionCommand {
             .context("No runtime configuration found")?;
 
         // Check if runtime exists
-        let runtime_spec = runtime_config.get(&self.runtime_name).with_context(|| {
-            format!("Runtime '{}' not found in configuration", self.runtime_name)
-        })?;
+        let runtime_spec = runtime_config
+            .get(&self.config.runtime_name)
+            .with_context(|| {
+                format!(
+                    "Runtime '{}' not found in configuration",
+                    self.config.runtime_name
+                )
+            })?;
 
         // Get target from runtime config
         let config_target = runtime_spec
@@ -68,17 +63,17 @@ impl RuntimeProvisionCommand {
             .map(|s| s.to_string());
 
         // Resolve target architecture
-        let target_arch = resolve_target(self.target.as_deref(), config_target.as_deref())
+        let target_arch = resolve_target(self.config.target.as_deref(), config_target.as_deref())
             .with_context(|| {
                 format!(
                     "No target architecture specified for runtime '{}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{}.target'",
-                    self.runtime_name,
-                    self.runtime_name
+                    self.config.runtime_name,
+                    self.config.runtime_name
                 )
             })?;
 
         print_info(
-            &format!("Provisioning runtime '{}'", self.runtime_name),
+            &format!("Provisioning runtime '{}'", self.config.runtime_name),
             OutputLevel::Normal,
         );
 
@@ -88,25 +83,26 @@ impl RuntimeProvisionCommand {
         // Create provision script
         let provision_script = self.create_provision_script(&target_arch)?;
 
-        if self.verbose {
+        if self.config.verbose {
             print_info("Executing provision script.", OutputLevel::Normal);
         }
 
-        let config = RunConfig {
+        let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.clone(),
             command: provision_script,
-            verbose: self.verbose,
+            verbose: self.config.verbose,
             source_environment: true,
-            interactive: !self.force,
+            interactive: !self.config.force,
+            env_vars: self.config.env_vars.clone(),
             container_args: crate::utils::config::Config::process_container_args(
-                self.container_args.as_ref(),
+                self.config.container_args.as_ref(),
             ),
-            dnf_args: self.dnf_args.clone(),
+            dnf_args: self.config.dnf_args.clone(),
             ..Default::default()
         };
         let provision_result = container_helper
-            .run_in_container(config)
+            .run_in_container(run_config)
             .await
             .context("Failed to provision runtime")?;
 
@@ -115,7 +111,10 @@ impl RuntimeProvisionCommand {
         }
 
         print_success(
-            &format!("Successfully provisioned runtime '{}'", self.runtime_name),
+            &format!(
+                "Successfully provisioned runtime '{}'",
+                self.config.runtime_name
+            ),
             OutputLevel::Normal,
         );
         Ok(())
@@ -127,7 +126,7 @@ impl RuntimeProvisionCommand {
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{}'."
 avocado-provision-{} {}
 "#,
-            self.runtime_name, target_arch, self.runtime_name
+            self.config.runtime_name, target_arch, self.config.runtime_name
         );
 
         Ok(script)
@@ -140,34 +139,39 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let cmd = RuntimeProvisionCommand::new(
-            "test-runtime".to_string(),
-            "avocado.toml".to_string(),
-            false,
-            false,
-            Some("x86_64".to_string()),
-            None,
-            None,
-        );
+        let config = RuntimeProvisionConfig {
+            runtime_name: "test-runtime".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            force: false,
+            target: Some("x86_64".to_string()),
+            env_vars: None,
+            container_args: None,
+            dnf_args: None,
+        };
+        let cmd = RuntimeProvisionCommand::new(config);
 
-        assert_eq!(cmd.runtime_name, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
-        assert!(!cmd.verbose);
-        assert!(!cmd.force);
-        assert_eq!(cmd.target, Some("x86_64".to_string()));
+        assert_eq!(cmd.config.runtime_name, "test-runtime");
+        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert!(!cmd.config.verbose);
+        assert!(!cmd.config.force);
+        assert_eq!(cmd.config.target, Some("x86_64".to_string()));
+        assert_eq!(cmd.config.env_vars, None);
     }
 
     #[test]
     fn test_create_provision_script() {
-        let cmd = RuntimeProvisionCommand::new(
-            "test-runtime".to_string(),
-            "avocado.toml".to_string(),
-            false,
-            false,
-            Some("x86_64".to_string()),
-            None,
-            None,
-        );
+        let config = RuntimeProvisionConfig {
+            runtime_name: "test-runtime".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            force: false,
+            target: Some("x86_64".to_string()),
+            env_vars: None,
+            container_args: None,
+            dnf_args: None,
+        };
+        let cmd = RuntimeProvisionCommand::new(config);
 
         let script = cmd.create_provision_script("x86_64").unwrap();
 
@@ -183,22 +187,51 @@ mod tests {
         ]);
         let dnf_args = Some(vec!["--nogpgcheck".to_string()]);
 
-        let cmd = RuntimeProvisionCommand::new(
-            "test-runtime".to_string(),
-            "avocado.toml".to_string(),
-            false,
-            false,
-            Some("x86_64".to_string()),
-            container_args.clone(),
-            dnf_args.clone(),
+        let config = RuntimeProvisionConfig {
+            runtime_name: "test-runtime".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            force: false,
+            target: Some("x86_64".to_string()),
+            env_vars: None,
+            container_args: container_args.clone(),
+            dnf_args: dnf_args.clone(),
+        };
+        let cmd = RuntimeProvisionCommand::new(config);
+
+        assert_eq!(cmd.config.runtime_name, "test-runtime");
+        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert!(!cmd.config.verbose);
+        assert!(!cmd.config.force);
+        assert_eq!(cmd.config.target, Some("x86_64".to_string()));
+        assert_eq!(cmd.config.env_vars, None);
+        assert_eq!(cmd.config.container_args, container_args);
+        assert_eq!(cmd.config.dnf_args, dnf_args);
+    }
+
+    #[test]
+    fn test_new_with_env_vars() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("AVOCADO_DEVICE_ID".to_string(), "device123".to_string());
+        env_vars.insert(
+            "AVOCADO_PROVISION_PROFILE".to_string(),
+            "production".to_string(),
         );
 
-        assert_eq!(cmd.runtime_name, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
-        assert!(!cmd.verbose);
-        assert!(!cmd.force);
-        assert_eq!(cmd.target, Some("x86_64".to_string()));
-        assert_eq!(cmd.container_args, container_args);
-        assert_eq!(cmd.dnf_args, dnf_args);
+        let config = RuntimeProvisionConfig {
+            runtime_name: "test-runtime".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            force: false,
+            target: Some("x86_64".to_string()),
+            env_vars: Some(env_vars.clone()),
+            container_args: None,
+            dnf_args: None,
+        };
+        let cmd = RuntimeProvisionCommand::new(config);
+
+        assert_eq!(cmd.config.runtime_name, "test-runtime");
+        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert_eq!(cmd.config.env_vars, Some(env_vars));
     }
 }
