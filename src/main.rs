@@ -662,6 +662,7 @@ async fn main() -> Result<()> {
                 dnf_args,
                 target,
                 verbose,
+                port,
             } => {
                 let hitl_cmd = HitlServerCommand {
                     config_path,
@@ -670,6 +671,7 @@ async fn main() -> Result<()> {
                     dnf_args,
                     target: target.or(cli.target),
                     verbose,
+                    port,
                 };
                 hitl_cmd.execute().await?;
                 Ok(())
@@ -917,5 +919,8 @@ enum HitlCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// NFS port number to use
+        #[arg(short, long)]
+        port: Option<u16>,
     },
 }

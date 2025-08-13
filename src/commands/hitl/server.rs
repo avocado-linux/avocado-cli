@@ -29,6 +29,9 @@ pub struct HitlServerCommand {
     /// Enable verbose output
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// NFS port number to use
+    pub port: Option<u16>,
 }
 
 impl HitlServerCommand {
@@ -169,6 +172,20 @@ impl HitlServerCommand {
         );
         commands.push(update_config_cmd);
 
+        // Update NFS_Port if a port is specified (it's nested inside NFS_Core_Param block)
+        if let Some(port) = self.port {
+            let port_update_cmd = format!(
+                "sed -i '/NFS_Core_Param {{/,/}}/s/NFS_Port = [0-9]\\+;/NFS_Port = {port};/' {config_file}"
+            );
+            commands.push(port_update_cmd);
+
+            if self.verbose {
+                commands.push(format!(
+                    "echo \"[DEBUG] Updated NFS_Port to {port} in NFS_Core_Param block in hitl-nfs.conf\""
+                ));
+            }
+        }
+
         if self.extensions.is_empty() {
             return format!("{} &&", commands.join(" && "));
         }
@@ -207,5 +224,90 @@ impl HitlServerCommand {
         }
 
         format!("{} &&", commands.join(" && "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_export_setup_commands_without_port() {
+        let cmd = HitlServerCommand {
+            config_path: "test.toml".to_string(),
+            extensions: vec![],
+            container_args: None,
+            dnf_args: None,
+            target: None,
+            verbose: false,
+            port: None,
+        };
+
+        let commands = cmd.generate_export_setup_commands("x86_64");
+
+        // Should create directories and exports.d directive but no port update
+        assert!(commands.contains("mkdir -p ${AVOCADO_SDK_PREFIX}/etc/avocado/exports.d"));
+        assert!(commands.contains("%dir /opt/_avocado/x86_64/sdk/etc/avocado/exports.d"));
+        assert!(!commands.contains("NFS_Port ="));
+    }
+
+        #[test]
+    fn test_generate_export_setup_commands_with_port() {
+        let cmd = HitlServerCommand {
+            config_path: "test.toml".to_string(),
+            extensions: vec![],
+            container_args: None,
+            dnf_args: None,
+            target: None,
+            verbose: false,
+            port: Some(2049),
+        };
+
+        let commands = cmd.generate_export_setup_commands("x86_64");
+
+        // Should include port update commands that search within NFS_Core_Param block
+        assert!(commands.contains("NFS_Port = 2049"));
+        assert!(commands.contains("/NFS_Core_Param {/,/}/s/NFS_Port = [0-9]\\+;/NFS_Port = 2049;/"));
+    }
+
+    #[test]
+    fn test_generate_export_setup_commands_with_port_and_verbose() {
+        let cmd = HitlServerCommand {
+            config_path: "test.toml".to_string(),
+            extensions: vec![],
+            container_args: None,
+            dnf_args: None,
+            target: None,
+            verbose: true,
+            port: Some(3049),
+        };
+
+        let commands = cmd.generate_export_setup_commands("x86_64");
+
+        // Should include port update commands and debug message
+        assert!(commands.contains("NFS_Port = 3049"));
+        assert!(commands.contains("[DEBUG] Updated NFS_Port to 3049 in NFS_Core_Param block in hitl-nfs.conf"));
+    }
+
+    #[test]
+    fn test_generate_export_setup_commands_with_extensions_and_port() {
+        let cmd = HitlServerCommand {
+            config_path: "test.toml".to_string(),
+            extensions: vec!["ext1".to_string(), "ext2".to_string()],
+            container_args: None,
+            dnf_args: None,
+            target: None,
+            verbose: false,
+            port: Some(4049),
+        };
+
+        let commands = cmd.generate_export_setup_commands("aarch64");
+
+        // Should include both port update and extension configurations
+        assert!(commands.contains("NFS_Port = 4049"));
+        assert!(commands.contains("Export_Id = 1"));
+        assert!(commands.contains("Export_Id = 2"));
+        assert!(commands.contains("/opt/_avocado/aarch64/extensions/ext1"));
+        assert!(commands.contains("/opt/_avocado/aarch64/extensions/ext2"));
     }
 }
