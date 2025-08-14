@@ -124,6 +124,9 @@ impl SdkContainer {
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
+        if config.verbose || self.verbose {
+            env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
+        }
 
         // Build the complete command
         let mut full_command = String::new();
@@ -287,7 +290,7 @@ else
     REPO_URL="https://repo.avocadolinux.org"
 fi
 
-echo "[INFO] Using repo URL: '$REPO_URL'"
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'"; fi
 
 # Get repo release from environment or default to prod
 if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
@@ -302,7 +305,7 @@ else
     REPO_RELEASE=${REPO_RELEASE:-dev}
 fi
 
-echo "[INFO] Using repo release: '$REPO_RELEASE'"
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
 
 export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_SDK_TARGET}"
 export AVOCADO_SDK_PREFIX="${AVOCADO_PREFIX}/sdk"

@@ -72,7 +72,7 @@ impl BuildCommand {
 
         // Step 1: Analyze dependencies to find extensions that need SDK compilation
         print_info(
-            "Step 1/3: Analyzing dependencies and compiling SDK code",
+            "Step 1/4: Analyzing dependencies and compiling SDK code",
             OutputLevel::Normal,
         );
         let required_extensions = self.find_required_extensions(&parsed, &runtimes_to_build)?;

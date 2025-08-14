@@ -316,7 +316,7 @@ echo "SYSEXT_SCOPE={}" >> "$release_file"
 # Check if extension includes kernel modules and add AVOCADO_ON_MERGE if needed
 if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.gz" 2>/dev/null | head -n 1)" ]; then
     echo "AVOCADO_ON_MERGE=depmod" >> "$release_file"
-    echo "Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=depmod to release file"
+    echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=depmod to release file"
 fi
 "#,
             self.extension,
