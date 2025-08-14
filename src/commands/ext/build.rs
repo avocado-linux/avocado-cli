@@ -72,6 +72,25 @@ impl ExtBuildCommand {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
+        // Get enable_services from configuration
+        let enable_services = ext_config
+            .get("enable_services")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Validate that confext is present if enable_services is used
+        if !enable_services.is_empty() && !ext_types.contains(&"confext") {
+            print_error(
+                &format!(
+                    "Warning: Extension '{}' has enable_services configured but 'confext' is not in types. \
+                    Service linking requires a confext. Please add 'confext' to the types array.",
+                    self.extension
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
         let ext_scopes = ext_config
             .get("scopes")
             .and_then(|v| v.as_array())
@@ -215,6 +234,7 @@ impl ExtBuildCommand {
                         repo_url,
                         repo_release,
                         &processed_container_args,
+                        &enable_services,
                     )
                     .await?
                 }
@@ -311,9 +331,10 @@ impl ExtBuildCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
+        enable_services: &[String],
     ) -> Result<bool> {
         // Create the build script for confext extension
-        let build_script = self.create_confext_build_script(ext_version, ext_scopes, overlay_config);
+        let build_script = self.create_confext_build_script(ext_version, ext_scopes, overlay_config, enable_services);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -421,7 +442,7 @@ fi
         )
     }
 
-    fn create_confext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_config: Option<&OverlayConfig>) -> String {
+    fn create_confext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_config: Option<&OverlayConfig>, enable_services: &[String]) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
                 OverlayMode::Merge => format!(
@@ -466,6 +487,33 @@ fi
             String::new()
         };
 
+        // Create service linking section
+        let service_linking_section = if !enable_services.is_empty() {
+            let mut service_commands = Vec::new();
+            for service in enable_services {
+                service_commands.push(format!(
+                    r#"
+# Link service file for {}
+service_file="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/systemd/system/{}"
+service_link_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/systemd/system/multi-user.target.upholds"
+service_link="$service_link_dir/{}"
+
+if [ -f "$service_file" ]; then
+    echo "Found service file: $service_file"
+    mkdir -p "$service_link_dir"
+    ln -sf "/usr/lib/systemd/system/{}" "$service_link"
+    echo "Created systemd service link: $service_link -> /usr/lib/systemd/system/{}"
+else
+    echo "Warning: Service file {} not found in extension sysroot"
+fi"#,
+                    service, self.extension, service, self.extension, service, service, service, service
+                ));
+            }
+            service_commands.join("\n")
+        } else {
+            String::new()
+        };
+
         format!(
             r#"
 set -e
@@ -477,11 +525,13 @@ mkdir -p "$release_dir"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
 echo "CONFEXT_SCOPE={}" >> "$release_file"
+{}
 "#,
             overlay_section,
             self.extension,
             self.extension,
-            ext_scopes.join(" ")
+            ext_scopes.join(" "),
+            service_linking_section
         )
     }
 }
@@ -532,7 +582,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None);
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[]);
 
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
@@ -576,10 +626,33 @@ mod tests {
         };
 
         let script =
-            cmd.create_confext_build_script("2.0", &["system".to_string(), "portable".to_string()], None);
+            cmd.create_confext_build_script("2.0", &["system".to_string(), "portable".to_string()], None, &[]);
 
         assert!(script.contains("echo \"CONFEXT_SCOPE=system portable\" >> \"$release_file\""));
         assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/etc/extension-release.d"));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_with_services() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let enable_services = vec!["peridiod.service".to_string(), "test.service".to_string()];
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &enable_services);
+
+        // Check that service linking commands are present
+        assert!(script.contains("# Link service file for peridiod.service"));
+        assert!(script.contains("service_file=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/systemd/system/peridiod.service\""));
+        assert!(script.contains("service_link_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/systemd/system/multi-user.target.upholds\""));
+        assert!(script.contains("ln -sf \"/usr/lib/systemd/system/peridiod.service\""));
+        assert!(script.contains("# Link service file for test.service"));
+        assert!(script.contains("echo \"Warning: Service file peridiod.service not found in extension sysroot\""));
     }
 
     #[test]
@@ -644,7 +717,7 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Merge,
         };
-        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some(&overlay_config), &[]);
 
         // Verify overlay merging commands are present
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
@@ -696,7 +769,7 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Opaque,
         };
-        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], Some(&overlay_config), &[]);
 
         // Verify overlay opaque mode commands are present
         assert!(script.contains("# Copy overlay directory to extension sysroot (opaque mode)"));
@@ -720,7 +793,7 @@ mod tests {
         };
 
         let script_sysext = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
-        let script_confext = cmd.create_confext_build_script("1.0", &["system".to_string()], None);
+        let script_confext = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[]);
 
         // Verify no overlay merging commands are present
         assert!(!script_sysext.contains("Merge overlay directory"));
