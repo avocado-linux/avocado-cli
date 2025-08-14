@@ -1,0 +1,12 @@
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime.default]
+target = "x86_64-unknown-linux-gnu"
+
+[ext.avocado-dev]
+types = ["sysext", "confext"]
+packages = ["vim", "curl"]
+
+[ext.avocado-dev.users]
+root = {no_password = true}

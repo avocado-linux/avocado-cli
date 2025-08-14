@@ -96,6 +96,9 @@ impl ExtBuildCommand {
             })
             .unwrap_or_default();
 
+        // Get users configuration
+        let users_config = ext_config.get("users").and_then(|v| v.as_table());
+
         // Validate that confext is present if enable_services is used
         if !enable_services.is_empty() && !ext_types.contains(&"confext") {
             print_error(
@@ -236,6 +239,7 @@ impl ExtBuildCommand {
                         repo_release,
                         &processed_container_args,
                         &modprobe_modules,
+                        users_config,
                     )
                     .await?
                 }
@@ -251,6 +255,7 @@ impl ExtBuildCommand {
                         repo_release,
                         &processed_container_args,
                         &enable_services,
+                        users_config,
                     )
                     .await?
                 }
@@ -299,6 +304,7 @@ impl ExtBuildCommand {
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
         modprobe_modules: &[String],
+        users_config: Option<&toml::value::Table>,
     ) -> Result<bool> {
         // Create the build script for sysext extension
         let build_script = self.create_sysext_build_script(
@@ -306,6 +312,7 @@ impl ExtBuildCommand {
             ext_scopes,
             overlay_config,
             modprobe_modules,
+            users_config,
         );
 
         // Execute the build script in the SDK container
@@ -354,6 +361,7 @@ impl ExtBuildCommand {
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
         enable_services: &[String],
+        users_config: Option<&toml::value::Table>,
     ) -> Result<bool> {
         // Create the build script for confext extension
         let build_script = self.create_confext_build_script(
@@ -361,6 +369,7 @@ impl ExtBuildCommand {
             ext_scopes,
             overlay_config,
             enable_services,
+            users_config,
         );
 
         // Execute the build script in the SDK container
@@ -402,6 +411,7 @@ impl ExtBuildCommand {
         ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
         modprobe_modules: &[String],
+        users_config: Option<&toml::value::Table>,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
@@ -460,10 +470,12 @@ fi
 
         let modprobe_list = modprobe_modules.join(" ");
 
+        let users_section = self.create_users_script_section(users_config);
+
         format!(
             r#"
 set -e
-{}
+{}{}
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/extension-release.d"
 release_file="$release_dir/extension-release.{}"
 modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
@@ -486,6 +498,7 @@ if [ -n "{}" ]; then
 fi
 "#,
             overlay_section,
+            users_section,
             self.extension,
             self.extension,
             self.extension,
@@ -503,6 +516,7 @@ fi
         ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
         enable_services: &[String],
+        users_config: Option<&toml::value::Table>,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
@@ -593,10 +607,12 @@ fi"#,
             String::new()
         };
 
+        let users_section = self.create_users_script_section(users_config);
+
         format!(
             r#"
 set -e
-{}
+{}{}
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/extension-release.d"
 release_file="$release_dir/extension-release.{}"
 
@@ -607,11 +623,81 @@ echo "CONFEXT_SCOPE={}" >> "$release_file"
 {}
 "#,
             overlay_section,
+            users_section,
             self.extension,
             self.extension,
             ext_scopes.join(" "),
             service_linking_section
         )
+    }
+
+    /// Creates a script section for handling user configuration
+    /// This will copy passwd/shadow files and modify them for users with no_password = true
+    fn create_users_script_section(&self, users_config: Option<&toml::value::Table>) -> String {
+        if let Some(users) = users_config {
+            let mut script_lines = Vec::new();
+            let mut users_with_no_password = Vec::new();
+
+            // First, collect all users that need no_password
+            for (username, user_config) in users {
+                if let Some(user_table) = user_config.as_table() {
+                    if let Some(no_password) = user_table.get("no_password") {
+                        if no_password.as_bool().unwrap_or(false) {
+                            users_with_no_password.push(username.clone());
+                        }
+                    }
+                }
+            }
+
+            if !users_with_no_password.is_empty() {
+                script_lines.push("\n# Copy and modify user authentication files".to_string());
+
+                // Copy passwd and shadow files from rootfs
+                script_lines.push(format!(
+                    r#"
+# Copy passwd and shadow files from rootfs to extension
+echo "Copying /etc/passwd and /etc/shadow from rootfs to extension"
+mkdir -p "$AVOCADO_EXT_SYSROOTS/{}/etc"
+cp "$AVOCADO_PREFIX/rootfs/etc/passwd" "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd"
+cp "$AVOCADO_PREFIX/rootfs/etc/shadow" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
+"#,
+                    self.extension, self.extension, self.extension
+                ));
+
+                // Modify shadow file for users with no_password
+                for username in &users_with_no_password {
+                    script_lines.push(format!(
+                        r#"
+# Modify shadow file to allow {} to login without password
+echo "Modifying shadow file for user '{}' to allow login without password"
+# Use sed to replace the password hash (second field) with empty string for the user
+# Format: username:password_hash:last_change:min_age:max_age:warn_period:inactive_period:expire_date:reserved
+# We want to change username:*:... to username::...
+if grep -q "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"; then
+    sed -i "s/^{}:\*:/{}::/" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
+    echo "Modified shadow entry for user '{}' to allow passwordless login"
+else
+    echo "Warning: User '{}' not found in shadow file"
+fi"#,
+                        username, username, username, self.extension, username, username, self.extension, username, username
+                    ));
+                }
+
+                script_lines.push(format!(
+                    r#"
+# Set proper ownership and permissions for authentication files
+chown root:root "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
+chmod 644 "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd"
+chmod 640 "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
+echo "Set proper permissions on authentication files""#,
+                    self.extension, self.extension, self.extension, self.extension
+                ));
+            }
+
+            script_lines.join("")
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -630,7 +716,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None);
 
         // Print the actual script for debugging
         // println!("Generated sysext build script:\n{}", script);
@@ -661,7 +747,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[]);
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None);
 
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
@@ -691,6 +777,7 @@ mod tests {
             &["system".to_string(), "portable".to_string()],
             None,
             &[],
+            None,
         );
 
         assert!(script.contains("echo \"SYSEXT_SCOPE=system portable\" >> \"$release_file\""));
@@ -713,6 +800,7 @@ mod tests {
             &["system".to_string(), "portable".to_string()],
             None,
             &[],
+            None,
         );
 
         assert!(script.contains("echo \"CONFEXT_SCOPE=system portable\" >> \"$release_file\""));
@@ -732,7 +820,7 @@ mod tests {
 
         let enable_services = vec!["peridiod.service".to_string(), "test.service".to_string()];
         let script =
-            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &enable_services);
+            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &enable_services, None);
 
         // Check that service linking commands are present
         assert!(script.contains("# Link service file for peridiod.service"));
@@ -756,7 +844,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None);
 
         // Verify the find command looks for common kernel module extensions
         assert!(script.contains("-name \"*.ko\""));
@@ -787,6 +875,7 @@ mod tests {
             &["system".to_string()],
             Some(&overlay_config),
             &[],
+            None,
         );
 
         // Verify overlay merging commands are present
@@ -821,6 +910,7 @@ mod tests {
             &["system".to_string()],
             Some(&overlay_config),
             &[],
+            None,
         );
 
         // Verify overlay merging commands are present
@@ -855,6 +945,7 @@ mod tests {
             &["system".to_string()],
             Some(&overlay_config),
             &[],
+            None,
         );
 
         // Verify overlay opaque mode commands are present
@@ -891,6 +982,7 @@ mod tests {
             &["system".to_string()],
             Some(&overlay_config),
             &[],
+            None,
         );
 
         // Verify overlay opaque mode commands are present
@@ -919,9 +1011,9 @@ mod tests {
         };
 
         let script_sysext =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None);
         let script_confext =
-            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[]);
+            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None);
 
         // Verify no overlay merging commands are present
         assert!(!script_sysext.contains("Merge overlay directory"));
@@ -945,7 +1037,7 @@ mod tests {
 
         let modprobe_modules = vec!["nfs".to_string(), "ext4".to_string()];
         let script =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &modprobe_modules);
+            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &modprobe_modules, None);
 
         // Verify AVOCADO_MODPROBE is added with correct modules
         assert!(script.contains("if [ -n \"nfs ext4\" ]; then"));
@@ -964,10 +1056,157 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None);
 
         // Verify AVOCADO_MODPROBE section exists but with empty check
         assert!(script.contains("if [ -n \"\" ]; then"));
         assert!(script.contains("AVOCADO_MODPROBE="));
+    }
+
+    #[test]
+    fn test_create_users_script_section_with_no_password_user() {
+        let cmd = ExtBuildCommand {
+            extension: "avocado-dev".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        // Create users config matching the example in the user request
+        let mut users_config = toml::value::Table::new();
+        let mut root_user = toml::value::Table::new();
+        root_user.insert("no_password".to_string(), toml::Value::Boolean(true));
+        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+
+        let script = cmd.create_users_script_section(Some(&users_config));
+
+        // Verify the users script section contains the expected commands
+        assert!(script.contains("# Copy and modify user authentication files"));
+        assert!(script.contains("Copying /etc/passwd and /etc/shadow from rootfs to extension"));
+        assert!(script.contains("mkdir -p \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc\""));
+        assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/passwd\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/passwd\""));
+        assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/shadow\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));
+        assert!(script.contains("Modifying shadow file for user 'root' to allow login without password"));
+        assert!(script.contains("sed -i \"s/^root:\\*:/root::/\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));
+        assert!(script.contains("Modified shadow entry for user 'root' to allow passwordless login"));
+        assert!(script.contains("chown root:root"));
+        assert!(script.contains("chmod 644"));
+        assert!(script.contains("chmod 640"));
+    }
+
+    #[test]
+    fn test_create_users_script_section_without_users() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_users_script_section(None);
+
+        // Should return empty string when no users config is provided
+        assert_eq!(script, "");
+    }
+
+    #[test]
+    fn test_create_users_script_section_with_password_user() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        // Create users config with a user that has password (not no_password)
+        let mut users_config = toml::value::Table::new();
+        let mut user = toml::value::Table::new();
+        user.insert("no_password".to_string(), toml::Value::Boolean(false));
+        users_config.insert("testuser".to_string(), toml::Value::Table(user));
+
+        let script = cmd.create_users_script_section(Some(&users_config));
+
+        // Should return empty string when no users have no_password = true
+        assert_eq!(script, "");
+    }
+
+    #[test]
+    fn test_sysext_build_script_with_users() {
+        let cmd = ExtBuildCommand {
+            extension: "avocado-dev".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        // Create users config matching the example in the user request
+        let mut users_config = toml::value::Table::new();
+        let mut root_user = toml::value::Table::new();
+        root_user.insert("no_password".to_string(), toml::Value::Boolean(true));
+        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            Some(&users_config),
+        );
+
+        // Verify the complete build script includes users functionality
+        assert!(script.contains("set -e"));
+        assert!(script.contains("# Copy and modify user authentication files"));
+        assert!(script.contains("mkdir -p \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc\""));
+        assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/passwd\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/passwd\""));
+        assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/shadow\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));
+        assert!(script.contains("sed -i \"s/^root:\\*:/root::/\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));
+        assert!(script.contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/avocado-dev/usr/lib/extension-release.d\""));
+        assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
+        assert!(script.contains("echo \"SYSEXT_SCOPE=system\" >> \"$release_file\""));
+    }
+
+    #[test]
+    fn test_confext_build_script_with_users() {
+        let cmd = ExtBuildCommand {
+            extension: "avocado-dev".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        // Create users config matching the example in the user request
+        let mut users_config = toml::value::Table::new();
+        let mut root_user = toml::value::Table::new();
+        root_user.insert("no_password".to_string(), toml::Value::Boolean(true));
+        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            Some(&users_config),
+        );
+
+        // Verify the complete build script includes users functionality
+        assert!(script.contains("set -e"));
+        assert!(script.contains("# Copy and modify user authentication files"));
+        assert!(script.contains("mkdir -p \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc\""));
+        assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/passwd\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/passwd\""));
+        assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/shadow\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));
+        assert!(script.contains("sed -i \"s/^root:\\*:/root::/\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));
+        assert!(script.contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/extension-release.d\""));
+        assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
+        assert!(script.contains("echo \"CONFEXT_SCOPE=system\" >> \"$release_file\""));
     }
 }
