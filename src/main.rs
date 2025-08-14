@@ -418,7 +418,6 @@ fn build_env_vars(
     env_args: Option<&Vec<String>>,
 ) -> Option<HashMap<String, String>> {
     let mut env_vars = parse_env_vars(env_args).unwrap_or_default();
-    println!("env_vars: {env_vars:?}");
 
     if let Some(profile) = provision_profile {
         env_vars.insert("AVOCADO_PROVISION_PROFILE".to_string(), profile.clone());
