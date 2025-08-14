@@ -79,6 +79,13 @@ impl ExtBuildCommand {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
             .unwrap_or_default();
 
+        // Get modprobe modules from configuration
+        let modprobe_modules = ext_config
+            .get("modprobe")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
         // Validate that confext is present if enable_services is used
         if !enable_services.is_empty() && !ext_types.contains(&"confext") {
             print_error(
@@ -220,6 +227,7 @@ impl ExtBuildCommand {
                         repo_url,
                         repo_release,
                         &processed_container_args,
+                        &modprobe_modules,
                     )
                     .await?
                 }
@@ -282,9 +290,10 @@ impl ExtBuildCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
+        modprobe_modules: &[String],
     ) -> Result<bool> {
         // Create the build script for sysext extension
-        let build_script = self.create_sysext_build_script(ext_version, ext_scopes, overlay_config);
+        let build_script = self.create_sysext_build_script(ext_version, ext_scopes, overlay_config, modprobe_modules);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -369,7 +378,7 @@ impl ExtBuildCommand {
         Ok(result)
     }
 
-    fn create_sysext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_config: Option<&OverlayConfig>) -> String {
+    fn create_sysext_build_script(&self, _ext_version: &str, ext_scopes: &[String], overlay_config: Option<&OverlayConfig>, modprobe_modules: &[String]) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
                 OverlayMode::Merge => format!(
@@ -414,6 +423,8 @@ fi
             String::new()
         };
 
+        let modprobe_list = modprobe_modules.join(" ");
+
         format!(
             r#"
 set -e
@@ -432,13 +443,22 @@ if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*
     echo "AVOCADO_ON_MERGE=depmod" >> "$release_file"
     echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=depmod to release file"
 fi
+
+# Add AVOCADO_MODPROBE if modprobe modules are specified
+if [ -n "{}" ]; then
+    echo "AVOCADO_MODPROBE={}" >> "$release_file"
+    echo "Added AVOCADO_MODPROBE={} to release file"
+fi
 "#,
             overlay_section,
             self.extension,
             self.extension,
             self.extension,
             ext_scopes.join(" "),
-            self.extension
+            self.extension,
+            modprobe_list,
+            modprobe_list,
+            modprobe_list
         )
     }
 
@@ -551,7 +571,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
 
         // Print the actual script for debugging
         // println!("Generated sysext build script:\n{}", script);
@@ -608,7 +628,7 @@ mod tests {
         };
 
         let script =
-            cmd.create_sysext_build_script("2.0", &["system".to_string(), "portable".to_string()], None);
+            cmd.create_sysext_build_script("2.0", &["system".to_string(), "portable".to_string()], None, &[]);
 
         assert!(script.contains("echo \"SYSEXT_SCOPE=system portable\" >> \"$release_file\""));
         assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/usr/lib/extension-release.d"));
@@ -666,7 +686,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
 
         // Verify the find command looks for common kernel module extensions
         assert!(script.contains("-name \"*.ko\""));
@@ -692,7 +712,7 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Merge,
         };
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some(&overlay_config), &[]);
 
         // Verify overlay merging commands are present
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
@@ -742,7 +762,7 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Opaque,
         };
-        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some(&overlay_config));
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], Some(&overlay_config), &[]);
 
         // Verify overlay opaque mode commands are present
         assert!(script.contains("# Copy overlay directory to extension sysroot (opaque mode)"));
@@ -792,7 +812,7 @@ mod tests {
             dnf_args: None,
         };
 
-        let script_sysext = cmd.create_sysext_build_script("1.0", &["system".to_string()], None);
+        let script_sysext = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
         let script_confext = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[]);
 
         // Verify no overlay merging commands are present
@@ -802,5 +822,43 @@ mod tests {
         assert!(!script_confext.contains("Merge overlay directory"));
         assert!(!script_confext.contains("Copy overlay directory"));
         assert!(!script_confext.contains("/opt/src/"));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_modprobe() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let modprobe_modules = vec!["nfs".to_string(), "ext4".to_string()];
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &modprobe_modules);
+
+        // Verify AVOCADO_MODPROBE is added with correct modules
+        assert!(script.contains("if [ -n \"nfs ext4\" ]; then"));
+        assert!(script.contains("echo \"AVOCADO_MODPROBE=nfs ext4\" >> \"$release_file\""));
+        assert!(script.contains("echo \"Added AVOCADO_MODPROBE=nfs ext4 to release file\""));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_without_modprobe() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+
+        // Verify AVOCADO_MODPROBE section exists but with empty check
+        assert!(script.contains("if [ -n \"\" ]; then"));
+        assert!(script.contains("AVOCADO_MODPROBE="));
     }
 }
