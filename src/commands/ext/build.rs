@@ -475,8 +475,17 @@ echo "SYSEXT_SCOPE={}" >> "$release_file"
 
 # Check if extension includes kernel modules and add AVOCADO_ON_MERGE if needed
 if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.gz" 2>/dev/null | head -n 1)" ]; then
-    echo "AVOCADO_ON_MERGE=depmod" >> "$release_file"
-    echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=depmod to release file"
+    echo "AVOCADO_ON_MERGE=\"depmod\"" >> "$release_file"
+    echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=\"depmod\" to release file"
+fi
+
+# Check if extension includes sysusers.d config files and add systemd-sysusers to AVOCADO_ON_MERGE if needed
+sysusers_dir1="$AVOCADO_EXT_SYSROOTS/{}/usr/local/lib/sysusers.d"
+sysusers_dir2="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/sysusers.d"
+if ([ -d "$sysusers_dir1" ] && [ -n "$(find "$sysusers_dir1" -name "*.conf" 2>/dev/null | head -n 1)" ]) || \
+   ([ -d "$sysusers_dir2" ] && [ -n "$(find "$sysusers_dir2" -name "*.conf" 2>/dev/null | head -n 1)" ]); then
+    echo "AVOCADO_ON_MERGE=\"systemd-sysusers\"" >> "$release_file"
+    echo "[INFO] Found sysusers.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-sysusers\" to release file"
 fi
 
 # Add AVOCADO_MODPROBE if modprobe modules are specified
@@ -490,6 +499,9 @@ fi
             self.extension,
             self.extension,
             ext_scopes.join(" "),
+            self.extension,
+            self.extension,
+            self.extension,
             self.extension,
             modprobe_list,
             modprobe_list,
@@ -604,12 +616,21 @@ mkdir -p "$release_dir"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
 echo "CONFEXT_SCOPE={}" >> "$release_file"
+
+# Check if extension includes sysusers.d config files and add systemd-sysusers to AVOCADO_ON_MERGE if needed
+sysusers_etc_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/sysusers.d"
+if [ -d "$sysusers_etc_dir" ] && [ -n "$(find "$sysusers_etc_dir" -name "*.conf" 2>/dev/null | head -n 1)" ]; then
+    echo "AVOCADO_ON_MERGE=\"systemd-sysusers\"" >> "$release_file"
+    echo "[INFO] Found sysusers.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-sysusers\" to release file"
+fi
 {}
 "#,
             overlay_section,
             self.extension,
             self.extension,
             ext_scopes.join(" "),
+            self.extension,
+            self.extension,
             service_linking_section
         )
     }
@@ -646,8 +667,18 @@ mod tests {
         assert!(script.contains(
             "if [ -d \"$modules_dir\" ] && [ -n \"$(find \"$modules_dir\" -name \"*.ko\""
         ));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=depmod\" >> \"$release_file\""));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found kernel modules in extension 'test-ext'"));
+
+        // Check for sysusers.d functionality
+        assert!(script
+            .contains("sysusers_dir1=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/local/lib/sysusers.d\""));
+        assert!(
+            script.contains("sysusers_dir2=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/sysusers.d\"")
+        );
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found sysusers.d config files in extension 'test-ext'"));
     }
 
     #[test]
@@ -671,8 +702,16 @@ mod tests {
         assert!(script.contains("echo \"CONFEXT_SCOPE=system\" >> \"$release_file\""));
         // Confext should NOT include kernel module detection
         assert!(!script.contains("modules_dir"));
-        assert!(!script.contains("AVOCADO_ON_MERGE=depmod"));
+        assert!(!script.contains("AVOCADO_ON_MERGE=\\\"depmod\\\""));
         assert!(!script.contains("Found kernel modules"));
+
+        // Check for sysusers.d functionality in confext
+        assert!(
+            script.contains("sysusers_etc_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/sysusers.d\"")
+        );
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found sysusers.d config files in extension 'test-ext'"));
     }
 
     #[test]
@@ -951,6 +990,76 @@ mod tests {
         assert!(script.contains("if [ -n \"nfs ext4\" ]; then"));
         assert!(script.contains("echo \"AVOCADO_MODPROBE=nfs ext4\" >> \"$release_file\""));
         assert!(script.contains("echo \"Added AVOCADO_MODPROBE=nfs ext4 to release file\""));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_sysusers() {
+        let cmd = ExtBuildCommand {
+            extension: "sysusers-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+
+        // Verify sysusers.d detection logic is present
+        assert!(script.contains(
+            "sysusers_dir1=\"$AVOCADO_EXT_SYSROOTS/sysusers-ext/usr/local/lib/sysusers.d\""
+        ));
+        assert!(script
+            .contains("sysusers_dir2=\"$AVOCADO_EXT_SYSROOTS/sysusers-ext/usr/lib/sysusers.d\""));
+        assert!(script.contains("find \"$sysusers_dir1\" -name \"*.conf\""));
+        assert!(script.contains("find \"$sysusers_dir2\" -name \"*.conf\""));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found sysusers.d config files in extension 'sysusers-ext'"));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_with_sysusers() {
+        let cmd = ExtBuildCommand {
+            extension: "sysusers-confext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[]);
+
+        // Verify sysusers.d detection logic is present for confext
+        assert!(script.contains(
+            "sysusers_etc_dir=\"$AVOCADO_EXT_SYSROOTS/sysusers-confext/etc/sysusers.d\""
+        ));
+        assert!(script.contains("find \"$sysusers_etc_dir\" -name \"*.conf\""));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found sysusers.d config files in extension 'sysusers-confext'"));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_both_kernel_modules_and_sysusers() {
+        let cmd = ExtBuildCommand {
+            extension: "combined-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[]);
+
+        // Verify both kernel modules and sysusers.d are handled correctly with separate lines
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found kernel modules in extension 'combined-ext'"));
+        assert!(script.contains("Found sysusers.d config files in extension 'combined-ext'"));
     }
 
     #[test]
