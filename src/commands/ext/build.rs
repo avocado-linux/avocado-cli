@@ -355,9 +355,9 @@ impl ExtBuildCommand {
                     r#"
 # Merge overlay directory into extension sysroot
 if [ -d "/opt/src/{}" ]; then
-    echo "Merging overlay directory '{}' into extension sysroot"
-    # Use rsync to merge directories and preserve existing structure
-    rsync -a /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+    echo "Merging overlay directory '{}' into extension sysroot with root:root ownership"
+    # Use rsync to merge directories and set ownership during copy
+    rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
 else
     echo "Warning: Overlay directory '{}' not found in source"
 fi
@@ -371,11 +371,22 @@ if [ -d "/opt/src/{}" ]; then
     echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
     # Use cp -r to replace directory contents completely
     cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+    # Fix ownership to root:root for copied overlay files only
+    echo "Setting ownership to root:root for overlay files"
+    find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
+        relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
+        if [ -n "$relpath" ]; then
+            destpath="$AVOCADO_EXT_SYSROOTS/{}/$relpath"
+            if [ -e "$destpath" ]; then
+                chown root:root "$destpath" 2>/dev/null || true
+            fi
+        fi
+    done
 else
     echo "Warning: Overlay directory '{}' not found in source"
 fi
 "#,
-                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
+                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
                 ),
             }
         } else {
@@ -417,9 +428,9 @@ fi
                     r#"
 # Merge overlay directory into extension sysroot
 if [ -d "/opt/src/{}" ]; then
-    echo "Merging overlay directory '{}' into extension sysroot"
-    # Use rsync to merge directories and preserve existing structure
-    rsync -a /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+    echo "Merging overlay directory '{}' into extension sysroot with root:root ownership"
+    # Use rsync to merge directories and set ownership during copy
+    rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
 else
     echo "Warning: Overlay directory '{}' not found in source"
 fi
@@ -433,11 +444,22 @@ if [ -d "/opt/src/{}" ]; then
     echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
     # Use cp -r to replace directory contents completely
     cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+    # Fix ownership to root:root for copied overlay files only
+    echo "Setting ownership to root:root for overlay files"
+    find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
+        relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
+        if [ -n "$relpath" ]; then
+            destpath="$AVOCADO_EXT_SYSROOTS/{}/$relpath"
+            if [ -e "$destpath" ]; then
+                chown root:root "$destpath" 2>/dev/null || true
+            fi
+        fi
+    done
 else
     echo "Warning: Overlay directory '{}' not found in source"
 fi
 "#,
-                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
+                    overlay_config.dir, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir, overlay_config.dir, self.extension, overlay_config.dir
                 ),
             }
         } else {
@@ -602,8 +624,8 @@ mod tests {
         // Verify overlay merging commands are present
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
-        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot\""));
-        assert!(script.contains("rsync -a /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
+        assert!(script.contains("rsync -a --chown=root:root /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
         assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
     }
 
@@ -627,8 +649,8 @@ mod tests {
         // Verify overlay merging commands are present
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
-        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot\""));
-        assert!(script.contains("rsync -a /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
+        assert!(script.contains("rsync -a --chown=root:root /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
         assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
     }
 
@@ -654,6 +676,8 @@ mod tests {
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""));
         assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
+        assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
+        assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
     }
 
@@ -679,6 +703,8 @@ mod tests {
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains("echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""));
         assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
+        assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
+        assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\""));
     }
 
