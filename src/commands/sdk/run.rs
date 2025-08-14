@@ -175,7 +175,9 @@ impl SdkRunCommand {
     ) -> Result<bool> {
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(container_helper.container_tool.clone(), false);
-        let volume_state = volume_manager.get_or_create_volume(&container_helper.cwd).await?;
+        let volume_state = volume_manager
+            .get_or_create_volume(&container_helper.cwd)
+            .await?;
         // Build container command for detached mode
         let mut container_cmd = vec![
             container_helper.container_tool.clone(),
@@ -194,15 +196,9 @@ impl SdkRunCommand {
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!(
-            "{}:/opt/src:rw",
-            container_helper.cwd.display()
-        ));
+        container_cmd.push(format!("{}:/opt/src:rw", container_helper.cwd.display()));
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!(
-            "{}:/opt/_avocado:rw",
-            volume_state.volume_name
-        ));
+        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 
         // Add environment variables
         container_cmd.push("-e".to_string());

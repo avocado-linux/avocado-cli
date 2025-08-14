@@ -25,7 +25,7 @@ impl VolumeState {
     /// Create a new volume state with a generated UUID-based name
     pub fn new(source_path: PathBuf, container_tool: String) -> Self {
         let uuid = Uuid::new_v4();
-        let volume_name = format!("avo-{}", uuid);
+        let volume_name = format!("avo-{uuid}");
 
         Self {
             volume_name,
@@ -42,11 +42,12 @@ impl VolumeState {
             return Ok(None);
         }
 
-        let content = fs::read_to_string(&state_file)
-            .with_context(|| format!("Failed to read volume state file: {}", state_file.display()))?;
+        let content = fs::read_to_string(&state_file).with_context(|| {
+            format!("Failed to read volume state file: {}", state_file.display())
+        })?;
 
-        let state: VolumeState = serde_json::from_str(&content)
-            .with_context(|| "Failed to parse volume state file")?;
+        let state: VolumeState =
+            serde_json::from_str(&content).with_context(|| "Failed to parse volume state file")?;
 
         Ok(Some(state))
     }
@@ -58,8 +59,12 @@ impl VolumeState {
         let content = serde_json::to_string_pretty(self)
             .with_context(|| "Failed to serialize volume state")?;
 
-        fs::write(&state_file, content)
-            .with_context(|| format!("Failed to write volume state file: {}", state_file.display()))?;
+        fs::write(&state_file, content).with_context(|| {
+            format!(
+                "Failed to write volume state file: {}",
+                state_file.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -93,13 +98,14 @@ impl VolumeManager {
                     );
                 }
                 return Ok(existing_state);
-            } else {
-                if self.verbose {
-                    print_info(
-                        &format!("Volume {} no longer exists, creating new one", existing_state.volume_name),
-                        OutputLevel::Normal,
-                    );
-                }
+            } else if self.verbose {
+                print_info(
+                    &format!(
+                        "Volume {} no longer exists, creating new one",
+                        existing_state.volume_name
+                    ),
+                    OutputLevel::Normal,
+                );
             }
         }
 
@@ -125,7 +131,7 @@ impl VolumeManager {
     /// Check if a docker volume exists
     async fn volume_exists(&self, volume_name: &str) -> Result<bool> {
         let output = AsyncCommand::new(&self.container_tool)
-            .args(&["volume", "inspect", volume_name])
+            .args(["volume", "inspect", volume_name])
             .output()
             .await
             .with_context(|| "Failed to check if volume exists")?;
@@ -136,17 +142,19 @@ impl VolumeManager {
     /// Create a docker volume with metadata
     async fn create_volume(&self, state: &VolumeState) -> Result<()> {
         let mut cmd = AsyncCommand::new(&self.container_tool);
-        cmd.args(&["volume", "create"]);
+        cmd.args(["volume", "create"]);
 
         // Add label with source path metadata
-        cmd.args(&[
+        cmd.args([
             "--label",
-            &format!("avocado.source_path={}", state.source_path)
+            &format!("avocado.source_path={}", state.source_path),
         ]);
 
         cmd.arg(&state.volume_name);
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .with_context(|| "Failed to create docker volume")?;
 
         if !output.status.success() {
@@ -160,7 +168,7 @@ impl VolumeManager {
     /// Remove a docker volume
     pub async fn remove_volume(&self, volume_name: &str) -> Result<()> {
         let output = AsyncCommand::new(&self.container_tool)
-            .args(&["volume", "rm", volume_name])
+            .args(["volume", "rm", volume_name])
             .output()
             .await
             .with_context(|| "Failed to remove docker volume")?;
@@ -172,8 +180,6 @@ impl VolumeManager {
 
         Ok(())
     }
-
-
 }
 
 /// Information about a docker volume
@@ -217,7 +223,9 @@ mod tests {
         state.save_to_dir(temp_dir.path()).unwrap();
 
         // Load state
-        let loaded_state = VolumeState::load_from_dir(temp_dir.path()).unwrap().unwrap();
+        let loaded_state = VolumeState::load_from_dir(temp_dir.path())
+            .unwrap()
+            .unwrap();
 
         assert_eq!(state.volume_name, loaded_state.volume_name);
         assert_eq!(state.source_path, loaded_state.source_path);

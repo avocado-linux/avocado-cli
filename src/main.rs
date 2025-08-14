@@ -8,8 +8,8 @@ mod utils;
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::ext::{
-    ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand, ExtImageCommand,
-    ExtInstallCommand, ExtListCommand,
+    ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
+    ExtImageCommand, ExtInstallCommand, ExtListCommand,
 };
 use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
@@ -441,8 +441,14 @@ async fn main() -> Result<()> {
             init_cmd.execute()?;
             Ok(())
         }
-        Commands::Clean { directory, skip_volumes, container_tool, verbose } => {
-            let clean_cmd = CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose);
+        Commands::Clean {
+            directory,
+            skip_volumes,
+            container_tool,
+            verbose,
+        } => {
+            let clean_cmd =
+                CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose);
             clean_cmd.execute().await?;
             Ok(())
         }

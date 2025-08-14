@@ -237,7 +237,10 @@ impl SdkContainer {
     ) -> Result<bool> {
         if verbose {
             print_info(
-                &format!("Mounting source directory: {} -> /opt/src", self.cwd.display()),
+                &format!(
+                    "Mounting source directory: {} -> /opt/src",
+                    self.cwd.display()
+                ),
                 OutputLevel::Normal,
             );
             print_info(

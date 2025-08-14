@@ -97,21 +97,22 @@ impl CleanCommand {
                 );
             }
 
-            volume_manager.remove_volume(&volume_state.volume_name).await.with_context(|| {
-                format!("Failed to remove volume: {}", volume_state.volume_name)
-            })?;
+            volume_manager
+                .remove_volume(&volume_state.volume_name)
+                .await
+                .with_context(|| {
+                    format!("Failed to remove volume: {}", volume_state.volume_name)
+                })?;
 
             print_success(
                 &format!("Removed docker volume: {}", volume_state.volume_name),
                 OutputLevel::Normal,
             );
-        } else {
-            if self.verbose {
-                print_info(
-                    "No volume state found, skipping volume cleanup.",
-                    OutputLevel::Normal,
-                );
-            }
+        } else if self.verbose {
+            print_info(
+                "No volume state found, skipping volume cleanup.",
+                OutputLevel::Normal,
+            );
         }
 
         Ok(())
@@ -131,10 +132,7 @@ impl CleanCommand {
                 OutputLevel::Normal,
             );
         } else if self.verbose {
-            print_info(
-                "No .avocado-state file found.",
-                OutputLevel::Normal,
-            );
+            print_info("No .avocado-state file found.", OutputLevel::Normal);
         }
 
         Ok(())

@@ -54,7 +54,7 @@ impl ExtCheckoutCommand {
 
         if self.verbose {
             print_info(
-                &format!("Creating temporary container: {}", temp_container_name),
+                &format!("Creating temporary container: {temp_container_name}"),
                 OutputLevel::Normal,
             );
         }
@@ -70,17 +70,19 @@ impl ExtCheckoutCommand {
 
         if self.verbose {
             print_info(
-                &format!("Extension sysroot path: {}", ext_sysroot_path),
+                &format!("Extension sysroot path: {ext_sysroot_path}"),
                 OutputLevel::Normal,
             );
             print_info(
-                &format!("Full source path in volume: {}", full_ext_path),
+                &format!("Full source path in volume: {full_ext_path}"),
                 OutputLevel::Normal,
             );
         }
 
         // Check if the path exists in the volume using a temporary container
-        let path_exists = self.check_path_exists(&volume_state.volume_name, &full_ext_path).await?;
+        let path_exists = self
+            .check_path_exists(&volume_state.volume_name, &full_ext_path)
+            .await?;
 
         if !path_exists {
             print_error(
@@ -95,7 +97,9 @@ impl ExtCheckoutCommand {
         }
 
         // Determine if the path is a file or directory
-        let is_directory = self.check_is_directory(&volume_state.volume_name, &full_ext_path).await?;
+        let is_directory = self
+            .check_is_directory(&volume_state.volume_name, &full_ext_path)
+            .await?;
 
         // Prepare the destination path
         let dest_path = cwd.join(&self.src_path);
@@ -108,7 +112,14 @@ impl ExtCheckoutCommand {
         }
 
         // Extract the files using docker cp
-        self.extract_files(&volume_state.volume_name, &full_ext_path, &dest_path, is_directory, &temp_container_name).await?;
+        self.extract_files(
+            &volume_state.volume_name,
+            &full_ext_path,
+            &dest_path,
+            is_directory,
+            &temp_container_name,
+        )
+        .await?;
 
         // Fix ownership to match host user
         self.fix_ownership(&dest_path).await?;
@@ -116,9 +127,7 @@ impl ExtCheckoutCommand {
         print_success(
             &format!(
                 "Successfully checked out '{}' from extension '{}' to '{}'",
-                self.ext_path,
-                self.extension,
-                self.src_path
+                self.ext_path, self.extension, self.src_path
             ),
             OutputLevel::Normal,
         );
@@ -158,7 +167,7 @@ impl ExtCheckoutCommand {
             .arg("run")
             .arg("--rm")
             .arg("-v")
-            .arg(format!("{}:/opt/_avocado:ro", volume_name))
+            .arg(format!("{volume_name}:/opt/_avocado:ro"))
             .arg("alpine:latest")
             .arg("test")
             .arg("-e")
@@ -175,7 +184,7 @@ impl ExtCheckoutCommand {
             .arg("run")
             .arg("--rm")
             .arg("-v")
-            .arg(format!("{}:/opt/_avocado:ro", volume_name))
+            .arg(format!("{volume_name}:/opt/_avocado:ro"))
             .arg("alpine:latest")
             .arg("test")
             .arg("-d")
@@ -200,18 +209,23 @@ impl ExtCheckoutCommand {
 
         // Ensure destination directory exists
         if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create destination directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create destination directory: {}",
+                    parent.display()
+                )
+            })?;
         }
 
-        let docker_cp_source = format!("{}:{}", temp_container_id, source_path);
+        let docker_cp_source = format!("{temp_container_id}:{source_path}");
 
         let docker_cp_dest = if is_directory {
             // For directories, copy the directory itself to preserve hierarchy
             // Docker cp will create the directory at the destination
             if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create parent directory: {}", parent.display())
+                })?;
             }
             dest_path.to_string_lossy().to_string()
         } else {
@@ -227,8 +241,9 @@ impl ExtCheckoutCommand {
 
             // Create parent directories
             if let Some(parent) = full_dest_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create parent directory: {}", parent.display())
+                })?;
             }
 
             full_dest_path.to_string_lossy().to_string()
@@ -236,7 +251,7 @@ impl ExtCheckoutCommand {
 
         if self.verbose {
             print_info(
-                &format!("Docker cp: {} -> {}", docker_cp_source, docker_cp_dest),
+                &format!("Docker cp: {docker_cp_source} -> {docker_cp_dest}"),
                 OutputLevel::Normal,
             );
         }
@@ -269,7 +284,7 @@ impl ExtCheckoutCommand {
         let output = AsyncCommand::new(&self.container_tool)
             .arg("create")
             .arg("-v")
-            .arg(format!("{}:/opt/_avocado:ro", volume_name))
+            .arg(format!("{volume_name}:/opt/_avocado:ro"))
             .arg("alpine:latest")
             .arg("true")
             .output()
@@ -278,7 +293,10 @@ impl ExtCheckoutCommand {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("Failed to create temporary container: {}", stderr));
+            return Err(anyhow::anyhow!(
+                "Failed to create temporary container: {}",
+                stderr
+            ));
         }
 
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -292,7 +310,12 @@ impl ExtCheckoutCommand {
 
         if self.verbose {
             print_info(
-                &format!("Setting ownership to {}:{} for {}", uid, gid, path.display()),
+                &format!(
+                    "Setting ownership to {}:{} for {}",
+                    uid,
+                    gid,
+                    path.display()
+                ),
                 OutputLevel::Normal,
             );
         }
@@ -300,7 +323,7 @@ impl ExtCheckoutCommand {
         // Use chown to fix ownership recursively
         let output = AsyncCommand::new("chown")
             .arg("-R")
-            .arg(format!("{}:{}", uid, gid))
+            .arg(format!("{uid}:{gid}"))
             .arg(path)
             .output()
             .await
@@ -310,7 +333,7 @@ impl ExtCheckoutCommand {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if self.verbose {
                 print_info(
-                    &format!("Note: Could not change ownership (may not be needed): {}", stderr),
+                    &format!("Note: Could not change ownership (may not be needed): {stderr}"),
                     OutputLevel::Normal,
                 );
             }
