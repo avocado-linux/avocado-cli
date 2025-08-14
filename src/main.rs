@@ -22,6 +22,7 @@ use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkRunCommand,
 };
+use commands::upgrade::UpgradeCommand;
 
 #[derive(Parser)]
 #[command(name = "avocado")]
@@ -89,6 +90,12 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+    /// Upgrade the CLI to the latest (or specified) version
+    Upgrade {
+        /// Controls what version to upgrade to. If not specified, the latest version will be used.
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Build all components (SDK compile, extensions, and runtime images)
     Build {
@@ -417,6 +424,11 @@ async fn main() -> Result<()> {
                 dnf_args,
             );
             build_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Upgrade { version } => {
+            let cmd = UpgradeCommand { version };
+            cmd.run().await?;
             Ok(())
         }
         Commands::Provision {

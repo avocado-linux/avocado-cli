@@ -7,3 +7,4 @@ pub mod install;
 pub mod provision;
 pub mod runtime;
 pub mod sdk;
+pub mod upgrade;
