@@ -55,6 +55,9 @@ enum Commands {
     Init {
         /// Directory to initialize (defaults to current directory)
         directory: Option<String>,
+        /// Target architecture (e.g., "qemux86-64")
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Runtime management commands
     Runtime {
@@ -435,8 +438,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { directory } => {
-            let init_cmd = InitCommand::new(cli.target, directory);
+        Commands::Init { directory, target } => {
+            let init_cmd = InitCommand::new(target.or(cli.target), directory);
             init_cmd.execute()?;
             Ok(())
         }
