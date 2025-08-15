@@ -43,11 +43,18 @@ pub struct CompileConfig {
     pub dependencies: Option<HashMap<String, toml::Value>>,
 }
 
+/// Provision profile configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProvisionProfileConfig {
+    pub container_args: Option<Vec<String>>,
+}
+
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub runtime: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
+    pub provision: Option<HashMap<String, ProvisionProfileConfig>>,
 }
 
 impl Config {
@@ -97,6 +104,18 @@ impl Config {
     /// Get the SDK container args from configuration
     pub fn get_sdk_container_args(&self) -> Option<&Vec<String>> {
         self.sdk.as_ref()?.container_args.as_ref()
+    }
+
+    /// Get provision profile configuration
+    pub fn get_provision_profile(&self, profile_name: &str) -> Option<&ProvisionProfileConfig> {
+        self.provision.as_ref()?.get(profile_name)
+    }
+
+    /// Get container args from provision profile
+    pub fn get_provision_profile_container_args(&self, profile_name: &str) -> Option<&Vec<String>> {
+        self.get_provision_profile(profile_name)?
+            .container_args
+            .as_ref()
     }
 
     /// Expand environment variables in a string
@@ -168,6 +187,28 @@ impl Config {
                 Some(merged)
             }
             (Some(config), None) => Self::process_container_args(Some(config)),
+            (None, Some(cli)) => Self::process_container_args(Some(cli)),
+            (None, None) => None,
+        }
+    }
+
+    /// Merge provision profile container args with CLI args, expanding environment variables
+    /// Returns a new Vec containing provision profile args first, then CLI args
+    pub fn merge_provision_container_args(
+        &self,
+        provision_profile: Option<&str>,
+        cli_args: Option<&Vec<String>>,
+    ) -> Option<Vec<String>> {
+        let profile_args = provision_profile
+            .and_then(|profile| self.get_provision_profile_container_args(profile));
+
+        match (profile_args, cli_args) {
+            (Some(profile), Some(cli)) => {
+                let mut merged = Self::process_container_args(Some(profile)).unwrap_or_default();
+                merged.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
+                Some(merged)
+            }
+            (Some(profile), None) => Self::process_container_args(Some(profile)),
             (None, Some(cli)) => Self::process_container_args(Some(cli)),
             (None, None) => None,
         }
@@ -539,5 +580,111 @@ container_args = ["--network=$TEST_USER-avocado", "--privileged"]
 
         // Clean up
         std::env::remove_var("TEST_VAR");
+    }
+
+    #[test]
+    fn test_provision_profile_config() {
+        let config_content = r#"
+[provision.usb]
+container_args = ["-v", "/dev/usb:/dev/usb", "-v", "/sys:/sys:ro"]
+
+[provision.development]
+container_args = ["--privileged", "--network=host"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test getting provision profile
+        let usb_profile = config.get_provision_profile("usb");
+        assert!(usb_profile.is_some());
+        let usb_args = config.get_provision_profile_container_args("usb");
+        assert!(usb_args.is_some());
+        let args = usb_args.unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "/dev/usb:/dev/usb");
+        assert_eq!(args[2], "-v");
+        assert_eq!(args[3], "/sys:/sys:ro");
+
+        // Test getting non-existent profile
+        assert!(config.get_provision_profile("nonexistent").is_none());
+        assert!(config
+            .get_provision_profile_container_args("nonexistent")
+            .is_none());
+    }
+
+    #[test]
+    fn test_merge_provision_container_args() {
+        let config_content = r#"
+[provision.usb]
+container_args = ["-v", "/dev/usb:/dev/usb", "--privileged"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test merging with CLI args
+        let cli_args = vec!["--cap-add=SYS_ADMIN".to_string(), "--rm".to_string()];
+        let merged = config.merge_provision_container_args(Some("usb"), Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 5);
+        assert_eq!(merged_args[0], "-v");
+        assert_eq!(merged_args[1], "/dev/usb:/dev/usb");
+        assert_eq!(merged_args[2], "--privileged");
+        assert_eq!(merged_args[3], "--cap-add=SYS_ADMIN");
+        assert_eq!(merged_args[4], "--rm");
+    }
+
+    #[test]
+    fn test_merge_provision_container_args_profile_only() {
+        let config_content = r#"
+[provision.test]
+container_args = ["--network=host"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test with no CLI args
+        let merged = config.merge_provision_container_args(Some("test"), None);
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 1);
+        assert_eq!(merged_args[0], "--network=host");
+    }
+
+    #[test]
+    fn test_merge_provision_container_args_cli_only() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test with only CLI args (no provision profile)
+        let cli_args = vec!["--cap-add=SYS_ADMIN".to_string()];
+        let merged = config.merge_provision_container_args(None, Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 1);
+        assert_eq!(merged_args[0], "--cap-add=SYS_ADMIN");
+    }
+
+    #[test]
+    fn test_merge_provision_container_args_none() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test with no provision profile and no CLI args
+        let merged = config.merge_provision_container_args(None, None);
+
+        assert!(merged.is_none());
     }
 }

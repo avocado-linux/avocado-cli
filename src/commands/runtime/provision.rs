@@ -13,6 +13,7 @@ pub struct RuntimeProvisionConfig {
     pub verbose: bool,
     pub force: bool,
     pub target: Option<String>,
+    pub provision_profile: Option<String>,
     pub env_vars: Option<HashMap<String, String>>,
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
@@ -28,8 +29,8 @@ impl RuntimeProvisionCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
-        let _config = load_config(&self.config.config_path)?;
+        // Load configuration
+        let config = load_config(&self.config.config_path)?;
         let content = std::fs::read_to_string(&self.config.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
@@ -95,7 +96,8 @@ impl RuntimeProvisionCommand {
             source_environment: true,
             interactive: !self.config.force,
             env_vars: self.config.env_vars.clone(),
-            container_args: crate::utils::config::Config::process_container_args(
+            container_args: config.merge_provision_container_args(
+                self.config.provision_profile.as_deref(),
                 self.config.container_args.as_ref(),
             ),
             dnf_args: self.config.dnf_args.clone(),
@@ -145,6 +147,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            provision_profile: None,
             env_vars: None,
             container_args: None,
             dnf_args: None,
@@ -167,6 +170,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            provision_profile: None,
             env_vars: None,
             container_args: None,
             dnf_args: None,
@@ -193,6 +197,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            provision_profile: None,
             env_vars: None,
             container_args: container_args.clone(),
             dnf_args: dnf_args.clone(),
@@ -224,6 +229,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            provision_profile: None,
             env_vars: Some(env_vars.clone()),
             container_args: None,
             dnf_args: None,

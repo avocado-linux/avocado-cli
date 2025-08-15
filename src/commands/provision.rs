@@ -17,6 +17,8 @@ pub struct ProvisionConfig {
     pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
+    /// Provision profile to use
+    pub provision_profile: Option<String>,
     /// Environment variables to pass to the provision process
     pub env_vars: Option<HashMap<String, String>>,
     /// Additional arguments to pass to the container runtime
@@ -38,7 +40,12 @@ impl ProvisionCommand {
 
     /// Execute the provision command by calling runtime provision
     pub async fn execute(&self) -> Result<()> {
-        let processed_container_args = crate::utils::config::Config::process_container_args(
+        // Load config to access provision profiles
+        let config = crate::utils::config::Config::load(&self.config.config_path)?;
+
+        // Merge provision profile container args with CLI container args
+        let merged_container_args = config.merge_provision_container_args(
+            self.config.provision_profile.as_deref(),
             self.config.container_args.as_ref(),
         );
 
@@ -49,8 +56,9 @@ impl ProvisionCommand {
                 verbose: self.config.verbose,
                 force: self.config.force,
                 target: self.config.target.clone(),
+                provision_profile: self.config.provision_profile.clone(),
                 env_vars: self.config.env_vars.clone(),
-                container_args: processed_container_args,
+                container_args: merged_container_args,
                 dnf_args: self.config.dnf_args.clone(),
             },
         );
@@ -74,6 +82,7 @@ mod tests {
             verbose: true,
             force: false,
             target: Some("x86_64".to_string()),
+            provision_profile: None,
             env_vars: Some(env_vars.clone()),
             container_args: Some(vec!["--privileged".to_string()]),
             dnf_args: Some(vec!["--nogpgcheck".to_string()]),
@@ -101,6 +110,7 @@ mod tests {
             verbose: false,
             force: true,
             target: None,
+            provision_profile: None,
             env_vars: None,
             container_args: None,
             dnf_args: None,
@@ -131,6 +141,7 @@ mod tests {
             verbose: false,
             force: false,
             target: None,
+            provision_profile: Some("production".to_string()),
             env_vars: Some(expected_env.clone()),
             container_args: None,
             dnf_args: None,
