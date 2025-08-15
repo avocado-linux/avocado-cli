@@ -648,6 +648,13 @@ if [ -d "$sysusers_etc_dir" ] && [ -n "$(find "$sysusers_etc_dir" -name "*.conf"
     echo "AVOCADO_ON_MERGE=\"systemd-sysusers\"" >> "$release_file"
     echo "[INFO] Found sysusers.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-sysusers\" to release file"
 fi
+
+# Check if extension includes ld.so.conf.d config files and add ldconfig to AVOCADO_ON_MERGE if needed
+ldso_etc_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/ld.so.conf.d"
+if [ -d "$ldso_etc_dir" ] && [ -n "$(find "$ldso_etc_dir" -name "*.conf" 2>/dev/null | head -n 1)" ]; then
+    echo "AVOCADO_ON_MERGE=\"ldconfig\"" >> "$release_file"
+    echo "[INFO] Found ld.so.conf.d config files in extension '{}', added AVOCADO_ON_MERGE=\"ldconfig\" to release file"
+fi
 {}
 "#,
             overlay_section,
@@ -655,6 +662,8 @@ fi
             self.extension,
             self.extension,
             ext_scopes.join(" "),
+            self.extension,
+            self.extension,
             self.extension,
             self.extension,
             service_linking_section
@@ -1177,6 +1186,14 @@ mod tests {
         assert!(script
             .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found sysusers.d config files in extension 'test-ext'"));
+
+        // Check for ld.so.conf.d functionality in confext
+        assert!(
+            script.contains("ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/ld.so.conf.d\"")
+        );
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found ld.so.conf.d config files in extension 'test-ext'"));
     }
 
     #[test]
@@ -1531,6 +1548,30 @@ mod tests {
         assert!(script
             .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found sysusers.d config files in extension 'sysusers-confext'"));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_with_ldso_conf_d() {
+        let cmd = ExtBuildCommand {
+            extension: "ldso-confext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script =
+            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+
+        // Verify ld.so.conf.d detection logic is present for confext
+        assert!(script.contains(
+            "ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/ldso-confext/etc/ld.so.conf.d\""
+        ));
+        assert!(script.contains("find \"$ldso_etc_dir\" -name \"*.conf\""));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
+        assert!(script.contains("Found ld.so.conf.d config files in extension 'ldso-confext'"));
     }
 
     #[test]
