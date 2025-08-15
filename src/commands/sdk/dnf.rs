@@ -6,7 +6,7 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_error, print_success, OutputLevel},
-    target::resolve_target,
+    target::resolve_target_required,
 };
 
 /// Implementation of the 'sdk dnf' command.
@@ -70,13 +70,7 @@ impl SdkDnfCommand {
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Resolve target with proper precedence
-        let config_target = config.get_target();
-        let target = resolve_target(self.target.as_deref(), config_target.as_deref())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'."
-                )
-            })?;
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         let container_helper = SdkContainer::new();
 

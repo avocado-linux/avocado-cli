@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
-use crate::utils::target::resolve_target;
+use crate::utils::target::resolve_target_required;
 
 #[derive(Debug, Clone)]
 struct OverlayConfig {
@@ -208,24 +208,8 @@ impl ExtBuildCommand {
             .and_then(|img| img.as_str())
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
-        // Use resolved target (from CLI/env) if available, otherwise fall back to config
-        let config_target = parsed
-            .get("runtime")
-            .and_then(|runtime| runtime.as_table())
-            .and_then(|runtime_table| {
-                if runtime_table.len() == 1 {
-                    runtime_table.values().next()
-                } else {
-                    None
-                }
-            })
-            .and_then(|runtime_config| runtime_config.get("target"))
-            .and_then(|target| target.as_str())
-            .map(|s| s.to_string());
-        let resolved_target = resolve_target(self.target.as_deref(), config_target.as_deref());
-        let target_arch = resolved_target.ok_or_else(|| {
-            anyhow::anyhow!("No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
-        })?;
+        // Resolve target with proper precedence
+        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();

@@ -2,7 +2,7 @@ use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
-    target::resolve_target,
+    target::resolve_target_required,
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -58,20 +58,13 @@ impl RuntimeProvisionCommand {
             })?;
 
         // Get target from runtime config
-        let config_target = runtime_spec
+        let _config_target = runtime_spec
             .get("target")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
         // Resolve target architecture
-        let target_arch = resolve_target(self.config.target.as_deref(), config_target.as_deref())
-            .with_context(|| {
-                format!(
-                    "No target architecture specified for runtime '{}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{}.target'",
-                    self.config.runtime_name,
-                    self.config.runtime_name
-                )
-            })?;
+        let target_arch = resolve_target_required(self.config.target.as_deref(), &config)?;
 
         print_info(
             &format!("Provisioning runtime '{}'", self.config.runtime_name),

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Test utilities - some functions may not be used in all tests
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};

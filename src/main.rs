@@ -97,6 +97,9 @@ enum Commands {
         /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -121,6 +124,9 @@ enum Commands {
         /// Runtime name to build (if not provided, builds all runtimes)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -142,6 +148,9 @@ enum Commands {
         /// Runtime name to provision
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Provision profile to use
         #[arg(long = "provision-profile")]
         provision_profile: Option<String>,
@@ -197,6 +206,9 @@ enum SdkCommands {
         /// Path to avocado.toml configuration file
         #[arg(short = 'C', long, default_value = "avocado.toml")]
         config: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -212,6 +224,9 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Specific compile sections to run
         sections: Vec<String>,
         /// Additional arguments to pass to the container runtime
@@ -229,6 +244,9 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// DNF command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -250,6 +268,9 @@ enum SdkCommands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -265,6 +286,9 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -290,6 +314,9 @@ enum RuntimeCommands {
         /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -311,6 +338,9 @@ enum RuntimeCommands {
         /// Runtime name to build
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -332,6 +362,9 @@ enum RuntimeCommands {
         /// Runtime name to provision
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Provision profile to use
         #[arg(long = "provision-profile")]
         provision_profile: Option<String>,
@@ -350,6 +383,9 @@ enum RuntimeCommands {
         /// Path to avocado.toml configuration file
         #[arg(short = 'C', long, default_value = "avocado.toml")]
         config: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
     },
     /// List dependencies for a runtime
     Deps {
@@ -359,6 +395,9 @@ enum RuntimeCommands {
         /// Runtime name to list dependencies for
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
     },
     /// Run DNF commands in a runtime's context
     Dnf {
@@ -371,6 +410,9 @@ enum RuntimeCommands {
         /// Name of the runtime to operate on
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// DNF command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -392,6 +434,9 @@ enum RuntimeCommands {
         /// Name of the runtime to clean
         #[arg(short = 'r', long = "runtime", required = true)]
         runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -462,6 +507,7 @@ async fn main() -> Result<()> {
             verbose,
             force,
             runtime,
+            target,
             container_args,
             dnf_args,
         } => {
@@ -470,7 +516,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 runtime,
-                cli.target,
+                target.or(cli.target),
                 container_args,
                 dnf_args,
             );
@@ -481,6 +527,7 @@ async fn main() -> Result<()> {
             config,
             verbose,
             runtime,
+            target,
             container_args,
             dnf_args,
         } => {
@@ -488,7 +535,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 runtime,
-                cli.target,
+                target.or(cli.target),
                 container_args,
                 dnf_args,
             );
@@ -505,6 +552,7 @@ async fn main() -> Result<()> {
             verbose,
             force,
             runtime,
+            target,
             provision_profile,
             env,
             container_args,
@@ -516,7 +564,7 @@ async fn main() -> Result<()> {
                     config_path: config,
                     verbose,
                     force,
-                    target: cli.target,
+                    target: target.or(cli.target),
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     container_args,
@@ -531,6 +579,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -539,7 +588,7 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     force,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -551,6 +600,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force: _,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -558,7 +608,7 @@ async fn main() -> Result<()> {
                     runtime,
                     config,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -570,6 +620,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force,
+                target,
                 provision_profile,
                 env,
                 container_args,
@@ -581,7 +632,7 @@ async fn main() -> Result<()> {
                         config_path: config,
                         verbose,
                         force,
-                        target: cli.target,
+                        target: target.or(cli.target),
                         provision_profile: provision_profile.clone(),
                         env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                         container_args,
@@ -591,12 +642,16 @@ async fn main() -> Result<()> {
                 provision_cmd.execute().await?;
                 Ok(())
             }
-            RuntimeCommands::List { config } => {
+            RuntimeCommands::List { config, target: _ } => {
                 let list_cmd = RuntimeListCommand::new(config);
                 list_cmd.execute()?;
                 Ok(())
             }
-            RuntimeCommands::Deps { config, runtime } => {
+            RuntimeCommands::Deps {
+                config,
+                runtime,
+                target: _,
+            } => {
                 let deps_cmd = RuntimeDepsCommand::new(config, runtime);
                 deps_cmd.execute()?;
                 Ok(())
@@ -605,6 +660,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 runtime,
+                target,
                 command,
                 container_args,
                 dnf_args,
@@ -614,7 +670,7 @@ async fn main() -> Result<()> {
                     runtime,
                     command,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -625,6 +681,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 runtime,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -632,7 +689,7 @@ async fn main() -> Result<()> {
                     runtime,
                     config,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -646,6 +703,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 extension,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -654,7 +712,7 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     force,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -665,6 +723,7 @@ async fn main() -> Result<()> {
                 extension,
                 config,
                 verbose,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -672,7 +731,7 @@ async fn main() -> Result<()> {
                     extension,
                     config,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -683,6 +742,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 extension,
+                target: _,
                 ext_path,
                 src_path,
                 container_tool,
@@ -698,12 +758,16 @@ async fn main() -> Result<()> {
                 checkout_cmd.execute().await?;
                 Ok(())
             }
-            ExtCommands::List { config } => {
+            ExtCommands::List { config, target: _ } => {
                 let list_cmd = ExtListCommand::new(config);
                 list_cmd.execute()?;
                 Ok(())
             }
-            ExtCommands::Deps { config, extension } => {
+            ExtCommands::Deps {
+                config,
+                extension,
+                target: _,
+            } => {
                 let deps_cmd = ExtDepsCommand::new(config, extension);
                 deps_cmd.execute()?;
                 Ok(())
@@ -712,6 +776,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 extension,
+                target,
                 command,
                 container_args,
                 dnf_args,
@@ -721,7 +786,7 @@ async fn main() -> Result<()> {
                     extension,
                     command,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -732,6 +797,7 @@ async fn main() -> Result<()> {
                 extension,
                 config,
                 verbose,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -739,7 +805,7 @@ async fn main() -> Result<()> {
                     extension,
                     config,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -750,6 +816,7 @@ async fn main() -> Result<()> {
                 extension,
                 config,
                 verbose,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -757,7 +824,7 @@ async fn main() -> Result<()> {
                     extension,
                     config,
                     verbose,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -814,6 +881,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force,
+                target,
                 container_args,
                 dnf_args,
             } => {
@@ -821,7 +889,7 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     force,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -863,6 +931,7 @@ async fn main() -> Result<()> {
             }
             SdkCommands::Deps {
                 config,
+                target: _,
                 container_args: _,
                 dnf_args: _,
             } => {
@@ -873,6 +942,7 @@ async fn main() -> Result<()> {
             SdkCommands::Compile {
                 config,
                 verbose,
+                target,
                 sections,
                 container_args,
                 dnf_args,
@@ -881,7 +951,7 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     sections,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -891,6 +961,7 @@ async fn main() -> Result<()> {
             SdkCommands::Dnf {
                 config,
                 verbose,
+                target,
                 command,
                 container_args,
                 dnf_args,
@@ -899,7 +970,7 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     command,
-                    cli.target,
+                    target.or(cli.target),
                     container_args,
                     dnf_args,
                 );
@@ -909,11 +980,17 @@ async fn main() -> Result<()> {
             SdkCommands::Clean {
                 config,
                 verbose,
+                target,
                 container_args,
                 dnf_args,
             } => {
-                let clean_cmd =
-                    SdkCleanCommand::new(config, verbose, cli.target, container_args, dnf_args);
+                let clean_cmd = SdkCleanCommand::new(
+                    config,
+                    verbose,
+                    target.or(cli.target),
+                    container_args,
+                    dnf_args,
+                );
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -937,6 +1014,9 @@ enum ExtCommands {
         /// Name of the extension to install (if not provided, installs all extensions)
         #[arg(short = 'e', long = "extension")]
         extension: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -955,6 +1035,9 @@ enum ExtCommands {
         /// Name of the extension to build (must be defined in config)
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -967,6 +1050,9 @@ enum ExtCommands {
         /// Path to avocado.toml configuration file
         #[arg(short = 'C', long, default_value = "avocado.toml")]
         config: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
     },
     /// List dependencies for extensions
     Deps {
@@ -976,6 +1062,9 @@ enum ExtCommands {
         /// Name of the extension to show dependencies for (if not provided, shows all extensions)
         #[arg(short = 'e', long = "extension")]
         extension: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
     },
     /// Run DNF commands in an extension's context
     Dnf {
@@ -988,6 +1077,9 @@ enum ExtCommands {
         /// Name of the extension to operate on
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// DNF command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -1009,6 +1101,9 @@ enum ExtCommands {
         /// Name of the extension to clean
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -1027,6 +1122,9 @@ enum ExtCommands {
         /// Name of the extension to checkout from
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Path within the extension sysroot to checkout (e.g., /etc/config.json or /etc for directory)
         #[arg(long = "ext-path", required = true)]
         ext_path: String,
@@ -1048,6 +1146,9 @@ enum ExtCommands {
         /// Name of the extension to create image for
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

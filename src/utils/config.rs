@@ -52,6 +52,7 @@ pub struct ProvisionProfileConfig {
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    pub default_target: Option<String>,
     pub runtime: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
     pub provision: Option<HashMap<String, ProvisionProfileConfig>>,
@@ -283,6 +284,14 @@ impl Config {
             None
         }
     }
+
+    /// Get the default target from configuration.
+    ///
+    /// # Returns
+    /// Returns the default_target from the configuration file
+    pub fn get_default_target(&self) -> Option<&String> {
+        self.default_target.as_ref()
+    }
 }
 
 /// Convenience function to load a config file
@@ -417,6 +426,55 @@ container_args = ["--network=$USER-avocado", "--privileged"]
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], "--network=$USER-avocado");
         assert_eq!(args[1], "--privileged");
+    }
+
+    #[test]
+    fn test_default_target_field() {
+        let config_content = r#"
+default_target = "qemux86-64"
+
+[runtime.dev]
+target = "qemux86-64"
+image = "avocadolinux/runtime:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test getting default target
+        assert_eq!(config.default_target, Some("qemux86-64".to_string()));
+        assert_eq!(config.get_default_target(), Some(&"qemux86-64".to_string()));
+    }
+
+    #[test]
+    fn test_no_default_target_field() {
+        let config_content = r#"
+[runtime.dev]
+target = "qemux86-64"
+image = "avocadolinux/runtime:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test that default target is None when not specified
+        assert_eq!(config.default_target, None);
+        assert_eq!(config.get_default_target(), None);
+    }
+
+    #[test]
+    fn test_empty_default_target_field() {
+        let config_content = r#"
+default_target = ""
+
+[runtime.dev]
+target = "qemux86-64"
+image = "avocadolinux/runtime:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test that empty string is preserved
+        assert_eq!(config.default_target, Some("".to_string()));
+        assert_eq!(config.get_default_target(), Some(&"".to_string()));
     }
 
     #[test]

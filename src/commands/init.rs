@@ -57,7 +57,9 @@ impl InitCommand {
 
         // Create the configuration content
         let config_content = format!(
-            r#"[runtime.dev]
+            r#"default_target = "{target}"
+
+[runtime.dev]
 target = "{target}"
 
 [runtime.dev.dependencies]

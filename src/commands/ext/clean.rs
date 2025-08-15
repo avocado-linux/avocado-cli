@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::utils::config::load_config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
-use crate::utils::target::resolve_target;
+use crate::utils::target::resolve_target_required;
 
 pub struct ExtCleanCommand {
     extension: String,
@@ -34,13 +34,13 @@ impl ExtCleanCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let _config = load_config(&self.config_path)?;
+        let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
         self.validate_extension_exists(&parsed)?;
         let container_image = self.get_container_image(&parsed)?;
-        let target = self.resolve_target_architecture(&parsed)?;
+        let target = self.resolve_target_architecture(&config)?;
 
         self.clean_extension(&container_image, &target).await
     }
@@ -80,29 +80,8 @@ impl ExtCleanCommand {
             })
     }
 
-    fn resolve_target_architecture(&self, parsed: &toml::Value) -> Result<String> {
-        let config_target = self.extract_config_target(parsed);
-        let resolved_target = resolve_target(self.target.as_deref(), config_target.as_deref());
-
-        resolved_target.ok_or_else(|| {
-            anyhow::anyhow!("No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
-        })
-    }
-
-    fn extract_config_target(&self, parsed: &toml::Value) -> Option<String> {
-        parsed
-            .get("runtime")
-            .and_then(|runtime| runtime.as_table())
-            .and_then(|runtime_table| {
-                if runtime_table.len() == 1 {
-                    runtime_table.values().next()
-                } else {
-                    None
-                }
-            })
-            .and_then(|runtime_config| runtime_config.get("target"))
-            .and_then(|target| target.as_str())
-            .map(|s| s.to_string())
+    fn resolve_target_architecture(&self, config: &crate::utils::config::Config) -> Result<String> {
+        resolve_target_required(self.target.as_deref(), config)
     }
 
     async fn clean_extension(&self, container_image: &str, target: &str) -> Result<()> {

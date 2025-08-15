@@ -6,7 +6,7 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
-    target::resolve_target,
+    target::resolve_target_required,
 };
 
 /// Implementation of the 'sdk clean' command.
@@ -60,13 +60,7 @@ impl SdkCleanCommand {
         let repo_release = config.get_sdk_repo_release();
 
         // Resolve target with proper precedence
-        let config_target = config.get_target();
-        let target = resolve_target(self.target.as_deref(), config_target.as_deref())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'."
-                )
-            })?;
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Create container helper
         let container_helper = SdkContainer::new().verbose(self.verbose);

@@ -1,3 +1,5 @@
+default_target = "qemux86-64"
+
 [runtime.default]
 target = "qemux86-64"
 

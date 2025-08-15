@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
-use crate::utils::target::resolve_target;
+use crate::utils::target::resolve_target_required;
 
 pub struct RuntimeInstallCommand {
     runtime: Option<String>,
@@ -120,6 +120,7 @@ impl RuntimeInstallCommand {
             let success = self
                 .install_single_runtime(
                     &parsed,
+                    &config,
                     runtime_name,
                     &container_helper,
                     container_image,
@@ -152,7 +153,8 @@ impl RuntimeInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn install_single_runtime(
         &self,
-        config: &toml::Value,
+        config_toml: &toml::Value,
+        config: &crate::utils::config::Config,
         runtime: &str,
         container_helper: &SdkContainer,
         container_image: &str,
@@ -161,21 +163,16 @@ impl RuntimeInstallCommand {
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Get runtime configuration
-        let runtime_config = config["runtime"][runtime].clone();
+        let runtime_config = config_toml["runtime"][runtime].clone();
 
         // Get target from runtime config
-        let config_target = runtime_config
+        let _config_target = runtime_config
             .get("target")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
         // Resolve target architecture
-        let target_arch = resolve_target(self.target.as_deref(), config_target.as_deref())
-            .with_context(|| {
-                format!(
-                    "No target architecture specified for runtime '{runtime}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{runtime}.target'"
-                )
-            })?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Create the commands to check and set up the runtime installroot
         let installroot_path = format!("$AVOCADO_PREFIX/runtimes/{runtime}");

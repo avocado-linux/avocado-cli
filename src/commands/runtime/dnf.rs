@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
-use crate::utils::target::resolve_target;
+use crate::utils::target::resolve_target_required;
 
 pub struct RuntimeDnfCommand {
     config_path: String,
@@ -44,7 +44,7 @@ impl RuntimeDnfCommand {
 
         self.validate_runtime_exists(&parsed)?;
         let container_image = self.get_container_image(&parsed)?;
-        let target = self.resolve_target_architecture(&parsed)?;
+        let target = self.resolve_target_architecture(&config)?;
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
@@ -96,26 +96,8 @@ impl RuntimeDnfCommand {
             })
     }
 
-    fn resolve_target_architecture(&self, parsed: &toml::Value) -> Result<String> {
-        let config_target = self.extract_config_target(parsed);
-        let resolved_target = resolve_target(self.target.as_deref(), config_target.as_deref());
-
-        resolved_target.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No target architecture specified for runtime '{}'. Use --target, AVOCADO_TARGET env var, or config under 'runtime.{}.target'.",
-                self.runtime, self.runtime
-            )
-        })
-    }
-
-    fn extract_config_target(&self, parsed: &toml::Value) -> Option<String> {
-        parsed
-            .get("runtime")
-            .and_then(|runtime| runtime.as_table())
-            .and_then(|runtime_table| runtime_table.get(&self.runtime))
-            .and_then(|runtime_config| runtime_config.get("target"))
-            .and_then(|target| target.as_str())
-            .map(|s| s.to_string())
+    fn resolve_target_architecture(&self, config: &crate::utils::config::Config) -> Result<String> {
+        resolve_target_required(self.target.as_deref(), config)
     }
 
     #[allow(clippy::too_many_arguments)]

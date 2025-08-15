@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
-use crate::utils::target::resolve_target;
+use crate::utils::target::resolve_target_required;
 
 pub struct ExtInstallCommand {
     extension: Option<String>,
@@ -112,7 +112,7 @@ impl ExtInstallCommand {
             })?;
 
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
-        let config_target = parsed
+        let _config_target = parsed
             .get("runtime")
             .and_then(|runtime| runtime.as_table())
             .and_then(|runtime_table| {
@@ -125,10 +125,7 @@ impl ExtInstallCommand {
             .and_then(|runtime_config| runtime_config.get("target"))
             .and_then(|target| target.as_str())
             .map(|s| s.to_string());
-        let resolved_target = resolve_target(self.target.as_deref(), config_target.as_deref());
-        let target = resolved_target.ok_or_else(|| {
-            anyhow::anyhow!("No target architecture specified. Use --target, AVOCADO_TARGET env var, or config under 'runtime.<name>.target'.")
-        })?;
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Use the container helper to run the setup commands
         let container_helper = SdkContainer::new();
