@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::utils::container::{RunConfig, SdkContainer};
-use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target;
 
 pub struct ExtImageCommand {
@@ -96,53 +96,42 @@ impl ExtImageCommand {
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
 
-        // Create images based on configuration
-        let mut overall_success = true;
+        // Create a single image for the extension
+        // The runtime will decide whether to use it as sysext, confext, or both
+        print_info(
+            &format!(
+                "Creating image for extension '{}' (types: {}).",
+                self.extension,
+                ext_types.join(", ")
+            ),
+            OutputLevel::Normal,
+        );
 
-        for ext_type in ext_types {
-            print_info(
+        let result = self
+            .create_image(
+                &container_helper,
+                container_image,
+                &target_arch,
+                &ext_types.join(","), // Pass types for potential future use
+                repo_url,
+                repo_release,
+                &merged_container_args,
+            )
+            .await?;
+
+        if result {
+            print_success(
                 &format!(
-                    "Creating {} image for extension '{}'.",
-                    ext_type, self.extension
+                    "Successfully created image for extension '{}' (types: {}).",
+                    self.extension,
+                    ext_types.join(", ")
                 ),
                 OutputLevel::Normal,
             );
-
-            let result = self
-                .create_image(
-                    &container_helper,
-                    container_image,
-                    &target_arch,
-                    ext_type,
-                    repo_url,
-                    repo_release,
-                    &merged_container_args,
-                )
-                .await?;
-
-            if result {
-                print_success(
-                    &format!(
-                        "Successfully created {} image for extension '{}'.",
-                        ext_type, self.extension
-                    ),
-                    OutputLevel::Normal,
-                );
-            } else {
-                print_error(
-                    &format!(
-                        "Failed to create {} image for extension '{}'.",
-                        ext_type, self.extension
-                    ),
-                    OutputLevel::Normal,
-                );
-                overall_success = false;
-            }
-        }
-
-        if !overall_success {
+        } else {
             return Err(anyhow::anyhow!(
-                "Failed to create one or more extension images"
+                "Failed to create extension image for '{}'",
+                self.extension
             ));
         }
 
