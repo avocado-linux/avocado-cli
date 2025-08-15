@@ -219,24 +219,29 @@ impl ExtCheckoutCommand {
 
         let docker_cp_source = format!("{temp_container_id}:{source_path}");
 
+        // Both files and directories should preserve the directory hierarchy from the original ext-path
+        // Use the ext_path to maintain the directory structure
+        let ext_path_normalized = if self.ext_path.starts_with('/') {
+            &self.ext_path[1..] // Remove leading slash
+        } else {
+            &self.ext_path
+        };
+
         let docker_cp_dest = if is_directory {
-            // For directories, copy the directory itself to preserve hierarchy
-            // Docker cp will create the directory at the destination
-            if let Some(parent) = dest_path.parent() {
+            // For directories, we need to create the parent directory structure and
+            // let docker cp create the final directory itself
+            let full_dest_path = dest_path.join(ext_path_normalized);
+
+            // Create parent directories (but not the final directory itself, docker cp will do that)
+            if let Some(parent) = full_dest_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("Failed to create parent directory: {}", parent.display())
                 })?;
             }
-            dest_path.to_string_lossy().to_string()
+
+            full_dest_path.to_string_lossy().to_string()
         } else {
             // For files, preserve the directory hierarchy from the original ext-path
-            // Use the ext_path to maintain the directory structure
-            let ext_path_normalized = if self.ext_path.starts_with('/') {
-                &self.ext_path[1..] // Remove leading slash
-            } else {
-                &self.ext_path
-            };
-
             let full_dest_path = dest_path.join(ext_path_normalized);
 
             // Create parent directories

@@ -86,7 +86,6 @@ All group attributes are optional with reasonable defaults:
 ```toml
 [ext.web-stack]
 types = ["sysext", "confext"]
-packages = ["nginx", "postgresql", "redis"]
 
 [ext.web-stack.users]
 # Simple users use inline syntax
