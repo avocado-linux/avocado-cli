@@ -13,6 +13,8 @@ use crate::utils::{
 pub struct SdkDnfCommand {
     /// Path to configuration file
     pub config_path: String,
+    /// Enable verbose output
+    pub verbose: bool,
     /// DNF command and arguments to execute
     pub command: Vec<String>,
     /// Global target architecture
@@ -27,6 +29,7 @@ impl SdkDnfCommand {
     /// Create a new SdkDnfCommand instance
     pub fn new(
         config_path: String,
+        verbose: bool,
         command: Vec<String>,
         target: Option<String>,
         container_args: Option<Vec<String>>,
@@ -34,6 +37,7 @@ impl SdkDnfCommand {
     ) -> Self {
         Self {
             config_path,
+            verbose,
             command,
             target,
             container_args,
@@ -129,7 +133,7 @@ impl SdkDnfCommand {
             container_image: container_image.to_string(),
             target: target.to_string(),
             command: command.to_string(),
-            verbose: true,
+            verbose: self.verbose,
             source_environment: true, // need environment for DNF
             interactive: true,        // allow user input for DNF prompts
             repo_url: repo_url.cloned(),
@@ -150,6 +154,7 @@ mod tests {
     fn test_new() {
         let cmd = SdkDnfCommand::new(
             "config.toml".to_string(),
+            false,
             vec!["install".to_string(), "gcc".to_string()],
             Some("test-target".to_string()),
             None,
@@ -157,13 +162,14 @@ mod tests {
         );
 
         assert_eq!(cmd.config_path, "config.toml");
+        assert!(!cmd.verbose);
         assert_eq!(cmd.command, vec!["install", "gcc"]);
         assert_eq!(cmd.target, Some("test-target".to_string()));
     }
 
     #[tokio::test]
     async fn test_empty_command() {
-        let cmd = SdkDnfCommand::new("config.toml".to_string(), vec![], None, None, None);
+        let cmd = SdkDnfCommand::new("config.toml".to_string(), false, vec![], None, None, None);
 
         let result = cmd.execute().await;
         assert!(result.is_err());

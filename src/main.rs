@@ -226,6 +226,9 @@ enum SdkCommands {
         /// Path to avocado.toml configuration file
         #[arg(short = 'C', long, default_value = "avocado.toml")]
         config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
         /// DNF command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -864,12 +867,19 @@ async fn main() -> Result<()> {
             }
             SdkCommands::Dnf {
                 config,
+                verbose,
                 command,
                 container_args,
                 dnf_args,
             } => {
-                let dnf_cmd =
-                    SdkDnfCommand::new(config, command, cli.target, container_args, dnf_args);
+                let dnf_cmd = SdkDnfCommand::new(
+                    config,
+                    verbose,
+                    command,
+                    cli.target,
+                    container_args,
+                    dnf_args,
+                );
                 dnf_cmd.execute().await?;
                 Ok(())
             }
