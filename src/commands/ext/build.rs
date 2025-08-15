@@ -96,6 +96,18 @@ impl ExtBuildCommand {
             })
             .unwrap_or_default();
 
+        // Get on_merge commands from configuration
+        let on_merge_commands = ext_config
+            .get("on_merge")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         // Get users and groups configuration
         let users_config = ext_config.get("users").and_then(|v| v.as_table());
         let groups_config = ext_config.get("groups").and_then(|v| v.as_table());
@@ -240,6 +252,7 @@ impl ExtBuildCommand {
                         repo_release,
                         &processed_container_args,
                         &modprobe_modules,
+                        &on_merge_commands,
                         users_config,
                         groups_config,
                     )
@@ -257,6 +270,7 @@ impl ExtBuildCommand {
                         repo_release,
                         &processed_container_args,
                         &enable_services,
+                        &on_merge_commands,
                         users_config,
                         groups_config,
                     )
@@ -307,6 +321,7 @@ impl ExtBuildCommand {
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
         modprobe_modules: &[String],
+        on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
     ) -> Result<bool> {
@@ -316,6 +331,7 @@ impl ExtBuildCommand {
             ext_scopes,
             overlay_config,
             modprobe_modules,
+            on_merge_commands,
             users_config,
             groups_config,
         );
@@ -366,6 +382,7 @@ impl ExtBuildCommand {
         repo_release: Option<&String>,
         processed_container_args: &Option<Vec<String>>,
         enable_services: &[String],
+        on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
     ) -> Result<bool> {
@@ -375,6 +392,7 @@ impl ExtBuildCommand {
             ext_scopes,
             overlay_config,
             enable_services,
+            on_merge_commands,
             users_config,
             groups_config,
         );
@@ -412,12 +430,14 @@ impl ExtBuildCommand {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_sysext_build_script(
         &self,
         _ext_version: &str,
         ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
         modprobe_modules: &[String],
+        on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
     ) -> String {
@@ -477,6 +497,7 @@ fi
         };
 
         let modprobe_list = modprobe_modules.join(" ");
+        let on_merge_list = on_merge_commands.join("; ");
 
         let users_section = self.create_users_script_section(users_config, groups_config);
 
@@ -513,6 +534,12 @@ if [ -n "{}" ]; then
     echo "AVOCADO_MODPROBE={}" >> "$release_file"
     echo "Added AVOCADO_MODPROBE={} to release file"
 fi
+
+# Add custom AVOCADO_ON_MERGE commands if specified
+if [ -n "{}" ]; then
+    echo "AVOCADO_ON_MERGE=\"{}\"" >> "$release_file"
+    echo "[INFO] Added custom on_merge commands to release file: {}"
+fi
 "#,
             overlay_section,
             users_section,
@@ -526,16 +553,21 @@ fi
             self.extension,
             modprobe_list,
             modprobe_list,
-            modprobe_list
+            modprobe_list,
+            on_merge_list,
+            on_merge_list,
+            on_merge_list
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_confext_build_script(
         &self,
         _ext_version: &str,
         ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
         enable_services: &[String],
+        on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
     ) -> String {
@@ -629,6 +661,7 @@ fi"#,
         };
 
         let users_section = self.create_users_script_section(users_config, groups_config);
+        let on_merge_list = on_merge_commands.join("; ");
 
         format!(
             r#"
@@ -655,6 +688,12 @@ if [ -d "$ldso_etc_dir" ] && [ -n "$(find "$ldso_etc_dir" -name "*.conf" 2>/dev/
     echo "AVOCADO_ON_MERGE=\"ldconfig\"" >> "$release_file"
     echo "[INFO] Found ld.so.conf.d config files in extension '{}', added AVOCADO_ON_MERGE=\"ldconfig\" to release file"
 fi
+
+# Add custom AVOCADO_ON_MERGE commands if specified
+if [ -n "{}" ]; then
+    echo "AVOCADO_ON_MERGE=\"{}\"" >> "$release_file"
+    echo "[INFO] Added custom on_merge commands to release file: {}"
+fi
 {}
 "#,
             overlay_section,
@@ -666,6 +705,9 @@ fi
             self.extension,
             self.extension,
             self.extension,
+            on_merge_list,
+            on_merge_list,
+            on_merge_list,
             service_linking_section
         )
     }
@@ -1123,8 +1165,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Print the actual script for debugging
         // println!("Generated sysext build script:\n{}", script);
@@ -1152,6 +1201,11 @@ mod tests {
         assert!(script
             .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found sysusers.d config files in extension 'test-ext'"));
+
+        // Check for custom on_merge functionality (should be present but not activated)
+        assert!(script.contains("# Add custom AVOCADO_ON_MERGE commands if specified"));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"\\\"\" >> \"$release_file\""));
+        assert!(script.contains("[INFO] Added custom on_merge commands to release file:"));
     }
 
     #[test]
@@ -1165,8 +1219,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
@@ -1188,12 +1249,15 @@ mod tests {
         assert!(script.contains("Found sysusers.d config files in extension 'test-ext'"));
 
         // Check for ld.so.conf.d functionality in confext
-        assert!(
-            script.contains("ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/ld.so.conf.d\"")
-        );
-        assert!(script
-            .contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
+        assert!(script.contains("ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/ld.so.conf.d\""));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found ld.so.conf.d config files in extension 'test-ext'"));
+
+        // Check for custom on_merge functionality (should be present but not activated)
+        assert!(script.contains("# Add custom AVOCADO_ON_MERGE commands if specified"));
+        assert!(script.contains("if [ -n \"\" ]; then")); // Empty check since no custom commands
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"\\\"\" >> \"$release_file\""));
+        assert!(script.contains("[INFO] Added custom on_merge commands to release file:"));
     }
 
     #[test]
@@ -1211,6 +1275,7 @@ mod tests {
             "2.0",
             &["system".to_string(), "portable".to_string()],
             None,
+            &[],
             &[],
             None,
             None,
@@ -1235,6 +1300,7 @@ mod tests {
             "2.0",
             &["system".to_string(), "portable".to_string()],
             None,
+            &[],
             &[],
             None,
             None,
@@ -1261,6 +1327,7 @@ mod tests {
             &["system".to_string()],
             None,
             &enable_services,
+            &[],
             None,
             None,
         );
@@ -1287,8 +1354,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify the find command looks for common kernel module extensions
         assert!(script.contains("-name \"*.ko\""));
@@ -1318,6 +1392,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             Some(&overlay_config),
+            &[],
             &[],
             None,
             None,
@@ -1355,6 +1430,7 @@ mod tests {
             &["system".to_string()],
             Some(&overlay_config),
             &[],
+            &[],
             None,
             None,
         );
@@ -1390,6 +1466,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             Some(&overlay_config),
+            &[],
             &[],
             None,
             None,
@@ -1429,6 +1506,7 @@ mod tests {
             &["system".to_string()],
             Some(&overlay_config),
             &[],
+            &[],
             None,
             None,
         );
@@ -1458,10 +1536,24 @@ mod tests {
             dnf_args: None,
         };
 
-        let script_sysext =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None, None);
-        let script_confext =
-            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script_sysext = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
+        let script_confext = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify no overlay merging commands are present
         assert!(!script_sysext.contains("Merge overlay directory"));
@@ -1489,6 +1581,7 @@ mod tests {
             &["system".to_string()],
             None,
             &modprobe_modules,
+            &[],
             None,
             None,
         );
@@ -1510,8 +1603,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify sysusers.d detection logic is present
         assert!(script.contains(
@@ -1537,8 +1637,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify sysusers.d detection logic is present for confext
         assert!(script.contains(
@@ -1561,17 +1668,86 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_confext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify ld.so.conf.d detection logic is present for confext
-        assert!(script.contains(
-            "ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/ldso-confext/etc/ld.so.conf.d\""
-        ));
+        assert!(
+            script.contains("ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/ldso-confext/etc/ld.so.conf.d\"")
+        );
         assert!(script.contains("find \"$ldso_etc_dir\" -name \"*.conf\""));
-        assert!(script
-            .contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found ld.so.conf.d config files in extension 'ldso-confext'"));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_custom_on_merge() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let on_merge_commands = vec![
+            "systemctl restart sshd.socket".to_string(),
+            "echo test".to_string(),
+        ];
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &on_merge_commands,
+            None,
+            None,
+        );
+
+        // Verify custom on_merge commands are added correctly
+        assert!(script.contains("if [ -n \"systemctl restart sshd.socket; echo test\" ]; then"));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket; echo test\\\"\" >> \"$release_file\""));
+        assert!(script.contains("[INFO] Added custom on_merge commands to release file: systemctl restart sshd.socket; echo test"));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_with_custom_on_merge() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let on_merge_commands = vec!["systemctl restart sshd.socket".to_string()];
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &on_merge_commands,
+            None,
+            None,
+        );
+
+        // Verify custom on_merge commands are added correctly
+        assert!(script.contains("if [ -n \"systemctl restart sshd.socket\" ]; then"));
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "[INFO] Added custom on_merge commands to release file: systemctl restart sshd.socket"
+        ));
     }
 
     #[test]
@@ -1585,8 +1761,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify both kernel modules and sysusers.d are handled correctly with separate lines
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
@@ -1607,8 +1790,15 @@ mod tests {
             dnf_args: None,
         };
 
-        let script =
-            cmd.create_sysext_build_script("1.0", &["system".to_string()], None, &[], None, None);
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        );
 
         // Verify AVOCADO_MODPROBE section exists but with empty check
         assert!(script.contains("if [ -n \"\" ]; then"));
@@ -1748,6 +1938,7 @@ mod tests {
             &["system".to_string()],
             None,
             &[],
+            &[],
             Some(&users_config),
             None,
         );
@@ -1789,6 +1980,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
+            &[],
             &[],
             Some(&users_config),
             None,
