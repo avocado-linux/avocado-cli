@@ -9,7 +9,7 @@ use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
-    ExtImageCommand, ExtInstallCommand, ExtListCommand,
+    ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
 };
 use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
@@ -764,6 +764,27 @@ async fn main() -> Result<()> {
                 image_cmd.execute().await?;
                 Ok(())
             }
+            ExtCommands::Package {
+                extension,
+                target,
+                config,
+                verbose,
+                output_dir,
+                container_args,
+                dnf_args,
+            } => {
+                let package_cmd = ExtPackageCommand::new(
+                    config,
+                    extension,
+                    target,
+                    output_dir,
+                    verbose,
+                    container_args,
+                    dnf_args,
+                );
+                package_cmd.execute().await?;
+                Ok(())
+            }
         },
         Commands::Hitl { command } => match command {
             HitlCommands::Server {
@@ -1027,6 +1048,30 @@ enum ExtCommands {
         /// Name of the extension to create image for
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Package extension sysroot into an RPM
+    Package {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Name of the extension to package
+        #[arg(short = 'e', long = "extension", required = true)]
+        extension: String,
+        /// Target architecture (e.g., x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu)
+        #[arg(short = 't', long = "target", required = true)]
+        target: String,
+        /// Output directory on host for the RPM package (relative or absolute path). If not specified, RPM stays in container at $AVOCADO_PREFIX/output/extensions
+        #[arg(long = "out-dir")]
+        output_dir: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

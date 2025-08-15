@@ -6,6 +6,7 @@ pub mod dnf;
 pub mod image;
 pub mod install;
 pub mod list;
+pub mod package;
 
 pub use build::ExtBuildCommand;
 pub use checkout::ExtCheckoutCommand;
@@ -15,3 +16,4 @@ pub use dnf::ExtDnfCommand;
 pub use image::ExtImageCommand;
 pub use install::ExtInstallCommand;
 pub use list::ExtListCommand;
+pub use package::ExtPackageCommand;
