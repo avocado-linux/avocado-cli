@@ -6,7 +6,7 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_error, print_success, OutputLevel},
-    target::resolve_target_required,
+    target::validate_and_log_target,
     volume::VolumeManager,
 };
 
@@ -87,20 +87,37 @@ impl SdkRunCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
-        // Get repo_url and repo_release from config
-        let repo_url = config.get_sdk_repo_url();
-        let repo_release = config.get_sdk_repo_release();
+        // Early target validation and logging - fail fast if target is unsupported
+        let target = validate_and_log_target(self.target.as_deref(), &config)?;
 
-        // Merge container args from config with CLI args
-        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+        // Get merged SDK configuration for the target
+        let merged_sdk_config = config.get_merged_sdk_config(&target, &self.config_path)?;
 
-        // Get the SDK image from configuration
-        let container_image = config.get_sdk_image().ok_or_else(|| {
-            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+        // Get repo_url and repo_release from merged config
+        let repo_url = merged_sdk_config.repo_url.as_ref();
+        let repo_release = merged_sdk_config.repo_release.as_ref();
+
+        // Merge container args from merged config with CLI args
+        let config_container_args = merged_sdk_config.container_args.as_ref();
+        let merged_container_args = match (config_container_args, self.container_args.as_ref()) {
+            (Some(config_args), Some(cli_args)) => {
+                let mut processed_args =
+                    Config::process_container_args(Some(config_args)).unwrap_or_default();
+                processed_args.extend_from_slice(cli_args);
+                Some(processed_args)
+            }
+            (Some(config_args), None) => Config::process_container_args(Some(config_args)),
+            (None, Some(cli_args)) => Some(cli_args.clone()),
+            (None, None) => None,
+        };
+
+        // Get the SDK image from merged configuration
+        let container_image = merged_sdk_config.image.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No container image specified in config under 'sdk.image' or 'sdk.{}.image'",
+                target
+            )
         })?;
-
-        // Resolve target with proper precedence
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         if let Some(ref name) = self.name {
             println!("Container name: {name}");
@@ -124,12 +141,12 @@ impl SdkRunCommand {
         let container_helper = SdkContainer::new().verbose(self.verbose);
 
         let success = if self.detach {
-            self.run_detached_container(&container_helper, container_image, &target, &command)
+            self.run_detached_container(&container_helper, &container_image, &target, &command)
                 .await?
         } else if self.interactive {
             self.run_interactive_container(
                 &container_helper,
-                container_image,
+                &container_image,
                 &target,
                 &command,
                 repo_url,

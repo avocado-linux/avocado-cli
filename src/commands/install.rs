@@ -8,6 +8,7 @@ use crate::commands::{
 use crate::utils::{
     config::Config,
     output::{print_info, print_success, OutputLevel},
+    target::validate_and_log_target,
 };
 
 /// Implementation of the 'install' command that runs all install subcommands.
@@ -55,6 +56,9 @@ impl InstallCommand {
         // Load the configuration to check what components exist
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+
+        // Early target validation and logging - fail fast if target is unsupported
+        let _target = validate_and_log_target(self.target.as_deref(), &config)?;
 
         print_info(
             "Starting comprehensive install process...",

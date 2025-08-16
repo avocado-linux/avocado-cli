@@ -10,8 +10,12 @@ use tempfile::NamedTempFile;
 /// Test the complete target precedence order: CLI > ENV > CONFIG > ERROR
 #[test]
 fn test_target_precedence_order() {
+    // Clean up any environment variables from other tests
+    env::remove_var("AVOCADO_TARGET");
+
     let config_content = r#"
 default_target = "config-target"
+supported_targets = ["cli-target", "env-target", "config-target"]
 
 [sdk]
 image = "ghcr.io/avocado-framework/avocado-sdk:latest"
@@ -112,7 +116,12 @@ target = "qemux86-64"
 
 #[test]
 fn test_avocado_target_environment_variable() {
+    // Clean up any environment variables from other tests
+    env::remove_var("AVOCADO_TARGET");
+
     let config_content = r#"
+supported_targets = ["test-env-target"]
+
 [sdk]
 image = "ghcr.io/avocado-framework/avocado-sdk:latest"
 
@@ -169,6 +178,10 @@ fn test_init_command_creates_default_target() {
             content.contains("default_target = \"test-init-target\""),
             "Generated config should contain default_target: {content}"
         );
+        assert!(
+            content.contains("supported_targets = [\"test-init-target\"]"),
+            "Generated config should contain supported_targets: {content}"
+        );
     }
 
     cleanup();
@@ -176,9 +189,13 @@ fn test_init_command_creates_default_target() {
 
 #[test]
 fn test_all_commands_accept_target_flag() {
+    // Clean up any environment variables from other tests
+    env::remove_var("AVOCADO_TARGET");
+
     // Test that major commands accept --target flag without error
     let config_content = r#"
 default_target = "qemux86-64"
+supported_targets = ["test", "qemux86-64"]
 
 [sdk]
 image = "ghcr.io/avocado-framework/avocado-sdk:latest"
@@ -236,4 +253,79 @@ sysext = true
             );
         }
     }
+}
+
+#[test]
+fn test_sdk_target_validation_supported() {
+    // Clean up any environment variables from other tests
+    env::remove_var("AVOCADO_TARGET");
+
+    let config_content = r#"
+default_target = "qemux86-64"
+supported_targets = ["qemux86-64"]
+
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime.dev]
+target = "qemux86-64"
+"#;
+
+    let mut config_file = NamedTempFile::new().unwrap();
+    write!(config_file, "{config_content}").unwrap();
+
+    // Test that a supported target works
+    let result = cli_with_config(
+        &["sdk", "run", "--target", "qemux86-64", "--", "echo", "test"],
+        None,
+        Some(config_file.path()),
+    );
+
+    // Should not fail with target validation error
+    if !result.success {
+        assert!(
+            !result
+                .stderr
+                .contains("not supported by this configuration"),
+            "Supported target should work: {}",
+            result.stderr
+        );
+    }
+}
+
+#[test]
+fn test_sdk_target_validation_unsupported() {
+    // Clean up any environment variables from other tests
+    env::remove_var("AVOCADO_TARGET");
+
+    let config_content = r#"
+default_target = "unsupported-target"
+supported_targets = ["qemux86-64"]
+
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime.dev]
+target = "qemux86-64"
+"#;
+
+    let mut config_file = NamedTempFile::new().unwrap();
+    write!(config_file, "{config_content}").unwrap();
+
+    // Test that an unsupported target fails
+    let result = cli_with_config(
+        &["sdk", "run", "--", "echo", "test"],
+        None,
+        Some(config_file.path()),
+    );
+
+    // Should fail with target validation error
+    assert!(!result.success, "Unsupported target should fail");
+    assert!(
+        result
+            .stderr
+            .contains("not supported by this configuration"),
+        "Should show target validation error: {}",
+        result.stderr
+    );
 }

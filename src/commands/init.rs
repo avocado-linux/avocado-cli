@@ -58,6 +58,7 @@ impl InitCommand {
         // Create the configuration content
         let config_content = format!(
             r#"default_target = "{target}"
+supported_targets = ["{target}"]
 
 [runtime.dev]
 target = "{target}"

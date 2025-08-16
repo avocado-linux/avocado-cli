@@ -7,7 +7,7 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
-    target::resolve_target_required,
+    target::validate_and_log_target,
 };
 
 /// Implementation of the 'sdk install' command.
@@ -52,6 +52,9 @@ impl SdkInstallCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
 
+        // Early target validation and logging - fail fast if target is unsupported
+        let target = validate_and_log_target(self.target.as_deref(), &config)?;
+
         // Merge container args from config with CLI args
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
@@ -63,9 +66,6 @@ impl SdkInstallCommand {
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
         })?;
-
-        // Resolve target with proper precedence
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         print_info("Installing SDK dependencies.", OutputLevel::Normal);
 
