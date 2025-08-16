@@ -3,12 +3,14 @@
 mod common;
 
 use common::cli_with_config;
+use serial_test::serial;
 use std::env;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
 /// Test the complete target precedence order: CLI > ENV > CONFIG > ERROR
 #[test]
+#[serial]
 fn test_target_precedence_order() {
     // Clean up any environment variables from other tests
     env::remove_var("AVOCADO_TARGET");
@@ -80,6 +82,7 @@ target = "qemux86-64"
 }
 
 #[test]
+#[serial]
 fn test_target_error_when_none_specified() {
     let config_content = r#"
 [sdk]
@@ -115,6 +118,7 @@ target = "qemux86-64"
 }
 
 #[test]
+#[serial]
 fn test_avocado_target_environment_variable() {
     // Clean up any environment variables from other tests
     env::remove_var("AVOCADO_TARGET");
@@ -153,6 +157,7 @@ target = "qemux86-64"
 }
 
 #[test]
+#[serial]
 fn test_init_command_creates_default_target() {
     // Use current directory and clean up after
     let result = cli_with_config(&["init", "--target", "test-init-target"], None, None);
@@ -188,6 +193,7 @@ fn test_init_command_creates_default_target() {
 }
 
 #[test]
+#[serial]
 fn test_all_commands_accept_target_flag() {
     // Clean up any environment variables from other tests
     env::remove_var("AVOCADO_TARGET");
@@ -256,6 +262,7 @@ sysext = true
 }
 
 #[test]
+#[serial]
 fn test_sdk_target_validation_supported() {
     // Clean up any environment variables from other tests
     env::remove_var("AVOCADO_TARGET");
@@ -294,6 +301,7 @@ target = "qemux86-64"
 }
 
 #[test]
+#[serial]
 fn test_sdk_target_validation_unsupported() {
     // Clean up any environment variables from other tests
     env::remove_var("AVOCADO_TARGET");

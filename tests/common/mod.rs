@@ -24,15 +24,52 @@ fn get_cli_command() -> (String, Vec<String>) {
 /// Execute the CLI with the given arguments and configuration
 fn execute_cli(args: &[&str], working_dir: Option<&Path>) -> TestResult {
     let (base_cmd, base_args) = get_cli_command();
-    let mut cmd = Command::new(base_cmd);
 
-    for arg in base_args {
-        cmd.arg(arg);
-    }
-    cmd.args(args);
+    // Create a shell script that sets up a clean environment and runs the CLI
+    let env_script = format!(
+        r#"#!/bin/bash
+# Clear AVOCADO_TARGET to ensure clean state
+unset AVOCADO_TARGET
+# Set AVOCADO_TARGET only if it was explicitly set in the test
+if [ -n "$TEST_AVOCADO_TARGET" ]; then
+    export AVOCADO_TARGET="$TEST_AVOCADO_TARGET"
+fi
+# Run the CLI command
+{} {} {}
+"#,
+        base_cmd,
+        base_args.join(" "),
+        args.join(" ")
+    );
+
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg(env_script);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+
+    // Start with a clean environment and only add what we need
+    cmd.env_clear();
+
+    // Add essential environment variables
+    for (key, value) in std::env::vars() {
+        match key.as_str() {
+            "PATH" | "HOME" | "USER" | "SHELL" | "TERM" | "CARGO_TARGET_DIR"
+            | "CARGO_MANIFEST_DIR" | "CARGO_PKG_NAME" | "CARGO_PKG_VERSION" | "RUST_BACKTRACE"
+            | "RUSTC" | "RUSTUP_HOME" | "CARGO_HOME" => {
+                cmd.env(key, value);
+            }
+            "AVOCADO_TARGET" => {
+                // Pass through as TEST_AVOCADO_TARGET so the script can decide whether to use it
+                cmd.env("TEST_AVOCADO_TARGET", value);
+            }
+            _ if key.starts_with("CARGO_") || key.starts_with("RUST_") => {
+                cmd.env(key, value);
+            }
+            _ => {} // Skip other environment variables to prevent pollution
+        }
     }
 
     let output = cmd.output().expect("Failed to execute command");
@@ -132,6 +169,9 @@ fn run_cli_core(
         std::fs::remove_dir_all(temp_dir).ok();
     }
 
+    // Clean up docker volumes
+    cleanup_docker_volumes();
+
     result
 }
 
@@ -188,7 +228,14 @@ pub fn cli_with_config(
     temp_dir: Option<&Path>,
     config: Option<&Path>,
 ) -> TestResult {
-    run_cli_core(args, temp_dir, config, false)
+    if let Some(config_path) = config {
+        let config_str = config_path.to_str().unwrap();
+        let args_with_config = insert_config_flag(args, config_str);
+        let args_ref: Vec<&str> = args_with_config.iter().map(|s| s.as_str()).collect();
+        execute_cli(&args_ref, temp_dir)
+    } else {
+        execute_cli(args, temp_dir)
+    }
 }
 
 // Assertion helpers
@@ -259,4 +306,21 @@ pub fn create_temp_dir() -> PathBuf {
 #[allow(dead_code)]
 pub fn cleanup_temp_dir(temp_dir: &Path) {
     std::fs::remove_dir_all(temp_dir).ok();
+}
+
+/// Clean up docker volumes created during tests
+fn cleanup_docker_volumes() {
+    let output = Command::new("docker")
+        .arg("volume")
+        .arg("prune")
+        .arg("--force")
+        .output()
+        .expect("Failed to execute docker volume prune");
+
+    if !output.status.success() {
+        eprintln!(
+            "Failed to clean up docker volumes: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

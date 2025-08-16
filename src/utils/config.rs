@@ -1792,10 +1792,7 @@ gdb-multiarch = "*"
         assert!(dev_x86.is_some());
         let dev_x86_value = dev_x86.unwrap();
         let dev_x86_table = dev_x86_value.as_table().unwrap();
-        assert_eq!(
-            dev_x86_table.get("debug_mode").unwrap().as_bool().unwrap(),
-            true
-        );
+        assert!(dev_x86_table.get("debug_mode").unwrap().as_bool().unwrap());
         assert!(dev_x86_table.get("cross_debug").is_none());
 
         let dev_arm64 = config
@@ -1804,22 +1801,16 @@ gdb-multiarch = "*"
         assert!(dev_arm64.is_some());
         let dev_arm64_value = dev_arm64.unwrap();
         let dev_arm64_table = dev_arm64_value.as_table().unwrap();
-        assert_eq!(
-            dev_arm64_table
-                .get("debug_mode")
-                .unwrap()
-                .as_bool()
-                .unwrap(),
-            true
-        ); // Inherited
-        assert_eq!(
-            dev_arm64_table
-                .get("cross_debug")
-                .unwrap()
-                .as_bool()
-                .unwrap(),
-            true
-        ); // Target-specific
+        assert!(dev_arm64_table
+            .get("debug_mode")
+            .unwrap()
+            .as_bool()
+            .unwrap()); // Inherited
+        assert!(dev_arm64_table
+            .get("cross_debug")
+            .unwrap()
+            .as_bool()
+            .unwrap()); // Target-specific
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
@@ -1897,14 +1888,11 @@ baud_rate = 115200
                 .unwrap(),
             300
         ); // Inherited
-        assert_eq!(
-            usb_arm64_table
-                .get("emulation_mode")
-                .unwrap()
-                .as_bool()
-                .unwrap(),
-            true
-        ); // Target-specific
+        assert!(usb_arm64_table
+            .get("emulation_mode")
+            .unwrap()
+            .as_bool()
+            .unwrap()); // Target-specific
 
         // Test network provision
         let net_x86 = config
@@ -2308,10 +2296,7 @@ shared_value = "rpi-override"
             rpi_table.get("shared_value").unwrap().as_str().unwrap(),
             "rpi-override"
         ); // Overridden
-        assert_eq!(
-            rpi_table.get("rpi_specific").unwrap().as_bool().unwrap(),
-            true
-        ); // Target-specific
+        assert!(rpi_table.get("rpi_specific").unwrap().as_bool().unwrap()); // Target-specific
         assert!(rpi_table.get("override_value").is_none()); // Not present for RPI
         assert!(rpi_table.get("nested_override").is_none()); // Not present for RPI
 

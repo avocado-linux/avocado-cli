@@ -414,6 +414,8 @@ mod tests {
 
     #[test]
     fn test_resolve_and_validate_target_success() {
+        // Ensure no environment variable interferes with resolution
+        env::remove_var("AVOCADO_TARGET");
         let config = create_config_with_supported_targets(vec!["qemux86-64".to_string()]);
 
         let result = resolve_and_validate_target_with_source(None, &config).map(|r| r.target);
@@ -423,6 +425,7 @@ mod tests {
 
     #[test]
     fn test_resolve_and_validate_target_unsupported() {
+        env::remove_var("AVOCADO_TARGET");
         let config = create_config_with_supported_targets(vec!["qemux86-64".to_string()]);
         // Override the default target to be unsupported
         let mut config = config;
@@ -437,6 +440,7 @@ mod tests {
 
     #[test]
     fn test_resolve_and_validate_target_all_supported() {
+        env::remove_var("AVOCADO_TARGET");
         // When supported_targets = "*", should allow any target
         let config = create_config_with_supported_targets_all();
         let mut config = config;
@@ -449,6 +453,7 @@ mod tests {
 
     #[test]
     fn test_resolve_and_validate_target_no_supported_targets() {
+        env::remove_var("AVOCADO_TARGET");
         // When no supported_targets are defined, should allow any target
         let config = create_test_config(Some("any-target"));
 
