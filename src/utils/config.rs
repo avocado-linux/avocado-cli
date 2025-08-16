@@ -1636,9 +1636,14 @@ libfoo-dev-arm64 = "*"
         let config = Config::load_from_str(config_content).unwrap();
 
         // Test base SDK configuration
-        let merged_x86 = config.get_merged_sdk_config("qemux86-64", config_path).unwrap();
+        let merged_x86 = config
+            .get_merged_sdk_config("qemux86-64", config_path)
+            .unwrap();
         assert_eq!(merged_x86.image, Some("base-sdk-image".to_string()));
-        assert_eq!(merged_x86.repo_url, Some("http://base-repo.com".to_string()));
+        assert_eq!(
+            merged_x86.repo_url,
+            Some("http://base-repo.com".to_string())
+        );
         assert_eq!(merged_x86.repo_release, Some("main".to_string()));
         assert_eq!(merged_x86.container_args.as_ref().unwrap().len(), 2);
 
@@ -1649,9 +1654,14 @@ libfoo-dev-arm64 = "*"
         assert!(deps_x86.contains_key("build-essential"));
 
         // Test target-specific SDK configuration
-        let merged_arm64 = config.get_merged_sdk_config("qemuarm64", config_path).unwrap();
+        let merged_arm64 = config
+            .get_merged_sdk_config("qemuarm64", config_path)
+            .unwrap();
         assert_eq!(merged_arm64.image, Some("arm64-sdk-image".to_string())); // Overridden
-        assert_eq!(merged_arm64.repo_url, Some("http://arm64-repo.com".to_string())); // Overridden
+        assert_eq!(
+            merged_arm64.repo_url,
+            Some("http://arm64-repo.com".to_string())
+        ); // Overridden
         assert_eq!(merged_arm64.repo_release, Some("main".to_string())); // Inherited
         assert_eq!(merged_arm64.container_args.as_ref().unwrap().len(), 1); // Overridden
 
@@ -1723,37 +1733,93 @@ gdb-multiarch = "*"
         let config = Config::load_from_str(config_content).unwrap();
 
         // Test production runtime for x86-64
-        let prod_x86 = config.get_merged_runtime_config("production", "qemux86-64", config_path).unwrap();
+        let prod_x86 = config
+            .get_merged_runtime_config("production", "qemux86-64", config_path)
+            .unwrap();
         assert!(prod_x86.is_some());
         let prod_x86_value = prod_x86.unwrap();
         let prod_x86_table = prod_x86_value.as_table().unwrap();
-        assert_eq!(prod_x86_table.get("image_version").unwrap().as_str().unwrap(), "v1.0.0");
-        assert_eq!(prod_x86_table.get("boot_timeout").unwrap().as_integer().unwrap(), 30);
+        assert_eq!(
+            prod_x86_table
+                .get("image_version")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "v1.0.0"
+        );
+        assert_eq!(
+            prod_x86_table
+                .get("boot_timeout")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            30
+        );
         assert!(prod_x86_table.get("memory").is_none()); // Should not have ARM64-specific field
 
         // Test production runtime for ARM64
-        let prod_arm64 = config.get_merged_runtime_config("production", "qemuarm64", config_path).unwrap();
+        let prod_arm64 = config
+            .get_merged_runtime_config("production", "qemuarm64", config_path)
+            .unwrap();
         assert!(prod_arm64.is_some());
         let prod_arm64_value = prod_arm64.unwrap();
         let prod_arm64_table = prod_arm64_value.as_table().unwrap();
-        assert_eq!(prod_arm64_table.get("image_version").unwrap().as_str().unwrap(), "v1.0.0-arm64"); // Overridden
-        assert_eq!(prod_arm64_table.get("boot_timeout").unwrap().as_integer().unwrap(), 30); // Inherited
-        assert_eq!(prod_arm64_table.get("memory").unwrap().as_str().unwrap(), "2G"); // Target-specific
+        assert_eq!(
+            prod_arm64_table
+                .get("image_version")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "v1.0.0-arm64"
+        ); // Overridden
+        assert_eq!(
+            prod_arm64_table
+                .get("boot_timeout")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            30
+        ); // Inherited
+        assert_eq!(
+            prod_arm64_table.get("memory").unwrap().as_str().unwrap(),
+            "2G"
+        ); // Target-specific
 
         // Test development runtime
-        let dev_x86 = config.get_merged_runtime_config("development", "qemux86-64", config_path).unwrap();
+        let dev_x86 = config
+            .get_merged_runtime_config("development", "qemux86-64", config_path)
+            .unwrap();
         assert!(dev_x86.is_some());
         let dev_x86_value = dev_x86.unwrap();
         let dev_x86_table = dev_x86_value.as_table().unwrap();
-        assert_eq!(dev_x86_table.get("debug_mode").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            dev_x86_table.get("debug_mode").unwrap().as_bool().unwrap(),
+            true
+        );
         assert!(dev_x86_table.get("cross_debug").is_none());
 
-        let dev_arm64 = config.get_merged_runtime_config("development", "qemuarm64", config_path).unwrap();
+        let dev_arm64 = config
+            .get_merged_runtime_config("development", "qemuarm64", config_path)
+            .unwrap();
         assert!(dev_arm64.is_some());
         let dev_arm64_value = dev_arm64.unwrap();
         let dev_arm64_table = dev_arm64_value.as_table().unwrap();
-        assert_eq!(dev_arm64_table.get("debug_mode").unwrap().as_bool().unwrap(), true); // Inherited
-        assert_eq!(dev_arm64_table.get("cross_debug").unwrap().as_bool().unwrap(), true); // Target-specific
+        assert_eq!(
+            dev_arm64_table
+                .get("debug_mode")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            true
+        ); // Inherited
+        assert_eq!(
+            dev_arm64_table
+                .get("cross_debug")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            true
+        ); // Target-specific
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
@@ -1790,41 +1856,87 @@ baud_rate = 115200
         let config = Config::load_from_str(config_content).unwrap();
 
         // Test USB provision for x86-64
-        let usb_x86 = config.get_merged_provision_config("usb", "qemux86-64", config_path).unwrap();
+        let usb_x86 = config
+            .get_merged_provision_config("usb", "qemux86-64", config_path)
+            .unwrap();
         assert!(usb_x86.is_some());
         let usb_x86_value = usb_x86.unwrap();
         let usb_x86_table = usb_x86_value.as_table().unwrap();
-        let args_x86 = usb_x86_table.get("container_args").unwrap().as_array().unwrap();
+        let args_x86 = usb_x86_table
+            .get("container_args")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(args_x86.len(), 3);
         assert_eq!(args_x86[0].as_str().unwrap(), "--privileged");
-        assert_eq!(usb_x86_table.get("timeout").unwrap().as_integer().unwrap(), 300);
+        assert_eq!(
+            usb_x86_table.get("timeout").unwrap().as_integer().unwrap(),
+            300
+        );
         assert!(usb_x86_table.get("emulation_mode").is_none());
 
         // Test USB provision for ARM64
-        let usb_arm64 = config.get_merged_provision_config("usb", "qemuarm64", config_path).unwrap();
+        let usb_arm64 = config
+            .get_merged_provision_config("usb", "qemuarm64", config_path)
+            .unwrap();
         assert!(usb_arm64.is_some());
         let usb_arm64_value = usb_arm64.unwrap();
         let usb_arm64_table = usb_arm64_value.as_table().unwrap();
-        let args_arm64 = usb_arm64_table.get("container_args").unwrap().as_array().unwrap();
+        let args_arm64 = usb_arm64_table
+            .get("container_args")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(args_arm64.len(), 3); // Overridden container_args
         assert_eq!(args_arm64[0].as_str().unwrap(), "--cap-add=SYS_ADMIN");
-        assert_eq!(usb_arm64_table.get("timeout").unwrap().as_integer().unwrap(), 300); // Inherited
-        assert_eq!(usb_arm64_table.get("emulation_mode").unwrap().as_bool().unwrap(), true); // Target-specific
+        assert_eq!(
+            usb_arm64_table
+                .get("timeout")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            300
+        ); // Inherited
+        assert_eq!(
+            usb_arm64_table
+                .get("emulation_mode")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            true
+        ); // Target-specific
 
         // Test network provision
-        let net_x86 = config.get_merged_provision_config("network", "qemux86-64", config_path).unwrap();
+        let net_x86 = config
+            .get_merged_provision_config("network", "qemux86-64", config_path)
+            .unwrap();
         assert!(net_x86.is_some());
         let net_x86_value = net_x86.unwrap();
         let net_x86_table = net_x86_value.as_table().unwrap();
-        assert_eq!(net_x86_table.get("protocol").unwrap().as_str().unwrap(), "ssh");
+        assert_eq!(
+            net_x86_table.get("protocol").unwrap().as_str().unwrap(),
+            "ssh"
+        );
         assert!(net_x86_table.get("baud_rate").is_none());
 
-        let net_arm64 = config.get_merged_provision_config("network", "qemuarm64", config_path).unwrap();
+        let net_arm64 = config
+            .get_merged_provision_config("network", "qemuarm64", config_path)
+            .unwrap();
         assert!(net_arm64.is_some());
         let net_arm64_value = net_arm64.unwrap();
         let net_arm64_table = net_arm64_value.as_table().unwrap();
-        assert_eq!(net_arm64_table.get("protocol").unwrap().as_str().unwrap(), "serial"); // Overridden
-        assert_eq!(net_arm64_table.get("baud_rate").unwrap().as_integer().unwrap(), 115200); // Target-specific
+        assert_eq!(
+            net_arm64_table.get("protocol").unwrap().as_str().unwrap(),
+            "serial"
+        ); // Overridden
+        assert_eq!(
+            net_arm64_table
+                .get("baud_rate")
+                .unwrap()
+                .as_integer()
+                .unwrap(),
+            115200
+        ); // Target-specific
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
@@ -1896,27 +2008,45 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         let config = Config::load_from_str(config_content).unwrap();
 
         // Test avocado-dev extension for x86-64
-        let ext_x86 = config.get_merged_ext_config("avocado-dev", "qemux86-64", config_path).unwrap();
+        let ext_x86 = config
+            .get_merged_ext_config("avocado-dev", "qemux86-64", config_path)
+            .unwrap();
         assert!(ext_x86.is_some());
         let ext_x86_value = ext_x86.unwrap();
         let ext_x86_table = ext_x86_value.as_table().unwrap();
-        assert_eq!(ext_x86_table.get("version").unwrap().as_str().unwrap(), "1.0.0");
-        assert_eq!(ext_x86_table.get("overlay").unwrap().as_str().unwrap(), "overlays/avocado-dev");
+        assert_eq!(
+            ext_x86_table.get("version").unwrap().as_str().unwrap(),
+            "1.0.0"
+        );
+        assert_eq!(
+            ext_x86_table.get("overlay").unwrap().as_str().unwrap(),
+            "overlays/avocado-dev"
+        );
 
         let types_x86 = ext_x86_table.get("types").unwrap().as_array().unwrap();
         assert_eq!(types_x86.len(), 2);
         assert_eq!(types_x86[0].as_str().unwrap(), "sysext");
 
         // Test avocado-dev extension for ARM64
-        let ext_arm64 = config.get_merged_ext_config("avocado-dev", "qemuarm64", config_path).unwrap();
+        let ext_arm64 = config
+            .get_merged_ext_config("avocado-dev", "qemuarm64", config_path)
+            .unwrap();
         assert!(ext_arm64.is_some());
         let ext_arm64_value = ext_arm64.unwrap();
         let ext_arm64_table = ext_arm64_value.as_table().unwrap();
-        assert_eq!(ext_arm64_table.get("version").unwrap().as_str().unwrap(), "1.0.0-arm64"); // Overridden
-        assert_eq!(ext_arm64_table.get("overlay").unwrap().as_str().unwrap(), "overlays/avocado-dev-arm64"); // Overridden
+        assert_eq!(
+            ext_arm64_table.get("version").unwrap().as_str().unwrap(),
+            "1.0.0-arm64"
+        ); // Overridden
+        assert_eq!(
+            ext_arm64_table.get("overlay").unwrap().as_str().unwrap(),
+            "overlays/avocado-dev-arm64"
+        ); // Overridden
 
         // Test nested dependencies merging
-        let deps_x86 = config.get_merged_nested_section("ext.avocado-dev", "dependencies", "qemux86-64", config_path).unwrap();
+        let deps_x86 = config
+            .get_merged_nested_section("ext.avocado-dev", "dependencies", "qemux86-64", config_path)
+            .unwrap();
         assert!(deps_x86.is_some());
         let deps_x86_value = deps_x86.unwrap();
         let deps_x86_table = deps_x86_value.as_table().unwrap();
@@ -1924,7 +2054,9 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         assert!(deps_x86_table.contains_key("nfs-utils"));
         assert!(!deps_x86_table.contains_key("gdb-multiarch"));
 
-        let deps_arm64 = config.get_merged_nested_section("ext.avocado-dev", "dependencies", "qemuarm64", config_path).unwrap();
+        let deps_arm64 = config
+            .get_merged_nested_section("ext.avocado-dev", "dependencies", "qemuarm64", config_path)
+            .unwrap();
         assert!(deps_arm64.is_some());
         let deps_arm64_value = deps_arm64.unwrap();
         let deps_arm64_table = deps_arm64_value.as_table().unwrap();
@@ -1933,7 +2065,14 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         assert!(deps_arm64_table.contains_key("arm64-debug-tools")); // Target-specific
 
         // Test SDK dependencies merging
-        let sdk_deps_x86 = config.get_merged_nested_section("ext.avocado-dev", "sdk.dependencies", "qemux86-64", config_path).unwrap();
+        let sdk_deps_x86 = config
+            .get_merged_nested_section(
+                "ext.avocado-dev",
+                "sdk.dependencies",
+                "qemux86-64",
+                config_path,
+            )
+            .unwrap();
         assert!(sdk_deps_x86.is_some());
         let sdk_deps_x86_value = sdk_deps_x86.unwrap();
         let sdk_deps_x86_table = sdk_deps_x86_value.as_table().unwrap();
@@ -1941,7 +2080,14 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         assert!(sdk_deps_x86_table.contains_key("nativesdk-gdb"));
         assert!(!sdk_deps_x86_table.contains_key("nativesdk-gdb-cross-aarch64"));
 
-        let sdk_deps_arm64 = config.get_merged_nested_section("ext.avocado-dev", "sdk.dependencies", "qemuarm64", config_path).unwrap();
+        let sdk_deps_arm64 = config
+            .get_merged_nested_section(
+                "ext.avocado-dev",
+                "sdk.dependencies",
+                "qemuarm64",
+                config_path,
+            )
+            .unwrap();
         assert!(sdk_deps_arm64.is_some());
         let sdk_deps_arm64_value = sdk_deps_arm64.unwrap();
         let sdk_deps_arm64_table = sdk_deps_arm64_value.as_table().unwrap();
@@ -1949,33 +2095,73 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         assert!(sdk_deps_arm64_table.contains_key("nativesdk-gdb-cross-aarch64")); // Target-specific
 
         // Test users merging
-        let users_root_x86 = config.get_merged_nested_section("ext.avocado-dev", "users.root", "qemux86-64", config_path).unwrap();
+        let users_root_x86 = config
+            .get_merged_nested_section("ext.avocado-dev", "users.root", "qemux86-64", config_path)
+            .unwrap();
         assert!(users_root_x86.is_some());
         let users_root_x86_value = users_root_x86.unwrap();
         let users_root_x86_table = users_root_x86_value.as_table().unwrap();
-        assert_eq!(users_root_x86_table.get("password").unwrap().as_str().unwrap(), "");
-        assert_eq!(users_root_x86_table.get("shell").unwrap().as_str().unwrap(), "/bin/bash");
+        assert_eq!(
+            users_root_x86_table
+                .get("password")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            users_root_x86_table.get("shell").unwrap().as_str().unwrap(),
+            "/bin/bash"
+        );
 
-        let users_root_arm64 = config.get_merged_nested_section("ext.avocado-dev", "users.root", "qemuarm64", config_path).unwrap();
+        let users_root_arm64 = config
+            .get_merged_nested_section("ext.avocado-dev", "users.root", "qemuarm64", config_path)
+            .unwrap();
         assert!(users_root_arm64.is_some());
         let users_root_arm64_value = users_root_arm64.unwrap();
         let users_root_arm64_table = users_root_arm64_value.as_table().unwrap();
-        assert_eq!(users_root_arm64_table.get("password").unwrap().as_str().unwrap(), "arm64-root"); // Overridden
-        assert_eq!(users_root_arm64_table.get("shell").unwrap().as_str().unwrap(), "/bin/bash"); // Inherited
+        assert_eq!(
+            users_root_arm64_table
+                .get("password")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "arm64-root"
+        ); // Overridden
+        assert_eq!(
+            users_root_arm64_table
+                .get("shell")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "/bin/bash"
+        ); // Inherited
 
         // Test peridio extension
-        let peridio_x86 = config.get_merged_ext_config("peridio", "qemux86-64", config_path).unwrap();
+        let peridio_x86 = config
+            .get_merged_ext_config("peridio", "qemux86-64", config_path)
+            .unwrap();
         assert!(peridio_x86.is_some());
         let peridio_x86_value = peridio_x86.unwrap();
         let peridio_x86_table = peridio_x86_value.as_table().unwrap();
-        let services_x86 = peridio_x86_table.get("enable_services").unwrap().as_array().unwrap();
+        let services_x86 = peridio_x86_table
+            .get("enable_services")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(services_x86.len(), 1);
 
-        let peridio_arm64 = config.get_merged_ext_config("peridio", "qemuarm64", config_path).unwrap();
+        let peridio_arm64 = config
+            .get_merged_ext_config("peridio", "qemuarm64", config_path)
+            .unwrap();
         assert!(peridio_arm64.is_some());
         let peridio_arm64_value = peridio_arm64.unwrap();
         let peridio_arm64_table = peridio_arm64_value.as_table().unwrap();
-        let services_arm64 = peridio_arm64_table.get("enable_services").unwrap().as_array().unwrap();
+        let services_arm64 = peridio_arm64_table
+            .get("enable_services")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(services_arm64.len(), 2); // Overridden with more services
 
         // Cleanup
@@ -2047,33 +2233,85 @@ shared_value = "rpi-override"
         let config = Config::load_from_str(config_content).unwrap();
 
         // Test x86-64 (base only)
-        let x86_nested = config.get_merged_nested_section("ext.complex", "level1.level2.level3", "qemux86-64", config_path).unwrap();
+        let x86_nested = config
+            .get_merged_nested_section(
+                "ext.complex",
+                "level1.level2.level3",
+                "qemux86-64",
+                config_path,
+            )
+            .unwrap();
         assert!(x86_nested.is_some());
         let x86_nested_value = x86_nested.unwrap();
         let x86_table = x86_nested_value.as_table().unwrap();
-        assert_eq!(x86_table.get("base_value").unwrap().as_str().unwrap(), "original");
-        assert_eq!(x86_table.get("shared_value").unwrap().as_str().unwrap(), "base");
+        assert_eq!(
+            x86_table.get("base_value").unwrap().as_str().unwrap(),
+            "original"
+        );
+        assert_eq!(
+            x86_table.get("shared_value").unwrap().as_str().unwrap(),
+            "base"
+        );
         assert!(x86_table.get("override_value").is_none());
         assert!(x86_table.get("nested_override").is_none());
 
         // Test ARM64 (has target-specific override)
-        let arm64_nested = config.get_merged_nested_section("ext.complex", "level1.level2.level3", "qemuarm64", config_path).unwrap();
+        let arm64_nested = config
+            .get_merged_nested_section(
+                "ext.complex",
+                "level1.level2.level3",
+                "qemuarm64",
+                config_path,
+            )
+            .unwrap();
         assert!(arm64_nested.is_some());
         let arm64_nested_value = arm64_nested.unwrap();
         let arm64_table = arm64_nested_value.as_table().unwrap();
-        assert_eq!(arm64_table.get("base_value").unwrap().as_str().unwrap(), "original"); // Inherited
-        assert_eq!(arm64_table.get("shared_value").unwrap().as_str().unwrap(), "arm64-override"); // Overridden
-        assert_eq!(arm64_table.get("override_value").unwrap().as_str().unwrap(), "arm64-specific"); // Target-specific
-        assert_eq!(arm64_table.get("nested_override").unwrap().as_str().unwrap(), "arm64-nested"); // Nested override
+        assert_eq!(
+            arm64_table.get("base_value").unwrap().as_str().unwrap(),
+            "original"
+        ); // Inherited
+        assert_eq!(
+            arm64_table.get("shared_value").unwrap().as_str().unwrap(),
+            "arm64-override"
+        ); // Overridden
+        assert_eq!(
+            arm64_table.get("override_value").unwrap().as_str().unwrap(),
+            "arm64-specific"
+        ); // Target-specific
+        assert_eq!(
+            arm64_table
+                .get("nested_override")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "arm64-nested"
+        ); // Nested override
 
         // Test RaspberryPi4 (different target-specific override)
-        let rpi_nested = config.get_merged_nested_section("ext.complex", "level1.level2.level3", "raspberrypi4", config_path).unwrap();
+        let rpi_nested = config
+            .get_merged_nested_section(
+                "ext.complex",
+                "level1.level2.level3",
+                "raspberrypi4",
+                config_path,
+            )
+            .unwrap();
         assert!(rpi_nested.is_some());
         let rpi_nested_value = rpi_nested.unwrap();
         let rpi_table = rpi_nested_value.as_table().unwrap();
-        assert_eq!(rpi_table.get("base_value").unwrap().as_str().unwrap(), "original"); // Inherited
-        assert_eq!(rpi_table.get("shared_value").unwrap().as_str().unwrap(), "rpi-override"); // Overridden
-        assert_eq!(rpi_table.get("rpi_specific").unwrap().as_bool().unwrap(), true); // Target-specific
+        assert_eq!(
+            rpi_table.get("base_value").unwrap().as_str().unwrap(),
+            "original"
+        ); // Inherited
+        assert_eq!(
+            rpi_table.get("shared_value").unwrap().as_str().unwrap(),
+            "rpi-override"
+        ); // Overridden
+        assert_eq!(
+            rpi_table.get("rpi_specific").unwrap().as_bool().unwrap(),
+            true
+        ); // Target-specific
         assert!(rpi_table.get("override_value").is_none()); // Not present for RPI
         assert!(rpi_table.get("nested_override").is_none()); // Not present for RPI
 
@@ -2106,30 +2344,45 @@ types = ["sysext"]
         let config = Config::load_from_str(target_only_config).unwrap();
 
         // SDK should return None for x86-64 (no base, no target-specific)
-        let sdk_x86 = config.get_merged_section("sdk", "qemux86-64", config_path).unwrap();
+        let sdk_x86 = config
+            .get_merged_section("sdk", "qemux86-64", config_path)
+            .unwrap();
         assert!(sdk_x86.is_none());
 
         // SDK should return target-specific for ARM64
-        let sdk_arm64 = config.get_merged_section("sdk", "qemuarm64", config_path).unwrap();
+        let sdk_arm64 = config
+            .get_merged_section("sdk", "qemuarm64", config_path)
+            .unwrap();
         assert!(sdk_arm64.is_some());
         let sdk_arm64_value = sdk_arm64.unwrap();
         let sdk_arm64_table = sdk_arm64_value.as_table().unwrap();
-        assert_eq!(sdk_arm64_table.get("image").unwrap().as_str().unwrap(), "arm64-only-sdk");
+        assert_eq!(
+            sdk_arm64_table.get("image").unwrap().as_str().unwrap(),
+            "arm64-only-sdk"
+        );
 
         // Runtime special should be None for x86-64
-        let runtime_x86 = config.get_merged_runtime_config("special", "qemux86-64", config_path).unwrap();
+        let runtime_x86 = config
+            .get_merged_runtime_config("special", "qemux86-64", config_path)
+            .unwrap();
         assert!(runtime_x86.is_none());
 
         // Runtime special should exist for ARM64
-        let runtime_arm64 = config.get_merged_runtime_config("special", "qemuarm64", config_path).unwrap();
+        let runtime_arm64 = config
+            .get_merged_runtime_config("special", "qemuarm64", config_path)
+            .unwrap();
         assert!(runtime_arm64.is_some());
 
         // Extension should be None for x86-64
-        let ext_x86 = config.get_merged_ext_config("arm-only", "qemux86-64", config_path).unwrap();
+        let ext_x86 = config
+            .get_merged_ext_config("arm-only", "qemux86-64", config_path)
+            .unwrap();
         assert!(ext_x86.is_none());
 
         // Extension should exist for ARM64
-        let ext_arm64 = config.get_merged_ext_config("arm-only", "qemuarm64", config_path).unwrap();
+        let ext_arm64 = config
+            .get_merged_ext_config("arm-only", "qemuarm64", config_path)
+            .unwrap();
         assert!(ext_arm64.is_some());
 
         // Cleanup

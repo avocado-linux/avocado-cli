@@ -102,7 +102,7 @@ impl ExtPackageCommand {
         let release = ext_config
             .get("release")
             .and_then(|v| v.as_str())
-            .unwrap_or("1")
+            .unwrap_or("r0")
             .to_string();
 
         let summary = ext_config
@@ -140,6 +140,8 @@ impl ExtPackageCommand {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let group = "system-extension".to_string();
+
         Ok(RpmMetadata {
             name,
             version,
@@ -149,6 +151,7 @@ impl ExtPackageCommand {
             license,
             arch,
             vendor,
+            group,
             url,
         })
     }
@@ -238,12 +241,15 @@ mkdir -p BUILD RPMS SOURCES SPECS SRPMS
 
 # Create spec file
 cat > SPECS/package.spec << 'SPEC_EOF'
+%define _buildhost reproducible
+
 Name: {}
 Version: {}
 Release: {}
 Summary: {}
 License: {}
-Vendor: {}{}
+Vendor: {}
+Group: {}{}
 
 %description
 {}
@@ -292,6 +298,7 @@ rm -rf "$TMPDIR"
             metadata.summary,
             metadata.license,
             metadata.vendor,
+            metadata.group,
             if let Some(url) = &metadata.url {
                 format!("\nURL: {url}")
             } else {
@@ -481,6 +488,7 @@ struct RpmMetadata {
     license: String,
     arch: String,
     vendor: String,
+    group: String,
     url: Option<String>,
 }
 
@@ -594,7 +602,7 @@ mod tests {
 
         assert_eq!(metadata.name, "test-extension");
         assert_eq!(metadata.version, "1.0.0");
-        assert_eq!(metadata.release, "1");
+        assert_eq!(metadata.release, "r0");
         assert_eq!(metadata.summary, "Test Extension system extension");
         assert_eq!(
             metadata.description,
@@ -603,6 +611,7 @@ mod tests {
         assert_eq!(metadata.license, "Unspecified");
         assert_eq!(metadata.arch, "avocado_x86_64_unknown_linux_gnu");
         assert_eq!(metadata.vendor, "Unspecified");
+        assert_eq!(metadata.group, "system-extension");
         assert_eq!(metadata.url, None);
     }
 
@@ -663,6 +672,7 @@ mod tests {
         assert_eq!(metadata.license, "MIT");
         assert_eq!(metadata.arch, "noarch"); // Explicit arch overrides generated
         assert_eq!(metadata.vendor, "Acme Corp");
+        assert_eq!(metadata.group, "system-extension");
         assert_eq!(metadata.url, Some("https://example.com".to_string()));
     }
 
