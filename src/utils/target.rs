@@ -226,6 +226,7 @@ pub fn get_target_from_config(config: &Config) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::env;
 
     fn create_test_config(default_target: Option<&str>) -> Config {
@@ -261,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_target_cli_priority() {
         // CLI target should have highest priority
         env::set_var("AVOCADO_TARGET", "env-target");
@@ -273,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_target_env_priority() {
         // Environment variable should have second priority
         env::set_var("AVOCADO_TARGET", "env-target");
@@ -285,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_target_config_fallback() {
         // Config default_target should be used as fallback
         env::remove_var("AVOCADO_TARGET");
@@ -295,6 +299,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_target_none() {
         // Should return None when no target is available
         env::remove_var("AVOCADO_TARGET");
@@ -305,6 +310,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_target_required_success() {
         // Should return target when available
         let config = create_test_config(Some("test-target"));
@@ -315,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_target_required_error() {
         // Should return error when no target available
         env::remove_var("AVOCADO_TARGET");
@@ -329,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_precedence_order_complete() {
         // Test complete precedence order: CLI > ENV > CONFIG
         env::set_var("AVOCADO_TARGET", "env-target");
@@ -349,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_get_target_from_env() {
         // Test environment variable function
         env::set_var("AVOCADO_TARGET", "test-env-target");
@@ -359,6 +368,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_empty_string_values() {
         // Test that empty strings are treated as no value
         env::remove_var("AVOCADO_TARGET");
@@ -370,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_supported_targets_list() {
         // Test with explicit list of supported targets
         let config = create_config_with_supported_targets(vec![
@@ -392,6 +403,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_supported_targets_all() {
         // Test with "*" (all targets supported)
         let config = create_config_with_supported_targets_all();
@@ -403,9 +415,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_supported_targets_none() {
         // Test with no supported_targets defined (all targets supported)
-        let config = create_test_config(Some("test-target"));
+        let config = create_test_config(Some("any-target"));
 
         assert!(config.get_supported_targets().is_none());
         assert!(config.is_target_supported("any-target"));
@@ -413,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_and_validate_target_success() {
         // Ensure no environment variable interferes with resolution
         env::remove_var("AVOCADO_TARGET");
@@ -424,6 +438,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_and_validate_target_unsupported() {
         env::remove_var("AVOCADO_TARGET");
         let config = create_config_with_supported_targets(vec!["qemux86-64".to_string()]);
@@ -439,6 +454,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_and_validate_target_all_supported() {
         env::remove_var("AVOCADO_TARGET");
         // When supported_targets = "*", should allow any target
@@ -452,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_and_validate_target_no_supported_targets() {
         env::remove_var("AVOCADO_TARGET");
         // When no supported_targets are defined, should allow any target
