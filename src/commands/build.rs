@@ -57,13 +57,17 @@ impl BuildCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
+        // Early target validation and logging - fail fast if target is unsupported
+        let target =
+            crate::utils::target::validate_and_log_target(self.target.as_deref(), &config)?;
+
         print_info(
             "Starting comprehensive build process...",
             OutputLevel::Normal,
         );
 
-        // Determine which runtimes to build
-        let runtimes_to_build = self.get_runtimes_to_build(&parsed)?;
+        // Determine which runtimes to build based on target
+        let runtimes_to_build = self.get_runtimes_to_build(&config, &parsed, &target)?;
 
         if runtimes_to_build.is_empty() {
             print_info("No runtimes found to build.", OutputLevel::Normal);
@@ -75,7 +79,8 @@ impl BuildCommand {
             "Step 1/4: Analyzing dependencies and compiling SDK code",
             OutputLevel::Normal,
         );
-        let required_extensions = self.find_required_extensions(&parsed, &runtimes_to_build)?;
+        let required_extensions =
+            self.find_required_extensions(&config, &parsed, &runtimes_to_build, &target)?;
         let sdk_sections = self.find_sdk_compile_sections(&config, &required_extensions)?;
 
         if !sdk_sections.is_empty() {
@@ -197,57 +202,101 @@ impl BuildCommand {
         Ok(())
     }
 
-    /// Determine which runtimes to build based on the --runtime parameter
-    fn get_runtimes_to_build(&self, parsed: &toml::Value) -> Result<Vec<String>> {
+    /// Determine which runtimes to build based on the --runtime parameter and target
+    fn get_runtimes_to_build(
+        &self,
+        config: &Config,
+        parsed: &toml::Value,
+        target: &str,
+    ) -> Result<Vec<String>> {
         let runtime_section = parsed
             .get("runtime")
             .and_then(|r| r.as_table())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
-        if let Some(ref runtime_name) = self.runtime {
-            // Single runtime specified
-            if !runtime_section.contains_key(runtime_name) {
+        let mut target_runtimes = Vec::new();
+
+        for runtime_name in runtime_section.keys() {
+            // If a specific runtime is requested, only check that one
+            if let Some(ref requested_runtime) = self.runtime {
+                if runtime_name != requested_runtime {
+                    continue;
+                }
+            }
+
+            // Check if this runtime is relevant for the target
+            let merged_runtime =
+                config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
+            if let Some(merged_value) = merged_runtime {
+                if let Some(runtime_target) = merged_value.get("target").and_then(|t| t.as_str()) {
+                    // Runtime has explicit target - only include if it matches
+                    if runtime_target == target {
+                        target_runtimes.push(runtime_name.clone());
+                    }
+                } else {
+                    // Runtime has no target specified - include for all targets
+                    target_runtimes.push(runtime_name.clone());
+                }
+            } else {
+                // If there's no merged config, check the base runtime config
+                if let Some(runtime_config) = runtime_section.get(runtime_name) {
+                    if let Some(runtime_target) =
+                        runtime_config.get("target").and_then(|t| t.as_str())
+                    {
+                        // Runtime has explicit target - only include if it matches
+                        if runtime_target == target {
+                            target_runtimes.push(runtime_name.clone());
+                        }
+                    } else {
+                        // Runtime has no target specified - include for all targets
+                        target_runtimes.push(runtime_name.clone());
+                    }
+                }
+            }
+        }
+
+        // If a specific runtime was requested but doesn't match the target, return an error
+        if let Some(ref requested_runtime) = self.runtime {
+            if target_runtimes.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "Runtime '{}' not found in configuration",
-                    runtime_name
+                    "Runtime '{}' is not configured for target '{}'",
+                    requested_runtime,
+                    target
                 ));
             }
-            Ok(vec![runtime_name.clone()])
-        } else {
-            // Build all runtimes
-            Ok(runtime_section.keys().cloned().collect())
         }
+
+        Ok(target_runtimes)
     }
 
-    /// Find all extensions required by the specified runtimes, or all extensions if no runtime specified
+    /// Find all extensions required by the specified runtimes and target
     fn find_required_extensions(
         &self,
+        config: &Config,
         parsed: &toml::Value,
         runtimes: &[String],
+        target: &str,
     ) -> Result<Vec<String>> {
         let mut required_extensions = HashSet::new();
 
-        // If no specific runtime is provided, build all extensions
-        if self.runtime.is_none() {
-            if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
-                for ext_name in ext_section.keys() {
-                    required_extensions.insert(ext_name.clone());
-                }
-            }
-        } else {
-            // Only build extensions needed by the specified runtimes
-            let runtime_section = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
+        // If no runtimes are found for this target, don't build any extensions
+        if runtimes.is_empty() {
+            return Ok(vec![]);
+        }
 
-            for runtime_name in runtimes {
-                if let Some(runtime_config) = runtime_section.get(runtime_name) {
-                    if let Some(dependencies) = runtime_config
-                        .get("dependencies")
-                        .and_then(|d| d.as_table())
-                    {
-                        for (_dep_name, dep_spec) in dependencies {
-                            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                                required_extensions.insert(ext_name.to_string());
-                            }
+        let _runtime_section = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
+
+        for runtime_name in runtimes {
+            // Get merged runtime config for this target
+            let merged_runtime =
+                config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
+            if let Some(merged_value) = merged_runtime {
+                if let Some(dependencies) =
+                    merged_value.get("dependencies").and_then(|d| d.as_table())
+                {
+                    for (_dep_name, dep_spec) in dependencies {
+                        if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                            required_extensions.insert(ext_name.to_string());
                         }
                     }
                 }
@@ -259,7 +308,7 @@ impl BuildCommand {
         Ok(extensions)
     }
 
-    /// Find SDK compile sections needed for the required extensions, or all sections if no runtime specified
+    /// Find SDK compile sections needed for the required extensions
     fn find_sdk_compile_sections(
         &self,
         config: &Config,
@@ -267,41 +316,23 @@ impl BuildCommand {
     ) -> Result<Vec<String>> {
         let mut needed_sections = HashSet::new();
 
-        // If no specific runtime is provided, compile all SDK sections
-        if self.runtime.is_none() {
+        // If we have extensions to build, compile all SDK sections
+        // A more sophisticated implementation could analyze which specific sections
+        // are needed based on the extension's SDK dependencies
+        if !required_extensions.is_empty() {
             let compile_dependencies = config.get_compile_dependencies();
             for section_name in compile_dependencies.keys() {
                 needed_sections.insert(section_name.clone());
             }
-        } else {
-            // Only compile sections needed by the required extensions
-            let content = std::fs::read_to_string(&self.config_path)?;
-            let extension_sdk_dependencies = config
-                .get_extension_sdk_dependencies(&content)
-                .with_context(|| "Failed to parse extension SDK dependencies")?;
 
-            // For each required extension, check if it has SDK dependencies that need compilation
-            for extension in required_extensions {
-                if let Some(_ext_deps) = extension_sdk_dependencies.get(extension) {
-                    // If the extension has SDK dependencies, we might need to compile them
-                    // For now, we'll check if there are compile sections defined and add them all
-                    // In a more sophisticated implementation, we'd analyze which specific sections
-                    // are needed based on the extension's SDK dependencies
-                    if self.verbose {
-                        print_info(
-                            &format!("Extension '{extension}' has SDK dependencies"),
-                            OutputLevel::Normal,
-                        );
-                    }
-                }
-            }
-
-            // Get compile sections from config - we'll compile all of them if any extensions need SDK code
-            if !required_extensions.is_empty() {
-                let compile_dependencies = config.get_compile_dependencies();
-                for section_name in compile_dependencies.keys() {
-                    needed_sections.insert(section_name.clone());
-                }
+            if self.verbose && !needed_sections.is_empty() {
+                print_info(
+                    &format!(
+                        "Found {} extensions requiring SDK compilation",
+                        required_extensions.len()
+                    ),
+                    OutputLevel::Normal,
+                );
             }
         }
 

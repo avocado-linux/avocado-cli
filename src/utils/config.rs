@@ -743,7 +743,10 @@ image = "avocadolinux/sdk:apollo-edge"
         let resolved_src_dir = config.get_resolved_src_dir(temp_file.path());
 
         assert!(resolved_src_dir.is_some());
-        assert_eq!(resolved_src_dir.unwrap(), PathBuf::from("/absolute/path/to/source"));
+        assert_eq!(
+            resolved_src_dir.unwrap(),
+            PathBuf::from("/absolute/path/to/source")
+        );
     }
 
     #[test]

@@ -60,6 +60,10 @@ impl InstallCommand {
         // Early target validation and logging - fail fast if target is unsupported
         let _target = validate_and_log_target(self.target.as_deref(), &config)?;
 
+        // Parse the configuration file for runtime/extension analysis
+        let content = std::fs::read_to_string(&self.config_path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+
         print_info(
             "Starting comprehensive install process...",
             OutputLevel::Normal,
@@ -86,8 +90,9 @@ impl InstallCommand {
             OutputLevel::Normal,
         );
 
-        // Determine which extensions to install based on runtime dependencies
-        let extensions_to_install = self.find_required_extensions(&config, &self.config_path)?;
+        // Determine which extensions to install based on runtime dependencies and target
+        let extensions_to_install =
+            self.find_required_extensions(&config, &self.config_path, &_target)?;
 
         if !extensions_to_install.is_empty() {
             for extension in &extensions_to_install {
@@ -115,31 +120,52 @@ impl InstallCommand {
             print_info("No extension dependencies to install.", OutputLevel::Normal);
         }
 
-        // 3. Install runtime dependencies
-        if let Some(ref runtime_name) = self.runtime {
+        // 3. Install runtime dependencies (filtered by target)
+        let target_runtimes = self.find_target_relevant_runtimes(&config, &parsed, &_target)?;
+
+        if target_runtimes.is_empty() {
             print_info(
-                &format!("Step 3/3: Installing runtime dependencies for '{runtime_name}'"),
+                &format!("Step 3/3: No runtimes found for target '{_target}'. Skipping runtime dependencies."),
                 OutputLevel::Normal,
             );
         } else {
-            print_info(
-                "Step 3/3: Installing runtime dependencies for all runtimes",
-                OutputLevel::Normal,
-            );
+            if target_runtimes.len() == 1 {
+                print_info(
+                    &format!(
+                        "Step 3/3: Installing runtime dependencies for '{}' (target: {_target})",
+                        target_runtimes[0]
+                    ),
+                    OutputLevel::Normal,
+                );
+            } else {
+                print_info(
+                    &format!("Step 3/3: Installing runtime dependencies for {} runtimes (target: {_target})", target_runtimes.len()),
+                    OutputLevel::Normal,
+                );
+            }
+
+            for runtime_name in &target_runtimes {
+                if self.verbose {
+                    print_info(
+                        &format!("Installing runtime dependencies for '{runtime_name}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+
+                let runtime_install_cmd = RuntimeInstallCommand::new(
+                    Some(runtime_name.clone()), // Install for this specific target-relevant runtime
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                );
+                runtime_install_cmd.execute().await.with_context(|| {
+                    format!("Failed to install runtime dependencies for '{runtime_name}'")
+                })?;
+            }
         }
-        let runtime_install_cmd = RuntimeInstallCommand::new(
-            self.runtime.clone(), // Use the specified runtime or None for all runtimes
-            self.config_path.clone(),
-            self.verbose,
-            self.force,
-            self.target.clone(),
-            self.container_args.clone(), // Pass original CLI args, let RuntimeInstallCommand merge with config
-            self.dnf_args.clone(),
-        );
-        runtime_install_cmd
-            .execute()
-            .await
-            .with_context(|| "Failed to install runtime dependencies")?;
 
         print_success(
             "All components installed successfully!",
@@ -148,8 +174,13 @@ impl InstallCommand {
         Ok(())
     }
 
-    /// Find all extensions required by the runtime, or all extensions if no runtime specified
-    fn find_required_extensions(&self, _config: &Config, config_path: &str) -> Result<Vec<String>> {
+    /// Find all extensions required by the runtime/target, or all extensions if no runtime/target specified
+    fn find_required_extensions(
+        &self,
+        config: &Config,
+        config_path: &str,
+        target: &str,
+    ) -> Result<Vec<String>> {
         use std::collections::HashSet;
 
         let mut required_extensions = HashSet::new();
@@ -158,26 +189,40 @@ impl InstallCommand {
         let content = std::fs::read_to_string(config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        // If no specific runtime is provided, install all extensions
-        if self.runtime.is_none() {
+        // First, find which runtimes are relevant for this target
+        let target_runtimes = self.find_target_relevant_runtimes(config, &parsed, target)?;
+
+        if target_runtimes.is_empty() {
+            if self.verbose {
+                print_info(
+                    &format!("No runtimes found for target '{target}'. Installing all extensions."),
+                    OutputLevel::Normal,
+                );
+            }
+            // If no runtimes match this target, install all extensions
             if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
                 for ext_name in ext_section.keys() {
                     required_extensions.insert(ext_name.clone());
                 }
             }
         } else {
-            // Only install extensions needed by the specified runtime
+            // Only install extensions needed by the target-relevant runtimes
             if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_table()) {
-                if let Some(runtime_name) = &self.runtime {
-                    if let Some(runtime_config) = runtime_section.get(runtime_name) {
-                        if let Some(dependencies) = runtime_config
-                            .get("dependencies")
-                            .and_then(|d| d.as_table())
-                        {
-                            for (_dep_name, dep_spec) in dependencies {
-                                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str())
-                                {
-                                    required_extensions.insert(ext_name.to_string());
+                for runtime_name in &target_runtimes {
+                    if let Some(_runtime_config) = runtime_section.get(runtime_name) {
+                        // Check both base dependencies and target-specific dependencies
+                        let merged_runtime =
+                            config.get_merged_runtime_config(runtime_name, target, config_path)?;
+                        if let Some(merged_value) = merged_runtime {
+                            if let Some(dependencies) =
+                                merged_value.get("dependencies").and_then(|d| d.as_table())
+                            {
+                                for (_dep_name, dep_spec) in dependencies {
+                                    if let Some(ext_name) =
+                                        dep_spec.get("ext").and_then(|v| v.as_str())
+                                    {
+                                        required_extensions.insert(ext_name.to_string());
+                                    }
                                 }
                             }
                         }
@@ -189,6 +234,61 @@ impl InstallCommand {
         let mut extensions: Vec<String> = required_extensions.into_iter().collect();
         extensions.sort();
         Ok(extensions)
+    }
+
+    /// Find runtimes that are relevant for the specified target
+    fn find_target_relevant_runtimes(
+        &self,
+        config: &Config,
+        parsed: &toml::Value,
+        target: &str,
+    ) -> Result<Vec<String>> {
+        let mut relevant_runtimes = Vec::new();
+
+        if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_table()) {
+            for runtime_name in runtime_section.keys() {
+                // If a specific runtime is requested, only check that one
+                if let Some(ref requested_runtime) = self.runtime {
+                    if runtime_name != requested_runtime {
+                        continue;
+                    }
+                }
+
+                // Check if this runtime is relevant for the target
+                let merged_runtime =
+                    config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
+                if let Some(merged_value) = merged_runtime {
+                    if let Some(runtime_target) =
+                        merged_value.get("target").and_then(|t| t.as_str())
+                    {
+                        // Runtime has explicit target - only include if it matches
+                        if runtime_target == target {
+                            relevant_runtimes.push(runtime_name.clone());
+                        }
+                    } else {
+                        // Runtime has no target specified - include for all targets
+                        relevant_runtimes.push(runtime_name.clone());
+                    }
+                } else {
+                    // If there's no merged config, check the base runtime config
+                    if let Some(runtime_config) = runtime_section.get(runtime_name) {
+                        if let Some(runtime_target) =
+                            runtime_config.get("target").and_then(|t| t.as_str())
+                        {
+                            // Runtime has explicit target - only include if it matches
+                            if runtime_target == target {
+                                relevant_runtimes.push(runtime_name.clone());
+                            }
+                        } else {
+                            // Runtime has no target specified - include for all targets
+                            relevant_runtimes.push(runtime_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(relevant_runtimes)
     }
 }
 

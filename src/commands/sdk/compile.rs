@@ -134,8 +134,8 @@ impl SdkCompileCommand {
                 OutputLevel::Normal,
             );
 
-            let container_helper = SdkContainer::from_config(&self.config_path, &config)?
-                .verbose(self.verbose);
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
 
             let compile_command = format!(
                 r#"if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
