@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Configuration error type
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +62,7 @@ pub enum SupportedTargets {
 pub struct Config {
     pub default_target: Option<String>,
     pub supported_targets: Option<SupportedTargets>,
+    pub src_dir: Option<String>,
     pub runtime: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
     pub provision: Option<HashMap<String, ProvisionProfileConfig>>,
@@ -307,6 +308,25 @@ impl Config {
         self.get_provision_profile(profile_name)?
             .container_args
             .as_ref()
+    }
+
+    /// Get the resolved source directory path
+    /// If src_dir is configured, it resolves relative paths relative to the config file
+    /// If not configured, returns None (use default behavior)
+    pub fn get_resolved_src_dir<P: AsRef<Path>>(&self, config_path: P) -> Option<PathBuf> {
+        self.src_dir.as_ref().map(|src_dir| {
+            let path = Path::new(src_dir);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                // Resolve relative to config file directory
+                let config_dir = config_path.as_ref().parent().unwrap_or(Path::new("."));
+                config_dir.join(path).canonicalize().unwrap_or_else(|_| {
+                    // If canonicalize fails, just join the paths
+                    config_dir.join(path)
+                })
+            }
+        })
     }
 
     /// Expand environment variables in a string
@@ -705,6 +725,69 @@ dependencies = { gcc = "*" }
     fn test_load_nonexistent_config() {
         let result = Config::load("nonexistent.toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_src_dir_absolute_path() {
+        let config_content = r#"
+src_dir = "/absolute/path/to/source"
+
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let resolved_src_dir = config.get_resolved_src_dir(temp_file.path());
+
+        assert!(resolved_src_dir.is_some());
+        assert_eq!(resolved_src_dir.unwrap(), PathBuf::from("/absolute/path/to/source"));
+    }
+
+    #[test]
+    fn test_src_dir_relative_path() {
+        let config_content = r#"
+src_dir = "../../"
+
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let resolved_src_dir = config.get_resolved_src_dir(temp_file.path());
+
+        assert!(resolved_src_dir.is_some());
+        let resolved_path = resolved_src_dir.unwrap();
+
+        // Should be resolved relative to the config file directory
+        let config_dir = temp_file.path().parent().unwrap();
+        let expected_path = config_dir.join("../../");
+
+        // Compare the canonical forms (or just the path if canonicalize fails)
+        let resolved_canonical = resolved_path.canonicalize().unwrap_or(resolved_path);
+        let expected_canonical = expected_path.canonicalize().unwrap_or(expected_path);
+        assert_eq!(resolved_canonical, expected_canonical);
+    }
+
+    #[test]
+    fn test_src_dir_not_configured() {
+        let config_content = r#"
+[sdk]
+image = "avocadolinux/sdk:apollo-edge"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let resolved_src_dir = config.get_resolved_src_dir(temp_file.path());
+
+        assert!(resolved_src_dir.is_none());
     }
 
     #[test]

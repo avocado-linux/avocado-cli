@@ -233,6 +233,7 @@ mod tests {
         Config {
             default_target: default_target.map(|s| s.to_string()),
             supported_targets: None,
+            src_dir: None,
             runtime: None,
             sdk: None,
             provision: None,
@@ -244,6 +245,7 @@ mod tests {
         Config {
             default_target: Some("qemux86-64".to_string()),
             supported_targets: Some(SupportedTargets::List(targets)),
+            src_dir: None,
             runtime: None,
             sdk: None,
             provision: None,
@@ -255,6 +257,7 @@ mod tests {
         Config {
             default_target: Some("qemux86-64".to_string()),
             supported_targets: Some(SupportedTargets::All("*".to_string())),
+            src_dir: None,
             runtime: None,
             sdk: None,
             provision: None,

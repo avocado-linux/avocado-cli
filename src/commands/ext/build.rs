@@ -212,7 +212,7 @@ impl ExtBuildCommand {
         let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Initialize SDK container helper
-        let container_helper = SdkContainer::new();
+        let container_helper = SdkContainer::from_config(&self.config_path, &config)?;
 
         // Build extensions based on configuration
         let mut overall_success = true;

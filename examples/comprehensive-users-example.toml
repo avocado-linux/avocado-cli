@@ -1,3 +1,9 @@
+# Custom source directory to mount in containers (optional)
+# If relative, it's resolved relative to this config file
+# If absolute, it's used as-is
+# If not specified, the current working directory is used
+# src_dir = "../../"
+
 [sdk]
 image = "ghcr.io/avocado-framework/avocado-sdk:latest"
 

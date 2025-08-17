@@ -138,7 +138,8 @@ impl SdkRunCommand {
         };
 
         // Use the container helper to run the command
-        let container_helper = SdkContainer::new().verbose(self.verbose);
+        let container_helper = SdkContainer::from_config(&self.config_path, &config)?
+            .verbose(self.verbose);
 
         let success = if self.detach {
             self.run_detached_container(&container_helper, &container_image, &target, &command)
@@ -207,7 +208,8 @@ impl SdkRunCommand {
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/src:rw", container_helper.cwd.display()));
+        let src_path = container_helper.src_dir.as_ref().unwrap_or(&container_helper.cwd);
+        container_cmd.push(format!("{}:/opt/src:rw", src_path.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 

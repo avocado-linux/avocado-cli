@@ -56,6 +56,7 @@ impl Default for RunConfig {
 pub struct SdkContainer {
     pub container_tool: String,
     pub cwd: PathBuf,
+    pub src_dir: Option<PathBuf>,
     pub verbose: bool,
 }
 
@@ -71,6 +72,7 @@ impl SdkContainer {
         Self {
             container_tool: "docker".to_string(),
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            src_dir: None,
             verbose: false,
         }
     }
@@ -81,6 +83,7 @@ impl SdkContainer {
         Self {
             container_tool,
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            src_dir: None,
             verbose: false,
         }
     }
@@ -89,6 +92,18 @@ impl SdkContainer {
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
+    }
+
+    /// Set custom source directory for mounting
+    pub fn with_src_dir(mut self, src_dir: Option<PathBuf>) -> Self {
+        self.src_dir = src_dir;
+        self
+    }
+
+    /// Create a new SdkContainer with configuration from config file
+    pub fn from_config(config_path: &str, config: &crate::utils::config::Config) -> Result<Self> {
+        let src_dir = config.get_resolved_src_dir(config_path);
+        Ok(Self::new().with_src_dir(src_dir))
     }
 
     /// Run a command in the container
@@ -199,7 +214,8 @@ impl SdkContainer {
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/src:rw", self.cwd.display()));
+        let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        container_cmd.push(format!("{}:/opt/src:rw", src_path.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 

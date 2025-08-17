@@ -85,7 +85,8 @@ impl SdkInstallCommand {
         let repo_release = config.get_sdk_repo_release();
 
         // Use the container helper to run the installation
-        let container_helper = SdkContainer::new().verbose(self.verbose);
+        let container_helper = SdkContainer::from_config(&self.config_path, &config)?
+            .verbose(self.verbose);
 
         // Install SDK dependencies (into SDK)
         let mut sdk_packages = Vec::new();
