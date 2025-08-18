@@ -302,6 +302,8 @@ impl SdkContainer {
                 Ok(false)
             }
         } else {
+            // In non-detached mode, we need to capture output to ensure stderr is visible
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
             let status = cmd
                 .status()
                 .await
