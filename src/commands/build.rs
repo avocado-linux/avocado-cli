@@ -81,6 +81,13 @@ impl BuildCommand {
                 .await;
         }
 
+        // If a specific runtime is requested, build only that runtime and its dependencies
+        if let Some(ref runtime_name) = self.runtime {
+            return self
+                .build_single_runtime(&config, &parsed, runtime_name, &target)
+                .await;
+        }
+
         print_info(
             "Starting comprehensive build process...",
             OutputLevel::Normal,
@@ -855,6 +862,265 @@ echo "External extension {extension_name} images are ready in output directory"
             OutputLevel::Normal,
         );
         Ok(())
+    }
+
+    /// Build a single runtime and its required extensions
+    async fn build_single_runtime(
+        &self,
+        config: &Config,
+        parsed: &toml::Value,
+        runtime_name: &str,
+        target: &str,
+    ) -> Result<()> {
+        print_info(
+            &format!("Building single runtime '{runtime_name}' for target '{target}'"),
+            OutputLevel::Normal,
+        );
+
+        // Verify the runtime exists and is configured for this target
+        let runtime_section = parsed
+            .get("runtime")
+            .and_then(|r| r.as_table())
+            .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
+
+        if !runtime_section.contains_key(runtime_name) {
+            return Err(anyhow::anyhow!(
+                "Runtime '{}' not found in configuration",
+                runtime_name
+            ));
+        }
+
+        // Check if this runtime is configured for the target
+        let merged_runtime =
+            config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
+        let runtime_config = if let Some(merged_value) = merged_runtime {
+            merged_value
+        } else {
+            return Err(anyhow::anyhow!(
+                "Runtime '{}' has no configuration for target '{}'",
+                runtime_name,
+                target
+            ));
+        };
+
+        // Check target compatibility
+        if let Some(runtime_target) = runtime_config.get("target").and_then(|t| t.as_str()) {
+            if runtime_target != target {
+                return Err(anyhow::anyhow!(
+                    "Runtime '{}' is configured for target '{}', not '{}'",
+                    runtime_name,
+                    runtime_target,
+                    target
+                ));
+            }
+        }
+
+        // Step 1: Find extensions required by this specific runtime
+        print_info(
+            "Step 1/4: Analyzing runtime dependencies",
+            OutputLevel::Normal,
+        );
+        let required_extensions = self.find_extensions_for_runtime(config, &runtime_config)?;
+        let sdk_sections = self.find_sdk_compile_sections(config, &required_extensions)?;
+
+        // Step 2: Compile SDK sections if needed
+        if !sdk_sections.is_empty() {
+            print_info("Step 2/4: Compiling SDK sections", OutputLevel::Normal);
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "Found {} SDK compile sections needed: {}",
+                        sdk_sections.len(),
+                        sdk_sections.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+
+            let sdk_compile_cmd = SdkCompileCommand::new(
+                self.config_path.clone(),
+                self.verbose,
+                sdk_sections,
+                self.target.clone(),
+                self.container_args.clone(),
+                self.dnf_args.clone(),
+            );
+            sdk_compile_cmd
+                .execute()
+                .await
+                .with_context(|| "Failed to compile SDK sections")?;
+        } else {
+            print_info("Step 2/4: No SDK compilation needed", OutputLevel::Normal);
+        }
+
+        // Step 3: Build required extensions
+        if !required_extensions.is_empty() {
+            print_info(
+                &format!(
+                    "Step 3/4: Building {} required extensions",
+                    required_extensions.len()
+                ),
+                OutputLevel::Normal,
+            );
+
+            for extension_dep in &required_extensions {
+                match extension_dep {
+                    ExtensionDependency::Local(extension_name) => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Building local extension '{extension_name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        let ext_build_cmd = ExtBuildCommand::new(
+                            extension_name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        );
+                        ext_build_cmd.execute().await.with_context(|| {
+                            format!("Failed to build extension '{extension_name}'")
+                        })?;
+
+                        // Create extension image
+                        let ext_image_cmd = ExtImageCommand::new(
+                            extension_name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        );
+                        ext_image_cmd.execute().await.with_context(|| {
+                            format!("Failed to create image for extension '{extension_name}'")
+                        })?;
+                    }
+                    ExtensionDependency::External {
+                        name,
+                        config_path: ext_config_path,
+                    } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Building external extension '{name}' from config '{ext_config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Build external extension
+                        self.build_external_extension(config, &self.config_path, name, ext_config_path, target).await.with_context(|| {
+                            format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
+                        })?;
+
+                        // Create images for external extension
+                        self.create_external_extension_images(config, &self.config_path, name, ext_config_path, target).await.with_context(|| {
+                            format!("Failed to create images for external extension '{name}' from config '{ext_config_path}'")
+                        })?;
+
+                        // Copy external extension images
+                        self.copy_external_extension_images(config, name, target)
+                            .await
+                            .with_context(|| {
+                                format!("Failed to copy images for external extension '{name}'")
+                            })?;
+                    }
+                }
+            }
+        } else {
+            print_info("Step 3/4: No extensions required", OutputLevel::Normal);
+        }
+
+        // Step 4: Build the runtime
+        print_info(
+            &format!("Step 4/4: Building runtime '{runtime_name}'"),
+            OutputLevel::Normal,
+        );
+
+        let runtime_build_cmd = RuntimeBuildCommand::new(
+            runtime_name.to_string(),
+            self.config_path.clone(),
+            self.verbose,
+            self.target.clone(),
+            self.container_args.clone(),
+            self.dnf_args.clone(),
+        );
+        runtime_build_cmd
+            .execute()
+            .await
+            .with_context(|| format!("Failed to build runtime '{runtime_name}'"))?;
+
+        print_success(
+            &format!("Successfully built runtime '{runtime_name}'!"),
+            OutputLevel::Normal,
+        );
+        Ok(())
+    }
+
+    /// Find extensions required by a specific runtime
+    fn find_extensions_for_runtime(
+        &self,
+        config: &Config,
+        runtime_config: &toml::Value,
+    ) -> Result<Vec<ExtensionDependency>> {
+        let mut required_extensions = HashSet::new();
+        let mut visited = HashSet::new();
+
+        // Check runtime dependencies for extensions
+        if let Some(dependencies) = runtime_config
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+        {
+            for (_dep_name, dep_spec) in dependencies {
+                // Check for extension dependency
+                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    // Check if this is an external extension (has config field)
+                    if let Some(external_config) = dep_spec.get("config").and_then(|v| v.as_str()) {
+                        let ext_dep = ExtensionDependency::External {
+                            name: ext_name.to_string(),
+                            config_path: external_config.to_string(),
+                        };
+                        required_extensions.insert(ext_dep.clone());
+
+                        // Recursively find nested external extension dependencies
+                        self.find_all_nested_extensions(
+                            config,
+                            &ext_dep,
+                            &mut required_extensions,
+                            &mut visited,
+                        )?;
+                    } else {
+                        // Local extension
+                        required_extensions
+                            .insert(ExtensionDependency::Local(ext_name.to_string()));
+
+                        // Also check local extension dependencies
+                        self.find_local_extension_dependencies(
+                            config,
+                            &toml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
+                            ext_name,
+                            &mut required_extensions,
+                            &mut visited,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let mut extensions: Vec<ExtensionDependency> = required_extensions.into_iter().collect();
+        extensions.sort_by(|a, b| {
+            let name_a = match a {
+                ExtensionDependency::Local(name) => name,
+                ExtensionDependency::External { name, .. } => name,
+            };
+            let name_b = match b {
+                ExtensionDependency::Local(name) => name,
+                ExtensionDependency::External { name, .. } => name,
+            };
+            name_a.cmp(name_b)
+        });
+        Ok(extensions)
     }
 
     /// Find an external extension by searching through the full dependency tree
