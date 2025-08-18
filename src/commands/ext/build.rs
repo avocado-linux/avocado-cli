@@ -16,8 +16,6 @@ enum OverlayMode {
     Opaque, // cp -r (replace directory contents)
 }
 
-
-
 pub struct ExtBuildCommand {
     extension: String,
     config_path: String,
@@ -208,8 +206,6 @@ impl ExtBuildCommand {
                 }
             }
         });
-
-
 
         // Get SDK configuration
         let container_image = parsed
@@ -1169,7 +1165,12 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1219,7 +1220,13 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],None,&[],&[],None,
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
             None,
             false,
         );
@@ -1352,7 +1359,12 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1382,7 +1394,12 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Merge,
         };
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],Some(&overlay_config),&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay_config),
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1415,7 +1432,13 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Merge,
         };
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],Some(&overlay_config),&[],&[],None,
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay_config),
+            &[],
+            &[],
+            None,
             None,
             false,
         );
@@ -1447,7 +1470,12 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Opaque,
         };
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],Some(&overlay_config),&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay_config),
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1482,7 +1510,13 @@ mod tests {
             dir: "peridio".to_string(),
             mode: OverlayMode::Opaque,
         };
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],Some(&overlay_config),&[],&[],None,
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay_config),
+            &[],
+            &[],
+            None,
             None,
             false,
         );
@@ -1512,12 +1546,23 @@ mod tests {
             dnf_args: None,
         };
 
-        let script_sysext = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script_sysext = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             false,
         );
-        let script_confext = cmd.create_confext_build_script("1.0",&["system".to_string()],None,&[],&[],None,
+        let script_confext = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
             None,
             false,
         );
@@ -1571,7 +1616,12 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1601,7 +1651,13 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],None,&[],&[],None,
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
             None,
             false,
         );
@@ -1627,7 +1683,13 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],None,&[],&[],None,
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
             None,
             false,
         );
@@ -1689,7 +1751,8 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
-            &[],&on_merge_commands,
+            &[],
+            &on_merge_commands,
             None,
             None,
             false,
@@ -1716,7 +1779,12 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1741,7 +1809,12 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             false,
@@ -1880,7 +1953,12 @@ mod tests {
         root_user.insert("password".to_string(), toml::Value::String("".to_string()));
         users_config.insert("root".to_string(), toml::Value::Table(root_user));
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             Some(&users_config),
             None,
             false,
@@ -1919,7 +1997,13 @@ mod tests {
         root_user.insert("password".to_string(), toml::Value::String("".to_string()));
         users_config.insert("root".to_string(), toml::Value::Table(root_user));
 
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],None,&[],&[],Some(&users_config),
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            Some(&users_config),
             None,
             false,
         );
@@ -2276,7 +2360,12 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_sysext_build_script("1.0",&["system".to_string()],None,&[],&[],
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
             None,
             None,
             true,
@@ -2297,7 +2386,13 @@ mod tests {
             dnf_args: None,
         };
 
-        let script = cmd.create_confext_build_script("1.0",&["system".to_string()],None,&[],&[],None,
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
             None,
             true,
         );
