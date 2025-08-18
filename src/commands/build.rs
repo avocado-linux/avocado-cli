@@ -167,9 +167,11 @@ impl BuildCommand {
                         })?;
 
                         // Copy external extension images to output directory so runtime build can find them
-                        self.copy_external_extension_images(&config, name, &target).await.with_context(|| {
-                            format!("Failed to copy images for external extension '{name}'")
-                        })?;
+                        self.copy_external_extension_images(&config, name, &target)
+                            .await
+                            .with_context(|| {
+                                format!("Failed to copy images for external extension '{name}'")
+                            })?;
                     }
                 }
             }
@@ -647,7 +649,8 @@ impl BuildCommand {
             .unwrap_or_else(|| vec!["sysext".to_string()]);
 
         // Resolve the external config path for ExtImageCommand
-        let resolved_external_config_path = config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
 
         // Create ExtImageCommand for the external extension
         let ext_image_cmd = crate::commands::ext::image::ExtImageCommand::new(

@@ -165,7 +165,8 @@ impl RuntimeBuildCommand {
 
         // Recursively discover all extension dependencies (including nested external extensions)
         let config = crate::utils::config::Config::load(&self.config_path)?;
-        let all_required_extensions = self.find_all_extension_dependencies(&config, &required_extensions)?;
+        let all_required_extensions =
+            self.find_all_extension_dependencies(&config, &required_extensions)?;
 
         // Build extension symlink commands from config
         let mut symlink_commands = Vec::new();
@@ -306,9 +307,14 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                 for (_dep_name, dep_spec) in dependencies {
                     if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
                         // Check if this is an external extension dependency
-                        if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
+                        if let Some(external_config_path) =
+                            dep_spec.get("config").and_then(|v| v.as_str())
+                        {
                             // This is an external extension - load its config and process recursively
-                            let external_extensions = config.load_external_extensions(&self.config_path, external_config_path)?;
+                            let external_extensions = config.load_external_extensions(
+                                &self.config_path,
+                                external_config_path,
+                            )?;
 
                             // Add the external extension itself
                             self.collect_extension_dependencies(
@@ -320,9 +326,13 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 
                             // Process its dependencies from the external config
                             if let Some(ext_config) = external_extensions.get(nested_ext_name) {
-                                if let Some(nested_deps) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+                                if let Some(nested_deps) =
+                                    ext_config.get("dependencies").and_then(|d| d.as_table())
+                                {
                                     for (_nested_dep_name, nested_dep_spec) in nested_deps {
-                                        if let Some(nested_nested_ext_name) = nested_dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                        if let Some(nested_nested_ext_name) =
+                                            nested_dep_spec.get("ext").and_then(|v| v.as_str())
+                                        {
                                             self.collect_extension_dependencies(
                                                 config,
                                                 nested_nested_ext_name,
@@ -348,23 +358,35 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         } else {
             // This might be an external extension - we need to find it in the runtime dependencies
             // to get its config path, then process its dependencies
-            let runtime_config = parsed.get("runtime").context("No runtime configuration found")?;
+            let runtime_config = parsed
+                .get("runtime")
+                .context("No runtime configuration found")?;
             let runtime_spec = runtime_config
                 .get(&self.runtime_name)
                 .with_context(|| format!("Runtime '{}' not found", self.runtime_name))?;
 
-            if let Some(runtime_deps) = runtime_spec.get("dependencies").and_then(|v| v.as_table()) {
+            if let Some(runtime_deps) = runtime_spec.get("dependencies").and_then(|v| v.as_table())
+            {
                 for (_dep_name, dep_spec) in runtime_deps {
                     if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
                         if dep_ext_name == ext_name {
-                            if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
+                            if let Some(external_config_path) =
+                                dep_spec.get("config").and_then(|v| v.as_str())
+                            {
                                 // Found the external extension - process its dependencies
-                                let external_extensions = config.load_external_extensions(&self.config_path, external_config_path)?;
+                                let external_extensions = config.load_external_extensions(
+                                    &self.config_path,
+                                    external_config_path,
+                                )?;
 
                                 if let Some(ext_config) = external_extensions.get(ext_name) {
-                                    if let Some(nested_deps) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+                                    if let Some(nested_deps) =
+                                        ext_config.get("dependencies").and_then(|d| d.as_table())
+                                    {
                                         for (_nested_dep_name, nested_dep_spec) in nested_deps {
-                                            if let Some(nested_ext_name) = nested_dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                            if let Some(nested_ext_name) =
+                                                nested_dep_spec.get("ext").and_then(|v| v.as_str())
+                                            {
                                                 self.collect_extension_dependencies(
                                                     config,
                                                     nested_ext_name,
@@ -390,6 +412,14 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
+        let config_path = temp_dir.path().join("avocado.toml");
+        fs::write(&config_path, content).unwrap();
+        config_path.to_string_lossy().to_string()
+    }
 
     #[test]
     fn test_new() {
@@ -410,6 +440,7 @@ mod tests {
 
     #[test]
     fn test_create_build_script() {
+        let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
 [sdk]
 image = "test-image"
@@ -420,10 +451,11 @@ target = "x86_64"
 [runtime.test-runtime.dependencies]
 test-dep = { ext = "test-ext" }
 "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
         let parsed: toml::Value = toml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            config_path,
             false,
             Some("x86_64".to_string()),
             None,
@@ -441,6 +473,7 @@ test-dep = { ext = "test-ext" }
 
     #[test]
     fn test_create_build_script_with_extensions() {
+        let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
 [sdk]
 image = "test-image"
@@ -455,10 +488,11 @@ test-dep = { ext = "test-ext" }
 version = "1.0"
 types = ["sysext"]
 "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
         let parsed: toml::Value = toml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            config_path,
             false,
             Some("x86_64".to_string()),
             None,
@@ -475,6 +509,7 @@ types = ["sysext"]
 
     #[test]
     fn test_create_build_script_with_type_overrides() {
+        let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
 [sdk]
 image = "test-image"
@@ -489,10 +524,11 @@ test-dep = { ext = "test-ext", types = ["sysext"] }
 version = "1.0"
 types = ["sysext", "confext"]
 "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
         let parsed: toml::Value = toml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            config_path,
             false,
             Some("x86_64".to_string()),
             None,
@@ -511,6 +547,7 @@ types = ["sysext", "confext"]
 
     #[test]
     fn test_create_build_script_no_type_override_uses_extension_defaults() {
+        let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
 [sdk]
 image = "test-image"
@@ -525,10 +562,11 @@ test-dep = { ext = "test-ext" }
 version = "1.0"
 types = ["confext"]
 "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
         let parsed: toml::Value = toml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            config_path,
             false,
             Some("x86_64".to_string()),
             None,

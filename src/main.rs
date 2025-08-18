@@ -189,7 +189,7 @@ enum SdkCommands {
         #[arg(short, long)]
         verbose: bool,
         /// Source the avocado SDK environment before running command
-        #[arg(short, long)]
+        #[arg(short = 'E', long)]
         env: bool,
         /// Command and arguments to run in container
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
