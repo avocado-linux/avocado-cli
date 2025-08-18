@@ -232,7 +232,7 @@ impl SdkContainer {
 
         // Add environment variables
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
+        container_cmd.push(format!("AVOCADO_TARGET={target}"));
 
         for (key, value) in env_vars {
             container_cmd.push("-e".to_string());
@@ -345,7 +345,7 @@ fi
 
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
 
-export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_SDK_TARGET}"
+export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_TARGET}"
 export AVOCADO_SDK_PREFIX="${AVOCADO_PREFIX}/sdk"
 export AVOCADO_EXT_SYSROOTS="${AVOCADO_PREFIX}/extensions"
 export DNF_SDK_HOST_PREFIX="${AVOCADO_SDK_PREFIX}"
@@ -410,7 +410,7 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF -y install "avocado-sdk-$AVOCADO_SDK_TARGET"
+        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF -y install "avocado-sdk-$AVOCADO_TARGET"
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
