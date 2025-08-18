@@ -309,36 +309,51 @@ impl ExtCheckoutCommand {
     }
 
     async fn fix_ownership(&self, path: &Path) -> Result<()> {
-        // Get current user ID and group ID
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
+        // On Unix systems, fix ownership to match the current user
+        #[cfg(unix)]
+        {
+            // Get current user ID and group ID
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
 
-        if self.verbose {
-            print_info(
-                &format!(
-                    "Setting ownership to {}:{} for {}",
-                    uid,
-                    gid,
-                    path.display()
-                ),
-                OutputLevel::Normal,
-            );
-        }
-
-        // Use chown to fix ownership recursively
-        let output = AsyncCommand::new("chown")
-            .arg("-R")
-            .arg(format!("{uid}:{gid}"))
-            .arg(path)
-            .output()
-            .await
-            .context("Failed to change file ownership")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             if self.verbose {
                 print_info(
-                    &format!("Note: Could not change ownership (may not be needed): {stderr}"),
+                    &format!(
+                        "Setting ownership to {}:{} for {}",
+                        uid,
+                        gid,
+                        path.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+
+            // Use chown to fix ownership recursively
+            let output = AsyncCommand::new("chown")
+                .arg("-R")
+                .arg(format!("{uid}:{gid}"))
+                .arg(path)
+                .output()
+                .await
+                .context("Failed to change file ownership")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if self.verbose {
+                    print_info(
+                        &format!("Note: Could not change ownership (may not be needed): {stderr}"),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
+        // On Windows, ownership changes are not needed/supported in the same way
+        #[cfg(windows)]
+        {
+            if self.verbose {
+                print_info(
+                    &format!("Ownership changes not needed on Windows for {}", path.display()),
                     OutputLevel::Normal,
                 );
             }
