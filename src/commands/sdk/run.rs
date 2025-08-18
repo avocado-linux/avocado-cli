@@ -26,6 +26,10 @@ pub struct SdkRunCommand {
     pub verbose: bool,
     /// Source the avocado SDK environment before running command
     pub env: bool,
+    /// Mount extension sysroot and change working directory to it
+    pub extension: Option<String>,
+    /// Mount runtime sysroot and change working directory to it
+    pub runtime: Option<String>,
     /// Command and arguments to run in container
     pub command: Option<Vec<String>>,
     /// Global target architecture
@@ -47,6 +51,8 @@ impl SdkRunCommand {
         interactive: bool,
         verbose: bool,
         env: bool,
+        extension: Option<String>,
+        runtime: Option<String>,
         command: Option<Vec<String>>,
         target: Option<String>,
         container_args: Option<Vec<String>>,
@@ -60,6 +66,8 @@ impl SdkRunCommand {
             interactive,
             verbose,
             env,
+            extension,
+            runtime,
             command,
             target,
             container_args,
@@ -73,6 +81,13 @@ impl SdkRunCommand {
         if self.interactive && self.detach {
             return Err(anyhow::anyhow!(
                 "Cannot specify both --interactive (-i) and --detach (-d) simultaneously."
+            ));
+        }
+
+        // Validate that extension and runtime are not both specified
+        if self.extension.is_some() && self.runtime.is_some() {
+            return Err(anyhow::anyhow!(
+                "Cannot specify both --extension (-e) and --runtime (-r) simultaneously."
             ));
         }
 
@@ -165,6 +180,8 @@ impl SdkRunCommand {
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
+                extension_sysroot: self.extension.clone(),
+                runtime_sysroot: self.runtime.clone(),
                 ..Default::default()
             };
             container_helper.run_in_container(config).await?
@@ -270,6 +287,8 @@ impl SdkRunCommand {
             repo_release: repo_release.cloned(),
             container_args: self.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            extension_sysroot: self.extension.clone(),
+            runtime_sysroot: self.runtime.clone(),
             ..Default::default()
         };
         container_helper.run_in_container(config).await
@@ -290,6 +309,8 @@ mod tests {
             false,
             true,
             false, // env
+            None,  // extension
+            None,  // runtime
             Some(vec!["echo".to_string(), "test".to_string()]),
             Some("test-target".to_string()),
             None,
@@ -319,6 +340,8 @@ mod tests {
             true,  // interactive
             false, // verbose
             true,  // env
+            None,  // extension
+            None,  // runtime
             Some(vec!["ls".to_string(), "-la".to_string()]),
             Some("test-target".to_string()),
             None,
@@ -341,6 +364,8 @@ mod tests {
             true, // interactive
             false,
             false, // env
+            None,  // extension
+            None,  // runtime
             None,
             None,
             None,
@@ -365,6 +390,8 @@ mod tests {
             false, // not interactive
             false,
             false, // env
+            None,  // extension
+            None,  // runtime
             None,  // no command
             None,
             None,
@@ -390,6 +417,8 @@ mod tests {
             false,
             false,
             true, // env = true
+            None, // extension
+            None, // runtime
             Some(vec![
                 "vm".to_string(),
                 "--mem".to_string(),
@@ -419,6 +448,8 @@ mod tests {
             false,
             false,
             false, // env = false
+            None,  // extension
+            None,  // runtime
             Some(vec!["echo".to_string(), "test".to_string()]),
             None,
             None,
@@ -426,5 +457,75 @@ mod tests {
         );
 
         assert!(!cmd_no_env.env);
+    }
+
+    #[tokio::test]
+    async fn test_extension_and_runtime_conflict() {
+        let cmd = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some("test-ext".to_string()),     // extension
+            Some("test-runtime".to_string()), // runtime
+            Some(vec!["echo".to_string(), "test".to_string()]),
+            None,
+            None,
+            None,
+        );
+
+        let result = cmd.execute().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot specify both --extension (-e) and --runtime (-r)"));
+    }
+
+    #[test]
+    fn test_extension_sysroot_creation() {
+        let cmd = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some("test-ext".to_string()), // extension
+            None,                         // runtime
+            Some(vec!["echo".to_string(), "test".to_string()]),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(cmd.extension, Some("test-ext".to_string()));
+        assert_eq!(cmd.runtime, None);
+    }
+
+    #[test]
+    fn test_runtime_sysroot_creation() {
+        let cmd = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,                             // extension
+            Some("test-runtime".to_string()), // runtime
+            Some(vec!["echo".to_string(), "test".to_string()]),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(cmd.extension, None);
+        assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
     }
 }

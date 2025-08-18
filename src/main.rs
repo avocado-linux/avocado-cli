@@ -191,6 +191,12 @@ enum SdkCommands {
         /// Source the avocado SDK environment before running command
         #[arg(short = 'E', long)]
         env: bool,
+        /// Mount extension sysroot and change working directory to it
+        #[arg(short = 'e', long)]
+        extension: Option<String>,
+        /// Mount runtime sysroot and change working directory to it
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Command and arguments to run in container
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -904,6 +910,8 @@ async fn main() -> Result<()> {
                 interactive,
                 verbose,
                 env,
+                extension,
+                runtime,
                 command,
                 container_args,
                 dnf_args,
@@ -921,6 +929,8 @@ async fn main() -> Result<()> {
                     interactive,
                     verbose,
                     env,
+                    extension,
+                    runtime,
                     cmd,
                     cli.target,
                     container_args,

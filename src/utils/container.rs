@@ -28,6 +28,8 @@ pub struct RunConfig {
     pub repo_release: Option<String>,
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
+    pub extension_sysroot: Option<String>,
+    pub runtime_sysroot: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -48,6 +50,8 @@ impl Default for RunConfig {
             repo_release: None,
             container_args: None,
             dnf_args: None,
+            extension_sysroot: None,
+            runtime_sysroot: None,
         }
     }
 }
@@ -148,7 +152,12 @@ impl SdkContainer {
 
         // Conditionally include the entrypoint script
         if config.use_entrypoint {
-            full_command.push_str(&self.create_entrypoint_script(config.source_environment));
+            full_command.push_str(&self.create_entrypoint_script(
+                config.source_environment,
+                config.extension_sysroot.as_deref(),
+                config.runtime_sysroot.as_deref(),
+                &config.target,
+            ));
             full_command.push('\n');
         }
 
@@ -218,6 +227,8 @@ impl SdkContainer {
         container_cmd.push(format!("{}:/opt/src:rw", src_path.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+
+        // Note: Working directory is handled in the entrypoint script based on sysroot parameters
 
         // Add environment variables
         container_cmd.push("-e".to_string());
@@ -300,7 +311,13 @@ impl SdkContainer {
     }
 
     /// Create the entrypoint script for SDK initialization
-    pub fn create_entrypoint_script(&self, source_environment: bool) -> String {
+    pub fn create_entrypoint_script(
+        &self,
+        source_environment: bool,
+        extension_sysroot: Option<&str>,
+        runtime_sysroot: Option<&str>,
+        target: &str,
+    ) -> String {
         let mut script = r#"
 set -e
 
@@ -420,8 +437,20 @@ fi
 
 export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
 
-cd /opt/src
 "#.to_string();
+
+        // Conditionally change to sysroot directory or default to /opt/src
+        if let Some(extension_name) = extension_sysroot {
+            script.push_str(&format!(
+                "cd /opt/_avocado/{target}/extensions/{extension_name}\n"
+            ));
+        } else if let Some(runtime_name) = runtime_sysroot {
+            script.push_str(&format!(
+                "cd /opt/_avocado/{target}/runtimes/{runtime_name}\n"
+            ));
+        } else {
+            script.push_str("cd /opt/src\n");
+        }
 
         // Conditionally add environment sourcing based on the source_environment parameter
         if source_environment {
@@ -532,10 +561,29 @@ mod tests {
     #[test]
     fn test_entrypoint_script() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true);
+        let script = container.create_entrypoint_script(true, None, None, "x86_64");
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
+        assert!(script.contains("cd /opt/src"));
+    }
+
+    #[test]
+    fn test_entrypoint_script_with_extension_sysroot() {
+        let container = SdkContainer::new();
+        let script = container.create_entrypoint_script(true, Some("test-ext"), None, "x86_64");
+        assert!(script.contains("AVOCADO_SDK_PREFIX"));
+        assert!(script.contains("cd /opt/_avocado/x86_64/extensions/test-ext"));
+        assert!(!script.contains("cd /opt/src"));
+    }
+
+    #[test]
+    fn test_entrypoint_script_with_runtime_sysroot() {
+        let container = SdkContainer::new();
+        let script = container.create_entrypoint_script(true, None, Some("test-runtime"), "x86_64");
+        assert!(script.contains("AVOCADO_SDK_PREFIX"));
+        assert!(script.contains("cd /opt/_avocado/x86_64/runtimes/test-runtime"));
+        assert!(!script.contains("cd /opt/src"));
     }
 
     #[test]
