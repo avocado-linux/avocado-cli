@@ -6,6 +6,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Represents the location of an extension (local or external)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExtensionLocation {
+    /// Extension defined in the main config file
+    Local { name: String, config_path: String },
+    /// Extension defined in an external config file
+    External { name: String, config_path: String },
+}
+
 /// Configuration error type
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -402,6 +411,295 @@ impl Config {
         }
 
         Ok(external_extensions)
+    }
+
+    /// Find an extension in the full dependency tree (local and external)
+    /// This is a comprehensive search that looks through all runtime dependencies
+    /// and their transitive extension dependencies
+    pub fn find_extension_in_dependency_tree(
+        &self,
+        config_path: &str,
+        extension_name: &str,
+        target: &str,
+    ) -> Result<Option<ExtensionLocation>> {
+        let content = std::fs::read_to_string(config_path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+
+        // First check if it's a local extension
+        if let Some(ext_section) = parsed.get("ext") {
+            if let Some(ext_table) = ext_section.as_table() {
+                if ext_table.contains_key(extension_name) {
+                    return Ok(Some(ExtensionLocation::Local {
+                        name: extension_name.to_string(),
+                        config_path: config_path.to_string(),
+                    }));
+                }
+            }
+        }
+
+        // If not local, search through the full dependency tree
+        let mut all_extensions = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::new();
+
+        // Get all extensions from runtime dependencies (this will recursively traverse)
+        let runtime_section = parsed
+            .get("runtime")
+            .and_then(|r| r.as_table());
+
+        if let Some(runtime_section) = runtime_section {
+            for runtime_name in runtime_section.keys() {
+                // Get merged runtime config for this target
+                let merged_runtime = self.get_merged_runtime_config(runtime_name, target, config_path)?;
+                if let Some(merged_value) = merged_runtime {
+                    if let Some(dependencies) =
+                        merged_value.get("dependencies").and_then(|d| d.as_table())
+                    {
+                        for (_dep_name, dep_spec) in dependencies {
+                            // Check for extension dependency
+                            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                // Check if this is an external extension (has config field)
+                                if let Some(external_config) =
+                                    dep_spec.get("config").and_then(|v| v.as_str())
+                                {
+                                    let ext_location = ExtensionLocation::External {
+                                        name: ext_name.to_string(),
+                                        config_path: external_config.to_string(),
+                                    };
+                                    all_extensions.insert(ext_location.clone());
+
+                                    // Recursively find nested external extension dependencies
+                                    self.find_all_nested_extensions_for_lookup(
+                                        config_path,
+                                        &ext_location,
+                                        &mut all_extensions,
+                                        &mut visited,
+                                    )?;
+                                } else {
+                                    // Local extension
+                                    all_extensions.insert(ExtensionLocation::Local {
+                                        name: ext_name.to_string(),
+                                        config_path: config_path.to_string(),
+                                    });
+
+                                    // Also check local extension dependencies
+                                    self.find_local_extension_dependencies_for_lookup(
+                                        config_path,
+                                        &parsed,
+                                        ext_name,
+                                        &mut all_extensions,
+                                        &mut visited,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now search for the target extension in all collected extensions
+        for ext_location in all_extensions {
+            let found_name = match &ext_location {
+                ExtensionLocation::Local { name, .. } => name,
+                ExtensionLocation::External { name, .. } => name,
+            };
+
+            if found_name == extension_name {
+                return Ok(Some(ext_location));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Recursively find all nested extensions for lookup
+    fn find_all_nested_extensions_for_lookup(
+        &self,
+        base_config_path: &str,
+        ext_location: &ExtensionLocation,
+        all_extensions: &mut std::collections::HashSet<ExtensionLocation>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let (ext_name, ext_config_path) = match ext_location {
+            ExtensionLocation::External { name, config_path } => (name, config_path),
+            ExtensionLocation::Local { name, config_path } => {
+                // For local extensions, we need to check their dependencies too
+                let content = std::fs::read_to_string(config_path)?;
+                let parsed: toml::Value = toml::from_str(&content)?;
+                return self.find_local_extension_dependencies_for_lookup(
+                    config_path,
+                    &parsed,
+                    name,
+                    all_extensions,
+                    visited,
+                );
+            }
+        };
+
+        // Cycle detection: check if we've already processed this extension
+        let ext_key = format!("{ext_name}:{ext_config_path}");
+        if visited.contains(&ext_key) {
+            return Ok(());
+        }
+        visited.insert(ext_key);
+
+        // Load the external extension configuration
+        let resolved_external_config_path =
+            self.resolve_path_relative_to_src_dir(base_config_path, ext_config_path);
+        let external_extensions = self.load_external_extensions(base_config_path, ext_config_path)?;
+
+        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                ext_name,
+                ext_config_path
+            )
+        })?;
+
+        // Load the nested config file to get its src_dir setting
+        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let nested_config: toml::Value =
+            toml::from_str(&nested_config_content).with_context(|| {
+                format!(
+                    "Failed to parse nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Create a temporary Config object for the nested config to handle its src_dir
+        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+
+        // Check if this external extension has dependencies
+        if let Some(dependencies) = extension_config
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+        {
+            for (_dep_name, dep_spec) in dependencies {
+                // Check for nested extension dependency
+                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    // Check if this is a nested external extension (has config field)
+                    if let Some(nested_external_config) =
+                        dep_spec.get("config").and_then(|v| v.as_str())
+                    {
+                        // Resolve the nested config path relative to the nested config's src_dir
+                        let nested_config_path = nested_config_obj
+                            .resolve_path_relative_to_src_dir(
+                                &resolved_external_config_path,
+                                nested_external_config,
+                            );
+
+                        let nested_ext_location = ExtensionLocation::External {
+                            name: nested_ext_name.to_string(),
+                            config_path: nested_config_path.to_string_lossy().to_string(),
+                        };
+
+                        // Add the nested extension to all extensions
+                        all_extensions.insert(nested_ext_location.clone());
+
+                        // Recursively process the nested extension
+                        self.find_all_nested_extensions_for_lookup(
+                            base_config_path,
+                            &nested_ext_location,
+                            all_extensions,
+                            visited,
+                        )?;
+                    } else {
+                        // This is a local extension dependency within the external config
+                        all_extensions.insert(ExtensionLocation::Local {
+                            name: nested_ext_name.to_string(),
+                            config_path: resolved_external_config_path.to_string_lossy().to_string(),
+                        });
+
+                        // Check dependencies of this local extension in the external config
+                        self.find_local_extension_dependencies_for_lookup(
+                            &resolved_external_config_path.to_string_lossy(),
+                            &nested_config,
+                            nested_ext_name,
+                            all_extensions,
+                            visited,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find dependencies of local extensions for lookup
+    fn find_local_extension_dependencies_for_lookup(
+        &self,
+        config_path: &str,
+        parsed_config: &toml::Value,
+        ext_name: &str,
+        all_extensions: &mut std::collections::HashSet<ExtensionLocation>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        // Cycle detection for local extensions
+        let ext_key = format!("local:{ext_name}:{config_path}");
+        if visited.contains(&ext_key) {
+            return Ok(());
+        }
+        visited.insert(ext_key);
+
+        // Get the local extension configuration
+        if let Some(ext_config) = parsed_config
+            .get("ext")
+            .and_then(|ext| ext.get(ext_name))
+        {
+            // Check if this local extension has dependencies
+            if let Some(dependencies) = ext_config
+                .get("dependencies")
+                .and_then(|d| d.as_table())
+            {
+                for (_dep_name, dep_spec) in dependencies {
+                    // Check for extension dependency
+                    if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                        // Check if this is an external extension (has config field)
+                        if let Some(external_config) =
+                            dep_spec.get("config").and_then(|v| v.as_str())
+                        {
+                            let ext_location = ExtensionLocation::External {
+                                name: nested_ext_name.to_string(),
+                                config_path: external_config.to_string(),
+                            };
+                            all_extensions.insert(ext_location.clone());
+
+                            // Recursively find nested external extension dependencies
+                            self.find_all_nested_extensions_for_lookup(
+                                config_path,
+                                &ext_location,
+                                all_extensions,
+                                visited,
+                            )?;
+                        } else {
+                            // Local extension dependency
+                            all_extensions.insert(ExtensionLocation::Local {
+                                name: nested_ext_name.to_string(),
+                                config_path: config_path.to_string(),
+                            });
+
+                            // Recursively check this local extension's dependencies
+                            self.find_local_extension_dependencies_for_lookup(
+                                config_path,
+                                parsed_config,
+                                nested_ext_name,
+                                all_extensions,
+                                visited,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Expand environment variables in a string

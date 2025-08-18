@@ -780,9 +780,9 @@ async fn main() -> Result<()> {
             ExtCommands::Deps {
                 config,
                 extension,
-                target: _,
+                target,
             } => {
-                let deps_cmd = ExtDepsCommand::new(config, extension);
+                let deps_cmd = ExtDepsCommand::new(config, extension, target.or(cli.target));
                 deps_cmd.execute()?;
                 Ok(())
             }

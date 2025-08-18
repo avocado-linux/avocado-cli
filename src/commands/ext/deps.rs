@@ -1,61 +1,73 @@
 use anyhow::Result;
 use std::collections::HashSet;
 
-use crate::utils::config::load_config;
-use crate::utils::output::{print_error, OutputLevel};
+use crate::utils::config::{Config, ExtensionLocation};
+use crate::utils::output::{print_error, print_info, OutputLevel};
+use crate::utils::target::resolve_target_required;
 
 pub struct ExtDepsCommand {
     config_path: String,
     extension: Option<String>,
+    target: Option<String>,
 }
 
 impl ExtDepsCommand {
-    pub fn new(config_path: String, extension: Option<String>) -> Self {
+    pub fn new(config_path: String, extension: Option<String>, target: Option<String>) -> Self {
         Self {
             config_path,
             extension,
+            target,
         }
     }
 
     pub fn execute(&self) -> Result<()> {
-        let _config = load_config(&self.config_path)?;
+        let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        self.get_ext_section(&parsed)?;
-        let extensions_to_process = self.get_extensions_to_process(&parsed)?;
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let extensions_to_process = self.get_extensions_to_process(&config, &parsed, &target)?;
 
         self.display_dependencies(&parsed, &extensions_to_process);
         Ok(())
     }
 
-    fn get_ext_section(&self, parsed: &toml::Value) -> Result<()> {
-        match parsed.get("ext") {
-            Some(_) => Ok(()),
-            None => {
-                self.handle_no_extensions();
-                Err(anyhow::anyhow!("No ext section found"))
-            }
-        }
-    }
-
-    fn get_extensions_to_process(&self, parsed: &toml::Value) -> Result<Vec<String>> {
-        let ext_section = parsed
-            .get("ext")
-            .ok_or_else(|| anyhow::anyhow!("No ext section found"))?;
-        let ext_table = ext_section
-            .as_table()
-            .ok_or_else(|| anyhow::anyhow!("Invalid ext section format"))?;
-
+    fn get_extensions_to_process(&self, config: &Config, parsed: &toml::Value, target: &str) -> Result<Vec<String>> {
         match &self.extension {
             Some(extension_name) => {
-                if !ext_table.contains_key(extension_name) {
-                    self.print_extension_not_found(extension_name);
-                    return Err(anyhow::anyhow!("Extension not found"));
+                // Use comprehensive lookup for specific extension
+                match config.find_extension_in_dependency_tree(&self.config_path, extension_name, target)? {
+                    Some(location) => {
+                        if let ExtensionLocation::External { name, config_path } = &location {
+                            print_info(
+                                &format!("Found external extension '{name}' in config '{config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        Ok(vec![extension_name.clone()])
+                    }
+                    None => {
+                        self.print_extension_not_found(extension_name);
+                        Err(anyhow::anyhow!("Extension not found"))
+                    }
                 }
-                Ok(vec![extension_name.clone()])
             }
-            None => Ok(ext_table.keys().cloned().collect()),
+            None => {
+                // For listing all extensions, still use local extensions only
+                let ext_section = parsed.get("ext");
+                match ext_section {
+                    Some(ext) => {
+                        let ext_table = ext
+                            .as_table()
+                            .ok_or_else(|| anyhow::anyhow!("Invalid ext section format"))?;
+                        Ok(ext_table.keys().cloned().collect())
+                    }
+                    None => {
+                        self.handle_no_extensions();
+                        Err(anyhow::anyhow!("No ext section found"))
+                    }
+                }
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::utils::config::Config;
+use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -42,9 +42,9 @@ impl ExtDnfCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        self.validate_extension_exists(&parsed)?;
-        let container_image = self.get_container_image(&parsed)?;
         let target = self.resolve_target_architecture(&config)?;
+        let extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
+        let container_image = self.get_container_image(&parsed)?;
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
@@ -57,32 +57,40 @@ impl ExtDnfCommand {
             repo_url,
             repo_release,
             &merged_container_args,
+            &extension_location,
         )
         .await
     }
 
-    fn validate_extension_exists(&self, parsed: &toml::Value) -> Result<()> {
-        let ext_section = parsed.get("ext").ok_or_else(|| {
-            print_error(
-                &format!("Extension '{}' not found in configuration.", self.extension),
-                OutputLevel::Normal,
-            );
-            anyhow::anyhow!("No ext section found")
-        })?;
-
-        let ext_table = ext_section
-            .as_table()
-            .ok_or_else(|| anyhow::anyhow!("Invalid ext section format"))?;
-
-        if !ext_table.contains_key(&self.extension) {
-            print_error(
-                &format!("Extension '{}' not found in configuration.", self.extension),
-                OutputLevel::Normal,
-            );
-            return Err(anyhow::anyhow!("Extension not found"));
+    fn find_extension_in_dependency_tree(&self, config: &Config, target: &str) -> Result<ExtensionLocation> {
+        match config.find_extension_in_dependency_tree(&self.config_path, &self.extension, target)? {
+            Some(location) => {
+                if self.verbose {
+                    match &location {
+                        ExtensionLocation::Local { name, config_path } => {
+                            print_info(
+                                &format!("Found local extension '{name}' in config '{config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        ExtensionLocation::External { name, config_path } => {
+                            print_info(
+                                &format!("Found external extension '{name}' in config '{config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+                Ok(location)
+            }
+            None => {
+                print_error(
+                    &format!("Extension '{}' not found in configuration.", self.extension),
+                    OutputLevel::Normal,
+                );
+                Err(anyhow::anyhow!("Extension not found"))
+            }
         }
-
-        Ok(())
     }
 
     fn get_container_image(&self, parsed: &toml::Value) -> Result<String> {
@@ -109,6 +117,7 @@ impl ExtDnfCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
+        extension_location: &ExtensionLocation,
     ) -> Result<()> {
         let container_helper = SdkContainer::new();
 
@@ -121,11 +130,12 @@ impl ExtDnfCommand {
             repo_url,
             repo_release,
             merged_container_args,
+            extension_location,
         )
         .await?;
 
         // Build and execute DNF command
-        let dnf_command = self.build_dnf_command();
+        let dnf_command = self.build_dnf_command(extension_location);
         self.run_dnf_command(
             &container_helper,
             container_image,
@@ -148,8 +158,13 @@ impl ExtDnfCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
+        extension_location: &ExtensionLocation,
     ) -> Result<()> {
-        let check_cmd = format!("test -d $AVOCADO_EXT_SYSROOTS/{}", self.extension);
+        let extension_name = match extension_location {
+            ExtensionLocation::Local { name, .. } => name,
+            ExtensionLocation::External { name, .. } => name,
+        };
+        let check_cmd = format!("test -d $AVOCADO_EXT_SYSROOTS/{extension_name}");
 
         let config = RunConfig {
             container_image: container_image.to_string(),
@@ -175,6 +190,7 @@ impl ExtDnfCommand {
                 repo_url,
                 repo_release,
                 merged_container_args,
+                extension_location,
             )
             .await?;
         }
@@ -191,10 +207,14 @@ impl ExtDnfCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
+        extension_location: &ExtensionLocation,
     ) -> Result<()> {
+        let extension_name = match extension_location {
+            ExtensionLocation::Local { name, .. } => name,
+            ExtensionLocation::External { name, .. } => name,
+        };
         let setup_cmd = format!(
-            "mkdir -p $AVOCADO_EXT_SYSROOTS/{}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{}/var/lib",
-            self.extension, self.extension
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib"
         );
 
         let config = RunConfig {
@@ -215,8 +235,7 @@ impl ExtDnfCommand {
         if !setup_success {
             print_error(
                 &format!(
-                    "Failed to set up extension directory for '{}'.",
-                    self.extension
+                    "Failed to set up extension directory for '{extension_name}'."
                 ),
                 OutputLevel::Normal,
             );
@@ -225,7 +244,7 @@ impl ExtDnfCommand {
 
         if self.verbose {
             print_info(
-                &format!("Created extension directory for '{}'.", self.extension),
+                &format!("Created extension directory for '{extension_name}'."),
                 OutputLevel::Normal,
             );
         }
@@ -275,8 +294,12 @@ impl ExtDnfCommand {
         }
     }
 
-    fn build_dnf_command(&self) -> String {
-        let installroot = format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension);
+    fn build_dnf_command(&self, extension_location: &ExtensionLocation) -> String {
+        let extension_name = match extension_location {
+            ExtensionLocation::Local { name, .. } => name,
+            ExtensionLocation::External { name, .. } => name,
+        };
+        let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension_name}");
         let command_args_str = self.command.join(" ");
         let dnf_args_str = if let Some(args) = &self.dnf_args {
             format!(" {} ", args.join(" "))
