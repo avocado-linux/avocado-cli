@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::commands::{
     ext::{ExtBuildCommand, ExtImageCommand},
     runtime::RuntimeBuildCommand,
-    sdk::{SdkCompileCommand, SdkInstallCommand},
+    sdk::SdkCompileCommand,
 };
 use crate::utils::{
     config::Config,
@@ -94,7 +94,7 @@ impl BuildCommand {
             return Ok(());
         }
 
-        // Step 1: Analyze dependencies and install/compile SDK code
+        // Step 1: Analyze dependencies and compile SDK code if needed
         print_info(
             "Step 1/4: Analyzing dependencies and preparing SDK",
             OutputLevel::Normal,
@@ -103,25 +103,7 @@ impl BuildCommand {
             self.find_required_extensions(&config, &parsed, &runtimes_to_build, &target)?;
         let sdk_sections = self.find_sdk_compile_sections(&config, &required_extensions)?;
 
-        // Install SDK dependencies (including from nested extension configs)
-        print_info(
-            "Installing SDK dependencies (including from nested extensions)...",
-            OutputLevel::Normal,
-        );
-        let sdk_install_cmd = SdkInstallCommand::new(
-            self.config_path.clone(),
-            self.verbose,
-            false, // force
-            self.target.clone(),
-            self.container_args.clone(),
-            self.dnf_args.clone(),
-        );
-        sdk_install_cmd
-            .execute()
-            .await
-            .with_context(|| "Failed to install SDK dependencies")?;
-
-        // Compile SDK sections if needed
+        // Compile SDK sections if needed (but don't install dependencies - that's for 'avocado install')
         if !sdk_sections.is_empty() {
             if self.verbose {
                 print_info(
@@ -801,57 +783,9 @@ echo "External extension {extension_name} images are ready in output directory"
                 })?
         };
 
-        // Step 1: Install SDK dependencies
+        // Step 1: Build the extension (skip SDK installation for single extension builds)
         print_info(
-            "Step 1/3: Installing SDK dependencies...",
-            OutputLevel::Normal,
-        );
-        let sdk_install_cmd = SdkInstallCommand::new(
-            self.config_path.clone(),
-            self.verbose,
-            false, // force
-            self.target.clone(),
-            self.container_args.clone(),
-            self.dnf_args.clone(),
-        );
-        sdk_install_cmd
-            .execute()
-            .await
-            .with_context(|| "Failed to install SDK dependencies")?;
-
-        // Check if we need SDK compilation for this extension
-        let sdk_sections = self.find_sdk_compile_sections(config, &[extension_dep.clone()])?;
-        if !sdk_sections.is_empty() {
-            if self.verbose {
-                print_info(
-                    &format!(
-                        "Found {} SDK compile sections needed: {}",
-                        sdk_sections.len(),
-                        sdk_sections.join(", ")
-                    ),
-                    OutputLevel::Normal,
-                );
-            }
-
-            let sdk_compile_cmd = SdkCompileCommand::new(
-                self.config_path.clone(),
-                self.verbose,
-                sdk_sections,
-                self.target.clone(),
-                self.container_args.clone(),
-                self.dnf_args.clone(),
-            );
-            sdk_compile_cmd
-                .execute()
-                .await
-                .with_context(|| "Failed to compile SDK sections")?;
-        } else {
-            print_info("No SDK compilation needed.", OutputLevel::Normal);
-        }
-
-        // Step 2: Build the extension
-        print_info(
-            &format!("Step 2/3: Building extension '{extension_name}'"),
+            &format!("Step 1/2: Building extension '{extension_name}'"),
             OutputLevel::Normal,
         );
 
@@ -880,9 +814,9 @@ echo "External extension {extension_name} images are ready in output directory"
             }
         }
 
-        // Step 3: Create extension image
+        // Step 2: Create extension image
         print_info(
-            &format!("Step 3/3: Creating image for extension '{extension_name}'"),
+            &format!("Step 2/2: Creating image for extension '{extension_name}'"),
             OutputLevel::Normal,
         );
 
@@ -934,7 +868,7 @@ echo "External extension {extension_name} images are ready in output directory"
         // First, collect all extensions in the dependency tree
         let mut all_extensions = HashSet::new();
         let mut visited = HashSet::new();
-        
+
         // Get all extensions from runtime dependencies (this will recursively traverse)
         let runtime_section = parsed
             .get("runtime")
@@ -973,7 +907,7 @@ echo "External extension {extension_name} images are ready in output directory"
                                 // Local extension
                                 all_extensions
                                     .insert(ExtensionDependency::Local(ext_name.to_string()));
-                                
+
                                 // Also check local extension dependencies
                                 self.find_local_extension_dependencies(
                                     config,
@@ -995,7 +929,7 @@ echo "External extension {extension_name} images are ready in output directory"
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
             };
-            
+
             if found_name == extension_name {
                 return Ok(Some(ext_dep));
             }
@@ -1115,15 +1049,16 @@ echo "External extension {extension_name} images are ready in output directory"
                         )?;
                     } else {
                         // This is a local extension dependency within the external config
-                        all_extensions.insert(ExtensionDependency::Local(nested_ext_name.to_string()));
-                        
+                        all_extensions
+                            .insert(ExtensionDependency::Local(nested_ext_name.to_string()));
+
                         if self.verbose {
                             print_info(
                                 &format!("Found local extension dependency '{nested_ext_name}' in external extension '{ext_name}'"),
                                 OutputLevel::Normal,
                             );
                         }
-                        
+
                         // Check dependencies of this local extension in the external config
                         self.find_local_extension_dependencies_in_config(
                             config,
@@ -1178,15 +1113,9 @@ echo "External extension {extension_name} images are ready in output directory"
         visited.insert(ext_key);
 
         // Get the local extension configuration
-        if let Some(ext_config) = parsed_config
-            .get("ext")
-            .and_then(|ext| ext.get(ext_name))
-        {
+        if let Some(ext_config) = parsed_config.get("ext").and_then(|ext| ext.get(ext_name)) {
             // Check if this local extension has dependencies
-            if let Some(dependencies) = ext_config
-                .get("dependencies")
-                .and_then(|d| d.as_table())
-            {
+            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
                 for (_dep_name, dep_spec) in dependencies {
                     // Check for extension dependency
                     if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
@@ -1211,7 +1140,7 @@ echo "External extension {extension_name} images are ready in output directory"
                             // Local extension dependency
                             all_extensions
                                 .insert(ExtensionDependency::Local(nested_ext_name.to_string()));
-                            
+
                             // Recursively check this local extension's dependencies
                             self.find_local_extension_dependencies_in_config(
                                 config,
