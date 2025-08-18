@@ -108,6 +108,12 @@ impl ExtBuildCommand {
             })
             .unwrap_or_default();
 
+        // Get reload_service_manager configuration (defaults to false)
+        let reload_service_manager = ext_config
+            .get("reload_service_manager")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Get users and groups configuration
         let users_config = ext_config.get("users").and_then(|v| v.as_table());
         let groups_config = ext_config.get("groups").and_then(|v| v.as_table());
@@ -239,6 +245,7 @@ impl ExtBuildCommand {
                         &on_merge_commands,
                         users_config,
                         groups_config,
+                        reload_service_manager,
                     )
                     .await?
                 }
@@ -257,6 +264,7 @@ impl ExtBuildCommand {
                         &on_merge_commands,
                         users_config,
                         groups_config,
+                        reload_service_manager,
                     )
                     .await?
                 }
@@ -308,6 +316,7 @@ impl ExtBuildCommand {
         on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
+        reload_service_manager: bool,
     ) -> Result<bool> {
         // Create the build script for sysext extension
         let build_script = self.create_sysext_build_script(
@@ -318,6 +327,7 @@ impl ExtBuildCommand {
             on_merge_commands,
             users_config,
             groups_config,
+            reload_service_manager,
         );
 
         // Execute the build script in the SDK container
@@ -369,6 +379,7 @@ impl ExtBuildCommand {
         on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
+        reload_service_manager: bool,
     ) -> Result<bool> {
         // Create the build script for confext extension
         let build_script = self.create_confext_build_script(
@@ -379,6 +390,7 @@ impl ExtBuildCommand {
             on_merge_commands,
             users_config,
             groups_config,
+            reload_service_manager,
         );
 
         // Execute the build script in the SDK container
@@ -424,6 +436,7 @@ impl ExtBuildCommand {
         on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
+        reload_service_manager: bool,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
@@ -495,7 +508,7 @@ modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
 
 mkdir -p "$release_dir"
 echo "ID=_any" > "$release_file"
-echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
+echo "EXTENSION_RELOAD_MANAGER={}" >> "$release_file"
 echo "SYSEXT_SCOPE={}" >> "$release_file"
 
 # Check if extension includes kernel modules and add AVOCADO_ON_MERGE if needed
@@ -530,6 +543,7 @@ fi
             self.extension,
             self.extension,
             self.extension,
+            if reload_service_manager { "1" } else { "0" },
             ext_scopes.join(" "),
             self.extension,
             self.extension,
@@ -554,6 +568,7 @@ fi
         on_merge_commands: &[String],
         users_config: Option<&toml::value::Table>,
         groups_config: Option<&toml::value::Table>,
+        reload_service_manager: bool,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
@@ -656,7 +671,7 @@ release_file="$release_dir/extension-release.{}"
 
 mkdir -p "$release_dir"
 echo "ID=_any" > "$release_file"
-echo "EXTENSION_RELOAD_MANAGER=1" >> "$release_file"
+echo "EXTENSION_RELOAD_MANAGER={}" >> "$release_file"
 echo "CONFEXT_SCOPE={}" >> "$release_file"
 
 # Check if extension includes sysusers.d config files and add systemd-sysusers to AVOCADO_ON_MERGE if needed
@@ -684,6 +699,7 @@ fi
             users_section,
             self.extension,
             self.extension,
+            if reload_service_manager { "1" } else { "0" },
             ext_scopes.join(" "),
             self.extension,
             self.extension,
@@ -1157,6 +1173,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Print the actual script for debugging
@@ -1168,7 +1185,7 @@ mod tests {
         assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext\""));
         assert!(script.contains("modules_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/modules\""));
         assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
-        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
+        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=0\" >> \"$release_file\""));
         assert!(script.contains("echo \"SYSEXT_SCOPE=system\" >> \"$release_file\""));
         assert!(script.contains(
             "if [ -d \"$modules_dir\" ] && [ -n \"$(find \"$modules_dir\" -name \"*.ko\""
@@ -1211,13 +1228,14 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
         assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext\""));
         assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
-        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
+        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=0\" >> \"$release_file\""));
         assert!(script.contains("echo \"CONFEXT_SCOPE=system\" >> \"$release_file\""));
         // Confext should NOT include kernel module detection
         assert!(!script.contains("modules_dir"));
@@ -1263,6 +1281,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         assert!(script.contains("echo \"SYSEXT_SCOPE=system portable\" >> \"$release_file\""));
@@ -1288,6 +1307,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         assert!(script.contains("echo \"CONFEXT_SCOPE=system portable\" >> \"$release_file\""));
@@ -1314,6 +1334,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Check that service linking commands are present
@@ -1346,6 +1367,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify the find command looks for common kernel module extensions
@@ -1380,6 +1402,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify overlay merging commands are present
@@ -1417,6 +1440,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify overlay merging commands are present
@@ -1454,6 +1478,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify overlay opaque mode commands are present
@@ -1493,6 +1518,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify overlay opaque mode commands are present
@@ -1528,6 +1554,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
         let script_confext = cmd.create_confext_build_script(
             "1.0",
@@ -1537,6 +1564,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify no overlay merging commands are present
@@ -1568,6 +1596,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify AVOCADO_MODPROBE is added with correct modules
@@ -1595,6 +1624,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify sysusers.d detection logic is present
@@ -1629,6 +1659,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify sysusers.d detection logic is present for confext
@@ -1660,6 +1691,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify ld.so.conf.d detection logic is present for confext
@@ -1694,6 +1726,7 @@ mod tests {
             &on_merge_commands,
             None,
             None,
+            false,
         );
 
         // Verify custom on_merge commands are added correctly
@@ -1722,6 +1755,7 @@ mod tests {
             &on_merge_commands,
             None,
             None,
+            false,
         );
 
         // Verify custom on_merge commands are added correctly
@@ -1753,6 +1787,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify both kernel modules and sysusers.d are handled correctly with separate lines
@@ -1782,6 +1817,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
 
         // Verify AVOCADO_MODPROBE section exists but with empty check
@@ -1925,6 +1961,7 @@ mod tests {
             &[],
             Some(&users_config),
             None,
+            false,
         );
 
         // Verify the complete build script includes users functionality
@@ -1968,6 +2005,7 @@ mod tests {
             &[],
             Some(&users_config),
             None,
+            false,
         );
 
         // Verify the complete build script includes users functionality
@@ -2309,5 +2347,57 @@ mod tests {
             script.contains("testuser:x:$CURRENT_UID:$CURRENT_UID:testuser:/home/testuser:/bin/sh")
         );
         assert!(script.contains("testuser:*:19000:0:99999:7:::")); // Default password "*" (no login)
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_reload_service_manager_true() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            true,
+        );
+
+        // Verify that reload_service_manager = true sets EXTENSION_RELOAD_MANAGER=1
+        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
+    }
+
+    #[test]
+    fn test_create_confext_build_script_with_reload_service_manager_true() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            true,
+        );
+
+        // Verify that reload_service_manager = true sets EXTENSION_RELOAD_MANAGER=1
+        assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
     }
 }
