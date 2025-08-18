@@ -1,6 +1,7 @@
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, OutputLevel};
+use crate::utils::target::validate_and_log_target;
 use anyhow::Result;
 use clap::Args;
 
@@ -39,38 +40,8 @@ impl HitlServerCommand {
         let config = Config::load(&self.config_path)?;
         let container_helper = SdkContainer::new().verbose(self.verbose);
 
-        // Determine target
-        let target = if let Some(ref target) = self.target {
-            target.clone()
-        } else if let Some(ref runtime_map) = config.runtime {
-            if let Some(first_runtime) = runtime_map.keys().next() {
-                if let Some(runtime_config) = runtime_map.get(first_runtime) {
-                    if let Some(ref target) = runtime_config.target {
-                        target.clone()
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "No target specified for runtime '{}'",
-                            first_runtime
-                        ));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "No target configuration found for runtime '{}'",
-                        first_runtime
-                    ));
-                }
-            } else {
-                return Err(anyhow::anyhow!("No runtime configurations found"));
-            }
-        } else {
-            return Err(anyhow::anyhow!(
-                "No target specified and no runtime configuration found"
-            ));
-        };
-
-        if self.verbose {
-            print_debug(&format!("Using target: {target}"), OutputLevel::Normal);
-        }
+        // Use shared target resolution logic with early validation and logging
+        let target = validate_and_log_target(self.target.as_deref(), &config)?;
 
         // Get SDK configuration
         let (container_image, repo_url, repo_release) = if let Some(sdk_config) = &config.sdk {
