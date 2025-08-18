@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -34,7 +35,7 @@ impl ExtImageCommand {
 
     pub async fn execute(&self) -> Result<()> {
         // Load configuration and parse raw TOML
-        let config = crate::utils::config::Config::load(&self.config_path)?;
+        let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
@@ -44,13 +45,37 @@ impl ExtImageCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
-        // Get extension configuration
+        // Find extension using comprehensive lookup
+        let extension_location = config.find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+            })?;
+
+        if self.verbose {
+            match &extension_location {
+                ExtensionLocation::Local { name, config_path } => {
+                    print_info(
+                        &format!("Found local extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                ExtensionLocation::External { name, config_path } => {
+                    print_info(
+                        &format!("Found external extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
+        // Get extension configuration (for now, we still need to get it from local config for image logic)
         let ext_config = parsed
             .get("ext")
             .and_then(|ext| ext.get(&self.extension))
             .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+                anyhow::anyhow!("Extension '{}' not found in local configuration. External extension images not yet supported.", self.extension)
             })?;
 
         // Get extension types from the types array

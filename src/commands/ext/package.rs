@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::utils::config::Config;
+use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::SdkContainer;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
@@ -46,12 +46,35 @@ impl ExtPackageCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        // Get extension configuration
+        // Find extension using comprehensive lookup
+        let extension_location = config.find_extension_in_dependency_tree(&self.config_path, &self.extension, &self.target)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+            })?;
+
+        if self.verbose {
+            match &extension_location {
+                ExtensionLocation::Local { name, config_path } => {
+                    print_info(
+                        &format!("Found local extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                ExtensionLocation::External { name, config_path } => {
+                    print_info(
+                        &format!("Found external extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
+        // Get extension configuration (for now, we still need to get it from local config for package logic)
         let ext_config = parsed
             .get("ext")
             .and_then(|ext| ext.get(&self.extension))
             .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+                anyhow::anyhow!("Extension '{}' not found in local configuration. External extension packaging not yet supported.", self.extension)
             })?;
 
         // Extract RPM metadata with defaults

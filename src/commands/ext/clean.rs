@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::utils::config::load_config;
+use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -34,39 +34,46 @@ impl ExtCleanCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let config = load_config(&self.config_path)?;
+        let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
-        self.validate_extension_exists(&parsed)?;
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let _extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
         let container_image = self.get_container_image(&parsed)?;
-        let target = self.resolve_target_architecture(&config)?;
 
         self.clean_extension(&container_image, &target).await
     }
 
-    fn validate_extension_exists(&self, parsed: &toml::Value) -> Result<()> {
-        let ext_section = parsed.get("ext").ok_or_else(|| {
-            print_error(
-                &format!("Extension '{}' not found in configuration.", self.extension),
-                OutputLevel::Normal,
-            );
-            anyhow::anyhow!("No ext section found")
-        })?;
-
-        let ext_table = ext_section
-            .as_table()
-            .ok_or_else(|| anyhow::anyhow!("Invalid ext section format"))?;
-
-        if !ext_table.contains_key(&self.extension) {
-            print_error(
-                &format!("Extension '{}' not found in configuration.", self.extension),
-                OutputLevel::Normal,
-            );
-            return Err(anyhow::anyhow!("Extension not found"));
+    fn find_extension_in_dependency_tree(&self, config: &Config, target: &str) -> Result<ExtensionLocation> {
+        match config.find_extension_in_dependency_tree(&self.config_path, &self.extension, target)? {
+            Some(location) => {
+                if self.verbose {
+                    match &location {
+                        ExtensionLocation::Local { name, config_path } => {
+                            print_info(
+                                &format!("Found local extension '{name}' in config '{config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        ExtensionLocation::External { name, config_path } => {
+                            print_info(
+                                &format!("Found external extension '{name}' in config '{config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+                Ok(location)
+            }
+            None => {
+                print_error(
+                    &format!("Extension '{}' not found in configuration.", self.extension),
+                    OutputLevel::Normal,
+                );
+                Err(anyhow::anyhow!("Extension not found"))
+            }
         }
-
-        Ok(())
     }
 
     fn get_container_image(&self, parsed: &toml::Value) -> Result<String> {
@@ -78,10 +85,6 @@ impl ExtCleanCommand {
             .ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'.")
             })
-    }
-
-    fn resolve_target_architecture(&self, config: &crate::utils::config::Config) -> Result<String> {
-        resolve_target_required(self.target.as_deref(), config)
     }
 
     async fn clean_extension(&self, container_image: &str, target: &str) -> Result<()> {

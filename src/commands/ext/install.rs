@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::utils::config::Config;
+use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -48,43 +48,52 @@ impl ExtInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-
-        // Check if ext section exists
-        let ext_section = match parsed.get("ext") {
-            Some(ext) => ext,
-            None => {
-                if self.extension.is_some() {
-                    print_error(
-                        &format!(
-                            "Extension '{}' not found in configuration.",
-                            self.extension.as_ref().unwrap()
-                        ),
-                        OutputLevel::Normal,
-                    );
-                    return Ok(());
-                } else {
-                    print_info("No extensions found in configuration.", OutputLevel::Normal);
-                    return Ok(());
-                }
-            }
-        };
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Determine which extensions to install
         let extensions_to_install = if let Some(extension_name) = &self.extension {
-            // Single extension specified
-            if !ext_section.as_table().unwrap().contains_key(extension_name) {
-                print_error(
-                    &format!("Extension '{extension_name}' not found in configuration."),
-                    OutputLevel::Normal,
-                );
-                return Ok(());
+            // Single extension specified - use comprehensive lookup
+            match config.find_extension_in_dependency_tree(&self.config_path, extension_name, &target)? {
+                Some(location) => {
+                    if self.verbose {
+                        match &location {
+                            ExtensionLocation::Local { name, config_path } => {
+                                print_info(
+                                    &format!("Found local extension '{name}' in config '{config_path}'"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                            ExtensionLocation::External { name, config_path } => {
+                                print_info(
+                                    &format!("Found external extension '{name}' in config '{config_path}'"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                        }
+                    }
+                    vec![extension_name.clone()]
+                }
+                None => {
+                    print_error(
+                        &format!("Extension '{extension_name}' not found in configuration."),
+                        OutputLevel::Normal,
+                    );
+                    return Ok(());
+                }
             }
-            vec![extension_name.clone()]
         } else {
-            // No extension specified - install all extensions
-            match ext_section.as_table() {
-                Some(table) => table.keys().cloned().collect(),
-                None => vec![],
+            // No extension specified - install all local extensions
+            match parsed.get("ext") {
+                Some(ext_section) => {
+                    match ext_section.as_table() {
+                        Some(table) => table.keys().cloned().collect(),
+                        None => vec![],
+                    }
+                }
+                None => {
+                    print_info("No extensions found in configuration.", OutputLevel::Normal);
+                    return Ok(());
+                }
             }
         };
 
