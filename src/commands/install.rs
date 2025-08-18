@@ -11,6 +11,15 @@ use crate::utils::{
     target::validate_and_log_target,
 };
 
+/// Represents an extension dependency that can be either local or external
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExtensionDependency {
+    /// Extension defined in the main config file
+    Local(String),
+    /// Extension defined in an external config file
+    External { name: String, config_path: String },
+}
+
 /// Implementation of the 'install' command that runs all install subcommands.
 pub struct InstallCommand {
     /// Path to configuration file
@@ -95,26 +104,48 @@ impl InstallCommand {
             self.find_required_extensions(&config, &self.config_path, &_target)?;
 
         if !extensions_to_install.is_empty() {
-            for extension in &extensions_to_install {
-                if self.verbose {
-                    print_info(
-                        &format!("Installing extension dependencies for '{extension}'"),
-                        OutputLevel::Normal,
-                    );
-                }
+            for extension_dep in &extensions_to_install {
+                match extension_dep {
+                    ExtensionDependency::Local(extension_name) => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Installing local extension dependencies for '{extension_name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
 
-                let ext_install_cmd = ExtInstallCommand::new(
-                    Some(extension.clone()),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.force,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                );
-                ext_install_cmd.execute().await.with_context(|| {
-                    format!("Failed to install extension dependencies for '{extension}'")
-                })?;
+                        let ext_install_cmd = ExtInstallCommand::new(
+                            Some(extension_name.clone()),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.force,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        );
+                        ext_install_cmd.execute().await.with_context(|| {
+                            format!(
+                                "Failed to install extension dependencies for '{extension_name}'"
+                            )
+                        })?;
+                    }
+                    ExtensionDependency::External {
+                        name,
+                        config_path: ext_config_path,
+                    } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Installing external extension dependencies for '{name}' from config '{ext_config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Install external extension to ${AVOCADO_PREFIX}/extensions/<ext_name>
+                        self.install_external_extension(&config, &self.config_path, name, ext_config_path, &_target).await.with_context(|| {
+                            format!("Failed to install external extension '{name}' from config '{ext_config_path}'")
+                        })?;
+                    }
+                }
             }
         } else {
             print_info("No extension dependencies to install.", OutputLevel::Normal);
@@ -180,10 +211,11 @@ impl InstallCommand {
         config: &Config,
         config_path: &str,
         target: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ExtensionDependency>> {
         use std::collections::HashSet;
 
         let mut required_extensions = HashSet::new();
+        let mut visited = HashSet::new(); // For cycle detection
 
         // Read and parse the configuration file
         let content = std::fs::read_to_string(config_path)?;
@@ -199,10 +231,10 @@ impl InstallCommand {
                     OutputLevel::Normal,
                 );
             }
-            // If no runtimes match this target, install all extensions
+            // If no runtimes match this target, install all local extensions
             if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
                 for ext_name in ext_section.keys() {
-                    required_extensions.insert(ext_name.clone());
+                    required_extensions.insert(ExtensionDependency::Local(ext_name.clone()));
                 }
             }
         } else {
@@ -218,10 +250,34 @@ impl InstallCommand {
                                 merged_value.get("dependencies").and_then(|d| d.as_table())
                             {
                                 for (_dep_name, dep_spec) in dependencies {
+                                    // Check for extension dependency
                                     if let Some(ext_name) =
                                         dep_spec.get("ext").and_then(|v| v.as_str())
                                     {
-                                        required_extensions.insert(ext_name.to_string());
+                                        // Check if this is an external extension (has config field)
+                                        if let Some(external_config) =
+                                            dep_spec.get("config").and_then(|v| v.as_str())
+                                        {
+                                            let ext_dep = ExtensionDependency::External {
+                                                name: ext_name.to_string(),
+                                                config_path: external_config.to_string(),
+                                            };
+                                            required_extensions.insert(ext_dep.clone());
+
+                                            // Recursively find nested external extension dependencies
+                                            self.find_nested_external_extensions(
+                                                config,
+                                                config_path,
+                                                &ext_dep,
+                                                &mut required_extensions,
+                                                &mut visited,
+                                            )?;
+                                        } else {
+                                            // Local extension
+                                            required_extensions.insert(ExtensionDependency::Local(
+                                                ext_name.to_string(),
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -231,9 +287,138 @@ impl InstallCommand {
             }
         }
 
-        let mut extensions: Vec<String> = required_extensions.into_iter().collect();
-        extensions.sort();
+        let mut extensions: Vec<ExtensionDependency> = required_extensions.into_iter().collect();
+        extensions.sort_by(|a, b| {
+            let name_a = match a {
+                ExtensionDependency::Local(name) => name,
+                ExtensionDependency::External { name, .. } => name,
+            };
+            let name_b = match b {
+                ExtensionDependency::Local(name) => name,
+                ExtensionDependency::External { name, .. } => name,
+            };
+            name_a.cmp(name_b)
+        });
         Ok(extensions)
+    }
+
+    /// Recursively find nested external extension dependencies
+    fn find_nested_external_extensions(
+        &self,
+        config: &Config,
+        base_config_path: &str,
+        ext_dep: &ExtensionDependency,
+        required_extensions: &mut std::collections::HashSet<ExtensionDependency>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let (ext_name, ext_config_path) = match ext_dep {
+            ExtensionDependency::External { name, config_path } => (name, config_path),
+            ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
+        };
+
+        // Cycle detection: check if we've already processed this extension
+        let ext_key = format!("{ext_name}:{ext_config_path}");
+        if visited.contains(&ext_key) {
+            if self.verbose {
+                print_info(
+                    &format!("Skipping already processed extension '{ext_name}' to avoid cycles"),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        }
+        visited.insert(ext_key);
+
+        // Load the external extension configuration
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(base_config_path, ext_config_path);
+        let external_extensions =
+            config.load_external_extensions(base_config_path, ext_config_path)?;
+
+        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                ext_name,
+                ext_config_path
+            )
+        })?;
+
+        // Load the nested config file to get its src_dir setting
+        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let nested_config: toml::Value =
+            toml::from_str(&nested_config_content).with_context(|| {
+                format!(
+                    "Failed to parse nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Create a temporary Config object for the nested config to handle its src_dir
+        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+
+        // Check if this external extension has dependencies
+        if let Some(dependencies) = extension_config
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+        {
+            for (_dep_name, dep_spec) in dependencies {
+                // Check for nested extension dependency
+                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    // Check if this is a nested external extension (has config field)
+                    if let Some(nested_external_config) =
+                        dep_spec.get("config").and_then(|v| v.as_str())
+                    {
+                        // Resolve the nested config path relative to the nested config's src_dir
+                        let nested_config_path = nested_config_obj
+                            .resolve_path_relative_to_src_dir(
+                                &resolved_external_config_path,
+                                nested_external_config,
+                            );
+
+                        let nested_ext_dep = ExtensionDependency::External {
+                            name: nested_ext_name.to_string(),
+                            config_path: nested_config_path.to_string_lossy().to_string(),
+                        };
+
+                        // Add the nested extension to required extensions
+                        required_extensions.insert(nested_ext_dep.clone());
+
+                        if self.verbose {
+                            print_info(
+                                &format!("Found nested external extension '{nested_ext_name}' required by '{ext_name}' at '{}'", nested_config_path.display()),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Recursively process the nested extension
+                        self.find_nested_external_extensions(
+                            config,
+                            base_config_path,
+                            &nested_ext_dep,
+                            required_extensions,
+                            visited,
+                        )?;
+                    } else {
+                        // This is a local extension dependency within the external config
+                        // We don't need to process it further as it will be handled during installation
+                        if self.verbose {
+                            print_info(
+                                &format!("Found local extension dependency '{nested_ext_name}' in external extension '{ext_name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Find runtimes that are relevant for the specified target
@@ -289,6 +474,220 @@ impl InstallCommand {
         }
 
         Ok(relevant_runtimes)
+    }
+
+    /// Install an external extension to ${AVOCADO_PREFIX}/extensions/<ext_name>
+    async fn install_external_extension(
+        &self,
+        config: &Config,
+        base_config_path: &str,
+        extension_name: &str,
+        external_config_path: &str,
+        target: &str,
+    ) -> Result<()> {
+        // Load the external extension configuration
+        let external_extensions =
+            config.load_external_extensions(base_config_path, external_config_path)?;
+
+        let extension_config = external_extensions.get(extension_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                extension_name,
+                external_config_path
+            )
+        })?;
+
+        // Create the sysroot for external extension
+        let container_image = config.get_sdk_image().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+        })?;
+
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+        let container_helper =
+            crate::utils::container::SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose);
+
+        // Check if extension sysroot already exists
+        let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension_name} ]");
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: check_command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+        let sysroot_exists = container_helper.run_in_container(run_config).await?;
+
+        if !sysroot_exists {
+            // Create the sysroot for external extension
+            let setup_command = format!(
+                "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib"
+            );
+            let run_config = crate::utils::container::RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: setup_command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+            let success = container_helper.run_in_container(run_config).await?;
+
+            if !success {
+                return Err(anyhow::anyhow!(
+                    "Failed to create sysroot for external extension '{}'",
+                    extension_name
+                ));
+            }
+
+            print_info(
+                &format!("Created sysroot for external extension '{extension_name}'."),
+                crate::utils::output::OutputLevel::Normal,
+            );
+        }
+
+        // Load the external config as a TOML value to process the extension
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
+        let external_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let _external_config_toml: toml::Value = toml::from_str(&external_config_content)
+            .with_context(|| {
+                format!(
+                    "Failed to parse external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Process the extension's dependencies (packages, not extension dependencies)
+        if let Some(toml::Value::Table(deps_map)) = extension_config.get("dependencies") {
+            if !deps_map.is_empty() {
+                let mut packages = Vec::new();
+
+                // Process package dependencies (not extension dependencies)
+                for (package_name, version_spec) in deps_map {
+                    // Skip extension dependencies (they have "ext" field) - these are handled separately
+                    if let toml::Value::Table(spec_map) = version_spec {
+                        if spec_map.contains_key("ext") {
+                            continue; // Skip extension dependencies - they're handled by the recursive logic
+                        }
+                    }
+
+                    // Process package dependencies only
+                    let package_name_and_version = if version_spec.as_str().is_some() {
+                        let version = version_spec.as_str().unwrap();
+                        if version == "*" {
+                            package_name.clone()
+                        } else {
+                            format!("{package_name}-{version}")
+                        }
+                    } else if let toml::Value::Table(spec_map) = version_spec {
+                        if let Some(version) = spec_map.get("version") {
+                            let version = version.as_str().unwrap_or("*");
+                            if version == "*" {
+                                package_name.clone()
+                            } else {
+                                format!("{package_name}-{version}")
+                            }
+                        } else {
+                            package_name.clone()
+                        }
+                    } else {
+                        package_name.clone()
+                    };
+
+                    packages.push(package_name_and_version);
+                }
+
+                if !packages.is_empty() {
+                    // Build DNF install command using the same format as regular extensions
+                    let yes = if self.force { "-y" } else { "" };
+                    let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension_name}");
+                    let dnf_args_str = if let Some(args) = &self.dnf_args {
+                        format!(" {} ", args.join(" "))
+                    } else {
+                        String::new()
+                    };
+                    let install_command = format!(
+                        r#"
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+$DNF_SDK_HOST \
+    $DNF_SDK_TARGET_REPO_CONF \
+    --installroot={} \
+    {} \
+    install \
+    {} \
+    {}
+"#,
+                        installroot,
+                        dnf_args_str,
+                        yes,
+                        packages.join(" ")
+                    );
+
+                    if self.verbose {
+                        print_info(
+                            &format!("Running command: {install_command}"),
+                            crate::utils::output::OutputLevel::Normal,
+                        );
+                    }
+
+                    let run_config = crate::utils::container::RunConfig {
+                        container_image: container_image.to_string(),
+                        target: target.to_string(),
+                        command: install_command,
+                        verbose: self.verbose,
+                        source_environment: false, // don't source environment (same as regular extensions)
+                        interactive: !self.force, // interactive if not forced (same as regular extensions)
+                        repo_url: repo_url.cloned(),
+                        repo_release: repo_release.cloned(),
+                        container_args: merged_container_args,
+                        dnf_args: self.dnf_args.clone(),
+                        ..Default::default()
+                    };
+
+                    let success = container_helper.run_in_container(run_config).await?;
+
+                    if success {
+                        print_info(
+                                &format!("Installed {} package(s) for external extension '{extension_name}'.", packages.len()),
+                                crate::utils::output::OutputLevel::Normal,
+                            );
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "Failed to install package dependencies for external extension '{}'",
+                            extension_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        print_info(
+            &format!("Successfully installed external extension '{extension_name}' from '{external_config_path}'."),
+            crate::utils::output::OutputLevel::Normal,
+        );
+
+        Ok(())
     }
 }
 

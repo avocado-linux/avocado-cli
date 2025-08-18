@@ -13,6 +13,15 @@ use crate::utils::{
     output::{print_info, print_success, OutputLevel},
 };
 
+/// Represents an extension dependency that can be either local or external
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExtensionDependency {
+    /// Extension defined in the main config file
+    Local(String),
+    /// Extension defined in an external config file
+    External { name: String, config_path: String },
+}
+
 /// Implementation of the 'build' command that runs all build subcommands.
 pub struct BuildCommand {
     /// Path to configuration file
@@ -114,26 +123,55 @@ impl BuildCommand {
         // Step 2: Build extensions
         print_info("Step 2/4: Building extensions", OutputLevel::Normal);
         if !required_extensions.is_empty() {
-            for extension in &required_extensions {
-                if self.verbose {
-                    print_info(
-                        &format!("Building extension '{extension}'"),
-                        OutputLevel::Normal,
-                    );
-                }
+            for extension_dep in &required_extensions {
+                match extension_dep {
+                    ExtensionDependency::Local(extension_name) => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Building local extension '{extension_name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
 
-                let ext_build_cmd = ExtBuildCommand::new(
-                    extension.clone(),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                );
-                ext_build_cmd
-                    .execute()
-                    .await
-                    .with_context(|| format!("Failed to build extension '{extension}'"))?;
+                        let ext_build_cmd = ExtBuildCommand::new(
+                            extension_name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        );
+                        ext_build_cmd.execute().await.with_context(|| {
+                            format!("Failed to build extension '{extension_name}'")
+                        })?;
+                    }
+                    ExtensionDependency::External {
+                        name,
+                        config_path: ext_config_path,
+                    } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Building external extension '{name}' from config '{ext_config_path}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Build external extension using its own config
+                        self.build_external_extension(&config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
+                            format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
+                        })?;
+
+                        // Create images for external extension
+                        self.create_external_extension_images(&config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
+                            format!("Failed to create images for external extension '{name}' from config '{ext_config_path}'")
+                        })?;
+
+                        // Copy external extension images to output directory so runtime build can find them
+                        self.copy_external_extension_images(&config, name, &target).await.with_context(|| {
+                            format!("Failed to copy images for external extension '{name}'")
+                        })?;
+                    }
+                }
             }
         } else {
             print_info("No extensions to build.", OutputLevel::Normal);
@@ -142,25 +180,42 @@ impl BuildCommand {
         // Step 3: Create extension images
         print_info("Step 3/4: Creating extension images", OutputLevel::Normal);
         if !required_extensions.is_empty() {
-            for extension in &required_extensions {
-                if self.verbose {
-                    print_info(
-                        &format!("Creating image for extension '{extension}'"),
-                        OutputLevel::Normal,
-                    );
-                }
+            for extension_dep in &required_extensions {
+                match extension_dep {
+                    ExtensionDependency::Local(extension_name) => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Creating image for local extension '{extension_name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
 
-                let ext_image_cmd = ExtImageCommand::new(
-                    extension.clone(),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                );
-                ext_image_cmd.execute().await.with_context(|| {
-                    format!("Failed to create image for extension '{extension}'")
-                })?;
+                        let ext_image_cmd = ExtImageCommand::new(
+                            extension_name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        );
+                        ext_image_cmd.execute().await.with_context(|| {
+                            format!("Failed to create image for extension '{extension_name}'")
+                        })?;
+                    }
+                    ExtensionDependency::External {
+                        name,
+                        config_path: _ext_config_path,
+                    } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Skipping image creation for external extension '{name}' - already handled by ExtBuildCommand"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        // External extensions already have their images created by ExtBuildCommand::execute()
+                        // No additional image creation needed
+                    }
+                }
             }
         } else {
             print_info("No extension images to create.", OutputLevel::Normal);
@@ -276,8 +331,9 @@ impl BuildCommand {
         parsed: &toml::Value,
         runtimes: &[String],
         target: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ExtensionDependency>> {
         let mut required_extensions = HashSet::new();
+        let mut visited = HashSet::new(); // For cycle detection
 
         // If no runtimes are found for this target, don't build any extensions
         if runtimes.is_empty() {
@@ -295,24 +351,173 @@ impl BuildCommand {
                     merged_value.get("dependencies").and_then(|d| d.as_table())
                 {
                     for (_dep_name, dep_spec) in dependencies {
+                        // Check for extension dependency
                         if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                            required_extensions.insert(ext_name.to_string());
+                            // Check if this is an external extension (has config field)
+                            if let Some(external_config) =
+                                dep_spec.get("config").and_then(|v| v.as_str())
+                            {
+                                let ext_dep = ExtensionDependency::External {
+                                    name: ext_name.to_string(),
+                                    config_path: external_config.to_string(),
+                                };
+                                required_extensions.insert(ext_dep.clone());
+
+                                // Recursively find nested external extension dependencies
+                                self.find_nested_external_extensions(
+                                    config,
+                                    &ext_dep,
+                                    &mut required_extensions,
+                                    &mut visited,
+                                )?;
+                            } else {
+                                // Local extension
+                                required_extensions
+                                    .insert(ExtensionDependency::Local(ext_name.to_string()));
+                            }
                         }
                     }
                 }
             }
         }
 
-        let mut extensions: Vec<String> = required_extensions.into_iter().collect();
-        extensions.sort();
+        let mut extensions: Vec<ExtensionDependency> = required_extensions.into_iter().collect();
+        extensions.sort_by(|a, b| {
+            let name_a = match a {
+                ExtensionDependency::Local(name) => name,
+                ExtensionDependency::External { name, .. } => name,
+            };
+            let name_b = match b {
+                ExtensionDependency::Local(name) => name,
+                ExtensionDependency::External { name, .. } => name,
+            };
+            name_a.cmp(name_b)
+        });
         Ok(extensions)
+    }
+
+    /// Recursively find nested external extension dependencies
+    fn find_nested_external_extensions(
+        &self,
+        config: &Config,
+        ext_dep: &ExtensionDependency,
+        required_extensions: &mut HashSet<ExtensionDependency>,
+        visited: &mut HashSet<String>,
+    ) -> Result<()> {
+        let (ext_name, ext_config_path) = match ext_dep {
+            ExtensionDependency::External { name, config_path } => (name, config_path),
+            ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
+        };
+
+        // Cycle detection: check if we've already processed this extension
+        let ext_key = format!("{ext_name}:{ext_config_path}");
+        if visited.contains(&ext_key) {
+            if self.verbose {
+                print_info(
+                    &format!("Skipping already processed extension '{ext_name}' to avoid cycles"),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        }
+        visited.insert(ext_key);
+
+        // Load the external extension configuration
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(&self.config_path, ext_config_path);
+        let external_extensions =
+            config.load_external_extensions(&self.config_path, ext_config_path)?;
+
+        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                ext_name,
+                ext_config_path
+            )
+        })?;
+
+        // Load the nested config file to get its src_dir setting
+        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let nested_config: toml::Value =
+            toml::from_str(&nested_config_content).with_context(|| {
+                format!(
+                    "Failed to parse nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Create a temporary Config object for the nested config to handle its src_dir
+        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+
+        // Check if this external extension has dependencies
+        if let Some(dependencies) = extension_config
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+        {
+            for (_dep_name, dep_spec) in dependencies {
+                // Check for nested extension dependency
+                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    // Check if this is a nested external extension (has config field)
+                    if let Some(nested_external_config) =
+                        dep_spec.get("config").and_then(|v| v.as_str())
+                    {
+                        // Resolve the nested config path relative to the nested config's src_dir
+                        let nested_config_path = nested_config_obj
+                            .resolve_path_relative_to_src_dir(
+                                &resolved_external_config_path,
+                                nested_external_config,
+                            );
+
+                        let nested_ext_dep = ExtensionDependency::External {
+                            name: nested_ext_name.to_string(),
+                            config_path: nested_config_path.to_string_lossy().to_string(),
+                        };
+
+                        // Add the nested extension to required extensions
+                        required_extensions.insert(nested_ext_dep.clone());
+
+                        if self.verbose {
+                            print_info(
+                                &format!("Found nested external extension '{nested_ext_name}' required by '{ext_name}' at '{}'", nested_config_path.display()),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Recursively process the nested extension
+                        self.find_nested_external_extensions(
+                            config,
+                            &nested_ext_dep,
+                            required_extensions,
+                            visited,
+                        )?;
+                    } else {
+                        // This is a local extension dependency within the external config
+                        // We don't need to process it further as it will be handled during build
+                        if self.verbose {
+                            print_info(
+                                &format!("Found local extension dependency '{nested_ext_name}' in external extension '{ext_name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Find SDK compile sections needed for the required extensions
     fn find_sdk_compile_sections(
         &self,
         config: &Config,
-        required_extensions: &[String],
+        required_extensions: &[ExtensionDependency],
     ) -> Result<Vec<String>> {
         let mut needed_sections = HashSet::new();
 
@@ -339,6 +544,198 @@ impl BuildCommand {
         let mut sections: Vec<String> = needed_sections.into_iter().collect();
         sections.sort();
         Ok(sections)
+    }
+
+    /// Build an external extension using its own config file
+    async fn build_external_extension(
+        &self,
+        config: &Config,
+        base_config_path: &str,
+        extension_name: &str,
+        external_config_path: &str,
+        target: &str,
+    ) -> Result<()> {
+        // Load the external extension configuration
+        let external_extensions =
+            config.load_external_extensions(base_config_path, external_config_path)?;
+
+        let _extension_config = external_extensions.get(extension_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                extension_name,
+                external_config_path
+            )
+        })?;
+
+        // Load the external config as a TOML value to process the extension
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
+        let external_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let _external_config_toml: toml::Value = toml::from_str(&external_config_content)
+            .with_context(|| {
+                format!(
+                    "Failed to parse external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Create a temporary ExtBuildCommand to build the external extension
+        let ext_build_cmd = crate::commands::ext::build::ExtBuildCommand::new(
+            extension_name.to_string(),
+            resolved_external_config_path.to_string_lossy().to_string(),
+            self.verbose,
+            Some(target.to_string()),
+            self.container_args.clone(),
+            self.dnf_args.clone(),
+        );
+
+        // Execute the extension build using the external config
+        match ext_build_cmd.execute().await {
+            Ok(_) => {
+                print_info(
+                    &format!("Successfully built external extension '{extension_name}' from '{external_config_path}'."),
+                    OutputLevel::Normal,
+                );
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to build external extension '{}' from '{}': {}",
+                extension_name,
+                external_config_path,
+                e
+            )),
+        }
+    }
+
+    /// Create images for external extension using ExtImageCommand
+    async fn create_external_extension_images(
+        &self,
+        config: &Config,
+        base_config_path: &str,
+        extension_name: &str,
+        external_config_path: &str,
+        target: &str,
+    ) -> Result<()> {
+        // Load the external extension configuration to get the types
+        let external_extensions =
+            config.load_external_extensions(base_config_path, external_config_path)?;
+
+        let extension_config = external_extensions.get(extension_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                extension_name,
+                external_config_path
+            )
+        })?;
+
+        // Get extension types from the external config
+        let types = extension_config
+            .get("types")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_else(|| vec!["sysext".to_string()]);
+
+        // Resolve the external config path for ExtImageCommand
+        let resolved_external_config_path = config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
+
+        // Create ExtImageCommand for the external extension
+        let ext_image_cmd = crate::commands::ext::image::ExtImageCommand::new(
+            extension_name.to_string(),
+            resolved_external_config_path.to_string_lossy().to_string(),
+            self.verbose,
+            Some(target.to_string()),
+            self.container_args.clone(),
+            self.dnf_args.clone(),
+        );
+
+        // Execute the image creation
+        ext_image_cmd.execute().await.with_context(|| {
+            format!("Failed to create images for external extension '{extension_name}'")
+        })?;
+
+        print_info(
+            &format!("Successfully created images for external extension '{extension_name}' (types: {}).", types.join(", ")),
+            OutputLevel::Normal,
+        );
+
+        Ok(())
+    }
+
+    /// Copy external extension images from their sysroot to the output directory
+    async fn copy_external_extension_images(
+        &self,
+        config: &Config,
+        extension_name: &str,
+        target: &str,
+    ) -> Result<()> {
+        // Get SDK configuration for container setup
+        let container_image = config.get_sdk_image().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+        })?;
+
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+        let container_helper =
+            crate::utils::container::SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose);
+
+        // The images are already created in the correct location by ExtImageCommand
+        // We just need to verify they exist
+        let copy_command = format!(
+            r#"
+# Verify external extension images are in the output directory
+echo "Verifying images for external extension {extension_name}:"
+ls -la $AVOCADO_PREFIX/output/extensions/{extension_name}*.raw 2>/dev/null || {{
+    echo "ERROR: No images found for external extension {extension_name} in output directory"
+    exit 1
+}}
+
+echo "External extension {extension_name} images are ready in output directory"
+"#
+        );
+
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: copy_command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args,
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+
+        let success = container_helper.run_in_container(run_config).await?;
+
+        if success {
+            print_info(
+                &format!("Successfully verified images for external extension '{extension_name}' in output directory."),
+                OutputLevel::Normal,
+            );
+        } else {
+            return Err(anyhow::anyhow!(
+                "Failed to verify images for external extension '{}'",
+                extension_name
+            ));
+        }
+
+        Ok(())
     }
 }
 

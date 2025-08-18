@@ -144,6 +144,7 @@ impl RuntimeBuildCommand {
         let mut extension_type_overrides: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
+        // First, collect direct runtime dependencies
         for (_dep_name, dep_spec) in runtime_deps {
             if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
                 required_extensions.insert(ext_name.to_string());
@@ -162,13 +163,19 @@ impl RuntimeBuildCommand {
             }
         }
 
+        // Recursively discover all extension dependencies (including nested external extensions)
+        let config = crate::utils::config::Config::load(&self.config_path)?;
+        let all_required_extensions = self.find_all_extension_dependencies(&config, &required_extensions)?;
+
         // Build extension symlink commands from config
         let mut symlink_commands = Vec::new();
+        let mut processed_extensions = HashSet::new();
 
+        // Process local extensions defined in [ext.*] sections
         if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_table()) {
             for (ext_name, _ext_data) in ext_config {
                 // Only process extensions that are required by this runtime
-                if required_extensions.contains(ext_name) {
+                if all_required_extensions.contains(ext_name) {
                     symlink_commands.push(format!(
                         r#"
 OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
@@ -182,7 +189,28 @@ else
     echo "Missing image for extension {ext_name}."
 fi"#
                     ));
+                    processed_extensions.insert(ext_name.clone());
                 }
+            }
+        }
+
+        // Process external extensions (those required but not defined locally)
+        for ext_name in &all_required_extensions {
+            if !processed_extensions.contains(ext_name) {
+                // This is an external extension - add symlink command for it
+                symlink_commands.push(format!(
+                    r#"
+OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
+RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
+
+if [ -f "$OUTPUT_EXT" ]; then
+    if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
+        ln -f $OUTPUT_EXT $RUNTIMES_EXT
+    fi
+else
+    echo "Missing image for external extension {ext_name}."
+fi"#
+                ));
             }
         }
 
@@ -222,6 +250,140 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         );
 
         Ok(script)
+    }
+
+    /// Recursively find all extension dependencies, including nested external extensions
+    fn find_all_extension_dependencies(
+        &self,
+        config: &crate::utils::config::Config,
+        direct_extensions: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        let mut all_extensions = HashSet::new();
+        let mut visited = HashSet::new();
+
+        // Process each direct extension dependency
+        for ext_name in direct_extensions {
+            self.collect_extension_dependencies(
+                config,
+                ext_name,
+                &mut all_extensions,
+                &mut visited,
+            )?;
+        }
+
+        Ok(all_extensions)
+    }
+
+    /// Recursively collect all dependencies for a single extension
+    fn collect_extension_dependencies(
+        &self,
+        config: &crate::utils::config::Config,
+        ext_name: &str,
+        all_extensions: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> Result<()> {
+        // Avoid infinite loops
+        if visited.contains(ext_name) {
+            return Ok(());
+        }
+        visited.insert(ext_name.to_string());
+
+        // Add this extension to the result set
+        all_extensions.insert(ext_name.to_string());
+
+        // Load the main config to check for local extensions
+        let content = std::fs::read_to_string(&self.config_path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+
+        // Check if this is a local extension
+        if let Some(ext_config) = parsed
+            .get("ext")
+            .and_then(|e| e.as_table())
+            .and_then(|table| table.get(ext_name))
+        {
+            // This is a local extension - check its dependencies
+            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+                for (_dep_name, dep_spec) in dependencies {
+                    if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                        // Check if this is an external extension dependency
+                        if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
+                            // This is an external extension - load its config and process recursively
+                            let external_extensions = config.load_external_extensions(&self.config_path, external_config_path)?;
+
+                            // Add the external extension itself
+                            self.collect_extension_dependencies(
+                                config,
+                                nested_ext_name,
+                                all_extensions,
+                                visited,
+                            )?;
+
+                            // Process its dependencies from the external config
+                            if let Some(ext_config) = external_extensions.get(nested_ext_name) {
+                                if let Some(nested_deps) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+                                    for (_nested_dep_name, nested_dep_spec) in nested_deps {
+                                        if let Some(nested_nested_ext_name) = nested_dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                            self.collect_extension_dependencies(
+                                                config,
+                                                nested_nested_ext_name,
+                                                all_extensions,
+                                                visited,
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // This is a local extension dependency
+                            self.collect_extension_dependencies(
+                                config,
+                                nested_ext_name,
+                                all_extensions,
+                                visited,
+                            )?;
+                        }
+                    }
+                }
+            }
+        } else {
+            // This might be an external extension - we need to find it in the runtime dependencies
+            // to get its config path, then process its dependencies
+            let runtime_config = parsed.get("runtime").context("No runtime configuration found")?;
+            let runtime_spec = runtime_config
+                .get(&self.runtime_name)
+                .with_context(|| format!("Runtime '{}' not found", self.runtime_name))?;
+
+            if let Some(runtime_deps) = runtime_spec.get("dependencies").and_then(|v| v.as_table()) {
+                for (_dep_name, dep_spec) in runtime_deps {
+                    if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                        if dep_ext_name == ext_name {
+                            if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
+                                // Found the external extension - process its dependencies
+                                let external_extensions = config.load_external_extensions(&self.config_path, external_config_path)?;
+
+                                if let Some(ext_config) = external_extensions.get(ext_name) {
+                                    if let Some(nested_deps) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+                                        for (_nested_dep_name, nested_dep_spec) in nested_deps {
+                                            if let Some(nested_ext_name) = nested_dep_spec.get("ext").and_then(|v| v.as_str()) {
+                                                self.collect_extension_dependencies(
+                                                    config,
+                                                    nested_ext_name,
+                                                    all_extensions,
+                                                    visited,
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -273,6 +273,15 @@ impl Config {
         Ok(config)
     }
 
+    /// Create a Config object from a TOML value
+    pub fn from_toml_value(value: &toml::Value) -> Result<Self> {
+        let config: Config = value
+            .clone()
+            .try_into()
+            .with_context(|| "Failed to parse TOML value into Config")?;
+        Ok(config)
+    }
+
     /// Get the SDK image from configuration
     pub fn get_sdk_image(&self) -> Option<&String> {
         self.sdk.as_ref()?.image.as_ref()
@@ -327,6 +336,72 @@ impl Config {
                 })
             }
         })
+    }
+
+    /// Resolve a path relative to src_dir if it's relative, or use as-is if absolute
+    /// If src_dir is not configured, resolve relative to config file directory
+    pub fn resolve_path_relative_to_src_dir<P: AsRef<Path>>(
+        &self,
+        config_path: P,
+        path: &str,
+    ) -> PathBuf {
+        let target_path = Path::new(path);
+
+        if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            // Try to resolve relative to src_dir first
+            if let Some(src_dir) = self.get_resolved_src_dir(&config_path) {
+                src_dir.join(target_path)
+            } else {
+                // Fallback to config file directory
+                let config_dir = config_path.as_ref().parent().unwrap_or(Path::new("."));
+                config_dir.join(target_path)
+            }
+        }
+    }
+
+    /// Load and parse external extension configuration from a config file
+    /// Returns a map of extension name to extension configuration
+    pub fn load_external_extensions<P: AsRef<Path>>(
+        &self,
+        config_path: P,
+        external_config_path: &str,
+    ) -> Result<HashMap<String, toml::Value>> {
+        let resolved_path =
+            self.resolve_path_relative_to_src_dir(&config_path, external_config_path);
+
+        if !resolved_path.exists() {
+            return Err(anyhow::anyhow!(
+                "External extension config file not found: {}",
+                resolved_path.display()
+            ));
+        }
+
+        let content = std::fs::read_to_string(&resolved_path).with_context(|| {
+            format!(
+                "Failed to read external config file: {}",
+                resolved_path.display()
+            )
+        })?;
+
+        let parsed: toml::Value = toml::from_str(&content).with_context(|| {
+            format!(
+                "Failed to parse external config file: {}",
+                resolved_path.display()
+            )
+        })?;
+
+        let mut external_extensions = HashMap::new();
+
+        // Find all [ext.*] sections in the external config
+        if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
+            for (ext_name, ext_config) in ext_section {
+                external_extensions.insert(ext_name.clone(), ext_config.clone());
+            }
+        }
+
+        Ok(external_extensions)
     }
 
     /// Expand environment variables in a string
