@@ -173,6 +173,9 @@ enum SdkCommands {
         /// Path to avocado.toml configuration file
         #[arg(short = 'C', long, default_value = "avocado.toml")]
         config: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Assign a name to the container
         #[arg(long)]
         name: Option<String>,
@@ -904,6 +907,7 @@ async fn main() -> Result<()> {
             }
             SdkCommands::Run {
                 config,
+                target,
                 name,
                 detach,
                 rm,
@@ -932,7 +936,7 @@ async fn main() -> Result<()> {
                     extension,
                     runtime,
                     cmd,
-                    cli.target,
+                    target,
                     container_args,
                     dnf_args,
                 );

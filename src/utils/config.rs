@@ -627,12 +627,22 @@ impl Config {
         let mut merged_config = self.sdk.clone().unwrap_or_default();
 
         // If there's a target-specific SDK section, merge it
+        // First try the nested approach: [sdk] -> [qemux86-64]
         if let Some(sdk_section) = parsed.get("sdk") {
             if let Some(target_section) = sdk_section.get(target) {
                 // Merge target-specific SDK configuration
                 if let Ok(target_config) = target_section.clone().try_into::<SdkConfig>() {
                     merged_config = merge_sdk_configs(merged_config, target_config);
                 }
+            }
+        }
+
+        // Also try the top-level approach: [sdk.qemux86-64]
+        let target_section_name = format!("sdk.{target}");
+        if let Some(target_section) = parsed.get(&target_section_name) {
+            // Merge target-specific SDK configuration
+            if let Ok(target_config) = target_section.clone().try_into::<SdkConfig>() {
+                merged_config = merge_sdk_configs(merged_config, target_config);
             }
         }
 
@@ -1306,6 +1316,37 @@ target-package = "*"
 
         // Base values should be preserved when not overridden
         assert_eq!(merged.repo_release, Some("base-release".to_string()));
+    }
+
+    #[test]
+    fn test_merged_sdk_config_with_container_args() {
+        // Test that target-specific container_args are properly merged
+        let config_content = r#"
+default_target = "qemux86-64"
+
+[sdk]
+image = "base-image"
+
+[sdk.qemux86-64]
+container_args = ["--net=host", "--privileged"]
+"#;
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let merged = config
+            .get_merged_sdk_config("qemux86-64", temp_file.path().to_str().unwrap())
+            .unwrap();
+
+        // Target-specific container_args should be present
+        assert_eq!(
+            merged.container_args,
+            Some(vec!["--net=host".to_string(), "--privileged".to_string()])
+        );
+
+        // Base image should be preserved
+        assert_eq!(merged.image, Some("base-image".to_string()));
     }
 
     #[test]

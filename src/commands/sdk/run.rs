@@ -156,35 +156,28 @@ impl SdkRunCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
 
+        // Create shared RunConfig for all execution modes
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: command.clone(),
+            verbose: self.verbose,
+            source_environment: self.env,
+            interactive: self.interactive,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            extension_sysroot: self.extension.clone(),
+            runtime_sysroot: self.runtime.clone(),
+            ..Default::default()
+        };
+
         let success = if self.detach {
-            self.run_detached_container(&container_helper, &container_image, &target, &command)
+            self.run_detached_container(&container_helper, &run_config)
                 .await?
-        } else if self.interactive {
-            self.run_interactive_container(
-                &container_helper,
-                &container_image,
-                &target,
-                &command,
-                repo_url,
-                repo_release,
-            )
-            .await?
         } else {
-            let config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.clone(),
-                command: command.clone(),
-                verbose: self.verbose,
-                source_environment: false, // don't source environment
-                interactive: false,        // not interactive
-                repo_url: repo_url.cloned(),
-                repo_release: repo_release.cloned(),
-                container_args: merged_container_args.clone(),
-                extension_sysroot: self.extension.clone(),
-                runtime_sysroot: self.runtime.clone(),
-                ..Default::default()
-            };
-            container_helper.run_in_container(config).await?
+            container_helper.run_in_container(run_config).await?
         };
 
         if success {
@@ -198,9 +191,7 @@ impl SdkRunCommand {
     async fn run_detached_container(
         &self,
         container_helper: &SdkContainer,
-        container_image: &str,
-        target: &str,
-        command: &str,
+        config: &RunConfig,
     ) -> Result<bool> {
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(container_helper.container_tool.clone(), false);
@@ -235,15 +226,20 @@ impl SdkRunCommand {
 
         // Add environment variables
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", config.target));
+
+        // Add merged container args
+        if let Some(args) = &config.container_args {
+            container_cmd.extend_from_slice(args);
+        }
 
         // Add the container image
-        container_cmd.push(container_image.to_string());
+        container_cmd.push(config.container_image.clone());
 
         // Add the command
         container_cmd.push("bash".to_string());
         container_cmd.push("-c".to_string());
-        container_cmd.push(command.to_string());
+        container_cmd.push(config.command.clone());
 
         // Execute using tokio Command
         let output = tokio::process::Command::new(&container_cmd[0])
@@ -264,34 +260,6 @@ impl SdkRunCommand {
             );
             Ok(false)
         }
-    }
-
-    /// Run container in interactive mode
-    async fn run_interactive_container(
-        &self,
-        container_helper: &SdkContainer,
-        container_image: &str,
-        target: &str,
-        command: &str,
-        repo_url: Option<&String>,
-        repo_release: Option<&String>,
-    ) -> Result<bool> {
-        let config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: command.to_string(),
-            verbose: self.verbose,
-            source_environment: self.env,
-            interactive: true,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
-            container_args: self.container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            extension_sysroot: self.extension.clone(),
-            runtime_sysroot: self.runtime.clone(),
-            ..Default::default()
-        };
-        container_helper.run_in_container(config).await
     }
 }
 
