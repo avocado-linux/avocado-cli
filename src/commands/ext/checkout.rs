@@ -353,7 +353,10 @@ impl ExtCheckoutCommand {
         {
             if self.verbose {
                 print_info(
-                    &format!("Ownership changes not needed on Windows for {}", path.display()),
+                    &format!(
+                        "Ownership changes not needed on Windows for {}",
+                        path.display()
+                    ),
                     OutputLevel::Normal,
                 );
             }

@@ -124,6 +124,9 @@ enum Commands {
         /// Runtime name to build (if not provided, builds all runtimes)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
+        /// Extension name to build (if not provided, builds all required extensions)
+        #[arg(short = 'e', long = "extension")]
+        extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -536,6 +539,7 @@ async fn main() -> Result<()> {
             config,
             verbose,
             runtime,
+            extension,
             target,
             container_args,
             dnf_args,
@@ -544,6 +548,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 runtime,
+                extension,
                 target.or(cli.target),
                 container_args,
                 dnf_args,

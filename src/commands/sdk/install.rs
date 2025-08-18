@@ -74,7 +74,11 @@ impl SdkInstallCommand {
 
         // Get extension SDK dependencies (including nested ones with target-specific dependencies)
         let extension_sdk_dependencies = config
-            .get_extension_sdk_dependencies_with_config_path_and_target(&config_content, Some(&self.config_path), Some(&target))
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                &config_content,
+                Some(&self.config_path),
+                Some(&target),
+            )
             .with_context(|| "Failed to parse extension SDK dependencies")?;
 
         // Get compile section dependencies

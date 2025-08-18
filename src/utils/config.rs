@@ -533,7 +533,11 @@ impl Config {
         config_content: &str,
         config_path: Option<&str>,
     ) -> Result<HashMap<String, HashMap<String, toml::Value>>> {
-        self.get_extension_sdk_dependencies_with_config_path_and_target(config_content, config_path, None)
+        self.get_extension_sdk_dependencies_with_config_path_and_target(
+            config_content,
+            config_path,
+            None,
+        )
     }
 
     /// Get extension SDK dependencies from configuration, including nested external extension dependencies and target-specific dependencies
@@ -577,7 +581,9 @@ impl Config {
                                 if let Some(target_table) = target_section.as_table() {
                                     if let Some(sdk_section) = target_table.get("sdk") {
                                         if let Some(sdk_table) = sdk_section.as_table() {
-                                            if let Some(dependencies) = sdk_table.get("dependencies") {
+                                            if let Some(dependencies) =
+                                                sdk_table.get("dependencies")
+                                            {
                                                 if let Some(deps_table) = dependencies.as_table() {
                                                     // Target-specific dependencies override base dependencies
                                                     for (k, v) in deps_table.iter() {
@@ -638,7 +644,8 @@ impl Config {
                             if let Some(target) = target {
                                 if let Some(target_section) = runtime_config_table.get(target) {
                                     if let Some(target_table) = target_section.as_table() {
-                                        if let Some(dependencies) = target_table.get("dependencies") {
+                                        if let Some(dependencies) = target_table.get("dependencies")
+                                        {
                                             if let Some(deps_table) = dependencies.as_table() {
                                                 self.collect_external_extension_sdk_dependencies_with_target(
                                                     config_path,
@@ -674,7 +681,9 @@ impl Config {
             if let Some(dep_spec_table) = dep_spec.as_table() {
                 // Check for external extension dependency
                 if let Some(ext_name) = dep_spec_table.get("ext").and_then(|v| v.as_str()) {
-                    if let Some(external_config) = dep_spec_table.get("config").and_then(|v| v.as_str()) {
+                    if let Some(external_config) =
+                        dep_spec_table.get("config").and_then(|v| v.as_str())
+                    {
                         // Cycle detection
                         let ext_key = format!("{ext_name}:{external_config}");
                         if visited.contains(&ext_key) {
@@ -683,30 +692,50 @@ impl Config {
                         visited.insert(ext_key);
 
                         // Load the external extension configuration
-                        let resolved_external_config_path =
-                            self.resolve_path_relative_to_src_dir(base_config_path, external_config);
+                        let resolved_external_config_path = self
+                            .resolve_path_relative_to_src_dir(base_config_path, external_config);
 
                         match std::fs::read_to_string(&resolved_external_config_path) {
                             Ok(external_config_content) => {
                                 match toml::from_str::<toml::Value>(&external_config_content) {
                                     Ok(external_parsed) => {
                                         // Create a temporary Config object for the external config
-                                        if let Ok(external_config_obj) = Config::from_toml_value(&external_parsed) {
+                                        if let Ok(external_config_obj) =
+                                            Config::from_toml_value(&external_parsed)
+                                        {
                                             // Only process the specific extension that's being referenced
                                             if let Some(ext_section) = external_parsed.get("ext") {
                                                 if let Some(ext_table) = ext_section.as_table() {
-                                                    if let Some(external_ext_config) = ext_table.get(ext_name) {
-                                                        if let Some(external_ext_config_table) = external_ext_config.as_table() {
+                                                    if let Some(external_ext_config) =
+                                                        ext_table.get(ext_name)
+                                                    {
+                                                        if let Some(external_ext_config_table) =
+                                                            external_ext_config.as_table()
+                                                        {
                                                             // Extract SDK dependencies for this specific external extension (base and target-specific)
                                                             let mut merged_deps = HashMap::new();
 
                                                             // First, collect base SDK dependencies from [ext.<ext_name>.sdk.dependencies]
-                                                            if let Some(sdk_section) = external_ext_config_table.get("sdk") {
-                                                                if let Some(sdk_table) = sdk_section.as_table() {
-                                                                    if let Some(dependencies) = sdk_table.get("dependencies") {
-                                                                        if let Some(deps_table) = dependencies.as_table() {
-                                                                            for (k, v) in deps_table.iter() {
-                                                                                merged_deps.insert(k.clone(), v.clone());
+                                                            if let Some(sdk_section) =
+                                                                external_ext_config_table.get("sdk")
+                                                            {
+                                                                if let Some(sdk_table) =
+                                                                    sdk_section.as_table()
+                                                                {
+                                                                    if let Some(dependencies) =
+                                                                        sdk_table
+                                                                            .get("dependencies")
+                                                                    {
+                                                                        if let Some(deps_table) =
+                                                                            dependencies.as_table()
+                                                                        {
+                                                                            for (k, v) in
+                                                                                deps_table.iter()
+                                                                            {
+                                                                                merged_deps.insert(
+                                                                                    k.clone(),
+                                                                                    v.clone(),
+                                                                                );
                                                                             }
                                                                         }
                                                                     }
@@ -715,11 +744,26 @@ impl Config {
 
                                                             // Then, if we have a target, collect target-specific dependencies from [ext.<ext_name>.<target>.sdk.dependencies]
                                                             if let Some(target) = target {
-                                                                if let Some(target_section) = external_ext_config_table.get(target) {
-                                                                    if let Some(target_table) = target_section.as_table() {
-                                                                        if let Some(sdk_section) = target_table.get("sdk") {
-                                                                            if let Some(sdk_table) = sdk_section.as_table() {
-                                                                                if let Some(dependencies) = sdk_table.get("dependencies") {
+                                                                if let Some(target_section) =
+                                                                    external_ext_config_table
+                                                                        .get(target)
+                                                                {
+                                                                    if let Some(target_table) =
+                                                                        target_section.as_table()
+                                                                    {
+                                                                        if let Some(sdk_section) =
+                                                                            target_table.get("sdk")
+                                                                        {
+                                                                            if let Some(sdk_table) =
+                                                                                sdk_section
+                                                                                    .as_table()
+                                                                            {
+                                                                                if let Some(
+                                                                                    dependencies,
+                                                                                ) = sdk_table
+                                                                                    .get(
+                                                                                    "dependencies",
+                                                                                ) {
                                                                                     if let Some(deps_table) = dependencies.as_table() {
                                                                                         // Target-specific dependencies override base dependencies
                                                                                         for (k, v) in deps_table.iter() {
@@ -735,12 +779,20 @@ impl Config {
 
                                                             // Add the merged dependencies if any exist
                                                             if !merged_deps.is_empty() {
-                                                                extension_sdk_deps.insert(ext_name.to_string(), merged_deps);
+                                                                extension_sdk_deps.insert(
+                                                                    ext_name.to_string(),
+                                                                    merged_deps,
+                                                                );
                                                             }
 
                                                             // Recursively process dependencies of this specific external extension
-                                                            if let Some(nested_dependencies) = external_ext_config_table.get("dependencies") {
-                                                                if let Some(nested_deps_table) = nested_dependencies.as_table() {
+                                                            if let Some(nested_dependencies) =
+                                                                external_ext_config_table
+                                                                    .get("dependencies")
+                                                            {
+                                                                if let Some(nested_deps_table) =
+                                                                    nested_dependencies.as_table()
+                                                                {
                                                                     external_config_obj.collect_external_extension_sdk_dependencies_with_target(
                                                                         &resolved_external_config_path.to_string_lossy(),
                                                                         nested_deps_table,
@@ -1191,13 +1243,29 @@ nativesdk-arm-tool = "*"
 
         let avocado_dev_base = extension_deps_no_target.get("avocado-dev").unwrap();
         assert_eq!(avocado_dev_base.len(), 2);
-        assert_eq!(avocado_dev_base.get("nativesdk-avocado-hitl").unwrap().as_str(), Some("*"));
-        assert_eq!(avocado_dev_base.get("nativesdk-base-tool").unwrap().as_str(), Some("1.0.0"));
+        assert_eq!(
+            avocado_dev_base
+                .get("nativesdk-avocado-hitl")
+                .unwrap()
+                .as_str(),
+            Some("*")
+        );
+        assert_eq!(
+            avocado_dev_base
+                .get("nativesdk-base-tool")
+                .unwrap()
+                .as_str(),
+            Some("1.0.0")
+        );
         assert!(avocado_dev_base.get("nativesdk-target-specific").is_none());
 
         // Test with qemux86-64 target (should merge base + target-specific)
         let extension_deps_x86 = config
-            .get_extension_sdk_dependencies_with_config_path_and_target(config_content, None, Some("qemux86-64"))
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                config_content,
+                None,
+                Some("qemux86-64"),
+            )
             .unwrap();
 
         assert_eq!(extension_deps_x86.len(), 2);
@@ -1205,20 +1273,42 @@ nativesdk-arm-tool = "*"
         let avocado_dev_x86 = extension_deps_x86.get("avocado-dev").unwrap();
         assert_eq!(avocado_dev_x86.len(), 3);
         // Target-specific dependency should override base
-        assert_eq!(avocado_dev_x86.get("nativesdk-avocado-hitl").unwrap().as_str(), Some("2.0.0"));
+        assert_eq!(
+            avocado_dev_x86
+                .get("nativesdk-avocado-hitl")
+                .unwrap()
+                .as_str(),
+            Some("2.0.0")
+        );
         // Base dependency should still be there
-        assert_eq!(avocado_dev_x86.get("nativesdk-base-tool").unwrap().as_str(), Some("1.0.0"));
+        assert_eq!(
+            avocado_dev_x86.get("nativesdk-base-tool").unwrap().as_str(),
+            Some("1.0.0")
+        );
         // Target-specific new dependency should be added
-        assert_eq!(avocado_dev_x86.get("nativesdk-target-specific").unwrap().as_str(), Some("*"));
+        assert_eq!(
+            avocado_dev_x86
+                .get("nativesdk-target-specific")
+                .unwrap()
+                .as_str(),
+            Some("*")
+        );
 
         // another-ext should only have base dependency for x86 target
         let another_ext_x86 = extension_deps_x86.get("another-ext").unwrap();
         assert_eq!(another_ext_x86.len(), 1);
-        assert_eq!(another_ext_x86.get("nativesdk-tool").unwrap().as_str(), Some("*"));
+        assert_eq!(
+            another_ext_x86.get("nativesdk-tool").unwrap().as_str(),
+            Some("*")
+        );
 
         // Test with qemuarm64 target
         let extension_deps_arm = config
-            .get_extension_sdk_dependencies_with_config_path_and_target(config_content, None, Some("qemuarm64"))
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                config_content,
+                None,
+                Some("qemuarm64"),
+            )
             .unwrap();
 
         assert_eq!(extension_deps_arm.len(), 2);
@@ -1226,14 +1316,29 @@ nativesdk-arm-tool = "*"
         // avocado-dev should only have base dependencies for arm target
         let avocado_dev_arm = extension_deps_arm.get("avocado-dev").unwrap();
         assert_eq!(avocado_dev_arm.len(), 2);
-        assert_eq!(avocado_dev_arm.get("nativesdk-avocado-hitl").unwrap().as_str(), Some("*"));
-        assert_eq!(avocado_dev_arm.get("nativesdk-base-tool").unwrap().as_str(), Some("1.0.0"));
+        assert_eq!(
+            avocado_dev_arm
+                .get("nativesdk-avocado-hitl")
+                .unwrap()
+                .as_str(),
+            Some("*")
+        );
+        assert_eq!(
+            avocado_dev_arm.get("nativesdk-base-tool").unwrap().as_str(),
+            Some("1.0.0")
+        );
 
         // another-ext should have base + arm-specific dependencies
         let another_ext_arm = extension_deps_arm.get("another-ext").unwrap();
         assert_eq!(another_ext_arm.len(), 2);
-        assert_eq!(another_ext_arm.get("nativesdk-tool").unwrap().as_str(), Some("*"));
-        assert_eq!(another_ext_arm.get("nativesdk-arm-tool").unwrap().as_str(), Some("*"));
+        assert_eq!(
+            another_ext_arm.get("nativesdk-tool").unwrap().as_str(),
+            Some("*")
+        );
+        assert_eq!(
+            another_ext_arm.get("nativesdk-arm-tool").unwrap().as_str(),
+            Some("*")
+        );
     }
 
     #[test]
@@ -1264,8 +1369,11 @@ types = ["confext"]
 
         // Test with config_path (should find runtime dependencies, but we can't test file access in unit test)
         // This demonstrates the method signature and logic, actual file access would be tested in integration tests
-        let result = config
-            .get_extension_sdk_dependencies_with_config_path_and_target(config_content, Some("dummy_path"), None);
+        let result = config.get_extension_sdk_dependencies_with_config_path_and_target(
+            config_content,
+            Some("dummy_path"),
+            None,
+        );
 
         // Should not error (file access would fail silently in the implementation)
         assert!(result.is_ok());
