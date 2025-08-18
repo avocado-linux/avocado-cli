@@ -124,17 +124,13 @@ impl RuntimeBuildCommand {
     }
 
     fn create_build_script(&self, parsed: &toml::Value, target_arch: &str) -> Result<String> {
-        // Get runtime dependencies to identify required extensions
-        let runtime_config = parsed
-            .get("runtime")
-            .context("No runtime configuration found")?;
-
-        let runtime_spec = runtime_config
-            .get(&self.runtime_name)
-            .with_context(|| format!("Runtime '{}' not found", self.runtime_name))?;
+        // Get merged runtime configuration including target-specific dependencies
+        let config = crate::utils::config::Config::load(&self.config_path)?;
+        let merged_runtime = config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
+            .with_context(|| format!("Runtime '{}' not found or has no configuration for target '{}'", self.runtime_name, target_arch))?;
 
         let binding = toml::map::Map::new();
-        let runtime_deps = runtime_spec
+        let runtime_deps = merged_runtime
             .get("dependencies")
             .and_then(|v| v.as_table())
             .unwrap_or(&binding);
@@ -164,9 +160,8 @@ impl RuntimeBuildCommand {
         }
 
         // Recursively discover all extension dependencies (including nested external extensions)
-        let config = crate::utils::config::Config::load(&self.config_path)?;
         let all_required_extensions =
-            self.find_all_extension_dependencies(&config, &required_extensions)?;
+            self.find_all_extension_dependencies(&config, &required_extensions, target_arch)?;
 
         // Build extension symlink commands from config
         let mut symlink_commands = Vec::new();
@@ -258,6 +253,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         &self,
         config: &crate::utils::config::Config,
         direct_extensions: &HashSet<String>,
+        target_arch: &str,
     ) -> Result<HashSet<String>> {
         let mut all_extensions = HashSet::new();
         let mut visited = HashSet::new();
@@ -269,6 +265,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                 ext_name,
                 &mut all_extensions,
                 &mut visited,
+                target_arch,
             )?;
         }
 
@@ -282,6 +279,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         ext_name: &str,
         all_extensions: &mut HashSet<String>,
         visited: &mut HashSet<String>,
+        target_arch: &str,
     ) -> Result<()> {
         // Avoid infinite loops
         if visited.contains(ext_name) {
@@ -322,6 +320,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                                 nested_ext_name,
                                 all_extensions,
                                 visited,
+                                target_arch,
                             )?;
 
                             // Process its dependencies from the external config
@@ -338,6 +337,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                                                 nested_nested_ext_name,
                                                 all_extensions,
                                                 visited,
+                                                target_arch,
                                             )?;
                                         }
                                     }
@@ -350,6 +350,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                                 nested_ext_name,
                                 all_extensions,
                                 visited,
+                                target_arch,
                             )?;
                         }
                     }
@@ -358,14 +359,10 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         } else {
             // This might be an external extension - we need to find it in the runtime dependencies
             // to get its config path, then process its dependencies
-            let runtime_config = parsed
-                .get("runtime")
-                .context("No runtime configuration found")?;
-            let runtime_spec = runtime_config
-                .get(&self.runtime_name)
-                .with_context(|| format!("Runtime '{}' not found", self.runtime_name))?;
+            let merged_runtime = config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
+                .with_context(|| format!("Runtime '{}' not found or has no configuration for target '{}'", self.runtime_name, target_arch))?;
 
-            if let Some(runtime_deps) = runtime_spec.get("dependencies").and_then(|v| v.as_table())
+            if let Some(runtime_deps) = merged_runtime.get("dependencies").and_then(|v| v.as_table())
             {
                 for (_dep_name, dep_spec) in runtime_deps {
                     if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
@@ -392,6 +389,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                                                     nested_ext_name,
                                                     all_extensions,
                                                     visited,
+                                                    target_arch,
                                                 )?;
                                             }
                                         }
