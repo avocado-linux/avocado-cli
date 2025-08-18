@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::commands::{
     ext::{ExtBuildCommand, ExtImageCommand},
     runtime::RuntimeBuildCommand,
-    sdk::SdkCompileCommand,
+    sdk::{SdkCompileCommand, SdkInstallCommand},
 };
 use crate::utils::{
     config::Config,
@@ -83,15 +83,34 @@ impl BuildCommand {
             return Ok(());
         }
 
-        // Step 1: Analyze dependencies to find extensions that need SDK compilation
+        // Step 1: Analyze dependencies and install/compile SDK code
         print_info(
-            "Step 1/4: Analyzing dependencies and compiling SDK code",
+            "Step 1/4: Analyzing dependencies and preparing SDK",
             OutputLevel::Normal,
         );
         let required_extensions =
             self.find_required_extensions(&config, &parsed, &runtimes_to_build, &target)?;
         let sdk_sections = self.find_sdk_compile_sections(&config, &required_extensions)?;
 
+        // Install SDK dependencies (including from nested extension configs)
+        print_info(
+            "Installing SDK dependencies (including from nested extensions)...",
+            OutputLevel::Normal,
+        );
+        let sdk_install_cmd = SdkInstallCommand::new(
+            self.config_path.clone(),
+            self.verbose,
+            false, // force
+            self.target.clone(),
+            self.container_args.clone(),
+            self.dnf_args.clone(),
+        );
+        sdk_install_cmd
+            .execute()
+            .await
+            .with_context(|| "Failed to install SDK dependencies")?;
+
+        // Compile SDK sections if needed
         if !sdk_sections.is_empty() {
             if self.verbose {
                 print_info(
