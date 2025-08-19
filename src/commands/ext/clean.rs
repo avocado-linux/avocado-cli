@@ -45,20 +45,32 @@ impl ExtCleanCommand {
         self.clean_extension(&container_image, &target).await
     }
 
-    fn find_extension_in_dependency_tree(&self, config: &Config, target: &str) -> Result<ExtensionLocation> {
-        match config.find_extension_in_dependency_tree(&self.config_path, &self.extension, target)? {
+    fn find_extension_in_dependency_tree(
+        &self,
+        config: &Config,
+        target: &str,
+    ) -> Result<ExtensionLocation> {
+        match config.find_extension_in_dependency_tree(
+            &self.config_path,
+            &self.extension,
+            target,
+        )? {
             Some(location) => {
                 if self.verbose {
                     match &location {
                         ExtensionLocation::Local { name, config_path } => {
                             print_info(
-                                &format!("Found local extension '{name}' in config '{config_path}'"),
+                                &format!(
+                                    "Found local extension '{name}' in config '{config_path}'"
+                                ),
                                 OutputLevel::Normal,
                             );
                         }
                         ExtensionLocation::External { name, config_path } => {
                             print_info(
-                                &format!("Found external extension '{name}' in config '{config_path}'"),
+                                &format!(
+                                    "Found external extension '{name}' in config '{config_path}'"
+                                ),
                                 OutputLevel::Normal,
                             );
                         }

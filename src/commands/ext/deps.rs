@@ -32,15 +32,26 @@ impl ExtDepsCommand {
         Ok(())
     }
 
-    fn get_extensions_to_process(&self, config: &Config, parsed: &toml::Value, target: &str) -> Result<Vec<String>> {
+    fn get_extensions_to_process(
+        &self,
+        config: &Config,
+        parsed: &toml::Value,
+        target: &str,
+    ) -> Result<Vec<String>> {
         match &self.extension {
             Some(extension_name) => {
                 // Use comprehensive lookup for specific extension
-                match config.find_extension_in_dependency_tree(&self.config_path, extension_name, target)? {
+                match config.find_extension_in_dependency_tree(
+                    &self.config_path,
+                    extension_name,
+                    target,
+                )? {
                     Some(location) => {
                         if let ExtensionLocation::External { name, config_path } = &location {
                             print_info(
-                                &format!("Found external extension '{name}' in config '{config_path}'"),
+                                &format!(
+                                    "Found external extension '{name}' in config '{config_path}'"
+                                ),
                                 OutputLevel::Normal,
                             );
                         }

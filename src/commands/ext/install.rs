@@ -53,13 +53,19 @@ impl ExtInstallCommand {
         // Determine which extensions to install
         let extensions_to_install = if let Some(extension_name) = &self.extension {
             // Single extension specified - use comprehensive lookup
-            match config.find_extension_in_dependency_tree(&self.config_path, extension_name, &target)? {
+            match config.find_extension_in_dependency_tree(
+                &self.config_path,
+                extension_name,
+                &target,
+            )? {
                 Some(location) => {
                     if self.verbose {
                         match &location {
                             ExtensionLocation::Local { name, config_path } => {
                                 print_info(
-                                    &format!("Found local extension '{name}' in config '{config_path}'"),
+                                    &format!(
+                                        "Found local extension '{name}' in config '{config_path}'"
+                                    ),
                                     OutputLevel::Normal,
                                 );
                             }
@@ -84,12 +90,10 @@ impl ExtInstallCommand {
         } else {
             // No extension specified - install all local extensions
             match parsed.get("ext") {
-                Some(ext_section) => {
-                    match ext_section.as_table() {
-                        Some(table) => table.keys().cloned().collect(),
-                        None => vec![],
-                    }
-                }
+                Some(ext_section) => match ext_section.as_table() {
+                    Some(table) => table.keys().cloned().collect(),
+                    None => vec![],
+                },
                 None => {
                     print_info("No extensions found in configuration.", OutputLevel::Normal);
                     return Ok(());

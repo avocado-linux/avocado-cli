@@ -126,8 +126,14 @@ impl RuntimeBuildCommand {
     fn create_build_script(&self, parsed: &toml::Value, target_arch: &str) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
         let config = crate::utils::config::Config::load(&self.config_path)?;
-        let merged_runtime = config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
-            .with_context(|| format!("Runtime '{}' not found or has no configuration for target '{}'", self.runtime_name, target_arch))?;
+        let merged_runtime = config
+            .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
+            .with_context(|| {
+                format!(
+                    "Runtime '{}' not found or has no configuration for target '{}'",
+                    self.runtime_name, target_arch
+                )
+            })?;
 
         let binding = toml::map::Map::new();
         let runtime_deps = merged_runtime
@@ -359,10 +365,18 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         } else {
             // This might be an external extension - we need to find it in the runtime dependencies
             // to get its config path, then process its dependencies
-            let merged_runtime = config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
-                .with_context(|| format!("Runtime '{}' not found or has no configuration for target '{}'", self.runtime_name, target_arch))?;
+            let merged_runtime = config
+                .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
+                .with_context(|| {
+                    format!(
+                        "Runtime '{}' not found or has no configuration for target '{}'",
+                        self.runtime_name, target_arch
+                    )
+                })?;
 
-            if let Some(runtime_deps) = merged_runtime.get("dependencies").and_then(|v| v.as_table())
+            if let Some(runtime_deps) = merged_runtime
+                .get("dependencies")
+                .and_then(|v| v.as_table())
             {
                 for (_dep_name, dep_spec) in runtime_deps {
                     if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {

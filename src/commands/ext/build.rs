@@ -60,7 +60,8 @@ impl ExtBuildCommand {
         let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Find extension using comprehensive lookup
-        let extension_location = config.find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
+        let extension_location = config
+            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
             .ok_or_else(|| {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;

@@ -47,7 +47,8 @@ impl ExtPackageCommand {
         let parsed: toml::Value = toml::from_str(&content)?;
 
         // Find extension using comprehensive lookup
-        let extension_location = config.find_extension_in_dependency_tree(&self.config_path, &self.extension, &self.target)?
+        let extension_location = config
+            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &self.target)?
             .ok_or_else(|| {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;

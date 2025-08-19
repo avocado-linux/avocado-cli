@@ -442,14 +442,13 @@ impl Config {
         let mut visited = std::collections::HashSet::new();
 
         // Get all extensions from runtime dependencies (this will recursively traverse)
-        let runtime_section = parsed
-            .get("runtime")
-            .and_then(|r| r.as_table());
+        let runtime_section = parsed.get("runtime").and_then(|r| r.as_table());
 
         if let Some(runtime_section) = runtime_section {
             for runtime_name in runtime_section.keys() {
                 // Get merged runtime config for this target
-                let merged_runtime = self.get_merged_runtime_config(runtime_name, target, config_path)?;
+                let merged_runtime =
+                    self.get_merged_runtime_config(runtime_name, target, config_path)?;
                 if let Some(merged_value) = merged_runtime {
                     if let Some(dependencies) =
                         merged_value.get("dependencies").and_then(|d| d.as_table())
@@ -546,7 +545,8 @@ impl Config {
         // Load the external extension configuration
         let resolved_external_config_path =
             self.resolve_path_relative_to_src_dir(base_config_path, ext_config_path);
-        let external_extensions = self.load_external_extensions(base_config_path, ext_config_path)?;
+        let external_extensions =
+            self.load_external_extensions(base_config_path, ext_config_path)?;
 
         let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -613,7 +613,9 @@ impl Config {
                         // This is a local extension dependency within the external config
                         all_extensions.insert(ExtensionLocation::Local {
                             name: nested_ext_name.to_string(),
-                            config_path: resolved_external_config_path.to_string_lossy().to_string(),
+                            config_path: resolved_external_config_path
+                                .to_string_lossy()
+                                .to_string(),
                         });
 
                         // Check dependencies of this local extension in the external config
@@ -649,15 +651,9 @@ impl Config {
         visited.insert(ext_key);
 
         // Get the local extension configuration
-        if let Some(ext_config) = parsed_config
-            .get("ext")
-            .and_then(|ext| ext.get(ext_name))
-        {
+        if let Some(ext_config) = parsed_config.get("ext").and_then(|ext| ext.get(ext_name)) {
             // Check if this local extension has dependencies
-            if let Some(dependencies) = ext_config
-                .get("dependencies")
-                .and_then(|d| d.as_table())
-            {
+            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
                 for (_dep_name, dep_spec) in dependencies {
                     // Check for extension dependency
                     if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {

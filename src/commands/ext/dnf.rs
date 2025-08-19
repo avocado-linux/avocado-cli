@@ -62,20 +62,32 @@ impl ExtDnfCommand {
         .await
     }
 
-    fn find_extension_in_dependency_tree(&self, config: &Config, target: &str) -> Result<ExtensionLocation> {
-        match config.find_extension_in_dependency_tree(&self.config_path, &self.extension, target)? {
+    fn find_extension_in_dependency_tree(
+        &self,
+        config: &Config,
+        target: &str,
+    ) -> Result<ExtensionLocation> {
+        match config.find_extension_in_dependency_tree(
+            &self.config_path,
+            &self.extension,
+            target,
+        )? {
             Some(location) => {
                 if self.verbose {
                     match &location {
                         ExtensionLocation::Local { name, config_path } => {
                             print_info(
-                                &format!("Found local extension '{name}' in config '{config_path}'"),
+                                &format!(
+                                    "Found local extension '{name}' in config '{config_path}'"
+                                ),
                                 OutputLevel::Normal,
                             );
                         }
                         ExtensionLocation::External { name, config_path } => {
                             print_info(
-                                &format!("Found external extension '{name}' in config '{config_path}'"),
+                                &format!(
+                                    "Found external extension '{name}' in config '{config_path}'"
+                                ),
                                 OutputLevel::Normal,
                             );
                         }
@@ -234,9 +246,7 @@ impl ExtDnfCommand {
 
         if !setup_success {
             print_error(
-                &format!(
-                    "Failed to set up extension directory for '{extension_name}'."
-                ),
+                &format!("Failed to set up extension directory for '{extension_name}'."),
                 OutputLevel::Normal,
             );
             return Err(anyhow::anyhow!("Failed to create extension directory"));
