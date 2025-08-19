@@ -16,8 +16,8 @@ use commands::init::InitCommand;
 use commands::install::InstallCommand;
 use commands::provision::ProvisionCommand;
 use commands::runtime::{
-    RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDepsCommand, RuntimeDnfCommand,
-    RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
+    RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDeployCommand, RuntimeDepsCommand,
+    RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
@@ -160,6 +160,30 @@ enum Commands {
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Deploy a runtime to a device (shortcut for 'runtime deploy')
+    Deploy {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Runtime name to deploy
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Device IP address or hostname to deploy to
+        #[arg(short = 'd', long = "device", required = true)]
+        device: String,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -456,6 +480,30 @@ enum RuntimeCommands {
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
     },
+    /// Deploy a runtime to a device
+    Deploy {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Runtime name to deploy
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Device IP address or hostname to deploy to
+        #[arg(short = 'd', long = "device", required = true)]
+        device: String,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
 }
 
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
@@ -587,6 +635,27 @@ async fn main() -> Result<()> {
             provision_cmd.execute().await?;
             Ok(())
         }
+        Commands::Deploy {
+            config,
+            verbose,
+            runtime,
+            target,
+            device,
+            container_args,
+            dnf_args,
+        } => {
+            let deploy_cmd = RuntimeDeployCommand::new(
+                runtime,
+                config,
+                verbose,
+                target.or(cli.target),
+                device,
+                container_args,
+                dnf_args,
+            );
+            deploy_cmd.execute().await?;
+            Ok(())
+        }
         Commands::Runtime { command } => match command {
             RuntimeCommands::Install {
                 runtime,
@@ -708,6 +777,27 @@ async fn main() -> Result<()> {
                     dnf_args,
                 );
                 clean_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::Deploy {
+                config,
+                verbose,
+                runtime,
+                target,
+                device,
+                container_args,
+                dnf_args,
+            } => {
+                let deploy_cmd = RuntimeDeployCommand::new(
+                    runtime,
+                    config,
+                    verbose,
+                    target.or(cli.target),
+                    device,
+                    container_args,
+                    dnf_args,
+                );
+                deploy_cmd.execute().await?;
                 Ok(())
             }
         },
