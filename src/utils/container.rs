@@ -356,9 +356,10 @@ export DNF_SDK_HOST="\
 dnf \
 --releasever="$REPO_RELEASE" \
 --best \
---setopt=tsflags=noscripts \
 ${AVOCADO_DNF_ARGS:-} \
 "
+
+export DNF_NO_SCRIPTS="--setopt=tsflags=noscripts"
 
 export DNF_SDK_HOST_OPTS="\
 --setopt=cachedir=${DNF_SDK_HOST_PREFIX}/var/cache \
@@ -381,7 +382,8 @@ export DNF_SDK_TARGET_REPO_CONF="\
 --setopt=reposdir=${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d \
 "
 
-export RPM_NO_CHROOT_FOR_SCRIPTS=1
+# TODO Checking
+# export RPM_NO_CHROOT_FOR_SCRIPTS=1
 
 mkdir -p /etc/dnf/vars
 mkdir -p ${AVOCADO_SDK_PREFIX}/etc/dnf/vars
@@ -412,7 +414,7 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF -y install "avocado-sdk-$AVOCADO_TARGET"
+        $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF -y install "avocado-sdk-$AVOCADO_TARGET"
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
@@ -420,16 +422,16 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF -y install avocado-sdk-toolchain
+        $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF -y install avocado-sdk-toolchain
 
     echo "[INFO] Installing rootfs sysroot."
     RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-      $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
+      $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
       -y --installroot $AVOCADO_PREFIX/rootfs install avocado-pkg-rootfs
 
     echo "[INFO] Installing SDK target sysroot."
     RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-    $DNF_SDK_HOST \
+    $DNF_SDK_HOST $DNF_NO_SCRIPTS \
         $DNF_SDK_TARGET_REPO_CONF \
         -y \
         --installroot ${AVOCADO_SDK_PREFIX}/target-sysroot \

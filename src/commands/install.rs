@@ -632,6 +632,7 @@ impl InstallCommand {
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    $DNF_NO_SCRIPTS \
     --installroot={} \
     {} \
     install \

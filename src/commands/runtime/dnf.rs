@@ -284,6 +284,7 @@ impl RuntimeDnfCommand {
             r#"
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST \
+    $DNF_NO_SCRIPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
     {dnf_args_str} \
