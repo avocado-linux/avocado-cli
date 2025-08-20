@@ -227,6 +227,8 @@ impl SdkRunCommand {
         // Add environment variables
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_TARGET={}", config.target));
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", config.target));
 
         // Add merged container args
         if let Some(args) = &config.container_args {

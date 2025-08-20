@@ -92,6 +92,7 @@ impl RuntimeDeployCommand {
         // Build environment variables for the deploy process
         let mut env_vars = HashMap::new();
         env_vars.insert("AVOCADO_TARGET".to_string(), target_arch.clone());
+        env_vars.insert("AVOCADO_SDK_TARGET".to_string(), target_arch.clone());
         env_vars.insert("AVOCADO_RUNTIME".to_string(), self.runtime_name.clone());
         env_vars.insert("AVOCADO_DEPLOY_MACHINE".to_string(), self.device.clone());
 
@@ -268,11 +269,16 @@ mod tests {
         let target_arch = "x86_64";
         let mut env_vars = HashMap::new();
         env_vars.insert("AVOCADO_TARGET".to_string(), target_arch.to_string());
+        env_vars.insert("AVOCADO_SDK_TARGET".to_string(), target_arch.to_string());
         env_vars.insert("AVOCADO_RUNTIME".to_string(), cmd.runtime_name.clone());
         env_vars.insert("AVOCADO_DEPLOY_MACHINE".to_string(), cmd.device.clone());
 
         // Verify all expected environment variables are present
         assert_eq!(env_vars.get("AVOCADO_TARGET"), Some(&"x86_64".to_string()));
+        assert_eq!(
+            env_vars.get("AVOCADO_SDK_TARGET"),
+            Some(&"x86_64".to_string())
+        );
         assert_eq!(
             env_vars.get("AVOCADO_RUNTIME"),
             Some(&"my-runtime".to_string())
@@ -281,6 +287,6 @@ mod tests {
             env_vars.get("AVOCADO_DEPLOY_MACHINE"),
             Some(&"192.168.1.10".to_string())
         );
-        assert_eq!(env_vars.len(), 3); // Ensure no extra variables
+        assert_eq!(env_vars.len(), 4); // Ensure no extra variables
     }
 }

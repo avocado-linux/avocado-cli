@@ -233,6 +233,8 @@ impl SdkContainer {
         // Add environment variables
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_TARGET={target}"));
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
 
         for (key, value) in env_vars {
             container_cmd.push("-e".to_string());
