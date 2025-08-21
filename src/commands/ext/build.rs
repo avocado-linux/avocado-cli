@@ -519,7 +519,12 @@ fi
             String::new()
         };
 
-        let modprobe_list = modprobe_modules.join(" ");
+        // Create modprobe commands for AVOCADO_ON_MERGE
+        let modprobe_commands: Vec<String> = modprobe_modules
+            .iter()
+            .map(|module| format!("modprobe {module}"))
+            .collect();
+
         let on_merge_list = on_merge_commands.join("; ");
 
         let users_section = self.create_users_script_section(users_config, groups_config);
@@ -539,8 +544,13 @@ echo "SYSEXT_SCOPE={}" >> "$release_file"
 
 # Check if extension includes kernel modules and add AVOCADO_ON_MERGE if needed
 if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.gz" 2>/dev/null | head -n 1)" ]; then
-    echo "AVOCADO_ON_MERGE=\"depmod\"" >> "$release_file"
-    echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=\"depmod\" to release file"
+    if [ -n "{}" ]; then
+        echo "AVOCADO_ON_MERGE=\"depmod; {}\"" >> "$release_file"
+        echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=\"depmod; {}\" to release file"
+    else
+        echo "AVOCADO_ON_MERGE=\"depmod\"" >> "$release_file"
+        echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=\"depmod\" to release file"
+    fi
 fi
 
 # Check if extension includes sysusers.d config files and add systemd-sysusers to AVOCADO_ON_MERGE if needed
@@ -550,12 +560,6 @@ if ([ -d "$sysusers_dir1" ] && [ -n "$(find "$sysusers_dir1" -name "*.conf" 2>/d
    ([ -d "$sysusers_dir2" ] && [ -n "$(find "$sysusers_dir2" -name "*.conf" 2>/dev/null | head -n 1)" ]); then
     echo "AVOCADO_ON_MERGE=\"systemd-sysusers\"" >> "$release_file"
     echo "[INFO] Found sysusers.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-sysusers\" to release file"
-fi
-
-# Add AVOCADO_MODPROBE if modprobe modules are specified
-if [ -n "{}" ]; then
-    echo "AVOCADO_MODPROBE={}" >> "$release_file"
-    echo "Added AVOCADO_MODPROBE={} to release file"
 fi
 
 # Add custom AVOCADO_ON_MERGE commands if specified
@@ -571,13 +575,14 @@ fi
             self.extension,
             if reload_service_manager { "1" } else { "0" },
             ext_scopes.join(" "),
+            modprobe_commands.join("; "),
+            modprobe_commands.join("; "),
+            self.extension,
+            modprobe_commands.join("; "),
             self.extension,
             self.extension,
             self.extension,
             self.extension,
-            modprobe_list,
-            modprobe_list,
-            modprobe_list,
             on_merge_list,
             on_merge_list,
             on_merge_list
@@ -1625,10 +1630,12 @@ mod tests {
             false,
         );
 
-        // Verify AVOCADO_MODPROBE is added with correct modules
-        assert!(script.contains("if [ -n \"nfs ext4\" ]; then"));
-        assert!(script.contains("echo \"AVOCADO_MODPROBE=nfs ext4\" >> \"$release_file\""));
-        assert!(script.contains("echo \"Added AVOCADO_MODPROBE=nfs ext4 to release file\""));
+        // Verify modprobe commands are added to AVOCADO_ON_MERGE when kernel modules are present
+        assert!(script.contains("if [ -n \"modprobe nfs; modprobe ext4\" ]; then"));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod; modprobe nfs; modprobe ext4\\\"\" >> \"$release_file\""));
+
+        // Check for the log message
+        assert!(script.contains("[INFO] Found kernel modules in extension 'test-ext', added AVOCADO_ON_MERGE=\\\"depmod; modprobe nfs; modprobe ext4\\\" to release file"));
     }
 
     #[test]
@@ -1846,9 +1853,43 @@ mod tests {
             false,
         );
 
-        // Verify AVOCADO_MODPROBE section exists but with empty check
-        assert!(script.contains("if [ -n \"\" ]; then"));
-        assert!(script.contains("AVOCADO_MODPROBE="));
+        // Verify that without modprobe modules, only depmod is added when kernel modules are found
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
+        // Verify no modprobe commands are added when no modules are specified
+        assert!(!script.contains("modprobe"));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_user_example_modules() {
+        let cmd = ExtBuildCommand {
+            extension: "gpio-test".to_string(),
+            config_path: "avocado.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        // Test with the example modules from the user's request
+        let modprobe_modules = vec!["gpio-pca953x".to_string(), "rtc-pcf8563w".to_string()];
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &modprobe_modules,
+            &[],
+            None,
+            None,
+            false,
+        );
+
+        // Verify the new behavior: modprobe commands are added to AVOCADO_ON_MERGE after depmod
+        assert!(script.contains("if [ -n \"modprobe gpio-pca953x; modprobe rtc-pcf8563w\" ]; then"));
+        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod; modprobe gpio-pca953x; modprobe rtc-pcf8563w\\\"\" >> \"$release_file\""));
+        assert!(script.contains("[INFO] Found kernel modules in extension 'gpio-test', added AVOCADO_ON_MERGE=\\\"depmod; modprobe gpio-pca953x; modprobe rtc-pcf8563w\\\" to release file"));
+
+        // Verify AVOCADO_MODPROBE is no longer used
+        assert!(!script.contains("AVOCADO_MODPROBE"));
     }
 
     #[test]
