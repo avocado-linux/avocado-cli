@@ -212,7 +212,6 @@ impl Config {
     }
 
     /// Get merged extension configuration for a specific extension and target
-    #[allow(dead_code)] // Future API for command integration
     pub fn get_merged_ext_config(
         &self,
         ext_name: &str,
@@ -3315,5 +3314,113 @@ types = ["sysext"]
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_nested_target_config_merging() {
+        // Create a temporary config file with nested target-specific configuration
+        let config_content = r#"
+default_target = "qemux86-64"
+supported_targets = ["qemux86-64", "reterminal-dm"]
+
+[sdk]
+image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+
+[runtime.default]
+target = "x86_64-unknown-linux-gnu"
+
+[ext.avocado-ext-webkit]
+version = "1.0.0"
+release = "r0"
+vendor = "Avocado Linux <info@avocadolinux.org>"
+summary = "WPE WebKit browser and display utilities"
+description = "WPE WebKit browser and display utilities"
+license = "Apache-2.0"
+url = "https://github.com/avocadolinux/avocado-ext"
+types = ["sysext", "confext"]
+enable_services = ["cog.service"]
+on_merge = ["systemctl restart --no-block cog.service"]
+
+[ext.avocado-ext-webkit.reterminal-dm]
+overlay = "extensions/webkit/overlays/reterminal-dm"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        let config_path = temp_file.path().to_str().unwrap();
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test extension config for qemux86-64 target (should only get base config)
+        let ext_x86 = config
+            .get_merged_ext_config("avocado-ext-webkit", "qemux86-64", config_path)
+            .unwrap();
+        assert!(ext_x86.is_some());
+        let ext_x86_value = ext_x86.unwrap();
+
+        // Should have base config values
+        assert_eq!(
+            ext_x86_value.get("version").and_then(|v| v.as_str()),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            ext_x86_value.get("vendor").and_then(|v| v.as_str()),
+            Some("Avocado Linux <info@avocadolinux.org>")
+        );
+
+        // Should NOT have the target-specific overlay
+        assert!(ext_x86_value.get("overlay").is_none());
+
+        // Test extension config for reterminal-dm target (should get base + target-specific config)
+        let ext_reterminal = config
+            .get_merged_ext_config("avocado-ext-webkit", "reterminal-dm", config_path)
+            .unwrap();
+        assert!(ext_reterminal.is_some());
+        let ext_reterminal_value = ext_reterminal.unwrap();
+
+        // Should have base config values
+        assert_eq!(
+            ext_reterminal_value.get("version").and_then(|v| v.as_str()),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            ext_reterminal_value.get("vendor").and_then(|v| v.as_str()),
+            Some("Avocado Linux <info@avocadolinux.org>")
+        );
+
+        // Should ALSO have the target-specific overlay
+        assert_eq!(
+            ext_reterminal_value.get("overlay").and_then(|v| v.as_str()),
+            Some("extensions/webkit/overlays/reterminal-dm")
+        );
+
+        // Test that arrays from base config are preserved for both targets
+        let types = ext_x86_value
+            .get("types")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(types.len(), 2);
+        assert!(types.iter().any(|v| v.as_str() == Some("sysext")));
+        assert!(types.iter().any(|v| v.as_str() == Some("confext")));
+
+        let enable_services = ext_x86_value
+            .get("enable_services")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(enable_services.len(), 1);
+        assert_eq!(enable_services[0].as_str(), Some("cog.service"));
+
+        // Test that arrays are also preserved for target-specific config
+        let types_reterminal = ext_reterminal_value
+            .get("types")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(types_reterminal.len(), 2);
+        assert!(types_reterminal
+            .iter()
+            .any(|v| v.as_str() == Some("sysext")));
+        assert!(types_reterminal
+            .iter()
+            .any(|v| v.as_str() == Some("confext")));
     }
 }

@@ -71,12 +71,11 @@ impl ExtImageCommand {
             }
         }
 
-        // Get extension configuration (for now, we still need to get it from local config for image logic)
-        let ext_config = parsed
-            .get("ext")
-            .and_then(|ext| ext.get(&self.extension))
+        // Get merged extension configuration with target-specific overrides
+        let ext_config = config
+            .get_merged_ext_config(&self.extension, &target, &self.config_path)?
             .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in local configuration. External extension images not yet supported.", self.extension)
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
         // Get extension types from the types array

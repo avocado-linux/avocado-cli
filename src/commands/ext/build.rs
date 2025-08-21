@@ -83,12 +83,11 @@ impl ExtBuildCommand {
             }
         }
 
-        // Get extension configuration (for now, we still need to get it from local config for build logic)
-        let ext_config = parsed
-            .get("ext")
-            .and_then(|ext| ext.get(&self.extension))
+        // Get merged extension configuration with target-specific overrides
+        let ext_config = config
+            .get_merged_ext_config(&self.extension, &target, &self.config_path)?
             .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in local configuration. External extension builds not yet supported.", self.extension)
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
         // Get extension types from the types array
@@ -519,7 +518,7 @@ fi
             String::new()
         };
 
-                // Create modprobe commands section for AVOCADO_ON_MERGE
+        // Create modprobe commands section for AVOCADO_ON_MERGE
         let modprobe_section = if !modprobe_modules.is_empty() {
             modprobe_modules
                 .iter()
@@ -1651,15 +1650,23 @@ mod tests {
             false,
         );
 
-                // Verify separate AVOCADO_ON_MERGE entries are added for kernel modules and modprobe commands
+        // Verify separate AVOCADO_ON_MERGE entries are added for kernel modules and modprobe commands
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
         assert!(script.contains("[INFO] Found kernel modules in extension 'test-ext', added AVOCADO_ON_MERGE=\\\"depmod\\\" to release file"));
 
         // Verify separate modprobe commands are added
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe nfs\\\"\" >> \"$release_file\""));
-        assert!(script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe nfs\\\" to release file"));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe ext4\\\"\" >> \"$release_file\""));
-        assert!(script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe ext4\\\" to release file"));
+        assert!(
+            script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe nfs\\\"\" >> \"$release_file\"")
+        );
+        assert!(
+            script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe nfs\\\" to release file")
+        );
+        assert!(
+            script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe ext4\\\"\" >> \"$release_file\"")
+        );
+        assert!(
+            script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe ext4\\\" to release file")
+        );
     }
 
     #[test]
@@ -1787,8 +1794,12 @@ mod tests {
         );
 
         // Verify custom on_merge commands are added as separate entries
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""));
-        assert!(script.contains("[INFO] Added custom on_merge command to release file: systemctl restart sshd.socket"));
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "[INFO] Added custom on_merge command to release file: systemctl restart sshd.socket"
+        ));
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"echo test\\\"\" >> \"$release_file\""));
         assert!(script.contains("[INFO] Added custom on_merge command to release file: echo test"));
     }
@@ -1907,15 +1918,23 @@ mod tests {
             false,
         );
 
-                // Verify separate AVOCADO_ON_MERGE entries are added
+        // Verify separate AVOCADO_ON_MERGE entries are added
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
         assert!(script.contains("[INFO] Found kernel modules in extension 'gpio-test', added AVOCADO_ON_MERGE=\\\"depmod\\\" to release file"));
 
         // Verify separate modprobe commands are added
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\"\" >> \"$release_file\""));
-        assert!(script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\" to release file"));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\"\" >> \"$release_file\""));
-        assert!(script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\" to release file"));
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\" to release file"
+        ));
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\" to release file"
+        ));
 
         // Verify AVOCADO_MODPROBE is no longer used
         assert!(!script.contains("AVOCADO_MODPROBE"));
@@ -1934,7 +1953,10 @@ mod tests {
 
         // Test with both modprobe modules and custom commands
         let modprobe_modules = vec!["module1".to_string(), "module2".to_string()];
-        let custom_commands = vec!["systemctl restart service1".to_string(), "echo 'test'".to_string()];
+        let custom_commands = vec![
+            "systemctl restart service1".to_string(),
+            "echo 'test'".to_string(),
+        ];
         let script = cmd.create_sysext_build_script(
             "1.0",
             &["system".to_string()],
@@ -1949,22 +1971,34 @@ mod tests {
         // Verify that each command gets its own separate AVOCADO_ON_MERGE entry
         // Kernel modules section
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe module1\\\"\" >> \"$release_file\""));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe module2\\\"\" >> \"$release_file\""));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe module1\\\"\" >> \"$release_file\""));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe module2\\\"\" >> \"$release_file\""));
 
         // Custom commands section
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"systemctl restart service1\\\"\" >> \"$release_file\""));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"echo 'test'\\\"\" >> \"$release_file\""));
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"systemctl restart service1\\\"\" >> \"$release_file\""
+        ));
+        assert!(
+            script.contains("echo \"AVOCADO_ON_MERGE=\\\"echo 'test'\\\"\" >> \"$release_file\"")
+        );
 
         // Verify no semicolon-separated commands
         assert!(!script.contains("depmod; modprobe"));
         assert!(!script.contains("systemctl restart service1; echo"));
 
         // Verify individual log messages
-        assert!(script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe module1\\\" to release file"));
-        assert!(script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe module2\\\" to release file"));
-        assert!(script.contains("[INFO] Added custom on_merge command to release file: systemctl restart service1"));
-        assert!(script.contains("[INFO] Added custom on_merge command to release file: echo 'test'"));
+        assert!(script
+            .contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe module1\\\" to release file"));
+        assert!(script
+            .contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe module2\\\" to release file"));
+        assert!(script.contains(
+            "[INFO] Added custom on_merge command to release file: systemctl restart service1"
+        ));
+        assert!(
+            script.contains("[INFO] Added custom on_merge command to release file: echo 'test'")
+        );
     }
 
     #[test]
