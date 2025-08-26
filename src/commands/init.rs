@@ -70,7 +70,7 @@ avocado-img-initramfs = "*"
 avocado-dev = {{ ext = "avocado-dev" }}
 
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [sdk.dependencies]
 nativesdk-qemu-system-x86-64 = "*"
@@ -133,7 +133,7 @@ mod tests {
         assert!(content.contains("avocado-img-rootfs = \"*\""));
         assert!(content.contains("avocado-img-initramfs = \"*\""));
         assert!(content.contains("avocado-dev = { ext = \"avocado-dev\" }"));
-        assert!(content.contains("image = \"avocadolinux/sdk:apollo-edge\""));
+        assert!(content.contains("image = \"docker.io/avocadolinux/sdk:apollo-edge\""));
         assert!(content.contains("nativesdk-qemu-system-x86-64 = \"*\""));
         assert!(content.contains("[ext.avocado-dev]"));
         assert!(content.contains("types = [\"sysext\", \"confext\"]"));

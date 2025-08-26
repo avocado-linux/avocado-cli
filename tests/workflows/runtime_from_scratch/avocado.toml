@@ -4,7 +4,7 @@ default_target = "qemux86-64"
 target = "qemux86-64"
 
 [sdk]
-image = "avocadolinux/sdk:dev"
+image = "docker.io/avocadolinux/sdk:dev"
 
 [sdk.dependencies]
 nativesdk-qemu-system-x86-64 = "*"

@@ -1349,7 +1349,7 @@ target = "qemux86-64"
 nativesdk-avocado-images = "*"
 
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [sdk.dependencies]
 cmake = "*"
@@ -1366,7 +1366,7 @@ dependencies = { gcc = "*" }
         assert_eq!(config.get_target(), Some("qemux86-64".to_string()));
         assert_eq!(
             config.get_sdk_image(),
-            Some(&"avocadolinux/sdk:apollo-edge".to_string())
+            Some(&"docker.io/avocadolinux/sdk:apollo-edge".to_string())
         );
         assert!(config.get_sdk_dependencies().is_some());
         assert!(!config.get_compile_dependencies().is_empty());
@@ -1384,7 +1384,7 @@ dependencies = { gcc = "*" }
 src_dir = "/absolute/path/to/source"
 
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -1406,7 +1406,7 @@ image = "avocadolinux/sdk:apollo-edge"
 src_dir = "../../"
 
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -1432,7 +1432,7 @@ image = "avocadolinux/sdk:apollo-edge"
     fn test_src_dir_not_configured() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -1448,7 +1448,7 @@ image = "avocadolinux/sdk:apollo-edge"
     fn test_extension_sdk_dependencies() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [ext.avocado-dev]
 types = ["sysext", "confext"]
@@ -1502,7 +1502,7 @@ nativesdk-tool = "*"
     fn test_extension_sdk_dependencies_with_target() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [ext.avocado-dev]
 types = ["sysext", "confext"]
@@ -1638,7 +1638,7 @@ nativesdk-arm-tool = "*"
     fn test_extension_sdk_dependencies_from_runtime_dependencies() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [runtime.dev.dependencies]
 avocado-ext-dev = { ext = "avocado-ext-dev", config = "extensions/dev/avocado.toml" }
@@ -1686,7 +1686,7 @@ types = ["confext"]
     fn test_sdk_container_args() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 container_args = ["--network=$USER-avocado", "--privileged"]
 "#;
 
@@ -1754,7 +1754,7 @@ image = "avocadolinux/runtime:apollo-edge"
     fn test_merge_sdk_container_args() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 container_args = ["--network=host", "--privileged"]
 "#;
 
@@ -1777,7 +1777,7 @@ container_args = ["--network=host", "--privileged"]
     fn test_merge_sdk_container_args_config_only() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 container_args = ["--network=host"]
 "#;
 
@@ -1796,7 +1796,7 @@ container_args = ["--network=host"]
     fn test_merge_sdk_container_args_cli_only() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -1815,7 +1815,7 @@ image = "avocadolinux/sdk:apollo-edge"
     fn test_merge_sdk_container_args_none() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -1864,7 +1864,7 @@ image = "avocadolinux/sdk:apollo-edge"
 
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 container_args = ["--network=$TEST_USER-avocado", "--privileged"]
 "#;
 
@@ -1989,7 +1989,7 @@ container_args = ["--network=host"]
     fn test_merge_provision_container_args_cli_only() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -2008,7 +2008,7 @@ image = "avocadolinux/sdk:apollo-edge"
     fn test_merge_provision_container_args_none() {
         let config_content = r#"
 [sdk]
-image = "avocadolinux/sdk:apollo-edge"
+image = "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();

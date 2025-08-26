@@ -50,7 +50,7 @@ impl HitlServerCommand {
             let image = sdk_config
                 .image
                 .as_ref()
-                .unwrap_or(&"avocadolinux/sdk:latest".to_string())
+                .unwrap_or(&"docker.io/avocadolinux/sdk:latest".to_string())
                 .clone();
             (image, repo_url, repo_release)
         } else {
