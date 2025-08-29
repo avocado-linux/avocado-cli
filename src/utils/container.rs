@@ -384,9 +384,6 @@ export DNF_SDK_TARGET_REPO_CONF="\
 --setopt=reposdir=${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d \
 "
 
-# TODO Checking
-# export RPM_NO_CHROOT_FOR_SCRIPTS=1
-
 mkdir -p /etc/dnf/vars
 mkdir -p ${AVOCADO_SDK_PREFIX}/etc/dnf/vars
 mkdir -p ${AVOCADO_SDK_PREFIX}/target-repoconf/etc/dnf/vars

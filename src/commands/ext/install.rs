@@ -295,20 +295,47 @@ impl ExtInstallCommand {
                 };
                 let command = format!(
                     r#"
+# Temporarily provide scriptlet tools in extension sysroot
+EXTENSION_ROOT="{installroot}"
+
+# Ensure directories exist
+mkdir -p "$EXTENSION_ROOT/usr/bin" "$EXTENSION_ROOT/usr/sbin"
+
+# Symlink the real update-alternatives from SDK (host-native)
+if [ -f "$AVOCADO_SDK_PREFIX/usr/bin/update-alternatives" ]; then
+    ln -sf "$AVOCADO_SDK_PREFIX/usr/bin/update-alternatives" "$EXTENSION_ROOT/usr/bin/update-alternatives"
+    LINKED_UPDATE_ALTERNATIVES=1
+fi
+
+# Create stubs for other common scriptlet tools (just succeed silently)
+ln -sf /bin/true "$EXTENSION_ROOT/usr/sbin/depmod"
+ln -sf /bin/true "$EXTENSION_ROOT/usr/sbin/ldconfig"
+ln -sf /bin/true "$EXTENSION_ROOT/usr/bin/systemctl"
+ln -sf /bin/true "$EXTENSION_ROOT/usr/sbin/systemd-tmpfiles"
+ln -sf /bin/true "$EXTENSION_ROOT/usr/bin/systemd-sysusers"
+
+# Run DNF with scriptlets enabled (removed $DNF_NO_SCRIPTS)
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
-    $DNF_NO_SCRIPTS \
     $DNF_SDK_TARGET_REPO_CONF \
-    --installroot={} \
-    {} \
+    --installroot={installroot} \
+    {dnf_args_str} \
     install \
-    {} \
-    {}
+    {yes} \
+    {packages}
+
+# Clean up: Remove all the symlinks
+[ "$LINKED_UPDATE_ALTERNATIVES" = "1" ] && rm -f "$EXTENSION_ROOT/usr/bin/update-alternatives"
+rm -f "$EXTENSION_ROOT/usr/sbin/depmod"
+rm -f "$EXTENSION_ROOT/usr/sbin/ldconfig"
+rm -f "$EXTENSION_ROOT/usr/bin/systemctl"
+rm -f "$EXTENSION_ROOT/usr/sbin/systemd-tmpfiles"
+rm -f "$EXTENSION_ROOT/usr/bin/systemd-sysusers"
 "#,
-                    installroot,
-                    dnf_args_str,
-                    yes,
-                    packages.join(" ")
+                    installroot = installroot,
+                    dnf_args_str = dnf_args_str,
+                    yes = yes,
+                    packages = packages.join(" ")
                 );
 
                 if self.verbose {
