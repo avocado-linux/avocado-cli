@@ -736,8 +736,8 @@ echo "External extension {extension_name} images are ready in output directory"
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
+            repo_url,
+            repo_release,
             container_args: merged_container_args,
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

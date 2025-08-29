@@ -149,8 +149,8 @@ impl SdkCompileCommand {
                 verbose: self.verbose,
                 source_environment: true,
                 interactive: false,
-                repo_url: repo_url.cloned(),
-                repo_release: repo_release.cloned(),
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 ..Default::default()

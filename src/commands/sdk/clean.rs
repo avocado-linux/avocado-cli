@@ -81,8 +81,8 @@ impl SdkCleanCommand {
             verbose: self.verbose,
             source_environment: false, // don't source environment
             interactive: false,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
+            repo_url,
+            repo_release,
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

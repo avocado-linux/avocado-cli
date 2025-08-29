@@ -124,8 +124,8 @@ impl RuntimeInstallCommand {
                     runtime_name,
                     &container_helper,
                     container_image,
-                    repo_url,
-                    repo_release,
+                    repo_url.as_ref(),
+                    repo_release.as_ref(),
                     &merged_container_args,
                 )
                 .await?;

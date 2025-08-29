@@ -54,8 +54,8 @@ impl ExtDnfCommand {
             &parsed,
             &container_image,
             &target,
-            repo_url,
-            repo_release,
+            repo_url.as_ref(),
+            repo_release.as_ref(),
             &merged_container_args,
             &extension_location,
         )

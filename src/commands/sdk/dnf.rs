@@ -93,8 +93,8 @@ impl SdkDnfCommand {
                 container_image,
                 &target,
                 &command,
-                repo_url,
-                repo_release,
+                repo_url.as_ref(),
+                repo_release.as_ref(),
                 merged_container_args.as_ref(),
             )
             .await?;

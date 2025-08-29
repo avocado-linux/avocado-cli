@@ -347,8 +347,8 @@ rm -rf "$TMPDIR"
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: config.get_sdk_repo_url().cloned(),
-            repo_release: config.get_sdk_repo_release().cloned(),
+            repo_url: config.get_sdk_repo_url(),
+            repo_release: config.get_sdk_repo_release(),
             container_args: merged_container_args,
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

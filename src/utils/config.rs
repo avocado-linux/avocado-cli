@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -300,14 +301,28 @@ impl Config {
         self.sdk.as_ref()?.dependencies.as_ref()
     }
 
-    /// Get the SDK repo URL from configuration
-    pub fn get_sdk_repo_url(&self) -> Option<&String> {
-        self.sdk.as_ref()?.repo_url.as_ref()
+    /// Get the SDK repo URL from environment variable or configuration
+    /// Priority: AVOCADO_SDK_REPO_URL environment variable > config file
+    pub fn get_sdk_repo_url(&self) -> Option<String> {
+        // First priority: Environment variable
+        if let Ok(env_url) = env::var("AVOCADO_SDK_REPO_URL") {
+            return Some(env_url);
+        }
+
+        // Second priority: Configuration file
+        self.sdk.as_ref()?.repo_url.as_ref().cloned()
     }
 
-    /// Get the SDK repo release from configuration
-    pub fn get_sdk_repo_release(&self) -> Option<&String> {
-        self.sdk.as_ref()?.repo_release.as_ref()
+    /// Get the SDK repo release from environment variable or configuration
+    /// Priority: AVOCADO_SDK_REPO_RELEASE environment variable > config file
+    pub fn get_sdk_repo_release(&self) -> Option<String> {
+        // First priority: Environment variable
+        if let Ok(env_release) = env::var("AVOCADO_SDK_REPO_RELEASE") {
+            return Some(env_release);
+        }
+
+        // Second priority: Configuration file
+        self.sdk.as_ref()?.repo_release.as_ref().cloned()
     }
 
     /// Get the SDK container args from configuration
@@ -1824,6 +1839,80 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
         let merged = config.merge_sdk_container_args(None);
 
         assert!(merged.is_none());
+    }
+
+    #[test]
+    fn test_get_sdk_repo_url_env_override() {
+        // Test environment variable override for SDK repo URL
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+repo_url = "https://config.example.com"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test without environment variable - should return config value
+        std::env::remove_var("AVOCADO_SDK_REPO_URL");
+        let repo_url = config.get_sdk_repo_url();
+        assert_eq!(repo_url, Some("https://config.example.com".to_string()));
+
+        // Test with environment variable - should return env value
+        std::env::set_var("AVOCADO_SDK_REPO_URL", "https://env.example.com");
+        let repo_url = config.get_sdk_repo_url();
+        assert_eq!(repo_url, Some("https://env.example.com".to_string()));
+
+        // Clean up
+        std::env::remove_var("AVOCADO_SDK_REPO_URL");
+    }
+
+    #[test]
+    fn test_get_sdk_repo_release_env_override() {
+        // Test environment variable override for SDK repo release
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+repo_release = "config-release"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test without environment variable - should return config value
+        std::env::remove_var("AVOCADO_SDK_REPO_RELEASE");
+        let repo_release = config.get_sdk_repo_release();
+        assert_eq!(repo_release, Some("config-release".to_string()));
+
+        // Test with environment variable - should return env value
+        std::env::set_var("AVOCADO_SDK_REPO_RELEASE", "env-release");
+        let repo_release = config.get_sdk_repo_release();
+        assert_eq!(repo_release, Some("env-release".to_string()));
+
+        // Clean up
+        std::env::remove_var("AVOCADO_SDK_REPO_RELEASE");
+    }
+
+    #[test]
+    fn test_get_sdk_repo_url_env_only() {
+        // Test environment variable when no config value exists
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test without environment variable - should return None
+        std::env::remove_var("AVOCADO_SDK_REPO_URL");
+        let repo_url = config.get_sdk_repo_url();
+        assert_eq!(repo_url, None);
+
+        // Test with environment variable - should return env value
+        std::env::set_var("AVOCADO_SDK_REPO_URL", "https://env-only.example.com");
+        let repo_url = config.get_sdk_repo_url();
+        assert_eq!(repo_url, Some("https://env-only.example.com".to_string()));
+
+        // Clean up
+        std::env::remove_var("AVOCADO_SDK_REPO_URL");
     }
 
     #[test]

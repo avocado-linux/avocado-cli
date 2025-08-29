@@ -519,8 +519,8 @@ impl InstallCommand {
             verbose: self.verbose,
             source_environment: false,
             interactive: false,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()
@@ -539,8 +539,8 @@ impl InstallCommand {
                 verbose: self.verbose,
                 source_environment: false,
                 interactive: false,
-                repo_url: repo_url.cloned(),
-                repo_release: repo_release.cloned(),
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 ..Default::default()
@@ -659,8 +659,8 @@ $DNF_SDK_HOST \
                         verbose: self.verbose,
                         source_environment: false, // don't source environment (same as regular extensions)
                         interactive: !self.force, // interactive if not forced (same as regular extensions)
-                        repo_url: repo_url.cloned(),
-                        repo_release: repo_release.cloned(),
+                        repo_url,
+                        repo_release,
                         container_args: merged_container_args,
                         dnf_args: self.dnf_args.clone(),
                         ..Default::default()

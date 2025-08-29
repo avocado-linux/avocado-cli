@@ -101,8 +101,8 @@ impl RuntimeBuildCommand {
             verbose: self.verbose,
             source_environment: true, // need environment for build
             interactive: false,       // build script runs non-interactively
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
+            repo_url,
+            repo_release,
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             ..Default::default()

@@ -135,8 +135,8 @@ impl ExtImageCommand {
                 container_image,
                 &target_arch,
                 &ext_types.join(","), // Pass types for potential future use
-                repo_url,
-                repo_release,
+                repo_url.as_ref(),
+                repo_release.as_ref(),
                 &merged_container_args,
             )
             .await?;
