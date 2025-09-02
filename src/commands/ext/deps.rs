@@ -160,7 +160,18 @@ impl ExtDepsCommand {
 
         // Try extension reference
         if let Some(toml::Value::String(ext_name)) = spec_map.get("ext") {
-            return self.resolve_extension_dependency(config, ext_name);
+            // Check if this is a versioned extension (has vsn field)
+            if let Some(toml::Value::String(version)) = spec_map.get("vsn") {
+                return vec![("ext".to_string(), ext_name.clone(), version.clone())];
+            }
+            // Check if this is an external extension (has config field)
+            else if spec_map.get("config").is_some() {
+                // For external extensions, we don't have a local version, so use "*"
+                return vec![("ext".to_string(), ext_name.clone(), "*".to_string())];
+            } else {
+                // Local extension - resolve from local config
+                return self.resolve_extension_dependency(config, ext_name);
+            }
         }
 
         // Try compile reference

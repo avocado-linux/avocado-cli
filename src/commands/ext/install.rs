@@ -249,20 +249,65 @@ impl ExtInstallCommand {
         }
 
         // Install dependencies if they exist
-        let extension_config = &config["ext"][extension];
-        let dependencies = extension_config.get("dependencies");
+        // Check if extension exists in local config (versioned extensions may not be local)
+        let dependencies = config
+            .get("ext")
+            .and_then(|ext| ext.as_table())
+            .and_then(|ext_table| ext_table.get(extension))
+            .and_then(|extension_config| extension_config.get("dependencies"));
 
         if let Some(toml::Value::Table(deps_map)) = dependencies {
-            // Build list of packages to install
+            // Build list of packages to install and handle extension dependencies
             let mut packages = Vec::new();
+            let mut extension_dependencies = Vec::new();
+
             for (package_name, version_spec) in deps_map {
-                // Skip compile dependencies (identified by dict value with 'compile' key)
+                // Handle extension dependencies
                 if let toml::Value::Table(spec_map) = version_spec {
+                    // Skip compile dependencies (identified by dict value with 'compile' key)
                     if spec_map.contains_key("compile") {
                         continue;
                     }
+
+                    // Check for extension dependency
+                    if let Some(ext_name) = spec_map.get("ext").and_then(|v| v.as_str()) {
+                        // Check if this is a versioned extension (has vsn field)
+                        if let Some(version) = spec_map.get("vsn").and_then(|v| v.as_str()) {
+                            extension_dependencies
+                                .push((ext_name.to_string(), Some(version.to_string())));
+                            if self.verbose {
+                                print_info(
+                                    &format!("Found versioned extension dependency: {ext_name} version {version}"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                        }
+                        // Check if this is an external extension (has config field)
+                        else if let Some(config_path) =
+                            spec_map.get("config").and_then(|v| v.as_str())
+                        {
+                            extension_dependencies.push((ext_name.to_string(), None));
+                            if self.verbose {
+                                print_info(
+                                    &format!("Found external extension dependency: {ext_name} from config {config_path}"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                        } else {
+                            // Local extension
+                            extension_dependencies.push((ext_name.to_string(), None));
+                            if self.verbose {
+                                print_info(
+                                    &format!("Found local extension dependency: {ext_name}"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                        }
+                        continue; // Skip adding to packages list
+                    }
                 }
 
+                // Handle regular package dependencies
                 match version_spec {
                     toml::Value::String(version) => {
                         if version == "*" {
@@ -281,6 +326,33 @@ impl ExtInstallCommand {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            // Handle extension dependencies first
+            if !extension_dependencies.is_empty() {
+                if self.verbose {
+                    print_info(
+                        &format!("Extension '{extension}' has {} extension dependencies that need to be installed first", extension_dependencies.len()),
+                        OutputLevel::Normal,
+                    );
+                }
+
+                // Note: Extension dependencies should be handled by the main install command
+                // or by recursive calls to ExtInstallCommand for each dependency.
+                // For now, we'll log them but not install them directly to avoid circular dependencies.
+                for (ext_name, version) in &extension_dependencies {
+                    if let Some(ver) = version {
+                        print_info(
+                            &format!("Extension dependency: {ext_name} (version {ver}) - should be installed via main install command"),
+                            OutputLevel::Normal,
+                        );
+                    } else {
+                        print_info(
+                            &format!("Extension dependency: {ext_name} - should be installed via main install command"),
+                            OutputLevel::Normal,
+                        );
+                    }
                 }
             }
 

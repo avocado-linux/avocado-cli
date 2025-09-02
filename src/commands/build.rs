@@ -13,13 +13,15 @@ use crate::utils::{
     output::{print_info, print_success, OutputLevel},
 };
 
-/// Represents an extension dependency that can be either local or external
+/// Represents an extension dependency that can be either local, external, or version-based
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionDependency {
     /// Extension defined in the main config file
     Local(String),
     /// Extension defined in an external config file
     External { name: String, config_path: String },
+    /// Extension resolved via DNF with a version specification
+    Versioned { name: String, version: String },
 }
 
 /// Implementation of the 'build' command that runs all build subcommands.
@@ -192,6 +194,15 @@ impl BuildCommand {
                                 format!("Failed to copy images for external extension '{name}'")
                             })?;
                     }
+                    ExtensionDependency::Versioned { name, version } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Skipping build for versioned extension '{name}' version '{version}' (installed via DNF)"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        // Versioned extensions are installed via DNF and don't need building
+                    }
                 }
             }
         } else {
@@ -235,6 +246,15 @@ impl BuildCommand {
                         }
                         // External extensions already have their images created by ExtBuildCommand::execute()
                         // No additional image creation needed
+                    }
+                    ExtensionDependency::Versioned { name, version } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Skipping image creation for versioned extension '{name}' version '{version}' (installed via DNF)"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        // Versioned extensions are installed via DNF and don't need image creation
                     }
                 }
             }
@@ -374,8 +394,16 @@ impl BuildCommand {
                     for (_dep_name, dep_spec) in dependencies {
                         // Check for extension dependency
                         if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                            // Check if this is a versioned extension (has vsn field)
+                            if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+                                let ext_dep = ExtensionDependency::Versioned {
+                                    name: ext_name.to_string(),
+                                    version: version.to_string(),
+                                };
+                                required_extensions.insert(ext_dep);
+                            }
                             // Check if this is an external extension (has config field)
-                            if let Some(external_config) =
+                            else if let Some(external_config) =
                                 dep_spec.get("config").and_then(|v| v.as_str())
                             {
                                 let ext_dep = ExtensionDependency::External {
@@ -407,10 +435,12 @@ impl BuildCommand {
             let name_a = match a {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
             name_a.cmp(name_b)
         });
@@ -428,6 +458,7 @@ impl BuildCommand {
         let (ext_name, ext_config_path) = match ext_dep {
             ExtensionDependency::External { name, config_path } => (name, config_path),
             ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
+            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
         };
 
         // Cycle detection: check if we've already processed this extension
@@ -760,6 +791,103 @@ echo "External extension {extension_name} images are ready in output directory"
         Ok(())
     }
 
+    /// Create image for a versioned extension from its sysroot
+    async fn create_versioned_extension_image(
+        &self,
+        extension_name: &str,
+        target: &str,
+    ) -> Result<()> {
+        print_info(
+            &format!("Creating image for versioned extension '{extension_name}'."),
+            OutputLevel::Normal,
+        );
+
+        // Load configuration
+        let config = Config::load(&self.config_path)?;
+        let content = std::fs::read_to_string(&self.config_path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+
+        // Merge container args from config and CLI
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+        // Get repo_url and repo_release from config
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
+        // Get SDK configuration
+        let container_image = parsed
+            .get("sdk")
+            .and_then(|sdk| sdk.get("image"))
+            .and_then(|img| img.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
+
+        // Initialize SDK container helper
+        let container_helper = crate::utils::container::SdkContainer::new();
+
+        // Create the image creation script
+        let image_script = format!(
+            r#"
+set -e
+
+# Common variables
+EXT_NAME="{extension_name}"
+OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
+OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME.raw"
+
+# Create output directory
+mkdir -p $OUTPUT_DIR
+
+# Remove existing file if it exists
+rm -f "$OUTPUT_FILE"
+
+# Check if extension sysroot exists
+if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
+    echo "Extension sysroot does not exist: $AVOCADO_EXT_SYSROOTS/$EXT_NAME."
+    exit 1
+fi
+
+# Create squashfs image from the versioned extension sysroot
+mksquashfs \
+  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
+  "$OUTPUT_FILE" \
+  -noappend \
+  -no-xattrs
+
+echo "Successfully created image for versioned extension '$EXT_NAME' at $OUTPUT_FILE"
+"#
+        );
+
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: image_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url,
+            repo_release,
+            container_args: merged_container_args,
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+
+        let success = container_helper.run_in_container(run_config).await?;
+
+        if success {
+            print_info(
+                &format!("Successfully created image for versioned extension '{extension_name}'."),
+                OutputLevel::Normal,
+            );
+        } else {
+            return Err(anyhow::anyhow!(
+                "Failed to create image for versioned extension '{}'",
+                extension_name
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Build a single extension without building runtimes
     async fn build_single_extension(
         &self,
@@ -819,6 +947,11 @@ echo "External extension {extension_name} images are ready in output directory"
                     format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
                 })?;
             }
+            ExtensionDependency::Versioned { name, version } => {
+                return Err(anyhow::anyhow!(
+                    "Cannot build individual versioned extension '{name}' version '{version}'. Versioned extensions are installed via DNF."
+                ));
+            }
         }
 
         // Step 2: Create extension image
@@ -854,6 +987,11 @@ echo "External extension {extension_name} images are ready in output directory"
                     .with_context(|| {
                         format!("Failed to copy images for external extension '{name}'")
                     })?;
+            }
+            ExtensionDependency::Versioned { name, version } => {
+                return Err(anyhow::anyhow!(
+                    "Cannot create image for individual versioned extension '{name}' version '{version}'. Versioned extensions are installed via DNF."
+                ));
             }
         }
 
@@ -1026,6 +1164,19 @@ echo "External extension {extension_name} images are ready in output directory"
                                 format!("Failed to copy images for external extension '{name}'")
                             })?;
                     }
+                    ExtensionDependency::Versioned { name, version } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Skipping build for versioned extension '{name}' version '{version}' (installed via DNF)"),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        // Versioned extensions are installed via DNF and don't need building
+                        // But they do need images created from their sysroots
+                        self.create_versioned_extension_image(name, target).await.with_context(|| {
+                            format!("Failed to create image for versioned extension '{name}' version '{version}'")
+                        })?;
+                    }
                 }
             }
         } else {
@@ -1075,8 +1226,18 @@ echo "External extension {extension_name} images are ready in output directory"
             for (_dep_name, dep_spec) in dependencies {
                 // Check for extension dependency
                 if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    // Check if this is a versioned extension (has vsn field)
+                    if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+                        let ext_dep = ExtensionDependency::Versioned {
+                            name: ext_name.to_string(),
+                            version: version.to_string(),
+                        };
+                        required_extensions.insert(ext_dep);
+                    }
                     // Check if this is an external extension (has config field)
-                    if let Some(external_config) = dep_spec.get("config").and_then(|v| v.as_str()) {
+                    else if let Some(external_config) =
+                        dep_spec.get("config").and_then(|v| v.as_str())
+                    {
                         let ext_dep = ExtensionDependency::External {
                             name: ext_name.to_string(),
                             config_path: external_config.to_string(),
@@ -1113,10 +1274,12 @@ echo "External extension {extension_name} images are ready in output directory"
             let name_a = match a {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
             name_a.cmp(name_b)
         });
@@ -1152,8 +1315,16 @@ echo "External extension {extension_name} images are ready in output directory"
                     for (_dep_name, dep_spec) in dependencies {
                         // Check for extension dependency
                         if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                            // Check if this is a versioned extension (has vsn field)
+                            if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+                                let ext_dep = ExtensionDependency::Versioned {
+                                    name: ext_name.to_string(),
+                                    version: version.to_string(),
+                                };
+                                all_extensions.insert(ext_dep);
+                            }
                             // Check if this is an external extension (has config field)
-                            if let Some(external_config) =
+                            else if let Some(external_config) =
                                 dep_spec.get("config").and_then(|v| v.as_str())
                             {
                                 let ext_dep = ExtensionDependency::External {
@@ -1194,6 +1365,7 @@ echo "External extension {extension_name} images are ready in output directory"
             let found_name = match &ext_dep {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
 
             if found_name == extension_name {
@@ -1224,6 +1396,7 @@ echo "External extension {extension_name} images are ready in output directory"
                     visited,
                 );
             }
+            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
         };
 
         // Cycle detection: check if we've already processed this extension

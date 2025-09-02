@@ -89,7 +89,18 @@ impl RuntimeDepsCommand {
     ) -> Option<(String, String, String)> {
         // Try to resolve as extension reference first
         if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-            return Some(self.resolve_extension_dependency(parsed, ext_name));
+            // Check if this is a versioned extension (has vsn field)
+            if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+                return Some(("ext".to_string(), ext_name.to_string(), version.to_string()));
+            }
+            // Check if this is an external extension (has config field)
+            else if dep_spec.get("config").is_some() {
+                // For external extensions, we don't have a local version, so use "*"
+                return Some(("ext".to_string(), ext_name.to_string(), "*".to_string()));
+            } else {
+                // Local extension - resolve from local config
+                return Some(self.resolve_extension_dependency(parsed, ext_name));
+            }
         }
 
         // Otherwise treat as package dependency

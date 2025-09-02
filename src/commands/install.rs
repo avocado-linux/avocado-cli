@@ -7,6 +7,7 @@ use crate::commands::{
 };
 use crate::utils::{
     config::Config,
+    container::SdkContainer,
     output::{print_info, print_success, OutputLevel},
     target::validate_and_log_target,
 };
@@ -18,6 +19,8 @@ pub enum ExtensionDependency {
     Local(String),
     /// Extension defined in an external config file
     External { name: String, config_path: String },
+    /// Extension resolved via DNF with a version specification
+    Versioned { name: String, version: String },
 }
 
 /// Implementation of the 'install' command that runs all install subcommands.
@@ -145,6 +148,21 @@ impl InstallCommand {
                             format!("Failed to install external extension '{name}' from config '{ext_config_path}'")
                         })?;
                     }
+                    ExtensionDependency::Versioned { name, version } => {
+                        if self.verbose {
+                            print_info(
+                                &format!(
+                                    "Installing versioned extension '{name}' version '{version}'"
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Install versioned extension to its own sysroot
+                        self.install_versioned_extension(&config, name, version, &_target).await.with_context(|| {
+                            format!("Failed to install versioned extension '{name}' version '{version}'")
+                        })?;
+                    }
                 }
             }
         } else {
@@ -254,8 +272,18 @@ impl InstallCommand {
                                     if let Some(ext_name) =
                                         dep_spec.get("ext").and_then(|v| v.as_str())
                                     {
+                                        // Check if this is a versioned extension (has vsn field)
+                                        if let Some(version) =
+                                            dep_spec.get("vsn").and_then(|v| v.as_str())
+                                        {
+                                            let ext_dep = ExtensionDependency::Versioned {
+                                                name: ext_name.to_string(),
+                                                version: version.to_string(),
+                                            };
+                                            required_extensions.insert(ext_dep);
+                                        }
                                         // Check if this is an external extension (has config field)
-                                        if let Some(external_config) =
+                                        else if let Some(external_config) =
                                             dep_spec.get("config").and_then(|v| v.as_str())
                                         {
                                             let ext_dep = ExtensionDependency::External {
@@ -292,10 +320,12 @@ impl InstallCommand {
             let name_a = match a {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
+                ExtensionDependency::Versioned { name, .. } => name,
             };
             name_a.cmp(name_b)
         });
@@ -314,6 +344,7 @@ impl InstallCommand {
         let (ext_name, ext_config_path) = match ext_dep {
             ExtensionDependency::External { name, config_path } => (name, config_path),
             ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
+            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
         };
 
         // Cycle detection: check if we've already processed this extension
@@ -513,7 +544,7 @@ impl InstallCommand {
         // Check if extension sysroot already exists
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension_name} ]");
         let run_config = crate::utils::container::RunConfig {
-            container_image: container_image.to_string(),
+            container_image: container_image.clone(),
             target: target.to_string(),
             command: check_command,
             verbose: self.verbose,
@@ -533,7 +564,7 @@ impl InstallCommand {
                 "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib"
             );
             let run_config = crate::utils::container::RunConfig {
-                container_image: container_image.to_string(),
+                container_image: container_image.clone(),
                 target: target.to_string(),
                 command: setup_command,
                 verbose: self.verbose,
@@ -653,7 +684,7 @@ $DNF_SDK_HOST \
                     }
 
                     let run_config = crate::utils::container::RunConfig {
-                        container_image: container_image.to_string(),
+                        container_image: container_image.clone(),
                         target: target.to_string(),
                         command: install_command,
                         verbose: self.verbose,
@@ -685,6 +716,146 @@ $DNF_SDK_HOST \
 
         print_info(
             &format!("Successfully installed external extension '{extension_name}' from '{external_config_path}'."),
+            crate::utils::output::OutputLevel::Normal,
+        );
+
+        Ok(())
+    }
+
+    /// Install a versioned extension using DNF to its own sysroot
+    async fn install_versioned_extension(
+        &self,
+        config: &Config,
+        extension_name: &str,
+        version: &str,
+        target: &str,
+    ) -> Result<()> {
+        // Get container configuration
+        let container_helper = SdkContainer::new();
+        let container_image = config.get_sdk_image().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+        })?;
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
+        // Create sysroot name for versioned extension (just use extension name)
+        let sysroot_name = extension_name.to_string();
+
+        // Check if sysroot already exists
+        let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{sysroot_name} ]");
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.clone(),
+            target: target.to_string(),
+            command: check_command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+        let sysroot_exists = container_helper.run_in_container(run_config).await?;
+
+        if !sysroot_exists {
+            // Create the sysroot for versioned extension
+            let setup_command = format!(
+                "mkdir -p $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib"
+            );
+            let run_config = crate::utils::container::RunConfig {
+                container_image: container_image.clone(),
+                target: target.to_string(),
+                command: setup_command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+            let success = container_helper.run_in_container(run_config).await?;
+
+            if !success {
+                return Err(anyhow::anyhow!(
+                    "Failed to create sysroot for versioned extension '{}-{}'",
+                    extension_name,
+                    version
+                ));
+            }
+
+            print_info(
+                &format!("Created sysroot for versioned extension '{extension_name}' version '{version}'."),
+                crate::utils::output::OutputLevel::Normal,
+            );
+        }
+
+        // Install the versioned extension package using DNF
+        let package_spec = if version == "*" {
+            extension_name.to_string()
+        } else {
+            format!("{extension_name}-{version}")
+        };
+
+        let installroot = format!("$AVOCADO_EXT_SYSROOTS/{sysroot_name}");
+        let yes = if self.force { "-y" } else { "" };
+        let dnf_args_str = if let Some(args) = &self.dnf_args {
+            format!(" {} ", args.join(" "))
+        } else {
+            String::new()
+        };
+
+        let install_command = format!(
+            r#"
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+$DNF_SDK_HOST \
+    $DNF_SDK_TARGET_REPO_CONF \
+    $DNF_NO_SCRIPTS \
+    --installroot={installroot} \
+    {dnf_args_str} \
+    install \
+    {yes} \
+    {package_spec}
+"#
+        );
+
+        if self.verbose {
+            print_info(
+                &format!("Running command: {install_command}"),
+                crate::utils::output::OutputLevel::Normal,
+            );
+        }
+
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.clone(),
+            target: target.to_string(),
+            command: install_command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: !self.force,
+            repo_url,
+            repo_release,
+            container_args: merged_container_args,
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+
+        let success = container_helper.run_in_container(run_config).await?;
+
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to install versioned extension '{}' version '{}' (package: {})",
+                extension_name,
+                version,
+                package_spec
+            ));
+        }
+
+        print_info(
+            &format!("Successfully installed versioned extension '{extension_name}' version '{version}'."),
             crate::utils::output::OutputLevel::Normal,
         );
 
@@ -757,5 +928,38 @@ mod tests {
         assert_eq!(cmd.target, None);
         assert_eq!(cmd.container_args, None);
         assert_eq!(cmd.dnf_args, None);
+    }
+
+    #[test]
+    fn test_extension_dependency_variants() {
+        // Test that all ExtensionDependency variants can be created and compared
+        let local = ExtensionDependency::Local("test-ext".to_string());
+        let external = ExtensionDependency::External {
+            name: "test-ext".to_string(),
+            config_path: "config.toml".to_string(),
+        };
+        let versioned = ExtensionDependency::Versioned {
+            name: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+        };
+
+        // Test that they are different
+        assert_ne!(local, external);
+        assert_ne!(local, versioned);
+        assert_ne!(external, versioned);
+
+        // Test that they can be cloned and hashed (for HashSet usage)
+        let mut set = std::collections::HashSet::new();
+        set.insert(local.clone());
+        set.insert(external.clone());
+        set.insert(versioned.clone());
+        assert_eq!(set.len(), 3);
+
+        // Test versioned extension with wildcard version
+        let versioned_wildcard = ExtensionDependency::Versioned {
+            name: "test-ext".to_string(),
+            version: "*".to_string(),
+        };
+        assert_ne!(versioned, versioned_wildcard);
     }
 }

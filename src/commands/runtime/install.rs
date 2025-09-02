@@ -236,11 +236,20 @@ impl RuntimeInstallCommand {
             let mut packages = Vec::new();
             for (package_name, version_spec) in deps_map {
                 // Skip extension dependencies (identified by 'ext' key)
+                // Note: Extension dependencies are handled by the main install command,
+                // not by individual runtime install
                 if let toml::Value::Table(spec_map) = version_spec {
                     if spec_map.contains_key("ext") {
                         if self.verbose {
+                            let dep_type = if spec_map.contains_key("vsn") {
+                                "versioned extension"
+                            } else if spec_map.contains_key("config") {
+                                "external extension"
+                            } else {
+                                "local extension"
+                            };
                             print_debug(
-                                &format!("Skipping extension dependency '{package_name}' (will be handled by runtime build)"),
+                                &format!("Skipping {dep_type} dependency '{package_name}' (handled by main install command)"),
                                 OutputLevel::Normal,
                             );
                         }
