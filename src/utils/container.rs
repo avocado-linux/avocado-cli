@@ -358,6 +358,8 @@ export DNF_SDK_HOST="\
 dnf \
 --releasever="$REPO_RELEASE" \
 --best \
+--setopt=install_weak_deps=0 \
+--setopt=check_config_file_age=0 \
 ${AVOCADO_DNF_ARGS:-} \
 "
 
