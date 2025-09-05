@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -91,7 +92,7 @@ impl ExtPackageCommand {
             );
         }
 
-        // Create RPM package in container
+        // Create main RPM package in container
         let output_path = self
             .create_rpm_package_in_container(&rpm_metadata, &config, &parsed)
             .await?;
@@ -103,6 +104,37 @@ impl ExtPackageCommand {
             ),
             OutputLevel::Normal,
         );
+
+        // Check if extension has SDK dependencies and create SDK package if needed
+        let sdk_dependencies = self.get_extension_sdk_dependencies(&config, &content)?;
+        if !sdk_dependencies.is_empty() {
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "Extension '{}' has SDK dependencies, creating SDK package...",
+                        self.extension
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+
+            let sdk_output_path = self
+                .create_sdk_rpm_package_in_container(
+                    &rpm_metadata,
+                    &config,
+                    &parsed,
+                    &sdk_dependencies,
+                )
+                .await?;
+
+            print_success(
+                &format!(
+                    "Successfully created SDK RPM package: {}",
+                    sdk_output_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+        }
 
         Ok(())
     }
@@ -499,6 +531,236 @@ rm -rf "$TMPDIR"
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(container_id)
     }
+
+    /// Get SDK dependencies for the current extension
+    fn get_extension_sdk_dependencies(
+        &self,
+        config: &Config,
+        config_content: &str,
+    ) -> Result<HashMap<String, toml::Value>> {
+        let extension_sdk_deps = config
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                config_content,
+                Some(&self.config_path),
+                Some(&self.target),
+            )?;
+
+        // Return the SDK dependencies for this specific extension, or empty if none
+        Ok(extension_sdk_deps
+            .get(&self.extension)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Create the SDK RPM package inside the container at $AVOCADO_PREFIX/output/extensions
+    async fn create_sdk_rpm_package_in_container(
+        &self,
+        metadata: &RpmMetadata,
+        config: &Config,
+        parsed: &toml::Value,
+        sdk_dependencies: &HashMap<String, toml::Value>,
+    ) -> Result<PathBuf> {
+        let container_image = parsed
+            .get("sdk")
+            .and_then(|sdk| sdk.get("image"))
+            .and_then(|img| img.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
+
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+        // Get the volume state
+        let cwd = std::env::current_dir().context("Failed to get current directory")?;
+        let volume_manager =
+            crate::utils::volume::VolumeManager::new("docker".to_string(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&cwd).await?;
+
+        // Create SDK RPM metadata with -sdk suffix and all_avocadosdk architecture
+        let sdk_metadata = RpmMetadata {
+            name: format!("{}-sdk", metadata.name),
+            version: metadata.version.clone(),
+            release: metadata.release.clone(),
+            summary: format!("{} SDK dependencies", metadata.summary),
+            description: format!("SDK dependencies for {}", metadata.description),
+            license: metadata.license.clone(),
+            arch: "all_avocadosdk".to_string(),
+            vendor: metadata.vendor.clone(),
+            group: metadata.group.clone(),
+            url: metadata.url.clone(),
+        };
+
+        // Create the RPM filename
+        let rpm_filename = format!(
+            "{}-{}-{}.{}.rpm",
+            sdk_metadata.name, sdk_metadata.version, sdk_metadata.release, sdk_metadata.arch
+        );
+
+        // Build dependency list for RPM spec
+        let mut requires_list = Vec::new();
+        for (dep_name, dep_value) in sdk_dependencies {
+            let version_spec = match dep_value {
+                toml::Value::String(version) if version == "*" => String::new(),
+                toml::Value::String(version) => format!(" = {version}"),
+                _ => String::new(),
+            };
+            requires_list.push(format!("{dep_name}{version_spec}"));
+        }
+        let requires_section = if requires_list.is_empty() {
+            String::new()
+        } else {
+            format!("Requires: {}", requires_list.join(", "))
+        };
+
+        // Create SDK RPM using rpmbuild in container
+        let rpm_build_script = format!(
+            r#"
+# Ensure output directory exists
+mkdir -p $AVOCADO_PREFIX/output/extensions
+
+# Create temporary directory for RPM build
+TMPDIR=$(mktemp -d)
+cd "$TMPDIR"
+
+# Create directory structure for rpmbuild
+mkdir -p BUILD RPMS SOURCES SPECS SRPMS
+
+# Create spec file for SDK package (no files, only dependencies)
+cat > SPECS/sdk-package.spec << 'SPEC_EOF'
+%define _buildhost reproducible
+
+Name: {}
+Version: {}
+Release: {}
+Summary: {}
+License: {}
+Vendor: {}
+Group: {}{}
+{}
+
+%description
+{}
+
+%files
+# No files - this is a dependency-only package
+
+%prep
+# No prep needed
+
+%build
+# No build needed
+
+%install
+# No install needed - dependency-only package
+
+%clean
+# Skip clean section - not needed for our use case
+
+%changelog
+SPEC_EOF
+
+# Build the RPM with custom architecture target and define the arch macro
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {}" --target {} -bb SPECS/sdk-package.spec
+
+# Move RPM to output directory
+mv RPMS/{}/*.rpm $AVOCADO_PREFIX/output/extensions/{} || {{
+    mv RPMS/*/*.rpm $AVOCADO_PREFIX/output/extensions/{} 2>/dev/null || {{
+        echo "Failed to find built SDK RPM"
+        exit 1
+    }}
+}}
+
+echo "SDK RPM created successfully: $AVOCADO_PREFIX/output/extensions/{}"
+
+# Cleanup
+rm -rf "$TMPDIR"
+"#,
+            sdk_metadata.name,
+            sdk_metadata.version,
+            sdk_metadata.release,
+            sdk_metadata.summary,
+            sdk_metadata.license,
+            sdk_metadata.vendor,
+            sdk_metadata.group,
+            if let Some(url) = &sdk_metadata.url {
+                format!("\nURL: {url}")
+            } else {
+                String::new()
+            },
+            requires_section,
+            sdk_metadata.description,
+            sdk_metadata.arch,
+            sdk_metadata.arch,
+            sdk_metadata.arch,
+            rpm_filename,
+            rpm_filename,
+            rpm_filename,
+        );
+
+        // Run the RPM build in the container
+        let container_helper = SdkContainer::new();
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.to_string(),
+            target: self.target.clone(),
+            command: rpm_build_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: config.get_sdk_repo_url(),
+            repo_release: config.get_sdk_repo_release(),
+            container_args: merged_container_args,
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+
+        if self.verbose {
+            print_info(
+                "Creating SDK RPM package in container...",
+                OutputLevel::Normal,
+            );
+        }
+
+        let success = container_helper.run_in_container(run_config).await?;
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to create SDK RPM package in container"
+            ));
+        }
+
+        // RPM is now created in the container at $AVOCADO_PREFIX/output/extensions/{rpm_filename}
+        let container_rpm_path = format!(
+            "/opt/_avocado/{}/output/extensions/{rpm_filename}",
+            self.target
+        );
+
+        // If --out is specified, copy the RPM to the host
+        if let Some(output_dir) = &self.output_dir {
+            self.copy_rpm_to_host(
+                &volume_state.volume_name,
+                &container_rpm_path,
+                output_dir,
+                &rpm_filename,
+                container_image,
+            )
+            .await?;
+
+            // Return the host path (canonicalized for clean display)
+            let host_output_path = if output_dir.starts_with('/') {
+                // Absolute path
+                PathBuf::from(output_dir).join(&rpm_filename)
+            } else {
+                // Relative path from current directory
+                std::env::current_dir()?
+                    .join(output_dir)
+                    .join(&rpm_filename)
+            };
+
+            // Canonicalize the path to resolve . and .. components for clean display
+            let canonical_path = host_output_path.canonicalize().unwrap_or(host_output_path);
+            Ok(canonical_path)
+        } else {
+            // Return the container path for informational purposes
+            Ok(PathBuf::from(container_rpm_path))
+        }
+    }
 }
 
 /// RPM metadata structure
@@ -766,5 +1028,83 @@ mod tests {
             let metadata = cmd.extract_rpm_metadata(&ext_config, target).unwrap();
             assert_eq!(metadata.arch, expected_arch, "Failed for target: {target}");
         }
+    }
+
+    #[test]
+    fn test_get_extension_sdk_dependencies_empty() {
+        use crate::utils::config::Config;
+
+        let cmd = ExtPackageCommand::new(
+            "test.toml".to_string(),
+            "test-ext".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Create a minimal config without SDK dependencies
+        let config_content = r#"
+[ext.test-ext]
+version = "1.0.0"
+"#;
+
+        let config = Config::from_toml_value(&toml::from_str(config_content).unwrap()).unwrap();
+        let sdk_deps = cmd
+            .get_extension_sdk_dependencies(&config, config_content)
+            .unwrap();
+
+        assert!(sdk_deps.is_empty());
+    }
+
+    #[test]
+    fn test_get_extension_sdk_dependencies_with_deps() {
+        use crate::utils::config::Config;
+
+        let cmd = ExtPackageCommand::new(
+            "test.toml".to_string(),
+            "test-ext".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Create a config with SDK dependencies
+        let config_content = r#"
+[ext.test-ext]
+version = "1.0.0"
+
+[ext.test-ext.sdk.dependencies]
+nativesdk-avocado-hitl = "*"
+nativesdk-openssh-ssh = "*"
+nativesdk-rsync = "1.2.3"
+"#;
+
+        let config = Config::from_toml_value(&toml::from_str(config_content).unwrap()).unwrap();
+        let sdk_deps = cmd
+            .get_extension_sdk_dependencies(&config, config_content)
+            .unwrap();
+
+        assert_eq!(sdk_deps.len(), 3);
+        assert!(sdk_deps.contains_key("nativesdk-avocado-hitl"));
+        assert!(sdk_deps.contains_key("nativesdk-openssh-ssh"));
+        assert!(sdk_deps.contains_key("nativesdk-rsync"));
+
+        // Check version values
+        assert_eq!(
+            sdk_deps["nativesdk-avocado-hitl"],
+            toml::Value::String("*".to_string())
+        );
+        assert_eq!(
+            sdk_deps["nativesdk-openssh-ssh"],
+            toml::Value::String("*".to_string())
+        );
+        assert_eq!(
+            sdk_deps["nativesdk-rsync"],
+            toml::Value::String("1.2.3".to_string())
+        );
     }
 }
