@@ -402,9 +402,7 @@ rm -rf "$TMPDIR"
         }
 
         // RPM is now created in the container at $AVOCADO_PREFIX/output/extensions/{rpm_filename}
-        let container_rpm_path = format!(
-            "/opt/_avocado/{target}/output/extensions/{rpm_filename}"
-        );
+        let container_rpm_path = format!("/opt/_avocado/{target}/output/extensions/{rpm_filename}");
 
         // If --out is specified, copy the RPM to the host
         if let Some(output_dir) = &self.output_dir {
@@ -733,9 +731,7 @@ rm -rf "$TMPDIR"
         }
 
         // RPM is now created in the container at $AVOCADO_PREFIX/output/extensions/{rpm_filename}
-        let container_rpm_path = format!(
-            "/opt/_avocado/{target}/output/extensions/{rpm_filename}"
-        );
+        let container_rpm_path = format!("/opt/_avocado/{target}/output/extensions/{rpm_filename}");
 
         // If --out is specified, copy the RPM to the host
         if let Some(output_dir) = &self.output_dir {

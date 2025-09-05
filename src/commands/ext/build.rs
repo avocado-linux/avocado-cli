@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
+use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
@@ -89,6 +90,10 @@ impl ExtBuildCommand {
             .ok_or_else(|| {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
+
+        // Handle compile dependencies with install scripts before building the extension
+        self.handle_compile_dependencies(&config, &ext_config, &target)
+            .await?;
 
         // Get extension types from the types array
         let ext_types = ext_config
@@ -1199,6 +1204,131 @@ echo "Set proper permissions on authentication files""#,
         }
 
         script_lines.join("")
+    }
+    /// Handle compile dependencies with install scripts
+    async fn handle_compile_dependencies(
+        &self,
+        config: &Config,
+        ext_config: &toml::Value,
+        target: &str,
+    ) -> Result<()> {
+        // Get dependencies from extension configuration
+        let dependencies = ext_config.get("dependencies").and_then(|v| v.as_table());
+
+        let Some(deps_table) = dependencies else {
+            return Ok(());
+        };
+
+        // Find compile dependencies with install scripts
+        let mut compile_install_deps = Vec::new();
+
+        for (dep_name, dep_spec) in deps_table {
+            if let toml::Value::Table(spec_map) = dep_spec {
+                // Check for the new syntax: { compile = "section-name", install = "script.sh" }
+                if let (
+                    Some(toml::Value::String(compile_section)),
+                    Some(toml::Value::String(install_script)),
+                ) = (spec_map.get("compile"), spec_map.get("install"))
+                {
+                    compile_install_deps.push((
+                        dep_name.clone(),
+                        compile_section.clone(),
+                        install_script.clone(),
+                    ));
+                }
+            }
+        }
+
+        if compile_install_deps.is_empty() {
+            return Ok(());
+        }
+
+        print_info(
+            &format!(
+                "Processing {} compile dependencies with install scripts",
+                compile_install_deps.len()
+            ),
+            OutputLevel::Normal,
+        );
+
+        // Get SDK configuration for container setup
+        let container_image = config.get_sdk_image().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+        })?;
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+        // Initialize SDK container helper
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+
+        // Process each compile dependency
+        for (dep_name, compile_section, install_script) in compile_install_deps {
+            print_info(
+                &format!(
+                    "Processing compile dependency '{dep_name}' -> compile: '{compile_section}', install: '{install_script}'"
+                ),
+                OutputLevel::Normal,
+            );
+
+            // First, run the SDK compile for the specified section
+            let compile_command = SdkCompileCommand::new(
+                self.config_path.clone(),
+                self.verbose,
+                vec![compile_section.clone()],
+                Some(target.to_string()),
+                self.container_args.clone(),
+                self.dnf_args.clone(),
+            );
+
+            compile_command.execute().await.with_context(|| {
+                format!("Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'")
+            })?;
+
+            // Then, run the install script
+            let src_dir = config.src_dir.as_deref().unwrap_or(".");
+            let install_script_path = format!("{src_dir}/{install_script}");
+
+            let install_command = format!(
+                r#"if [ -f '{install_script_path}' ]; then echo 'Running install script: {install_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script_path}'; else echo 'Install script {install_script} not found.' && ls -la {src_dir}; exit 1; fi"#
+            );
+
+            if self.verbose {
+                print_info(
+                    &format!("Running install script for dependency '{dep_name}': {install_script}"),
+                    OutputLevel::Normal,
+                );
+            }
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: install_command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            let success = container_helper.run_in_container(run_config).await?;
+
+            if success {
+                print_success(
+                    &format!("Successfully processed compile dependency '{dep_name}'"),
+                    OutputLevel::Normal,
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Failed to run install script '{install_script}' for compile dependency '{dep_name}'"
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2575,5 +2705,53 @@ mod tests {
 
         // Verify that reload_service_manager = true sets EXTENSION_RELOAD_MANAGER=1
         assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=1\" >> \"$release_file\""));
+    }
+
+    #[test]
+    fn test_handle_compile_dependencies_parsing() {
+        // Test that the new compile dependency syntax is properly parsed
+        let config_content = r#"
+[ext.my-extension]
+types = ["sysext"]
+
+[ext.my-extension.dependencies]
+my-app = { compile = "my-app", install = "ext-install.sh" }
+regular-package = "1.0.0"
+old-compile-dep = { compile = "old-section" }
+
+[sdk.compile.my-app]
+compile = "ext-compile.sh"
+
+[sdk.compile.old-section]
+compile = "ext-compile.sh"
+"#;
+
+        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let ext_config = parsed.get("ext").unwrap().get("my-extension").unwrap();
+        let dependencies = ext_config.get("dependencies").unwrap().as_table().unwrap();
+
+        // Check that we can identify compile dependencies with install scripts
+        let mut compile_install_deps = Vec::new();
+        for (dep_name, dep_spec) in dependencies {
+            if let toml::Value::Table(spec_map) = dep_spec {
+                if let (
+                    Some(toml::Value::String(compile_section)),
+                    Some(toml::Value::String(install_script)),
+                ) = (spec_map.get("compile"), spec_map.get("install"))
+                {
+                    compile_install_deps.push((
+                        dep_name.clone(),
+                        compile_section.clone(),
+                        install_script.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Should find exactly one compile dependency with install script
+        assert_eq!(compile_install_deps.len(), 1);
+        assert_eq!(compile_install_deps[0].0, "my-app");
+        assert_eq!(compile_install_deps[0].1, "my-app");
+        assert_eq!(compile_install_deps[0].2, "ext-install.sh");
     }
 }

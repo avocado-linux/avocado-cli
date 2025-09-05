@@ -174,9 +174,21 @@ impl ExtDepsCommand {
             }
         }
 
-        // Try compile reference
+        // Try compile reference (both old and new syntax)
         if let Some(toml::Value::String(compile_name)) = spec_map.get("compile") {
-            return self.resolve_compile_dependencies(config, compile_name);
+            // Check if this is the new syntax with install script
+            if let Some(toml::Value::String(install_script)) = spec_map.get("install") {
+                // New syntax: { compile = "section-name", install = "script.sh" }
+                // Return a special marker to indicate this needs install script handling
+                return vec![(
+                    "compile_with_install".to_string(),
+                    compile_name.clone(),
+                    install_script.clone(),
+                )];
+            } else {
+                // Old syntax: { compile = "section-name" }
+                return self.resolve_compile_dependencies(config, compile_name);
+            }
         }
 
         Vec::new()
@@ -277,5 +289,91 @@ impl ExtDepsCommand {
                 _ => a.1.cmp(&b.1),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_compile_dependency_with_install() {
+        let config_content = r#"
+[ext.my-extension]
+types = ["sysext"]
+
+[ext.my-extension.dependencies]
+my-app = { compile = "my-app", install = "ext-install.sh" }
+regular-package = "1.0.0"
+old-compile-dep = { compile = "old-section" }
+
+[sdk.compile.my-app]
+compile = "ext-compile.sh"
+
+[sdk.compile.old-section]
+compile = "ext-compile.sh"
+"#;
+
+        let config: toml::Value = toml::from_str(config_content).unwrap();
+        let cmd = ExtDepsCommand {
+            config_path: "test.toml".to_string(),
+            extension: Some("my-extension".to_string()),
+            target: None,
+        };
+
+        // Test new syntax with install script
+        let spec_map = toml::Table::from_iter([
+            (
+                "compile".to_string(),
+                toml::Value::String("my-app".to_string()),
+            ),
+            (
+                "install".to_string(),
+                toml::Value::String("ext-install.sh".to_string()),
+            ),
+        ]);
+
+        let result = cmd.resolve_table_dependency(&config, "my-app", &spec_map);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "compile_with_install");
+        assert_eq!(result[0].1, "my-app");
+        assert_eq!(result[0].2, "ext-install.sh");
+
+        // Test old syntax without install script
+        let spec_map_old = toml::Table::from_iter([(
+            "compile".to_string(),
+            toml::Value::String("old-section".to_string()),
+        )]);
+
+        let result_old = cmd.resolve_table_dependency(&config, "old-compile-dep", &spec_map_old);
+        // Should resolve to compile dependencies (empty in this test case since no deps in old-section)
+        assert_eq!(result_old.len(), 0);
+    }
+
+    #[test]
+    fn test_resolve_regular_dependencies() {
+        let config_content = r#"
+[ext.test-ext]
+types = ["sysext"]
+"#;
+
+        let config: toml::Value = toml::from_str(config_content).unwrap();
+        let cmd = ExtDepsCommand {
+            config_path: "test.toml".to_string(),
+            extension: Some("test-ext".to_string()),
+            target: None,
+        };
+
+        // Test version dependency
+        let spec_map = toml::Table::from_iter([(
+            "version".to_string(),
+            toml::Value::String("1.0.0".to_string()),
+        )]);
+
+        let result = cmd.resolve_table_dependency(&config, "test-package", &spec_map);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "pkg");
+        assert_eq!(result[0].1, "test-package");
+        assert_eq!(result[0].2, "1.0.0");
     }
 }
