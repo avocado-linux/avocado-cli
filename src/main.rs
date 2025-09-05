@@ -1276,9 +1276,9 @@ enum ExtCommands {
         /// Name of the extension to package
         #[arg(short = 'e', long = "extension", required = true)]
         extension: String,
-        /// Target architecture (e.g., x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu)
-        #[arg(short = 't', long = "target", required = true)]
-        target: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Output directory on host for the RPM package (relative or absolute path). If not specified, RPM stays in container at $AVOCADO_PREFIX/output/extensions
         #[arg(long = "out-dir")]
         output_dir: Option<String>,

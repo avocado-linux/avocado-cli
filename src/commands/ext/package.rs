@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::SdkContainer;
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::target::resolve_target_required;
 
 /// Command to package an extension sysroot into an RPM
 pub struct ExtPackageCommand {
     pub config_path: String,
     pub extension: String,
-    pub target: String,
+    pub target: Option<String>,
     pub output_dir: Option<String>,
     pub verbose: bool,
     pub container_args: Option<Vec<String>>,
@@ -24,7 +25,7 @@ impl ExtPackageCommand {
     pub fn new(
         config_path: String,
         extension: String,
-        target: String,
+        target: Option<String>,
         output_dir: Option<String>,
         verbose: bool,
         container_args: Option<Vec<String>>,
@@ -47,9 +48,12 @@ impl ExtPackageCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
 
+        // Resolve target using unified target resolution logic
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
+
         // Find extension using comprehensive lookup
         let extension_location = config
-            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &self.target)?
+            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
             .ok_or_else(|| {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
@@ -80,7 +84,7 @@ impl ExtPackageCommand {
             })?;
 
         // Extract RPM metadata with defaults
-        let rpm_metadata = self.extract_rpm_metadata(ext_config, &self.target)?;
+        let rpm_metadata = self.extract_rpm_metadata(ext_config, &target)?;
 
         if self.verbose {
             print_info(
@@ -94,7 +98,7 @@ impl ExtPackageCommand {
 
         // Create main RPM package in container
         let output_path = self
-            .create_rpm_package_in_container(&rpm_metadata, &config, &parsed)
+            .create_rpm_package_in_container(&rpm_metadata, &config, &parsed, &target)
             .await?;
 
         print_success(
@@ -106,7 +110,7 @@ impl ExtPackageCommand {
         );
 
         // Check if extension has SDK dependencies and create SDK package if needed
-        let sdk_dependencies = self.get_extension_sdk_dependencies(&config, &content)?;
+        let sdk_dependencies = self.get_extension_sdk_dependencies(&config, &content, &target)?;
         if !sdk_dependencies.is_empty() {
             if self.verbose {
                 print_info(
@@ -124,6 +128,7 @@ impl ExtPackageCommand {
                     &config,
                     &parsed,
                     &sdk_dependencies,
+                    &target,
                 )
                 .await?;
 
@@ -246,6 +251,7 @@ impl ExtPackageCommand {
         metadata: &RpmMetadata,
         config: &Config,
         parsed: &toml::Value,
+        target: &str,
     ) -> Result<PathBuf> {
         let container_image = parsed
             .get("sdk")
@@ -374,7 +380,7 @@ rm -rf "$TMPDIR"
         let container_helper = SdkContainer::new();
         let run_config = crate::utils::container::RunConfig {
             container_image: container_image.to_string(),
-            target: self.target.clone(),
+            target: target.to_string(),
             command: rpm_build_script,
             verbose: self.verbose,
             source_environment: true,
@@ -397,8 +403,7 @@ rm -rf "$TMPDIR"
 
         // RPM is now created in the container at $AVOCADO_PREFIX/output/extensions/{rpm_filename}
         let container_rpm_path = format!(
-            "/opt/_avocado/{}/output/extensions/{rpm_filename}",
-            self.target
+            "/opt/_avocado/{target}/output/extensions/{rpm_filename}"
         );
 
         // If --out is specified, copy the RPM to the host
@@ -537,12 +542,13 @@ rm -rf "$TMPDIR"
         &self,
         config: &Config,
         config_content: &str,
+        target: &str,
     ) -> Result<HashMap<String, toml::Value>> {
         let extension_sdk_deps = config
             .get_extension_sdk_dependencies_with_config_path_and_target(
                 config_content,
                 Some(&self.config_path),
-                Some(&self.target),
+                Some(target),
             )?;
 
         // Return the SDK dependencies for this specific extension, or empty if none
@@ -559,6 +565,7 @@ rm -rf "$TMPDIR"
         config: &Config,
         parsed: &toml::Value,
         sdk_dependencies: &HashMap<String, toml::Value>,
+        target: &str,
     ) -> Result<PathBuf> {
         let container_image = parsed
             .get("sdk")
@@ -699,7 +706,7 @@ rm -rf "$TMPDIR"
         let container_helper = SdkContainer::new();
         let run_config = crate::utils::container::RunConfig {
             container_image: container_image.to_string(),
-            target: self.target.clone(),
+            target: target.to_string(),
             command: rpm_build_script,
             verbose: self.verbose,
             source_environment: true,
@@ -727,8 +734,7 @@ rm -rf "$TMPDIR"
 
         // RPM is now created in the container at $AVOCADO_PREFIX/output/extensions/{rpm_filename}
         let container_rpm_path = format!(
-            "/opt/_avocado/{}/output/extensions/{rpm_filename}",
-            self.target
+            "/opt/_avocado/{target}/output/extensions/{rpm_filename}"
         );
 
         // If --out is specified, copy the RPM to the host
@@ -787,7 +793,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-ext".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -817,7 +823,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-ext".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -839,7 +845,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-ext".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -869,7 +875,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-extension".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -906,7 +912,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "web-server".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -967,7 +973,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-extension".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -990,7 +996,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-ext".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -1037,7 +1043,7 @@ mod tests {
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-ext".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -1052,7 +1058,7 @@ version = "1.0.0"
 
         let config = Config::from_toml_value(&toml::from_str(config_content).unwrap()).unwrap();
         let sdk_deps = cmd
-            .get_extension_sdk_dependencies(&config, config_content)
+            .get_extension_sdk_dependencies(&config, config_content, "x86_64-unknown-linux-gnu")
             .unwrap();
 
         assert!(sdk_deps.is_empty());
@@ -1065,7 +1071,7 @@ version = "1.0.0"
         let cmd = ExtPackageCommand::new(
             "test.toml".to_string(),
             "test-ext".to_string(),
-            "x86_64-unknown-linux-gnu".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
             None,
             false,
             None,
@@ -1085,7 +1091,7 @@ nativesdk-rsync = "1.2.3"
 
         let config = Config::from_toml_value(&toml::from_str(config_content).unwrap()).unwrap();
         let sdk_deps = cmd
-            .get_extension_sdk_dependencies(&config, config_content)
+            .get_extension_sdk_dependencies(&config, config_content, "x86_64-unknown-linux-gnu")
             .unwrap();
 
         assert_eq!(sdk_deps.len(), 3);
