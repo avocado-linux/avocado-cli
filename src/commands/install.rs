@@ -814,6 +814,7 @@ RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
     $DNF_NO_SCRIPTS \
+    --setopt=persistdir={installroot}/var/lib/extensions/ \
     --installroot={installroot} \
     {dnf_args_str} \
     install \
