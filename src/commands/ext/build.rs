@@ -1282,7 +1282,9 @@ echo "Set proper permissions on authentication files""#,
             );
 
             compile_command.execute().await.with_context(|| {
-                format!("Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'")
+                format!(
+                    "Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'"
+                )
             })?;
 
             // Then, run the install script
@@ -1295,7 +1297,9 @@ echo "Set proper permissions on authentication files""#,
 
             if self.verbose {
                 print_info(
-                    &format!("Running install script for dependency '{dep_name}': {install_script}"),
+                    &format!(
+                        "Running install script for dependency '{dep_name}': {install_script}"
+                    ),
                     OutputLevel::Normal,
                 );
             }

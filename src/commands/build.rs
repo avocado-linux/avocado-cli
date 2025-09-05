@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use crate::commands::{
     ext::{ExtBuildCommand, ExtImageCommand},
     runtime::RuntimeBuildCommand,
-    sdk::SdkCompileCommand,
 };
 use crate::utils::{
     config::Config,
@@ -103,43 +102,13 @@ impl BuildCommand {
             return Ok(());
         }
 
-        // Step 1: Analyze dependencies and compile SDK code if needed
-        print_info(
-            "Step 1/4: Analyzing dependencies and preparing SDK",
-            OutputLevel::Normal,
-        );
+        // Step 1: Analyze dependencies
+        print_info("Step 1/4: Analyzing dependencies", OutputLevel::Normal);
         let required_extensions =
             self.find_required_extensions(&config, &parsed, &runtimes_to_build, &target)?;
-        let sdk_sections = self.find_sdk_compile_sections(&config, &required_extensions)?;
 
-        // Compile SDK sections if needed (but don't install dependencies - that's for 'avocado install')
-        if !sdk_sections.is_empty() {
-            if self.verbose {
-                print_info(
-                    &format!(
-                        "Found {} SDK compile sections needed: {}",
-                        sdk_sections.len(),
-                        sdk_sections.join(", ")
-                    ),
-                    OutputLevel::Normal,
-                );
-            }
-
-            let sdk_compile_cmd = SdkCompileCommand::new(
-                self.config_path.clone(),
-                self.verbose,
-                sdk_sections,
-                self.target.clone(),
-                self.container_args.clone(),
-                self.dnf_args.clone(),
-            );
-            sdk_compile_cmd
-                .execute()
-                .await
-                .with_context(|| "Failed to compile SDK sections")?;
-        } else {
-            print_info("No SDK compilation needed.", OutputLevel::Normal);
-        }
+        // Note: SDK compile sections are now compiled on-demand when extensions are built
+        // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
 
         // Step 2: Build extensions
         print_info("Step 2/4: Building extensions", OutputLevel::Normal);
@@ -567,39 +536,6 @@ impl BuildCommand {
         }
 
         Ok(())
-    }
-
-    /// Find SDK compile sections needed for the required extensions
-    fn find_sdk_compile_sections(
-        &self,
-        config: &Config,
-        required_extensions: &[ExtensionDependency],
-    ) -> Result<Vec<String>> {
-        let mut needed_sections = HashSet::new();
-
-        // If we have extensions to build, compile all SDK sections
-        // A more sophisticated implementation could analyze which specific sections
-        // are needed based on the extension's SDK dependencies
-        if !required_extensions.is_empty() {
-            let compile_dependencies = config.get_compile_dependencies();
-            for section_name in compile_dependencies.keys() {
-                needed_sections.insert(section_name.clone());
-            }
-
-            if self.verbose && !needed_sections.is_empty() {
-                print_info(
-                    &format!(
-                        "Found {} extensions requiring SDK compilation",
-                        required_extensions.len()
-                    ),
-                    OutputLevel::Normal,
-                );
-            }
-        }
-
-        let mut sections: Vec<String> = needed_sections.into_iter().collect();
-        sections.sort();
-        Ok(sections)
     }
 
     /// Build an external extension using its own config file
@@ -1063,43 +999,15 @@ echo "Successfully created image for versioned extension '$EXT_NAME' at $OUTPUT_
             OutputLevel::Normal,
         );
         let required_extensions = self.find_extensions_for_runtime(config, &runtime_config)?;
-        let sdk_sections = self.find_sdk_compile_sections(config, &required_extensions)?;
 
-        // Step 2: Compile SDK sections if needed
-        if !sdk_sections.is_empty() {
-            print_info("Step 2/4: Compiling SDK sections", OutputLevel::Normal);
-            if self.verbose {
-                print_info(
-                    &format!(
-                        "Found {} SDK compile sections needed: {}",
-                        sdk_sections.len(),
-                        sdk_sections.join(", ")
-                    ),
-                    OutputLevel::Normal,
-                );
-            }
+        // Note: SDK compile sections are now compiled on-demand when extensions are built
+        // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
 
-            let sdk_compile_cmd = SdkCompileCommand::new(
-                self.config_path.clone(),
-                self.verbose,
-                sdk_sections,
-                self.target.clone(),
-                self.container_args.clone(),
-                self.dnf_args.clone(),
-            );
-            sdk_compile_cmd
-                .execute()
-                .await
-                .with_context(|| "Failed to compile SDK sections")?;
-        } else {
-            print_info("Step 2/4: No SDK compilation needed", OutputLevel::Normal);
-        }
-
-        // Step 3: Build required extensions
+        // Step 2: Build required extensions
         if !required_extensions.is_empty() {
             print_info(
                 &format!(
-                    "Step 3/4: Building {} required extensions",
+                    "Step 2/3: Building {} required extensions",
                     required_extensions.len()
                 ),
                 OutputLevel::Normal,
@@ -1184,12 +1092,12 @@ echo "Successfully created image for versioned extension '$EXT_NAME' at $OUTPUT_
                 }
             }
         } else {
-            print_info("Step 3/4: No extensions required", OutputLevel::Normal);
+            print_info("Step 2/3: No extensions required", OutputLevel::Normal);
         }
 
-        // Step 4: Build the runtime
+        // Step 3: Build the runtime
         print_info(
-            &format!("Step 4/4: Building runtime '{runtime_name}'"),
+            &format!("Step 3/3: Building runtime '{runtime_name}'"),
             OutputLevel::Normal,
         );
 
