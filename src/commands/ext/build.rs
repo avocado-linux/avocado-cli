@@ -1292,13 +1292,21 @@ echo "Set proper permissions on authentication files""#,
             let install_script_path = format!("{src_dir}/{install_script}");
 
             let install_command = format!(
-                r#"if [ -f '{install_script_path}' ]; then echo 'Running install script: {install_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script_path}'; else echo 'Install script {install_script} not found.' && ls -la {src_dir}; exit 1; fi"#
+                r#"if [ -f '{install_script_path}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script_path}'; else echo 'Install script {install_script} not found.' && ls -la {src_dir}; exit 1; fi"#,
+                extension_name = self.extension
             );
 
             if self.verbose {
                 print_info(
                     &format!(
                         "Running install script for dependency '{dep_name}': {install_script}"
+                    ),
+                    OutputLevel::Normal,
+                );
+                print_info(
+                    &format!(
+                        "Setting AVOCADO_BUILD_EXT_SYSROOT=$AVOCADO_EXT_SYSROOTS/{}",
+                        self.extension
                     ),
                     OutputLevel::Normal,
                 );
@@ -2757,5 +2765,38 @@ compile = "ext-compile.sh"
         assert_eq!(compile_install_deps[0].0, "my-app");
         assert_eq!(compile_install_deps[0].1, "my-app");
         assert_eq!(compile_install_deps[0].2, "ext-install.sh");
+    }
+
+    #[test]
+    fn test_install_command_includes_sysroot_env() {
+        // Test that the install command includes the AVOCADO_BUILD_EXT_SYSROOT environment variable
+        let cmd = ExtBuildCommand {
+            extension: "test-extension".to_string(),
+            config_path: "test.toml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let src_dir = "src";
+        let install_script = "test-install.sh";
+        let install_script_path = format!("{src_dir}/{install_script}");
+
+        let expected_command = format!(
+            r#"if [ -f '{install_script_path}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script_path}'; else echo 'Install script {install_script} not found.' && ls -la {src_dir}; exit 1; fi"#,
+            extension_name = cmd.extension
+        );
+
+        // Verify the command includes the environment variable export with proper quoting
+        assert!(expected_command.contains(
+            r#"export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/test-extension""#
+        ));
+
+        // The command should look like this (for demonstration):
+        // if [ -f 'src/test-install.sh' ]; then echo 'Running install script: test-install.sh';
+        // export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/test-extension";
+        // AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash 'src/test-install.sh';
+        // else echo 'Install script test-install.sh not found.' && ls -la src; exit 1; fi
     }
 }

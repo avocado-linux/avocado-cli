@@ -1,0 +1,29 @@
+# Example configuration showing how install scripts can use AVOCADO_BUILD_EXT_SYSROOT
+
+default_target = "qemux86-64"
+src_dir = "examples"
+
+[runtime.default]
+target = "qemux86-64"
+
+[sdk]
+image = "docker.io/avocadolinux/sdk:dev"
+
+# SDK compile section
+[sdk.compile.my-app]
+compile = "ext-compile.sh"
+
+[sdk.compile.my-app.dependencies]
+build-essential = "*"
+
+# Extension that uses compile dependency with install script
+[ext.my-extension]
+types = ["sysext"]
+
+[ext.my-extension.dependencies]
+# The install script will have access to AVOCADO_BUILD_EXT_SYSROOT
+# which points to $AVOCADO_EXT_SYSROOTS/my-extension
+my-app = { compile = "my-app", install = "ext-install-example.sh" }
+
+# Regular dependencies work as before
+some-package = "1.0.0"
