@@ -250,11 +250,15 @@ impl BuildCommand {
                     ExtensionDependency::Versioned { name, version } => {
                         if self.verbose {
                             print_info(
-                                &format!("Skipping image creation for versioned extension '{name}' version '{version}' (installed via DNF)"),
+                                &format!("Creating image for versioned extension '{name}' version '{version}'"),
                                 OutputLevel::Normal,
                             );
                         }
-                        // Versioned extensions are installed via DNF and don't need image creation
+
+                        // Create image for versioned extension from its sysroot
+                        self.create_versioned_extension_image(name, &target).await.with_context(|| {
+                            format!("Failed to create image for versioned extension '{name}' version '{version}'")
+                        })?;
                     }
                 }
             }
