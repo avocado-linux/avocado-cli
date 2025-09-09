@@ -24,6 +24,7 @@ use commands::sdk::{
     SdkRunCommand,
 };
 use commands::upgrade::UpgradeCommand;
+use commands::fetch::FetchCommand;
 
 #[derive(Parser)]
 #[command(name = "avocado")]
@@ -127,6 +128,30 @@ enum Commands {
         /// Extension name to build (if not provided, builds all required extensions)
         #[arg(short = 'e', long = "extension")]
         extension: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Fetch and refresh repository metadata for sysroots
+    Fetch {
+        /// Path to avocado.toml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Extension name to fetch metadata for (if not provided, fetches for all sysroots)
+        #[arg(short = 'e', long = "extension")]
+        extension: Option<String>,
+        /// Runtime name to fetch metadata for (if not provided, fetches for all sysroots)
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -602,6 +627,27 @@ async fn main() -> Result<()> {
                 dnf_args,
             );
             build_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Fetch {
+            config,
+            verbose,
+            extension,
+            runtime,
+            target,
+            container_args,
+            dnf_args,
+        } => {
+            let fetch_cmd = FetchCommand::new(
+                config,
+                verbose,
+                extension,
+                runtime,
+                target.or(cli.target),
+                container_args,
+                dnf_args,
+            );
+            fetch_cmd.execute().await?;
             Ok(())
         }
         Commands::Upgrade { version } => {
