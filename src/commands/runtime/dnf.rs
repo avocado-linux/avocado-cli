@@ -287,6 +287,7 @@ $DNF_SDK_HOST \
     $DNF_NO_SCRIPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {dnf_args_str} \
     {command_args_str}
 "#

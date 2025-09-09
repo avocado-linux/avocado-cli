@@ -11,6 +11,7 @@ use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
     ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
 };
+use commands::fetch::FetchCommand;
 use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
 use commands::install::InstallCommand;
@@ -24,7 +25,6 @@ use commands::sdk::{
     SdkRunCommand,
 };
 use commands::upgrade::UpgradeCommand;
-use commands::fetch::FetchCommand;
 
 #[derive(Parser)]
 #[command(name = "avocado")]

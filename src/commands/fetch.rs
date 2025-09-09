@@ -147,7 +147,7 @@ impl FetchCommand {
         );
 
         // Check if extension exists in configuration
-        if !config_toml
+        if config_toml
             .get("ext")
             .and_then(|ext| ext.get(extension))
             .is_none()
@@ -247,7 +247,7 @@ $DNF_SDK_HOST \
         );
 
         // Check if runtime exists in configuration
-        if !config_toml
+        if config_toml
             .get("runtime")
             .and_then(|rt| rt.get(runtime))
             .is_none()
@@ -341,7 +341,10 @@ $DNF_SDK_HOST \
         config_toml: &toml::Value,
         container_config: &ContainerConfig<'_>,
     ) -> Result<()> {
-        print_info("Fetching repository metadata for all sysroots", OutputLevel::Normal);
+        print_info(
+            "Fetching repository metadata for all sysroots",
+            OutputLevel::Normal,
+        );
 
         // 1. Fetch SDK host metadata
         self.fetch_sdk_host_metadata(container_config).await?;
@@ -432,7 +435,10 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
             return Err(anyhow::anyhow!("Failed to fetch SDK host metadata"));
         }
 
-        print_success("Successfully fetched SDK host metadata", OutputLevel::Normal);
+        print_success(
+            "Successfully fetched SDK host metadata",
+            OutputLevel::Normal,
+        );
         Ok(())
     }
 
@@ -582,7 +588,9 @@ $DNF_SDK_HOST \
         let success = container_config.helper.run_in_container(run_config).await?;
 
         if !success {
-            return Err(anyhow::anyhow!("Failed to fetch SDK target sysroot metadata"));
+            return Err(anyhow::anyhow!(
+                "Failed to fetch SDK target sysroot metadata"
+            ));
         }
 
         print_success(

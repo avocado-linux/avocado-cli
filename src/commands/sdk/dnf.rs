@@ -81,7 +81,7 @@ impl SdkDnfCommand {
             String::new()
         };
         let command = format!(
-            "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF {} {}",
+            "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF --disablerepo=${{AVOCADO_TARGET}}-target-ext {} {}",
             dnf_args_str,
             self.command.join(" ")
         );

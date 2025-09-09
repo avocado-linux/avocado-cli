@@ -665,6 +665,7 @@ $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
     $DNF_NO_SCRIPTS \
     --installroot={} \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
     install \
     {} \
@@ -816,6 +817,8 @@ $DNF_SDK_HOST \
     $DNF_NO_SCRIPTS \
     --setopt=persistdir={installroot}/var/lib/extensions/ \
     --installroot={installroot} \
+    --enablerepo=${{AVOCADO_TARGET}}-target-ext \
+    --setopt=install_weak_deps=0 \
     {dnf_args_str} \
     install \
     {yes} \

@@ -127,6 +127,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_REPO_CONF \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
     install \
     {} \
@@ -184,6 +185,7 @@ RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     --installroot {} \
     $DNF_SDK_TARGET_REPO_CONF \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
     install \
     {} \
