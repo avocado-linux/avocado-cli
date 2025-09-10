@@ -415,6 +415,12 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     sed -i "s|^%_usr[[:space:]]*/usr$|%_usr                   $AVOCADO_SDK_PREFIX/usr|" $AVOCADO_SDK_PREFIX/usr/lib/rpm/macros
     sed -i "s|^%_var[[:space:]]*/var$|%_var                   $AVOCADO_SDK_PREFIX/var|" $AVOCADO_SDK_PREFIX/usr/lib/rpm/macros
 
+    # Create separate rpm config for versioned extensions with custom %_dbpath
+    mkdir -p $AVOCADO_SDK_PREFIX/ext-rpm-config
+    cp -r /usr/lib/rpm/* $AVOCADO_SDK_PREFIX/ext-rpm-config/
+    # Update macros for versioned extensions to use extension.d/rpm database location
+    sed -i "s|^%_dbpath[[:space:]]*%{_var}/lib/rpm$|%_dbpath                %{_var}/lib/extension.d/rpm|" $AVOCADO_SDK_PREFIX/ext-rpm-config/macros
+
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \

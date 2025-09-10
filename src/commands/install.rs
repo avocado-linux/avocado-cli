@@ -660,6 +660,7 @@ impl InstallCommand {
                     };
                     let install_command = format!(
                         r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
@@ -763,7 +764,7 @@ $DNF_SDK_HOST \
         if !sysroot_exists {
             // Create the sysroot for versioned extension
             let setup_command = format!(
-                "mkdir -p $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib"
+                "mkdir -p $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib/extension.d && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib/extension.d"
             );
             let run_config = crate::utils::container::RunConfig {
                 container_image: container_image.clone(),
@@ -811,11 +812,12 @@ $DNF_SDK_HOST \
 
         let install_command = format!(
             r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
     $DNF_NO_SCRIPTS \
-    --setopt=persistdir={installroot}/var/lib/extensions/ \
+    --setopt=persistdir={installroot}/var/lib/extension.d/ \
     --installroot={installroot} \
     --enablerepo=${{AVOCADO_TARGET}}-target-ext \
     --setopt=install_weak_deps=0 \

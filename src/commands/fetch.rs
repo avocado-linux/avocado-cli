@@ -191,6 +191,7 @@ impl FetchCommand {
 
         let makecache_command = format!(
             r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
