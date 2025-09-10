@@ -579,9 +579,9 @@ rm -rf "$TMPDIR"
             crate::utils::volume::VolumeManager::new("docker".to_string(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&cwd).await?;
 
-        // Create SDK RPM metadata with -sdk suffix and all_avocadosdk architecture
+        // Create SDK RPM metadata with nativesdk- prefix and all_avocadosdk architecture
         let sdk_metadata = RpmMetadata {
-            name: format!("{}-sdk", metadata.name),
+            name: format!("nativesdk-{}", metadata.name),
             version: metadata.version.clone(),
             release: metadata.release.clone(),
             summary: format!("{} SDK dependencies", metadata.summary),
