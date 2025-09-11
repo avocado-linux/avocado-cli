@@ -228,8 +228,11 @@ impl RuntimeInstallCommand {
             }
         }
 
-        // Install dependencies if they exist
-        let dependencies = runtime_config.get("dependencies");
+        // Install dependencies if they exist (using merged config to include target-specific dependencies)
+        let merged_runtime = config.get_merged_runtime_config(runtime, &target_arch, &self.config_path)?;
+        let dependencies = merged_runtime
+            .as_ref()
+            .and_then(|merged| merged.get("dependencies"));
 
         if let Some(toml::Value::Table(deps_map)) = dependencies {
             // Build list of packages to install (excluding extension references)
@@ -666,5 +669,43 @@ gcc = "*"
         assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
         assert!(cmd.verbose);
         assert!(cmd.force);
+    }
+
+    #[test]
+    fn test_runtime_install_with_target_specific_dependencies() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+[sdk]
+image = "test-image"
+
+[runtime.dev]
+# Base dependencies
+[runtime.dev.dependencies]
+avocado-img-bootfiles = "*"
+avocado-img-rootfs = "*"
+avocado-img-initramfs = "*"
+
+# Target-specific dependencies
+[runtime.dev.jetson-orin-nano-devkit-nvme.dependencies]
+avocado-img-tegraflash = "*"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let cmd = RuntimeInstallCommand::new(
+            Some("dev".to_string()),
+            config_path,
+            false,
+            false,
+            Some("jetson-orin-nano-devkit-nvme".to_string()),
+            None,
+            None,
+        );
+
+        // Test that the command is created correctly
+        assert_eq!(cmd.runtime, Some("dev".to_string()));
+        assert_eq!(cmd.target, Some("jetson-orin-nano-devkit-nvme".to_string()));
+
+        // Note: The actual dependency resolution is tested by the merged config functionality
+        // which is already covered in the config module tests
     }
 }
