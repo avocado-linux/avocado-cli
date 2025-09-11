@@ -434,11 +434,11 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF check-update
+        $DNF_SDK_HOST $DNF_SDK_REPO_CONF check-update
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF -y install avocado-sdk-toolchain
+        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF -y install avocado-sdk-toolchain
 
     echo "[INFO] Installing rootfs sysroot."
     RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
