@@ -30,6 +30,7 @@ pub struct RunConfig {
     pub dnf_args: Option<Vec<String>>,
     pub extension_sysroot: Option<String>,
     pub runtime_sysroot: Option<String>,
+    pub no_bootstrap: bool,
 }
 
 impl Default for RunConfig {
@@ -52,6 +53,7 @@ impl Default for RunConfig {
             dnf_args: None,
             extension_sysroot: None,
             runtime_sysroot: None,
+            no_bootstrap: false,
         }
     }
 }
@@ -157,6 +159,7 @@ impl SdkContainer {
                 config.extension_sysroot.as_deref(),
                 config.runtime_sysroot.as_deref(),
                 &config.target,
+                config.no_bootstrap,
             ));
             full_command.push('\n');
         }
@@ -321,6 +324,7 @@ impl SdkContainer {
         extension_sysroot: Option<&str>,
         runtime_sysroot: Option<&str>,
         target: &str,
+        no_bootstrap: bool,
     ) -> String {
         let mut script = r#"
 set -e
@@ -386,9 +390,6 @@ export DNF_SDK_TARGET_REPO_CONF="\
 --setopt=reposdir=${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d \
 "
 
-# TODO Checking
-# export RPM_NO_CHROOT_FOR_SCRIPTS=1
-
 mkdir -p /etc/dnf/vars
 mkdir -p ${AVOCADO_SDK_PREFIX}/etc/dnf/vars
 mkdir -p ${AVOCADO_SDK_PREFIX}/target-repoconf/etc/dnf/vars
@@ -396,7 +397,12 @@ mkdir -p ${AVOCADO_SDK_PREFIX}/target-repoconf/etc/dnf/vars
 echo "${REPO_URL}" > /etc/dnf/vars/repo_url
 echo "${REPO_URL}" > ${DNF_SDK_HOST_PREFIX}/etc/dnf/vars/repo_url
 echo "${REPO_URL}" > ${DNF_SDK_TARGET_PREFIX}/etc/dnf/vars/repo_url
+"#
+        .to_string();
 
+        // Only include bootstrap logic if no_bootstrap is false
+        if !no_bootstrap {
+            script.push_str(r#"
 if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     echo "[INFO] Initializing Avocado SDK."
     mkdir -p $AVOCADO_SDK_PREFIX/etc
@@ -448,10 +454,15 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
         install \
         packagegroup-core-standalone-sdk-target
 fi
+"#);
+        }
 
+        script.push_str(
+            r#"
 export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
 
-"#.to_string();
+"#,
+        );
 
         // Conditionally change to sysroot directory or default to /opt/src
         if let Some(extension_name) = extension_sysroot {
@@ -575,7 +586,7 @@ mod tests {
     #[test]
     fn test_entrypoint_script() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, None, None, "x86_64");
+        let script = container.create_entrypoint_script(true, None, None, "x86_64", false);
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
@@ -585,7 +596,8 @@ mod tests {
     #[test]
     fn test_entrypoint_script_with_extension_sysroot() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, Some("test-ext"), None, "x86_64");
+        let script =
+            container.create_entrypoint_script(true, Some("test-ext"), None, "x86_64", false);
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/extensions/test-ext"));
         assert!(!script.contains("cd /opt/src"));
@@ -594,10 +606,33 @@ mod tests {
     #[test]
     fn test_entrypoint_script_with_runtime_sysroot() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, None, Some("test-runtime"), "x86_64");
+        let script =
+            container.create_entrypoint_script(true, None, Some("test-runtime"), "x86_64", false);
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/runtimes/test-runtime"));
         assert!(!script.contains("cd /opt/src"));
+    }
+
+    #[test]
+    fn test_entrypoint_script_no_bootstrap() {
+        let container = SdkContainer::new();
+        let script = container.create_entrypoint_script(true, None, None, "x86_64", true);
+
+        // Should still contain environment variables
+        assert!(script.contains("AVOCADO_SDK_PREFIX"));
+        assert!(script.contains("DNF_SDK_HOST"));
+
+        // Should NOT contain bootstrap initialization
+        assert!(!script.contains("Initializing Avocado SDK"));
+        assert!(!script.contains("install \"avocado-sdk-"));
+        assert!(!script.contains("install avocado-sdk-toolchain"));
+        assert!(!script.contains("Installing rootfs sysroot"));
+
+        // Should still change to /opt/src
+        assert!(script.contains("cd /opt/src"));
+
+        // Should still contain environment sourcing (this is separate from bootstrap)
+        assert!(script.contains("source \"${AVOCADO_SDK_PREFIX}/environment-setup\""));
     }
 
     #[test]

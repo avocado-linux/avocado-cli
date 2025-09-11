@@ -38,6 +38,8 @@ pub struct SdkRunCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Skip SDK bootstrap initialization
+    pub no_bootstrap: bool,
 }
 
 impl SdkRunCommand {
@@ -57,6 +59,7 @@ impl SdkRunCommand {
         target: Option<String>,
         container_args: Option<Vec<String>>,
         dnf_args: Option<Vec<String>>,
+        no_bootstrap: bool,
     ) -> Self {
         Self {
             config_path,
@@ -72,6 +75,7 @@ impl SdkRunCommand {
             target,
             container_args,
             dnf_args,
+            no_bootstrap,
         }
     }
 
@@ -170,6 +174,7 @@ impl SdkRunCommand {
             dnf_args: self.dnf_args.clone(),
             extension_sysroot: self.extension.clone(),
             runtime_sysroot: self.runtime.clone(),
+            no_bootstrap: self.no_bootstrap,
             ..Default::default()
         };
 
@@ -285,6 +290,7 @@ mod tests {
             Some("test-target".to_string()),
             None,
             None,
+            false, // no_bootstrap
         );
 
         assert_eq!(cmd.config_path, "config.toml");
@@ -316,6 +322,7 @@ mod tests {
             Some("test-target".to_string()),
             None,
             None,
+            false, // no_bootstrap
         );
 
         // Verify that the command struct stores the values correctly
@@ -340,6 +347,7 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         let result = cmd.execute().await;
@@ -366,6 +374,7 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         let result = cmd.execute().await;
@@ -397,6 +406,7 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         assert!(cmd.env);
@@ -424,6 +434,7 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         assert!(!cmd_no_env.env);
@@ -445,6 +456,7 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         let result = cmd.execute().await;
@@ -471,6 +483,7 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         assert_eq!(cmd.extension, Some("test-ext".to_string()));
@@ -493,9 +506,34 @@ mod tests {
             None,
             None,
             None,
+            false, // no_bootstrap
         );
 
         assert_eq!(cmd.extension, None);
         assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
+    }
+
+    #[test]
+    fn test_no_bootstrap_flag() {
+        let cmd = SdkRunCommand::new(
+            "config.toml".to_string(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None, // extension
+            None, // runtime
+            Some(vec!["echo".to_string(), "test".to_string()]),
+            None,
+            None,
+            None,
+            true, // no_bootstrap = true
+        );
+
+        assert!(cmd.no_bootstrap);
+        assert_eq!(cmd.config_path, "config.toml");
+        assert!(!cmd.env);
     }
 }

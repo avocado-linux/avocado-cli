@@ -261,6 +261,9 @@ enum SdkCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Skip SDK bootstrap initialization and go directly to container prompt
+        #[arg(long)]
+        no_bootstrap: bool,
     },
     /// List SDK dependencies
     Deps {
@@ -1060,6 +1063,7 @@ async fn main() -> Result<()> {
                 command,
                 container_args,
                 dnf_args,
+                no_bootstrap,
             } => {
                 let cmd = if command.is_empty() {
                     None
@@ -1080,6 +1084,7 @@ async fn main() -> Result<()> {
                     target,
                     container_args,
                     dnf_args,
+                    no_bootstrap,
                 );
                 run_cmd.execute().await?;
                 Ok(())
