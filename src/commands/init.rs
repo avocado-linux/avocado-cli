@@ -23,6 +23,20 @@ impl InitCommand {
         Self { target, directory }
     }
 
+    /// Detects the system architecture and returns the appropriate default target.
+    ///
+    /// # Returns
+    /// * `"qemux86-64"` for x86_64 systems
+    /// * `"qemuarm64"` for aarch64 systems
+    /// * `"qemux86-64"` as fallback for unknown architectures
+    pub fn get_default_target() -> &'static str {
+        match std::env::consts::ARCH {
+            "x86_64" => "qemux86-64",
+            "aarch64" => "qemuarm64",
+            _ => "qemux86-64", // fallback to x86_64 for unknown architectures
+        }
+    }
+
     /// Executes the init command, creating the avocado.toml configuration file.
     ///
     /// # Returns
@@ -35,7 +49,10 @@ impl InitCommand {
     /// * The avocado.toml file already exists
     /// * The configuration file cannot be written
     pub fn execute(&self) -> Result<()> {
-        let target = self.target.as_deref().unwrap_or("qemux86-64");
+        let target = self
+            .target
+            .as_deref()
+            .unwrap_or_else(|| Self::get_default_target());
         let directory = self.directory.as_deref().unwrap_or(".");
 
         // Validate and create directory if it doesn't exist
@@ -58,31 +75,75 @@ impl InitCommand {
         // Create the configuration content
         let config_content = format!(
             r#"default_target = "{target}"
+
+# Add adiditonal supported targets or use "*" for all targets
 supported_targets = ["{target}"]
 
-[runtime.dev]
-target = "{target}"
+##
+## Runtimes
+##
 
 [runtime.dev.dependencies]
 avocado-img-bootfiles = "*"
 avocado-img-rootfs = "*"
 avocado-img-initramfs = "*"
-avocado-dev = {{ ext = "avocado-dev" }}
+avocado-ext-dev = {{ ext = "avocado-ext-dev", vsn = "*" }}
+avocado-ext-sshd-dev = {{ ext = "avocado-ext-sshd-dev", vsn = "*" }}
+config = {{ ext = "config" }}
+app = {{ ext = "app" }}
+
+##
+## Extensions
+##
+
+# Generated default app extension
+# Use or modify this to install dependencies and or include sdk compiled code
+[ext.app]
+types = ["sysext", "confext"]
+
+# Install application dependencies
+[ext.app.dependencies]
+#curl = "*"
+#iperf3 = "*"
+
+# Generated default config extension
+# Use or modify this to configure "real" user accounts (passwd, shadow, group)
+# or configure other system services
+[ext.config]
+types = ["confext"]
+
+# NOT FOR PRODUCTION: Set root password to empty string
+[ext.config.users.root]
+password = ""
+
+##
+## SDK
+##
 
 [sdk]
 image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [sdk.dependencies]
-nativesdk-qemu-system-x86-64 = "*"
+avocado-sdk-toolchain = "*"
 
-[ext.avocado-dev]
-types = ["sysext", "confext"]
+[sdk.qemux86-64]
+container_args = ["--network=host"]
 
-[ext.avocado-dev.dependencies]
-avocado-hitl = "*"
+[sdk.qemuarm64]
+container_args = ["--network=host"]
 
-[ext.avocado-dev.sdk.dependencies]
-nativesdk-avocado-hitl = "*"
+##
+## Provisioning
+##
+
+# When provisioning using usb or sd provisioning profiles, set extra sdk
+# container arguments to allow access to these devices
+
+[provision.usb]
+container_args = ["-v", "/dev:/dev", "-v", "/sys:/sys:ro", "--privileged"]
+
+[provision.sd]
+container_args = ["-v", "/dev:/dev", "-v", "/sys:/sys:ro", "--privileged"]
 "#
         );
 
@@ -127,18 +188,18 @@ mod tests {
         assert!(config_path.exists());
 
         let content = fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("target = \"qemux86-64\""));
-        assert!(content.contains("[runtime.dev]"));
+        let expected_target = InitCommand::get_default_target();
+        assert!(content.contains(&format!("default_target = \"{expected_target}\"")));
+        assert!(content.contains("[runtime.dev.dependencies]"));
         assert!(content.contains("avocado-img-bootfiles = \"*\""));
         assert!(content.contains("avocado-img-rootfs = \"*\""));
         assert!(content.contains("avocado-img-initramfs = \"*\""));
-        assert!(content.contains("avocado-dev = { ext = \"avocado-dev\" }"));
+        assert!(content.contains("avocado-ext-dev = { ext = \"avocado-ext-dev\", vsn = \"*\" }"));
         assert!(content.contains("image = \"docker.io/avocadolinux/sdk:apollo-edge\""));
-        assert!(content.contains("nativesdk-qemu-system-x86-64 = \"*\""));
-        assert!(content.contains("[ext.avocado-dev]"));
+        assert!(content.contains("[ext.app]"));
         assert!(content.contains("types = [\"sysext\", \"confext\"]"));
-        assert!(content.contains("avocado-hitl = \"*\""));
-        assert!(content.contains("nativesdk-avocado-hitl = \"*\""));
+        assert!(content.contains("[ext.config]"));
+        assert!(content.contains("avocado-sdk-toolchain = \"*\""));
     }
 
     #[test]
@@ -154,7 +215,7 @@ mod tests {
 
         let config_path = PathBuf::from(temp_path).join("avocado.toml");
         let content = fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("target = \"custom-arch\""));
+        assert!(content.contains("default_target = \"custom-arch\""));
     }
 
     #[test]

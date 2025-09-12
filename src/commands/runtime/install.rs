@@ -229,7 +229,8 @@ impl RuntimeInstallCommand {
         }
 
         // Install dependencies if they exist (using merged config to include target-specific dependencies)
-        let merged_runtime = config.get_merged_runtime_config(runtime, &target_arch, &self.config_path)?;
+        let merged_runtime =
+            config.get_merged_runtime_config(runtime, &target_arch, &self.config_path)?;
         let dependencies = merged_runtime
             .as_ref()
             .and_then(|merged| merged.get("dependencies"));
