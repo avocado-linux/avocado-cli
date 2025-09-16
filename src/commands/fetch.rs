@@ -1,4 +1,5 @@
 use anyhow::Result;
+use tokio::process::Command as AsyncCommand;
 
 use crate::utils::{
     config::Config,
@@ -69,6 +70,9 @@ impl FetchCommand {
 
         // Initialize container helper
         let container_helper = SdkContainer::new();
+
+        // Pull the latest SDK container image
+        self.pull_sdk_image(container_image).await?;
 
         // Get repo configuration from config
         let repo_url = config_toml
@@ -599,5 +603,46 @@ $DNF_SDK_HOST \
             OutputLevel::Normal,
         );
         Ok(())
+    }
+
+    async fn pull_sdk_image(&self, container_image: &str) -> Result<()> {
+        print_info(
+            &format!("Pulling latest SDK container image: {container_image}"),
+            OutputLevel::Normal,
+        );
+
+        // Determine the container tool to use (docker or podman)
+        let container_tool =
+            std::env::var("AVOCADO_CONTAINER_TOOL").unwrap_or_else(|_| "docker".to_string());
+
+        if self.verbose {
+            print_info(
+                &format!("Running command: {container_tool} pull {container_image}"),
+                OutputLevel::Normal,
+            );
+        }
+
+        let mut cmd = AsyncCommand::new(&container_tool);
+        cmd.arg("pull").arg(container_image);
+
+        let output = cmd.output().await?;
+
+        if output.status.success() {
+            print_success(
+                &format!("Successfully pulled SDK container image: {container_image}"),
+                OutputLevel::Normal,
+            );
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            print_error(
+                &format!("Failed to pull SDK container image: {stderr}"),
+                OutputLevel::Normal,
+            );
+            Err(anyhow::anyhow!(
+                "Failed to pull SDK container image: {}",
+                stderr
+            ))
+        }
     }
 }
