@@ -304,7 +304,7 @@ mkdir -p BUILD RPMS SOURCES SPECS SRPMS
 # Create spec file
 cat > SPECS/package.spec << 'SPEC_EOF'
 %define _buildhost reproducible
-%global _use_internal_dependency_generator 0
+AutoReqProv: no
 
 Name: {}
 Version: {}
