@@ -763,9 +763,8 @@ $DNF_SDK_HOST \
 
         if !sysroot_exists {
             // Create the sysroot for versioned extension
-            let setup_command = format!(
-                "mkdir -p $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib/extension.d"
-            );
+            let setup_command =
+                format!("mkdir -p $AVOCADO_EXT_SYSROOTS/{sysroot_name}/var/lib/extension.d");
             let run_config = crate::utils::container::RunConfig {
                 container_image: container_image.clone(),
                 target: target.to_string(),
