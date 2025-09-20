@@ -183,6 +183,7 @@ impl VolumeManager {
 }
 
 /// Information about a docker volume
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VolumeInfo {
     #[serde(rename = "Name")]
