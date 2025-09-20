@@ -2,6 +2,7 @@
 
 pub mod clean;
 pub mod ext;
+pub mod fetch;
 pub mod hitl;
 pub mod init;
 pub mod runtime;

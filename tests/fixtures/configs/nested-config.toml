@@ -1,0 +1,8 @@
+[avocado]
+version = "0.1.0"
+target = "x86_64"
+src_dir = "."
+
+[ext.nested-extension]
+types = ["sysext"]
+packages = ["wget"]

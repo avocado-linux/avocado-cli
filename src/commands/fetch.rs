@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::collections::HashSet;
 use tokio::process::Command as AsyncCommand;
 
+use crate::commands::install::ExtensionDependency;
 use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
@@ -360,7 +362,7 @@ $DNF_SDK_HOST \
         // 3. Fetch SDK target sysroot metadata
         self.fetch_sdk_target_metadata(container_config).await?;
 
-        // 4. Fetch all extension metadata
+        // 4. Fetch all extension metadata (including nested external extensions)
         if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_table()) {
             for extension_name in extensions.keys() {
                 if let Err(e) = self
@@ -373,6 +375,27 @@ $DNF_SDK_HOST \
                     );
                     // Continue with other extensions instead of failing completely
                 }
+            }
+        }
+
+        // 4.5. Fetch metadata for all external extensions (including nested ones)
+        let config = Config::load(&self.config_path)?;
+        let all_external_extensions =
+            self.discover_all_external_extensions(&config, config_toml)?;
+        for ext_dep in all_external_extensions {
+            if let Err(e) = self
+                .fetch_external_extension_metadata(&ext_dep, container_config)
+                .await
+            {
+                let ext_name = match &ext_dep {
+                    ExtensionDependency::External { name, .. } => name,
+                    _ => continue,
+                };
+                print_error(
+                    &format!("Failed to fetch metadata for external extension '{ext_name}': {e}"),
+                    OutputLevel::Normal,
+                );
+                // Continue with other extensions instead of failing completely
             }
         }
 
@@ -644,5 +667,255 @@ $DNF_SDK_HOST \
                 stderr
             ))
         }
+    }
+
+    /// Discover all external extensions (including nested ones) that have sysroots
+    fn discover_all_external_extensions(
+        &self,
+        config: &Config,
+        config_toml: &toml::Value,
+    ) -> Result<Vec<ExtensionDependency>> {
+        let mut all_external_extensions = HashSet::new();
+        let mut visited = HashSet::new();
+
+        // Find external extensions from main config
+        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_table()) {
+            for (ext_name, ext_config) in extensions {
+                if let Some(dependencies) =
+                    ext_config.get("dependencies").and_then(|d| d.as_table())
+                {
+                    for (_dep_name, dep_spec) in dependencies {
+                        // Check for external extension dependency
+                        if let Some(external_config) =
+                            dep_spec.get("config").and_then(|v| v.as_str())
+                        {
+                            let ext_dep = ExtensionDependency::External {
+                                name: ext_name.clone(),
+                                config_path: external_config.to_string(),
+                            };
+                            all_external_extensions.insert(ext_dep.clone());
+
+                            // Recursively find nested external extension dependencies
+                            self.find_nested_external_extensions(
+                                config,
+                                &ext_dep,
+                                &mut all_external_extensions,
+                                &mut visited,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(all_external_extensions.into_iter().collect())
+    }
+
+    /// Recursively find nested external extension dependencies
+    fn find_nested_external_extensions(
+        &self,
+        config: &Config,
+        ext_dep: &ExtensionDependency,
+        all_external_extensions: &mut HashSet<ExtensionDependency>,
+        visited: &mut HashSet<String>,
+    ) -> Result<()> {
+        let (ext_name, ext_config_path) = match ext_dep {
+            ExtensionDependency::External { name, config_path } => (name, config_path),
+            ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
+            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
+        };
+
+        // Cycle detection: check if we've already processed this extension
+        let ext_key = format!("{ext_name}:{ext_config_path}");
+        if visited.contains(&ext_key) {
+            if self.verbose {
+                print_info(
+                    &format!("Skipping already processed extension '{ext_name}' to avoid cycles"),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        }
+        visited.insert(ext_key);
+
+        // Load the external extension configuration
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(&self.config_path, ext_config_path);
+        let external_extensions =
+            config.load_external_extensions(&self.config_path, ext_config_path)?;
+
+        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' not found in external config file '{}'",
+                ext_name,
+                ext_config_path
+            )
+        })?;
+
+        // Load the nested config file to get its src_dir setting
+        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let nested_config: toml::Value =
+            toml::from_str(&nested_config_content).with_context(|| {
+                format!(
+                    "Failed to parse nested config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Create a temporary Config object for the nested config to handle its src_dir
+        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+
+        // Check if this external extension has dependencies
+        if let Some(dependencies) = extension_config
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+        {
+            for (_dep_name, dep_spec) in dependencies {
+                // Check for nested extension dependency
+                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    // Check if this is a nested external extension (has config field)
+                    if let Some(nested_external_config) =
+                        dep_spec.get("config").and_then(|v| v.as_str())
+                    {
+                        // Resolve the nested config path relative to the nested config's src_dir
+                        let nested_config_path = nested_config_obj
+                            .resolve_path_relative_to_src_dir(
+                                &resolved_external_config_path,
+                                nested_external_config,
+                            );
+
+                        let nested_ext_dep = ExtensionDependency::External {
+                            name: nested_ext_name.to_string(),
+                            config_path: nested_config_path.to_string_lossy().to_string(),
+                        };
+
+                        // Add the nested extension to all extensions
+                        all_external_extensions.insert(nested_ext_dep.clone());
+
+                        if self.verbose {
+                            print_info(
+                                &format!("Found nested external extension '{nested_ext_name}' required by '{ext_name}' at '{}'", nested_config_path.display()),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Recursively process the nested extension
+                        self.find_nested_external_extensions(
+                            config,
+                            &nested_ext_dep,
+                            all_external_extensions,
+                            visited,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetch metadata for an external extension
+    async fn fetch_external_extension_metadata(
+        &self,
+        ext_dep: &ExtensionDependency,
+        container_config: &ContainerConfig<'_>,
+    ) -> Result<()> {
+        let (ext_name, _ext_config_path) = match ext_dep {
+            ExtensionDependency::External { name, config_path } => (name, config_path),
+            _ => return Ok(()), // Only handle external extensions
+        };
+
+        print_info(
+            &format!("Fetching repository metadata for external extension '{ext_name}'"),
+            OutputLevel::Normal,
+        );
+
+        // Check if extension sysroot exists
+        let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{ext_name} ]");
+        let run_config = RunConfig {
+            container_image: container_config.image.to_string(),
+            target: container_config.target_arch.to_string(),
+            command: check_command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: container_config.repo_url.cloned(),
+            repo_release: container_config.repo_release.cloned(),
+            container_args: container_config.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+        let sysroot_exists = container_config.helper.run_in_container(run_config).await?;
+
+        if !sysroot_exists {
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "Extension sysroot '{ext_name}' does not exist, skipping metadata fetch"
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        }
+
+        // Run DNF makecache for the extension sysroot
+        let dnf_args_str = if let Some(args) = &self.dnf_args {
+            format!(" {} ", args.join(" "))
+        } else {
+            String::new()
+        };
+
+        let makecache_command = format!(
+            r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+$DNF_SDK_HOST \
+    $DNF_SDK_TARGET_REPO_CONF \
+    --installroot=$AVOCADO_EXT_SYSROOTS/{ext_name} \
+    {dnf_args_str} \
+    makecache
+"#
+        );
+
+        if self.verbose {
+            print_info(
+                &format!("Running command: {makecache_command}"),
+                OutputLevel::Normal,
+            );
+        }
+
+        let run_config = RunConfig {
+            container_image: container_config.image.to_string(),
+            target: container_config.target_arch.to_string(),
+            command: makecache_command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: container_config.repo_url.cloned(),
+            repo_release: container_config.repo_release.cloned(),
+            container_args: container_config.container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+        let success = container_config.helper.run_in_container(run_config).await?;
+
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to fetch metadata for external extension '{ext_name}'"
+            ));
+        }
+
+        print_success(
+            &format!("Successfully fetched metadata for external extension '{ext_name}'"),
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 }

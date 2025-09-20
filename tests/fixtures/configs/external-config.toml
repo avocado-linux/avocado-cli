@@ -1,0 +1,11 @@
+[avocado]
+version = "0.1.0"
+target = "x86_64"
+src_dir = "."
+
+[ext.external-extension]
+types = ["sysext"]
+packages = ["curl"]
+
+[ext.external-extension.dependencies]
+nested-dep = { ext = "nested-extension", config = "nested-config.toml" }
