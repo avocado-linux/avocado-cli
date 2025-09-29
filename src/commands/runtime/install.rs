@@ -687,7 +687,7 @@ avocado-img-rootfs = "*"
 avocado-img-initramfs = "*"
 
 # Target-specific dependencies
-[runtime.dev.jetson-orin-nano-devkit-nvme.dependencies]
+[runtime.dev.jetson-orin-nano-devkit.dependencies]
 avocado-img-tegraflash = "*"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
@@ -697,14 +697,14 @@ avocado-img-tegraflash = "*"
             config_path,
             false,
             false,
-            Some("jetson-orin-nano-devkit-nvme".to_string()),
+            Some("jetson-orin-nano-devkit".to_string()),
             None,
             None,
         );
 
         // Test that the command is created correctly
         assert_eq!(cmd.runtime, Some("dev".to_string()));
-        assert_eq!(cmd.target, Some("jetson-orin-nano-devkit-nvme".to_string()));
+        assert_eq!(cmd.target, Some("jetson-orin-nano-devkit".to_string()));
 
         // Note: The actual dependency resolution is tested by the merged config functionality
         // which is already covered in the config module tests

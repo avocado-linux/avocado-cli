@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
+use std::include_str;
 use std::path::Path;
 
 /// Command to initialize a new Avocado project with configuration files.
@@ -34,6 +35,37 @@ impl InitCommand {
             "x86_64" => "qemux86-64",
             "aarch64" => "qemuarm64",
             _ => "qemux86-64", // fallback to x86_64 for unknown architectures
+        }
+    }
+
+    /// Loads the configuration template for the specified target.
+    ///
+    /// # Arguments
+    /// * `target` - The target architecture string
+    ///
+    /// # Returns
+    /// * The configuration template content as a string
+    fn load_config_template(target: &str) -> String {
+        match target {
+            "qemux86-64" => include_str!("../../configs/qemu/qemux86-64.toml").to_string(),
+            "qemuarm64" => include_str!("../../configs/qemu/qemuarm64.toml").to_string(),
+            "reterminal" => include_str!("../../configs/seeed/reterminal.toml").to_string(),
+            "reterminal-dm" => include_str!("../../configs/seeed/reterminal-dm.toml").to_string(),
+            "jetson-orin-nano-devkit" => {
+                include_str!("../../configs/nvidia/jetson-orin-nano-devkit.toml").to_string()
+            }
+            "raspberrypi4" => {
+                include_str!("../../configs/raspberry-pi/raspberrypi-4-model-b.toml").to_string()
+            }
+            "raspberrypi5" => {
+                include_str!("../../configs/raspberry-pi/raspberrypi-5.toml").to_string()
+            }
+            "icam-540" => include_str!("../../configs/advantech/icam-540.toml").to_string(),
+            _ => {
+                // Use default template and substitute the target
+                let default_template = include_str!("../../configs/default.toml");
+                default_template.replace("{target}", target)
+            }
         }
     }
 
@@ -72,80 +104,8 @@ impl InitCommand {
             );
         }
 
-        // Create the configuration content
-        let config_content = format!(
-            r#"default_target = "{target}"
-
-# Add adiditonal supported targets or use "*" for all targets
-supported_targets = ["{target}"]
-
-##
-## Runtimes
-##
-
-[runtime.dev.dependencies]
-avocado-img-bootfiles = "*"
-avocado-img-rootfs = "*"
-avocado-img-initramfs = "*"
-avocado-ext-dev = {{ ext = "avocado-ext-dev", vsn = "*" }}
-avocado-ext-sshd-dev = {{ ext = "avocado-ext-sshd-dev", vsn = "*" }}
-config = {{ ext = "config" }}
-app = {{ ext = "app" }}
-
-##
-## Extensions
-##
-
-# Generated default app extension
-# Use or modify this to install dependencies and or include sdk compiled code
-[ext.app]
-types = ["sysext", "confext"]
-
-# Install application dependencies
-[ext.app.dependencies]
-#curl = "*"
-#iperf3 = "*"
-
-# Generated default config extension
-# Use or modify this to configure "real" user accounts (passwd, shadow, group)
-# or configure other system services
-[ext.config]
-types = ["confext"]
-
-# NOT FOR PRODUCTION: Set root password to empty string
-[ext.config.users.root]
-password = ""
-
-##
-## SDK
-##
-
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-
-[sdk.dependencies]
-avocado-sdk-toolchain = "*"
-
-[sdk.qemux86-64]
-container_args = ["--network=host"]
-
-[sdk.qemuarm64]
-container_args = ["--network=host"]
-
-##
-## Provisioning
-##
-
-# When provisioning using usb or sd provisioning profiles, set extra sdk
-# container arguments to allow access to these devices
-
-[provision.usb]
-container_args = ["-v", "/dev:/dev", "-v", "/sys:/sys:ro", "--privileged"]
-
-[provision.sd]
-container_args = ["-v", "/dev:/dev", "-v", "/sys:/sys:ro", "--privileged"]
-"#
-        );
+        // Load the configuration template for the target
+        let config_content = Self::load_config_template(target);
 
         // Write the configuration file
         fs::write(&toml_path, config_content).with_context(|| {

@@ -1,0 +1,65 @@
+default_target = "jetson-orin-nano-devkit"
+
+# Add additional supported targets or use "*" for all targets
+supported_targets = ["jetson-orin-nano-devkit"]
+
+##
+## Runtimes
+##
+
+[runtime.dev.dependencies]
+avocado-img-bootfiles = "*"
+avocado-img-rootfs = "*"
+avocado-img-initramfs = "*"
+config = { ext = "config" }
+app = { ext = "app" }
+
+[runtime.dev.jetson-orin-nano-devkit.dependencies]
+avocado-img-tegraflash = "*"
+
+##
+## Extensions
+##
+
+# Generated default app extension
+# Use or modify this to install dependencies and or include sdk compiled code
+[ext.app]
+types = ["sysext", "confext"]
+
+# Install application dependencies
+[ext.app.dependencies]
+#curl = "*"
+#iperf3 = "*"
+
+# Generated default config extension
+# Use or modify this to configure "real" user accounts (passwd, shadow, group)
+# or configure other system services
+[ext.config]
+types = ["confext"]
+
+# NOT FOR PRODUCTION: Set root password to empty string
+[ext.config.users.root]
+password = ""
+
+##
+## SDK
+##
+
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+
+[sdk.dependencies]
+avocado-sdk-toolchain = "*"
+
+[sdk.jetson-orin-nano-devkit]
+container_args = ["--network=host", "-v", "/dev:/dev", "-v", "/sys:/sys:ro", "--privileged"]
+
+[sdk.jetson-orin-nano-devkit.dependencies]
+nativesdk-util-linux-mount = "*"
+
+##
+## Provisioning
+##
+
+[provision.tegraflash]
+container_args = ["-v", "/dev:/dev", "-v", "/sys:/sys:ro", "--privileged"]
