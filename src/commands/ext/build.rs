@@ -1288,11 +1288,10 @@ echo "Set proper permissions on authentication files""#,
             })?;
 
             // Then, run the install script
-            let src_dir = config.src_dir.as_deref().unwrap_or(".");
-            let install_script_path = format!("{src_dir}/{install_script}");
-
+            // Note: install_script is already relative to /opt/src (the mounted src_dir in the container)
+            // so we don't need to prepend src_dir here - just use it directly like compile scripts do
             let install_command = format!(
-                r#"if [ -f '{install_script_path}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script_path}'; else echo 'Install script {install_script} not found.' && ls -la {src_dir}; exit 1; fi"#,
+                r#"if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
                 extension_name = self.extension
             );
 
