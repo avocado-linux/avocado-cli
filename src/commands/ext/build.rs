@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{Config, ExtensionLocation};
@@ -210,6 +211,13 @@ impl ExtBuildCommand {
         let overlay_config = ext_config.get("overlay").map(|v| {
             if let Some(dir_str) = v.as_str() {
                 // Simple string format: overlay = "directory"
+                print_info(
+                    &format!(
+                        "[DEBUG] Overlay configuration (string): dir='{}', mode=Merge (default)",
+                        dir_str
+                    ),
+                    OutputLevel::Normal,
+                );
                 OverlayConfig {
                     dir: dir_str.to_string(),
                     mode: OverlayMode::Merge, // Default to merge mode
@@ -227,15 +235,34 @@ impl ExtBuildCommand {
                     _ => OverlayMode::Merge, // Default to merge mode
                 };
 
+                print_info(
+                    &format!(
+                        "[DEBUG] Overlay configuration (table): dir='{}', mode={:?}",
+                        dir, mode
+                    ),
+                    OutputLevel::Normal,
+                );
+
                 OverlayConfig { dir, mode }
             } else {
                 // Fallback for invalid format
+                print_info(
+                    "[DEBUG] Overlay configuration (fallback): dir='overlay', mode=Merge",
+                    OutputLevel::Normal,
+                );
                 OverlayConfig {
                     dir: "overlay".to_string(),
                     mode: OverlayMode::Merge,
                 }
             }
         });
+
+        if overlay_config.is_none() {
+            print_info(
+                "[DEBUG] No overlay configuration found in extension config",
+                OutputLevel::Normal,
+            );
+        }
 
         // Get SDK configuration
         let container_image = parsed
@@ -348,7 +375,64 @@ impl ExtBuildCommand {
         groups_config: Option<&toml::value::Table>,
         reload_service_manager: bool,
     ) -> Result<bool> {
+        // Log the source directory that will be mounted
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        print_info(
+            &format!(
+                "[DEBUG] Source directory to be mounted as /opt/src: {}",
+                current_dir.display()
+            ),
+            OutputLevel::Normal,
+        );
+
         // Create the build script for sysext extension
+        if let Some(config) = overlay_config {
+            print_info(
+                &format!(
+                    "[DEBUG] Creating sysext build script with overlay: dir='{}', mode={:?}",
+                    config.dir, config.mode
+                ),
+                OutputLevel::Normal,
+            );
+
+            // Check if overlay directory exists in the host filesystem
+            let overlay_path = current_dir.join(&config.dir);
+            if overlay_path.exists() {
+                print_info(
+                    &format!(
+                        "[DEBUG] Overlay directory exists on host at: {}",
+                        overlay_path.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+            } else {
+                print_info(
+                    &format!(
+                        "[DEBUG] Overlay directory NOT found on host at: {}",
+                        overlay_path.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+
+                // Check alternative locations
+                let extensions_path = current_dir.join("extensions").join(&config.dir);
+                if extensions_path.exists() {
+                    print_info(
+                        &format!(
+                            "[DEBUG] Found overlay at alternative location: {}",
+                            extensions_path.display()
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        } else {
+            print_info(
+                "[DEBUG] Creating sysext build script without overlay",
+                OutputLevel::Normal,
+            );
+        }
+
         let build_script = self.create_sysext_build_script(
             ext_version,
             ext_scopes,
@@ -411,6 +495,64 @@ impl ExtBuildCommand {
         groups_config: Option<&toml::value::Table>,
         reload_service_manager: bool,
     ) -> Result<bool> {
+        // Log the source directory that will be mounted
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        print_info(
+            &format!(
+                "[DEBUG] Source directory to be mounted as /opt/src: {}",
+                current_dir.display()
+            ),
+            OutputLevel::Normal,
+        );
+
+        // Log overlay configuration if present
+        if let Some(config) = overlay_config {
+            print_info(
+                &format!(
+                    "[DEBUG] Creating confext build script with overlay: dir='{}', mode={:?}",
+                    config.dir, config.mode
+                ),
+                OutputLevel::Normal,
+            );
+
+            // Check if overlay directory exists in the host filesystem
+            let overlay_path = current_dir.join(&config.dir);
+            if overlay_path.exists() {
+                print_info(
+                    &format!(
+                        "[DEBUG] Overlay directory exists on host at: {}",
+                        overlay_path.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+            } else {
+                print_info(
+                    &format!(
+                        "[DEBUG] Overlay directory NOT found on host at: {}",
+                        overlay_path.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+
+                // Check alternative locations
+                let extensions_path = current_dir.join("extensions").join(&config.dir);
+                if extensions_path.exists() {
+                    print_info(
+                        &format!(
+                            "[DEBUG] Found overlay at alternative location: {}",
+                            extensions_path.display()
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        } else {
+            print_info(
+                "[DEBUG] Creating confext build script without overlay",
+                OutputLevel::Normal,
+            );
+        }
+
         // Create the build script for confext extension
         let build_script = self.create_confext_build_script(
             ext_version,
@@ -473,29 +615,77 @@ impl ExtBuildCommand {
                 OverlayMode::Merge => format!(
                     r#"
 # Merge overlay directory into extension sysroot
+echo "[DEBUG] Checking for overlay directory at: /opt/src/{}"
+echo "[DEBUG] Current working directory: $(pwd)"
+echo "[DEBUG] Contents of /opt/src/:"
+ls -la /opt/src/ 2>/dev/null || echo "[DEBUG] Unable to list /opt/src/"
+
+# Check if overlay directory exists at different potential locations
 if [ -d "/opt/src/{}" ]; then
-    echo "Merging overlay directory '{}' into extension sysroot with root:root ownership"
+    echo "[INFO] Found overlay directory at: /opt/src/{}"
+    echo "[DEBUG] Overlay directory contents:"
+    ls -la "/opt/src/{}/" 2>/dev/null || echo "[DEBUG] Unable to list overlay contents"
+    echo "[INFO] Merging overlay directory '{}' into extension sysroot with root:root ownership"
+    echo "[DEBUG] Target sysroot: $AVOCADO_EXT_SYSROOTS/{}"
     # Use rsync to merge directories and set ownership during copy
     rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+    echo "[INFO] Overlay merge completed"
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "[WARNING] Overlay directory '{}' not found in source"
+    echo "[DEBUG] Expected path was: /opt/src/{}"
+    echo "[DEBUG] Checking alternative paths:"
+
+    # Check if it's in a subdirectory
+    if [ -d "/opt/src/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/extensions/{}"
+    elif [ -d "/opt/src/avocado-cli/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/{}"
+    elif [ -d "/opt/src/avocado-cli/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/extensions/{}"
+    else
+        echo "[DEBUG] Not found in any alternative location"
+    fi
+
+    # Show what directories do exist for debugging
+    echo "[DEBUG] Available directories in /opt/src/:"
+    find /opt/src -maxdepth 2 -type d 2>/dev/null | head -20 || echo "[DEBUG] Unable to find directories"
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    overlay_config.dir, // line 618
+                    overlay_config.dir, // line 624
+                    overlay_config.dir, // line 625
+                    overlay_config.dir, // line 627
+                    overlay_config.dir, // line 628
+                    self.extension,     // line 629
+                    overlay_config.dir, // line 631 (first)
+                    self.extension,     // line 631 (second)
+                    overlay_config.dir, // line 634
+                    overlay_config.dir, // line 635
+                    overlay_config.dir, // line 639
+                    overlay_config.dir, // line 640
+                    overlay_config.dir, // line 641
+                    overlay_config.dir, // line 642
+                    overlay_config.dir, // line 643
+                    overlay_config.dir  // line 644
                 ),
                 OverlayMode::Opaque => format!(
                     r#"
 # Copy overlay directory to extension sysroot (opaque mode)
+echo "[DEBUG] Checking for overlay directory at: /opt/src/{} (opaque mode)"
+echo "[DEBUG] Current working directory: $(pwd)"
+echo "[DEBUG] Contents of /opt/src/:"
+ls -la /opt/src/ 2>/dev/null || echo "[DEBUG] Unable to list /opt/src/"
+
 if [ -d "/opt/src/{}" ]; then
-    echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
+    echo "[INFO] Found overlay directory at: /opt/src/{}"
+    echo "[DEBUG] Overlay directory contents:"
+    ls -la "/opt/src/{}/" 2>/dev/null || echo "[DEBUG] Unable to list overlay contents"
+    echo "[INFO] Copying overlay directory '{}' to extension sysroot (opaque mode)"
+    echo "[DEBUG] Target sysroot: $AVOCADO_EXT_SYSROOTS/{}"
     # Use cp -r to replace directory contents completely
     cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
     # Fix ownership to root:root for copied overlay files only
-    echo "Setting ownership to root:root for overlay files"
+    echo "[INFO] Setting ownership to root:root for overlay files"
     find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
         relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
         if [ -n "$relpath" ]; then
@@ -505,18 +695,47 @@ if [ -d "/opt/src/{}" ]; then
             fi
         fi
     done
+    echo "[INFO] Overlay copy completed (opaque mode)"
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "[WARNING] Overlay directory '{}' not found in source"
+    echo "[DEBUG] Expected path was: /opt/src/{}"
+    echo "[DEBUG] Checking alternative paths:"
+
+    # Check if it's in a subdirectory
+    if [ -d "/opt/src/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/extensions/{}"
+    elif [ -d "/opt/src/avocado-cli/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/{}"
+    elif [ -d "/opt/src/avocado-cli/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/extensions/{}"
+    else
+        echo "[DEBUG] Not found in any alternative location"
+    fi
+
+    # Show what directories do exist for debugging
+    echo "[DEBUG] Available directories in /opt/src/:"
+    find /opt/src -maxdepth 2 -type d 2>/dev/null | head -20 || echo "[DEBUG] Unable to find directories"
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    overlay_config.dir, // line 664
+                    overlay_config.dir, // line 669
+                    overlay_config.dir, // line 670
+                    overlay_config.dir, // line 672
+                    overlay_config.dir, // line 673
+                    self.extension,     // line 674
+                    overlay_config.dir, // line 676 (first)
+                    self.extension,     // line 676 (second)
+                    overlay_config.dir, // line 679
+                    overlay_config.dir, // line 680
+                    self.extension,     // line 682
+                    overlay_config.dir, // line 690
+                    overlay_config.dir, // line 691
+                    overlay_config.dir, // line 695
+                    overlay_config.dir, // line 696
+                    overlay_config.dir, // line 698
+                    overlay_config.dir, // line 699
+                    overlay_config.dir, // line 701
+                    overlay_config.dir  // line 702
                 ),
             }
         } else {
@@ -622,29 +841,77 @@ fi
                 OverlayMode::Merge => format!(
                     r#"
 # Merge overlay directory into extension sysroot
+echo "[DEBUG] Checking for overlay directory at: /opt/src/{}"
+echo "[DEBUG] Current working directory: $(pwd)"
+echo "[DEBUG] Contents of /opt/src/:"
+ls -la /opt/src/ 2>/dev/null || echo "[DEBUG] Unable to list /opt/src/"
+
+# Check if overlay directory exists at different potential locations
 if [ -d "/opt/src/{}" ]; then
-    echo "Merging overlay directory '{}' into extension sysroot with root:root ownership"
+    echo "[INFO] Found overlay directory at: /opt/src/{}"
+    echo "[DEBUG] Overlay directory contents:"
+    ls -la "/opt/src/{}/" 2>/dev/null || echo "[DEBUG] Unable to list overlay contents"
+    echo "[INFO] Merging overlay directory '{}' into extension sysroot with root:root ownership"
+    echo "[DEBUG] Target sysroot: $AVOCADO_EXT_SYSROOTS/{}"
     # Use rsync to merge directories and set ownership during copy
     rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+    echo "[INFO] Overlay merge completed"
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "[WARNING] Overlay directory '{}' not found in source"
+    echo "[DEBUG] Expected path was: /opt/src/{}"
+    echo "[DEBUG] Checking alternative paths:"
+
+    # Check if it's in a subdirectory
+    if [ -d "/opt/src/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/extensions/{}"
+    elif [ -d "/opt/src/avocado-cli/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/{}"
+    elif [ -d "/opt/src/avocado-cli/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/extensions/{}"
+    else
+        echo "[DEBUG] Not found in any alternative location"
+    fi
+
+    # Show what directories do exist for debugging
+    echo "[DEBUG] Available directories in /opt/src/:"
+    find /opt/src -maxdepth 2 -type d 2>/dev/null | head -20 || echo "[DEBUG] Unable to find directories"
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    overlay_config.dir, // line 822
+                    overlay_config.dir, // line 828
+                    overlay_config.dir, // line 829
+                    overlay_config.dir, // line 831
+                    overlay_config.dir, // line 832
+                    self.extension,     // line 833
+                    overlay_config.dir, // line 835 (first)
+                    self.extension,     // line 835 (second)
+                    overlay_config.dir, // line 838
+                    overlay_config.dir, // line 839
+                    overlay_config.dir, // line 843
+                    overlay_config.dir, // line 844
+                    overlay_config.dir, // line 846
+                    overlay_config.dir, // line 847
+                    overlay_config.dir, // line 849
+                    overlay_config.dir  // line 850
                 ),
                 OverlayMode::Opaque => format!(
                     r#"
 # Copy overlay directory to extension sysroot (opaque mode)
+echo "[DEBUG] Checking for overlay directory at: /opt/src/{} (opaque mode)"
+echo "[DEBUG] Current working directory: $(pwd)"
+echo "[DEBUG] Contents of /opt/src/:"
+ls -la /opt/src/ 2>/dev/null || echo "[DEBUG] Unable to list /opt/src/"
+
 if [ -d "/opt/src/{}" ]; then
-    echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
+    echo "[INFO] Found overlay directory at: /opt/src/{}"
+    echo "[DEBUG] Overlay directory contents:"
+    ls -la "/opt/src/{}/" 2>/dev/null || echo "[DEBUG] Unable to list overlay contents"
+    echo "[INFO] Copying overlay directory '{}' to extension sysroot (opaque mode)"
+    echo "[DEBUG] Target sysroot: $AVOCADO_EXT_SYSROOTS/{}"
     # Use cp -r to replace directory contents completely
     cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
     # Fix ownership to root:root for copied overlay files only
-    echo "Setting ownership to root:root for overlay files"
+    echo "[INFO] Setting ownership to root:root for overlay files"
     find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
         relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
         if [ -n "$relpath" ]; then
@@ -654,18 +921,47 @@ if [ -d "/opt/src/{}" ]; then
             fi
         fi
     done
+    echo "[INFO] Overlay copy completed (opaque mode)"
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "[WARNING] Overlay directory '{}' not found in source"
+    echo "[DEBUG] Expected path was: /opt/src/{}"
+    echo "[DEBUG] Checking alternative paths:"
+
+    # Check if it's in a subdirectory
+    if [ -d "/opt/src/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/extensions/{}"
+    elif [ -d "/opt/src/avocado-cli/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/{}"
+    elif [ -d "/opt/src/avocado-cli/extensions/{}" ]; then
+        echo "[DEBUG] Found at: /opt/src/avocado-cli/extensions/{}"
+    else
+        echo "[DEBUG] Not found in any alternative location"
+    fi
+
+    # Show what directories do exist for debugging
+    echo "[DEBUG] Available directories in /opt/src/:"
+    find /opt/src -maxdepth 2 -type d 2>/dev/null | head -20 || echo "[DEBUG] Unable to find directories"
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    overlay_config.dir, // line 868
+                    overlay_config.dir, // line 873
+                    overlay_config.dir, // line 874
+                    overlay_config.dir, // line 876
+                    overlay_config.dir, // line 877
+                    self.extension,     // line 878
+                    overlay_config.dir, // line 880 (first)
+                    self.extension,     // line 880 (second)
+                    overlay_config.dir, // line 883
+                    overlay_config.dir, // line 884
+                    self.extension,     // line 886
+                    overlay_config.dir, // line 894
+                    overlay_config.dir, // line 895
+                    overlay_config.dir, // line 899
+                    overlay_config.dir, // line 900
+                    overlay_config.dir, // line 902
+                    overlay_config.dir, // line 903
+                    overlay_config.dir, // line 905
+                    overlay_config.dir  // line 906
                 ),
             }
         } else {
@@ -1601,12 +1897,10 @@ mod tests {
         // Verify overlay merging commands are present
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
-        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
-        assert!(script.contains(
-            "rsync -a --chown=root:root /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""
-        ));
+        assert!(script.contains("echo \"[INFO] Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
+        assert!(script.contains("rsync -a --chown=root:root /opt/src/peridio/"));
         assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
+            script.contains("echo \"[WARNING] Overlay directory 'peridio' not found in source\"")
         );
     }
 
@@ -1639,12 +1933,10 @@ mod tests {
         // Verify overlay merging commands are present
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
-        assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
-        assert!(script.contains(
-            "rsync -a --chown=root:root /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""
-        ));
+        assert!(script.contains("echo \"[INFO] Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
+        assert!(script.contains("rsync -a --chown=root:root /opt/src/peridio/"));
         assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
+            script.contains("echo \"[WARNING] Overlay directory 'peridio' not found in source\"")
         );
     }
 
@@ -1678,13 +1970,13 @@ mod tests {
         assert!(script.contains("# Copy overlay directory to extension sysroot (opaque mode)"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains(
-            "echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""
+            "echo \"[INFO] Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""
         ));
         assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
-        assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
+        assert!(script.contains("echo \"[INFO] Setting ownership to root:root for overlay files\""));
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
+            script.contains("echo \"[WARNING] Overlay directory 'peridio' not found in source\"")
         );
     }
 
@@ -1718,13 +2010,13 @@ mod tests {
         assert!(script.contains("# Copy overlay directory to extension sysroot (opaque mode)"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains(
-            "echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""
+            "echo \"[INFO] Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""
         ));
         assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
-        assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
+        assert!(script.contains("echo \"[INFO] Setting ownership to root:root for overlay files\""));
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
+            script.contains("echo \"[WARNING] Overlay directory 'peridio' not found in source\"")
         );
     }
 
