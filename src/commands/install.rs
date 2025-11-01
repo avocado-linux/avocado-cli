@@ -554,6 +554,7 @@ impl InstallCommand {
             repo_release: repo_release.clone(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             ..Default::default()
         };
         let sysroot_exists = container_helper.run_in_container(run_config).await?;
@@ -574,6 +575,7 @@ impl InstallCommand {
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(run_config).await?;
@@ -695,6 +697,7 @@ $DNF_SDK_HOST \
                         repo_release,
                         container_args: merged_container_args,
                         dnf_args: self.dnf_args.clone(),
+                        disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                         ..Default::default()
                     };
 
@@ -756,6 +759,7 @@ $DNF_SDK_HOST \
             repo_release: repo_release.clone(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             ..Default::default()
         };
         let sysroot_exists = container_helper.run_in_container(run_config).await?;
@@ -775,6 +779,7 @@ $DNF_SDK_HOST \
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(run_config).await?;
@@ -808,6 +813,8 @@ $DNF_SDK_HOST \
             String::new()
         };
 
+        // Always disable weak dependencies for versioned extensions since they're pre-built
+        // and need to be installed exactly as specified without pulling in recommends
         let install_command = format!(
             r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
@@ -844,6 +851,7 @@ $DNF_SDK_HOST \
             repo_release,
             container_args: merged_container_args,
             dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             ..Default::default()
         };
 

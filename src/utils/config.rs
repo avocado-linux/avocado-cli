@@ -44,6 +44,7 @@ pub struct SdkConfig {
     pub repo_url: Option<String>,
     pub repo_release: Option<String>,
     pub container_args: Option<Vec<String>>,
+    pub disable_weak_dependencies: Option<bool>,
 }
 
 /// Compile configuration for SDK
@@ -328,6 +329,15 @@ impl Config {
     /// Get the SDK container args from configuration
     pub fn get_sdk_container_args(&self) -> Option<&Vec<String>> {
         self.sdk.as_ref()?.container_args.as_ref()
+    }
+
+    /// Get the disable_weak_dependencies setting from SDK configuration
+    /// Returns the configured value or false (enable weak deps) if not set
+    pub fn get_sdk_disable_weak_dependencies(&self) -> bool {
+        self.sdk
+            .as_ref()
+            .and_then(|sdk| sdk.disable_weak_dependencies)
+            .unwrap_or(false) // Default to false (enable weak dependencies)
     }
 
     /// Get provision profile configuration

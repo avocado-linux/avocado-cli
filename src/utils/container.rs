@@ -31,6 +31,7 @@ pub struct RunConfig {
     pub extension_sysroot: Option<String>,
     pub runtime_sysroot: Option<String>,
     pub no_bootstrap: bool,
+    pub disable_weak_dependencies: bool,
 }
 
 impl Default for RunConfig {
@@ -54,6 +55,7 @@ impl Default for RunConfig {
             extension_sysroot: None,
             runtime_sysroot: None,
             no_bootstrap: false,
+            disable_weak_dependencies: false,
         }
     }
 }
@@ -160,6 +162,7 @@ impl SdkContainer {
                 config.runtime_sysroot.as_deref(),
                 &config.target,
                 config.no_bootstrap,
+                config.disable_weak_dependencies,
             ));
             full_command.push('\n');
         }
@@ -325,8 +328,17 @@ impl SdkContainer {
         runtime_sysroot: Option<&str>,
         target: &str,
         no_bootstrap: bool,
+        disable_weak_dependencies: bool,
     ) -> String {
-        let mut script = r#"
+        // Conditionally add install_weak_deps flag
+        let weak_deps_flag = if disable_weak_dependencies {
+            "--setopt=install_weak_deps=0 \\\n"
+        } else {
+            ""
+        };
+
+        let mut script = format!(
+            r#"
 set -e
 
 # Get repo url from environment or default to prod
@@ -348,57 +360,57 @@ else
     if [ -f /etc/os-release ]; then
         REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
     fi
-    REPO_RELEASE=${REPO_RELEASE:-dev}
+    REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
 
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
 
-export AVOCADO_PREFIX="/opt/_avocado/${AVOCADO_TARGET}"
-export AVOCADO_SDK_PREFIX="${AVOCADO_PREFIX}/sdk"
-export AVOCADO_EXT_SYSROOTS="${AVOCADO_PREFIX}/extensions"
-export DNF_SDK_HOST_PREFIX="${AVOCADO_SDK_PREFIX}"
-export DNF_SDK_TARGET_PREFIX="${AVOCADO_SDK_PREFIX}/target-repoconf"
+export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
+export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk"
+export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
+export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
+export DNF_SDK_TARGET_PREFIX="${{AVOCADO_SDK_PREFIX}}/target-repoconf"
 export DNF_SDK_HOST="\
 dnf \
 --releasever="$REPO_RELEASE" \
 --best \
---setopt=install_weak_deps=0 \
---setopt=check_config_file_age=0 \
-${AVOCADO_DNF_ARGS:-} \
+{weak_deps_flag}--setopt=check_config_file_age=0 \
+${{AVOCADO_DNF_ARGS:-}} \
 "
 
 export DNF_NO_SCRIPTS="--setopt=tsflags=noscripts"
 
 export DNF_SDK_HOST_OPTS="\
---setopt=cachedir=${DNF_SDK_HOST_PREFIX}/var/cache \
---setopt=logdir=${DNF_SDK_HOST_PREFIX}/var/log \
---setopt=persistdir=${DNF_SDK_HOST_PREFIX}/var/lib/dnf
+--setopt=cachedir=${{DNF_SDK_HOST_PREFIX}}/var/cache \
+--setopt=logdir=${{DNF_SDK_HOST_PREFIX}}/var/log \
+--setopt=persistdir=${{DNF_SDK_HOST_PREFIX}}/var/lib/dnf
 "
 
 export DNF_SDK_HOST_REPO_CONF="\
---setopt=varsdir=${DNF_SDK_HOST_PREFIX}/etc/dnf/vars \
---setopt=reposdir=${DNF_SDK_HOST_PREFIX}/etc/yum.repos.d \
+--setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d \
 "
 
 export DNF_SDK_REPO_CONF="\
---setopt=varsdir=${DNF_SDK_HOST_PREFIX}/etc/dnf/vars \
---setopt=reposdir=${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d \
+--setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
 "
 
 export DNF_SDK_TARGET_REPO_CONF="\
---setopt=varsdir=${DNF_SDK_TARGET_PREFIX}/etc/dnf/vars \
---setopt=reposdir=${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d \
+--setopt=varsdir=${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
 "
 
 mkdir -p /etc/dnf/vars
-mkdir -p ${AVOCADO_SDK_PREFIX}/etc/dnf/vars
-mkdir -p ${AVOCADO_SDK_PREFIX}/target-repoconf/etc/dnf/vars
+mkdir -p ${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars
+mkdir -p ${{AVOCADO_SDK_PREFIX}}/target-repoconf/etc/dnf/vars
 
-echo "${REPO_URL}" > /etc/dnf/vars/repo_url
-echo "${REPO_URL}" > ${DNF_SDK_HOST_PREFIX}/etc/dnf/vars/repo_url
-echo "${REPO_URL}" > ${DNF_SDK_TARGET_PREFIX}/etc/dnf/vars/repo_url
-"#
-        .to_string();
+echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
+echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url
+echo "${{REPO_URL}}" > ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars/repo_url
+"#,
+            weak_deps_flag = weak_deps_flag
+        );
 
         // Only include bootstrap logic if no_bootstrap is false
         if !no_bootstrap {
@@ -586,7 +598,7 @@ mod tests {
     #[test]
     fn test_entrypoint_script() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, None, None, "x86_64", false);
+        let script = container.create_entrypoint_script(true, None, None, "x86_64", false, false);
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
@@ -596,8 +608,14 @@ mod tests {
     #[test]
     fn test_entrypoint_script_with_extension_sysroot() {
         let container = SdkContainer::new();
-        let script =
-            container.create_entrypoint_script(true, Some("test-ext"), None, "x86_64", false);
+        let script = container.create_entrypoint_script(
+            true,
+            Some("test-ext"),
+            None,
+            "x86_64",
+            false,
+            false,
+        );
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/extensions/test-ext"));
         assert!(!script.contains("cd /opt/src"));
@@ -606,8 +624,14 @@ mod tests {
     #[test]
     fn test_entrypoint_script_with_runtime_sysroot() {
         let container = SdkContainer::new();
-        let script =
-            container.create_entrypoint_script(true, None, Some("test-runtime"), "x86_64", false);
+        let script = container.create_entrypoint_script(
+            true,
+            None,
+            Some("test-runtime"),
+            "x86_64",
+            false,
+            false,
+        );
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/runtimes/test-runtime"));
         assert!(!script.contains("cd /opt/src"));
@@ -616,7 +640,7 @@ mod tests {
     #[test]
     fn test_entrypoint_script_no_bootstrap() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, None, None, "x86_64", true);
+        let script = container.create_entrypoint_script(true, None, None, "x86_64", true, false);
 
         // Should still contain environment variables
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
