@@ -478,7 +478,8 @@ if [ -d "/opt/src/{}" ]; then
     # Use rsync to merge directories and set ownership during copy
     rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{}' not found in source"
+    exit 1
 fi
 "#,
                     overlay_config.dir,
@@ -506,7 +507,8 @@ if [ -d "/opt/src/{}" ]; then
         fi
     done
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{}' not found in source"
+    exit 1
 fi
 "#,
                     overlay_config.dir,
@@ -627,7 +629,8 @@ if [ -d "/opt/src/{}" ]; then
     # Use rsync to merge directories and set ownership during copy
     rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{}' not found in source"
+    exit 1
 fi
 "#,
                     overlay_config.dir,
@@ -655,7 +658,8 @@ if [ -d "/opt/src/{}" ]; then
         fi
     done
 else
-    echo "Warning: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{}' not found in source"
+    exit 1
 fi
 "#,
                     overlay_config.dir,
@@ -1604,9 +1608,8 @@ mod tests {
         assert!(script.contains(
             "rsync -a --chown=root:root /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""
         ));
-        assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
-        );
+        assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
+        assert!(script.contains("exit 1"));
     }
 
     #[test]
@@ -1642,9 +1645,8 @@ mod tests {
         assert!(script.contains(
             "rsync -a --chown=root:root /opt/src/peridio/ \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""
         ));
-        assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
-        );
+        assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
+        assert!(script.contains("exit 1"));
     }
 
     #[test]
@@ -1682,9 +1684,8 @@ mod tests {
         assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
         assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
-        assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
-        );
+        assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
+        assert!(script.contains("exit 1"));
     }
 
     #[test]
@@ -1722,9 +1723,8 @@ mod tests {
         assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
         assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
-        assert!(
-            script.contains("echo \"Warning: Overlay directory 'peridio' not found in source\"")
-        );
+        assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
+        assert!(script.contains("exit 1"));
     }
 
     #[test]
