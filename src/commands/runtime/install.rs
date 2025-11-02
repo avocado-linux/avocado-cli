@@ -337,6 +337,7 @@ $DNF_SDK_HOST \
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
+                    disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                     ..Default::default()
                 };
                 let success = container_helper.run_in_container(run_config).await?;

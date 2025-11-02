@@ -163,6 +163,7 @@ impl ExtInstallCommand {
                     repo_url.as_ref(),
                     repo_release.as_ref(),
                     &merged_container_args,
+                    config.get_sdk_disable_weak_dependencies(),
                 )
                 .await?
             {
@@ -194,6 +195,7 @@ impl ExtInstallCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
+        disable_weak_dependencies: bool,
     ) -> Result<bool> {
         // Create the commands to check and set up the directory structure
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
@@ -400,6 +402,7 @@ $DNF_SDK_HOST \
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
+                    disable_weak_dependencies,
                     ..Default::default()
                 };
                 let install_success = container_helper.run_in_container(run_config).await?;

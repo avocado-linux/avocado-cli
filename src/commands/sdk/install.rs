@@ -139,7 +139,7 @@ $DNF_SDK_HOST \
             );
 
             // Use the container helper's run_in_container method
-            let config = RunConfig {
+            let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target.clone(),
                 command,
@@ -150,9 +150,10 @@ $DNF_SDK_HOST \
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 ..Default::default()
             };
-            let install_success = container_helper.run_in_container(config).await?;
+            let install_success = container_helper.run_in_container(run_config).await?;
 
             if install_success {
                 print_success("Installed SDK dependencies.", OutputLevel::Normal);
@@ -208,7 +209,7 @@ $DNF_SDK_HOST \
                     );
 
                     // Use the container helper's run_in_container method with target-dev installroot
-                    let config = RunConfig {
+                    let run_config = RunConfig {
                         container_image: container_image.to_string(),
                         target: target.clone(),
                         command,
@@ -219,9 +220,10 @@ $DNF_SDK_HOST \
                         repo_release: repo_release.clone(),
                         container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
+                        disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                         ..Default::default()
                     };
-                    let install_success = container_helper.run_in_container(config).await?;
+                    let install_success = container_helper.run_in_container(run_config).await?;
 
                     if !install_success {
                         return Err(anyhow::anyhow!(
