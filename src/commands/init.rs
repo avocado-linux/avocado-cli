@@ -181,9 +181,7 @@ impl InitCommand {
         })?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Reference '{reference_name}' does not contain an avocado.toml file"
-            );
+            anyhow::bail!("Reference '{reference_name}' does not contain an avocado.toml file");
         }
 
         let content: GitHubContent = response
@@ -373,6 +371,57 @@ impl InitCommand {
         })
     }
 
+    /// Creates a .gitignore file with Avocado-specific entries.
+    ///
+    /// # Arguments
+    /// * `directory` - The directory to create the .gitignore file in
+    ///
+    /// # Returns
+    /// * `Ok(())` if successful
+    /// * `Err` if the file cannot be written
+    fn create_gitignore(directory: &str) -> Result<()> {
+        let gitignore_path = Path::new(directory).join(".gitignore");
+
+        // Don't overwrite existing .gitignore files
+        if gitignore_path.exists() {
+            // Read existing content
+            let existing_content = fs::read_to_string(&gitignore_path).with_context(|| {
+                format!("Failed to read existing '{}'", gitignore_path.display())
+            })?;
+
+            // Check if .avocado-state is already in the .gitignore
+            if !existing_content.contains(".avocado-state") {
+                // Append to existing .gitignore
+                let mut updated_content = existing_content;
+                if !updated_content.ends_with('\n') {
+                    updated_content.push('\n');
+                }
+                updated_content.push_str("\n# Avocado state files\n.avocado-state\n");
+
+                fs::write(&gitignore_path, updated_content)
+                    .with_context(|| format!("Failed to update '{}'", gitignore_path.display()))?;
+
+                println!("✓ Updated .gitignore to ignore .avocado-state files.");
+            }
+
+            return Ok(());
+        }
+
+        // Create new .gitignore with Avocado-specific entries
+        let gitignore_content = "# Avocado state files\n.avocado-state\n";
+
+        fs::write(&gitignore_path, gitignore_content).with_context(|| {
+            format!(
+                "Failed to write .gitignore file '{}'",
+                gitignore_path.display()
+            )
+        })?;
+
+        println!("✓ Created .gitignore file.");
+
+        Ok(())
+    }
+
     /// Executes the init command, creating the avocado.toml configuration file.
     ///
     /// # Returns
@@ -411,9 +460,7 @@ impl InitCommand {
 
             // If both reference and target are specified, validate target support
             if let Some(target) = &self.target {
-                println!(
-                    "Validating target '{target}' is supported by reference '{ref_name}'..."
-                );
+                println!("Validating target '{target}' is supported by reference '{ref_name}'...");
 
                 // Download and parse the reference's avocado.toml
                 let toml_content = Self::download_reference_config(ref_name).await?;
@@ -426,9 +473,7 @@ impl InitCommand {
                     );
                 }
 
-                println!(
-                    "✓ Target '{target}' is supported by reference '{ref_name}'."
-                );
+                println!("✓ Target '{target}' is supported by reference '{ref_name}'.");
             }
 
             // Download all contents from the reference
@@ -489,6 +534,9 @@ impl InitCommand {
                     .display()
             );
         }
+
+        // Create .gitignore file (for both reference and non-reference paths)
+        Self::create_gitignore(directory)?;
 
         Ok(())
     }
@@ -579,5 +627,61 @@ mod tests {
 
         let config_path = new_dir_path.join("avocado.toml");
         assert!(config_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_init_creates_gitignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let result = init_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        let gitignore_path = PathBuf::from(temp_path).join(".gitignore");
+        assert!(gitignore_path.exists());
+
+        let content = fs::read_to_string(&gitignore_path).unwrap();
+        assert!(content.contains(".avocado-state"));
+    }
+
+    #[tokio::test]
+    async fn test_init_updates_existing_gitignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+        let gitignore_path = PathBuf::from(temp_path).join(".gitignore");
+
+        // Create existing .gitignore with some content
+        fs::write(&gitignore_path, "*.log\n").unwrap();
+
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let result = init_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        let content = fs::read_to_string(&gitignore_path).unwrap();
+        assert!(content.contains("*.log")); // Original content preserved
+        assert!(content.contains(".avocado-state")); // New content added
+    }
+
+    #[tokio::test]
+    async fn test_init_does_not_duplicate_gitignore_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+        let gitignore_path = PathBuf::from(temp_path).join(".gitignore");
+
+        // Create existing .gitignore with .avocado-state already in it
+        fs::write(&gitignore_path, "*.log\n.avocado-state\n").unwrap();
+
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let result = init_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        let content = fs::read_to_string(&gitignore_path).unwrap();
+        // Count occurrences of .avocado-state - should be exactly 1
+        let count = content.matches(".avocado-state").count();
+        assert_eq!(count, 1);
     }
 }
