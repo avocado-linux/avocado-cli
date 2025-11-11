@@ -408,8 +408,7 @@ mkdir -p ${{AVOCADO_SDK_PREFIX}}/target-repoconf/etc/dnf/vars
 echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars/repo_url
-"#,
-            weak_deps_flag = weak_deps_flag
+"#
         );
 
         // Only include bootstrap logic if no_bootstrap is false

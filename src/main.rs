@@ -59,6 +59,9 @@ enum Commands {
         /// Target architecture (e.g., "qemux86-64")
         #[arg(long)]
         target: Option<String>,
+        /// Reference example to initialize from (downloads from avocado-os/references)
+        #[arg(long)]
+        reference: Option<String>,
     },
     /// Runtime management commands
     Runtime {
@@ -574,9 +577,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { directory, target } => {
-            let init_cmd = InitCommand::new(target.or(cli.target), directory);
-            init_cmd.execute()?;
+        Commands::Init {
+            directory,
+            target,
+            reference,
+        } => {
+            let init_cmd = InitCommand::new(target.or(cli.target), directory, reference);
+            init_cmd.execute().await?;
             Ok(())
         }
         Commands::Clean {
