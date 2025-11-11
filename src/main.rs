@@ -902,7 +902,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 extension,
-                target: _,
+                target,
                 ext_path,
                 src_path,
                 container_tool,
@@ -914,6 +914,7 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     container_tool,
+                    target.or(cli.target),
                 );
                 checkout_cmd.execute().await?;
                 Ok(())

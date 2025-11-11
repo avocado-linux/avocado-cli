@@ -12,6 +12,7 @@ pub struct ExtCheckoutCommand {
     config_path: String,
     verbose: bool,
     container_tool: String,
+    target: Option<String>,
 }
 
 impl ExtCheckoutCommand {
@@ -22,6 +23,7 @@ impl ExtCheckoutCommand {
         config_path: String,
         verbose: bool,
         container_tool: String,
+        target: Option<String>,
     ) -> Self {
         Self {
             extension,
@@ -30,6 +32,7 @@ impl ExtCheckoutCommand {
             config_path,
             verbose,
             container_tool,
+            target,
         }
     }
 
@@ -60,7 +63,7 @@ impl ExtCheckoutCommand {
         }
 
         // Get target from config to determine the extension sysroot path
-        let target = self.get_target_from_config(&cwd)?;
+        let target = self.resolve_target(&cwd, &volume_state.volume_name).await?;
         let ext_sysroot_path = format!("/opt/_avocado/{}/extensions/{}", target, self.extension);
         let full_ext_path = if self.ext_path.starts_with('/') {
             format!("{}{}", ext_sysroot_path, self.ext_path)
@@ -133,6 +136,91 @@ impl ExtCheckoutCommand {
         );
 
         Ok(())
+    }
+
+    async fn resolve_target(&self, cwd: &Path, volume_name: &str) -> Result<String> {
+        // Strategy 1: Use CLI-provided target
+        if let Some(ref target) = self.target {
+            if self.verbose {
+                print_info(
+                    &format!("Using target from CLI: {target}"),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(target.clone());
+        }
+
+        // Strategy 2: Try to get target from config file
+        if let Ok(target) = self.get_target_from_config(cwd) {
+            if self.verbose {
+                print_info(
+                    &format!("Using target from config: {target}"),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(target);
+        }
+
+        // Strategy 3: Discover available targets from the volume
+        if self.verbose {
+            print_info(
+                "No target in config, discovering from volume...",
+                OutputLevel::Normal,
+            );
+        }
+
+        let available_targets = self.discover_targets_from_volume(volume_name).await?;
+
+        if available_targets.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No targets found in volume. Please specify a target with --target or configure a runtime in your config file."
+            ));
+        }
+
+        if available_targets.len() == 1 {
+            let target = available_targets[0].clone();
+            if self.verbose {
+                print_info(
+                    &format!("Auto-detected target from volume: {target}"),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(target);
+        }
+
+        // Multiple targets available, need user to specify
+        Err(anyhow::anyhow!(
+            "Multiple targets found in volume: {}. Please specify one with --target",
+            available_targets.join(", ")
+        ))
+    }
+
+    async fn discover_targets_from_volume(&self, volume_name: &str) -> Result<Vec<String>> {
+        // List directories in /opt/_avocado/ to find available targets
+        let output = AsyncCommand::new(&self.container_tool)
+            .arg("run")
+            .arg("--rm")
+            .arg("-v")
+            .arg(format!("{volume_name}:/opt/_avocado:ro"))
+            .arg("alpine:latest")
+            .arg("sh")
+            .arg("-c")
+            .arg("ls -1 /opt/_avocado 2>/dev/null || true")
+            .output()
+            .await
+            .context("Failed to list targets in volume")?;
+
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        let targets: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .collect();
+
+        Ok(targets)
     }
 
     fn get_target_from_config(&self, cwd: &Path) -> Result<String> {
@@ -379,6 +467,7 @@ mod tests {
             "avocado.toml".to_string(),
             false,
             "docker".to_string(),
+            None,
         );
 
         assert_eq!(cmd.extension, "test-ext");
