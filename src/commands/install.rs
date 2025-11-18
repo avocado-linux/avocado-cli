@@ -662,10 +662,13 @@ impl InstallCommand {
                     };
                     let install_command = format!(
                         r#"
+RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+AVOCADO_EXT_INSTALLROOT={} \
+PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
-    $DNF_NO_SCRIPTS \
     --installroot={} \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
@@ -673,6 +676,7 @@ $DNF_SDK_HOST \
     {} \
     {}
 "#,
+                        installroot,
                         installroot,
                         dnf_args_str,
                         yes,
@@ -691,8 +695,8 @@ $DNF_SDK_HOST \
                         target: target.to_string(),
                         command: install_command,
                         verbose: self.verbose,
-                        source_environment: false, // don't source environment (same as regular extensions)
-                        interactive: !self.force, // interactive if not forced (same as regular extensions)
+                        source_environment: false, // don't source environment
+                        interactive: !self.force,  // interactive if not forced
                         repo_url,
                         repo_release,
                         container_args: merged_container_args,
@@ -820,8 +824,8 @@ $DNF_SDK_HOST \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
-    $DNF_SDK_TARGET_REPO_CONF \
     $DNF_NO_SCRIPTS \
+    $DNF_SDK_TARGET_REPO_CONF \
     --setopt=persistdir={installroot}/var/lib/extension.d/ \
     --installroot={installroot} \
     --enablerepo=${{AVOCADO_TARGET}}-target-ext \
