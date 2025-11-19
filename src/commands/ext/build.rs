@@ -206,6 +206,14 @@ impl ExtBuildCommand {
             .and_then(|v| v.as_str())
             .unwrap_or("0.1.0");
 
+        // Validate semver format
+        Self::validate_semver(ext_version).with_context(|| {
+            format!(
+                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
+                self.extension, ext_version
+            )
+        })?;
+
         // Get overlay configuration
         let overlay_config = ext_config.get("overlay").map(|v| {
             if let Some(dir_str) = v.as_str() {
@@ -459,7 +467,7 @@ impl ExtBuildCommand {
     #[allow(clippy::too_many_arguments)]
     fn create_sysext_build_script(
         &self,
-        _ext_version: &str,
+        ext_version: &str,
         ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
         modprobe_modules: &[String],
@@ -564,7 +572,7 @@ echo "[INFO] Added custom on_merge command to release file: {command}""#
 set -e
 {}{}
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/extension-release.d"
-release_file="$release_dir/extension-release.{}"
+release_file="$release_dir/extension-release.{}-{}"
 modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
 
 mkdir -p "$release_dir"
@@ -595,6 +603,7 @@ fi
             users_section,
             self.extension,
             self.extension,
+            ext_version,
             self.extension,
             if reload_service_manager { "1" } else { "0" },
             ext_scopes.join(" "),
@@ -610,7 +619,7 @@ fi
     #[allow(clippy::too_many_arguments)]
     fn create_confext_build_script(
         &self,
-        _ext_version: &str,
+        ext_version: &str,
         ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
         enable_services: &[String],
@@ -733,7 +742,7 @@ echo "[INFO] Added custom on_merge command to release file: {command}""#
 set -e
 {}{}
 release_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/extension-release.d"
-release_file="$release_dir/extension-release.{}"
+release_file="$release_dir/extension-release.{}-{}"
 
 mkdir -p "$release_dir"
 echo "ID=_any" > "$release_file"
@@ -762,6 +771,7 @@ fi
             users_section,
             self.extension,
             self.extension,
+            ext_version,
             if reload_service_manager { "1" } else { "0" },
             ext_scopes.join(" "),
             self.extension,
@@ -1345,6 +1355,38 @@ echo "Set proper permissions on authentication files""#,
 
         Ok(())
     }
+
+    /// Validate semantic versioning format (X.Y.Z where X, Y, Z are non-negative integers)
+    fn validate_semver(version: &str) -> Result<()> {
+        let parts: Vec<&str> = version.split('.').collect();
+
+        if parts.len() < 3 {
+            return Err(anyhow::anyhow!(
+                "Version must follow semantic versioning format with at least MAJOR.MINOR.PATCH components (e.g., '1.0.0', '2.1.3')"
+            ));
+        }
+
+        // Validate the first 3 components (MAJOR.MINOR.PATCH)
+        for (i, part) in parts.iter().take(3).enumerate() {
+            // Handle pre-release and build metadata (e.g., "1.0.0-alpha" or "1.0.0+build")
+            let component = part.split(&['-', '+'][..]).next().unwrap_or(part);
+
+            component.parse::<u32>().with_context(|| {
+                let component_name = match i {
+                    0 => "MAJOR",
+                    1 => "MINOR",
+                    2 => "PATCH",
+                    _ => "component",
+                };
+                format!(
+                    "{} version component '{}' must be a non-negative integer in semantic versioning format",
+                    component_name, component
+                )
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1379,7 +1421,7 @@ mod tests {
         assert!(script.contains(
             "release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/extension-release.d\""
         ));
-        assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext\""));
+        assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext-1.0\""));
         assert!(script.contains("modules_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/modules\""));
         assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
         assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=0\" >> \"$release_file\""));
@@ -1430,7 +1472,7 @@ mod tests {
 
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/extension-release.d\""));
-        assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext\""));
+        assert!(script.contains("release_file=\"$release_dir/extension-release.test-ext-1.0\""));
         assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
         assert!(script.contains("echo \"EXTENSION_RELOAD_MANAGER=0\" >> \"$release_file\""));
         assert!(script.contains("echo \"CONFEXT_SCOPE=system\" >> \"$release_file\""));
@@ -2293,6 +2335,8 @@ mod tests {
         assert!(script.contains(
             "release_dir=\"$AVOCADO_EXT_SYSROOTS/avocado-dev/usr/lib/extension-release.d\""
         ));
+        // Note: Script generation uses ext_version parameter which is "0.1.0" in create_sysext_build_script call
+        assert!(script.contains("release_file=\"$release_dir/extension-release.avocado-dev-"));
         assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
         assert!(script.contains("echo \"SYSEXT_SCOPE=system\" >> \"$release_file\""));
     }
@@ -2335,6 +2379,8 @@ mod tests {
         assert!(script.contains("Creating user 'root'"));
         assert!(script
             .contains("release_dir=\"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/extension-release.d\""));
+        // Note: Script generation uses ext_version parameter
+        assert!(script.contains("release_file=\"$release_dir/extension-release.avocado-dev-"));
         assert!(script.contains("echo \"ID=_any\" > \"$release_file\""));
         assert!(script.contains("echo \"CONFEXT_SCOPE=system\" >> \"$release_file\""));
     }

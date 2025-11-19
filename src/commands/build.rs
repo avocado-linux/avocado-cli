@@ -764,6 +764,43 @@ echo "External extension {extension_name} images are ready in output directory"
         // Initialize SDK container helper
         let container_helper = crate::utils::container::SdkContainer::new();
 
+        // Query RPM version for the extension from the RPM database
+        // Use the same RPM configuration that was used during installation
+        let version_query_script = format!(
+            r#"
+set -e
+# Query RPM version for extension from RPM database using the same config as installation
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+rpm --root="$AVOCADO_EXT_SYSROOTS/{extension_name}" --dbpath=/var/lib/extension.d/rpm -q {extension_name} --queryformat '%{{VERSION}}'
+"#
+        );
+
+        let version_query_config = crate::utils::container::RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: version_query_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            ..Default::default()
+        };
+
+        let ext_version = container_helper
+            .run_in_container_with_output(version_query_config)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to query RPM version for extension '{}'. The RPM database should contain this package. \
+                    This may indicate the extension was not properly installed via packages, or the RPM database is corrupted.",
+                    extension_name
+                )
+            })?;
+
         // Create the image creation script
         let image_script = format!(
             r#"
@@ -771,14 +808,15 @@ set -e
 
 # Common variables
 EXT_NAME="{extension_name}"
+EXT_VERSION="{ext_version}"
 OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
-OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME.raw"
+OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw"
 
 # Create output directory
 mkdir -p $OUTPUT_DIR
 
-# Remove existing file if it exists
-rm -f "$OUTPUT_FILE"
+# Remove existing file if it exists (including any old versions)
+rm -f "$OUTPUT_DIR/$EXT_NAME"*.raw
 
 # Check if extension sysroot exists
 if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
@@ -793,7 +831,7 @@ mksquashfs \
   -noappend \
   -no-xattrs
 
-echo "Successfully created image for versioned extension '$EXT_NAME' at $OUTPUT_FILE"
+echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION' at $OUTPUT_FILE"
 "#
         );
 

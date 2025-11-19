@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -78,6 +78,25 @@ impl ExtImageCommand {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
+        // Get extension version
+        let ext_version = ext_config
+            .get("version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Extension '{}' is missing required 'version' field",
+                    self.extension
+                )
+            })?;
+
+        // Validate semver format
+        Self::validate_semver(ext_version).with_context(|| {
+            format!(
+                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
+                self.extension, ext_version
+            )
+        })?;
+
         // Get extension types from the types array
         let ext_types = ext_config
             .get("types")
@@ -134,6 +153,7 @@ impl ExtImageCommand {
                 &container_helper,
                 container_image,
                 &target_arch,
+                ext_version,
                 &ext_types.join(","), // Pass types for potential future use
                 repo_url.as_ref(),
                 repo_release.as_ref(),
@@ -144,16 +164,18 @@ impl ExtImageCommand {
         if result {
             print_success(
                 &format!(
-                    "Successfully created image for extension '{}' (types: {}).",
+                    "Successfully created image for extension '{}-{}' (types: {}).",
                     self.extension,
+                    ext_version,
                     ext_types.join(", ")
                 ),
                 OutputLevel::Normal,
             );
         } else {
             return Err(anyhow::anyhow!(
-                "Failed to create extension image for '{}'",
-                self.extension
+                "Failed to create extension image for '{}-{}'",
+                self.extension,
+                ext_version
             ));
         }
 
@@ -166,13 +188,14 @@ impl ExtImageCommand {
         container_helper: &SdkContainer,
         container_image: &str,
         target_arch: &str,
+        ext_version: &str,
         extension_type: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<bool> {
         // Create the build script
-        let build_script = self.create_build_script(extension_type);
+        let build_script = self.create_build_script(ext_version, extension_type);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -197,15 +220,16 @@ impl ExtImageCommand {
         Ok(result)
     }
 
-    fn create_build_script(&self, _extension_type: &str) -> String {
+    fn create_build_script(&self, ext_version: &str, _extension_type: &str) -> String {
         format!(
             r#"
 set -e
 
 # Common variables
 EXT_NAME="{}"
+EXT_VERSION="{}"
 OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
-OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME.raw"
+OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw"
 
 # Create output directory
 mkdir -p $OUTPUT_DIR
@@ -225,8 +249,42 @@ mksquashfs \
   "$OUTPUT_FILE" \
   -noappend \
   -no-xattrs
+
+echo "Created extension image: $OUTPUT_FILE"
 "#,
-            self.extension
+            self.extension, ext_version
         )
+    }
+
+    /// Validate semantic versioning format (X.Y.Z where X, Y, Z are non-negative integers)
+    fn validate_semver(version: &str) -> Result<()> {
+        let parts: Vec<&str> = version.split('.').collect();
+
+        if parts.len() < 3 {
+            return Err(anyhow::anyhow!(
+                "Version must follow semantic versioning format with at least MAJOR.MINOR.PATCH components (e.g., '1.0.0', '2.1.3')"
+            ));
+        }
+
+        // Validate the first 3 components (MAJOR.MINOR.PATCH)
+        for (i, part) in parts.iter().take(3).enumerate() {
+            // Handle pre-release and build metadata (e.g., "1.0.0-alpha" or "1.0.0+build")
+            let component = part.split(&['-', '+'][..]).next().unwrap_or(part);
+
+            component.parse::<u32>().with_context(|| {
+                let component_name = match i {
+                    0 => "MAJOR",
+                    1 => "MINOR",
+                    2 => "PATCH",
+                    _ => "component",
+                };
+                format!(
+                    "{} version component '{}' must be a non-negative integer in semantic versioning format",
+                    component_name, component
+                )
+            })?;
+        }
+
+        Ok(())
     }
 }

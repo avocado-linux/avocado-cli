@@ -175,20 +175,26 @@ impl RuntimeBuildCommand {
 
         // Process local extensions defined in [ext.*] sections
         if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_table()) {
-            for (ext_name, _ext_data) in ext_config {
+            for (ext_name, ext_data) in ext_config {
                 // Only process extensions that are required by this runtime
                 if all_required_extensions.contains(ext_name) {
+                    // Get version from extension config
+                    let ext_version = ext_data
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0.1.0");
+
                     symlink_commands.push(format!(
                         r#"
-OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
-RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
+OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw
+RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}-{ext_version}.raw
 
 if [ -f "$OUTPUT_EXT" ]; then
     if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
         ln -f $OUTPUT_EXT $RUNTIMES_EXT
     fi
 else
-    echo "Missing image for extension {ext_name}."
+    echo "Missing image for extension {ext_name}-{ext_version}."
 fi"#
                     ));
                     processed_extensions.insert(ext_name.clone());
@@ -199,15 +205,16 @@ fi"#
         // Process external extensions (those required but not defined locally)
         for ext_name in &all_required_extensions {
             if !processed_extensions.contains(ext_name) {
-                // This is an external extension - add symlink command for it
+                // This is an external extension - use wildcard to find versioned file
                 symlink_commands.push(format!(
                     r#"
-OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}.raw
-RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}.raw
-
-if [ -f "$OUTPUT_EXT" ]; then
+# Find external extension {ext_name} with any version
+OUTPUT_EXT=$(ls $AVOCADO_PREFIX/output/extensions/{ext_name}-*.raw 2>/dev/null | head -n 1)
+if [ -n "$OUTPUT_EXT" ]; then
+    EXT_FILENAME=$(basename "$OUTPUT_EXT")
+    RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/$EXT_FILENAME
     if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
-        ln -f $OUTPUT_EXT $RUNTIMES_EXT
+        ln -f "$OUTPUT_EXT" "$RUNTIMES_EXT"
     fi
 else
     echo "Missing image for external extension {ext_name}."
@@ -228,21 +235,47 @@ fi"#
 RUNTIME_NAME="{}"
 TARGET_ARCH="{}"
 
+# Read OS VERSION_ID from rootfs
+if [ -f "$AVOCADO_PREFIX/rootfs/etc/os-release" ]; then
+    # Source the os-release file and extract VERSION_ID
+    . "$AVOCADO_PREFIX/rootfs/etc/os-release"
+    if [ -z "$VERSION_ID" ]; then
+        echo "Warning: VERSION_ID not found in os-release, using 'unknown'"
+        VERSION_ID="unknown"
+    fi
+    echo "Using OS VERSION_ID: $VERSION_ID"
+else
+    echo "Warning: /etc/os-release not found in rootfs, using VERSION_ID='unknown'"
+    VERSION_ID="unknown"
+fi
+
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
+mkdir -p "$VAR_DIR/lib/avocado/runtime/$VERSION_ID"
 
 OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
 
 {}
 
+# Create symlinks in runtime/<VERSION_ID> pointing to enabled extensions
+echo "Creating runtime symlinks for VERSION_ID: $VERSION_ID"
+for ext in "$VAR_DIR/lib/avocado/extensions/"*.raw; do
+    if [ -f "$ext" ]; then
+        ext_filename=$(basename "$ext")
+        ln -sf "../../extensions/$ext_filename" "$VAR_DIR/lib/avocado/runtime/$VERSION_ID/$ext_filename"
+        echo "Created symlink: runtime/$VERSION_ID/$ext_filename -> extensions/$ext_filename"
+    fi
+done
+
 # Potential future SDK target hook.
 # echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
 # avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME
 
-# Create btrfs image with extensions and confexts subvolumes
+# Create btrfs image with extensions and runtime subvolumes
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado/extensions \
+    --subvol rw:lib/avocado/runtime \
     -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
@@ -497,7 +530,7 @@ target = "x86_64"
 test-dep = { ext = "test-ext" }
 
 [ext.test-ext]
-version = "1.0"
+version = "1.0.0"
 types = ["sysext"]
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
@@ -513,10 +546,10 @@ types = ["sysext"]
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
-        assert!(script.contains("test-ext.raw"));
+        assert!(script.contains("test-ext-1.0.0.raw"));
         // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
-        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext.raw"));
-        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext.raw"));
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext-1.0.0.raw"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext-1.0.0.raw"));
     }
 
     #[test]
@@ -533,7 +566,7 @@ target = "x86_64"
 test-dep = { ext = "test-ext", types = ["sysext"] }
 
 [ext.test-ext]
-version = "1.0"
+version = "1.0.0"
 types = ["sysext", "confext"]
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
@@ -550,11 +583,11 @@ types = ["sysext", "confext"]
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
         // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
-        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext.raw"));
-        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext.raw"));
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext-1.0.0.raw"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext-1.0.0.raw"));
         // Should NOT include symlinks to systemd directories (runtime will handle this)
-        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
-        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $SYSEXT"));
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $CONFEXT"));
     }
 
     #[test]
@@ -571,7 +604,7 @@ target = "x86_64"
 test-dep = { ext = "test-ext" }
 
 [ext.test-ext]
-version = "1.0"
+version = "1.0.0"
 types = ["confext"]
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
@@ -588,10 +621,10 @@ types = ["confext"]
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
         // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
-        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext.raw"));
-        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext.raw"));
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext-1.0.0.raw"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext-1.0.0.raw"));
         // Should NOT include symlinks to systemd directories (runtime will handle this)
-        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $SYSEXT"));
-        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext.raw $CONFEXT"));
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $SYSEXT"));
+        assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $CONFEXT"));
     }
 }

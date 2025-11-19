@@ -170,7 +170,7 @@ gcc = { version = "11.0" }
 app-ext = { ext = "my-extension" }
 
 [ext.my-extension]
-version = "2.0"
+version = "2.0.0"
 types = ["sysext"]
 "#
     }
@@ -198,7 +198,7 @@ types = ["sysext"]
         // Extensions should come first
         assert_eq!(deps[0].0, "ext");
         assert_eq!(deps[0].1, "my-extension");
-        assert_eq!(deps[0].2, "2.0");
+        assert_eq!(deps[0].2, "2.0.0");
 
         // Then packages
         assert_eq!(deps[1].0, "pkg");

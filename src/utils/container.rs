@@ -263,6 +263,116 @@ impl SdkContainer {
         Ok(container_cmd)
     }
 
+    /// Run a command in the container and capture its output
+    pub async fn run_in_container_with_output(&self, config: RunConfig) -> Result<Option<String>> {
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        // Build environment variables
+        let mut env_vars = config.env_vars.unwrap_or_default();
+
+        // Set host platform environment variable
+        let host_platform = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else {
+            "unknown"
+        };
+        env_vars.insert(
+            "AVOCADO_HOST_PLATFORM".to_string(),
+            host_platform.to_string(),
+        );
+
+        if let Some(url) = &config.repo_url {
+            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
+        }
+        if let Some(release) = &config.repo_release {
+            env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
+        }
+        if let Some(dnf_args) = &config.dnf_args {
+            env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
+        }
+        if config.verbose || self.verbose {
+            env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
+        }
+
+        // Build the complete command
+        let mut full_command = String::new();
+
+        // Conditionally include the entrypoint script
+        if config.use_entrypoint {
+            full_command.push_str(&self.create_entrypoint_script(
+                config.source_environment,
+                config.extension_sysroot.as_deref(),
+                config.runtime_sysroot.as_deref(),
+                &config.target,
+                config.no_bootstrap,
+                config.disable_weak_dependencies,
+            ));
+            full_command.push('\n');
+        }
+
+        full_command.push_str(&config.command);
+
+        let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
+
+        // Build container command with volume state
+        let container_cmd = self.build_container_command(
+            &config.container_image,
+            &bash_cmd,
+            &config.target,
+            &env_vars,
+            config.container_name.as_deref(),
+            false, // Never detach when capturing output
+            config.rm,
+            false, // Never interactive when capturing output
+            config.container_args.as_deref(),
+            &volume_state,
+        )?;
+
+        if config.verbose || self.verbose {
+            print_info(
+                &format!(
+                    "Mounting source directory: {} -> /opt/src",
+                    self.cwd.display()
+                ),
+                OutputLevel::Normal,
+            );
+            print_info(
+                &format!("Container command: {}", container_cmd.join(" ")),
+                OutputLevel::Normal,
+            );
+        }
+
+        // Execute command and capture output
+        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        cmd.args(&container_cmd[1..]);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .with_context(|| "Failed to execute container command")?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(Some(stdout))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if config.verbose || self.verbose {
+                print_error(
+                    &format!("Container execution failed: {stderr}"),
+                    OutputLevel::Normal,
+                );
+            }
+            Ok(None)
+        }
+    }
+
     /// Execute the container command
     async fn execute_container_command(
         &self,

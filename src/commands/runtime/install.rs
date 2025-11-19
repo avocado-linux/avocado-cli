@@ -556,7 +556,7 @@ curl = { version = "7.0" }
 app-ext = { ext = "my-extension" }
 
 [ext.my-extension]
-version = "2.0"
+version = "2.0.0"
 types = ["sysext"]
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
