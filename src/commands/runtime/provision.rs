@@ -71,6 +71,26 @@ impl RuntimeProvisionCommand {
             OutputLevel::Normal,
         );
 
+        // Determine extensions required for this runtime/target combination
+        let runtime_extensions = Self::collect_runtime_extensions(
+            &parsed,
+            &config,
+            &self.config.runtime_name,
+            target_arch.as_str(),
+            &self.config.config_path,
+        )?;
+
+        // Merge CLI env vars with AVOCADO_EXT_LIST if any extensions exist
+        let mut env_vars = self.config.env_vars.clone().unwrap_or_default();
+        if !runtime_extensions.is_empty() {
+            env_vars.insert("AVOCADO_EXT_LIST".to_string(), runtime_extensions.join(" "));
+        }
+        let env_vars = if env_vars.is_empty() {
+            None
+        } else {
+            Some(env_vars)
+        };
+
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
 
@@ -88,7 +108,7 @@ impl RuntimeProvisionCommand {
             verbose: self.config.verbose,
             source_environment: true,
             interactive: !self.config.force,
-            env_vars: self.config.env_vars.clone(),
+            env_vars,
             container_args: config.merge_provision_container_args(
                 self.config.provision_profile.as_deref(),
                 self.config.container_args.as_ref(),
@@ -125,6 +145,84 @@ avocado-provision-{} {}
         );
 
         Ok(script)
+    }
+
+    fn collect_runtime_extensions(
+        parsed: &toml::Value,
+        config: &crate::utils::config::Config,
+        runtime_name: &str,
+        target_arch: &str,
+        config_path: &str,
+    ) -> Result<Vec<String>> {
+        let merged_runtime =
+            config.get_merged_runtime_config(runtime_name, target_arch, config_path)?;
+
+        let runtime_dep_table = merged_runtime
+            .as_ref()
+            .and_then(|value| value.get("dependencies").and_then(|d| d.as_table()))
+            .or_else(|| {
+                parsed
+                    .get("runtime")
+                    .and_then(|r| r.get(runtime_name))
+                    .and_then(|runtime_value| runtime_value.get("dependencies"))
+                    .and_then(|d| d.as_table())
+            });
+
+        let mut extensions = Vec::new();
+
+        if let Some(deps) = runtime_dep_table {
+            for dep_spec in deps.values() {
+                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    let version = Self::resolve_extension_version(
+                        parsed,
+                        config,
+                        config_path,
+                        ext_name,
+                        dep_spec,
+                    )?;
+                    extensions.push(format!("{ext_name}-{version}"));
+                }
+            }
+        }
+
+        extensions.sort();
+        extensions.dedup();
+
+        Ok(extensions)
+    }
+
+    fn resolve_extension_version(
+        parsed: &toml::Value,
+        config: &crate::utils::config::Config,
+        config_path: &str,
+        ext_name: &str,
+        dep_spec: &toml::Value,
+    ) -> Result<String> {
+        if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+            return Ok(version.to_string());
+        }
+
+        if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
+            let external_extensions =
+                config.load_external_extensions(config_path, external_config_path)?;
+            if let Some(ext_config) = external_extensions.get(ext_name) {
+                if let Some(version) = ext_config.get("version").and_then(|v| v.as_str()) {
+                    return Ok(version.to_string());
+                }
+            }
+            return Ok("*".to_string());
+        }
+
+        let version = parsed
+            .get("ext")
+            .and_then(|ext_section| ext_section.as_table())
+            .and_then(|ext_table| ext_table.get(ext_name))
+            .and_then(|ext_config| ext_config.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string();
+
+        Ok(version)
     }
 }
 
@@ -174,6 +272,43 @@ mod tests {
 
         assert!(script.contains("avocado-provision-x86_64 test-runtime"));
         assert!(script.contains("Running SDK lifecycle hook 'avocado-provision'"));
+    }
+
+    #[test]
+    fn test_collect_runtime_extensions() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocado/sdk:latest"
+
+[runtime.test-runtime]
+[runtime.test-runtime.dependencies]
+ext_one = { ext = "alpha-ext" }
+ext_two = { ext = "beta-ext" }
+        "#;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("avocado.toml");
+        fs::write(&config_path, config_content).unwrap();
+
+        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let config = crate::utils::config::Config::load(&config_path).unwrap();
+
+        let extensions = RuntimeProvisionCommand::collect_runtime_extensions(
+            &parsed,
+            &config,
+            "test-runtime",
+            "x86_64",
+            config_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            extensions,
+            vec!["alpha-ext-*".to_string(), "beta-ext-*".to_string()]
+        );
     }
 
     #[test]
