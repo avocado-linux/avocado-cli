@@ -251,20 +251,20 @@ fi
 
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
-mkdir -p "$VAR_DIR/lib/avocado/runtime/$VERSION_ID"
+mkdir -p "$VAR_DIR/lib/avocado/os-releases/$VERSION_ID"
 
 OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
 
 {}
 
-# Create symlinks in runtime/<VERSION_ID> pointing to enabled extensions
-echo "Creating runtime symlinks for VERSION_ID: $VERSION_ID"
+# Create symlinks in os-releases/<VERSION_ID> pointing to enabled extensions
+echo "Creating OS release symlinks for VERSION_ID: $VERSION_ID"
 for ext in "$VAR_DIR/lib/avocado/extensions/"*.raw; do
     if [ -f "$ext" ]; then
         ext_filename=$(basename "$ext")
-        ln -sf "../../extensions/$ext_filename" "$VAR_DIR/lib/avocado/runtime/$VERSION_ID/$ext_filename"
-        echo "Created symlink: runtime/$VERSION_ID/$ext_filename -> extensions/$ext_filename"
+        ln -sf "../../extensions/$ext_filename" "$VAR_DIR/lib/avocado/os-releases/$VERSION_ID/$ext_filename"
+        echo "Created symlink: os-releases/$VERSION_ID/$ext_filename -> extensions/$ext_filename"
     fi
 done
 
@@ -272,10 +272,10 @@ done
 # echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
 # avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME
 
-# Create btrfs image with extensions and runtime subvolumes
+# Create btrfs image with extensions and os-releases subvolumes
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado/extensions \
-    --subvol rw:lib/avocado/runtime \
+    --subvol rw:lib/avocado/os-releases \
     -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
