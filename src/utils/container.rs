@@ -497,21 +497,65 @@ exec ${AVOCADO_SDK_PREFIX}/usr/bin/opkg "$@"
 OPKGWRAPPER_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/opkg
     
-    # Create wrapper script that blocks other commands
-    cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh << 'WRAPPER_EOF'
+    # Create generic noop wrapper for commands we don't want to execute
+    cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/noop-command << 'NOOP_EOF'
 #!/bin/bash
-# Selective scriptlet execution wrapper
-# Silently succeeds for blocked executables
+# Generic noop wrapper - always succeeds
 exit 0
-WRAPPER_EOF
-    chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
+NOOP_EOF
+    chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/noop-command
+    
+    # Create a smart grep wrapper that pretends users/groups exist
+    cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/grep << 'GREP_EOF'
+#!/bin/bash
+# Smart grep wrapper for scriptlet user/group validation
+# When checking /etc/passwd or /etc/group, pretend the user/group exists
+# For everything else, use the real grep
+
+# Check if this looks like a user/group existence check
+if [[ "$*" =~ /etc/passwd ]] || [[ "$*" =~ /etc/group ]]; then
+    # Pretend we found a match - output a fake line and exit 0
+    echo "placeholder:x:1000:1000::/:/bin/false"
+    exit 0
+fi
+
+# For everything else, use real grep (find it in original PATH, not our wrapper dir)
+# Remove our wrapper directory from PATH to find the real grep
+ORIGINAL_PATH="${PATH#${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:}"
+exec env PATH="$ORIGINAL_PATH" grep "$@"
+GREP_EOF
+    chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/grep
+    
+    # Create symlinks for common scriptlet commands that should noop
+    # Allowlist approach: we create wrappers for what we DON'T want, not for what we DO want
+    for cmd in useradd groupadd usermod groupmod userdel groupdel chown chmod chgrp \
+               flock systemctl systemd-tmpfiles ldconfig depmod udevadm \
+               dbus-send killall service update-rc.d invoke-rc.d \
+               gtk-update-icon-cache glib-compile-schemas update-desktop-database \
+               fc-cache mkfontdir mkfontscale install-info update-mime-database \
+               passwd chpasswd gpasswd newusers \
+               systemd-sysusers systemd-hwdb kmod insmod modprobe \
+               setcap getcap chcon restorecon selinuxenabled getenforce \
+               rpm-helper gtk-query-immodules-3.0 \
+               gdk-pixbuf-query-loaders gio-querymodules \
+               dconf gsettings glib-compile-resources \
+               bbnote bbfatal bbwarn bbdebug; do
+        ln -sf noop-command $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/$cmd
+    done
     
     # Create shell wrapper for scriptlet interpreter
-    # This will be copied to /bin/sh in extension sysroots
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh << 'SHELL_EOF'
 #!/bin/bash
-# Shell wrapper for RPM scriptlets running in chroot
-# Executes bash from the SDK (which is accessible from the container)
+# Shell wrapper for RPM scriptlets
+# Set OPT=--opt to make Yocto scriptlets skip user/group management
+# This is the proper way to tell Yocto scripts we're in a sysroot environment
+
+# Set PATH to find our command wrappers first
+export PATH="${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:$PATH"
+
+# Tell Yocto scriptlets we're in OPT mode (skip user/group creation)
+export OPT="--opt"
+
 exec ${AVOCADO_SDK_PREFIX}/usr/bin/bash "$@"
 SHELL_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
@@ -519,22 +563,12 @@ SHELL_EOF
     # Update macros for extension scriptlets
     sed -i "s|^%_dbpath[[:space:]]*%{_var}/lib/rpm$|%_dbpath                %{_var}/lib/rpm|" $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros
     
-    # Add macro overrides to redirect common scriptlet commands to wrapper
+    # Add macro overrides for shell interpreter only
     cat >> $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros << 'MACROS_EOF'
 
-# Override shell interpreter for scriptlets to use SDK environment shell
+# Override shell interpreter for scriptlets to use our custom shell
 %__bash                 $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
 %__sh                   $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
-
-# Selective scriptlet execution - only allow update-alternatives and opkg
-# Common scriptlet commands are redirected to wrapper that blocks them
-%__ln                   $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
-%__cp                   $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
-%__mkdir_p              $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
-%__rm                   $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
-%__install              $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
-%__systemctl            $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
-%__ldconfig             $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-wrapper.sh
 MACROS_EOF
 
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
