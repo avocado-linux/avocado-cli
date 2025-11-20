@@ -25,6 +25,7 @@ avocado-img-tegraflash = "*"
 # Use or modify this to install dependencies and or include sdk compiled code
 [ext.app]
 types = ["sysext", "confext"]
+version = "0.1.0"
 
 # Install application dependencies
 [ext.app.dependencies]
@@ -36,6 +37,7 @@ types = ["sysext", "confext"]
 # or configure other system services
 [ext.config]
 types = ["confext"]
+version = "0.1.0"
 
 # NOT FOR PRODUCTION: Set root password to empty string
 [ext.config.users.root]

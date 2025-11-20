@@ -24,6 +24,7 @@ avocado-bsp-icam-540 = { ext = "avocado-bsp-icam-540", config = "bsp/icam-540/av
 
 [ext.app]
 types = ["sysext", "confext"]
+version = "0.1.0"
 
 [ext.app.dependencies]
 i2c-tools = "*"
@@ -47,6 +48,7 @@ udev-hwdb = "*"
 
 [ext.config]
 types = ["confext"]
+version = "0.1.0"
 
 [ext.config.users.root]
 password = ""

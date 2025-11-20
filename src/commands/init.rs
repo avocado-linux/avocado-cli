@@ -684,4 +684,123 @@ mod tests {
         let count = content.matches(".avocado-state").count();
         assert_eq!(count, 1);
     }
+
+    /// Helper function to validate that all [ext.<name>] blocks have a version field
+    fn validate_ext_versions(config_content: &str, config_name: &str) {
+        let config: toml::Value = toml::from_str(config_content)
+            .unwrap_or_else(|e| panic!("Failed to parse {} config: {}", config_name, e));
+
+        // TOML parses [ext.app] as a nested structure: ext -> app
+        // So we need to look for the "ext" key and then check its children
+        if let Some(table) = config.as_table() {
+            if let Some(ext_value) = table.get("ext") {
+                if let Some(ext_table) = ext_value.as_table() {
+                    // Now iterate through each extension (app, config, etc.)
+                    for (ext_name, ext_config) in ext_table {
+                        if let Some(ext_config_table) = ext_config.as_table() {
+                            assert!(
+                                ext_config_table.contains_key("version"),
+                                "Config '{}' has [ext.{}] block without 'version' field. All extension blocks must have a version field.",
+                                config_name,
+                                ext_name
+                            );
+
+                            // Validate that version is a string
+                            assert!(
+                                ext_config_table
+                                    .get("version")
+                                    .and_then(|v| v.as_str())
+                                    .is_some(),
+                                "Config '{}' has [ext.{}] block with non-string 'version' field",
+                                config_name,
+                                ext_name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_config_templates_have_ext_versions() {
+        // Test default template (substitute {target} placeholder for validation)
+        let default_template =
+            include_str!("../../configs/default.toml").replace("{target}", "test-target");
+        validate_ext_versions(&default_template, "default.toml");
+
+        // Test qemux86-64
+        let qemux86_64 = include_str!("../../configs/qemu/qemux86-64.toml");
+        validate_ext_versions(qemux86_64, "qemux86-64.toml");
+
+        // Test qemuarm64
+        let qemuarm64 = include_str!("../../configs/qemu/qemuarm64.toml");
+        validate_ext_versions(qemuarm64, "qemuarm64.toml");
+
+        // Test reterminal
+        let reterminal = include_str!("../../configs/seeed/reterminal.toml");
+        validate_ext_versions(reterminal, "reterminal.toml");
+
+        // Test reterminal-dm
+        let reterminal_dm = include_str!("../../configs/seeed/reterminal-dm.toml");
+        validate_ext_versions(reterminal_dm, "reterminal-dm.toml");
+
+        // Test jetson-orin-nano-devkit
+        let jetson = include_str!("../../configs/nvidia/jetson-orin-nano-devkit.toml");
+        validate_ext_versions(jetson, "jetson-orin-nano-devkit.toml");
+
+        // Test raspberrypi4
+        let rpi4 = include_str!("../../configs/raspberry-pi/raspberrypi-4-model-b.toml");
+        validate_ext_versions(rpi4, "raspberrypi-4-model-b.toml");
+
+        // Test raspberrypi5
+        let rpi5 = include_str!("../../configs/raspberry-pi/raspberrypi-5.toml");
+        validate_ext_versions(rpi5, "raspberrypi-5.toml");
+
+        // Test icam-540
+        let icam = include_str!("../../configs/advantech/icam-540.toml");
+        validate_ext_versions(icam, "icam-540.toml");
+    }
+
+    #[tokio::test]
+    async fn test_generated_configs_have_ext_versions() {
+        // Test that configs generated for all supported targets have versions
+        let targets = vec![
+            "qemux86-64",
+            "qemuarm64",
+            "reterminal",
+            "reterminal-dm",
+            "jetson-orin-nano-devkit",
+            "raspberrypi4",
+            "raspberrypi5",
+            "icam-540",
+            "custom-target", // This uses the default template
+        ];
+
+        for target in targets {
+            let temp_dir = TempDir::new().unwrap();
+            let temp_path = temp_dir.path().to_str().unwrap();
+
+            let init_cmd =
+                InitCommand::new(Some(target.to_string()), Some(temp_path.to_string()), None);
+            let result = init_cmd.execute().await;
+
+            assert!(
+                result.is_ok(),
+                "Failed to initialize config for target '{}': {:?}",
+                target,
+                result.err()
+            );
+
+            let config_path = PathBuf::from(temp_path).join("avocado.toml");
+            let content = fs::read_to_string(&config_path).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to read generated config for target '{}': {}",
+                    target, e
+                )
+            });
+
+            validate_ext_versions(&content, &format!("generated config for {}", target));
+        }
+    }
 }
