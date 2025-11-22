@@ -319,9 +319,12 @@ impl ExtDnfCommand {
 
         format!(
             r#"
+RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+AVOCADO_EXT_INSTALLROOT={installroot} \
+PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
-    $DNF_NO_SCRIPTS \
     $DNF_SDK_TARGET_REPO_CONF \
     --installroot={installroot} \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \

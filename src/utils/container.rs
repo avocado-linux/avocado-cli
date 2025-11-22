@@ -556,46 +556,34 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     # Create a bin directory for command wrappers
     mkdir -p $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin
     
-    # Create update-alternatives wrapper that prefixes paths with installroot
+    # Create update-alternatives wrapper that uses OPKG_OFFLINE_ROOT
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/update-alternatives << 'UAWRAPPER_EOF'
 #!/bin/bash
-# update-alternatives wrapper for extension scriptlets running without chroot
-# Opkg's update-alternatives doesn't support --altdir, so we need to prefix paths
-# We only prefix the link location (where to create it), not the target (what it points to)
+# update-alternatives wrapper for extension scriptlets
+# Sets OPKG_OFFLINE_ROOT to manage alternatives within the extension sysroot
 
 if [ -n "$AVOCADO_EXT_INSTALLROOT" ]; then
-    # Parse arguments and prefix file paths with installroot
-    # Format: update-alternatives --install <link> <name> <path> <priority>
-    # or: update-alternatives --remove <name> <path>
-    
     case "$1" in
-        --install)
-            # update-alternatives --install <link> <name> <path> <priority>
-            if [ $# -ge 5 ]; then
-                link="$2"
-                name="$3"
-                path="$4"
-                priority="$5"
-                # Only prefix the link location with installroot, keep target as-is
-                [ "${link:0:1}" = "/" ] && link="$AVOCADO_EXT_INSTALLROOT$link"
-                # path stays as-is - it should be relative to the extension root
-                exec ${AVOCADO_SDK_PREFIX}/usr/bin/update-alternatives --install "$link" "$name" "$path" "$priority"
-            fi
-            ;;
-        --remove)
-            # update-alternatives --remove <name> <path>
-            if [ $# -ge 3 ]; then
-                name="$2"
-                path="$3"
-                # path stays as-is for remove too
-                exec ${AVOCADO_SDK_PREFIX}/usr/bin/update-alternatives --remove "$name" "$path"
-            fi
+        --install|--remove|--config|--auto|--display|--list|--query|--set)
+            # Debug: Show what we're doing
+            echo "update-alternatives: OPKG_OFFLINE_ROOT=$AVOCADO_EXT_INSTALLROOT"
+            echo "update-alternatives: executing: update-alternatives $*"
+            
+            # Set OPKG_OFFLINE_ROOT to the extension's installroot
+            # This tells opkg-update-alternatives to operate within that root
+            # Also ensure alternatives directory is created
+            /usr/bin/mkdir -p "${AVOCADO_EXT_INSTALLROOT}/var/lib/opkg/alternatives" 2>/dev/null || true
+            
+            # Set clean PATH and call update-alternatives with OPKG_OFFLINE_ROOT
+            export OPKG_OFFLINE_ROOT="$AVOCADO_EXT_INSTALLROOT"
+            PATH="${AVOCADO_SDK_PREFIX}/usr/bin:/usr/bin:/bin" \
+                exec ${AVOCADO_SDK_PREFIX}/usr/bin/update-alternatives "$@"
             ;;
     esac
 fi
 
-# Fallback: call SDK's update-alternatives as-is
-exec ${AVOCADO_SDK_PREFIX}/usr/bin/update-alternatives "$@"
+# If called without AVOCADO_EXT_INSTALLROOT, fail safely
+exit 0
 UAWRAPPER_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/update-alternatives
     
@@ -660,8 +648,9 @@ GREP_EOF
 # Set OPT=--opt to make Yocto scriptlets skip user/group management
 # This is the proper way to tell Yocto scripts we're in a sysroot environment
 
-# Set PATH to find our command wrappers first
-export PATH="${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:$PATH"
+# Set PATH to find our command wrappers first, but explicitly exclude the installroot
+# Only include: wrapper bin, SDK utilities, and container system paths
+export PATH="${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:${AVOCADO_SDK_PREFIX}/usr/bin:/usr/bin:/bin"
 
 # Tell Yocto scriptlets we're in OPT mode (skip user/group creation)
 export OPT="--opt"
