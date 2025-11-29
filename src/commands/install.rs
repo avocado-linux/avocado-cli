@@ -870,8 +870,16 @@ $DNF_SDK_HOST \
             ));
         }
 
+        let version_msg = if version == "*" {
+            "latest version".to_string()
+        } else {
+            format!("version '{version}'")
+        };
+
         print_info(
-            &format!("Successfully installed versioned extension '{extension_name}' version '{version}'."),
+            &format!(
+                "Successfully installed versioned extension '{extension_name}' {version_msg}."
+            ),
             crate::utils::output::OutputLevel::Normal,
         );
 
