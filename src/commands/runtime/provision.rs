@@ -72,18 +72,26 @@ impl RuntimeProvisionCommand {
         );
 
         // Determine extensions required for this runtime/target combination
-        let runtime_extensions = Self::collect_runtime_extensions(
-            &parsed,
-            &config,
-            &self.config.runtime_name,
-            target_arch.as_str(),
-            &self.config.config_path,
-        )?;
+        // This includes local extensions, external extensions, and versioned extensions from ext repos
+        // For package repository extensions, we query the RPM database to get actual installed versions
+        let resolved_extensions = self
+            .collect_runtime_extensions(
+                &parsed,
+                &config,
+                &self.config.runtime_name,
+                target_arch.as_str(),
+                &self.config.config_path,
+                container_image,
+            )
+            .await?;
 
         // Merge CLI env vars with AVOCADO_EXT_LIST if any extensions exist
         let mut env_vars = self.config.env_vars.clone().unwrap_or_default();
-        if !runtime_extensions.is_empty() {
-            env_vars.insert("AVOCADO_EXT_LIST".to_string(), runtime_extensions.join(" "));
+        if !resolved_extensions.is_empty() {
+            env_vars.insert(
+                "AVOCADO_EXT_LIST".to_string(),
+                resolved_extensions.join(" "),
+            );
         }
         let env_vars = if env_vars.is_empty() {
             None
@@ -147,12 +155,14 @@ avocado-provision-{} {}
         Ok(script)
     }
 
-    fn collect_runtime_extensions(
+    async fn collect_runtime_extensions(
+        &self,
         parsed: &toml::Value,
         config: &crate::utils::config::Config,
         runtime_name: &str,
         target_arch: &str,
         config_path: &str,
+        container_image: &str,
     ) -> Result<Vec<String>> {
         let merged_runtime =
             config.get_merged_runtime_config(runtime_name, target_arch, config_path)?;
@@ -173,13 +183,17 @@ avocado-provision-{} {}
         if let Some(deps) = runtime_dep_table {
             for dep_spec in deps.values() {
                 if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                    let version = Self::resolve_extension_version(
-                        parsed,
-                        config,
-                        config_path,
-                        ext_name,
-                        dep_spec,
-                    )?;
+                    let version = self
+                        .resolve_extension_version(
+                            parsed,
+                            config,
+                            config_path,
+                            ext_name,
+                            dep_spec,
+                            container_image,
+                            target_arch,
+                        )
+                        .await?;
                     extensions.push(format!("{ext_name}-{version}"));
                 }
             }
@@ -191,38 +205,124 @@ avocado-provision-{} {}
         Ok(extensions)
     }
 
-    fn resolve_extension_version(
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_extension_version(
+        &self,
         parsed: &toml::Value,
         config: &crate::utils::config::Config,
         config_path: &str,
         ext_name: &str,
         dep_spec: &toml::Value,
+        container_image: &str,
+        target_arch: &str,
     ) -> Result<String> {
+        // If version is explicitly specified with vsn field, use it (unless it's a wildcard)
         if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-            return Ok(version.to_string());
+            if version != "*" {
+                return Ok(version.to_string());
+            }
+            // If vsn is "*", fall through to query RPM for the actual installed version
         }
 
+        // If external config is specified, try to get version from it
         if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
             let external_extensions =
                 config.load_external_extensions(config_path, external_config_path)?;
             if let Some(ext_config) = external_extensions.get(ext_name) {
                 if let Some(version) = ext_config.get("version").and_then(|v| v.as_str()) {
-                    return Ok(version.to_string());
+                    if version != "*" {
+                        return Ok(version.to_string());
+                    }
+                    // If version is "*", fall through to query RPM
                 }
             }
-            return Ok("*".to_string());
+            // External config but no version found or version is "*" - query RPM database
+            return self
+                .query_rpm_version(ext_name, container_image, target_arch)
+                .await;
         }
 
-        let version = parsed
+        // Try to get version from local [ext] section
+        if let Some(version) = parsed
             .get("ext")
             .and_then(|ext_section| ext_section.as_table())
             .and_then(|ext_table| ext_table.get(ext_name))
             .and_then(|ext_config| ext_config.get("version"))
             .and_then(|v| v.as_str())
-            .unwrap_or("*")
-            .to_string();
+        {
+            if version != "*" {
+                return Ok(version.to_string());
+            }
+            // If version is "*", fall through to query RPM
+        }
 
-        Ok(version)
+        // No version found in config - this is likely a package repository extension
+        // Query RPM database for the installed version
+        self.query_rpm_version(ext_name, container_image, target_arch)
+            .await
+    }
+
+    /// Query RPM database for the actual installed version of an extension
+    ///
+    /// This queries the RPM database in the extension's sysroot at $AVOCADO_EXT_SYSROOTS/{ext_name}
+    /// to get the actual installed version. This ensures AVOCADO_EXT_LIST contains
+    /// precise version information.
+    async fn query_rpm_version(
+        &self,
+        ext_name: &str,
+        container_image: &str,
+        target: &str,
+    ) -> Result<String> {
+        let container_helper = SdkContainer::new();
+
+        let version_query_script = format!(
+            r#"
+set -e
+# Query RPM version for extension from RPM database using the same config as installation
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm -q {ext_name} --queryformat '%{{VERSION}}'
+"#
+        );
+
+        let version_query_config = crate::utils::container::RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: version_query_script,
+            verbose: self.config.verbose,
+            source_environment: true,
+            interactive: false,
+            ..Default::default()
+        };
+
+        match container_helper
+            .run_in_container_with_output(version_query_config)
+            .await
+        {
+            Ok(Some(actual_version)) => {
+                let trimmed_version = actual_version.trim();
+                if self.config.verbose {
+                    print_info(
+                        &format!(
+                            "Resolved extension '{ext_name}' to version '{trimmed_version}' from RPM database"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                Ok(trimmed_version.to_string())
+            }
+            Ok(None) => Err(anyhow::anyhow!(
+                "Failed to query version for extension '{}' from RPM database. \
+                    Extension may not be installed yet. Run 'avocado install' first.",
+                ext_name
+            )),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to query version for extension '{}' from RPM database: {}. \
+                    Extension may not be installed yet. Run 'avocado install' first.",
+                ext_name,
+                e
+            )),
+        }
     }
 }
 
@@ -274,8 +374,8 @@ mod tests {
         assert!(script.contains("Running SDK lifecycle hook 'avocado-provision'"));
     }
 
-    #[test]
-    fn test_collect_runtime_extensions() {
+    #[tokio::test]
+    async fn test_collect_runtime_extensions() {
         use std::fs;
         use tempfile::TempDir;
 
@@ -285,8 +385,8 @@ image = "docker.io/avocado/sdk:latest"
 
 [runtime.test-runtime]
 [runtime.test-runtime.dependencies]
-ext_one = { ext = "alpha-ext" }
-ext_two = { ext = "beta-ext" }
+ext_one = { ext = "alpha-ext", vsn = "1.0.0" }
+ext_two = { ext = "beta-ext", vsn = "2.0.0" }
         "#;
 
         let temp_dir = TempDir::new().unwrap();
@@ -296,18 +396,35 @@ ext_two = { ext = "beta-ext" }
         let parsed: toml::Value = toml::from_str(config_content).unwrap();
         let config = crate::utils::config::Config::load(&config_path).unwrap();
 
-        let extensions = RuntimeProvisionCommand::collect_runtime_extensions(
-            &parsed,
-            &config,
-            "test-runtime",
-            "x86_64",
-            config_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let provision_config = RuntimeProvisionConfig {
+            runtime_name: "test-runtime".to_string(),
+            config_path: config_path.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            target: Some("x86_64".to_string()),
+            provision_profile: None,
+            env_vars: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let command = RuntimeProvisionCommand::new(provision_config);
+
+        let extensions = command
+            .collect_runtime_extensions(
+                &parsed,
+                &config,
+                "test-runtime",
+                "x86_64",
+                config_path.to_str().unwrap(),
+                "docker.io/avocado/sdk:latest",
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             extensions,
-            vec!["alpha-ext-*".to_string(), "beta-ext-*".to_string()]
+            vec!["alpha-ext-1.0.0".to_string(), "beta-ext-2.0.0".to_string()]
         );
     }
 
