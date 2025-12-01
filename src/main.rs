@@ -188,6 +188,9 @@ enum Commands {
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
+        /// Output path relative to src_dir for provisioning artifacts
+        #[arg(long = "out")]
+        out: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -438,6 +441,9 @@ enum RuntimeCommands {
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
+        /// Output path relative to src_dir for provisioning artifacts
+        #[arg(long = "out")]
+        out: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -673,6 +679,7 @@ async fn main() -> Result<()> {
             target,
             provision_profile,
             env,
+            out,
             container_args,
             dnf_args,
         } => {
@@ -685,6 +692,7 @@ async fn main() -> Result<()> {
                     target: target.or(cli.target),
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                    out,
                     container_args,
                     dnf_args,
                 });
@@ -762,6 +770,7 @@ async fn main() -> Result<()> {
                 target,
                 provision_profile,
                 env,
+                out,
                 container_args,
                 dnf_args,
             } => {
@@ -774,6 +783,7 @@ async fn main() -> Result<()> {
                         target: target.or(cli.target),
                         provision_profile: provision_profile.clone(),
                         env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                        out,
                         container_args,
                         dnf_args,
                     },

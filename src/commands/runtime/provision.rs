@@ -15,6 +15,7 @@ pub struct RuntimeProvisionConfig {
     pub target: Option<String>,
     pub provision_profile: Option<String>,
     pub env_vars: Option<HashMap<String, String>>,
+    pub out: Option<String>,
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
 }
@@ -93,6 +94,15 @@ impl RuntimeProvisionCommand {
                 resolved_extensions.join(" "),
             );
         }
+
+        // Set AVOCADO_PROVISION_OUT if --out is specified
+        if let Some(out_path) = &self.config.out {
+            // Construct the absolute path from the container's perspective
+            // The src_dir is mounted at /opt/src in the container
+            let container_out_path = format!("/opt/src/{}", out_path);
+            env_vars.insert("AVOCADO_PROVISION_OUT".to_string(), container_out_path);
+        }
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -340,6 +350,7 @@ mod tests {
             target: Some("x86_64".to_string()),
             provision_profile: None,
             env_vars: None,
+            out: None,
             container_args: None,
             dnf_args: None,
         };
@@ -351,6 +362,7 @@ mod tests {
         assert!(!cmd.config.force);
         assert_eq!(cmd.config.target, Some("x86_64".to_string()));
         assert_eq!(cmd.config.env_vars, None);
+        assert_eq!(cmd.config.out, None);
     }
 
     #[test]
@@ -363,6 +375,7 @@ mod tests {
             target: Some("x86_64".to_string()),
             provision_profile: None,
             env_vars: None,
+            out: None,
             container_args: None,
             dnf_args: None,
         };
@@ -404,6 +417,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
             target: Some("x86_64".to_string()),
             provision_profile: None,
             env_vars: None,
+            out: None,
             container_args: None,
             dnf_args: None,
         };
@@ -444,6 +458,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
             target: Some("x86_64".to_string()),
             provision_profile: None,
             env_vars: None,
+            out: None,
             container_args: container_args.clone(),
             dnf_args: dnf_args.clone(),
         };
@@ -455,6 +470,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
         assert!(!cmd.config.force);
         assert_eq!(cmd.config.target, Some("x86_64".to_string()));
         assert_eq!(cmd.config.env_vars, None);
+        assert_eq!(cmd.config.out, None);
         assert_eq!(cmd.config.container_args, container_args);
         assert_eq!(cmd.config.dnf_args, dnf_args);
     }
@@ -476,6 +492,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
             target: Some("x86_64".to_string()),
             provision_profile: None,
             env_vars: Some(env_vars.clone()),
+            out: None,
             container_args: None,
             dnf_args: None,
         };
