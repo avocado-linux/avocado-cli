@@ -405,10 +405,12 @@ impl Config {
         config_path: P,
     ) -> Result<Option<String>> {
         // Get merged runtime config to include target-specific overrides
-        let config_path_str = config_path.as_ref().to_str().ok_or_else(|| {
-            anyhow::anyhow!("Invalid UTF-8 in config path")
-        })?;
-        let merged_runtime = self.get_merged_runtime_config(runtime_name, target, config_path_str)?;
+        let config_path_str = config_path
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in config path"))?;
+        let merged_runtime =
+            self.get_merged_runtime_config(runtime_name, target, config_path_str)?;
 
         // Extract stone_include_paths and convert to owned Vec<String>
         let stone_paths: Option<Vec<String>> = merged_runtime
@@ -3693,6 +3695,47 @@ stone_include_paths = ["stone-aarch64"]
     }
 
     #[test]
+    fn test_stone_include_paths_user_example() {
+        // Test the exact example from the user's request
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:latest"
+
+[runtime.dev]
+stone_include_paths = ["stone-common"]
+
+[runtime.dev.qemux86-64]
+stone_include_paths = ["stone-qemux86-64"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+
+        // Test qemux86-64 target - should use the override
+        let stone_paths_qemu = config
+            .get_stone_include_paths_for_runtime("dev", "qemux86-64", temp_file.path())
+            .unwrap();
+        assert!(stone_paths_qemu.is_some());
+        assert_eq!(stone_paths_qemu.unwrap(), "/opt/src/stone-qemux86-64");
+
+        // Test aarch64 target - should use the base (stone-common)
+        let stone_paths_arm = config
+            .get_stone_include_paths_for_runtime("dev", "aarch64", temp_file.path())
+            .unwrap();
+        assert!(stone_paths_arm.is_some());
+        assert_eq!(stone_paths_arm.unwrap(), "/opt/src/stone-common");
+
+        // Test x86_64 target - should also use the base (stone-common)
+        let stone_paths_x86 = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap();
+        assert!(stone_paths_x86.is_some());
+        assert_eq!(stone_paths_x86.unwrap(), "/opt/src/stone-common");
+    }
+
+    #[test]
     fn test_stone_include_paths_empty_array() {
         let config_content = r#"
 [sdk]
@@ -3715,4 +3758,3 @@ stone_include_paths = []
         assert!(stone_paths.is_none());
     }
 }
-
