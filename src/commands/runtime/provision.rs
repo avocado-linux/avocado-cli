@@ -103,6 +103,15 @@ impl RuntimeProvisionCommand {
             env_vars.insert("AVOCADO_PROVISION_OUT".to_string(), container_out_path);
         }
 
+        // Set AVOCADO_STONE_INCLUDE_PATHS if configured
+        if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
+            &self.config.runtime_name,
+            &target_arch,
+            &self.config.config_path,
+        )? {
+            env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
+        }
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {

@@ -94,6 +94,22 @@ impl RuntimeBuildCommand {
             );
         }
 
+        // Get stone include paths if configured
+        let mut env_vars = std::collections::HashMap::new();
+        if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
+            &self.runtime_name,
+            &target_arch,
+            &self.config_path,
+        )? {
+            env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
+        }
+
+        let env_vars = if env_vars.is_empty() {
+            None
+        } else {
+            Some(env_vars)
+        };
+
         let config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.clone(),
@@ -105,6 +121,7 @@ impl RuntimeBuildCommand {
             repo_release,
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            env_vars,
             ..Default::default()
         };
         let complete_result = container_helper
