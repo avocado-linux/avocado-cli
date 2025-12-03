@@ -34,6 +34,7 @@ pub struct RuntimeConfig {
     pub target: Option<String>,
     pub dependencies: Option<HashMap<String, toml::Value>>,
     pub stone_include_paths: Option<Vec<String>>,
+    pub stone_manifest: Option<String>,
 }
 
 /// SDK configuration section
@@ -457,6 +458,37 @@ impl Config {
                 .collect();
 
             Ok(Some(container_paths.join(" ")))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get stone manifest for a runtime and convert it to a container path
+    /// Returns the absolute path from the container's perspective (e.g., "/opt/src/stone-qemux86-64.json")
+    pub fn get_stone_manifest_for_runtime<P: AsRef<Path>>(
+        &self,
+        runtime_name: &str,
+        target: &str,
+        config_path: P,
+    ) -> Result<Option<String>> {
+        // Get merged runtime config to include target-specific overrides
+        let config_path_str = config_path
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in config path"))?;
+        let merged_runtime =
+            self.get_merged_runtime_config(runtime_name, target, config_path_str)?;
+
+        // Extract stone_manifest value
+        let stone_manifest: Option<String> = merged_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.get("stone_manifest"))
+            .and_then(|manifest| manifest.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(manifest_path) = stone_manifest {
+            // Convert to container path (/opt/src/<path>)
+            Ok(Some(format!("/opt/src/{}", manifest_path)))
         } else {
             Ok(None)
         }
@@ -3756,5 +3788,129 @@ stone_include_paths = []
 
         // Empty array should return None
         assert!(stone_paths.is_none());
+    }
+
+    #[test]
+    fn test_stone_manifest_basic() {
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:latest"
+
+[runtime.test-runtime]
+target = "x86_64"
+stone_manifest = "stone-manifest.json"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_manifest = config
+            .get_stone_manifest_for_runtime("test-runtime", "x86_64", temp_file.path())
+            .unwrap();
+
+        assert!(stone_manifest.is_some());
+        assert_eq!(stone_manifest.unwrap(), "/opt/src/stone-manifest.json");
+    }
+
+    #[test]
+    fn test_stone_manifest_not_configured() {
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:latest"
+
+[runtime.test-runtime]
+target = "x86_64"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_manifest = config
+            .get_stone_manifest_for_runtime("test-runtime", "x86_64", temp_file.path())
+            .unwrap();
+
+        assert!(stone_manifest.is_none());
+    }
+
+    #[test]
+    fn test_stone_manifest_target_specific_override() {
+        // Test the exact example from the user's request
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:latest"
+
+[runtime.dev]
+stone_manifest = "stone-common.json"
+
+[runtime.dev.qemux86-64]
+stone_manifest = "stone-qemux86-64.json"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+
+        // Test qemux86-64 target - should use the override
+        let stone_manifest_qemu = config
+            .get_stone_manifest_for_runtime("dev", "qemux86-64", temp_file.path())
+            .unwrap();
+        assert!(stone_manifest_qemu.is_some());
+        assert_eq!(
+            stone_manifest_qemu.unwrap(),
+            "/opt/src/stone-qemux86-64.json"
+        );
+
+        // Test aarch64 target - should use the base
+        let stone_manifest_arm = config
+            .get_stone_manifest_for_runtime("dev", "aarch64", temp_file.path())
+            .unwrap();
+        assert!(stone_manifest_arm.is_some());
+        assert_eq!(stone_manifest_arm.unwrap(), "/opt/src/stone-common.json");
+
+        // Test x86_64 target - should also use the base
+        let stone_manifest_x86 = config
+            .get_stone_manifest_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap();
+        assert!(stone_manifest_x86.is_some());
+        assert_eq!(stone_manifest_x86.unwrap(), "/opt/src/stone-common.json");
+    }
+
+    #[test]
+    fn test_stone_manifest_only_target_specific() {
+        // Test when stone_manifest is only defined in target-specific section
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:latest"
+
+[runtime.dev]
+target = "x86_64"
+
+[runtime.dev.qemux86-64]
+stone_manifest = "stone-qemux86-64.json"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+
+        // Test qemux86-64 target - should have the manifest
+        let stone_manifest_qemu = config
+            .get_stone_manifest_for_runtime("dev", "qemux86-64", temp_file.path())
+            .unwrap();
+        assert!(stone_manifest_qemu.is_some());
+        assert_eq!(
+            stone_manifest_qemu.unwrap(),
+            "/opt/src/stone-qemux86-64.json"
+        );
+
+        // Test other targets - should not have a manifest
+        let stone_manifest_arm = config
+            .get_stone_manifest_for_runtime("dev", "aarch64", temp_file.path())
+            .unwrap();
+        assert!(stone_manifest_arm.is_none());
     }
 }

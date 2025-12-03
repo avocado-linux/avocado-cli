@@ -112,6 +112,15 @@ impl RuntimeProvisionCommand {
             env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
         }
 
+        // Set AVOCADO_STONE_MANIFEST if configured
+        if let Some(stone_manifest) = config.get_stone_manifest_for_runtime(
+            &self.config.runtime_name,
+            &target_arch,
+            &self.config.config_path,
+        )? {
+            env_vars.insert("AVOCADO_STONE_MANIFEST".to_string(), stone_manifest);
+        }
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {
