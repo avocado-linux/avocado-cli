@@ -12,7 +12,6 @@ ext:
     packages:
     - nginx
     dependencies:
-      external-dep: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          ext: external-extension
-          config: external-config.toml
+      external-dep:
+        ext: external-extension
+        config: external-config.toml

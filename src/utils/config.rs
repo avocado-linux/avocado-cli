@@ -301,6 +301,42 @@ impl Config {
         let path = config_path.as_ref();
 
         if !path.exists() {
+            // If a YAML file is requested but doesn't exist, check for a TOML version
+            let is_yaml_request = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "yaml" || e == "yml")
+                .unwrap_or(false);
+
+            if is_yaml_request {
+                // Try to find a corresponding TOML file
+                let toml_path = path.with_extension("toml");
+                if toml_path.exists() {
+                    println!(
+                        "⚠ Found legacy TOML config file: {}. Migrating to YAML format...",
+                        toml_path.display()
+                    );
+
+                    // Migrate TOML to YAML
+                    let migrated_path = Self::migrate_toml_to_yaml(&toml_path)?;
+
+                    // Load the migrated YAML file
+                    let content = fs::read_to_string(&migrated_path).with_context(|| {
+                        format!(
+                            "Failed to read migrated config file: {}",
+                            migrated_path.display()
+                        )
+                    })?;
+
+                    return Self::load_from_yaml_str(&content).with_context(|| {
+                        format!(
+                            "Failed to parse migrated YAML config file: {}",
+                            migrated_path.display()
+                        )
+                    });
+                }
+            }
+
             return Err(ConfigError::FileNotFound(path.display().to_string()).into());
         }
 

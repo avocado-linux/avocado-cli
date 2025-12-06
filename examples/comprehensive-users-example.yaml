@@ -14,12 +14,10 @@ ext:
     - nginx
     - postgresql
     users:
-      root: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          password: ''
-      guest: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          password: '*'
+      root:
+        password: ''
+      guest:
+        password: '*'
       alice:
         password: $6$salt$hash
         uid: 1001
@@ -72,12 +70,10 @@ ext:
         groups:
         - users
     groups:
-      users: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          gid: 1000
-      sudo: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          gid: 27
+      users:
+        gid: 1000
+      sudo:
+        gid: 27
       developers:
         gid: 2000
         members:

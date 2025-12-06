@@ -17,9 +17,8 @@ ext:
     confext: true
     dependencies:
       cryptoauthlib: '*'
-      pingpong: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          compile: pingpong
+      pingpong:
+        compile: pingpong
   ext-2:
     sysext: false
     confext: true

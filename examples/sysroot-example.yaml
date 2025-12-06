@@ -15,8 +15,7 @@ ext:
     types:
     - sysext
     dependencies:
-      my-app: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          compile: my-app
-          install: ext-install-example.sh
+      my-app:
+        compile: my-app
+        install: ext-install-example.sh
       some-package: 1.0.0

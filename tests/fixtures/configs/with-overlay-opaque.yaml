@@ -9,7 +9,6 @@ ext:
     types:
     - sysext
     - confext
-    overlay: !!python/object/new:toml.decoder.DynamicInlineTableDict
-      dictitems:
-        dir: peridio-overlay
-        mode: opaque
+    overlay:
+      dir: peridio-overlay
+      mode: opaque

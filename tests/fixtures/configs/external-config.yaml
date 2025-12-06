@@ -9,7 +9,6 @@ ext:
     packages:
     - curl
     dependencies:
-      nested-dep: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          ext: nested-extension
-          config: nested-config.toml
+      nested-dep:
+        ext: nested-extension
+        config: nested-config.toml

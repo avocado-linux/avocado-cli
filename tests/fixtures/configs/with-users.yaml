@@ -13,9 +13,8 @@ ext:
     - vim
     - curl
     users:
-      root: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          password: ''
+      root:
+        password: ''
       avocado:
         uid: 1000
         groups:
@@ -25,6 +24,5 @@ ext:
         home: /home/avocado
         shell: /bin/bash
     groups:
-      avocado: !!python/object/new:toml.decoder.DynamicInlineTableDict
-        dictitems:
-          gid: 1000
+      avocado:
+        gid: 1000
