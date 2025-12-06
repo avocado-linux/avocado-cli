@@ -1,0 +1,28 @@
+default_target: qemux86-64
+runtime:
+  default:
+    target: qemux86-64
+sdk:
+  image: docker.io/avocadolinux/sdk:dev
+  dependencies:
+    nativesdk-qemu-system-x86-64: '*'
+  compile:
+    pingpong:
+      compile: pingpong-compile.sh
+      dependencies:
+        libcryptoauth-dev: '*'
+ext:
+  ext-1:
+    sysext: true
+    confext: true
+    dependencies:
+      cryptoauthlib: '*'
+      pingpong: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          compile: pingpong
+  ext-2:
+    sysext: false
+    confext: true
+  ext-3:
+    sysext: true
+    confext: false

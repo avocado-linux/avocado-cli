@@ -227,8 +227,7 @@ $DNF_SDK_HOST \
 
                     if !install_success {
                         return Err(anyhow::anyhow!(
-                            "Failed to install dependencies for compile section '{}'.",
-                            section_name
+                            "Failed to install dependencies for compile section '{section_name}'."
                         ));
                     }
                 } else {
@@ -251,18 +250,18 @@ $DNF_SDK_HOST \
     }
 
     /// Build a list of packages from dependencies HashMap
-    fn build_package_list(&self, dependencies: &HashMap<String, toml::Value>) -> Vec<String> {
+    fn build_package_list(&self, dependencies: &HashMap<String, serde_yaml::Value>) -> Vec<String> {
         let mut packages = Vec::new();
 
         for (package_name, version) in dependencies {
             match version {
-                toml::Value::String(v) if v == "*" => {
+                serde_yaml::Value::String(v) if v == "*" => {
                     packages.push(package_name.clone());
                 }
-                toml::Value::String(v) => {
+                serde_yaml::Value::String(v) => {
                     packages.push(format!("{package_name}-{v}"));
                 }
-                toml::Value::Table(_) => {
+                serde_yaml::Value::Mapping(_) => {
                     // Handle dictionary version format like {'core2_64': '*'}
                     packages.push(package_name.clone());
                 }
@@ -279,17 +278,20 @@ $DNF_SDK_HOST \
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::Value;
     use std::collections::HashMap;
-    use toml::Value;
 
     #[test]
     fn test_build_package_list() {
-        let cmd = SdkInstallCommand::new("test.toml".to_string(), false, false, None, None, None);
+        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
 
         let mut deps = HashMap::new();
         deps.insert("package1".to_string(), Value::String("*".to_string()));
         deps.insert("package2".to_string(), Value::String("1.0.0".to_string()));
-        deps.insert("package3".to_string(), Value::Table(toml::map::Map::new()));
+        deps.insert(
+            "package3".to_string(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
 
         let packages = cmd.build_package_list(&deps);
 

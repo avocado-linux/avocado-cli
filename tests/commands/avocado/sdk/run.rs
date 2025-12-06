@@ -19,7 +19,7 @@ fn test_sdk_run_echo() {
         .join("tests")
         .join("fixtures")
         .join("configs")
-        .join("minimal.toml");
+        .join("minimal.yaml");
     common::assert_cmd(
         &["sdk", "run", "--", "echo", "test"],
         None,

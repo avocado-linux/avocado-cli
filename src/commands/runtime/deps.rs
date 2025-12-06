@@ -20,7 +20,7 @@ impl RuntimeDepsCommand {
     pub fn execute(&self) -> Result<()> {
         let _config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         self.validate_runtime_exists(&parsed)?;
         let dependencies = self.list_runtime_dependencies(&parsed, &self.runtime_name)?;
@@ -34,7 +34,7 @@ impl RuntimeDepsCommand {
         Ok(())
     }
 
-    fn validate_runtime_exists(&self, parsed: &toml::Value) -> Result<()> {
+    fn validate_runtime_exists(&self, parsed: &serde_yaml::Value) -> Result<()> {
         let runtime_config = parsed
             .get("runtime")
             .context("No runtime configuration found")?;
@@ -54,7 +54,7 @@ impl RuntimeDepsCommand {
 
     fn list_runtime_dependencies(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         runtime_name: &str,
     ) -> Result<Vec<(String, String, String)>> {
         let runtime_config = parsed
@@ -65,14 +65,18 @@ impl RuntimeDepsCommand {
             .get(runtime_name)
             .with_context(|| format!("Runtime '{runtime_name}' not found"))?;
 
-        let runtime_deps = runtime_spec.get("dependencies").and_then(|v| v.as_table());
+        let runtime_deps = runtime_spec
+            .get("dependencies")
+            .and_then(|v| v.as_mapping());
 
         let mut dependencies = Vec::new();
 
         if let Some(deps_table) = runtime_deps {
-            for (dep_name, dep_spec) in deps_table {
-                if let Some(dependency) = self.resolve_dependency(parsed, dep_name, dep_spec) {
-                    dependencies.push(dependency);
+            for (dep_name_val, dep_spec) in deps_table {
+                if let Some(dep_name) = dep_name_val.as_str() {
+                    if let Some(dependency) = self.resolve_dependency(parsed, dep_name, dep_spec) {
+                        dependencies.push(dependency);
+                    }
                 }
             }
         }
@@ -83,9 +87,9 @@ impl RuntimeDepsCommand {
 
     fn resolve_dependency(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         dep_name: &str,
-        dep_spec: &toml::Value,
+        dep_spec: &serde_yaml::Value,
     ) -> Option<(String, String, String)> {
         // Try to resolve as extension reference first
         if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
@@ -109,12 +113,12 @@ impl RuntimeDepsCommand {
 
     fn resolve_extension_dependency(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         ext_name: &str,
     ) -> (String, String, String) {
         let version = parsed
             .get("ext")
-            .and_then(|ext_config| ext_config.as_table())
+            .and_then(|ext_config| ext_config.as_mapping())
             .and_then(|ext_table| ext_table.get(ext_name))
             .and_then(|ext_spec| ext_spec.get("version"))
             .and_then(|v| v.as_str())
@@ -126,7 +130,7 @@ impl RuntimeDepsCommand {
     fn resolve_package_dependency(
         &self,
         dep_name: &str,
-        dep_spec: &toml::Value,
+        dep_spec: &serde_yaml::Value,
     ) -> (String, String, String) {
         let version = dep_spec
             .get("version")
@@ -152,42 +156,46 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
-        let config_path = temp_dir.path().join("avocado.toml");
+        let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
     }
 
     fn create_test_config_content() -> &'static str {
         r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.test-runtime]
-target = "x86_64"
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      gcc:
+        version: "11.0"
+      app-ext:
+        ext: my-extension
 
-[runtime.test-runtime.dependencies]
-gcc = { version = "11.0" }
-app-ext = { ext = "my-extension" }
-
-[ext.my-extension]
-version = "2.0.0"
-types = ["sysext"]
+ext:
+  my-extension:
+    version: "2.0.0"
+    types:
+      - sysext
 "#
     }
 
     #[test]
     fn test_new() {
-        let cmd = RuntimeDepsCommand::new("avocado.toml".to_string(), "test-runtime".to_string());
+        let cmd = RuntimeDepsCommand::new("avocado.yaml".to_string(), "test-runtime".to_string());
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert_eq!(cmd.runtime_name, "test-runtime");
     }
 
     #[test]
     fn test_list_runtime_dependencies() {
         let config_content = create_test_config_content();
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
-        let cmd = RuntimeDepsCommand::new("avocado.toml".to_string(), "test-runtime".to_string());
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeDepsCommand::new("avocado.yaml".to_string(), "test-runtime".to_string());
 
         let deps = cmd
             .list_runtime_dependencies(&parsed, "test-runtime")

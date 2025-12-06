@@ -1,0 +1,55 @@
+default_target: raspberrypi4
+supported_targets:
+- raspberrypi4
+runtime:
+  dev:
+    dependencies:
+      avocado-img-bootfiles: '*'
+      avocado-img-rootfs: '*'
+      avocado-img-initramfs: '*'
+      avocado-ext-dev:
+        ext: avocado-ext-dev
+        vsn: '*'
+      avocado-ext-sshd-dev:
+        ext: avocado-ext-sshd-dev
+        vsn: '*'
+      config:
+        ext: config
+      app:
+        ext: app
+ext:
+  app:
+    types:
+    - sysext
+    - confext
+    version: 0.1.0
+    dependencies: {}
+  config:
+    types:
+    - confext
+    version: 0.1.0
+    users:
+      root:
+        password: ''
+sdk:
+  image: docker.io/avocadolinux/sdk:apollo-edge
+  dependencies:
+    avocado-sdk-toolchain: '*'
+  raspberrypi4:
+    container_args:
+    - --network=host
+provision:
+  img:
+    container_args:
+    - -v
+    - /dev:/dev
+    - -v
+    - /sys:/sys:ro
+    - --privileged
+  sd:
+    container_args:
+    - -v
+    - /dev:/dev
+    - -v
+    - /sys:/sys:ro
+    - --privileged

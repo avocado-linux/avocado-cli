@@ -8,7 +8,7 @@ use clap::Args;
 #[derive(Args, Debug)]
 pub struct HitlServerCommand {
     /// Path to the avocado.toml configuration file
-    #[arg(short, long, default_value = "avocado.toml")]
+    #[arg(short, long, default_value = "avocado.yaml")]
     pub config_path: String,
 
     /// Extensions to create NFS exports for
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn test_generate_export_setup_commands_without_port() {
         let cmd = HitlServerCommand {
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             extensions: vec![],
             container_args: None,
             dnf_args: None,
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn test_generate_export_setup_commands_with_port() {
         let cmd = HitlServerCommand {
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             extensions: vec![],
             container_args: None,
             dnf_args: None,
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn test_generate_export_setup_commands_with_port_and_verbose() {
         let cmd = HitlServerCommand {
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             extensions: vec![],
             container_args: None,
             dnf_args: None,
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn test_generate_export_setup_commands_with_extensions_and_port() {
         let cmd = HitlServerCommand {
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             extensions: vec!["ext1".to_string(), "ext2".to_string()],
             container_args: None,
             dnf_args: None,

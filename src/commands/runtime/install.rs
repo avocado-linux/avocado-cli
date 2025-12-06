@@ -40,7 +40,7 @@ impl RuntimeInstallCommand {
         // Load the configuration and parse raw TOML
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -73,7 +73,7 @@ impl RuntimeInstallCommand {
         let runtimes_to_install = if let Some(runtime_name) = &self.runtime {
             // Single runtime specified
             if !runtime_section
-                .as_table()
+                .as_mapping()
                 .unwrap()
                 .contains_key(runtime_name)
             {
@@ -86,8 +86,11 @@ impl RuntimeInstallCommand {
             vec![runtime_name.clone()]
         } else {
             // No runtime specified - install for all runtimes
-            match runtime_section.as_table() {
-                Some(table) => table.keys().cloned().collect(),
+            match runtime_section.as_mapping() {
+                Some(table) => table
+                    .keys()
+                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .collect(),
                 None => vec![],
             }
         };
@@ -153,7 +156,7 @@ impl RuntimeInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn install_single_runtime(
         &self,
-        config_toml: &toml::Value,
+        config_toml: &serde_yaml::Value,
         config: &crate::utils::config::Config,
         runtime: &str,
         container_helper: &SdkContainer,
@@ -235,19 +238,29 @@ impl RuntimeInstallCommand {
             .as_ref()
             .and_then(|merged| merged.get("dependencies"));
 
-        if let Some(toml::Value::Table(deps_map)) = dependencies {
+        if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install (excluding extension references)
             let mut packages = Vec::new();
-            for (package_name, version_spec) in deps_map {
+            for (package_name_val, version_spec) in deps_map {
+                // Convert package name from Value to String
+                let package_name = match package_name_val.as_str() {
+                    Some(name) => name,
+                    None => continue, // Skip if package name is not a string
+                };
+
                 // Skip extension dependencies (identified by 'ext' key)
                 // Note: Extension dependencies are handled by the main install command,
                 // not by individual runtime install
-                if let toml::Value::Table(spec_map) = version_spec {
-                    if spec_map.contains_key("ext") {
+                if let serde_yaml::Value::Mapping(spec_map) = version_spec {
+                    if spec_map.contains_key(serde_yaml::Value::String("ext".to_string())) {
                         if self.verbose {
-                            let dep_type = if spec_map.contains_key("vsn") {
+                            let dep_type = if spec_map
+                                .contains_key(serde_yaml::Value::String("vsn".to_string()))
+                            {
                                 "versioned extension"
-                            } else if spec_map.contains_key("config") {
+                            } else if spec_map
+                                .contains_key(serde_yaml::Value::String("config".to_string()))
+                            {
                                 "external extension"
                             } else {
                                 "local extension"
@@ -264,23 +277,23 @@ impl RuntimeInstallCommand {
                 let package_name_and_version = if version_spec.as_str().is_some() {
                     let version = version_spec.as_str().unwrap();
                     if version == "*" {
-                        package_name.clone()
+                        package_name.to_string()
                     } else {
                         format!("{package_name}-{version}")
                     }
-                } else if let toml::Value::Table(spec_map) = version_spec {
+                } else if let serde_yaml::Value::Mapping(spec_map) = version_spec {
                     if let Some(version) = spec_map.get("version") {
                         let version = version.as_str().unwrap_or("*");
                         if version == "*" {
-                            package_name.clone()
+                            package_name.to_string()
                         } else {
                             format!("{package_name}-{version}")
                         }
                     } else {
-                        package_name.clone()
+                        package_name.to_string()
                     }
                 } else {
-                    package_name.clone()
+                    package_name.to_string()
                 };
 
                 packages.push(package_name_and_version);
@@ -378,7 +391,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
-        let config_path = temp_dir.path().join("avocado.toml");
+        let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
     }
@@ -387,7 +400,7 @@ mod tests {
     fn test_new() {
         let cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             false,
             Some("x86_64".to_string()),
@@ -396,7 +409,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert!(!cmd.force);
         assert_eq!(cmd.target, Some("x86_64".to_string()));
@@ -406,7 +419,7 @@ mod tests {
     fn test_new_all_runtimes() {
         let cmd = RuntimeInstallCommand::new(
             None,
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             true,
             true,
             None,
@@ -415,7 +428,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime, None);
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(cmd.verbose);
         assert!(cmd.force);
         assert_eq!(cmd.target, None);
@@ -427,8 +440,8 @@ mod tests {
     async fn test_execute_no_runtime_section() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
@@ -451,11 +464,12 @@ image = "test-image"
     async fn test_execute_runtime_not_found() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.other-runtime]
-target = "x86_64"
+runtime:
+  other-runtime:
+    target: "x86_64"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
@@ -478,11 +492,11 @@ target = "x86_64"
     async fn test_execute_no_sdk_config() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[runtime.test-runtime]
-target = "x86_64"
-
-[runtime.test-runtime.dependencies]
-gcc = "11.0"
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      gcc: "11.0"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
@@ -509,14 +523,14 @@ gcc = "11.0"
     async fn test_execute_no_container_image() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-# Missing image field
+sdk:
+  # Missing image field
 
-[runtime.test-runtime]
-target = "x86_64"
-
-[runtime.test-runtime.dependencies]
-gcc = "11.0"
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      gcc: "11.0"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 

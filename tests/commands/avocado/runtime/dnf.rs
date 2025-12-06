@@ -19,7 +19,7 @@ fn test_dnf_missing_config() {
             "runtime",
             "dnf",
             "-C",
-            "nonexistent.toml",
+            "nonexistent.yaml",
             "-r",
             "test-runtime",
             "list",

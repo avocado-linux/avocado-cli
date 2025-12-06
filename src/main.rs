@@ -89,8 +89,8 @@ enum Commands {
     },
     /// Install all components (SDK, extensions, and runtime dependencies)
     Install {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -119,8 +119,8 @@ enum Commands {
     },
     /// Build all components (SDK compile, extensions, and runtime images)
     Build {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -143,8 +143,8 @@ enum Commands {
     },
     /// Fetch and refresh repository metadata for sysroots
     Fetch {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -167,8 +167,8 @@ enum Commands {
     },
     /// Provision a runtime (shortcut for 'runtime provision')
     Provision {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -200,8 +200,8 @@ enum Commands {
     },
     /// Deploy a runtime to a device (shortcut for 'runtime deploy')
     Deploy {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -228,8 +228,8 @@ enum Commands {
 enum SdkCommands {
     /// Create and run an SDK container
     Run {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Target architecture
         #[arg(short, long)]
@@ -273,8 +273,8 @@ enum SdkCommands {
     },
     /// List SDK dependencies
     Deps {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Target architecture
         #[arg(short, long)]
@@ -288,8 +288,8 @@ enum SdkCommands {
     },
     /// Run compile scripts
     Compile {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -308,8 +308,8 @@ enum SdkCommands {
     },
     /// Run DNF commands in the SDK context
     Dnf {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -329,8 +329,8 @@ enum SdkCommands {
     },
     /// Install dependencies into the SDK
     Install {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -350,8 +350,8 @@ enum SdkCommands {
     },
     /// Remove the SDK directory
     Clean {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -372,8 +372,8 @@ enum SdkCommands {
 enum RuntimeCommands {
     /// Install dependencies into runtime installroots
     Install {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -396,8 +396,8 @@ enum RuntimeCommands {
     },
     /// Build a runtime
     Build {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -420,8 +420,8 @@ enum RuntimeCommands {
     },
     /// Provision a runtime
     Provision {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -453,8 +453,8 @@ enum RuntimeCommands {
     },
     /// List runtime names
     List {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Target architecture
         #[arg(short, long)]
@@ -462,8 +462,8 @@ enum RuntimeCommands {
     },
     /// List dependencies for a runtime
     Deps {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Runtime name to list dependencies for
         #[arg(short = 'r', long = "runtime", required = true)]
@@ -474,8 +474,8 @@ enum RuntimeCommands {
     },
     /// Run DNF commands in a runtime's context
     Dnf {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -498,8 +498,8 @@ enum RuntimeCommands {
     },
     /// Clean runtime installroot directory
     Clean {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -519,8 +519,8 @@ enum RuntimeCommands {
     },
     /// Deploy a runtime to a device
     Deploy {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1180,8 +1180,8 @@ async fn main() -> Result<()> {
 enum ExtCommands {
     /// Install dependencies into extension sysroots
     Install {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1204,8 +1204,8 @@ enum ExtCommands {
     },
     /// Build sysext and/or confext extensions from configuration
     Build {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1225,8 +1225,8 @@ enum ExtCommands {
     },
     /// List extension names
     List {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Target architecture
         #[arg(short, long)]
@@ -1234,8 +1234,8 @@ enum ExtCommands {
     },
     /// List dependencies for extensions
     Deps {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Name of the extension to show dependencies for (if not provided, shows all extensions)
         #[arg(short = 'e', long = "extension")]
@@ -1246,8 +1246,8 @@ enum ExtCommands {
     },
     /// Run DNF commands in an extension's context
     Dnf {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1270,8 +1270,8 @@ enum ExtCommands {
     },
     /// Clean an extension's sysroot
     Clean {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1291,8 +1291,8 @@ enum ExtCommands {
     },
     /// Check out files from extension sysroot to source directory
     Checkout {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1315,8 +1315,8 @@ enum ExtCommands {
     },
     /// Create squashfs image from system extension
     Image {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1336,8 +1336,8 @@ enum ExtCommands {
     },
     /// Package extension sysroot into an RPM
     Package {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
@@ -1364,8 +1364,8 @@ enum ExtCommands {
 enum HitlCommands {
     /// Start a HITL server container with preconfigured settings
     Server {
-        /// Path to avocado.toml configuration file
-        #[arg(short = 'C', long, default_value = "avocado.toml")]
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config_path: String,
         /// Extensions to create NFS exports for
         #[arg(short, long = "extension")]

@@ -4,7 +4,7 @@ use tempfile::TempDir;
 use avocado_cli::commands::runtime::RuntimeInstallCommand;
 
 fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
-    let config_path = temp_dir.path().join("avocado.toml");
+    let config_path = temp_dir.path().join("avocado.yaml");
     fs::write(&config_path, content).unwrap();
     config_path.to_string_lossy().to_string()
 }
@@ -13,7 +13,7 @@ fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
 fn test_new() {
     let cmd = RuntimeInstallCommand::new(
         Some("test-runtime".to_string()),
-        "avocado.toml".to_string(),
+        "avocado.yaml".to_string(),
         false,
         false,
         Some("x86_64".to_string()),
@@ -22,7 +22,7 @@ fn test_new() {
     );
 
     assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
-    assert_eq!(cmd.config_path, "avocado.toml");
+    assert_eq!(cmd.config_path, "avocado.yaml");
     assert!(!cmd.verbose);
     assert!(!cmd.force);
     assert_eq!(cmd.target, Some("x86_64".to_string()));
@@ -32,7 +32,7 @@ fn test_new() {
 fn test_new_all_runtimes() {
     let cmd = RuntimeInstallCommand::new(
         None,
-        "avocado.toml".to_string(),
+        "avocado.yaml".to_string(),
         true,
         true,
         None,
@@ -41,7 +41,7 @@ fn test_new_all_runtimes() {
     );
 
     assert_eq!(cmd.runtime, None);
-    assert_eq!(cmd.config_path, "avocado.toml");
+    assert_eq!(cmd.config_path, "avocado.yaml");
     assert!(cmd.verbose);
     assert!(cmd.force);
     assert_eq!(cmd.target, None);

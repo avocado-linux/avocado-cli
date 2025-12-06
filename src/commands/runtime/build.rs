@@ -39,7 +39,7 @@ impl RuntimeBuildCommand {
         // Load configuration and parse raw TOML
         let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Process container args with environment variable expansion
         let processed_container_args =
@@ -149,7 +149,7 @@ impl RuntimeBuildCommand {
         Ok(())
     }
 
-    fn create_build_script(&self, parsed: &toml::Value, target_arch: &str) -> Result<String> {
+    fn create_build_script(&self, parsed: &serde_yaml::Value, target_arch: &str) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
         let config = crate::utils::config::Config::load(&self.config_path)?;
         let merged_runtime = config
@@ -161,10 +161,10 @@ impl RuntimeBuildCommand {
                 )
             })?;
 
-        let binding = toml::map::Map::new();
+        let binding = serde_yaml::Mapping::new();
         let runtime_deps = merged_runtime
             .get("dependencies")
-            .and_then(|v| v.as_table())
+            .and_then(|v| v.as_mapping())
             .unwrap_or(&binding);
 
         // Extract extension names and any type overrides from runtime dependencies
@@ -178,7 +178,7 @@ impl RuntimeBuildCommand {
                 required_extensions.insert(ext_name.to_string());
 
                 // Check if the runtime dependency specifies custom types
-                if let Some(types) = dep_spec.get("types").and_then(|v| v.as_array()) {
+                if let Some(types) = dep_spec.get("types").and_then(|v| v.as_sequence()) {
                     let type_strings: Vec<String> = types
                         .iter()
                         .filter_map(|v| v.as_str())
@@ -200,18 +200,19 @@ impl RuntimeBuildCommand {
         let mut processed_extensions = HashSet::new();
 
         // Process local extensions defined in [ext.*] sections
-        if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_table()) {
-            for (ext_name, ext_data) in ext_config {
-                // Only process extensions that are required by this runtime
-                if all_required_extensions.contains(ext_name) {
-                    // Get version from extension config
-                    let ext_version = ext_data
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0.1.0");
+        if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_mapping()) {
+            for (ext_name_val, ext_data) in ext_config {
+                if let Some(ext_name) = ext_name_val.as_str() {
+                    // Only process extensions that are required by this runtime
+                    if all_required_extensions.contains(ext_name) {
+                        // Get version from extension config
+                        let ext_version = ext_data
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0.1.0");
 
-                    symlink_commands.push(format!(
-                        r#"
+                        symlink_commands.push(format!(
+                            r#"
 OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw
 RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}-{ext_version}.raw
 
@@ -222,8 +223,9 @@ if [ -f "$OUTPUT_EXT" ]; then
 else
     echo "Missing image for extension {ext_name}-{ext_version}."
 fi"#
-                    ));
-                    processed_extensions.insert(ext_name.clone());
+                        ));
+                        processed_extensions.insert(ext_name.to_string());
+                    }
                 }
             }
         }
@@ -357,16 +359,17 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 
         // Load the main config to check for local extensions
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Check if this is a local extension
         if let Some(ext_config) = parsed
             .get("ext")
-            .and_then(|e| e.as_table())
+            .and_then(|e| e.as_mapping())
             .and_then(|table| table.get(ext_name))
         {
             // This is a local extension - check its dependencies
-            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_mapping())
+            {
                 for (_dep_name, dep_spec) in dependencies {
                     if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
                         // Check if this is an external extension dependency
@@ -391,7 +394,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                             // Process its dependencies from the external config
                             if let Some(ext_config) = external_extensions.get(nested_ext_name) {
                                 if let Some(nested_deps) =
-                                    ext_config.get("dependencies").and_then(|d| d.as_table())
+                                    ext_config.get("dependencies").and_then(|d| d.as_mapping())
                                 {
                                     for (_nested_dep_name, nested_dep_spec) in nested_deps {
                                         if let Some(nested_nested_ext_name) =
@@ -435,7 +438,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 
             if let Some(runtime_deps) = merged_runtime
                 .get("dependencies")
-                .and_then(|v| v.as_table())
+                .and_then(|v| v.as_mapping())
             {
                 for (_dep_name, dep_spec) in runtime_deps {
                     if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
@@ -451,7 +454,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 
                                 if let Some(ext_config) = external_extensions.get(ext_name) {
                                     if let Some(nested_deps) =
-                                        ext_config.get("dependencies").and_then(|d| d.as_table())
+                                        ext_config.get("dependencies").and_then(|d| d.as_mapping())
                                     {
                                         for (_nested_dep_name, nested_dep_spec) in nested_deps {
                                             if let Some(nested_ext_name) =
@@ -487,7 +490,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
-        let config_path = temp_dir.path().join("avocado.toml");
+        let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
     }
@@ -496,7 +499,7 @@ mod tests {
     fn test_new() {
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("x86_64".to_string()),
             None,
@@ -504,7 +507,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime_name, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert_eq!(cmd.target, Some("x86_64".to_string()));
     }
@@ -513,17 +516,18 @@ mod tests {
     fn test_create_build_script() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.test-runtime]
-target = "x86_64"
-
-[runtime.test-runtime.dependencies]
-test-dep = { ext = "test-ext" }
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      test-dep:
+        ext: test-ext
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
             config_path,
@@ -546,21 +550,24 @@ test-dep = { ext = "test-ext" }
     fn test_create_build_script_with_extensions() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.test-runtime]
-target = "x86_64"
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      test-dep:
+        ext: test-ext
 
-[runtime.test-runtime.dependencies]
-test-dep = { ext = "test-ext" }
-
-[ext.test-ext]
-version = "1.0.0"
-types = ["sysext"]
+ext:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
             config_path,
@@ -582,21 +589,27 @@ types = ["sysext"]
     fn test_create_build_script_with_type_overrides() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.test-runtime]
-target = "x86_64"
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      test-dep:
+        ext: test-ext
+        types:
+          - sysext
 
-[runtime.test-runtime.dependencies]
-test-dep = { ext = "test-ext", types = ["sysext"] }
-
-[ext.test-ext]
-version = "1.0.0"
-types = ["sysext", "confext"]
+ext:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+      - confext
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
             config_path,
@@ -620,21 +633,24 @@ types = ["sysext", "confext"]
     fn test_create_build_script_no_type_override_uses_extension_defaults() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.test-runtime]
-target = "x86_64"
+runtime:
+  test-runtime:
+    target: "x86_64"
+    dependencies:
+      test-dep:
+        ext: test-ext
 
-[runtime.test-runtime.dependencies]
-test-dep = { ext = "test-ext" }
-
-[ext.test-ext]
-version = "1.0.0"
-types = ["confext"]
+ext:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - confext
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let cmd = RuntimeBuildCommand::new(
             "test-runtime".to_string(),
             config_path,

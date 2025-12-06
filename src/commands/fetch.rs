@@ -56,7 +56,7 @@ impl FetchCommand {
         // Load configuration
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let config_toml: toml::Value = toml::from_str(&content)?;
+        let config_toml: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
@@ -143,7 +143,7 @@ impl FetchCommand {
 
     async fn fetch_extension_metadata(
         &self,
-        config_toml: &toml::Value,
+        config_toml: &serde_yaml::Value,
         extension: &str,
         container_config: &ContainerConfig<'_>,
     ) -> Result<()> {
@@ -244,7 +244,7 @@ $DNF_SDK_HOST \
 
     async fn fetch_runtime_metadata(
         &self,
-        config_toml: &toml::Value,
+        config_toml: &serde_yaml::Value,
         runtime: &str,
         container_config: &ContainerConfig<'_>,
     ) -> Result<()> {
@@ -345,7 +345,7 @@ $DNF_SDK_HOST \
 
     async fn fetch_all_metadata(
         &self,
-        config_toml: &toml::Value,
+        config_toml: &serde_yaml::Value,
         container_config: &ContainerConfig<'_>,
     ) -> Result<()> {
         print_info(
@@ -363,17 +363,21 @@ $DNF_SDK_HOST \
         self.fetch_sdk_target_metadata(container_config).await?;
 
         // 4. Fetch all extension metadata (including nested external extensions)
-        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_table()) {
-            for extension_name in extensions.keys() {
-                if let Err(e) = self
-                    .fetch_extension_metadata(config_toml, extension_name, container_config)
-                    .await
-                {
-                    print_error(
-                        &format!("Failed to fetch metadata for extension '{extension_name}': {e}"),
-                        OutputLevel::Normal,
-                    );
-                    // Continue with other extensions instead of failing completely
+        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_mapping()) {
+            for extension_name_val in extensions.keys() {
+                if let Some(extension_name) = extension_name_val.as_str() {
+                    if let Err(e) = self
+                        .fetch_extension_metadata(config_toml, extension_name, container_config)
+                        .await
+                    {
+                        print_error(
+                            &format!(
+                                "Failed to fetch metadata for extension '{extension_name}': {e}"
+                            ),
+                            OutputLevel::Normal,
+                        );
+                        // Continue with other extensions instead of failing completely
+                    }
                 }
             }
         }
@@ -400,17 +404,19 @@ $DNF_SDK_HOST \
         }
 
         // 5. Fetch all runtime metadata
-        if let Some(runtimes) = config_toml.get("runtime").and_then(|rt| rt.as_table()) {
-            for runtime_name in runtimes.keys() {
-                if let Err(e) = self
-                    .fetch_runtime_metadata(config_toml, runtime_name, container_config)
-                    .await
-                {
-                    print_error(
-                        &format!("Failed to fetch metadata for runtime '{runtime_name}': {e}"),
-                        OutputLevel::Normal,
-                    );
-                    // Continue with other runtimes instead of failing completely
+        if let Some(runtimes) = config_toml.get("runtime").and_then(|rt| rt.as_mapping()) {
+            for runtime_name_val in runtimes.keys() {
+                if let Some(runtime_name) = runtime_name_val.as_str() {
+                    if let Err(e) = self
+                        .fetch_runtime_metadata(config_toml, runtime_name, container_config)
+                        .await
+                    {
+                        print_error(
+                            &format!("Failed to fetch metadata for runtime '{runtime_name}': {e}"),
+                            OutputLevel::Normal,
+                        );
+                        // Continue with other runtimes instead of failing completely
+                    }
                 }
             }
         }
@@ -663,8 +669,7 @@ $DNF_SDK_HOST \
                 OutputLevel::Normal,
             );
             Err(anyhow::anyhow!(
-                "Failed to pull SDK container image: {}",
-                stderr
+                "Failed to pull SDK container image: {stderr}"
             ))
         }
     }
@@ -673,35 +678,37 @@ $DNF_SDK_HOST \
     fn discover_all_external_extensions(
         &self,
         config: &Config,
-        config_toml: &toml::Value,
+        config_toml: &serde_yaml::Value,
     ) -> Result<Vec<ExtensionDependency>> {
         let mut all_external_extensions = HashSet::new();
         let mut visited = HashSet::new();
 
         // Find external extensions from main config
-        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_table()) {
-            for (ext_name, ext_config) in extensions {
-                if let Some(dependencies) =
-                    ext_config.get("dependencies").and_then(|d| d.as_table())
-                {
-                    for (_dep_name, dep_spec) in dependencies {
-                        // Check for external extension dependency
-                        if let Some(external_config) =
-                            dep_spec.get("config").and_then(|v| v.as_str())
-                        {
-                            let ext_dep = ExtensionDependency::External {
-                                name: ext_name.clone(),
-                                config_path: external_config.to_string(),
-                            };
-                            all_external_extensions.insert(ext_dep.clone());
+        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_mapping()) {
+            for (ext_name_val, ext_config) in extensions {
+                if let Some(ext_name) = ext_name_val.as_str() {
+                    if let Some(dependencies) =
+                        ext_config.get("dependencies").and_then(|d| d.as_mapping())
+                    {
+                        for (_dep_name, dep_spec) in dependencies {
+                            // Check for external extension dependency
+                            if let Some(external_config) =
+                                dep_spec.get("config").and_then(|v| v.as_str())
+                            {
+                                let ext_dep = ExtensionDependency::External {
+                                    name: ext_name.to_string(),
+                                    config_path: external_config.to_string(),
+                                };
+                                all_external_extensions.insert(ext_dep.clone());
 
-                            // Recursively find nested external extension dependencies
-                            self.find_nested_external_extensions(
-                                config,
-                                &ext_dep,
-                                &mut all_external_extensions,
-                                &mut visited,
-                            )?;
+                                // Recursively find nested external extension dependencies
+                                self.find_nested_external_extensions(
+                                    config,
+                                    &ext_dep,
+                                    &mut all_external_extensions,
+                                    &mut visited,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -746,9 +753,7 @@ $DNF_SDK_HOST \
 
         let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                ext_name,
-                ext_config_path
+                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
             )
         })?;
 
@@ -760,8 +765,8 @@ $DNF_SDK_HOST \
                     resolved_external_config_path.display()
                 )
             })?;
-        let nested_config: toml::Value =
-            toml::from_str(&nested_config_content).with_context(|| {
+        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
+            .with_context(|| {
                 format!(
                     "Failed to parse nested config file: {}",
                     resolved_external_config_path.display()
@@ -769,12 +774,12 @@ $DNF_SDK_HOST \
             })?;
 
         // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
 
         // Check if this external extension has dependencies
         if let Some(dependencies) = extension_config
             .get("dependencies")
-            .and_then(|d| d.as_table())
+            .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for nested extension dependency

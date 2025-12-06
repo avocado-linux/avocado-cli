@@ -46,7 +46,7 @@ impl ExtPackageCommand {
         // Load configuration and parse raw TOML
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Resolve target using unified target resolution logic
         let target = resolve_target_required(self.target.as_deref(), &config)?;
@@ -145,7 +145,11 @@ impl ExtPackageCommand {
     }
 
     /// Extract RPM metadata from extension configuration with defaults
-    fn extract_rpm_metadata(&self, ext_config: &toml::Value, target: &str) -> Result<RpmMetadata> {
+    fn extract_rpm_metadata(
+        &self,
+        ext_config: &serde_yaml::Value,
+        target: &str,
+    ) -> Result<RpmMetadata> {
         // Version is required
         let version = ext_config
             .get("version")
@@ -276,8 +280,7 @@ impl ExtPackageCommand {
                     _ => "component",
                 };
                 format!(
-                    "{} version component '{}' must be a non-negative integer in semantic versioning format",
-                    component_name, component
+                    "{component_name} version component '{component}' must be a non-negative integer in semantic versioning format"
                 )
             })?;
         }
@@ -290,7 +293,7 @@ impl ExtPackageCommand {
         &self,
         metadata: &RpmMetadata,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<PathBuf> {
         let container_image = parsed
@@ -539,7 +542,7 @@ rm -rf "$TMPDIR"
 
         if !copy_output.status.success() {
             let stderr = String::from_utf8_lossy(&copy_output.stderr);
-            return Err(anyhow::anyhow!("Docker cp failed: {}", stderr));
+            return Err(anyhow::anyhow!("Docker cp failed: {stderr}"));
         }
 
         if self.verbose {
@@ -567,8 +570,7 @@ rm -rf "$TMPDIR"
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow::anyhow!(
-                "Failed to create temporary container: {}",
-                stderr
+                "Failed to create temporary container: {stderr}"
             ));
         }
 
@@ -582,7 +584,7 @@ rm -rf "$TMPDIR"
         config: &Config,
         config_content: &str,
         target: &str,
-    ) -> Result<HashMap<String, toml::Value>> {
+    ) -> Result<HashMap<String, serde_yaml::Value>> {
         let extension_sdk_deps = config
             .get_extension_sdk_dependencies_with_config_path_and_target(
                 config_content,
@@ -602,8 +604,8 @@ rm -rf "$TMPDIR"
         &self,
         metadata: &RpmMetadata,
         config: &Config,
-        parsed: &toml::Value,
-        sdk_dependencies: &HashMap<String, toml::Value>,
+        parsed: &serde_yaml::Value,
+        sdk_dependencies: &HashMap<String, serde_yaml::Value>,
         target: &str,
     ) -> Result<PathBuf> {
         let container_image = parsed
@@ -644,8 +646,8 @@ rm -rf "$TMPDIR"
         let mut requires_list = Vec::new();
         for (dep_name, dep_value) in sdk_dependencies {
             let version_spec = match dep_value {
-                toml::Value::String(version) if version == "*" => String::new(),
-                toml::Value::String(version) => format!(" = {version}"),
+                serde_yaml::Value::String(version) if version == "*" => String::new(),
+                serde_yaml::Value::String(version) => format!(" = {version}"),
                 _ => String::new(),
             };
             requires_list.push(format!("{dep_name}{version_spec}"));
@@ -828,7 +830,7 @@ mod tests {
     #[test]
     fn test_generate_summary_from_name() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-ext".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -858,7 +860,7 @@ mod tests {
     #[test]
     fn test_generate_description_from_name() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-ext".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -880,7 +882,7 @@ mod tests {
     #[test]
     fn test_generate_arch_from_target() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-ext".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -910,7 +912,7 @@ mod tests {
     #[test]
     fn test_extract_rpm_metadata_minimal() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-extension".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -919,10 +921,10 @@ mod tests {
             None,
         );
 
-        let mut ext_config = toml::Value::Table(toml::value::Table::new());
-        ext_config.as_table_mut().unwrap().insert(
-            "version".to_string(),
-            toml::Value::String("1.0.0".to_string()),
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        ext_config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
         );
 
         let metadata = cmd
@@ -947,7 +949,7 @@ mod tests {
     #[test]
     fn test_extract_rpm_metadata_full() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "web-server".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -956,37 +958,40 @@ mod tests {
             None,
         );
 
-        let mut ext_config = toml::Value::Table(toml::value::Table::new());
-        let config_map = ext_config.as_table_mut().unwrap();
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let config_map = ext_config.as_mapping_mut().unwrap();
 
         config_map.insert(
-            "version".to_string(),
-            toml::Value::String("2.1.3".to_string()),
-        );
-        config_map.insert("release".to_string(), toml::Value::String("2".to_string()));
-        config_map.insert(
-            "summary".to_string(),
-            toml::Value::String("Custom web server".to_string()),
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("2.1.3".to_string()),
         );
         config_map.insert(
-            "description".to_string(),
-            toml::Value::String("A custom web server extension".to_string()),
+            serde_yaml::Value::String("release".to_string()),
+            serde_yaml::Value::String("2".to_string()),
         );
         config_map.insert(
-            "license".to_string(),
-            toml::Value::String("MIT".to_string()),
+            serde_yaml::Value::String("summary".to_string()),
+            serde_yaml::Value::String("Custom web server".to_string()),
         );
         config_map.insert(
-            "arch".to_string(),
-            toml::Value::String("noarch".to_string()),
+            serde_yaml::Value::String("description".to_string()),
+            serde_yaml::Value::String("A custom web server extension".to_string()),
         );
         config_map.insert(
-            "vendor".to_string(),
-            toml::Value::String("Acme Corp".to_string()),
+            serde_yaml::Value::String("license".to_string()),
+            serde_yaml::Value::String("MIT".to_string()),
         );
         config_map.insert(
-            "url".to_string(),
-            toml::Value::String("https://example.com".to_string()),
+            serde_yaml::Value::String("arch".to_string()),
+            serde_yaml::Value::String("noarch".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("vendor".to_string()),
+            serde_yaml::Value::String("Acme Corp".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("url".to_string()),
+            serde_yaml::Value::String("https://example.com".to_string()),
         );
 
         let metadata = cmd
@@ -1008,7 +1013,7 @@ mod tests {
     #[test]
     fn test_extract_rpm_metadata_missing_version() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-extension".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -1017,7 +1022,7 @@ mod tests {
             None,
         );
 
-        let ext_config = toml::Value::Table(toml::value::Table::new());
+        let ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
 
         let result = cmd.extract_rpm_metadata(&ext_config, "x86_64-unknown-linux-gnu");
 
@@ -1031,7 +1036,7 @@ mod tests {
     #[test]
     fn test_arch_generation_with_different_targets() {
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-ext".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -1040,10 +1045,10 @@ mod tests {
             None,
         );
 
-        let mut ext_config = toml::Value::Table(toml::value::Table::new());
-        ext_config.as_table_mut().unwrap().insert(
-            "version".to_string(),
-            toml::Value::String("1.0.0".to_string()),
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        ext_config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
         );
 
         // Test various target architectures
@@ -1078,7 +1083,7 @@ mod tests {
         use crate::utils::config::Config;
 
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-ext".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -1089,11 +1094,12 @@ mod tests {
 
         // Create a minimal config without SDK dependencies
         let config_content = r#"
-[ext.test-ext]
-version = "1.0.0"
+ext:
+  test-ext:
+    version: "1.0.0"
 "#;
 
-        let config = Config::from_toml_value(&toml::from_str(config_content).unwrap()).unwrap();
+        let config = serde_yaml::from_str::<Config>(config_content).unwrap();
         let sdk_deps = cmd
             .get_extension_sdk_dependencies(&config, config_content, "x86_64-unknown-linux-gnu")
             .unwrap();
@@ -1106,7 +1112,7 @@ version = "1.0.0"
         use crate::utils::config::Config;
 
         let cmd = ExtPackageCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             "test-ext".to_string(),
             Some("x86_64-unknown-linux-gnu".to_string()),
             None,
@@ -1117,16 +1123,17 @@ version = "1.0.0"
 
         // Create a config with SDK dependencies
         let config_content = r#"
-[ext.test-ext]
-version = "1.0.0"
-
-[ext.test-ext.sdk.dependencies]
-nativesdk-avocado-hitl = "*"
-nativesdk-openssh-ssh = "*"
-nativesdk-rsync = "1.2.3"
+ext:
+  test-ext:
+    version: "1.0.0"
+    sdk:
+      dependencies:
+        nativesdk-avocado-hitl: "*"
+        nativesdk-openssh-ssh: "*"
+        nativesdk-rsync: "1.2.3"
 "#;
 
-        let config = Config::from_toml_value(&toml::from_str(config_content).unwrap()).unwrap();
+        let config = serde_yaml::from_str::<Config>(config_content).unwrap();
         let sdk_deps = cmd
             .get_extension_sdk_dependencies(&config, config_content, "x86_64-unknown-linux-gnu")
             .unwrap();
@@ -1139,15 +1146,15 @@ nativesdk-rsync = "1.2.3"
         // Check version values
         assert_eq!(
             sdk_deps["nativesdk-avocado-hitl"],
-            toml::Value::String("*".to_string())
+            serde_yaml::Value::String("*".to_string())
         );
         assert_eq!(
             sdk_deps["nativesdk-openssh-ssh"],
-            toml::Value::String("*".to_string())
+            serde_yaml::Value::String("*".to_string())
         );
         assert_eq!(
             sdk_deps["nativesdk-rsync"],
-            toml::Value::String("1.2.3".to_string())
+            serde_yaml::Value::String("1.2.3".to_string())
         );
     }
 }

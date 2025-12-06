@@ -37,7 +37,7 @@ impl ExtImageCommand {
         // Load configuration and parse raw TOML
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Merge container args from config and CLI
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -100,7 +100,7 @@ impl ExtImageCommand {
         // Get extension types from the types array
         let ext_types = ext_config
             .get("types")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
@@ -121,7 +121,7 @@ impl ExtImageCommand {
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed
             .get("runtime")
-            .and_then(|runtime| runtime.as_table())
+            .and_then(|runtime| runtime.as_mapping())
             .and_then(|runtime_table| {
                 if runtime_table.len() == 1 {
                     runtime_table.values().next()
@@ -279,8 +279,7 @@ echo "Created extension image: $OUTPUT_FILE"
                     _ => "component",
                 };
                 format!(
-                    "{} version component '{}' must be a non-negative integer in semantic versioning format",
-                    component_name, component
+                    "{component_name} version component '{component}' must be a non-negative integer in semantic versioning format"
                 )
             })?;
         }

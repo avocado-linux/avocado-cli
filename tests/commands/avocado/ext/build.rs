@@ -22,7 +22,7 @@ fn test_ext_build_with_fixture_extension() {
         .join("tests")
         .join("fixtures")
         .join("configs")
-        .join("with-confext.toml");
+        .join("with-confext.yaml");
     let result =
         common::cli_with_config(&["ext", "build", "test-confext"], None, Some(&config_path));
     // Should complete regardless of Docker availability

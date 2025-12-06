@@ -50,7 +50,7 @@ impl ExtBuildCommand {
         // Load configuration and parse raw TOML
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let processed_container_args =
@@ -98,14 +98,14 @@ impl ExtBuildCommand {
         // Get extension types from the types array
         let ext_types = ext_config
             .get("types")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
         // Get enable_services from configuration
         let enable_services = ext_config
             .get("enable_services")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -117,7 +117,7 @@ impl ExtBuildCommand {
         // Get modprobe modules from configuration
         let modprobe_modules = ext_config
             .get("modprobe")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -129,7 +129,7 @@ impl ExtBuildCommand {
         // Get on_merge commands from configuration
         let on_merge_commands = ext_config
             .get("on_merge")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -145,8 +145,8 @@ impl ExtBuildCommand {
             .unwrap_or(false);
 
         // Get users and groups configuration
-        let users_config = ext_config.get("users").and_then(|v| v.as_table());
-        let groups_config = ext_config.get("groups").and_then(|v| v.as_table());
+        let users_config = ext_config.get("users").and_then(|v| v.as_mapping());
+        let groups_config = ext_config.get("groups").and_then(|v| v.as_mapping());
 
         // Validate that confext is present if enable_services is used
         if !enable_services.is_empty() && !ext_types.contains(&"confext") {
@@ -162,7 +162,7 @@ impl ExtBuildCommand {
 
         let ext_scopes = ext_config
             .get("scopes")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -173,7 +173,7 @@ impl ExtBuildCommand {
 
         let sysext_scopes = ext_config
             .get("sysext_scopes")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -184,7 +184,7 @@ impl ExtBuildCommand {
 
         let confext_scopes = ext_config
             .get("confext_scopes")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -222,7 +222,7 @@ impl ExtBuildCommand {
                     dir: dir_str.to_string(),
                     mode: OverlayMode::Merge, // Default to merge mode
                 }
-            } else if let Some(table) = v.as_table() {
+            } else if let Some(table) = v.as_mapping() {
                 // Table format: overlay = {dir = "directory", mode = "opaque"}
                 let dir = table
                     .get("dir")
@@ -352,8 +352,8 @@ impl ExtBuildCommand {
         processed_container_args: &Option<Vec<String>>,
         modprobe_modules: &[String],
         on_merge_commands: &[String],
-        users_config: Option<&toml::value::Table>,
-        groups_config: Option<&toml::value::Table>,
+        users_config: Option<&serde_yaml::Mapping>,
+        groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
     ) -> Result<bool> {
         // Create the build script for sysext extension
@@ -415,8 +415,8 @@ impl ExtBuildCommand {
         processed_container_args: &Option<Vec<String>>,
         enable_services: &[String],
         on_merge_commands: &[String],
-        users_config: Option<&toml::value::Table>,
-        groups_config: Option<&toml::value::Table>,
+        users_config: Option<&serde_yaml::Mapping>,
+        groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
     ) -> Result<bool> {
         // Create the build script for confext extension
@@ -472,8 +472,8 @@ impl ExtBuildCommand {
         overlay_config: Option<&OverlayConfig>,
         modprobe_modules: &[String],
         on_merge_commands: &[String],
-        users_config: Option<&toml::value::Table>,
-        groups_config: Option<&toml::value::Table>,
+        users_config: Option<&serde_yaml::Mapping>,
+        groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
@@ -624,8 +624,8 @@ fi
         overlay_config: Option<&OverlayConfig>,
         enable_services: &[String],
         on_merge_commands: &[String],
-        users_config: Option<&toml::value::Table>,
-        groups_config: Option<&toml::value::Table>,
+        users_config: Option<&serde_yaml::Mapping>,
+        groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
@@ -787,8 +787,8 @@ fi
     /// This will copy passwd/shadow/group files and create/modify users and groups
     fn create_users_script_section(
         &self,
-        users_config: Option<&toml::value::Table>,
-        groups_config: Option<&toml::value::Table>,
+        users_config: Option<&serde_yaml::Mapping>,
+        groups_config: Option<&serde_yaml::Mapping>,
     ) -> String {
         // If neither users nor groups are configured, return empty string
         if users_config.is_none() && groups_config.is_none() {
@@ -822,11 +822,19 @@ cp "$AVOCADO_PREFIX/rootfs/etc/group" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
         if let Some(groups) = groups_config {
             script_lines.push("\n# Create groups".to_string());
 
-            for (groupname, group_config) in groups {
-                if let Some(group_table) = group_config.as_table() {
+            for (groupname_val, group_config) in groups {
+                // Convert groupname from Value to String
+                let groupname = match groupname_val.as_str() {
+                    Some(name) => name,
+                    None => continue, // Skip if groupname is not a string
+                };
+
+                if let Some(group_table) = group_config.as_mapping() {
                     // Parse comprehensive group configuration with defaults
                     let gid = if let Some(gid_value) = group_table.get("gid") {
-                        if let Some(gid_num) = gid_value.as_integer() {
+                        if let Some(gid_num) = gid_value.as_i64() {
+                            gid_num.to_string()
+                        } else if let Some(gid_num) = gid_value.as_u64() {
                             gid_num.to_string()
                         } else {
                             "$CURRENT_GID".to_string()
@@ -846,7 +854,7 @@ cp "$AVOCADO_PREFIX/rootfs/etc/group" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
                         .unwrap_or(""); // Default: no group password
 
                     let members = if let Some(members_value) = group_table.get("members") {
-                        if let Some(members_array) = members_value.as_array() {
+                        if let Some(members_array) = members_value.as_sequence() {
                             members_array
                                 .iter()
                                 .filter_map(|m| m.as_str())
@@ -860,7 +868,7 @@ cp "$AVOCADO_PREFIX/rootfs/etc/group" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
                     };
 
                     let _admins = if let Some(admins_value) = group_table.get("admins") {
-                        if let Some(admins_array) = admins_value.as_array() {
+                        if let Some(admins_array) = admins_value.as_sequence() {
                             admins_array
                                 .iter()
                                 .filter_map(|a| a.as_str())
@@ -965,8 +973,14 @@ fi"#,
         if let Some(users) = users_config {
             let mut user_script_lines = Vec::new();
 
-            for (username, user_config) in users {
-                if let Some(user_table) = user_config.as_table() {
+            for (username_val, user_config) in users {
+                // Convert username from Value to String
+                let username = match username_val.as_str() {
+                    Some(name) => name,
+                    None => continue, // Skip if username is not a string
+                };
+
+                if let Some(user_table) = user_config.as_mapping() {
                     // Check if user has password field - if not, create with disabled login
                     let password = user_table
                         .get("password")
@@ -977,7 +991,7 @@ fi"#,
 
                     // Parse comprehensive user configuration with defaults
                     let uid = if let Some(uid_value) = user_table.get("uid") {
-                        if let Some(uid_num) = uid_value.as_integer() {
+                        if let Some(uid_num) = uid_value.as_i64() {
                             uid_num.to_string()
                         } else {
                             "$CURRENT_UID".to_string()
@@ -987,7 +1001,7 @@ fi"#,
                     };
 
                     let gid = if let Some(gid_value) = user_table.get("gid") {
-                        if let Some(gid_num) = gid_value.as_integer() {
+                        if let Some(gid_num) = gid_value.as_i64() {
                             gid_num.to_string()
                         } else {
                             "$CURRENT_UID".to_string() // Default to same as UID for user private groups
@@ -1013,51 +1027,51 @@ fi"#,
                         .unwrap_or("/bin/sh"); // Default shell
 
                     let groups = if let Some(groups_value) = user_table.get("groups") {
-                        if let Some(groups_array) = groups_value.as_array() {
+                        if let Some(groups_array) = groups_value.as_sequence() {
                             groups_array
                                 .iter()
                                 .filter_map(|g| g.as_str())
                                 .map(|s| s.to_string())
                                 .collect::<Vec<_>>()
                         } else {
-                            vec![username.clone()] // Default to user's own group
+                            vec![username.to_string()] // Default to user's own group
                         }
                     } else {
-                        vec![username.clone()] // Default to user's own group
+                        vec![username.to_string()] // Default to user's own group
                     };
 
-                    let _primary_group = groups.first().unwrap_or(username);
+                    let _primary_group = groups.first().map(|s| s.as_str()).unwrap_or(username);
 
                     // Shadow file attributes with defaults
                     let last_change = user_table
                         .get("last_change")
-                        .and_then(|l| l.as_integer())
+                        .and_then(|l| l.as_i64())
                         .unwrap_or(19000); // Default to a reasonable epoch day
 
                     let min_days = user_table
                         .get("min_days")
-                        .and_then(|m| m.as_integer())
+                        .and_then(|m| m.as_i64())
                         .unwrap_or(0); // Default: no minimum
 
                     let max_days = user_table
                         .get("max_days")
-                        .and_then(|m| m.as_integer())
+                        .and_then(|m| m.as_i64())
                         .unwrap_or(99999); // Default: no maximum
 
                     let warn_days = user_table
                         .get("warn_days")
-                        .and_then(|w| w.as_integer())
+                        .and_then(|w| w.as_i64())
                         .unwrap_or(7); // Default: warn 7 days before
 
                     let inactive_days = user_table
                         .get("inactive_days")
-                        .and_then(|i| i.as_integer())
+                        .and_then(|i| i.as_i64())
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| "".to_string()); // Default: no inactive period
 
                     let expire_date = user_table
                         .get("expire_date")
-                        .and_then(|e| e.as_integer())
+                        .and_then(|e| e.as_i64())
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "".to_string()); // Default: no expiration
 
@@ -1223,11 +1237,11 @@ echo "Set proper permissions on authentication files""#,
     async fn handle_compile_dependencies(
         &self,
         config: &Config,
-        ext_config: &toml::Value,
+        ext_config: &serde_yaml::Value,
         target: &str,
     ) -> Result<()> {
         // Get dependencies from extension configuration
-        let dependencies = ext_config.get("dependencies").and_then(|v| v.as_table());
+        let dependencies = ext_config.get("dependencies").and_then(|v| v.as_mapping());
 
         let Some(deps_table) = dependencies else {
             return Ok(());
@@ -1236,19 +1250,21 @@ echo "Set proper permissions on authentication files""#,
         // Find compile dependencies with install scripts
         let mut compile_install_deps = Vec::new();
 
-        for (dep_name, dep_spec) in deps_table {
-            if let toml::Value::Table(spec_map) = dep_spec {
-                // Check for the new syntax: { compile = "section-name", install = "script.sh" }
-                if let (
-                    Some(toml::Value::String(compile_section)),
-                    Some(toml::Value::String(install_script)),
-                ) = (spec_map.get("compile"), spec_map.get("install"))
-                {
-                    compile_install_deps.push((
-                        dep_name.clone(),
-                        compile_section.clone(),
-                        install_script.clone(),
-                    ));
+        for (dep_name_val, dep_spec) in deps_table {
+            if let Some(dep_name) = dep_name_val.as_str() {
+                if let serde_yaml::Value::Mapping(spec_map) = dep_spec {
+                    // Check for the new syntax: { compile = "section-name", install = "script.sh" }
+                    if let (
+                        Some(serde_yaml::Value::String(compile_section)),
+                        Some(serde_yaml::Value::String(install_script)),
+                    ) = (spec_map.get("compile"), spec_map.get("install"))
+                    {
+                        compile_install_deps.push((
+                            dep_name.to_string(),
+                            compile_section.clone(),
+                            install_script.clone(),
+                        ));
+                    }
                 }
             }
         }
@@ -1379,8 +1395,7 @@ echo "Set proper permissions on authentication files""#,
                     _ => "component",
                 };
                 format!(
-                    "{} version component '{}' must be a non-negative integer in semantic versioning format",
-                    component_name, component
+                    "{component_name} version component '{component}' must be a non-negative integer in semantic versioning format"
                 )
             })?;
         }
@@ -1397,7 +1412,7 @@ mod tests {
     fn test_create_sysext_build_script_basic() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1452,7 +1467,7 @@ mod tests {
     fn test_create_confext_build_script_basic() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1504,7 +1519,7 @@ mod tests {
     fn test_create_sysext_build_script_multiple_scopes() {
         let cmd = ExtBuildCommand {
             extension: "multi-scope-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1530,7 +1545,7 @@ mod tests {
     fn test_create_confext_build_script_multiple_scopes() {
         let cmd = ExtBuildCommand {
             extension: "multi-scope-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1556,7 +1571,7 @@ mod tests {
     fn test_create_confext_build_script_with_services() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1590,7 +1605,7 @@ mod tests {
     fn test_kernel_module_detection_pattern() {
         let cmd = ExtBuildCommand {
             extension: "kernel-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1621,7 +1636,7 @@ mod tests {
     fn test_sysext_overlay_functionality() {
         let cmd = ExtBuildCommand {
             extension: "overlay-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1658,7 +1673,7 @@ mod tests {
     fn test_confext_overlay_functionality() {
         let cmd = ExtBuildCommand {
             extension: "overlay-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1695,7 +1710,7 @@ mod tests {
     fn test_sysext_overlay_opaque_mode() {
         let cmd = ExtBuildCommand {
             extension: "opaque-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1734,7 +1749,7 @@ mod tests {
     fn test_confext_overlay_opaque_mode() {
         let cmd = ExtBuildCommand {
             extension: "opaque-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1773,7 +1788,7 @@ mod tests {
     fn test_no_overlay_functionality() {
         let cmd = ExtBuildCommand {
             extension: "no-overlay-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1814,7 +1829,7 @@ mod tests {
     fn test_create_sysext_build_script_with_modprobe() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1856,7 +1871,7 @@ mod tests {
     fn test_create_sysext_build_script_with_sysusers() {
         let cmd = ExtBuildCommand {
             extension: "sysusers-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1891,7 +1906,7 @@ mod tests {
     fn test_create_confext_build_script_with_sysusers() {
         let cmd = ExtBuildCommand {
             extension: "sysusers-confext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1923,7 +1938,7 @@ mod tests {
     fn test_create_confext_build_script_with_ldso_conf_d() {
         let cmd = ExtBuildCommand {
             extension: "ldso-confext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1954,7 +1969,7 @@ mod tests {
     fn test_create_sysext_build_script_with_custom_on_merge() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -1991,7 +2006,7 @@ mod tests {
     fn test_create_confext_build_script_with_custom_on_merge() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2023,7 +2038,7 @@ mod tests {
     fn test_create_sysext_build_script_with_both_kernel_modules_and_sysusers() {
         let cmd = ExtBuildCommand {
             extension: "combined-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2053,7 +2068,7 @@ mod tests {
     fn test_create_sysext_build_script_without_modprobe() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2081,7 +2096,7 @@ mod tests {
     fn test_create_sysext_build_script_with_user_example_modules() {
         let cmd = ExtBuildCommand {
             extension: "gpio-test".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2127,7 +2142,7 @@ mod tests {
     fn test_separate_avocado_on_merge_entries() {
         let cmd = ExtBuildCommand {
             extension: "comprehensive-test".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2188,7 +2203,7 @@ mod tests {
     fn test_create_users_script_section_with_empty_password_user() {
         let cmd = ExtBuildCommand {
             extension: "avocado-dev".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2196,10 +2211,16 @@ mod tests {
         };
 
         // Create users config matching the example in the user request
-        let mut users_config = toml::value::Table::new();
-        let mut root_user = toml::value::Table::new();
-        root_user.insert("password".to_string(), toml::Value::String("".to_string()));
-        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+        let mut users_config = serde_yaml::Mapping::new();
+        let mut root_user = serde_yaml::Mapping::new();
+        root_user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("".to_string()),
+        );
+        users_config.insert(
+            serde_yaml::Value::String("root".to_string()),
+            serde_yaml::Value::Mapping(root_user),
+        );
 
         let script = cmd.create_users_script_section(Some(&users_config), None);
 
@@ -2223,7 +2244,7 @@ mod tests {
     fn test_create_users_script_section_without_users() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2240,7 +2261,7 @@ mod tests {
     fn test_create_users_script_section_with_non_empty_password_user() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2248,13 +2269,16 @@ mod tests {
         };
 
         // Create users config with a user that has a non-empty password
-        let mut users_config = toml::value::Table::new();
-        let mut user = toml::value::Table::new();
+        let mut users_config = serde_yaml::Mapping::new();
+        let mut user = serde_yaml::Mapping::new();
         user.insert(
-            "password".to_string(),
-            toml::Value::String("$6$salt$hashedpassword".to_string()),
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("$6$salt$hashedpassword".to_string()),
         );
-        users_config.insert("testuser".to_string(), toml::Value::Table(user));
+        users_config.insert(
+            serde_yaml::Value::String("testuser".to_string()),
+            serde_yaml::Value::Mapping(user),
+        );
 
         let script = cmd.create_users_script_section(Some(&users_config), None);
 
@@ -2273,7 +2297,7 @@ mod tests {
     fn test_create_users_script_section_with_invalid_password_type() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2281,10 +2305,16 @@ mod tests {
         };
 
         // Create users config with a user that has a non-string password
-        let mut users_config = toml::value::Table::new();
-        let mut user = toml::value::Table::new();
-        user.insert("password".to_string(), toml::Value::Integer(123));
-        users_config.insert("testuser".to_string(), toml::Value::Table(user));
+        let mut users_config = serde_yaml::Mapping::new();
+        let mut user = serde_yaml::Mapping::new();
+        user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::Number(123.into()),
+        );
+        users_config.insert(
+            serde_yaml::Value::String("testuser".to_string()),
+            serde_yaml::Value::Mapping(user),
+        );
 
         let script = cmd.create_users_script_section(Some(&users_config), None);
 
@@ -2299,7 +2329,7 @@ mod tests {
     fn test_sysext_build_script_with_users() {
         let cmd = ExtBuildCommand {
             extension: "avocado-dev".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2307,10 +2337,16 @@ mod tests {
         };
 
         // Create users config matching the example in the user request
-        let mut users_config = toml::value::Table::new();
-        let mut root_user = toml::value::Table::new();
-        root_user.insert("password".to_string(), toml::Value::String("".to_string()));
-        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+        let mut users_config = serde_yaml::Mapping::new();
+        let mut root_user = serde_yaml::Mapping::new();
+        root_user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("".to_string()),
+        );
+        users_config.insert(
+            serde_yaml::Value::String("root".to_string()),
+            serde_yaml::Value::Mapping(root_user),
+        );
 
         let script = cmd.create_sysext_build_script(
             "1.0",
@@ -2345,7 +2381,7 @@ mod tests {
     fn test_confext_build_script_with_users() {
         let cmd = ExtBuildCommand {
             extension: "avocado-dev".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2353,10 +2389,16 @@ mod tests {
         };
 
         // Create users config matching the example in the user request
-        let mut users_config = toml::value::Table::new();
-        let mut root_user = toml::value::Table::new();
-        root_user.insert("password".to_string(), toml::Value::String("".to_string()));
-        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+        let mut users_config = serde_yaml::Mapping::new();
+        let mut root_user = serde_yaml::Mapping::new();
+        root_user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("".to_string()),
+        );
+        users_config.insert(
+            serde_yaml::Value::String("root".to_string()),
+            serde_yaml::Value::Mapping(root_user),
+        );
 
         let script = cmd.create_confext_build_script(
             "1.0",
@@ -2389,7 +2431,7 @@ mod tests {
     fn test_warning_for_empty_password() {
         let cmd = ExtBuildCommand {
             extension: "warning-test".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2397,23 +2439,32 @@ mod tests {
         };
 
         // Test empty password - should show warning
-        let mut empty_users_config = toml::value::Table::new();
-        let mut empty_user = toml::value::Table::new();
-        empty_user.insert("password".to_string(), toml::Value::String("".to_string()));
-        empty_users_config.insert("testuser".to_string(), toml::Value::Table(empty_user));
+        let mut empty_users_config = serde_yaml::Mapping::new();
+        let mut empty_user = serde_yaml::Mapping::new();
+        empty_user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("".to_string()),
+        );
+        empty_users_config.insert(
+            serde_yaml::Value::String("testuser".to_string()),
+            serde_yaml::Value::Mapping(empty_user),
+        );
 
         let empty_script = cmd.create_users_script_section(Some(&empty_users_config), None);
         assert!(empty_script
             .contains("[WARNING] User 'testuser' will be able to login with NO PASSWORD"));
 
         // Test hashed password - should NOT show warning
-        let mut hashed_users_config = toml::value::Table::new();
-        let mut hashed_user = toml::value::Table::new();
+        let mut hashed_users_config = serde_yaml::Mapping::new();
+        let mut hashed_user = serde_yaml::Mapping::new();
         hashed_user.insert(
-            "password".to_string(),
-            toml::Value::String("$6$salt$hash".to_string()),
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("$6$salt$hash".to_string()),
         );
-        hashed_users_config.insert("testuser".to_string(), toml::Value::Table(hashed_user));
+        hashed_users_config.insert(
+            serde_yaml::Value::String("testuser".to_string()),
+            serde_yaml::Value::Mapping(hashed_user),
+        );
 
         let hashed_script = cmd.create_users_script_section(Some(&hashed_users_config), None);
         assert!(!hashed_script
@@ -2426,7 +2477,7 @@ mod tests {
     fn test_full_users_and_groups_functionality() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2434,31 +2485,49 @@ mod tests {
         };
 
         // Create comprehensive groups config
-        let mut groups_config = toml::value::Table::new();
-        let mut avocado_group = toml::value::Table::new();
-        avocado_group.insert("gid".to_string(), toml::Value::Integer(1000));
-        groups_config.insert("avocado".to_string(), toml::Value::Table(avocado_group));
+        let mut groups_config = serde_yaml::Mapping::new();
+        let mut avocado_group = serde_yaml::Mapping::new();
+        avocado_group.insert(
+            serde_yaml::Value::String("gid".to_string()),
+            serde_yaml::Value::Number(1000.into()),
+        );
+        groups_config.insert(
+            serde_yaml::Value::String("avocado".to_string()),
+            serde_yaml::Value::Mapping(avocado_group),
+        );
 
         // Create comprehensive users config
-        let mut users_config = toml::value::Table::new();
+        let mut users_config = serde_yaml::Mapping::new();
 
         // Root user with empty password
-        let mut root_user = toml::value::Table::new();
-        root_user.insert("password".to_string(), toml::Value::String("".to_string()));
-        users_config.insert("root".to_string(), toml::Value::Table(root_user));
+        let mut root_user = serde_yaml::Mapping::new();
+        root_user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("".to_string()),
+        );
+        users_config.insert(
+            serde_yaml::Value::String("root".to_string()),
+            serde_yaml::Value::Mapping(root_user),
+        );
 
         // Avocado user with UID, groups, and hashed password
-        let mut avocado_user = toml::value::Table::new();
-        avocado_user.insert("uid".to_string(), toml::Value::Integer(1000));
+        let mut avocado_user = serde_yaml::Mapping::new();
         avocado_user.insert(
-            "groups".to_string(),
-            toml::Value::Array(vec![toml::Value::String("avocado".to_string())]),
+            serde_yaml::Value::String("uid".to_string()),
+            serde_yaml::Value::Number(1000.into()),
         );
         avocado_user.insert(
-            "password".to_string(),
-            toml::Value::String("$6$salt$hash".to_string()),
+            serde_yaml::Value::String("groups".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("avocado".to_string())]),
         );
-        users_config.insert("avocado".to_string(), toml::Value::Table(avocado_user));
+        avocado_user.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("$6$salt$hash".to_string()),
+        );
+        users_config.insert(
+            serde_yaml::Value::String("avocado".to_string()),
+            serde_yaml::Value::Mapping(avocado_user),
+        );
 
         let script = cmd.create_users_script_section(Some(&users_config), Some(&groups_config));
 
@@ -2491,7 +2560,7 @@ mod tests {
     fn test_comprehensive_users_and_groups_schema() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2499,141 +2568,219 @@ mod tests {
         };
 
         // Create comprehensive users configuration using mixed approach
-        let mut users_table = toml::value::Table::new();
+        let mut users_table = serde_yaml::Mapping::new();
 
         // Simple users use inline-style tables (represented as TOML tables in tests)
-        let mut root_table = toml::value::Table::new();
-        root_table.insert("password".to_string(), toml::Value::String("".to_string()));
-        users_table.insert("root".to_string(), toml::Value::Table(root_table));
+        let mut root_table = serde_yaml::Mapping::new();
+        root_table.insert(
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("".to_string()),
+        );
+        users_table.insert(
+            serde_yaml::Value::String("root".to_string()),
+            serde_yaml::Value::Mapping(root_table),
+        );
 
         // Complex users would use table syntax in real TOML (but represented as nested tables in tests)
-        let mut alice_table = toml::value::Table::new();
+        let mut alice_table = serde_yaml::Mapping::new();
         alice_table.insert(
-            "password".to_string(),
-            toml::Value::String("$6$salt$hash".to_string()),
-        );
-        alice_table.insert("uid".to_string(), toml::Value::Integer(1001));
-        alice_table.insert(
-            "gecos".to_string(),
-            toml::Value::String("Alice Developer".to_string()),
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("$6$salt$hash".to_string()),
         );
         alice_table.insert(
-            "shell".to_string(),
-            toml::Value::String("/bin/zsh".to_string()),
+            serde_yaml::Value::String("uid".to_string()),
+            serde_yaml::Value::Number(1001.into()),
         );
         alice_table.insert(
-            "groups".to_string(),
-            toml::Value::Array(vec![
-                toml::Value::String("users".to_string()),
-                toml::Value::String("developers".to_string()),
+            serde_yaml::Value::String("gecos".to_string()),
+            serde_yaml::Value::String("Alice Developer".to_string()),
+        );
+        alice_table.insert(
+            serde_yaml::Value::String("shell".to_string()),
+            serde_yaml::Value::String("/bin/zsh".to_string()),
+        );
+        alice_table.insert(
+            serde_yaml::Value::String("groups".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("users".to_string()),
+                serde_yaml::Value::String("developers".to_string()),
             ]),
         );
-        users_table.insert("alice".to_string(), toml::Value::Table(alice_table));
+        users_table.insert(
+            serde_yaml::Value::String("alice".to_string()),
+            serde_yaml::Value::Mapping(alice_table),
+        );
 
         // User with comprehensive passwd attributes
-        let mut bob_table = toml::value::Table::new();
+        let mut bob_table = serde_yaml::Mapping::new();
         bob_table.insert(
-            "password".to_string(),
-            toml::Value::String("$6$anothersalt$anotherhash".to_string()),
-        );
-        bob_table.insert("uid".to_string(), toml::Value::Integer(1002));
-        bob_table.insert("gid".to_string(), toml::Value::Integer(1002));
-        bob_table.insert(
-            "gecos".to_string(),
-            toml::Value::String("Bob Smith,DevOps,Room 123,555-1234,555-5678".to_string()),
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("$6$anothersalt$anotherhash".to_string()),
         );
         bob_table.insert(
-            "home".to_string(),
-            toml::Value::String("/home/bob".to_string()),
+            serde_yaml::Value::String("uid".to_string()),
+            serde_yaml::Value::Number(1002.into()),
         );
         bob_table.insert(
-            "shell".to_string(),
-            toml::Value::String("/bin/bash".to_string()),
+            serde_yaml::Value::String("gid".to_string()),
+            serde_yaml::Value::Number(1002.into()),
         );
         bob_table.insert(
-            "groups".to_string(),
-            toml::Value::Array(vec![
-                toml::Value::String("users".to_string()),
-                toml::Value::String("admins".to_string()),
+            serde_yaml::Value::String("gecos".to_string()),
+            serde_yaml::Value::String("Bob Smith,DevOps,Room 123,555-1234,555-5678".to_string()),
+        );
+        bob_table.insert(
+            serde_yaml::Value::String("home".to_string()),
+            serde_yaml::Value::String("/home/bob".to_string()),
+        );
+        bob_table.insert(
+            serde_yaml::Value::String("shell".to_string()),
+            serde_yaml::Value::String("/bin/bash".to_string()),
+        );
+        bob_table.insert(
+            serde_yaml::Value::String("groups".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("users".to_string()),
+                serde_yaml::Value::String("admins".to_string()),
             ]),
         );
-        users_table.insert("bob".to_string(), toml::Value::Table(bob_table));
+        users_table.insert(
+            serde_yaml::Value::String("bob".to_string()),
+            serde_yaml::Value::Mapping(bob_table),
+        );
 
         // User with comprehensive shadow attributes for password aging
-        let mut charlie_table = toml::value::Table::new();
+        let mut charlie_table = serde_yaml::Mapping::new();
         charlie_table.insert(
-            "password".to_string(),
-            toml::Value::String("$6$salt3$hash3".to_string()),
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("$6$salt3$hash3".to_string()),
         );
-        charlie_table.insert("uid".to_string(), toml::Value::Integer(1003));
         charlie_table.insert(
-            "gecos".to_string(),
-            toml::Value::String("Charlie Security".to_string()),
+            serde_yaml::Value::String("uid".to_string()),
+            serde_yaml::Value::Number(1003.into()),
         );
-        charlie_table.insert("last_change".to_string(), toml::Value::Integer(19000));
-        charlie_table.insert("min_days".to_string(), toml::Value::Integer(7));
-        charlie_table.insert("max_days".to_string(), toml::Value::Integer(90));
-        charlie_table.insert("warn_days".to_string(), toml::Value::Integer(7));
-        charlie_table.insert("inactive_days".to_string(), toml::Value::Integer(14));
-        charlie_table.insert("expire_date".to_string(), toml::Value::Integer(20000));
         charlie_table.insert(
-            "groups".to_string(),
-            toml::Value::Array(vec![toml::Value::String("users".to_string())]),
+            serde_yaml::Value::String("gecos".to_string()),
+            serde_yaml::Value::String("Charlie Security".to_string()),
         );
-        users_table.insert("charlie".to_string(), toml::Value::Table(charlie_table));
+        charlie_table.insert(
+            serde_yaml::Value::String("last_change".to_string()),
+            serde_yaml::Value::Number(19000.into()),
+        );
+        charlie_table.insert(
+            serde_yaml::Value::String("min_days".to_string()),
+            serde_yaml::Value::Number(7.into()),
+        );
+        charlie_table.insert(
+            serde_yaml::Value::String("max_days".to_string()),
+            serde_yaml::Value::Number(90.into()),
+        );
+        charlie_table.insert(
+            serde_yaml::Value::String("warn_days".to_string()),
+            serde_yaml::Value::Number(7.into()),
+        );
+        charlie_table.insert(
+            serde_yaml::Value::String("inactive_days".to_string()),
+            serde_yaml::Value::Number(14.into()),
+        );
+        charlie_table.insert(
+            serde_yaml::Value::String("expire_date".to_string()),
+            serde_yaml::Value::Number(20000.into()),
+        );
+        charlie_table.insert(
+            serde_yaml::Value::String("groups".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("users".to_string())]),
+        );
+        users_table.insert(
+            serde_yaml::Value::String("charlie".to_string()),
+            serde_yaml::Value::Mapping(charlie_table),
+        );
 
         // System service user
-        let mut nginx_table = toml::value::Table::new();
-        nginx_table.insert("password".to_string(), toml::Value::String("*".to_string()));
-        nginx_table.insert("uid".to_string(), toml::Value::Integer(33));
-        nginx_table.insert("gid".to_string(), toml::Value::Integer(33));
+        let mut nginx_table = serde_yaml::Mapping::new();
         nginx_table.insert(
-            "gecos".to_string(),
-            toml::Value::String("nginx web server".to_string()),
+            serde_yaml::Value::String("password".to_string()),
+            serde_yaml::Value::String("*".to_string()),
         );
         nginx_table.insert(
-            "home".to_string(),
-            toml::Value::String("/var/www".to_string()),
+            serde_yaml::Value::String("uid".to_string()),
+            serde_yaml::Value::Number(33.into()),
         );
         nginx_table.insert(
-            "shell".to_string(),
-            toml::Value::String("/usr/sbin/nologin".to_string()),
+            serde_yaml::Value::String("gid".to_string()),
+            serde_yaml::Value::Number(33.into()),
         );
-        nginx_table.insert("system".to_string(), toml::Value::Boolean(true));
-        users_table.insert("nginx".to_string(), toml::Value::Table(nginx_table));
+        nginx_table.insert(
+            serde_yaml::Value::String("gecos".to_string()),
+            serde_yaml::Value::String("nginx web server".to_string()),
+        );
+        nginx_table.insert(
+            serde_yaml::Value::String("home".to_string()),
+            serde_yaml::Value::String("/var/www".to_string()),
+        );
+        nginx_table.insert(
+            serde_yaml::Value::String("shell".to_string()),
+            serde_yaml::Value::String("/usr/sbin/nologin".to_string()),
+        );
+        nginx_table.insert(
+            serde_yaml::Value::String("system".to_string()),
+            serde_yaml::Value::Bool(true),
+        );
+        users_table.insert(
+            serde_yaml::Value::String("nginx".to_string()),
+            serde_yaml::Value::Mapping(nginx_table),
+        );
 
         // Create comprehensive groups configuration
-        let mut groups_table = toml::value::Table::new();
+        let mut groups_table = serde_yaml::Mapping::new();
 
         // Basic group
-        let mut users_group_table = toml::value::Table::new();
-        users_group_table.insert("gid".to_string(), toml::Value::Integer(1000));
-        groups_table.insert("users".to_string(), toml::Value::Table(users_group_table));
+        let mut users_group_table = serde_yaml::Mapping::new();
+        users_group_table.insert(
+            serde_yaml::Value::String("gid".to_string()),
+            serde_yaml::Value::Number(1000.into()),
+        );
+        groups_table.insert(
+            serde_yaml::Value::String("users".to_string()),
+            serde_yaml::Value::Mapping(users_group_table),
+        );
 
         // Group with members
-        let mut developers_group_table = toml::value::Table::new();
-        developers_group_table.insert("gid".to_string(), toml::Value::Integer(2000));
+        let mut developers_group_table = serde_yaml::Mapping::new();
         developers_group_table.insert(
-            "members".to_string(),
-            toml::Value::Array(vec![
-                toml::Value::String("alice".to_string()),
-                toml::Value::String("bob".to_string()),
+            serde_yaml::Value::String("gid".to_string()),
+            serde_yaml::Value::Number(2000.into()),
+        );
+        developers_group_table.insert(
+            serde_yaml::Value::String("members".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("alice".to_string()),
+                serde_yaml::Value::String("bob".to_string()),
             ]),
         );
         groups_table.insert(
-            "developers".to_string(),
-            toml::Value::Table(developers_group_table),
+            serde_yaml::Value::String("developers".to_string()),
+            serde_yaml::Value::Mapping(developers_group_table),
         );
 
         // System group
-        let mut admins_group_table = toml::value::Table::new();
-        admins_group_table.insert("gid".to_string(), toml::Value::Integer(27));
-        admins_group_table.insert("system".to_string(), toml::Value::Boolean(true));
+        let mut admins_group_table = serde_yaml::Mapping::new();
         admins_group_table.insert(
-            "members".to_string(),
-            toml::Value::Array(vec![toml::Value::String("bob".to_string())]),
+            serde_yaml::Value::String("gid".to_string()),
+            serde_yaml::Value::Number(27.into()),
         );
-        groups_table.insert("admins".to_string(), toml::Value::Table(admins_group_table));
+        admins_group_table.insert(
+            serde_yaml::Value::String("system".to_string()),
+            serde_yaml::Value::Bool(true),
+        );
+        admins_group_table.insert(
+            serde_yaml::Value::String("members".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("bob".to_string())]),
+        );
+        groups_table.insert(
+            serde_yaml::Value::String("admins".to_string()),
+            serde_yaml::Value::Mapping(admins_group_table),
+        );
 
         let script = cmd.create_users_script_section(Some(&users_table), Some(&groups_table));
 
@@ -2691,7 +2838,7 @@ mod tests {
     fn test_minimal_user_defaults() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2699,9 +2846,12 @@ mod tests {
         };
 
         // Test user with just name (no fields at all)
-        let mut users_table = toml::value::Table::new();
-        let empty_table = toml::value::Table::new();
-        users_table.insert("testuser".to_string(), toml::Value::Table(empty_table));
+        let mut users_table = serde_yaml::Mapping::new();
+        let empty_table = serde_yaml::Mapping::new();
+        users_table.insert(
+            serde_yaml::Value::String("testuser".to_string()),
+            serde_yaml::Value::Mapping(empty_table),
+        );
 
         let script = cmd.create_users_script_section(Some(&users_table), None);
 
@@ -2716,7 +2866,7 @@ mod tests {
     fn test_create_sysext_build_script_with_reload_service_manager_true() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2742,7 +2892,7 @@ mod tests {
     fn test_create_confext_build_script_with_reload_service_manager_true() {
         let cmd = ExtBuildCommand {
             extension: "test-ext".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,
@@ -2768,36 +2918,51 @@ mod tests {
     fn test_handle_compile_dependencies_parsing() {
         // Test that the new compile dependency syntax is properly parsed
         let config_content = r#"
-[ext.my-extension]
-types = ["sysext"]
+ext:
+  my-extension:
+    types:
+      - sysext
+    dependencies:
+      my-app:
+        compile: my-app
+        install: ext-install.sh
+      regular-package: "1.0.0"
+      old-compile-dep:
+        compile: old-section
 
-[ext.my-extension.dependencies]
-my-app = { compile = "my-app", install = "ext-install.sh" }
-regular-package = "1.0.0"
-old-compile-dep = { compile = "old-section" }
-
-[sdk.compile.my-app]
-compile = "ext-compile.sh"
-
-[sdk.compile.old-section]
-compile = "ext-compile.sh"
+sdk:
+  compile:
+    my-app:
+      compile: ext-compile.sh
+    old-section:
+      compile: ext-compile.sh
 "#;
 
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
-        let ext_config = parsed.get("ext").unwrap().get("my-extension").unwrap();
-        let dependencies = ext_config.get("dependencies").unwrap().as_table().unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let ext_config = parsed
+            .get(serde_yaml::Value::String("ext".to_string()))
+            .unwrap()
+            .get(serde_yaml::Value::String("my-extension".to_string()))
+            .unwrap();
+        let dependencies = ext_config
+            .get(serde_yaml::Value::String("dependencies".to_string()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
 
         // Check that we can identify compile dependencies with install scripts
         let mut compile_install_deps = Vec::new();
         for (dep_name, dep_spec) in dependencies {
-            if let toml::Value::Table(spec_map) = dep_spec {
+            if let serde_yaml::Value::Mapping(spec_map) = dep_spec {
                 if let (
-                    Some(toml::Value::String(compile_section)),
-                    Some(toml::Value::String(install_script)),
-                ) = (spec_map.get("compile"), spec_map.get("install"))
-                {
+                    Some(serde_yaml::Value::String(compile_section)),
+                    Some(serde_yaml::Value::String(install_script)),
+                ) = (
+                    spec_map.get(serde_yaml::Value::String("compile".to_string())),
+                    spec_map.get(serde_yaml::Value::String("install".to_string())),
+                ) {
                     compile_install_deps.push((
-                        dep_name.clone(),
+                        dep_name.as_str().unwrap_or("").to_string(),
                         compile_section.clone(),
                         install_script.clone(),
                     ));
@@ -2817,7 +2982,7 @@ compile = "ext-compile.sh"
         // Test that the install command includes the AVOCADO_BUILD_EXT_SYSROOT environment variable
         let cmd = ExtBuildCommand {
             extension: "test-extension".to_string(),
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             verbose: false,
             target: None,
             container_args: None,

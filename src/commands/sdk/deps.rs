@@ -181,13 +181,15 @@ impl SdkDepsCommand {
         &self,
         config: &Config,
         package_name: &str,
-        package_spec: &toml::Value,
+        package_spec: &serde_yaml::Value,
     ) -> Vec<(String, String, String)> {
         match package_spec {
-            toml::Value::String(version) => {
+            serde_yaml::Value::String(version) => {
                 vec![("pkg".to_string(), package_name.to_string(), version.clone())]
             }
-            toml::Value::Table(table) => self.resolve_table_dependency(config, package_name, table),
+            serde_yaml::Value::Mapping(table) => {
+                self.resolve_table_dependency(config, package_name, table)
+            }
             _ => {
                 // Default case: treat as package with wildcard version
                 vec![("pkg".to_string(), package_name.to_string(), "*".to_string())]
@@ -199,21 +201,21 @@ impl SdkDepsCommand {
         &self,
         config: &Config,
         package_name: &str,
-        table: &toml::Table,
+        table: &serde_yaml::Mapping,
     ) -> Vec<(String, String, String)> {
         // Try version first
-        if let Some(toml::Value::String(version)) = table.get("version") {
+        if let Some(serde_yaml::Value::String(version)) = table.get("version") {
             return vec![("pkg".to_string(), package_name.to_string(), version.clone())];
         }
 
         // Try extension reference
-        if let Some(toml::Value::String(ext_name)) = table.get("ext") {
+        if let Some(serde_yaml::Value::String(ext_name)) = table.get("ext") {
             let version = self.get_extension_version(config, ext_name);
             return vec![("ext".to_string(), ext_name.clone(), version)];
         }
 
         // Try compile reference
-        if let Some(toml::Value::String(compile_name)) = table.get("compile") {
+        if let Some(serde_yaml::Value::String(compile_name)) = table.get("compile") {
             return self.get_compile_dependencies(config, compile_name);
         }
 
@@ -252,13 +254,13 @@ impl SdkDepsCommand {
     fn extract_dependency_version(
         &self,
         dep_name: &str,
-        dep_spec: &toml::Value,
+        dep_spec: &serde_yaml::Value,
     ) -> Option<(String, String, String)> {
         match dep_spec {
-            toml::Value::String(version) => {
+            serde_yaml::Value::String(version) => {
                 Some(("pkg".to_string(), dep_name.to_string(), version.clone()))
             }
-            toml::Value::Table(table) => table
+            serde_yaml::Value::Mapping(table) => table
                 .get("version")
                 .and_then(|v| v.as_str())
                 .map(|version| ("pkg".to_string(), dep_name.to_string(), version.to_string())),
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_resolve_package_dependencies() {
-        let cmd = SdkDepsCommand::new("test.toml".to_string());
+        let cmd = SdkDepsCommand::new("test.yaml".to_string());
 
         // Create a minimal config for testing
         let config_content = r#"
@@ -299,7 +301,7 @@ cmake = "*"
         let deps = cmd.resolve_package_dependencies(
             &config,
             "test-package",
-            &toml::Value::String("1.0.0".to_string()),
+            &serde_yaml::Value::String("1.0.0".to_string()),
         );
         assert_eq!(deps.len(), 1);
         assert_eq!(
@@ -312,13 +314,16 @@ cmake = "*"
         );
 
         // Test table with version
-        let mut table = toml::map::Map::new();
+        let mut table = serde_yaml::Mapping::new();
         table.insert(
-            "version".to_string(),
-            toml::Value::String("2.0.0".to_string()),
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("2.0.0".to_string()),
         );
-        let deps =
-            cmd.resolve_package_dependencies(&config, "test-package2", &toml::Value::Table(table));
+        let deps = cmd.resolve_package_dependencies(
+            &config,
+            "test-package2",
+            &serde_yaml::Value::Mapping(table),
+        );
         assert_eq!(deps.len(), 1);
         assert_eq!(
             deps[0],
@@ -332,20 +337,20 @@ cmake = "*"
 
     #[test]
     fn test_list_packages_by_section() {
-        let cmd = SdkDepsCommand::new("test.toml".to_string());
+        let cmd = SdkDepsCommand::new("test.yaml".to_string());
 
         let config_content = r#"
-[sdk]
-image = "test-image"
-
-[sdk.dependencies]
-cmake = "*"
-gcc = "11.0.0"
-
-[sdk.compile.app]
-dependencies = { make = "4.3" }
+sdk:
+  image: "test-image"
+  dependencies:
+    cmake: "*"
+    gcc: "11.0.0"
+  compile:
+    app:
+      dependencies:
+        make: "4.3"
 "#;
-        let mut temp_file = NamedTempFile::new().unwrap();
+        let mut temp_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
@@ -374,28 +379,32 @@ dependencies = { make = "4.3" }
 
     #[test]
     fn test_multiple_extensions_with_same_dependency() {
-        let cmd = SdkDepsCommand::new("test.toml".to_string());
+        let cmd = SdkDepsCommand::new("test.yaml".to_string());
 
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
+  dependencies:
+    cmake: "*"
 
-[sdk.dependencies]
-cmake = "*"
+ext:
+  avocado-dev:
+    types:
+      - sysext
+      - confext
+    sdk:
+      dependencies:
+        nativesdk-avocado-hitl: "*"
 
-[ext.avocado-dev]
-types = ["sysext", "confext"]
-
-[ext.avocado-dev.sdk.dependencies]
-nativesdk-avocado-hitl = "*"
-
-[ext.avocado-dev1]
-types = ["sysext", "confext"]
-
-[ext.avocado-dev1.sdk.dependencies]
-nativesdk-avocado-hitl = "*"
+  avocado-dev1:
+    types:
+      - sysext
+      - confext
+    sdk:
+      dependencies:
+        nativesdk-avocado-hitl: "*"
 "#;
-        let mut temp_file = NamedTempFile::new().unwrap();
+        let mut temp_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 

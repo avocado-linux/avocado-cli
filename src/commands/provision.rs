@@ -81,7 +81,7 @@ mod tests {
 
         let config = ProvisionConfig {
             runtime: "my-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: true,
             force: false,
             target: Some("x86_64".to_string()),
@@ -94,7 +94,7 @@ mod tests {
         let cmd = ProvisionCommand::new(config);
 
         assert_eq!(cmd.config.runtime, "my-runtime");
-        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert!(cmd.config.verbose);
         assert!(!cmd.config.force);
         assert_eq!(cmd.config.target, Some("x86_64".to_string()));
@@ -144,7 +144,7 @@ mod tests {
 
         let config = ProvisionConfig {
             runtime: "my-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
             target: None,
@@ -164,7 +164,7 @@ mod tests {
     fn test_new_with_out_path() {
         let config = ProvisionConfig {
             runtime: "test-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
             target: None,

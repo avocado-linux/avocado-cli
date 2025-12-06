@@ -40,7 +40,7 @@ impl ExtInstallCommand {
         // Load the configuration and parse raw TOML
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -90,8 +90,11 @@ impl ExtInstallCommand {
         } else {
             // No extension specified - install all local extensions
             match parsed.get("ext") {
-                Some(ext_section) => match ext_section.as_table() {
-                    Some(table) => table.keys().cloned().collect(),
+                Some(ext_section) => match ext_section.as_mapping() {
+                    Some(table) => table
+                        .keys()
+                        .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                        .collect(),
                     None => vec![],
                 },
                 None => {
@@ -127,7 +130,7 @@ impl ExtInstallCommand {
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed
             .get("runtime")
-            .and_then(|runtime| runtime.as_table())
+            .and_then(|runtime| runtime.as_mapping())
             .and_then(|runtime_table| {
                 if runtime_table.len() == 1 {
                     runtime_table.values().next()
@@ -167,10 +170,7 @@ impl ExtInstallCommand {
                 )
                 .await?
             {
-                return Err(anyhow::anyhow!(
-                    "Failed to install extension '{}'",
-                    ext_name
-                ));
+                return Err(anyhow::anyhow!("Failed to install extension '{ext_name}'"));
             }
         }
 
@@ -187,7 +187,7 @@ impl ExtInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn install_single_extension(
         &self,
-        config: &toml::Value,
+        config: &serde_yaml::Value,
         extension: &str,
         container_helper: &SdkContainer,
         container_image: &str,
@@ -254,20 +254,26 @@ impl ExtInstallCommand {
         // Check if extension exists in local config (versioned extensions may not be local)
         let dependencies = config
             .get("ext")
-            .and_then(|ext| ext.as_table())
+            .and_then(|ext| ext.as_mapping())
             .and_then(|ext_table| ext_table.get(extension))
             .and_then(|extension_config| extension_config.get("dependencies"));
 
-        if let Some(toml::Value::Table(deps_map)) = dependencies {
+        if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install and handle extension dependencies
             let mut packages = Vec::new();
             let mut extension_dependencies = Vec::new();
 
-            for (package_name, version_spec) in deps_map {
+            for (package_name_val, version_spec) in deps_map {
+                // Convert package name from Value to String
+                let package_name = match package_name_val.as_str() {
+                    Some(name) => name,
+                    None => continue, // Skip if package name is not a string
+                };
+
                 // Handle extension dependencies
-                if let toml::Value::Table(spec_map) = version_spec {
+                if let serde_yaml::Value::Mapping(spec_map) = version_spec {
                     // Skip compile dependencies (identified by dict value with 'compile' key)
-                    if spec_map.contains_key("compile") {
+                    if spec_map.contains_key(serde_yaml::Value::String("compile".to_string())) {
                         continue;
                     }
 
@@ -311,17 +317,17 @@ impl ExtInstallCommand {
 
                 // Handle regular package dependencies
                 match version_spec {
-                    toml::Value::String(version) => {
+                    serde_yaml::Value::String(version) => {
                         if version == "*" {
-                            packages.push(package_name.clone());
+                            packages.push(package_name.to_string());
                         } else {
                             packages.push(format!("{package_name}-{version}"));
                         }
                     }
-                    toml::Value::Table(spec_map) => {
-                        if let Some(toml::Value::String(version)) = spec_map.get("version") {
+                    serde_yaml::Value::Mapping(spec_map) => {
+                        if let Some(serde_yaml::Value::String(version)) = spec_map.get("version") {
                             if version == "*" {
-                                packages.push(package_name.clone());
+                                packages.push(package_name.to_string());
                             } else {
                                 packages.push(format!("{package_name}-{version}"));
                             }

@@ -33,7 +33,7 @@ impl RuntimeProvisionCommand {
         // Load configuration
         let config = load_config(&self.config.config_path)?;
         let content = std::fs::read_to_string(&self.config.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Get SDK configuration
         let sdk_config = parsed.get("sdk").context("No SDK configuration found")?;
@@ -99,7 +99,7 @@ impl RuntimeProvisionCommand {
         if let Some(out_path) = &self.config.out {
             // Construct the absolute path from the container's perspective
             // The src_dir is mounted at /opt/src in the container
-            let container_out_path = format!("/opt/src/{}", out_path);
+            let container_out_path = format!("/opt/src/{out_path}");
             env_vars.insert("AVOCADO_PROVISION_OUT".to_string(), container_out_path);
         }
 
@@ -185,7 +185,7 @@ avocado-provision-{} {}
 
     async fn collect_runtime_extensions(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         config: &crate::utils::config::Config,
         runtime_name: &str,
         target_arch: &str,
@@ -197,13 +197,13 @@ avocado-provision-{} {}
 
         let runtime_dep_table = merged_runtime
             .as_ref()
-            .and_then(|value| value.get("dependencies").and_then(|d| d.as_table()))
+            .and_then(|value| value.get("dependencies").and_then(|d| d.as_mapping()))
             .or_else(|| {
                 parsed
                     .get("runtime")
                     .and_then(|r| r.get(runtime_name))
                     .and_then(|runtime_value| runtime_value.get("dependencies"))
-                    .and_then(|d| d.as_table())
+                    .and_then(|d| d.as_mapping())
             });
 
         let mut extensions = Vec::new();
@@ -236,11 +236,11 @@ avocado-provision-{} {}
     #[allow(clippy::too_many_arguments)]
     async fn resolve_extension_version(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         config: &crate::utils::config::Config,
         config_path: &str,
         ext_name: &str,
-        dep_spec: &toml::Value,
+        dep_spec: &serde_yaml::Value,
         container_image: &str,
         target_arch: &str,
     ) -> Result<String> {
@@ -273,7 +273,7 @@ avocado-provision-{} {}
         // Try to get version from local [ext] section
         if let Some(version) = parsed
             .get("ext")
-            .and_then(|ext_section| ext_section.as_table())
+            .and_then(|ext_section| ext_section.as_mapping())
             .and_then(|ext_table| ext_table.get(ext_name))
             .and_then(|ext_config| ext_config.get("version"))
             .and_then(|v| v.as_str())
@@ -340,15 +340,12 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
                 Ok(trimmed_version.to_string())
             }
             Ok(None) => Err(anyhow::anyhow!(
-                "Failed to query version for extension '{}' from RPM database. \
-                    Extension may not be installed yet. Run 'avocado install' first.",
-                ext_name
+                "Failed to query version for extension '{ext_name}' from RPM database. \
+                    Extension may not be installed yet. Run 'avocado install' first."
             )),
             Err(e) => Err(anyhow::anyhow!(
-                "Failed to query version for extension '{}' from RPM database: {}. \
-                    Extension may not be installed yet. Run 'avocado install' first.",
-                ext_name,
-                e
+                "Failed to query version for extension '{ext_name}' from RPM database: {e}. \
+                    Extension may not be installed yet. Run 'avocado install' first."
             )),
         }
     }
@@ -362,7 +359,7 @@ mod tests {
     fn test_new() {
         let config = RuntimeProvisionConfig {
             runtime_name: "test-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
@@ -375,7 +372,7 @@ mod tests {
         let cmd = RuntimeProvisionCommand::new(config);
 
         assert_eq!(cmd.config.runtime_name, "test-runtime");
-        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert!(!cmd.config.verbose);
         assert!(!cmd.config.force);
         assert_eq!(cmd.config.target, Some("x86_64".to_string()));
@@ -387,7 +384,7 @@ mod tests {
     fn test_create_provision_script() {
         let config = RuntimeProvisionConfig {
             runtime_name: "test-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
@@ -411,20 +408,25 @@ mod tests {
         use tempfile::TempDir;
 
         let config_content = r#"
-[sdk]
-image = "docker.io/avocado/sdk:latest"
+sdk:
+  image: "docker.io/avocado/sdk:latest"
 
-[runtime.test-runtime]
-[runtime.test-runtime.dependencies]
-ext_one = { ext = "alpha-ext", vsn = "1.0.0" }
-ext_two = { ext = "beta-ext", vsn = "2.0.0" }
+runtime:
+  test-runtime:
+    dependencies:
+      ext_one:
+        ext: alpha-ext
+        vsn: "1.0.0"
+      ext_two:
+        ext: beta-ext
+        vsn: "2.0.0"
         "#;
 
         let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("avocado.toml");
+        let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, config_content).unwrap();
 
-        let parsed: toml::Value = toml::from_str(config_content).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let config = crate::utils::config::Config::load(&config_path).unwrap();
 
         let provision_config = RuntimeProvisionConfig {
@@ -470,7 +472,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
 
         let config = RuntimeProvisionConfig {
             runtime_name: "test-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
@@ -483,7 +485,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
         let cmd = RuntimeProvisionCommand::new(config);
 
         assert_eq!(cmd.config.runtime_name, "test-runtime");
-        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert!(!cmd.config.verbose);
         assert!(!cmd.config.force);
         assert_eq!(cmd.config.target, Some("x86_64".to_string()));
@@ -504,7 +506,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
 
         let config = RuntimeProvisionConfig {
             runtime_name: "test-runtime".to_string(),
-            config_path: "avocado.toml".to_string(),
+            config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
@@ -517,7 +519,7 @@ ext_two = { ext = "beta-ext", vsn = "2.0.0" }
         let cmd = RuntimeProvisionCommand::new(config);
 
         assert_eq!(cmd.config.runtime_name, "test-runtime");
-        assert_eq!(cmd.config.config_path, "avocado.toml");
+        assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert_eq!(cmd.config.env_vars, Some(env_vars));
     }
 }

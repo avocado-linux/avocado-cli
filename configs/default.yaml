@@ -1,0 +1,96 @@
+default_target: "{target}"
+
+# Add additional supported targets or use "*" for all targets
+supported_targets:
+  - {target}
+
+##
+## Runtimes
+##
+
+runtime:
+  dev:
+    dependencies:
+      avocado-img-bootfiles: "*"
+      avocado-img-rootfs: "*"
+      avocado-img-initramfs: "*"
+      avocado-ext-dev:
+        ext: avocado-ext-dev
+        vsn: "*"
+      avocado-ext-sshd-dev:
+        ext: avocado-ext-sshd-dev
+        vsn: "*"
+      config:
+        ext: config
+      app:
+        ext: app
+
+##
+## Extensions
+##
+
+ext:
+  # Generated default app extension
+  # Use or modify this to install dependencies and or include sdk compiled code
+  app:
+    types:
+      - sysext
+      - confext
+    version: "0.1.0"
+
+  # Install application dependencies
+    # dependencies:
+#curl = "*"
+#iperf3 = "*"
+
+# Generated default config extension
+# Use or modify this to configure "real" user accounts (passwd, shadow, group)
+# or configure other system services
+  config:
+    types:
+      - confext
+    version: "0.1.0"
+
+    # NOT FOR PRODUCTION: Set root password to empty string
+    users:
+      root:
+        password: ""
+
+##
+## SDK
+##
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+
+  dependencies:
+    avocado-sdk-toolchain: "*"
+
+  {target}:
+    container_args:
+      - --network=host
+
+##
+## Provisioning
+##
+
+# When provisioning using usb or sd provisioning profiles, set extra sdk
+# container arguments to allow access to these devices
+
+provision:
+  usb:
+    container_args:
+      - -v
+      - /dev:/dev
+      - -v
+      - /sys:/sys:ro
+      - --privileged
+
+  sd:
+    container_args:
+      - -v
+      - /dev:/dev
+      - -v
+      - /sys:/sys:ro
+      - --privileged
+

@@ -25,7 +25,7 @@ fn test_ext_image_with_fixture_extension() {
         .join("tests")
         .join("fixtures")
         .join("configs")
-        .join("with-sysext.toml");
+        .join("with-sysext.yaml");
     let result =
         common::cli_with_config(&["ext", "image", "test-sysext"], None, Some(&config_path));
     // Should complete regardless of Docker availability

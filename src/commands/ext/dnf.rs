@@ -40,7 +40,7 @@ impl ExtDnfCommand {
         let config = Config::load(&self.config_path)?;
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         let target = self.resolve_target_architecture(&config)?;
         let extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
@@ -105,7 +105,7 @@ impl ExtDnfCommand {
         }
     }
 
-    fn get_container_image(&self, parsed: &toml::Value) -> Result<String> {
+    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
         parsed
             .get("sdk")
             .and_then(|sdk| sdk.get("image"))
@@ -123,7 +123,7 @@ impl ExtDnfCommand {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dnf_command(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         container_image: &str,
         target: &str,
         repo_url: Option<&String>,
@@ -163,7 +163,7 @@ impl ExtDnfCommand {
     #[allow(clippy::too_many_arguments)]
     async fn setup_extension_environment(
         &self,
-        _config: &toml::Value,
+        _config: &serde_yaml::Value,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,

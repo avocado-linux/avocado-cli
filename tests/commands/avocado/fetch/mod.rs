@@ -19,7 +19,7 @@ fn test_fetch_with_external_extensions() {
         .join("tests")
         .join("fixtures")
         .join("configs")
-        .join("with-external-extensions.toml");
+        .join("with-external-extensions.yaml");
 
     // This test verifies that the fetch command can discover and process
     // external extensions with nested configs without crashing
@@ -62,7 +62,7 @@ fn test_fetch_discovers_nested_extensions() {
         .join("tests")
         .join("fixtures")
         .join("configs")
-        .join("with-external-extensions.toml");
+        .join("with-external-extensions.yaml");
 
     let result = common::cli_with_config(
         &["fetch", "--verbose", "--target", "x86_64"],

@@ -23,7 +23,7 @@ impl ExtDepsCommand {
     pub fn execute(&self) -> Result<()> {
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         let target = resolve_target_required(self.target.as_deref(), &config)?;
         let extensions_to_process = self.get_extensions_to_process(&config, &parsed, &target)?;
@@ -35,7 +35,7 @@ impl ExtDepsCommand {
     fn get_extensions_to_process(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<Vec<String>> {
         match &self.extension {
@@ -69,9 +69,12 @@ impl ExtDepsCommand {
                 match ext_section {
                     Some(ext) => {
                         let ext_table = ext
-                            .as_table()
+                            .as_mapping()
                             .ok_or_else(|| anyhow::anyhow!("Invalid ext section format"))?;
-                        Ok(ext_table.keys().cloned().collect())
+                        Ok(ext_table
+                            .keys()
+                            .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                            .collect())
                     }
                     None => {
                         self.handle_no_extensions();
@@ -103,7 +106,7 @@ impl ExtDepsCommand {
         );
     }
 
-    fn display_dependencies(&self, parsed: &toml::Value, extensions: &[String]) {
+    fn display_dependencies(&self, parsed: &serde_yaml::Value, extensions: &[String]) {
         if extensions.is_empty() {
             println!("No extensions found in configuration.");
             return;
@@ -132,15 +135,15 @@ impl ExtDepsCommand {
 
     fn resolve_package_dependencies(
         &self,
-        config: &toml::Value,
+        config: &serde_yaml::Value,
         package_name: &str,
-        package_spec: &toml::Value,
+        package_spec: &serde_yaml::Value,
     ) -> Vec<(String, String, String)> {
         match package_spec {
-            toml::Value::String(version) => {
+            serde_yaml::Value::String(version) => {
                 vec![("pkg".to_string(), package_name.to_string(), version.clone())]
             }
-            toml::Value::Table(spec_map) => {
+            serde_yaml::Value::Mapping(spec_map) => {
                 self.resolve_table_dependency(config, package_name, spec_map)
             }
             _ => Vec::new(),
@@ -149,19 +152,19 @@ impl ExtDepsCommand {
 
     fn resolve_table_dependency(
         &self,
-        config: &toml::Value,
+        config: &serde_yaml::Value,
         package_name: &str,
-        spec_map: &toml::Table,
+        spec_map: &serde_yaml::Mapping,
     ) -> Vec<(String, String, String)> {
         // Try version first
-        if let Some(toml::Value::String(version)) = spec_map.get("version") {
+        if let Some(serde_yaml::Value::String(version)) = spec_map.get("version") {
             return vec![("pkg".to_string(), package_name.to_string(), version.clone())];
         }
 
         // Try extension reference
-        if let Some(toml::Value::String(ext_name)) = spec_map.get("ext") {
+        if let Some(serde_yaml::Value::String(ext_name)) = spec_map.get("ext") {
             // Check if this is a versioned extension (has vsn field)
-            if let Some(toml::Value::String(version)) = spec_map.get("vsn") {
+            if let Some(serde_yaml::Value::String(version)) = spec_map.get("vsn") {
                 return vec![("ext".to_string(), ext_name.clone(), version.clone())];
             }
             // Check if this is an external extension (has config field)
@@ -175,9 +178,9 @@ impl ExtDepsCommand {
         }
 
         // Try compile reference (both old and new syntax)
-        if let Some(toml::Value::String(compile_name)) = spec_map.get("compile") {
+        if let Some(serde_yaml::Value::String(compile_name)) = spec_map.get("compile") {
             // Check if this is the new syntax with install script
-            if let Some(toml::Value::String(install_script)) = spec_map.get("install") {
+            if let Some(serde_yaml::Value::String(install_script)) = spec_map.get("install") {
                 // New syntax: { compile = "section-name", install = "script.sh" }
                 // Return a special marker to indicate this needs install script handling
                 return vec![(
@@ -196,7 +199,7 @@ impl ExtDepsCommand {
 
     fn resolve_extension_dependency(
         &self,
-        config: &toml::Value,
+        config: &serde_yaml::Value,
         ext_name: &str,
     ) -> Vec<(String, String, String)> {
         let version = config
@@ -211,7 +214,7 @@ impl ExtDepsCommand {
 
     fn resolve_compile_dependencies(
         &self,
-        config: &toml::Value,
+        config: &serde_yaml::Value,
         compile_name: &str,
     ) -> Vec<(String, String, String)> {
         let compile_deps = config
@@ -219,7 +222,7 @@ impl ExtDepsCommand {
             .and_then(|sdk| sdk.get("compile"))
             .and_then(|compile| compile.get(compile_name))
             .and_then(|compile_config| compile_config.get("dependencies"))
-            .and_then(|deps| deps.as_table());
+            .and_then(|deps| deps.as_mapping());
 
         let Some(deps_table) = compile_deps else {
             return Vec::new();
@@ -227,20 +230,24 @@ impl ExtDepsCommand {
 
         deps_table
             .iter()
-            .filter_map(|(dep_name, dep_spec)| self.extract_dependency_version(dep_name, dep_spec))
+            .filter_map(|(dep_name_val, dep_spec)| {
+                dep_name_val
+                    .as_str()
+                    .and_then(|dep_name| self.extract_dependency_version(dep_name, dep_spec))
+            })
             .collect()
     }
 
     fn extract_dependency_version(
         &self,
         dep_name: &str,
-        dep_spec: &toml::Value,
+        dep_spec: &serde_yaml::Value,
     ) -> Option<(String, String, String)> {
         match dep_spec {
-            toml::Value::String(version) => {
+            serde_yaml::Value::String(version) => {
                 Some(("pkg".to_string(), dep_name.to_string(), version.clone()))
             }
-            toml::Value::Table(spec_map) => spec_map
+            serde_yaml::Value::Mapping(spec_map) => spec_map
                 .get("version")
                 .and_then(|v| v.as_str())
                 .map(|version| ("pkg".to_string(), dep_name.to_string(), version.to_string())),
@@ -250,14 +257,14 @@ impl ExtDepsCommand {
 
     fn list_packages_from_config(
         &self,
-        config: &toml::Value,
+        config: &serde_yaml::Value,
         extension: &str,
     ) -> Vec<(String, String, String)> {
         let dependencies = config
             .get("ext")
             .and_then(|ext_section| ext_section.get(extension))
             .and_then(|ext_config| ext_config.get("dependencies"))
-            .and_then(|deps| deps.as_table());
+            .and_then(|deps| deps.as_mapping());
 
         let Some(deps_table) = dependencies else {
             return Vec::new();
@@ -265,8 +272,13 @@ impl ExtDepsCommand {
 
         let mut all_packages: Vec<_> = deps_table
             .iter()
-            .flat_map(|(package_name, package_spec)| {
-                self.resolve_package_dependencies(config, package_name, package_spec)
+            .flat_map(|(package_name_val, package_spec)| {
+                package_name_val
+                    .as_str()
+                    .map(|package_name| {
+                        self.resolve_package_dependencies(config, package_name, package_spec)
+                    })
+                    .unwrap_or_default()
             })
             .collect();
 
@@ -299,37 +311,42 @@ mod tests {
     #[test]
     fn test_resolve_compile_dependency_with_install() {
         let config_content = r#"
-[ext.my-extension]
-types = ["sysext"]
+ext:
+  my-extension:
+    types:
+      - sysext
+    dependencies:
+      my-app:
+        compile: my-app
+        install: ext-install.sh
+      regular-package: "1.0.0"
+      old-compile-dep:
+        compile: old-section
 
-[ext.my-extension.dependencies]
-my-app = { compile = "my-app", install = "ext-install.sh" }
-regular-package = "1.0.0"
-old-compile-dep = { compile = "old-section" }
-
-[sdk.compile.my-app]
-compile = "ext-compile.sh"
-
-[sdk.compile.old-section]
-compile = "ext-compile.sh"
+sdk:
+  compile:
+    my-app:
+      compile: ext-compile.sh
+    old-section:
+      compile: ext-compile.sh
 "#;
 
-        let config: toml::Value = toml::from_str(config_content).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let cmd = ExtDepsCommand {
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             extension: Some("my-extension".to_string()),
             target: None,
         };
 
         // Test new syntax with install script
-        let spec_map = toml::Table::from_iter([
+        let spec_map = serde_yaml::Mapping::from_iter([
             (
-                "compile".to_string(),
-                toml::Value::String("my-app".to_string()),
+                serde_yaml::Value::String("compile".to_string()),
+                serde_yaml::Value::String("my-app".to_string()),
             ),
             (
-                "install".to_string(),
-                toml::Value::String("ext-install.sh".to_string()),
+                serde_yaml::Value::String("install".to_string()),
+                serde_yaml::Value::String("ext-install.sh".to_string()),
             ),
         ]);
 
@@ -340,9 +357,9 @@ compile = "ext-compile.sh"
         assert_eq!(result[0].2, "ext-install.sh");
 
         // Test old syntax without install script
-        let spec_map_old = toml::Table::from_iter([(
-            "compile".to_string(),
-            toml::Value::String("old-section".to_string()),
+        let spec_map_old = serde_yaml::Mapping::from_iter([(
+            serde_yaml::Value::String("compile".to_string()),
+            serde_yaml::Value::String("old-section".to_string()),
         )]);
 
         let result_old = cmd.resolve_table_dependency(&config, "old-compile-dep", &spec_map_old);
@@ -353,21 +370,23 @@ compile = "ext-compile.sh"
     #[test]
     fn test_resolve_regular_dependencies() {
         let config_content = r#"
-[ext.test-ext]
-types = ["sysext"]
+ext:
+  test-ext:
+    types:
+      - sysext
 "#;
 
-        let config: toml::Value = toml::from_str(config_content).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let cmd = ExtDepsCommand {
-            config_path: "test.toml".to_string(),
+            config_path: "test.yaml".to_string(),
             extension: Some("test-ext".to_string()),
             target: None,
         };
 
         // Test version dependency
-        let spec_map = toml::Table::from_iter([(
-            "version".to_string(),
-            toml::Value::String("1.0.0".to_string()),
+        let spec_map = serde_yaml::Mapping::from_iter([(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
         )]);
 
         let result = cmd.resolve_table_dependency(&config, "test-package", &spec_map);

@@ -15,7 +15,7 @@ impl ExtListCommand {
     pub fn execute(&self) -> Result<()> {
         let _config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         let extensions = self.get_extensions(&parsed);
         self.display_extensions(&extensions);
@@ -28,11 +28,16 @@ impl ExtListCommand {
         Ok(())
     }
 
-    fn get_extensions(&self, parsed: &toml::Value) -> Vec<String> {
+    fn get_extensions(&self, parsed: &serde_yaml::Value) -> Vec<String> {
         parsed
             .get("ext")
-            .and_then(|ext_section| ext_section.as_table())
-            .map(|table| table.keys().cloned().collect())
+            .and_then(|ext_section| ext_section.as_mapping())
+            .map(|table| {
+                table
+                    .keys()
+                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

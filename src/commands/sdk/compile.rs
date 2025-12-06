@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_get_compile_sections_from_config() {
-        let cmd = SdkCompileCommand::new("test.toml".to_string(), false, vec![], None, None, None);
+        let cmd = SdkCompileCommand::new("test.yaml".to_string(), false, vec![], None, None, None);
 
         let config_content = r#"
 [sdk]
@@ -279,7 +279,7 @@ dependencies = { make = "*" }
     #[tokio::test]
     async fn test_missing_sections_error() {
         let cmd = SdkCompileCommand::new(
-            "test.toml".to_string(),
+            "test.yaml".to_string(),
             false,
             vec!["nonexistent".to_string()],
             None,
@@ -305,11 +305,14 @@ dependencies = { gcc = "*" }
 
     #[test]
     fn test_find_compile_script_in_section() {
-        let cmd = SdkCompileCommand::new("test.toml".to_string(), false, vec![], None, None, None);
+        let cmd = SdkCompileCommand::new("test.yaml".to_string(), false, vec![], None, None, None);
 
         // Test section with compile script
         let mut deps = std::collections::HashMap::new();
-        deps.insert("gcc".to_string(), toml::Value::String("*".to_string()));
+        deps.insert(
+            "gcc".to_string(),
+            serde_yaml::Value::String("*".to_string()),
+        );
 
         let section_config = crate::utils::config::CompileConfig {
             compile: Some("my_script.sh".to_string()),

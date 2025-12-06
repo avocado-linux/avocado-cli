@@ -17,12 +17,15 @@ impl RuntimeListCommand {
         // Load configuration and parse raw TOML
         let _config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Check if runtime section exists
-        if let Some(runtime_config) = parsed.get("runtime").and_then(|v| v.as_table()) {
+        if let Some(runtime_config) = parsed.get("runtime").and_then(|v| v.as_mapping()) {
             // List all runtime names
-            let mut runtimes: Vec<&String> = runtime_config.keys().collect();
+            let mut runtimes: Vec<String> = runtime_config
+                .keys()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect();
             runtimes.sort();
 
             for runtime_name in &runtimes {
@@ -48,29 +51,29 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_config_file(temp_dir: &TempDir, content: &str) -> String {
-        let config_path = temp_dir.path().join("avocado.toml");
+        let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
     }
 
     #[test]
     fn test_new() {
-        let cmd = RuntimeListCommand::new("avocado.toml".to_string());
-        assert_eq!(cmd.config_path, "avocado.toml");
+        let cmd = RuntimeListCommand::new("avocado.yaml".to_string());
+        assert_eq!(cmd.config_path, "avocado.yaml");
     }
 
     #[test]
     fn test_execute_with_runtimes() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 
-[runtime.app]
-target = "x86_64"
-
-[runtime.server]
-target = "aarch64"
+runtime:
+  app:
+    target: "x86_64"
+  server:
+    target: "aarch64"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
         let cmd = RuntimeListCommand::new(config_path);
@@ -83,8 +86,8 @@ target = "aarch64"
     fn test_execute_without_runtimes() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
         let cmd = RuntimeListCommand::new(config_path);

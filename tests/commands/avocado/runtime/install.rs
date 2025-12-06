@@ -15,7 +15,7 @@ fn test_short_help() {
 #[test]
 fn test_install_missing_config() {
     common::refute_cmd(
-        &["runtime", "install", "-C", "nonexistent.toml"],
+        &["runtime", "install", "-C", "nonexistent.yaml"],
         None,
         None,
     );
@@ -23,25 +23,36 @@ fn test_install_missing_config() {
 
 #[test]
 fn test_install_with_verbose() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["runtime", "install", "--verbose"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(&["runtime", "install", "--verbose"], Some(&temp_dir), None);
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_install_with_runtime_flag() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["runtime", "install", "-r", "test-runtime"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(
+        &["runtime", "install", "-r", "test-runtime"],
+        Some(&temp_dir),
+        None,
+    );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_install_with_force() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["runtime", "install", "--force"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(&["runtime", "install", "--force"], Some(&temp_dir), None);
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_install_with_container_args() {
-    // This will fail with a real config but tests argument parsing
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
     common::refute_cmd(
         &[
             "runtime",
@@ -49,23 +60,28 @@ fn test_install_with_container_args() {
             "--container-arg",
             "--cap-add=SYS_ADMIN",
         ],
-        None,
+        Some(&temp_dir),
         None,
     );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_install_with_dnf_args() {
-    // This will fail with a real config but tests argument parsing
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
     common::refute_cmd(
         &["runtime", "install", "--dnf-arg", "--nogpgcheck"],
-        None,
+        Some(&temp_dir),
         None,
     );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_install_all_runtimes() {
-    // Install for all runtimes (no -r flag)
-    common::refute_cmd(&["runtime", "install"], None, None);
+    // Install for all runtimes (no -r flag) - will fail without config
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(&["runtime", "install"], Some(&temp_dir), None);
+    common::cleanup_temp_dir(&temp_dir);
 }

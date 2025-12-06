@@ -20,7 +20,7 @@ struct GitHubContent {
 
 /// Command to initialize a new Avocado project with configuration files.
 ///
-/// This command creates a new `avocado.toml` configuration file in the specified
+/// This command creates a new `avocado.yaml` configuration file in the specified
 /// directory with default settings for the Avocado build system.
 pub struct InitCommand {
     /// Target architecture (e.g., "qemux86-64")
@@ -72,26 +72,29 @@ impl InitCommand {
     /// # Returns
     /// * The configuration template content as a string
     fn load_config_template(target: &str) -> String {
-        match target {
-            "qemux86-64" => include_str!("../../configs/qemu/qemux86-64.toml").to_string(),
-            "qemuarm64" => include_str!("../../configs/qemu/qemuarm64.toml").to_string(),
-            "reterminal" => include_str!("../../configs/seeed/reterminal.toml").to_string(),
-            "reterminal-dm" => include_str!("../../configs/seeed/reterminal-dm.toml").to_string(),
-            "jetson-orin-nano-devkit" => {
-                include_str!("../../configs/nvidia/jetson-orin-nano-devkit.toml").to_string()
-            }
-            "raspberrypi4" => {
-                include_str!("../../configs/raspberry-pi/raspberrypi-4-model-b.toml").to_string()
-            }
-            "raspberrypi5" => {
-                include_str!("../../configs/raspberry-pi/raspberrypi-5.toml").to_string()
-            }
-            "icam-540" => include_str!("../../configs/advantech/icam-540.toml").to_string(),
-            _ => {
-                // Use default template and substitute the target
-                let default_template = include_str!("../../configs/default.toml");
-                default_template.replace("{target}", target)
-            }
+        // Try to load YAML config first, fall back to default with target substitution
+        let yaml_content = match target {
+            "reterminal" => Some(include_str!("../../configs/seeed/reterminal.yaml")),
+            "reterminal-dm" => Some(include_str!("../../configs/seeed/reterminal-dm.yaml")),
+            "jetson-orin-nano-devkit" => Some(include_str!(
+                "../../configs/nvidia/jetson-orin-nano-devkit.yaml"
+            )),
+            "raspberrypi4" => Some(include_str!(
+                "../../configs/raspberry-pi/raspberrypi-4-model-b.yaml"
+            )),
+            "raspberrypi5" => Some(include_str!(
+                "../../configs/raspberry-pi/raspberrypi-5.yaml"
+            )),
+            "icam-540" => Some(include_str!("../../configs/advantech/icam-540.yaml")),
+            _ => None,
+        };
+
+        if let Some(content) = yaml_content {
+            content.to_string()
+        } else {
+            // Use default YAML template and substitute the target
+            let default_template = include_str!("../../configs/default.yaml");
+            default_template.replace("{target}", target)
         }
     }
 
@@ -159,7 +162,7 @@ impl InitCommand {
         Ok(())
     }
 
-    /// Downloads the avocado.toml file from a reference and returns its content.
+    /// Downloads the avocado.yaml file from a reference and returns its content.
     ///
     /// # Arguments
     /// * `reference_name` - The name of the reference folder
@@ -169,7 +172,7 @@ impl InitCommand {
     /// * `Err` if the file doesn't exist or cannot be downloaded
     async fn download_reference_config(reference_name: &str) -> Result<String> {
         let url = format!(
-            "{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{REFERENCES_PATH}/{reference_name}/avocado.toml"
+            "{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{REFERENCES_PATH}/{reference_name}/avocado.yaml"
         );
 
         let client = reqwest::Client::builder()
@@ -177,11 +180,11 @@ impl InitCommand {
             .build()?;
 
         let response = client.get(&url).send().await.with_context(|| {
-            format!("Failed to fetch avocado.toml from reference '{reference_name}'")
+            format!("Failed to fetch avocado.yaml from reference '{reference_name}'")
         })?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Reference '{reference_name}' does not contain an avocado.toml file");
+            anyhow::bail!("Reference '{reference_name}' does not contain an avocado.yaml file");
         }
 
         let content: GitHubContent = response
@@ -194,23 +197,23 @@ impl InitCommand {
                 .get(&download_url)
                 .send()
                 .await
-                .with_context(|| "Failed to download avocado.toml")?;
+                .with_context(|| "Failed to download avocado.yaml")?;
 
             let file_content = file_response
                 .text()
                 .await
-                .with_context(|| "Failed to read avocado.toml content")?;
+                .with_context(|| "Failed to read avocado.yaml content")?;
 
             Ok(file_content)
         } else {
-            anyhow::bail!("Could not get download URL for avocado.toml");
+            anyhow::bail!("Could not get download URL for avocado.yaml");
         }
     }
 
     /// Checks if a target is supported in the given TOML content.
     ///
     /// # Arguments
-    /// * `toml_content` - The content of the avocado.toml file
+    /// * `toml_content` - The content of the avocado.yaml file
     /// * `target` - The target to check for
     ///
     /// # Returns
@@ -219,10 +222,10 @@ impl InitCommand {
     /// * `Err` if the TOML cannot be parsed or doesn't have supported_targets
     fn is_target_supported(toml_content: &str, target: &str) -> Result<bool> {
         let config: toml::Value =
-            toml::from_str(toml_content).with_context(|| "Failed to parse avocado.toml")?;
+            toml::from_str(toml_content).with_context(|| "Failed to parse avocado.yaml")?;
 
         let supported_targets_value = config.get("supported_targets").ok_or_else(|| {
-            anyhow::anyhow!("Reference avocado.toml missing 'supported_targets' field")
+            anyhow::anyhow!("Reference avocado.yaml missing 'supported_targets' field")
         })?;
 
         // Handle supported_targets as a string (e.g., "*")
@@ -248,10 +251,10 @@ impl InitCommand {
         anyhow::bail!("supported_targets must be either a string or an array");
     }
 
-    /// Updates the default_target in the avocado.toml file.
+    /// Updates the default_target in the avocado.yaml file.
     ///
     /// # Arguments
-    /// * `toml_path` - Path to the avocado.toml file
+    /// * `toml_path` - Path to the avocado.yaml file
     /// * `new_target` - The new target to set as default
     ///
     /// # Returns
@@ -263,7 +266,7 @@ impl InitCommand {
 
         // Parse as toml::Value to preserve structure
         let mut config: toml::Value =
-            toml::from_str(&content).with_context(|| "Failed to parse avocado.toml")?;
+            toml::from_str(&content).with_context(|| "Failed to parse avocado.yaml")?;
 
         // Update the default_target field
         if let Some(table) = config.as_table_mut() {
@@ -272,7 +275,7 @@ impl InitCommand {
                 toml::Value::String(new_target.to_string()),
             );
         } else {
-            anyhow::bail!("avocado.toml is not a valid TOML table");
+            anyhow::bail!("avocado.yaml is not a valid TOML table");
         }
 
         // Write back to file
@@ -422,7 +425,7 @@ impl InitCommand {
         Ok(())
     }
 
-    /// Executes the init command, creating the avocado.toml configuration file.
+    /// Executes the init command, creating the avocado.yaml configuration file.
     ///
     /// # Returns
     /// * `Ok(())` if the initialization was successful
@@ -431,7 +434,7 @@ impl InitCommand {
     /// # Errors
     /// This function will return an error if:
     /// * The target directory cannot be created
-    /// * The avocado.toml file already exists
+    /// * The avocado.yaml file already exists
     /// * The configuration file cannot be written
     /// * The reference doesn't exist (when using --reference)
     /// * There was an error downloading reference contents
@@ -452,9 +455,8 @@ impl InitCommand {
             println!("Checking if reference '{ref_name}' exists...");
             if !Self::reference_exists(ref_name).await? {
                 anyhow::bail!(
-                    "Reference '{ref_name}' not found in {}/{REPO_NAME}/{REPO_BRANCH}/{REFERENCES_PATH}. \
-                    Please check the available references at https://github.com/{REPO_OWNER}/{REPO_NAME}/tree/{REPO_BRANCH}/{REFERENCES_PATH}",
-                    REPO_OWNER
+                    "Reference '{ref_name}' not found in {REPO_OWNER}/{REPO_NAME}/{REPO_BRANCH}/{REFERENCES_PATH}. \
+                    Please check the available references at https://github.com/{REPO_OWNER}/{REPO_NAME}/tree/{REPO_BRANCH}/{REFERENCES_PATH}"
                 );
             }
 
@@ -462,14 +464,14 @@ impl InitCommand {
             if let Some(target) = &self.target {
                 println!("Validating target '{target}' is supported by reference '{ref_name}'...");
 
-                // Download and parse the reference's avocado.toml
+                // Download and parse the reference's avocado.yaml
                 let toml_content = Self::download_reference_config(ref_name).await?;
 
                 // Check if target is supported
                 if !Self::is_target_supported(&toml_content, target)? {
                     anyhow::bail!(
                         "Target '{target}' is not supported by reference '{ref_name}'. \
-                        Please check the reference's avocado.toml for supported_targets."
+                        Please check the reference's avocado.yaml for supported_targets."
                     );
                 }
 
@@ -480,9 +482,9 @@ impl InitCommand {
             println!("Downloading reference contents...");
             Self::download_reference_contents(ref_name, ref_name, Path::new(directory)).await?;
 
-            // If a target was specified, update the default_target in the downloaded avocado.toml
+            // If a target was specified, update the default_target in the downloaded avocado.yaml
             if let Some(target) = &self.target {
-                let toml_path = Path::new(directory).join("avocado.toml");
+                let toml_path = Path::new(directory).join("avocado.yaml");
                 if toml_path.exists() {
                     println!("Updating default_target to '{target}'...");
                     Self::update_default_target(&toml_path, target)?;
@@ -498,14 +500,14 @@ impl InitCommand {
                     .display()
             );
         } else {
-            // Original behavior: create avocado.toml from template
+            // Original behavior: create avocado.yaml from template
             let target = self
                 .target
                 .as_deref()
                 .unwrap_or_else(|| Self::get_default_target());
 
-            // Create the avocado.toml file path
-            let toml_path = Path::new(directory).join("avocado.toml");
+            // Create the avocado.yaml file path
+            let toml_path = Path::new(directory).join("avocado.yaml");
 
             // Check if configuration file already exists
             if toml_path.exists() {
@@ -559,22 +561,28 @@ mod tests {
 
         assert!(result.is_ok());
 
-        let config_path = PathBuf::from(temp_path).join("avocado.toml");
+        let config_path = PathBuf::from(temp_path).join("avocado.yaml");
         assert!(config_path.exists());
 
         let content = fs::read_to_string(&config_path).unwrap();
         let expected_target = InitCommand::get_default_target();
-        assert!(content.contains(&format!("default_target = \"{expected_target}\"")));
-        assert!(content.contains("[runtime.dev.dependencies]"));
-        assert!(content.contains("avocado-img-bootfiles = \"*\""));
-        assert!(content.contains("avocado-img-rootfs = \"*\""));
-        assert!(content.contains("avocado-img-initramfs = \"*\""));
-        assert!(content.contains("avocado-ext-dev = { ext = \"avocado-ext-dev\", vsn = \"*\" }"));
-        assert!(content.contains("image = \"docker.io/avocadolinux/sdk:apollo-edge\""));
-        assert!(content.contains("[ext.app]"));
-        assert!(content.contains("types = [\"sysext\", \"confext\"]"));
-        assert!(content.contains("[ext.config]"));
-        assert!(content.contains("avocado-sdk-toolchain = \"*\""));
+        assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
+        assert!(content.contains("runtime:"));
+        assert!(content.contains("dev:"));
+        assert!(content.contains("dependencies:"));
+        assert!(content.contains("avocado-img-bootfiles: \"*\""));
+        assert!(content.contains("avocado-img-rootfs: \"*\""));
+        assert!(content.contains("avocado-img-initramfs: \"*\""));
+        assert!(content.contains("avocado-ext-dev:"));
+        assert!(content.contains("ext: avocado-ext-dev"));
+        assert!(content.contains("vsn: \"*\""));
+        assert!(content.contains("image: \"docker.io/avocadolinux/sdk:apollo-edge\""));
+        assert!(content.contains("ext:"));
+        assert!(content.contains("app:"));
+        assert!(content.contains("- sysext"));
+        assert!(content.contains("- confext"));
+        assert!(content.contains("config:"));
+        assert!(content.contains("avocado-sdk-toolchain: \"*\""));
     }
 
     #[tokio::test]
@@ -591,16 +599,16 @@ mod tests {
 
         assert!(result.is_ok());
 
-        let config_path = PathBuf::from(temp_path).join("avocado.toml");
+        let config_path = PathBuf::from(temp_path).join("avocado.yaml");
         let content = fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("default_target = \"custom-arch\""));
+        assert!(content.contains("default_target: \"custom-arch\""));
     }
 
     #[tokio::test]
     async fn test_init_file_already_exists() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
-        let config_path = PathBuf::from(temp_path).join("avocado.toml");
+        let config_path = PathBuf::from(temp_path).join("avocado.yaml");
 
         // Create existing file
         fs::write(&config_path, "existing content").unwrap();
@@ -625,7 +633,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(new_dir_path.exists());
 
-        let config_path = new_dir_path.join("avocado.toml");
+        let config_path = new_dir_path.join("avocado.yaml");
         assert!(config_path.exists());
     }
 
@@ -687,33 +695,30 @@ mod tests {
 
     /// Helper function to validate that all [ext.<name>] blocks have a version field
     fn validate_ext_versions(config_content: &str, config_name: &str) {
-        let config: toml::Value = toml::from_str(config_content)
-            .unwrap_or_else(|e| panic!("Failed to parse {} config: {}", config_name, e));
+        let config: serde_yaml::Value = serde_yaml::from_str(config_content)
+            .unwrap_or_else(|e| panic!("Failed to parse {config_name} config: {e}"));
 
-        // TOML parses [ext.app] as a nested structure: ext -> app
+        // YAML parses ext.app as a nested structure: ext -> app
         // So we need to look for the "ext" key and then check its children
-        if let Some(table) = config.as_table() {
-            if let Some(ext_value) = table.get("ext") {
-                if let Some(ext_table) = ext_value.as_table() {
+        if let Some(mapping) = config.as_mapping() {
+            if let Some(ext_value) = mapping.get(serde_yaml::Value::String("ext".to_string())) {
+                if let Some(ext_table) = ext_value.as_mapping() {
                     // Now iterate through each extension (app, config, etc.)
-                    for (ext_name, ext_config) in ext_table {
-                        if let Some(ext_config_table) = ext_config.as_table() {
+                    for (ext_name_val, ext_config) in ext_table {
+                        let ext_name = ext_name_val.as_str().unwrap_or("");
+                        if let Some(ext_config_table) = ext_config.as_mapping() {
                             assert!(
-                                ext_config_table.contains_key("version"),
-                                "Config '{}' has [ext.{}] block without 'version' field. All extension blocks must have a version field.",
-                                config_name,
-                                ext_name
+                                ext_config_table.contains_key(serde_yaml::Value::String("version".to_string())),
+                                "Config '{config_name}' has ext.{ext_name} block without 'version' field. All extension blocks must have a version field."
                             );
 
                             // Validate that version is a string
                             assert!(
                                 ext_config_table
-                                    .get("version")
+                                    .get(serde_yaml::Value::String("version".to_string()))
                                     .and_then(|v| v.as_str())
                                     .is_some(),
-                                "Config '{}' has [ext.{}] block with non-string 'version' field",
-                                config_name,
-                                ext_name
+                                "Config '{config_name}' has ext.{ext_name} block with non-string 'version' field"
                             );
                         }
                     }
@@ -726,40 +731,32 @@ mod tests {
     fn test_all_config_templates_have_ext_versions() {
         // Test default template (substitute {target} placeholder for validation)
         let default_template =
-            include_str!("../../configs/default.toml").replace("{target}", "test-target");
-        validate_ext_versions(&default_template, "default.toml");
-
-        // Test qemux86-64
-        let qemux86_64 = include_str!("../../configs/qemu/qemux86-64.toml");
-        validate_ext_versions(qemux86_64, "qemux86-64.toml");
-
-        // Test qemuarm64
-        let qemuarm64 = include_str!("../../configs/qemu/qemuarm64.toml");
-        validate_ext_versions(qemuarm64, "qemuarm64.toml");
+            include_str!("../../configs/default.yaml").replace("{target}", "test-target");
+        validate_ext_versions(&default_template, "default.yaml");
 
         // Test reterminal
-        let reterminal = include_str!("../../configs/seeed/reterminal.toml");
-        validate_ext_versions(reterminal, "reterminal.toml");
+        let reterminal = include_str!("../../configs/seeed/reterminal.yaml");
+        validate_ext_versions(reterminal, "reterminal.yaml");
 
         // Test reterminal-dm
-        let reterminal_dm = include_str!("../../configs/seeed/reterminal-dm.toml");
-        validate_ext_versions(reterminal_dm, "reterminal-dm.toml");
+        let reterminal_dm = include_str!("../../configs/seeed/reterminal-dm.yaml");
+        validate_ext_versions(reterminal_dm, "reterminal-dm.yaml");
 
         // Test jetson-orin-nano-devkit
-        let jetson = include_str!("../../configs/nvidia/jetson-orin-nano-devkit.toml");
-        validate_ext_versions(jetson, "jetson-orin-nano-devkit.toml");
+        let jetson = include_str!("../../configs/nvidia/jetson-orin-nano-devkit.yaml");
+        validate_ext_versions(jetson, "jetson-orin-nano-devkit.yaml");
 
         // Test raspberrypi4
-        let rpi4 = include_str!("../../configs/raspberry-pi/raspberrypi-4-model-b.toml");
-        validate_ext_versions(rpi4, "raspberrypi-4-model-b.toml");
+        let rpi4 = include_str!("../../configs/raspberry-pi/raspberrypi-4-model-b.yaml");
+        validate_ext_versions(rpi4, "raspberrypi-4-model-b.yaml");
 
         // Test raspberrypi5
-        let rpi5 = include_str!("../../configs/raspberry-pi/raspberrypi-5.toml");
-        validate_ext_versions(rpi5, "raspberrypi-5.toml");
+        let rpi5 = include_str!("../../configs/raspberry-pi/raspberrypi-5.yaml");
+        validate_ext_versions(rpi5, "raspberrypi-5.yaml");
 
         // Test icam-540
-        let icam = include_str!("../../configs/advantech/icam-540.toml");
-        validate_ext_versions(icam, "icam-540.toml");
+        let icam = include_str!("../../configs/advantech/icam-540.yaml");
+        validate_ext_versions(icam, "icam-540.yaml");
     }
 
     #[tokio::test]
@@ -792,15 +789,12 @@ mod tests {
                 result.err()
             );
 
-            let config_path = PathBuf::from(temp_path).join("avocado.toml");
+            let config_path = PathBuf::from(temp_path).join("avocado.yaml");
             let content = fs::read_to_string(&config_path).unwrap_or_else(|e| {
-                panic!(
-                    "Failed to read generated config for target '{}': {}",
-                    target, e
-                )
+                panic!("Failed to read generated config for target '{target}': {e}")
             });
 
-            validate_ext_versions(&content, &format!("generated config for {}", target));
+            validate_ext_versions(&content, &format!("generated config for {target}"));
         }
     }
 }

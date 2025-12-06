@@ -40,7 +40,7 @@ impl RuntimeDnfCommand {
         let config = Config::load(&self.config_path)?;
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         self.validate_runtime_exists(&parsed)?;
         let container_image = self.get_container_image(&parsed)?;
@@ -61,7 +61,7 @@ impl RuntimeDnfCommand {
         .await
     }
 
-    fn validate_runtime_exists(&self, parsed: &toml::Value) -> Result<()> {
+    fn validate_runtime_exists(&self, parsed: &serde_yaml::Value) -> Result<()> {
         let runtime_section = parsed.get("runtime").ok_or_else(|| {
             print_error(
                 &format!("Runtime '{}' not found in configuration.", self.runtime),
@@ -71,7 +71,7 @@ impl RuntimeDnfCommand {
         })?;
 
         let runtime_table = runtime_section
-            .as_table()
+            .as_mapping()
             .ok_or_else(|| anyhow::anyhow!("Invalid runtime section format"))?;
 
         if !runtime_table.contains_key(&self.runtime) {
@@ -85,7 +85,7 @@ impl RuntimeDnfCommand {
         Ok(())
     }
 
-    fn get_container_image(&self, parsed: &toml::Value) -> Result<String> {
+    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
         parsed
             .get("sdk")
             .and_then(|sdk| sdk.get("image"))
@@ -103,7 +103,7 @@ impl RuntimeDnfCommand {
     #[allow(clippy::too_many_arguments)]
     async fn execute_dnf_command(
         &self,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         container_image: &str,
         target: &str,
         repo_url: Option<&String>,
@@ -141,7 +141,7 @@ impl RuntimeDnfCommand {
     #[allow(clippy::too_many_arguments)]
     async fn setup_runtime_environment(
         &self,
-        _config: &toml::Value,
+        _config: &serde_yaml::Value,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn test_new() {
         let cmd = RuntimeDnfCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             "test-runtime".to_string(),
             vec!["list".to_string(), "installed".to_string()],
             false,
@@ -311,7 +311,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert_eq!(cmd.runtime, "test-runtime");
         assert_eq!(cmd.command, vec!["list", "installed"]);
         assert!(!cmd.verbose);
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_new_with_verbose_and_args() {
         let cmd = RuntimeDnfCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             "test-runtime".to_string(),
             vec!["install".to_string(), "gcc".to_string()],
             true,
@@ -330,7 +330,7 @@ mod tests {
             Some(vec!["--nogpgcheck".to_string()]),
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert_eq!(cmd.runtime, "test-runtime");
         assert_eq!(cmd.command, vec!["install", "gcc"]);
         assert!(cmd.verbose);
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn test_build_dnf_command() {
         let cmd = RuntimeDnfCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             "test-runtime".to_string(),
             vec!["list".to_string(), "installed".to_string()],
             false,
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn test_build_dnf_command_no_args() {
         let cmd = RuntimeDnfCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             "my-runtime".to_string(),
             vec!["search".to_string(), "python".to_string()],
             false,

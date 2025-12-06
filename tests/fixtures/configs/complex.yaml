@@ -1,0 +1,39 @@
+default_target: qemux86-64
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:v1.0.0
+  version: 1.0.0
+runtime:
+  default:
+    target: aarch64-unknown-linux-gnu
+    board: raspberry-pi-4
+ext:
+  web-server:
+    types:
+    - sysext
+    - confext
+    packages:
+    - nginx
+    - certbot
+    - curl
+  config-only:
+    types:
+    - confext
+    files:
+      etc/app/config.yaml: "version: 1.0\nfeatures:\n  - logging\n  - metrics"
+      etc/systemd/system/myapp.service: '[Unit]
+
+        Description=My App
+
+
+        [Service]
+
+        Type=simple
+
+        ExecStart=/usr/bin/myapp'
+  monitoring:
+    types:
+    - sysext
+    packages:
+    - prometheus
+    - grafana
+    - node-exporter

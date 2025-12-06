@@ -228,13 +228,13 @@ impl ExtCheckoutCommand {
         let config_content = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-        let parsed: toml::Value = toml::from_str(&config_content)
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&config_content)
             .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
 
         // Get target from runtime configuration
         let target = parsed
             .get("runtime")
-            .and_then(|runtime| runtime.as_table())
+            .and_then(|runtime| runtime.as_mapping())
             .and_then(|runtime_table| {
                 if runtime_table.len() == 1 {
                     runtime_table.values().next()
@@ -367,7 +367,7 @@ impl ExtCheckoutCommand {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("Docker cp failed: {}", stderr));
+            return Err(anyhow::anyhow!("Docker cp failed: {stderr}"));
         }
 
         Ok(())
@@ -387,8 +387,7 @@ impl ExtCheckoutCommand {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow::anyhow!(
-                "Failed to create temporary container: {}",
-                stderr
+                "Failed to create temporary container: {stderr}"
             ));
         }
 
@@ -464,7 +463,7 @@ mod tests {
             "test-ext".to_string(),
             "/etc/config".to_string(),
             "extracted/config".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             "docker".to_string(),
             None,

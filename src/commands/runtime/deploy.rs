@@ -42,7 +42,7 @@ impl RuntimeDeployCommand {
         // Load configuration
         let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Get SDK configuration
         let sdk_config = parsed.get("sdk").context("No SDK configuration found")?;
@@ -148,7 +148,7 @@ mod tests {
     fn test_new() {
         let cmd = RuntimeDeployCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("x86_64".to_string()),
             "192.168.1.100".to_string(),
@@ -157,7 +157,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime_name, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert_eq!(cmd.target, Some("x86_64".to_string()));
         assert_eq!(cmd.device, "192.168.1.100");
@@ -167,7 +167,7 @@ mod tests {
     fn test_create_deploy_script() {
         let cmd = RuntimeDeployCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("x86_64".to_string()),
             "device.local".to_string(),
@@ -193,7 +193,7 @@ mod tests {
 
         let cmd = RuntimeDeployCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             true,
             Some("aarch64".to_string()),
             "192.168.1.50".to_string(),
@@ -202,7 +202,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime_name, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(cmd.verbose);
         assert_eq!(cmd.target, Some("aarch64".to_string()));
         assert_eq!(cmd.device, "192.168.1.50");
@@ -214,7 +214,7 @@ mod tests {
     fn test_create_deploy_script_with_ip() {
         let cmd = RuntimeDeployCommand::new(
             "edge-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("qemux86-64".to_string()),
             "10.0.0.42".to_string(),
@@ -234,7 +234,7 @@ mod tests {
     fn test_create_deploy_script_with_hostname() {
         let cmd = RuntimeDeployCommand::new(
             "production".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("aarch64".to_string()),
             "edge-device.company.com".to_string(),
@@ -257,7 +257,7 @@ mod tests {
         // but we can verify the structure is correct
         let cmd = RuntimeDeployCommand::new(
             "my-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("x86_64".to_string()),
             "192.168.1.10".to_string(),

@@ -1,0 +1,14 @@
+default_target: qemux86-64
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+runtime:
+  default:
+    target: x86_64-unknown-linux-gnu
+ext:
+  peridio:
+    types:
+    - sysext
+    - confext
+    overlay: peridio
+    dependencies:
+      curl: '*'

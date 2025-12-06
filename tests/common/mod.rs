@@ -117,7 +117,7 @@ fn get_minimal_config_path() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("configs")
-        .join("minimal.toml")
+        .join("minimal.yaml")
 }
 
 /// Generate a unique temporary directory name

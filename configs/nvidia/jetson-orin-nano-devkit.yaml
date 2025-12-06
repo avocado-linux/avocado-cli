@@ -1,0 +1,52 @@
+default_target: jetson-orin-nano-devkit
+supported_targets:
+- jetson-orin-nano-devkit
+runtime:
+  dev:
+    dependencies:
+      avocado-img-bootfiles: '*'
+      avocado-img-rootfs: '*'
+      avocado-img-initramfs: '*'
+      config:
+        ext: config
+      app:
+        ext: app
+    jetson-orin-nano-devkit:
+      dependencies:
+        avocado-img-tegraflash: '*'
+ext:
+  app:
+    types:
+    - sysext
+    - confext
+    version: 0.1.0
+    dependencies: {}
+  config:
+    types:
+    - confext
+    version: 0.1.0
+    users:
+      root:
+        password: ''
+sdk:
+  image: docker.io/avocadolinux/sdk:apollo-edge
+  dependencies:
+    avocado-sdk-toolchain: '*'
+  jetson-orin-nano-devkit:
+    container_args:
+    - --network=host
+    - -v
+    - /dev:/dev
+    - -v
+    - /sys:/sys:ro
+    - --privileged
+    dependencies:
+      nativesdk-util-linux-mount: '*'
+provision:
+  tegraflash:
+    container_args:
+    - -v
+    - /dev:/dev
+    - -v
+    - /sys:/sys:ro
+    - --privileged

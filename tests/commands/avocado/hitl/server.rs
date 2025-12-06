@@ -14,24 +14,33 @@ fn test_short_help() {
 
 #[test]
 fn test_server_missing_config() {
-    common::refute_cmd(&["hitl", "server", "-C", "nonexistent.toml"], None, None);
+    common::refute_cmd(&["hitl", "server", "-C", "nonexistent.yaml"], None, None);
 }
 
 #[test]
 fn test_server_with_verbose() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["hitl", "server", "--verbose"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(&["hitl", "server", "--verbose"], Some(&temp_dir), None);
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_server_with_target() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["hitl", "server", "-t", "qemux86-64"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(
+        &["hitl", "server", "-t", "qemux86-64"],
+        Some(&temp_dir),
+        None,
+    );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_server_with_container_args() {
-    // This will fail with a real config but tests argument parsing
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
     common::refute_cmd(
         &[
             "hitl",
@@ -41,26 +50,40 @@ fn test_server_with_container_args() {
             "--container-arg",
             "--device=/dev/kvm",
         ],
-        None,
+        Some(&temp_dir),
         None,
     );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_server_with_dnf_args() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["hitl", "server", "--dnf-arg", "--assumeyes"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(
+        &["hitl", "server", "--dnf-arg", "--assumeyes"],
+        Some(&temp_dir),
+        None,
+    );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_server_with_extension() {
-    // This will fail with a real config but tests argument parsing
-    common::refute_cmd(&["hitl", "server", "-e", "avocado-dev"], None, None);
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
+    common::refute_cmd(
+        &["hitl", "server", "-e", "avocado-dev"],
+        Some(&temp_dir),
+        None,
+    );
+    common::cleanup_temp_dir(&temp_dir);
 }
 
 #[test]
 fn test_server_with_multiple_extensions() {
-    // This will fail with a real config but tests argument parsing
+    // This will fail without config - tests argument parsing
+    let temp_dir = common::create_temp_dir();
     common::refute_cmd(
         &[
             "hitl",
@@ -70,7 +93,8 @@ fn test_server_with_multiple_extensions() {
             "--extension",
             "foo",
         ],
-        None,
+        Some(&temp_dir),
         None,
     );
+    common::cleanup_temp_dir(&temp_dir);
 }

@@ -36,7 +36,7 @@ impl ExtCleanCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         let target = resolve_target_required(self.target.as_deref(), &config)?;
         let _extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
@@ -88,7 +88,7 @@ impl ExtCleanCommand {
         }
     }
 
-    fn get_container_image(&self, parsed: &toml::Value) -> Result<String> {
+    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
         parsed
             .get("sdk")
             .and_then(|sdk| sdk.get("image"))

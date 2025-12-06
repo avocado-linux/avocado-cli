@@ -133,8 +133,7 @@ impl SdkRunCommand {
         // Get the SDK image from merged configuration
         let container_image = merged_sdk_config.image.ok_or_else(|| {
             anyhow::anyhow!(
-                "No container image specified in config under 'sdk.image' or 'sdk.{}.image'",
-                target
+                "No container image specified in config under 'sdk.image' or 'sdk.{target}.image'"
             )
         })?;
 

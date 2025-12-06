@@ -1,0 +1,15 @@
+avocado:
+  version: 0.1.0
+  target: x86_64
+  src_dir: .
+ext:
+  external-extension:
+    types:
+    - sysext
+    packages:
+    - curl
+    dependencies:
+      nested-dep: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          ext: nested-extension
+          config: nested-config.toml

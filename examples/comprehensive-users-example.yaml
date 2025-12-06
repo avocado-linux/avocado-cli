@@ -1,0 +1,105 @@
+sdk:
+  image: docker.io/avocadolinux/sdk:apollo-edge
+runtime:
+  default:
+    target: x86_64-unknown-linux-gnu
+ext:
+  avocado-dev:
+    types:
+    - sysext
+    - confext
+    packages:
+    - vim
+    - curl
+    - nginx
+    - postgresql
+    users:
+      root: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          password: ''
+      guest: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          password: '*'
+      alice:
+        password: $6$salt$hash
+        uid: 1001
+        gid: 1001
+        gecos: Alice Smith,Engineering,Room 123,555-1234,555-5678
+        home: /home/alice
+        shell: /bin/zsh
+        groups:
+        - users
+        - developers
+        - sudo
+      bob:
+        password: $6$anothersalt$anotherhash
+        uid: 1002
+        gecos: Bob Johnson,DevOps Team
+        home: /home/bob
+        shell: /bin/bash
+        groups:
+        - users
+        - admins
+        last_change: 19000
+        min_days: 7
+        max_days: 90
+        warn_days: 7
+        inactive_days: 14
+        expire_date: 20000
+      nginx:
+        password: '*'
+        uid: 33
+        gid: 33
+        gecos: nginx web server
+        home: /var/www
+        shell: /usr/sbin/nologin
+        system: true
+      postgres:
+        password: '!'
+        uid: 26
+        gid: 26
+        gecos: PostgreSQL Server
+        home: /var/lib/pgsql
+        shell: /bin/bash
+        system: true
+        groups:
+        - postgres
+      temp:
+        password: '!'
+        uid: 1099
+        disabled: true
+        gecos: Temporary disabled account
+        groups:
+        - users
+    groups:
+      users: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          gid: 1000
+      sudo: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          gid: 27
+      developers:
+        gid: 2000
+        members:
+        - alice
+        - bob
+        system: false
+      admins:
+        gid: 2001
+        system: true
+        members:
+        - bob
+      secure:
+        gid: 3000
+        password: $6$groupsalt$grouphash
+        admins:
+        - alice
+        - bob
+        members:
+        - alice
+      nginx:
+        gid: 33
+        system: true
+      postgres:
+        gid: 26
+        system: true

@@ -159,12 +159,17 @@ target = "qemux86-64"
 #[test]
 #[serial]
 fn test_init_command_creates_default_target() {
-    // Use current directory and clean up after
-    let result = cli_with_config(&["init", "--target", "test-init-target"], None, None);
+    // Use a temp directory to avoid conflicts with existing avocado.yaml
+    let temp_dir = common::create_temp_dir();
+    let result = cli_with_config(
+        &["init", "--target", "test-init-target"],
+        Some(&temp_dir),
+        None,
+    );
 
     // Clean up first regardless of test result
     let cleanup = || {
-        std::fs::remove_file("avocado.toml").ok();
+        std::fs::remove_dir_all(&temp_dir).ok();
     };
 
     if !result.success {
@@ -177,14 +182,15 @@ fn test_init_command_creates_default_target() {
     }
 
     // Check that the generated config contains default_target
-    if std::path::Path::new("avocado.toml").exists() {
-        let content = std::fs::read_to_string("avocado.toml").unwrap();
+    let config_path = temp_dir.join("avocado.yaml");
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            content.contains("default_target = \"test-init-target\""),
+            content.contains("default_target: \"test-init-target\""),
             "Generated config should contain default_target: {content}"
         );
         assert!(
-            content.contains("supported_targets = [\"test-init-target\"]"),
+            content.contains("- test-init-target"),
             "Generated config should contain supported_targets: {content}"
         );
     }

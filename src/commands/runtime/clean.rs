@@ -36,7 +36,7 @@ impl RuntimeCleanCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = load_config(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         self.validate_runtime_exists(&parsed)?;
         let container_image = self.get_container_image(&parsed)?;
@@ -45,7 +45,7 @@ impl RuntimeCleanCommand {
         self.clean_runtime(&container_image, &target).await
     }
 
-    fn validate_runtime_exists(&self, parsed: &toml::Value) -> Result<()> {
+    fn validate_runtime_exists(&self, parsed: &serde_yaml::Value) -> Result<()> {
         let runtime_section = parsed.get("runtime").ok_or_else(|| {
             print_error(
                 &format!("Runtime '{}' not found in configuration.", self.runtime),
@@ -55,7 +55,7 @@ impl RuntimeCleanCommand {
         })?;
 
         let runtime_table = runtime_section
-            .as_table()
+            .as_mapping()
             .ok_or_else(|| anyhow::anyhow!("Invalid runtime section format"))?;
 
         if !runtime_table.contains_key(&self.runtime) {
@@ -69,7 +69,7 @@ impl RuntimeCleanCommand {
         Ok(())
     }
 
-    fn get_container_image(&self, parsed: &toml::Value) -> Result<String> {
+    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
         parsed
             .get("sdk")
             .and_then(|sdk| sdk.get("image"))
@@ -141,7 +141,7 @@ mod tests {
     fn test_new() {
         let cmd = RuntimeCleanCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("x86_64".to_string()),
             None,
@@ -149,7 +149,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert_eq!(cmd.target, Some("x86_64".to_string()));
     }
@@ -158,7 +158,7 @@ mod tests {
     fn test_new_with_verbose_and_args() {
         let cmd = RuntimeCleanCommand::new(
             "test-runtime".to_string(),
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             true,
             None,
             Some(vec!["--cap-add=SYS_ADMIN".to_string()]),
@@ -166,7 +166,7 @@ mod tests {
         );
 
         assert_eq!(cmd.runtime, "test-runtime");
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(cmd.verbose);
         assert_eq!(cmd.target, None);
         assert_eq!(

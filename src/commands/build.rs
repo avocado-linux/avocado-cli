@@ -69,7 +69,7 @@ impl BuildCommand {
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Early target validation and logging - fail fast if target is unsupported
         let target =
@@ -275,50 +275,54 @@ impl BuildCommand {
     fn get_runtimes_to_build(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<Vec<String>> {
         let runtime_section = parsed
             .get("runtime")
-            .and_then(|r| r.as_table())
+            .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
         let mut target_runtimes = Vec::new();
 
-        for runtime_name in runtime_section.keys() {
-            // If a specific runtime is requested, only check that one
-            if let Some(ref requested_runtime) = self.runtime {
-                if runtime_name != requested_runtime {
-                    continue;
-                }
-            }
-
-            // Check if this runtime is relevant for the target
-            let merged_runtime =
-                config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
-            if let Some(merged_value) = merged_runtime {
-                if let Some(runtime_target) = merged_value.get("target").and_then(|t| t.as_str()) {
-                    // Runtime has explicit target - only include if it matches
-                    if runtime_target == target {
-                        target_runtimes.push(runtime_name.clone());
+        for runtime_name_val in runtime_section.keys() {
+            if let Some(runtime_name) = runtime_name_val.as_str() {
+                // If a specific runtime is requested, only check that one
+                if let Some(ref requested_runtime) = self.runtime {
+                    if runtime_name != requested_runtime {
+                        continue;
                     }
-                } else {
-                    // Runtime has no target specified - include for all targets
-                    target_runtimes.push(runtime_name.clone());
                 }
-            } else {
-                // If there's no merged config, check the base runtime config
-                if let Some(runtime_config) = runtime_section.get(runtime_name) {
+
+                // Check if this runtime is relevant for the target
+                let merged_runtime =
+                    config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
+                if let Some(merged_value) = merged_runtime {
                     if let Some(runtime_target) =
-                        runtime_config.get("target").and_then(|t| t.as_str())
+                        merged_value.get("target").and_then(|t| t.as_str())
                     {
                         // Runtime has explicit target - only include if it matches
                         if runtime_target == target {
-                            target_runtimes.push(runtime_name.clone());
+                            target_runtimes.push(runtime_name.to_string());
                         }
                     } else {
                         // Runtime has no target specified - include for all targets
-                        target_runtimes.push(runtime_name.clone());
+                        target_runtimes.push(runtime_name.to_string());
+                    }
+                } else {
+                    // If there's no merged config, check the base runtime config
+                    if let Some(runtime_config) = runtime_section.get(runtime_name_val) {
+                        if let Some(runtime_target) =
+                            runtime_config.get("target").and_then(|t| t.as_str())
+                        {
+                            // Runtime has explicit target - only include if it matches
+                            if runtime_target == target {
+                                target_runtimes.push(runtime_name.to_string());
+                            }
+                        } else {
+                            // Runtime has no target specified - include for all targets
+                            target_runtimes.push(runtime_name.to_string());
+                        }
                     }
                 }
             }
@@ -328,9 +332,7 @@ impl BuildCommand {
         if let Some(ref requested_runtime) = self.runtime {
             if target_runtimes.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "Runtime '{}' is not configured for target '{}'",
-                    requested_runtime,
-                    target
+                    "Runtime '{requested_runtime}' is not configured for target '{target}'"
                 ));
             }
         }
@@ -342,7 +344,7 @@ impl BuildCommand {
     fn find_required_extensions(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         runtimes: &[String],
         target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
@@ -354,15 +356,16 @@ impl BuildCommand {
             return Ok(vec![]);
         }
 
-        let _runtime_section = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
+        let _runtime_section = parsed.get("runtime").and_then(|r| r.as_mapping()).unwrap();
 
         for runtime_name in runtimes {
             // Get merged runtime config for this target
             let merged_runtime =
                 config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
             if let Some(merged_value) = merged_runtime {
-                if let Some(dependencies) =
-                    merged_value.get("dependencies").and_then(|d| d.as_table())
+                if let Some(dependencies) = merged_value
+                    .get("dependencies")
+                    .and_then(|d| d.as_mapping())
                 {
                     for (_dep_name, dep_spec) in dependencies {
                         // Check for extension dependency
@@ -455,9 +458,7 @@ impl BuildCommand {
 
         let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                ext_name,
-                ext_config_path
+                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
             )
         })?;
 
@@ -469,8 +470,8 @@ impl BuildCommand {
                     resolved_external_config_path.display()
                 )
             })?;
-        let nested_config: toml::Value =
-            toml::from_str(&nested_config_content).with_context(|| {
+        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
+            .with_context(|| {
                 format!(
                     "Failed to parse nested config file: {}",
                     resolved_external_config_path.display()
@@ -478,12 +479,12 @@ impl BuildCommand {
             })?;
 
         // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
 
         // Check if this external extension has dependencies
         if let Some(dependencies) = extension_config
             .get("dependencies")
-            .and_then(|d| d.as_table())
+            .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for nested extension dependency
@@ -553,9 +554,7 @@ impl BuildCommand {
 
         let _extension_config = external_extensions.get(extension_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                extension_name,
-                external_config_path
+                "Extension '{extension_name}' not found in external config file '{external_config_path}'"
             )
         })?;
 
@@ -569,8 +568,8 @@ impl BuildCommand {
                     resolved_external_config_path.display()
                 )
             })?;
-        let _external_config_toml: toml::Value = toml::from_str(&external_config_content)
-            .with_context(|| {
+        let _external_config_toml: serde_yaml::Value =
+            serde_yaml::from_str(&external_config_content).with_context(|| {
                 format!(
                     "Failed to parse external config file: {}",
                     resolved_external_config_path.display()
@@ -597,10 +596,7 @@ impl BuildCommand {
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(
-                "Failed to build external extension '{}' from '{}': {}",
-                extension_name,
-                external_config_path,
-                e
+                "Failed to build external extension '{extension_name}' from '{external_config_path}': {e}"
             )),
         }
     }
@@ -620,16 +616,14 @@ impl BuildCommand {
 
         let extension_config = external_extensions.get(extension_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                extension_name,
-                external_config_path
+                "Extension '{extension_name}' not found in external config file '{external_config_path}'"
             )
         })?;
 
         // Get extension types from the external config
         let types = extension_config
             .get("types")
-            .and_then(|t| t.as_array())
+            .and_then(|t| t.as_sequence())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
@@ -723,8 +717,7 @@ echo "External extension {extension_name} images are ready in output directory"
             );
         } else {
             return Err(anyhow::anyhow!(
-                "Failed to verify images for external extension '{}'",
-                extension_name
+                "Failed to verify images for external extension '{extension_name}'"
             ));
         }
 
@@ -745,7 +738,7 @@ echo "External extension {extension_name} images are ready in output directory"
         // Load configuration
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Merge container args from config and CLI
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -795,9 +788,8 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{extension_name}" --dbpath=/var/lib/extension.
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Failed to query RPM version for extension '{}'. The RPM database should contain this package. \
-                    This may indicate the extension was not properly installed via packages, or the RPM database is corrupted.",
-                    extension_name
+                    "Failed to query RPM version for extension '{extension_name}'. The RPM database should contain this package. \
+                    This may indicate the extension was not properly installed via packages, or the RPM database is corrupted."
                 )
             })?;
 
@@ -858,8 +850,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             );
         } else {
             return Err(anyhow::anyhow!(
-                "Failed to create image for versioned extension '{}'",
-                extension_name
+                "Failed to create image for versioned extension '{extension_name}'"
             ));
         }
 
@@ -870,7 +861,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     async fn build_single_extension(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         extension_name: &str,
         target: &str,
     ) -> Result<()> {
@@ -890,8 +881,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             self.find_external_extension(config, parsed, extension_name, target)?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Extension '{}' not found in local extensions or external dependencies",
-                        extension_name
+                        "Extension '{extension_name}' not found in local extensions or external dependencies"
                     )
                 })?
         };
@@ -984,7 +974,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     async fn build_single_runtime(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         runtime_name: &str,
         target: &str,
     ) -> Result<()> {
@@ -996,13 +986,12 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         // Verify the runtime exists and is configured for this target
         let runtime_section = parsed
             .get("runtime")
-            .and_then(|r| r.as_table())
+            .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
         if !runtime_section.contains_key(runtime_name) {
             return Err(anyhow::anyhow!(
-                "Runtime '{}' not found in configuration",
-                runtime_name
+                "Runtime '{runtime_name}' not found in configuration"
             ));
         }
 
@@ -1013,9 +1002,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             merged_value
         } else {
             return Err(anyhow::anyhow!(
-                "Runtime '{}' has no configuration for target '{}'",
-                runtime_name,
-                target
+                "Runtime '{runtime_name}' has no configuration for target '{target}'"
             ));
         };
 
@@ -1023,10 +1010,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         if let Some(runtime_target) = runtime_config.get("target").and_then(|t| t.as_str()) {
             if runtime_target != target {
                 return Err(anyhow::anyhow!(
-                    "Runtime '{}' is configured for target '{}', not '{}'",
-                    runtime_name,
-                    runtime_target,
-                    target
+                    "Runtime '{runtime_name}' is configured for target '{runtime_target}', not '{target}'"
                 ));
             }
         }
@@ -1163,7 +1147,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     fn find_extensions_for_runtime(
         &self,
         config: &Config,
-        runtime_config: &toml::Value,
+        runtime_config: &serde_yaml::Value,
     ) -> Result<Vec<ExtensionDependency>> {
         let mut required_extensions = HashSet::new();
         let mut visited = HashSet::new();
@@ -1171,7 +1155,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         // Check runtime dependencies for extensions
         if let Some(dependencies) = runtime_config
             .get("dependencies")
-            .and_then(|d| d.as_table())
+            .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for extension dependency
@@ -1209,7 +1193,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         // Also check local extension dependencies
                         self.find_local_extension_dependencies(
                             config,
-                            &toml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
+                            &serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
                             ext_name,
                             &mut required_extensions,
                             &mut visited,
@@ -1240,7 +1224,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     fn find_external_extension(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         extension_name: &str,
         target: &str,
     ) -> Result<Option<ExtensionDependency>> {
@@ -1251,16 +1235,23 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         // Get all extensions from runtime dependencies (this will recursively traverse)
         let runtime_section = parsed
             .get("runtime")
-            .and_then(|r| r.as_table())
+            .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
-        for runtime_name in runtime_section.keys() {
+        for runtime_name_val in runtime_section.keys() {
+            // Convert runtime name from Value to String
+            let runtime_name = match runtime_name_val.as_str() {
+                Some(name) => name,
+                None => continue, // Skip if runtime name is not a string
+            };
+
             // Get merged runtime config for this target
             let merged_runtime =
                 config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
             if let Some(merged_value) = merged_runtime {
-                if let Some(dependencies) =
-                    merged_value.get("dependencies").and_then(|d| d.as_table())
+                if let Some(dependencies) = merged_value
+                    .get("dependencies")
+                    .and_then(|d| d.as_mapping())
                 {
                     for (_dep_name, dep_spec) in dependencies {
                         // Check for extension dependency
@@ -1340,7 +1331,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 // For local extensions, we need to check their dependencies too
                 return self.find_local_extension_dependencies(
                     config,
-                    &toml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
+                    &serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
                     name,
                     all_extensions,
                     visited,
@@ -1370,9 +1361,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
 
         let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                ext_name,
-                ext_config_path
+                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
             )
         })?;
 
@@ -1384,8 +1373,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     resolved_external_config_path.display()
                 )
             })?;
-        let nested_config: toml::Value =
-            toml::from_str(&nested_config_content).with_context(|| {
+        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
+            .with_context(|| {
                 format!(
                     "Failed to parse nested config file: {}",
                     resolved_external_config_path.display()
@@ -1393,12 +1382,12 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             })?;
 
         // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
 
         // Check if this external extension has dependencies
         if let Some(dependencies) = extension_config
             .get("dependencies")
-            .and_then(|d| d.as_table())
+            .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for nested extension dependency
@@ -1469,7 +1458,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     fn find_local_extension_dependencies(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         ext_name: &str,
         all_extensions: &mut HashSet<ExtensionDependency>,
         visited: &mut HashSet<String>,
@@ -1488,7 +1477,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     fn find_local_extension_dependencies_in_config(
         &self,
         config: &Config,
-        parsed_config: &toml::Value,
+        parsed_config: &serde_yaml::Value,
         ext_name: &str,
         config_path: &std::path::Path,
         all_extensions: &mut HashSet<ExtensionDependency>,
@@ -1504,7 +1493,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         // Get the local extension configuration
         if let Some(ext_config) = parsed_config.get("ext").and_then(|ext| ext.get(ext_name)) {
             // Check if this local extension has dependencies
-            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_table()) {
+            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_mapping())
+            {
                 for (_dep_name, dep_spec) in dependencies {
                     // Check for extension dependency
                     if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
@@ -1556,7 +1546,7 @@ mod tests {
     #[test]
     fn test_new() {
         let cmd = BuildCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             true,
             Some("my-runtime".to_string()),
             Some("my-extension".to_string()),
@@ -1565,7 +1555,7 @@ mod tests {
             Some(vec!["--nogpgcheck".to_string()]),
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(cmd.verbose);
         assert_eq!(cmd.runtime, Some("my-runtime".to_string()));
         assert_eq!(cmd.extension, Some("my-extension".to_string()));
@@ -1598,7 +1588,7 @@ mod tests {
     #[test]
     fn test_new_with_runtime() {
         let cmd = BuildCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             Some("test-runtime".to_string()),
             None,
@@ -1607,7 +1597,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
         assert_eq!(cmd.extension, None);
@@ -1619,7 +1609,7 @@ mod tests {
     #[test]
     fn test_new_with_extension() {
         let cmd = BuildCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             None,
             Some("test-extension".to_string()),
@@ -1628,7 +1618,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert_eq!(cmd.runtime, None);
         assert_eq!(cmd.extension, Some("test-extension".to_string()));

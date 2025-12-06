@@ -74,7 +74,7 @@ impl InstallCommand {
 
         // Parse the configuration file for runtime/extension analysis
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         print_info(
             "Starting comprehensive install process...",
@@ -237,7 +237,7 @@ impl InstallCommand {
 
         // Read and parse the configuration file
         let content = std::fs::read_to_string(config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // First, find which runtimes are relevant for this target
         let target_runtimes = self.find_target_relevant_runtimes(config, &parsed, target)?;
@@ -250,22 +250,26 @@ impl InstallCommand {
                 );
             }
             // If no runtimes match this target, install all local extensions
-            if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_table()) {
-                for ext_name in ext_section.keys() {
-                    required_extensions.insert(ExtensionDependency::Local(ext_name.clone()));
+            if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+                for ext_name_val in ext_section.keys() {
+                    if let Some(ext_name) = ext_name_val.as_str() {
+                        required_extensions
+                            .insert(ExtensionDependency::Local(ext_name.to_string()));
+                    }
                 }
             }
         } else {
             // Only install extensions needed by the target-relevant runtimes
-            if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_table()) {
+            if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_mapping()) {
                 for runtime_name in &target_runtimes {
                     if let Some(_runtime_config) = runtime_section.get(runtime_name) {
                         // Check both base dependencies and target-specific dependencies
                         let merged_runtime =
                             config.get_merged_runtime_config(runtime_name, target, config_path)?;
                         if let Some(merged_value) = merged_runtime {
-                            if let Some(dependencies) =
-                                merged_value.get("dependencies").and_then(|d| d.as_table())
+                            if let Some(dependencies) = merged_value
+                                .get("dependencies")
+                                .and_then(|d| d.as_mapping())
                             {
                                 for (_dep_name, dep_spec) in dependencies {
                                     // Check for extension dependency
@@ -368,9 +372,7 @@ impl InstallCommand {
 
         let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                ext_name,
-                ext_config_path
+                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
             )
         })?;
 
@@ -382,8 +384,8 @@ impl InstallCommand {
                     resolved_external_config_path.display()
                 )
             })?;
-        let nested_config: toml::Value =
-            toml::from_str(&nested_config_content).with_context(|| {
+        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
+            .with_context(|| {
                 format!(
                     "Failed to parse nested config file: {}",
                     resolved_external_config_path.display()
@@ -391,12 +393,12 @@ impl InstallCommand {
             })?;
 
         // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = Config::from_toml_value(&nested_config)?;
+        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
 
         // Check if this external extension has dependencies
         if let Some(dependencies) = extension_config
             .get("dependencies")
-            .and_then(|d| d.as_table())
+            .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for nested extension dependency
@@ -456,48 +458,53 @@ impl InstallCommand {
     fn find_target_relevant_runtimes(
         &self,
         config: &Config,
-        parsed: &toml::Value,
+        parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<Vec<String>> {
         let mut relevant_runtimes = Vec::new();
 
-        if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_table()) {
-            for runtime_name in runtime_section.keys() {
-                // If a specific runtime is requested, only check that one
-                if let Some(ref requested_runtime) = self.runtime {
-                    if runtime_name != requested_runtime {
-                        continue;
-                    }
-                }
-
-                // Check if this runtime is relevant for the target
-                let merged_runtime =
-                    config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
-                if let Some(merged_value) = merged_runtime {
-                    if let Some(runtime_target) =
-                        merged_value.get("target").and_then(|t| t.as_str())
-                    {
-                        // Runtime has explicit target - only include if it matches
-                        if runtime_target == target {
-                            relevant_runtimes.push(runtime_name.clone());
+        if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_mapping()) {
+            for runtime_name_val in runtime_section.keys() {
+                if let Some(runtime_name) = runtime_name_val.as_str() {
+                    // If a specific runtime is requested, only check that one
+                    if let Some(ref requested_runtime) = self.runtime {
+                        if runtime_name != requested_runtime {
+                            continue;
                         }
-                    } else {
-                        // Runtime has no target specified - include for all targets
-                        relevant_runtimes.push(runtime_name.clone());
                     }
-                } else {
-                    // If there's no merged config, check the base runtime config
-                    if let Some(runtime_config) = runtime_section.get(runtime_name) {
+
+                    // Check if this runtime is relevant for the target
+                    let merged_runtime = config.get_merged_runtime_config(
+                        runtime_name,
+                        target,
+                        &self.config_path,
+                    )?;
+                    if let Some(merged_value) = merged_runtime {
                         if let Some(runtime_target) =
-                            runtime_config.get("target").and_then(|t| t.as_str())
+                            merged_value.get("target").and_then(|t| t.as_str())
                         {
                             // Runtime has explicit target - only include if it matches
                             if runtime_target == target {
-                                relevant_runtimes.push(runtime_name.clone());
+                                relevant_runtimes.push(runtime_name.to_string());
                             }
                         } else {
                             // Runtime has no target specified - include for all targets
-                            relevant_runtimes.push(runtime_name.clone());
+                            relevant_runtimes.push(runtime_name.to_string());
+                        }
+                    } else {
+                        // If there's no merged config, check the base runtime config
+                        if let Some(runtime_config) = runtime_section.get(runtime_name_val) {
+                            if let Some(runtime_target) =
+                                runtime_config.get("target").and_then(|t| t.as_str())
+                            {
+                                // Runtime has explicit target - only include if it matches
+                                if runtime_target == target {
+                                    relevant_runtimes.push(runtime_name.to_string());
+                                }
+                            } else {
+                                // Runtime has no target specified - include for all targets
+                                relevant_runtimes.push(runtime_name.to_string());
+                            }
                         }
                     }
                 }
@@ -522,9 +529,7 @@ impl InstallCommand {
 
         let extension_config = external_extensions.get(extension_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Extension '{}' not found in external config file '{}'",
-                extension_name,
-                external_config_path
+                "Extension '{extension_name}' not found in external config file '{external_config_path}'"
             )
         })?;
 
@@ -582,8 +587,7 @@ impl InstallCommand {
 
             if !success {
                 return Err(anyhow::anyhow!(
-                    "Failed to create sysroot for external extension '{}'",
-                    extension_name
+                    "Failed to create sysroot for external extension '{extension_name}'"
                 ));
             }
 
@@ -603,8 +607,8 @@ impl InstallCommand {
                     resolved_external_config_path.display()
                 )
             })?;
-        let _external_config_toml: toml::Value = toml::from_str(&external_config_content)
-            .with_context(|| {
+        let _external_config_toml: serde_yaml::Value =
+            serde_yaml::from_str(&external_config_content).with_context(|| {
                 format!(
                     "Failed to parse external config file: {}",
                     resolved_external_config_path.display()
@@ -612,15 +616,21 @@ impl InstallCommand {
             })?;
 
         // Process the extension's dependencies (packages, not extension dependencies)
-        if let Some(toml::Value::Table(deps_map)) = extension_config.get("dependencies") {
+        if let Some(serde_yaml::Value::Mapping(deps_map)) = extension_config.get("dependencies") {
             if !deps_map.is_empty() {
                 let mut packages = Vec::new();
 
                 // Process package dependencies (not extension dependencies)
-                for (package_name, version_spec) in deps_map {
+                for (package_name_val, version_spec) in deps_map {
+                    // Convert package name from Value to String
+                    let package_name = match package_name_val.as_str() {
+                        Some(name) => name,
+                        None => continue, // Skip if package name is not a string
+                    };
+
                     // Skip extension dependencies (they have "ext" field) - these are handled separately
-                    if let toml::Value::Table(spec_map) = version_spec {
-                        if spec_map.contains_key("ext") {
+                    if let serde_yaml::Value::Mapping(spec_map) = version_spec {
+                        if spec_map.contains_key(serde_yaml::Value::String("ext".to_string())) {
                             continue; // Skip extension dependencies - they're handled by the recursive logic
                         }
                     }
@@ -629,23 +639,23 @@ impl InstallCommand {
                     let package_name_and_version = if version_spec.as_str().is_some() {
                         let version = version_spec.as_str().unwrap();
                         if version == "*" {
-                            package_name.clone()
+                            package_name.to_string()
                         } else {
                             format!("{package_name}-{version}")
                         }
-                    } else if let toml::Value::Table(spec_map) = version_spec {
+                    } else if let serde_yaml::Value::Mapping(spec_map) = version_spec {
                         if let Some(version) = spec_map.get("version") {
                             let version = version.as_str().unwrap_or("*");
                             if version == "*" {
-                                package_name.clone()
+                                package_name.to_string()
                             } else {
                                 format!("{package_name}-{version}")
                             }
                         } else {
-                            package_name.clone()
+                            package_name.to_string()
                         }
                     } else {
-                        package_name.clone()
+                        package_name.to_string()
                     };
 
                     packages.push(package_name_and_version);
@@ -714,8 +724,7 @@ $DNF_SDK_HOST \
                             );
                     } else {
                         return Err(anyhow::anyhow!(
-                            "Failed to install package dependencies for external extension '{}'",
-                            extension_name
+                            "Failed to install package dependencies for external extension '{extension_name}'"
                         ));
                     }
                 }
@@ -790,9 +799,7 @@ $DNF_SDK_HOST \
 
             if !success {
                 return Err(anyhow::anyhow!(
-                    "Failed to create sysroot for versioned extension '{}-{}'",
-                    extension_name,
-                    version
+                    "Failed to create sysroot for versioned extension '{extension_name}-{version}'"
                 ));
             }
 
@@ -863,10 +870,7 @@ $DNF_SDK_HOST \
 
         if !success {
             return Err(anyhow::anyhow!(
-                "Failed to install versioned extension '{}' version '{}' (package: {})",
-                extension_name,
-                version,
-                package_spec
+                "Failed to install versioned extension '{extension_name}' version '{version}' (package: {package_spec})"
             ));
         }
 
@@ -894,7 +898,7 @@ mod tests {
     #[test]
     fn test_new() {
         let cmd = InstallCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             true,
             false,
             Some("my-runtime".to_string()),
@@ -903,7 +907,7 @@ mod tests {
             Some(vec!["--nogpgcheck".to_string()]),
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(cmd.verbose);
         assert!(!cmd.force);
         assert_eq!(cmd.runtime, Some("my-runtime".to_string()));
@@ -936,7 +940,7 @@ mod tests {
     #[test]
     fn test_new_with_runtime() {
         let cmd = InstallCommand::new(
-            "avocado.toml".to_string(),
+            "avocado.yaml".to_string(),
             false,
             true,
             Some("test-runtime".to_string()),
@@ -945,7 +949,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(cmd.config_path, "avocado.toml");
+        assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
         assert!(cmd.force);
         assert_eq!(cmd.runtime, Some("test-runtime".to_string()));

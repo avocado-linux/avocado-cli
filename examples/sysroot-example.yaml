@@ -1,0 +1,22 @@
+default_target: qemux86-64
+src_dir: examples
+runtime:
+  default:
+    target: qemux86-64
+sdk:
+  image: docker.io/avocadolinux/sdk:dev
+  compile:
+    my-app:
+      compile: ext-compile.sh
+      dependencies:
+        build-essential: '*'
+ext:
+  my-extension:
+    types:
+    - sysext
+    dependencies:
+      my-app: !!python/object/new:toml.decoder.DynamicInlineTableDict
+        dictitems:
+          compile: my-app
+          install: ext-install-example.sh
+      some-package: 1.0.0
