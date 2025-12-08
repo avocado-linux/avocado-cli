@@ -46,6 +46,7 @@
 use anyhow::Result;
 use regex::Regex;
 use serde_yaml::Value;
+use std::collections::HashSet;
 
 pub mod avocado;
 pub mod config;
@@ -80,12 +81,29 @@ const MAX_ITERATIONS: usize = 100;
 pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> Result<()> {
     let mut iteration = 0;
     let mut changed = true;
+    let mut previous_states: Vec<String> = Vec::new();
 
     // Keep iterating until no more changes or we hit the iteration limit
     while changed && iteration < MAX_ITERATIONS {
+        // Serialize current state to detect cycles
+        let current_state = serde_yaml::to_string(yaml_value)?;
+
+        // Check if we've seen this exact state before (cycle detection)
+        if previous_states.contains(&current_state) {
+            // Find which templates are stuck in a cycle
+            anyhow::bail!(
+                "Circular reference detected: configuration contains templates that reference each other in a cycle. \
+                 This typically happens when config values reference each other (e.g., a: '{{{{ config.b }}}}', b: '{{{{ config.a }}}}')"
+            );
+        }
+
+        previous_states.push(current_state);
+
         // Clone the value to use as root for lookups
         let root = yaml_value.clone();
-        changed = interpolate_value(yaml_value, &root, cli_target)?;
+        // Create a new resolving stack for each iteration
+        let mut resolving_stack = HashSet::new();
+        changed = interpolate_value(yaml_value, &root, cli_target, &mut resolving_stack)?;
         iteration += 1;
     }
 
@@ -104,29 +122,35 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
 /// * `value` - The current value to interpolate
 /// * `root` - The root YAML value for config references
 /// * `cli_target` - Optional CLI target value
+/// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
 ///
 /// # Returns
 /// Result with a boolean indicating if any changes were made
-fn interpolate_value(value: &mut Value, root: &Value, cli_target: Option<&str>) -> Result<bool> {
+fn interpolate_value(
+    value: &mut Value,
+    root: &Value,
+    cli_target: Option<&str>,
+    resolving_stack: &mut HashSet<String>,
+) -> Result<bool> {
     let mut changed = false;
 
     match value {
         Value::String(s) => {
-            if let Some(new_value) = interpolate_string(s, root, cli_target)? {
+            if let Some(new_value) = interpolate_string(s, root, cli_target, resolving_stack)? {
                 *s = new_value;
                 changed = true;
             }
         }
         Value::Mapping(map) => {
             for (_, v) in map.iter_mut() {
-                if interpolate_value(v, root, cli_target)? {
+                if interpolate_value(v, root, cli_target, resolving_stack)? {
                     changed = true;
                 }
             }
         }
         Value::Sequence(seq) => {
             for item in seq.iter_mut() {
-                if interpolate_value(item, root, cli_target)? {
+                if interpolate_value(item, root, cli_target, resolving_stack)? {
                     changed = true;
                 }
             }
@@ -145,6 +169,7 @@ fn interpolate_value(value: &mut Value, root: &Value, cli_target: Option<&str>) 
 /// * `input` - The input string that may contain templates
 /// * `root` - The root YAML value for config references
 /// * `cli_target` - Optional CLI target value
+/// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
 ///
 /// # Returns
 /// Result with Option<String> - Some(new_string) if changes were made, None if no templates found
@@ -152,6 +177,7 @@ fn interpolate_string(
     input: &str,
     root: &Value,
     cli_target: Option<&str>,
+    resolving_stack: &mut HashSet<String>,
 ) -> Result<Option<String>> {
     // Regex to match {{ ... }} templates
     let re = Regex::new(r"\{\{\s*([^}]+)\s*\}\}").unwrap();
@@ -168,7 +194,7 @@ fn interpolate_string(
         let full_match = capture.get(0).unwrap().as_str();
         let template = capture.get(1).unwrap().as_str().trim();
 
-        if let Some(replacement) = resolve_template(template, root, cli_target)? {
+        if let Some(replacement) = resolve_template(template, root, cli_target, resolving_stack)? {
             result = result.replace(full_match, &replacement);
             any_replaced = true;
         }
@@ -187,6 +213,7 @@ fn interpolate_string(
 /// * `template` - The template expression (e.g., "env.VAR" or "config.key")
 /// * `root` - The root YAML value for config references
 /// * `cli_target` - Optional CLI target value
+/// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
 ///
 /// # Returns
 /// Result with Option<String> - Some(value) if resolved, None if should be left as-is
@@ -194,16 +221,34 @@ fn resolve_template(
     template: &str,
     root: &Value,
     cli_target: Option<&str>,
+    resolving_stack: &mut HashSet<String>,
 ) -> Result<Option<String>> {
+    // Check for circular reference
+    if resolving_stack.contains(template) {
+        anyhow::bail!(
+            "Circular reference detected: template '{{{{ {template} }}}}' references itself. \
+             Resolution chain: {}",
+            resolving_stack
+                .iter()
+                .map(|t| format!("'{{{{ {t} }}}}'"))
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        );
+    }
+
+    // Add to resolving stack
+    resolving_stack.insert(template.to_string());
+
     let parts: Vec<&str> = template.split('.').collect();
 
     if parts.is_empty() {
+        resolving_stack.remove(template);
         anyhow::bail!("Invalid template syntax: empty template");
     }
 
     let context = parts[0];
 
-    match context {
+    let result = match context {
         "env" => {
             if parts.len() < 2 {
                 anyhow::bail!("Invalid env template: {template}");
@@ -230,7 +275,12 @@ fn resolve_template(
                 "Unknown template context: {context}. Expected 'env', 'config', or 'avocado'"
             );
         }
-    }
+    };
+
+    // Remove from resolving stack after resolution
+    resolving_stack.remove(template);
+
+    result
 }
 
 #[cfg(test)]
@@ -461,7 +511,47 @@ b: "{{ config.a }}"
         // Should error due to circular reference
         let result = interpolate_config(&mut config, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("circular"));
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Circular reference") || error_msg.contains("circular"),
+            "Expected circular reference error, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn test_direct_self_reference() {
+        let mut config = parse_yaml(
+            r#"
+a: "{{ config.a }}"
+"#,
+        );
+
+        // Should error immediately on direct self-reference
+        let result = interpolate_config(&mut config, None);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        eprintln!("Direct self-reference error: {error_msg}");
+        assert!(
+            error_msg.contains("Circular reference") || error_msg.contains("circular"),
+            "Expected circular reference error, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn test_indirect_circular_reference() {
+        let mut config = parse_yaml(
+            r#"
+a: "{{ config.b }}"
+b: "{{ config.c }}"
+c: "{{ config.a }}"
+"#,
+        );
+
+        // Should error due to indirect circular reference
+        let result = interpolate_config(&mut config, None);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Circular reference"));
     }
 
     #[test]
