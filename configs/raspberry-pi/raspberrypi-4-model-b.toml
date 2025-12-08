@@ -28,6 +28,7 @@ version = "0.1.0"
 
 # Install application dependencies
 [ext.app.dependencies]
+fwup = "*"
 #curl = "*"
 #iperf3 = "*"
 
@@ -51,6 +52,7 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
 
 [sdk.dependencies]
 avocado-sdk-toolchain = "*"
+nativesdk-openssh-ssh = "*"
 
 [sdk.raspberrypi4]
 container_args = ["--network=host"]
