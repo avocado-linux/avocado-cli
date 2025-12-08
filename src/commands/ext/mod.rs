@@ -9,11 +9,17 @@ pub mod list;
 pub mod package;
 
 pub use build::ExtBuildCommand;
+#[allow(unused_imports)]
 pub use checkout::ExtCheckoutCommand;
+#[allow(unused_imports)]
 pub use clean::ExtCleanCommand;
+#[allow(unused_imports)]
 pub use deps::ExtDepsCommand;
+#[allow(unused_imports)]
 pub use dnf::ExtDnfCommand;
 pub use image::ExtImageCommand;
 pub use install::ExtInstallCommand;
+#[allow(unused_imports)]
 pub use list::ExtListCommand;
+#[allow(unused_imports)]
 pub use package::ExtPackageCommand;

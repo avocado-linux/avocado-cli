@@ -1,5 +1,10 @@
 default_target: x86_64-unknown-linux-gnu
 
+# Test distro configuration
+distro:
+  channel: apollo-edge
+  version: 0.1.0
+
 # Test config self-reference
 base_image: "ghcr.io/avocado/base"
 derived_image: "{{ config.base_image }}:latest"
@@ -7,7 +12,7 @@ derived_image: "{{ config.base_image }}:latest"
 # Test nested config reference
 nested:
   value: "nested_value"
-  
+
 reference_nested: "{{ config.nested.value }}"
 
 runtime:
@@ -18,18 +23,22 @@ runtime:
       # Test multiple interpolation types
       base-pkg: "{{ config.base_image }}"
       target-pkg: "avocado-os-{{ avocado.target }}"
-      env-pkg: "{{ env.TEST_PKG }}"
-      
+      env-pkg: "{{ env.TEST_PKG_ENV_VAR_INTERP }}"
+
   prod:
     dependencies:
       # Test combined interpolation
       combined: "{{ config.base_image }}-{{ avocado.target }}"
 
 sdk:
-  image: "{{ config.base_image }}"
-  
+  # Test distro interpolation via config context
+  image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
+  dependencies:
+    avocado-sdk-toolchain: "{{ config.distro.version }}"
+    nativesdk-avocado-ext-dev: "*"
+
 ext:
   test-ext:
     types:
       - sysext
-    version: "{{ env.EXT_VERSION }}"
+    version: "{{ env.EXT_VERSION_ENV_VAR_INTERP }}"

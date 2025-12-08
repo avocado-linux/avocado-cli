@@ -74,6 +74,13 @@ pub struct ProvisionProfileConfig {
     pub container_args: Option<Vec<String>>,
 }
 
+/// Distribution configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DistroConfig {
+    pub channel: Option<String>,
+    pub version: Option<String>,
+}
+
 /// Supported targets configuration - can be either "*" (all targets) or a list of specific targets
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -88,6 +95,7 @@ pub struct Config {
     pub default_target: Option<String>,
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
+    pub distro: Option<DistroConfig>,
     pub runtime: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
     pub provision: Option<HashMap<String, ProvisionProfileConfig>>,

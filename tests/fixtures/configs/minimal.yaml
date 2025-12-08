@@ -1,4 +1,7 @@
 default_target: x86_64-unknown-linux-gnu
+distro:
+  channel: apollo-edge
+  version: 0.1.0
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 runtime:

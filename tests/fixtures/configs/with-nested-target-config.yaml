@@ -2,6 +2,9 @@ default_target: qemux86-64
 supported_targets:
 - qemux86-64
 - reterminal-dm
+distro:
+  channel: apollo-edge
+  version: 0.1.0
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 runtime:

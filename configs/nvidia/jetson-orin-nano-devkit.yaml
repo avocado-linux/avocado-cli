@@ -1,6 +1,9 @@
 default_target: jetson-orin-nano-devkit
 supported_targets:
 - jetson-orin-nano-devkit
+distro:
+  channel: apollo-edge
+  version: 0.1.0
 runtime:
   dev:
     dependencies:
@@ -32,9 +35,10 @@ ext:
       root:
         password: ''
 sdk:
-  image: docker.io/avocadolinux/sdk:apollo-edge
+  image: docker.io/avocadolinux/sdk:{{ config.distro.channel }}
   dependencies:
-    avocado-sdk-toolchain: '*'
+    avocado-sdk-toolchain: "{{ config.distro.version }}"
+    nativesdk-avocado-ext-dev: "*"
   jetson-orin-nano-devkit:
     container_args:
     - --network=host

@@ -567,6 +567,9 @@ mod tests {
         let content = fs::read_to_string(&config_path).unwrap();
         let expected_target = InitCommand::get_default_target();
         assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
+        assert!(content.contains("distro:"));
+        assert!(content.contains("channel: apollo-edge"));
+        assert!(content.contains("version: 0.1.0"));
         assert!(content.contains("runtime:"));
         assert!(content.contains("dev:"));
         assert!(content.contains("dependencies:"));
@@ -576,13 +579,16 @@ mod tests {
         assert!(content.contains("avocado-ext-dev:"));
         assert!(content.contains("ext: avocado-ext-dev"));
         assert!(content.contains("vsn: \"*\""));
-        assert!(content.contains("image: \"docker.io/avocadolinux/sdk:apollo-edge\""));
+        assert!(
+            content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.channel }}\"")
+        );
         assert!(content.contains("ext:"));
         assert!(content.contains("app:"));
         assert!(content.contains("- sysext"));
         assert!(content.contains("- confext"));
         assert!(content.contains("config:"));
-        assert!(content.contains("avocado-sdk-toolchain: \"*\""));
+        assert!(content.contains("avocado-sdk-toolchain: \"{{ config.distro.version }}\""));
+        assert!(content.contains("nativesdk-avocado-ext-dev: \"*\""));
     }
 
     #[tokio::test]

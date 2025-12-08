@@ -31,8 +31,7 @@ pub fn resolve(var_name: &str) -> Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(_) => {
             eprintln!(
-                "[WARNING] Environment variable '{}' is not set, replacing with empty string",
-                var_name
+                "[WARNING] Environment variable '{var_name}' is not set, replacing with empty string"
             );
             Ok(Some(String::new()))
         }

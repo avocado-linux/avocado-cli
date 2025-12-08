@@ -2,6 +2,9 @@ supported_targets:
 - icam-540
 default_target: icam-540
 src_dir: ../../
+distro:
+  channel: apollo-edge
+  version: 0.1.0
 runtime:
   dev:
     dependencies:
@@ -54,9 +57,10 @@ ext:
       root:
         password: ''
 sdk:
-  image: avocadolinux/sdk:apollo-edge
+  image: docker.io/avocadolinux/sdk:{{ config.distro.channel }}
   dependencies:
-    avocado-sdk-toolchain: '*'
+    avocado-sdk-toolchain: "{{ config.distro.version }}"
+    nativesdk-avocado-ext-dev: "*"
   icam-540:
     dependencies:
       nativesdk-util-linux-mount: '*'

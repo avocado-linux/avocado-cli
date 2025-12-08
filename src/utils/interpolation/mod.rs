@@ -19,6 +19,10 @@
 //! base: "value"
 //! derived: "{{ config.base }}"
 //! nested: "{{ config.some.deep.path }}"
+//! distro:
+//!   channel: apollo-edge
+//! sdk:
+//!   image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
 //! ```
 //! - Navigates the YAML tree using dot notation
 //! - Returns an error if path doesn't exist (fatal)
@@ -87,8 +91,7 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
 
     if iteration >= MAX_ITERATIONS {
         anyhow::bail!(
-            "Maximum interpolation iterations ({}) exceeded. Possible circular reference detected.",
-            MAX_ITERATIONS
+            "Maximum interpolation iterations ({MAX_ITERATIONS}) exceeded. Possible circular reference detected."
         );
     }
 
@@ -203,29 +206,28 @@ fn resolve_template(
     match context {
         "env" => {
             if parts.len() < 2 {
-                anyhow::bail!("Invalid env template: {}", template);
+                anyhow::bail!("Invalid env template: {template}");
             }
             let var_name = parts[1..].join(".");
             env::resolve(&var_name)
         }
         "config" => {
             if parts.len() < 2 {
-                anyhow::bail!("Invalid config template: {}", template);
+                anyhow::bail!("Invalid config template: {template}");
             }
             let path = &parts[1..];
             config::resolve(root, path)
         }
         "avocado" => {
             if parts.len() < 2 {
-                anyhow::bail!("Invalid avocado template: {}", template);
+                anyhow::bail!("Invalid avocado template: {template}");
             }
             let key = parts[1];
             avocado::resolve(key, root, cli_target)
         }
         _ => {
             anyhow::bail!(
-                "Unknown template context: {}. Expected 'env', 'config', or 'avocado'",
-                context
+                "Unknown template context: {context}. Expected 'env', 'config', or 'avocado'"
             );
         }
     }
@@ -581,5 +583,34 @@ key: "{{ unknown.value }}"
             .unwrap_err()
             .to_string()
             .contains("Unknown template context"));
+    }
+
+    #[test]
+    fn test_config_distro_interpolation() {
+        let mut config = parse_yaml(
+            r#"
+distro:
+  channel: apollo-edge
+  version: 0.1.0
+sdk:
+  image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
+  dependencies:
+    avocado-sdk-toolchain: "{{ config.distro.version }}"
+"#,
+        );
+
+        interpolate_config(&mut config, None).unwrap();
+
+        let sdk = config.get("sdk").unwrap();
+        assert_eq!(
+            sdk.get("image").unwrap().as_str().unwrap(),
+            "docker.io/avocadolinux/sdk:apollo-edge"
+        );
+
+        let deps = sdk.get("dependencies").unwrap();
+        assert_eq!(
+            deps.get("avocado-sdk-toolchain").unwrap().as_str().unwrap(),
+            "0.1.0"
+        );
     }
 }

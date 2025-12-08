@@ -15,11 +15,10 @@ fn get_interpolation_test_config() -> PathBuf {
 }
 
 #[test]
-#[serial]
 fn test_env_var_interpolation() {
-    // Set test environment variables
-    env::set_var("TEST_PKG", "test-package-1.0");
-    env::set_var("EXT_VERSION", "2.5.1");
+    // Use unique env var names to avoid parallel test conflicts
+    env::set_var("TEST_PKG_ENV_VAR_INTERP", "test-package-1.0");
+    env::set_var("EXT_VERSION_ENV_VAR_INTERP", "2.5.1");
 
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
@@ -37,16 +36,16 @@ fn test_env_var_interpolation() {
     }
 
     // Clean up
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
+    env::remove_var("TEST_PKG_ENV_VAR_INTERP");
+    env::remove_var("EXT_VERSION_ENV_VAR_INTERP");
 }
 
 #[test]
 #[serial]
 fn test_missing_env_var_warning() {
-    // Ensure env var is not set
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
+    // Ensure the env vars used in the test config are not set
+    env::remove_var("TEST_PKG_ENV_VAR_INTERP");
+    env::remove_var("EXT_VERSION_ENV_VAR_INTERP");
 
     let config_path = get_interpolation_test_config();
 
@@ -59,7 +58,7 @@ fn test_missing_env_var_warning() {
     if let Some(deps) = &dev.dependencies {
         if let Some(env_pkg) = deps.get("env-pkg") {
             let pkg_str = env_pkg.as_str().unwrap();
-            // Should be empty string
+            // Should be empty string since TEST_PKG_ENV_VAR_INTERP is not set in this test
             assert_eq!(pkg_str, "");
         }
     }
@@ -67,11 +66,8 @@ fn test_missing_env_var_warning() {
 
 #[test]
 fn test_config_self_reference() {
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
-
     let config_path = get_interpolation_test_config();
-    let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
+    let _config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
     // Check that derived_image contains the interpolated base_image value
     let content = fs::read_to_string(&config_path).unwrap();
@@ -87,9 +83,6 @@ fn test_config_self_reference() {
 
 #[test]
 fn test_nested_config_reference() {
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
-
     let config_path = get_interpolation_test_config();
     let content = fs::read_to_string(&config_path).unwrap();
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
@@ -104,8 +97,6 @@ fn test_nested_config_reference() {
 #[serial]
 fn test_avocado_target_from_env() {
     env::set_var("AVOCADO_TARGET", "aarch64-unknown-linux-gnu");
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
 
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
@@ -122,8 +113,6 @@ fn test_avocado_target_from_env() {
 #[serial]
 fn test_avocado_target_from_config() {
     env::remove_var("AVOCADO_TARGET");
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
 
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
@@ -139,8 +128,6 @@ fn test_avocado_target_from_config() {
 #[serial]
 fn test_avocado_target_unavailable() {
     env::remove_var("AVOCADO_TARGET");
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
 
     // Create a test config without default_target
     let test_yaml = r#"
@@ -178,7 +165,7 @@ reference: "{{ config.nonexistent.path }}"
 #[test]
 #[serial]
 fn test_multiple_interpolation_types() {
-    env::set_var("TEST_PKG", "test-pkg");
+    env::set_var("TEST_PKG_ENV_VAR_INTERP", "test-pkg");
     env::set_var("AVOCADO_TARGET", "riscv64-unknown-linux-gnu");
 
     let config_path = get_interpolation_test_config();
@@ -207,7 +194,7 @@ fn test_multiple_interpolation_types() {
         }
     }
 
-    env::remove_var("TEST_PKG");
+    env::remove_var("TEST_PKG_ENV_VAR_INTERP");
     env::remove_var("AVOCADO_TARGET");
 }
 
@@ -215,8 +202,6 @@ fn test_multiple_interpolation_types() {
 #[serial]
 fn test_combined_interpolation() {
     env::set_var("AVOCADO_TARGET", "armv7-unknown-linux-gnueabihf");
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
 
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
@@ -238,15 +223,42 @@ fn test_combined_interpolation() {
 
 #[test]
 fn test_sdk_image_interpolation() {
-    env::remove_var("TEST_PKG");
-    env::remove_var("EXT_VERSION");
-
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
-    // SDK image should be interpolated from config.base_image
+    // SDK image should be interpolated from distro fields
     assert_eq!(
         config.sdk.as_ref().unwrap().image.as_ref().unwrap(),
-        "ghcr.io/avocado/base"
+        "docker.io/avocadolinux/sdk:apollo-edge"
     );
+}
+
+#[test]
+fn test_distro_config_loaded() {
+    let config_path = get_interpolation_test_config();
+    let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
+
+    // Check that distro is loaded
+    assert!(config.distro.is_some());
+    let distro = config.distro.as_ref().unwrap();
+    assert_eq!(distro.channel.as_ref().unwrap(), "apollo-edge");
+    assert_eq!(distro.version.as_ref().unwrap(), "0.1.0");
+}
+
+#[test]
+fn test_config_distro_interpolation_in_sdk() {
+    let config_path = get_interpolation_test_config();
+    let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
+
+    // SDK image should use config.distro interpolation
+    let sdk = config.sdk.as_ref().unwrap();
+    assert_eq!(
+        sdk.image.as_ref().unwrap(),
+        "docker.io/avocadolinux/sdk:apollo-edge"
+    );
+
+    // SDK dependencies should use config.distro.version interpolation
+    let deps = sdk.dependencies.as_ref().unwrap();
+    let toolchain_version = deps.get("avocado-sdk-toolchain").unwrap();
+    assert_eq!(toolchain_version.as_str().unwrap(), "0.1.0");
 }

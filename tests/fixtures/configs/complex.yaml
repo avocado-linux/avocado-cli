@@ -1,4 +1,7 @@
 default_target: qemux86-64
+distro:
+  channel: apollo-stable
+  version: 1.0.0
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:v1.0.0
   version: 1.0.0
