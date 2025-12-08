@@ -2,4 +2,5 @@
 
 mod commands;
 mod common;
+mod interpolation;
 mod workflows;

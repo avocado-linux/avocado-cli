@@ -13,6 +13,9 @@ runtime:
       avocado-ext-sshd-dev:
         ext: avocado-ext-sshd-dev
         vsn: '*'
+      avocado-bsp:
+        ext: avocado-bsp-{{ avocado.target }}
+        config: bsp/{{ avocado.target }}/avocado.toml
       config:
         ext: config
       app:

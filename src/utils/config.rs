@@ -390,8 +390,17 @@ impl Config {
 
     /// Load configuration from a YAML string
     pub fn load_from_yaml_str(content: &str) -> Result<Self> {
-        let config: Config =
+        // Parse YAML into a Value first
+        let mut parsed: serde_yaml::Value =
             serde_yaml::from_str(content).with_context(|| "Failed to parse YAML configuration")?;
+
+        // Perform interpolation before deserializing to Config struct
+        crate::utils::interpolation::interpolate_config(&mut parsed, None)
+            .with_context(|| "Failed to interpolate configuration values")?;
+
+        // Deserialize to Config struct
+        let config: Config = serde_yaml::from_value(parsed)
+            .with_context(|| "Failed to deserialize configuration after interpolation")?;
 
         Ok(config)
     }

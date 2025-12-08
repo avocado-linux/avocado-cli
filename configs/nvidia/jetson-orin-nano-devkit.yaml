@@ -7,6 +7,9 @@ runtime:
       avocado-img-bootfiles: '*'
       avocado-img-rootfs: '*'
       avocado-img-initramfs: '*'
+      avocado-bsp:
+        ext: avocado-bsp-{{ avocado.target }}
+        config: bsp/{{ avocado.target }}/avocado.toml
       config:
         ext: config
       app:

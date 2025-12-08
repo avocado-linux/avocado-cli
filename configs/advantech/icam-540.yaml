@@ -11,6 +11,9 @@ runtime:
       avocado-ext-dev:
         ext: avocado-ext-dev
         config: extensions/dev/avocado.toml
+      avocado-bsp:
+          ext: avocado-bsp-{{ avocado.target }}
+          config: bsp/{{ avocado.target }}/avocado.toml
       config:
         ext: config
       app:
@@ -18,9 +21,6 @@ runtime:
     icam-540:
       dependencies:
         avocado-img-tegraflash: '*'
-        avocado-bsp-icam-540:
-          ext: avocado-bsp-icam-540
-          config: bsp/icam-540/avocado.toml
 ext:
   app:
     types:

@@ -1,0 +1,35 @@
+default_target: x86_64-unknown-linux-gnu
+
+# Test config self-reference
+base_image: "ghcr.io/avocado/base"
+derived_image: "{{ config.base_image }}:latest"
+
+# Test nested config reference
+nested:
+  value: "nested_value"
+  
+reference_nested: "{{ config.nested.value }}"
+
+runtime:
+  dev:
+    # Test avocado.target interpolation
+    target: "{{ avocado.target }}"
+    dependencies:
+      # Test multiple interpolation types
+      base-pkg: "{{ config.base_image }}"
+      target-pkg: "avocado-os-{{ avocado.target }}"
+      env-pkg: "{{ env.TEST_PKG }}"
+      
+  prod:
+    dependencies:
+      # Test combined interpolation
+      combined: "{{ config.base_image }}-{{ avocado.target }}"
+
+sdk:
+  image: "{{ config.base_image }}"
+  
+ext:
+  test-ext:
+    types:
+      - sysext
+    version: "{{ env.EXT_VERSION }}"
