@@ -110,7 +110,7 @@ fn insert_config_flag(args: &[&str], config_path: &str) -> Vec<String> {
     new_args
 }
 
-/// Get the path to the minimal.toml config file
+/// Get the path to the minimal.yaml config file
 fn get_minimal_config_path() -> PathBuf {
     std::env::current_dir()
         .expect("Failed to get current directory")

@@ -1,6 +1,3 @@
-avocado:
-  version: 0.1.0
-  target: x86_64
 sdk:
   image: registry.fedoraproject.org/fedora-toolbox:40
   repo_url: https://mirrors.fedoraproject.org/metalink?repo=fedora-40&arch=x86_64
@@ -14,4 +11,4 @@ ext:
     dependencies:
       external-dep:
         ext: external-extension
-        config: external-config.toml
+        config: external-config.yaml
