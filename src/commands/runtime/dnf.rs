@@ -43,7 +43,7 @@ impl RuntimeDnfCommand {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         self.validate_runtime_exists(&parsed)?;
-        let container_image = self.get_container_image(&parsed)?;
+        let container_image = self.get_container_image(&config)?;
         let target = self.resolve_target_architecture(&config)?;
 
         // Get repo_url and repo_release from config
@@ -85,11 +85,9 @@ impl RuntimeDnfCommand {
         Ok(())
     }
 
-    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
-        parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+    fn get_container_image(&self, config: &Config) -> Result<String> {
+        config
+            .get_sdk_image()
             .map(|s| s.to_string())
             .ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'.")

@@ -103,11 +103,9 @@ impl RuntimeInstallCommand {
             return Ok(());
         }
 
-        // Get SDK configuration
-        let sdk_config = parsed.get("sdk").context("No SDK configuration found")?;
-        let container_image = sdk_config
-            .get("image")
-            .and_then(|v| v.as_str())
+        // Get SDK configuration from interpolated config
+        let container_image = config
+            .get_sdk_image()
             .context("No SDK container image specified in configuration")?;
 
         // Initialize container helper
@@ -516,7 +514,7 @@ runtime:
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("No SDK configuration found"));
+            .contains("No SDK container image specified in configuration"));
     }
 
     #[tokio::test]

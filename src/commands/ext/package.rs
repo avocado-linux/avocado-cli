@@ -293,13 +293,11 @@ impl ExtPackageCommand {
         &self,
         metadata: &RpmMetadata,
         config: &Config,
-        parsed: &serde_yaml::Value,
+        _parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<PathBuf> {
-        let container_image = parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+        let container_image = config
+            .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -604,14 +602,12 @@ rm -rf "$TMPDIR"
         &self,
         metadata: &RpmMetadata,
         config: &Config,
-        parsed: &serde_yaml::Value,
+        _parsed: &serde_yaml::Value,
         sdk_dependencies: &HashMap<String, serde_yaml::Value>,
         target: &str,
     ) -> Result<PathBuf> {
-        let container_image = parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+        let container_image = config
+            .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());

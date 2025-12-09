@@ -44,7 +44,7 @@ impl ExtDnfCommand {
 
         let target = self.resolve_target_architecture(&config)?;
         let extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
-        let container_image = self.get_container_image(&parsed)?;
+        let container_image = self.get_container_image(&config)?;
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
@@ -105,11 +105,9 @@ impl ExtDnfCommand {
         }
     }
 
-    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
-        parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+    fn get_container_image(&self, config: &Config) -> Result<String> {
+        config
+            .get_sdk_image()
             .map(|s| s.to_string())
             .ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'.")

@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::utils::config::load_config;
+use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -39,7 +39,7 @@ impl RuntimeCleanCommand {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         self.validate_runtime_exists(&parsed)?;
-        let container_image = self.get_container_image(&parsed)?;
+        let container_image = self.get_container_image(&config)?;
         let target = self.resolve_target_architecture(&config)?;
 
         self.clean_runtime(&container_image, &target).await
@@ -69,11 +69,9 @@ impl RuntimeCleanCommand {
         Ok(())
     }
 
-    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
-        parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+    fn get_container_image(&self, config: &Config) -> Result<String> {
+        config
+            .get_sdk_image()
             .map(|s| s.to_string())
             .ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'.")

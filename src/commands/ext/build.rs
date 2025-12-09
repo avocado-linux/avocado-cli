@@ -50,7 +50,7 @@ impl ExtBuildCommand {
         // Load configuration and parse raw TOML
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let _parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let processed_container_args =
@@ -245,11 +245,9 @@ impl ExtBuildCommand {
             }
         });
 
-        // Get SDK configuration
-        let container_image = parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+        // Get SDK configuration from interpolated config
+        let container_image = config
+            .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
         // Resolve target with proper precedence

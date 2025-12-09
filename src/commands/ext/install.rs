@@ -118,14 +118,10 @@ impl ExtInstallCommand {
             OutputLevel::Normal,
         );
 
-        // Get the SDK image and target from configuration
-        let container_image = parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("No container image specified in config under 'sdk.image'.")
-            })?;
+        // Get the SDK image from interpolated config
+        let container_image = config.get_sdk_image().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'.")
+        })?;
 
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed

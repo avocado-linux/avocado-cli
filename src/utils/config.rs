@@ -127,7 +127,11 @@ impl Config {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {config_path}"))?;
 
-        let parsed = Self::parse_config_value(config_path, &content)?;
+        let mut parsed = Self::parse_config_value(config_path, &content)?;
+
+        // Apply interpolation to the parsed config
+        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
+            .with_context(|| "Failed to interpolate configuration values")?;
 
         // Get the base section
         let base_section = self.get_nested_section(&parsed, section_path);
@@ -283,7 +287,11 @@ impl Config {
         // Read the raw config to access target-specific sections
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {config_path}"))?;
-        let parsed = Self::parse_config_value(config_path, &content)?;
+        let mut parsed = Self::parse_config_value(config_path, &content)?;
+
+        // Apply interpolation to the parsed config
+        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
+            .with_context(|| "Failed to interpolate configuration values")?;
 
         // Get the base section: base_path.nested_path
         let base_section_path = format!("{base_path}.{nested_path}");

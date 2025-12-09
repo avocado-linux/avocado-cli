@@ -111,11 +111,9 @@ impl ExtImageCommand {
             ));
         }
 
-        // Get SDK configuration
-        let container_image = parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+        // Get SDK configuration from interpolated config
+        let container_image = config
+            .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
         // Use resolved target (from CLI/env) if available, otherwise fall back to config

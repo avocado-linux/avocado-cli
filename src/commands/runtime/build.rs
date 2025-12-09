@@ -49,12 +49,9 @@ impl RuntimeBuildCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
-        // Get SDK configuration
-        let sdk_config = parsed.get("sdk").context("No SDK configuration found")?;
-
-        let container_image = sdk_config
-            .get("image")
-            .and_then(|v| v.as_str())
+        // Get SDK configuration from interpolated config
+        let container_image = config
+            .get_sdk_image()
             .context("No SDK container image specified in configuration")?;
 
         // Get runtime configuration

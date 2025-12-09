@@ -61,11 +61,9 @@ impl FetchCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
 
-        // Get container configuration
-        let container_image = config_toml
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+        // Get container configuration from interpolated config
+        let container_image = config
+            .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());

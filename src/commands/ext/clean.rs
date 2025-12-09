@@ -36,11 +36,11 @@ impl ExtCleanCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = Config::load(&self.config_path)?;
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let _parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         let target = resolve_target_required(self.target.as_deref(), &config)?;
         let _extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
-        let container_image = self.get_container_image(&parsed)?;
+        let container_image = self.get_container_image(&config)?;
 
         self.clean_extension(&container_image, &target).await
     }
@@ -88,11 +88,9 @@ impl ExtCleanCommand {
         }
     }
 
-    fn get_container_image(&self, parsed: &serde_yaml::Value) -> Result<String> {
-        parsed
-            .get("sdk")
-            .and_then(|sdk| sdk.get("image"))
-            .and_then(|img| img.as_str())
+    fn get_container_image(&self, config: &Config) -> Result<String> {
+        config
+            .get_sdk_image()
             .map(|s| s.to_string())
             .ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'.")
