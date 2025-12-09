@@ -19,6 +19,90 @@ use std::path::{Path, PathBuf};
 // automatically converted to avocado.yaml format.
 // =============================================================================
 
+/// Custom deserializer module for container_args
+mod container_args_deserializer {
+    use serde::{Deserialize, Deserializer};
+
+    /// Splits a string on unescaped spaces, respecting quotes
+    ///
+    /// Examples:
+    /// - "-v /dev:/dev" -> ["-v", "/dev:/dev"]
+    /// - "-v /path\\ with\\ spaces:/dev" -> ["-v", "/path with spaces:/dev"]
+    /// - "-e \"VAR=value with spaces\"" -> ["-e", "VAR=value with spaces"]
+    fn split_on_unescaped_spaces(s: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut current = String::new();
+        let mut chars = s.chars().peekable();
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut escape_next = false;
+
+        while let Some(ch) = chars.next() {
+            if escape_next {
+                current.push(ch);
+                escape_next = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => {
+                    // Look ahead to see if we're escaping a space or quote
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch == ' ' || next_ch == '"' || next_ch == '\'' || next_ch == '\\' {
+                            escape_next = true;
+                        } else {
+                            current.push(ch);
+                        }
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                '\'' if !in_double_quote => {
+                    in_single_quote = !in_single_quote;
+                }
+                '"' if !in_single_quote => {
+                    in_double_quote = !in_double_quote;
+                }
+                ' ' if !in_single_quote && !in_double_quote => {
+                    if !current.is_empty() {
+                        result.push(current.clone());
+                        current.clear();
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            result.push(current);
+        }
+
+        result
+    }
+
+    /// Deserializes container_args from either a string or an array
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrVec {
+            String(String),
+            Vec(Vec<String>),
+        }
+
+        let value = Option::<StringOrVec>::deserialize(deserializer)?;
+
+        Ok(value.map(|v| match v {
+            StringOrVec::String(s) => split_on_unescaped_spaces(&s),
+            StringOrVec::Vec(vec) => vec,
+        }))
+    }
+}
+
 /// Represents the location of an extension (local or external)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionLocation {
@@ -57,6 +141,7 @@ pub struct SdkConfig {
     pub compile: Option<HashMap<String, CompileConfig>>,
     pub repo_url: Option<String>,
     pub repo_release: Option<String>,
+    #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
     pub disable_weak_dependencies: Option<bool>,
 }
@@ -71,6 +156,7 @@ pub struct CompileConfig {
 /// Provision profile configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvisionProfileConfig {
+    #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
 }
 
@@ -4186,5 +4272,181 @@ stone_manifest = "stone-qemux86-64.json"
             .get_stone_manifest_for_runtime("dev", "aarch64", temp_file.path())
             .unwrap();
         assert!(stone_manifest_arm.is_none());
+    }
+
+    #[test]
+    fn test_container_args_as_string() {
+        // Test that container_args can be provided as a string and is split on unescaped spaces
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args: "-v /dev:/dev --privileged --network=host"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_sdk_container_args();
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "/dev:/dev");
+        assert_eq!(args[2], "--privileged");
+        assert_eq!(args[3], "--network=host");
+    }
+
+    #[test]
+    fn test_container_args_as_array() {
+        // Test that container_args still works as an array
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args:
+    - "-v"
+    - "/dev:/dev"
+    - "--privileged"
+    - "--network=host"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_sdk_container_args();
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "/dev:/dev");
+        assert_eq!(args[2], "--privileged");
+        assert_eq!(args[3], "--network=host");
+    }
+
+    #[test]
+    fn test_container_args_string_with_escaped_spaces() {
+        // Test that escaped spaces are preserved in the string
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args: "-v /path\\ with\\ spaces:/dev --name my\\ container"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_sdk_container_args();
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "/path with spaces:/dev");
+        assert_eq!(args[2], "--name");
+        assert_eq!(args[3], "my container");
+    }
+
+    #[test]
+    fn test_container_args_string_with_quotes() {
+        // Test that quoted strings with spaces are preserved
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args: "-e \"VAR=value with spaces\" -e 'OTHER=also has spaces'"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_sdk_container_args();
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-e");
+        assert_eq!(args[1], "VAR=value with spaces");
+        assert_eq!(args[2], "-e");
+        assert_eq!(args[3], "OTHER=also has spaces");
+    }
+
+    #[test]
+    fn test_container_args_provision_as_string() {
+        // Test that provision profile container_args also supports string format
+        let config_content = r#"
+provision:
+  usb:
+    container_args: "-v /dev:/dev -v /sys:/sys:ro --privileged"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_provision_profile_container_args("usb");
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "/dev:/dev");
+        assert_eq!(args[2], "-v");
+        assert_eq!(args[3], "/sys:/sys:ro");
+        assert_eq!(args[4], "--privileged");
+    }
+
+    #[test]
+    fn test_container_args_empty_string() {
+        // Test that empty string results in empty array
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args: ""
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_sdk_container_args();
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 0);
+    }
+
+    #[test]
+    fn test_merge_container_args_string_and_array() {
+        // Test merging when config uses string and CLI uses array
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args: "--network=host --privileged"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let cli_args = vec!["-v".to_string(), "/dev:/dev".to_string()];
+        let merged = config.merge_sdk_container_args(Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged = merged.unwrap();
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0], "--network=host");
+        assert_eq!(merged[1], "--privileged");
+        assert_eq!(merged[2], "-v");
+        assert_eq!(merged[3], "/dev:/dev");
+    }
+
+    #[test]
+    fn test_container_args_complex_string() {
+        // Test a complex real-world example with multiple types of arguments
+        let config_content = r#"
+sdk:
+  image: docker.io/avocadolinux/sdk:latest
+  container_args: "--network=host --privileged -v /dev:/dev -v /sys:/sys:ro -e \"BUILD_ENV=production\" --name my-container"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let args = config.get_sdk_container_args();
+
+        assert!(args.is_some());
+        let args = args.unwrap();
+        assert_eq!(args.len(), 10);
+        assert_eq!(args[0], "--network=host");
+        assert_eq!(args[1], "--privileged");
+        assert_eq!(args[2], "-v");
+        assert_eq!(args[3], "/dev:/dev");
+        assert_eq!(args[4], "-v");
+        assert_eq!(args[5], "/sys:/sys:ro");
+        assert_eq!(args[6], "-e");
+        assert_eq!(args[7], "BUILD_ENV=production");
+        assert_eq!(args[8], "--name");
+        assert_eq!(args[9], "my-container");
     }
 }
