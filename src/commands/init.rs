@@ -16,6 +16,14 @@ struct GitHubContent {
     #[serde(rename = "type")]
     item_type: String,
     download_url: Option<String>,
+    /// The SHA of the content (for files, dirs, and submodules)
+    sha: Option<String>,
+    /// For submodules: the git URL of the submodule repository (may not always be present)
+    submodule_git_url: Option<String>,
+    /// The size of the file (submodules have size 0)
+    size: Option<u64>,
+    /// The git URL - for submodules this points to the submodule repo's tree
+    git_url: Option<String>,
 }
 
 /// Command to initialize a new Avocado project with configuration files.
@@ -407,31 +415,273 @@ impl InitCommand {
 
                 let local_path = local_base_path.join(relative_path);
 
-                match item.item_type.as_str() {
-                    "file" => {
-                        if let Some(ref download_url) = item.download_url {
-                            println!("  Downloading {relative_path}...");
-                            Self::download_file(download_url, &local_path).await?;
-                        }
-                    }
-                    "dir" => {
+                // Check if this is a submodule (can appear as type "submodule" or "file")
+                if Self::is_submodule(&item, repo_owner, repo_name) {
+                    // Try to get submodule info from submodule_git_url first, then fall back to git_url
+                    let submodule_info = if let Some(ref submodule_url) = item.submodule_git_url {
+                        item.sha.as_ref().and_then(|sha| {
+                            Self::parse_github_url(submodule_url)
+                                .map(|(owner, repo)| (owner, repo, sha.clone()))
+                        })
+                    } else {
+                        // Parse from git_url (format: https://api.github.com/repos/{owner}/{repo}/git/trees/{sha})
+                        item.git_url
+                            .as_ref()
+                            .and_then(|url| Self::parse_git_api_url(url))
+                    };
+
+                    if let Some((sub_owner, sub_repo, sha)) = submodule_info {
+                        println!("  Downloading submodule {relative_path} from {sub_owner}/{sub_repo}@{sha}...");
                         fs::create_dir_all(&local_path).with_context(|| {
                             format!("Failed to create directory '{}'", local_path.display())
                         })?;
-                        // Recursively download directory contents
-                        let sub_path = item.path.replace(&format!("{REFERENCES_PATH}/"), "");
-                        Self::download_reference_contents(
-                            reference_name,
-                            &sub_path,
-                            local_base_path,
-                            repo_owner,
-                            repo_name,
-                            git_ref,
+                        Self::download_submodule_contents(
+                            &sub_owner,
+                            &sub_repo,
+                            &sha,
+                            "",
+                            &local_path,
+                        )
+                        .await?;
+                    } else {
+                        println!(
+                            "  Warning: Submodule '{relative_path}' missing required info, skipping"
+                        );
+                    }
+                } else {
+                    match item.item_type.as_str() {
+                        "file" => {
+                            if let Some(ref download_url) = item.download_url {
+                                println!("  Downloading {relative_path}...");
+                                Self::download_file(download_url, &local_path).await?;
+                            }
+                        }
+                        "dir" => {
+                            fs::create_dir_all(&local_path).with_context(|| {
+                                format!("Failed to create directory '{}'", local_path.display())
+                            })?;
+                            // Recursively download directory contents
+                            let sub_path = item.path.replace(&format!("{REFERENCES_PATH}/"), "");
+                            Self::download_reference_contents(
+                                reference_name,
+                                &sub_path,
+                                local_base_path,
+                                repo_owner,
+                                repo_name,
+                                git_ref,
+                            )
+                            .await?;
+                        }
+                        _ => {
+                            // Skip other types (symlinks, etc.)
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Parses a GitHub URL to extract owner and repo name.
+    ///
+    /// Supports formats:
+    /// - https://github.com/owner/repo.git
+    /// - https://github.com/owner/repo
+    /// - git://github.com/owner/repo.git
+    /// - git@github.com:owner/repo.git
+    ///
+    /// # Arguments
+    /// * `url` - The GitHub URL to parse
+    ///
+    /// # Returns
+    /// * `Some((owner, repo))` if parsing succeeded
+    /// * `None` if the URL format is not recognized
+    fn parse_github_url(url: &str) -> Option<(String, String)> {
+        // Handle git@github.com:owner/repo.git format
+        if url.starts_with("git@github.com:") {
+            let path = url.strip_prefix("git@github.com:")?;
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() >= 2 {
+                return Some((parts[0].to_string(), parts[1].to_string()));
+            }
+            return None;
+        }
+
+        // Handle https:// and git:// URLs
+        let url = url
+            .strip_prefix("https://github.com/")
+            .or_else(|| url.strip_prefix("git://github.com/"))?;
+        let url = url.strip_suffix(".git").unwrap_or(url);
+        let parts: Vec<&str> = url.split('/').collect();
+        if parts.len() >= 2 {
+            Some((parts[0].to_string(), parts[1].to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Parses a GitHub API git_url to extract owner, repo, and SHA.
+    ///
+    /// The git_url for submodules has the format:
+    /// https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}
+    ///
+    /// # Arguments
+    /// * `git_url` - The GitHub API git URL
+    ///
+    /// # Returns
+    /// * `Some((owner, repo, sha))` if parsing succeeded
+    /// * `None` if the URL format is not recognized
+    fn parse_git_api_url(git_url: &str) -> Option<(String, String, String)> {
+        // Format: https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}
+        let url = git_url.strip_prefix("https://api.github.com/repos/")?;
+        let parts: Vec<&str> = url.split('/').collect();
+        // Expected: [owner, repo, "git", "trees", sha]
+        if parts.len() >= 5 && parts[2] == "git" && parts[3] == "trees" {
+            Some((
+                parts[0].to_string(),
+                parts[1].to_string(),
+                parts[4].to_string(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Checks if a GitHubContent item is a submodule.
+    ///
+    /// Submodules in GitHub's API can appear as either:
+    /// - type: "submodule" with submodule_git_url
+    /// - type: "file" with size: 0, download_url: null, and git_url pointing to another repo's tree
+    fn is_submodule(item: &GitHubContent, current_owner: &str, current_repo: &str) -> bool {
+        if item.item_type == "submodule" {
+            return true;
+        }
+
+        // Check for submodules that appear as files
+        if item.item_type == "file" && item.download_url.is_none() && item.size == Some(0) {
+            // Check if git_url points to a different repository
+            if let Some(ref git_url) = item.git_url {
+                if let Some((owner, repo, _)) = Self::parse_git_api_url(git_url) {
+                    // If the git_url points to a different repo, it's a submodule
+                    return owner != current_owner || repo != current_repo;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Recursively downloads all contents from a GitHub submodule at a specific commit.
+    ///
+    /// # Arguments
+    /// * `repo_owner` - The submodule repository owner
+    /// * `repo_name` - The submodule repository name
+    /// * `git_ref` - The git ref (commit SHA) to fetch from
+    /// * `path` - The path within the submodule repository (empty for root)
+    /// * `local_path` - The local path to download to
+    ///
+    /// # Returns
+    /// * `Ok(())` if successful
+    /// * `Err` if there was an error downloading the contents
+    fn download_submodule_contents<'a>(
+        repo_owner: &'a str,
+        repo_name: &'a str,
+        git_ref: &'a str,
+        path: &'a str,
+        local_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = if path.is_empty() {
+                format!("{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/contents?ref={git_ref}")
+            } else {
+                format!(
+                    "{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/contents/{path}?ref={git_ref}"
+                )
+            };
+
+            let client = reqwest::Client::builder()
+                .user_agent("avocado-cli")
+                .build()?;
+
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("Failed to fetch submodule contents from {url}"))?;
+
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "Failed to fetch submodule contents: HTTP {}",
+                    response.status()
+                );
+            }
+
+            let contents: Vec<GitHubContent> = response
+                .json()
+                .await
+                .with_context(|| "Failed to parse GitHub API response for submodule")?;
+
+            for item in contents {
+                let item_name = item.path.rsplit('/').next().unwrap_or(&item.path);
+                let item_local_path = local_path.join(item_name);
+
+                // Check if this is a submodule (can appear as type "submodule" or "file")
+                if Self::is_submodule(&item, repo_owner, repo_name) {
+                    // Try to get submodule info from submodule_git_url first, then fall back to git_url
+                    let submodule_info = if let Some(ref submodule_url) = item.submodule_git_url {
+                        item.sha.as_ref().and_then(|sha| {
+                            Self::parse_github_url(submodule_url)
+                                .map(|(owner, repo)| (owner, repo, sha.clone()))
+                        })
+                    } else {
+                        // Parse from git_url (format: https://api.github.com/repos/{owner}/{repo}/git/trees/{sha})
+                        item.git_url
+                            .as_ref()
+                            .and_then(|url| Self::parse_git_api_url(url))
+                    };
+
+                    if let Some((sub_owner, sub_repo, sha)) = submodule_info {
+                        println!("    Downloading nested submodule {item_name} from {sub_owner}/{sub_repo}@{sha}...");
+                        fs::create_dir_all(&item_local_path).with_context(|| {
+                            format!("Failed to create directory '{}'", item_local_path.display())
+                        })?;
+                        Self::download_submodule_contents(
+                            &sub_owner,
+                            &sub_repo,
+                            &sha,
+                            "",
+                            &item_local_path,
                         )
                         .await?;
                     }
-                    _ => {
-                        // Skip other types (symlinks, submodules, etc.)
+                } else {
+                    match item.item_type.as_str() {
+                        "file" => {
+                            if let Some(ref download_url) = item.download_url {
+                                Self::download_file(download_url, &item_local_path).await?;
+                            }
+                        }
+                        "dir" => {
+                            fs::create_dir_all(&item_local_path).with_context(|| {
+                                format!(
+                                    "Failed to create directory '{}'",
+                                    item_local_path.display()
+                                )
+                            })?;
+                            Self::download_submodule_contents(
+                                repo_owner,
+                                repo_name,
+                                git_ref,
+                                &item.path,
+                                &item_local_path,
+                            )
+                            .await?;
+                        }
+                        _ => {
+                            // Skip other types
+                        }
                     }
                 }
             }
@@ -905,5 +1155,148 @@ mod tests {
 
             validate_ext_versions(&content, &format!("generated config for {target}"));
         }
+    }
+
+    #[test]
+    fn test_parse_github_url() {
+        // Test https://github.com/owner/repo.git format
+        assert_eq!(
+            InitCommand::parse_github_url("https://github.com/avocado-linux/avocado-os.git"),
+            Some(("avocado-linux".to_string(), "avocado-os".to_string()))
+        );
+
+        // Test https://github.com/owner/repo format (no .git suffix)
+        assert_eq!(
+            InitCommand::parse_github_url("https://github.com/avocado-linux/avocado-os"),
+            Some(("avocado-linux".to_string(), "avocado-os".to_string()))
+        );
+
+        // Test git://github.com/owner/repo.git format
+        assert_eq!(
+            InitCommand::parse_github_url("git://github.com/avocado-linux/avocado-os.git"),
+            Some(("avocado-linux".to_string(), "avocado-os".to_string()))
+        );
+
+        // Test git@github.com:owner/repo.git format (SSH)
+        assert_eq!(
+            InitCommand::parse_github_url("git@github.com:avocado-linux/avocado-os.git"),
+            Some(("avocado-linux".to_string(), "avocado-os".to_string()))
+        );
+
+        // Test invalid URLs
+        assert_eq!(
+            InitCommand::parse_github_url("https://gitlab.com/avocado-linux/avocado-os.git"),
+            None
+        );
+        assert_eq!(InitCommand::parse_github_url("invalid-url"), None);
+    }
+
+    #[test]
+    fn test_parse_git_api_url() {
+        // Test valid git API URL format
+        assert_eq!(
+            InitCommand::parse_git_api_url(
+                "https://api.github.com/repos/avocado-linux/ref-rust/git/trees/b075804a37c196f6551d8a497d316ddb61dc44cb"
+            ),
+            Some((
+                "avocado-linux".to_string(),
+                "ref-rust".to_string(),
+                "b075804a37c196f6551d8a497d316ddb61dc44cb".to_string()
+            ))
+        );
+
+        // Test another valid URL
+        assert_eq!(
+            InitCommand::parse_git_api_url(
+                "https://api.github.com/repos/owner/repo/git/trees/abc123"
+            ),
+            Some((
+                "owner".to_string(),
+                "repo".to_string(),
+                "abc123".to_string()
+            ))
+        );
+
+        // Test invalid URLs
+        assert_eq!(
+            InitCommand::parse_git_api_url("https://api.github.com/repos/owner/repo/contents/file"),
+            None
+        );
+        assert_eq!(InitCommand::parse_git_api_url("invalid-url"), None);
+    }
+
+    #[test]
+    fn test_is_submodule() {
+        // Test explicit submodule type
+        let submodule_item = GitHubContent {
+            path: "submodule".to_string(),
+            item_type: "submodule".to_string(),
+            download_url: None,
+            sha: Some("abc123".to_string()),
+            submodule_git_url: Some("https://github.com/owner/repo.git".to_string()),
+            size: Some(0),
+            git_url: None,
+        };
+        assert!(InitCommand::is_submodule(
+            &submodule_item,
+            "current-owner",
+            "current-repo"
+        ));
+
+        // Test submodule appearing as file (size 0, no download_url, git_url points to different repo)
+        let submodule_as_file = GitHubContent {
+            path: "ref-rust".to_string(),
+            item_type: "file".to_string(),
+            download_url: None,
+            sha: Some("b075804a37c196f6551d8a497d316ddb61dc44cb".to_string()),
+            submodule_git_url: None,
+            size: Some(0),
+            git_url: Some(
+                "https://api.github.com/repos/avocado-linux/ref-rust/git/trees/b075804a37c196f6551d8a497d316ddb61dc44cb".to_string()
+            ),
+        };
+        assert!(InitCommand::is_submodule(
+            &submodule_as_file,
+            "avocado-linux",
+            "avocado-os"
+        ));
+
+        // Test regular file (not a submodule)
+        let regular_file = GitHubContent {
+            path: "file.txt".to_string(),
+            item_type: "file".to_string(),
+            download_url: Some("https://example.com/file.txt".to_string()),
+            sha: Some("abc123".to_string()),
+            submodule_git_url: None,
+            size: Some(100),
+            git_url: Some(
+                "https://api.github.com/repos/avocado-linux/avocado-os/git/blobs/abc123"
+                    .to_string(),
+            ),
+        };
+        assert!(!InitCommand::is_submodule(
+            &regular_file,
+            "avocado-linux",
+            "avocado-os"
+        ));
+
+        // Test file in same repo (not a submodule even if size is 0)
+        let same_repo_file = GitHubContent {
+            path: "empty-file".to_string(),
+            item_type: "file".to_string(),
+            download_url: None,
+            sha: Some("abc123".to_string()),
+            submodule_git_url: None,
+            size: Some(0),
+            git_url: Some(
+                "https://api.github.com/repos/avocado-linux/avocado-os/git/trees/abc123"
+                    .to_string(),
+            ),
+        };
+        assert!(!InitCommand::is_submodule(
+            &same_repo_file,
+            "avocado-linux",
+            "avocado-os"
+        ));
     }
 }
