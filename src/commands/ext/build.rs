@@ -102,12 +102,12 @@ impl ExtBuildCommand {
         self.handle_compile_dependencies(&config, &ext_config, &target)
             .await?;
 
-        // Get extension types from the types array
+        // Get extension types from the types array (defaults to ["sysext", "confext"])
         let ext_types = ext_config
             .get("types")
             .and_then(|v| v.as_sequence())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
+            .unwrap_or_else(|| vec!["sysext", "confext"]);
 
         // Get enable_services from configuration
         let enable_services = ext_config
@@ -199,13 +199,6 @@ impl ExtBuildCommand {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| ext_scopes.clone());
-
-        if ext_types.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Extension '{}' has no types specified. The 'types' array must contain at least one of: 'sysext', 'confext'.",
-                self.extension
-            ));
-        }
 
         // Get extension version
         let ext_version = ext_config

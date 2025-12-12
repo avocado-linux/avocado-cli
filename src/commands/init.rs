@@ -729,7 +729,8 @@ mod tests {
         let new_dir_path = temp_dir.path().join("new_project");
         let new_dir_str = new_dir_path.to_str().unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(new_dir_str.to_string()), None, None, None, None);
+        let init_cmd =
+            InitCommand::new(None, Some(new_dir_str.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());

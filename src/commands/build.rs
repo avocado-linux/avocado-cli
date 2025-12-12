@@ -620,7 +620,7 @@ impl BuildCommand {
             )
         })?;
 
-        // Get extension types from the external config
+        // Get extension types from the external config (defaults to ["sysext", "confext"])
         let types = extension_config
             .get("types")
             .and_then(|t| t.as_sequence())
@@ -630,7 +630,7 @@ impl BuildCommand {
                     .map(|s| s.to_string())
                     .collect::<Vec<String>>()
             })
-            .unwrap_or_else(|| vec!["sysext".to_string()]);
+            .unwrap_or_else(|| vec!["sysext".to_string(), "confext".to_string()]);
 
         // Resolve the external config path for ExtImageCommand
         let resolved_external_config_path =

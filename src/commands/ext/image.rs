@@ -104,19 +104,12 @@ impl ExtImageCommand {
             )
         })?;
 
-        // Get extension types from the types array
+        // Get extension types from the types array (defaults to ["sysext", "confext"])
         let ext_types = ext_config
             .get("types")
             .and_then(|v| v.as_sequence())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
-
-        if ext_types.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Extension '{}' has no types specified. The 'types' array must contain at least one of: 'sysext', 'confext'.",
-                self.extension
-            ));
-        }
+            .unwrap_or_else(|| vec!["sysext", "confext"]);
 
         // Get SDK configuration from interpolated config
         let container_image = config

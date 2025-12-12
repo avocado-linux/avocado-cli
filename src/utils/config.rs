@@ -638,8 +638,8 @@ impl Config {
             .with_context(|| format!("Failed to read config file: {config_path}"))?;
 
         // Parse YAML into a Value
-        let mut parsed: serde_yaml::Value = serde_yaml::from_str(&content)
-            .with_context(|| "Failed to parse YAML configuration")?;
+        let mut parsed: serde_yaml::Value =
+            serde_yaml::from_str(&content).with_context(|| "Failed to parse YAML configuration")?;
 
         // Perform interpolation with the target
         crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
