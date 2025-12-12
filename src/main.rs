@@ -62,6 +62,15 @@ enum Commands {
         /// Reference example to initialize from (downloads from avocado-os/references)
         #[arg(long)]
         reference: Option<String>,
+        /// Branch to fetch reference from (defaults to "main")
+        #[arg(long)]
+        reference_branch: Option<String>,
+        /// Specific commit SHA to fetch reference from
+        #[arg(long)]
+        reference_commit: Option<String>,
+        /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/avocado-os")
+        #[arg(long)]
+        reference_repo: Option<String>,
     },
     /// Runtime management commands
     Runtime {
@@ -587,8 +596,18 @@ async fn main() -> Result<()> {
             directory,
             target,
             reference,
+            reference_branch,
+            reference_commit,
+            reference_repo,
         } => {
-            let init_cmd = InitCommand::new(target.or(cli.target), directory, reference);
+            let init_cmd = InitCommand::new(
+                target.or(cli.target),
+                directory,
+                reference,
+                reference_branch,
+                reference_commit,
+                reference_repo,
+            );
             init_cmd.execute().await?;
             Ok(())
         }

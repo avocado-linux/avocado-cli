@@ -29,6 +29,12 @@ pub struct InitCommand {
     directory: Option<String>,
     /// Reference example to download from avocado-os repository
     reference: Option<String>,
+    /// Branch to fetch reference from (defaults to "main")
+    reference_branch: Option<String>,
+    /// Specific commit SHA to fetch reference from
+    reference_commit: Option<String>,
+    /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/avocado-os")
+    reference_repo: Option<String>,
 }
 
 impl InitCommand {
@@ -38,15 +44,25 @@ impl InitCommand {
     /// * `target` - Optional target architecture string
     /// * `directory` - Optional directory path to initialize
     /// * `reference` - Optional reference example name to download
+    /// * `reference_branch` - Optional branch to fetch reference from
+    /// * `reference_commit` - Optional specific commit SHA to fetch reference from
+    /// * `reference_repo` - Optional repository to fetch reference from (format: "owner/repo")
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         target: Option<String>,
         directory: Option<String>,
         reference: Option<String>,
+        reference_branch: Option<String>,
+        reference_commit: Option<String>,
+        reference_repo: Option<String>,
     ) -> Self {
         Self {
             target,
             directory,
             reference,
+            reference_branch,
+            reference_commit,
+            reference_repo,
         }
     }
 
@@ -62,6 +78,41 @@ impl InitCommand {
             "aarch64" => "qemuarm64",
             _ => "qemux86-64", // fallback to x86_64 for unknown architectures
         }
+    }
+
+    /// Returns the repository owner from reference_repo or the default.
+    fn get_repo_owner(&self) -> &str {
+        self.reference_repo
+            .as_ref()
+            .and_then(|repo| repo.split('/').next())
+            .unwrap_or(REPO_OWNER)
+    }
+
+    /// Returns the repository name from reference_repo or the default.
+    fn get_repo_name(&self) -> &str {
+        self.reference_repo
+            .as_ref()
+            .and_then(|repo| repo.split('/').nth(1))
+            .unwrap_or(REPO_NAME)
+    }
+
+    /// Returns the git ref (commit, branch, or default branch) for API requests.
+    fn get_git_ref(&self) -> &str {
+        if let Some(commit) = &self.reference_commit {
+            commit.as_str()
+        } else if let Some(branch) = &self.reference_branch {
+            branch.as_str()
+        } else {
+            REPO_BRANCH
+        }
+    }
+
+    /// Returns the display string for the reference source (for error messages).
+    fn get_reference_source(&self) -> String {
+        let owner = self.get_repo_owner();
+        let name = self.get_repo_name();
+        let git_ref = self.get_git_ref();
+        format!("{owner}/{name}/{git_ref}/{REFERENCES_PATH}")
     }
 
     /// Loads the configuration template for the specified target.
@@ -98,7 +149,7 @@ impl InitCommand {
         }
     }
 
-    /// Checks if a reference exists in the avocado-os repository.
+    /// Checks if a reference exists in the repository.
     ///
     /// # Arguments
     /// * `reference_name` - The name of the reference to check
@@ -107,9 +158,12 @@ impl InitCommand {
     /// * `Ok(true)` if the reference exists
     /// * `Ok(false)` if the reference doesn't exist
     /// * `Err` if there was an error checking
-    async fn reference_exists(reference_name: &str) -> Result<bool> {
+    async fn reference_exists(&self, reference_name: &str) -> Result<bool> {
+        let owner = self.get_repo_owner();
+        let name = self.get_repo_name();
+        let git_ref = self.get_git_ref();
         let url = format!(
-            "{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{REFERENCES_PATH}/{reference_name}"
+            "{GITHUB_API_BASE}/repos/{owner}/{name}/contents/{REFERENCES_PATH}/{reference_name}?ref={git_ref}"
         );
 
         let client = reqwest::Client::builder()
@@ -170,9 +224,12 @@ impl InitCommand {
     /// # Returns
     /// * `Ok(String)` with the file content if successful
     /// * `Err` if the file doesn't exist or cannot be downloaded
-    async fn download_reference_config(reference_name: &str) -> Result<String> {
+    async fn download_reference_config(&self, reference_name: &str) -> Result<String> {
+        let owner = self.get_repo_owner();
+        let name = self.get_repo_name();
+        let git_ref = self.get_git_ref();
         let url = format!(
-            "{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{REFERENCES_PATH}/{reference_name}/avocado.yaml"
+            "{GITHUB_API_BASE}/repos/{owner}/{name}/contents/{REFERENCES_PATH}/{reference_name}/avocado.yaml?ref={git_ref}"
         );
 
         let client = reqwest::Client::builder()
@@ -298,6 +355,9 @@ impl InitCommand {
     /// * `reference_name` - The name of the reference folder
     /// * `github_path` - The path within the repository (relative to references/)
     /// * `local_base_path` - The base local path to download to
+    /// * `repo_owner` - The repository owner
+    /// * `repo_name` - The repository name
+    /// * `git_ref` - The git ref (branch/commit) to fetch from
     ///
     /// # Returns
     /// * `Ok(())` if successful
@@ -306,10 +366,13 @@ impl InitCommand {
         reference_name: &'a str,
         github_path: &'a str,
         local_base_path: &'a Path,
+        repo_owner: &'a str,
+        repo_name: &'a str,
+        git_ref: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let url = format!(
-                "{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{REFERENCES_PATH}/{github_path}"
+                "{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/contents/{REFERENCES_PATH}/{github_path}?ref={git_ref}"
             );
 
             let client = reqwest::Client::builder()
@@ -361,6 +424,9 @@ impl InitCommand {
                             reference_name,
                             &sub_path,
                             local_base_path,
+                            repo_owner,
+                            repo_name,
+                            git_ref,
                         )
                         .await?;
                     }
@@ -441,6 +507,13 @@ impl InitCommand {
     pub async fn execute(&self) -> Result<()> {
         let directory = self.directory.as_deref().unwrap_or(".");
 
+        // Validate mutually exclusive options
+        if self.reference_branch.is_some() && self.reference_commit.is_some() {
+            anyhow::bail!(
+                "Cannot specify both --reference-branch and --reference-commit. Please use only one."
+            );
+        }
+
         // Validate and create directory if it doesn't exist
         if !Path::new(directory).exists() {
             fs::create_dir_all(directory)
@@ -449,14 +522,26 @@ impl InitCommand {
 
         // If reference is specified, download the reference project
         if let Some(ref_name) = &self.reference {
+            let reference_source = self.get_reference_source();
             println!("Initializing from reference '{ref_name}'...");
+
+            // Print source info if using non-default values
+            if self.reference_repo.is_some()
+                || self.reference_branch.is_some()
+                || self.reference_commit.is_some()
+            {
+                println!("Using source: {reference_source}");
+            }
 
             // Check if reference exists
             println!("Checking if reference '{ref_name}' exists...");
-            if !Self::reference_exists(ref_name).await? {
+            if !self.reference_exists(ref_name).await? {
                 anyhow::bail!(
-                    "Reference '{ref_name}' not found in {REPO_OWNER}/{REPO_NAME}/{REPO_BRANCH}/{REFERENCES_PATH}. \
-                    Please check the available references at https://github.com/{REPO_OWNER}/{REPO_NAME}/tree/{REPO_BRANCH}/{REFERENCES_PATH}"
+                    "Reference '{ref_name}' not found in {reference_source}. \
+                    Please check the available references at https://github.com/{}/{}/tree/{}",
+                    self.get_repo_owner(),
+                    self.get_repo_name(),
+                    self.get_git_ref()
                 );
             }
 
@@ -465,7 +550,7 @@ impl InitCommand {
                 println!("Validating target '{target}' is supported by reference '{ref_name}'...");
 
                 // Download and parse the reference's avocado.yaml
-                let toml_content = Self::download_reference_config(ref_name).await?;
+                let toml_content = self.download_reference_config(ref_name).await?;
 
                 // Check if target is supported
                 if !Self::is_target_supported(&toml_content, target)? {
@@ -480,7 +565,15 @@ impl InitCommand {
 
             // Download all contents from the reference
             println!("Downloading reference contents...");
-            Self::download_reference_contents(ref_name, ref_name, Path::new(directory)).await?;
+            Self::download_reference_contents(
+                ref_name,
+                ref_name,
+                Path::new(directory),
+                self.get_repo_owner(),
+                self.get_repo_name(),
+                self.get_git_ref(),
+            )
+            .await?;
 
             // If a target was specified, update the default_target in the downloaded avocado.yaml
             if let Some(target) = &self.target {
@@ -556,7 +649,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -600,6 +693,9 @@ mod tests {
             Some("custom-arch".to_string()),
             Some(temp_path.to_string()),
             None,
+            None,
+            None,
+            None,
         );
         let result = init_cmd.execute().await;
 
@@ -619,7 +715,7 @@ mod tests {
         // Create existing file
         fs::write(&config_path, "existing content").unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_err());
@@ -633,7 +729,7 @@ mod tests {
         let new_dir_path = temp_dir.path().join("new_project");
         let new_dir_str = new_dir_path.to_str().unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(new_dir_str.to_string()), None);
+        let init_cmd = InitCommand::new(None, Some(new_dir_str.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -648,7 +744,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -669,7 +765,7 @@ mod tests {
         // Create existing .gitignore with some content
         fs::write(&gitignore_path, "*.log\n").unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -688,7 +784,7 @@ mod tests {
         // Create existing .gitignore with .avocado-state already in it
         fs::write(&gitignore_path, "*.log\n.avocado-state\n").unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None);
+        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -784,8 +880,14 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let temp_path = temp_dir.path().to_str().unwrap();
 
-            let init_cmd =
-                InitCommand::new(Some(target.to_string()), Some(temp_path.to_string()), None);
+            let init_cmd = InitCommand::new(
+                Some(target.to_string()),
+                Some(temp_path.to_string()),
+                None,
+                None,
+                None,
+                None,
+            );
             let result = init_cmd.execute().await;
 
             assert!(
