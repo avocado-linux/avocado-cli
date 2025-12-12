@@ -262,6 +262,25 @@ impl Config {
         }
     }
 
+    /// Parse config content and apply interpolation with the given target.
+    ///
+    /// This is used when we need to read raw config values with interpolation applied,
+    /// particularly for extension SDK dependencies that may contain templates like
+    /// `{{ avocado.target }}` in their keys.
+    fn parse_config_value_with_interpolation(
+        path: &str,
+        content: &str,
+        target: Option<&str>,
+    ) -> Result<serde_yaml::Value> {
+        let mut parsed = Self::parse_config_value(path, content)?;
+
+        // Apply interpolation with the target
+        crate::utils::interpolation::interpolate_config(&mut parsed, target)
+            .with_context(|| "Failed to interpolate configuration values")?;
+
+        Ok(parsed)
+    }
+
     /// Helper function to get a nested section from YAML using dot notation
     #[allow(dead_code)] // Helper for merging system
     fn get_nested_section<'a>(
@@ -596,6 +615,49 @@ impl Config {
     /// Get SDK dependencies
     pub fn get_sdk_dependencies(&self) -> Option<&HashMap<String, serde_yaml::Value>> {
         self.sdk.as_ref()?.dependencies.as_ref()
+    }
+
+    /// Get SDK dependencies with target interpolation.
+    ///
+    /// This method re-reads the config file and interpolates `{{ avocado.target }}`
+    /// templates with the provided target value.
+    ///
+    /// # Arguments
+    /// * `config_path` - Path to the configuration file
+    /// * `target` - The target architecture to use for interpolation
+    ///
+    /// # Returns
+    /// Interpolated SDK dependencies, or None if no dependencies are defined
+    pub fn get_sdk_dependencies_for_target(
+        &self,
+        config_path: &str,
+        target: &str,
+    ) -> Result<Option<HashMap<String, serde_yaml::Value>>> {
+        // Re-read the config file to get raw (uninterpolated) values
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read config file: {config_path}"))?;
+
+        // Parse YAML into a Value
+        let mut parsed: serde_yaml::Value = serde_yaml::from_str(&content)
+            .with_context(|| "Failed to parse YAML configuration")?;
+
+        // Perform interpolation with the target
+        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
+            .with_context(|| "Failed to interpolate configuration values")?;
+
+        // Extract SDK dependencies from the interpolated config
+        let sdk_deps = parsed
+            .get("sdk")
+            .and_then(|sdk| sdk.get("dependencies"))
+            .and_then(|deps| deps.as_mapping())
+            .map(|mapping| {
+                mapping
+                    .iter()
+                    .filter_map(|(k, v)| k.as_str().map(|key| (key.to_string(), v.clone())))
+                    .collect::<HashMap<String, serde_yaml::Value>>()
+            });
+
+        Ok(sdk_deps)
     }
 
     /// Get the SDK repo URL from environment variable or configuration
@@ -1268,12 +1330,16 @@ impl Config {
         config_path: Option<&str>,
         target: Option<&str>,
     ) -> Result<HashMap<String, HashMap<String, serde_yaml::Value>>> {
-        // Try to determine if this is YAML or TOML from the config_path
+        // Parse config with interpolation applied (including target for {{ avocado.target }} in keys)
         let parsed = if let Some(path) = config_path {
-            Self::parse_config_value(path, config_content)?
+            Self::parse_config_value_with_interpolation(path, config_content, target)?
         } else {
-            // Default to YAML parsing
-            serde_yaml::from_str(config_content).with_context(|| "Failed to parse configuration")?
+            // Default to YAML parsing with interpolation
+            let mut value: serde_yaml::Value = serde_yaml::from_str(config_content)
+                .with_context(|| "Failed to parse configuration")?;
+            crate::utils::interpolation::interpolate_config(&mut value, target)
+                .with_context(|| "Failed to interpolate configuration values")?;
+            value
         };
 
         let mut extension_sdk_deps = HashMap::new();
@@ -1437,9 +1503,11 @@ impl Config {
                                 let ext_config_path_str = resolved_external_config_path
                                     .to_str()
                                     .unwrap_or(external_config);
-                                match Self::parse_config_value(
+                                // Use interpolation-aware parsing to handle {{ avocado.target }} in keys
+                                match Self::parse_config_value_with_interpolation(
                                     ext_config_path_str,
                                     &external_config_content,
+                                    target,
                                 ) {
                                     Ok(external_parsed) => {
                                         // Create a temporary Config object for the external config

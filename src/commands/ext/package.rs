@@ -43,10 +43,10 @@ impl ExtPackageCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
+        // Load configuration
         let config = Config::load(&self.config_path)?;
+        // Read config content for extension SDK dependencies parsing
         let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Resolve target using unified target resolution logic
         let target = resolve_target_required(self.target.as_deref(), &config)?;
@@ -57,6 +57,12 @@ impl ExtPackageCommand {
             .ok_or_else(|| {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
+
+        // Get the config path where this extension is actually defined
+        let ext_config_path = match &extension_location {
+            ExtensionLocation::Local { config_path, .. } => config_path.clone(),
+            ExtensionLocation::External { config_path, .. } => config_path.clone(),
+        };
 
         if self.verbose {
             match &extension_location {
@@ -75,16 +81,16 @@ impl ExtPackageCommand {
             }
         }
 
-        // Get extension configuration (for now, we still need to get it from local config for package logic)
-        let ext_config = parsed
-            .get("ext")
-            .and_then(|ext| ext.get(&self.extension))
+        // Get merged extension configuration with target-specific overrides and interpolation
+        // Use the config path where the extension is actually defined for proper interpolation
+        let ext_config = config
+            .get_merged_ext_config(&self.extension, &target, &ext_config_path)?
             .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in local configuration. External extension packaging not yet supported.", self.extension)
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
         // Extract RPM metadata with defaults
-        let rpm_metadata = self.extract_rpm_metadata(ext_config, &target)?;
+        let rpm_metadata = self.extract_rpm_metadata(&ext_config, &target)?;
 
         if self.verbose {
             print_info(
@@ -98,7 +104,7 @@ impl ExtPackageCommand {
 
         // Create main RPM package in container
         let output_path = self
-            .create_rpm_package_in_container(&rpm_metadata, &config, &parsed, &target)
+            .create_rpm_package_in_container(&rpm_metadata, &config, &target)
             .await?;
 
         print_success(
@@ -126,7 +132,6 @@ impl ExtPackageCommand {
                 .create_sdk_rpm_package_in_container(
                     &rpm_metadata,
                     &config,
-                    &parsed,
                     &sdk_dependencies,
                     &target,
                 )
@@ -293,7 +298,6 @@ impl ExtPackageCommand {
         &self,
         metadata: &RpmMetadata,
         config: &Config,
-        _parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<PathBuf> {
         let container_image = config
@@ -602,7 +606,6 @@ rm -rf "$TMPDIR"
         &self,
         metadata: &RpmMetadata,
         config: &Config,
-        _parsed: &serde_yaml::Value,
         sdk_dependencies: &HashMap<String, serde_yaml::Value>,
         target: &str,
     ) -> Result<PathBuf> {

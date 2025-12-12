@@ -54,6 +54,12 @@ impl ExtImageCommand {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
+        // Get the config path where this extension is actually defined
+        let ext_config_path = match &extension_location {
+            ExtensionLocation::Local { config_path, .. } => config_path.clone(),
+            ExtensionLocation::External { config_path, .. } => config_path.clone(),
+        };
+
         if self.verbose {
             match &extension_location {
                 ExtensionLocation::Local { name, config_path } => {
@@ -72,8 +78,9 @@ impl ExtImageCommand {
         }
 
         // Get merged extension configuration with target-specific overrides
+        // Use the config path where the extension is actually defined for proper interpolation
         let ext_config = config
-            .get_merged_ext_config(&self.extension, &target, &self.config_path)?
+            .get_merged_ext_config(&self.extension, &target, &ext_config_path)?
             .ok_or_else(|| {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;

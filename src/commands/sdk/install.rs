@@ -69,8 +69,11 @@ impl SdkInstallCommand {
 
         print_info("Installing SDK dependencies.", OutputLevel::Normal);
 
-        // Get SDK dependencies
-        let sdk_dependencies = config.get_sdk_dependencies();
+        // Get SDK dependencies with target interpolation
+        // This re-parses the config to interpolate {{ avocado.target }} templates
+        let sdk_dependencies = config
+            .get_sdk_dependencies_for_target(&self.config_path, &target)
+            .with_context(|| "Failed to get SDK dependencies with target interpolation")?;
 
         // Get extension SDK dependencies (including nested ones with target-specific dependencies)
         let extension_sdk_dependencies = config
@@ -96,7 +99,7 @@ impl SdkInstallCommand {
         let mut sdk_packages = Vec::new();
 
         // Add regular SDK dependencies
-        if let Some(dependencies) = sdk_dependencies {
+        if let Some(ref dependencies) = sdk_dependencies {
             sdk_packages.extend(self.build_package_list(dependencies));
         }
 

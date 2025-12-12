@@ -15,6 +15,7 @@ fn get_interpolation_test_config() -> PathBuf {
 }
 
 #[test]
+#[serial]
 fn test_env_var_interpolation() {
     // Use unique env var names to avoid parallel test conflicts
     env::set_var("TEST_PKG_ENV_VAR_INTERP", "test-package-1.0");

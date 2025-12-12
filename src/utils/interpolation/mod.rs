@@ -142,6 +142,28 @@ fn interpolate_value(
             }
         }
         Value::Mapping(map) => {
+            // First, collect keys that need interpolation
+            // We can't mutate keys in place, so we need to rebuild entries with new keys
+            let mut keys_to_replace: Vec<(Value, Value, Value)> = Vec::new();
+
+            for (k, v) in map.iter() {
+                if let Value::String(key_str) = k {
+                    if let Some(new_key) =
+                        interpolate_string(key_str, root, cli_target, resolving_stack)?
+                    {
+                        keys_to_replace.push((k.clone(), Value::String(new_key), v.clone()));
+                    }
+                }
+            }
+
+            // Apply key replacements
+            for (old_key, new_key, value) in keys_to_replace {
+                map.remove(&old_key);
+                map.insert(new_key, value);
+                changed = true;
+            }
+
+            // Then interpolate all values (including newly inserted ones)
             for (_, v) in map.iter_mut() {
                 if interpolate_value(v, root, cli_target, resolving_stack)? {
                     changed = true;
@@ -701,6 +723,93 @@ sdk:
         assert_eq!(
             deps.get("avocado-sdk-toolchain").unwrap().as_str().unwrap(),
             "0.1.0"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_key_interpolation() {
+        // Test that templates in mapping KEYS are interpolated, not just values
+        let mut config = parse_yaml(
+            r#"
+default_target: qemux86-64
+sdk:
+  dependencies:
+    packagegroup-rust-cross-canadian-{{ avocado.target }}: "*"
+    regular-package: "1.0.0"
+"#,
+        );
+
+        interpolate_config(&mut config, Some("qemux86-64")).unwrap();
+
+        let sdk = config.get("sdk").unwrap();
+        let deps = sdk.get("dependencies").unwrap();
+
+        // The key should be interpolated with the target
+        assert!(deps
+            .get("packagegroup-rust-cross-canadian-qemux86-64")
+            .is_some());
+        assert_eq!(
+            deps.get("packagegroup-rust-cross-canadian-qemux86-64")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "*"
+        );
+
+        // Regular package should still be there
+        assert_eq!(
+            deps.get("regular-package").unwrap().as_str().unwrap(),
+            "1.0.0"
+        );
+
+        // The original template key should NOT exist anymore
+        assert!(deps
+            .get("packagegroup-rust-cross-canadian-{{ avocado.target }}")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_key_interpolation_with_env() {
+        env::set_var("MY_SUFFIX", "custom");
+
+        let mut config = parse_yaml(
+            r#"
+dependencies:
+  package-{{ env.MY_SUFFIX }}: "1.0.0"
+"#,
+        );
+
+        interpolate_config(&mut config, None).unwrap();
+
+        let deps = config.get("dependencies").unwrap();
+        assert!(deps.get("package-custom").is_some());
+        assert_eq!(
+            deps.get("package-custom").unwrap().as_str().unwrap(),
+            "1.0.0"
+        );
+
+        env::remove_var("MY_SUFFIX");
+    }
+
+    #[test]
+    fn test_key_interpolation_with_config_ref() {
+        let mut config = parse_yaml(
+            r#"
+prefix: myprefix
+mapping:
+  "{{ config.prefix }}-key": value
+"#,
+        );
+
+        interpolate_config(&mut config, None).unwrap();
+
+        let mapping = config.get("mapping").unwrap();
+        assert!(mapping.get("myprefix-key").is_some());
+        assert_eq!(
+            mapping.get("myprefix-key").unwrap().as_str().unwrap(),
+            "value"
         );
     }
 }
