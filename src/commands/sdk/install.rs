@@ -183,11 +183,17 @@ $DNF_SDK_HOST \
                     } else {
                         String::new()
                     };
+                    // For compile dependencies (target-dev sysroot), we:
+                    // - Use $DNF_NO_SCRIPTS to skip scriptlet execution (not needed for cross-compilation)
+                    // - Always disable weak dependencies (dev packages don't need them)
+                    // - Skip documentation (not needed in dev sysroot)
                     let command = format!(
                         r#"
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-$DNF_SDK_HOST \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS \
     --installroot {} \
+    --setopt=install_weak_deps=0 \
+    --nodocs \
     $DNF_SDK_TARGET_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
