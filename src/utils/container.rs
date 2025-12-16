@@ -489,11 +489,12 @@ ${{AVOCADO_DNF_ARGS:-}} \
 "
 
 export DNF_NO_SCRIPTS="--setopt=tsflags=noscripts"
+export SSL_CERT_FILE=${{AVOCADO_SDK_PREFIX}}/etc/ssl/certs/ca-certificates.crt
 
 export DNF_SDK_HOST_OPTS="\
 --setopt=cachedir=${{DNF_SDK_HOST_PREFIX}}/var/cache \
 --setopt=logdir=${{DNF_SDK_HOST_PREFIX}}/var/log \
---setopt=persistdir=${{DNF_SDK_HOST_PREFIX}}/var/lib/dnf
+--setopt=persistdir=${{DNF_SDK_HOST_PREFIX}}/var/lib/dnf \
 "
 
 export DNF_SDK_HOST_REPO_CONF="\
@@ -552,10 +553,10 @@ if [ ! -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     # This allows only update-alternatives and opkg to run, blocking other scriptlet commands
     mkdir -p $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts
     cp -r /usr/lib/rpm/* $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/
-    
+
     # Create a bin directory for command wrappers
     mkdir -p $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin
-    
+
     # Create update-alternatives wrapper that uses OPKG_OFFLINE_ROOT
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/update-alternatives << 'UAWRAPPER_EOF'
 #!/bin/bash
@@ -568,12 +569,12 @@ if [ -n "$AVOCADO_EXT_INSTALLROOT" ]; then
             # Debug: Show what we're doing
             echo "update-alternatives: OPKG_OFFLINE_ROOT=$AVOCADO_EXT_INSTALLROOT"
             echo "update-alternatives: executing: update-alternatives $*"
-            
+
             # Set OPKG_OFFLINE_ROOT to the extension's installroot
             # This tells opkg-update-alternatives to operate within that root
             # Also ensure alternatives directory is created
             /usr/bin/mkdir -p "${AVOCADO_EXT_INSTALLROOT}/var/lib/opkg/alternatives" 2>/dev/null || true
-            
+
             # Set clean PATH and call update-alternatives with OPKG_OFFLINE_ROOT
             export OPKG_OFFLINE_ROOT="$AVOCADO_EXT_INSTALLROOT"
             PATH="${AVOCADO_SDK_PREFIX}/usr/bin:/usr/bin:/bin" \
@@ -586,7 +587,7 @@ fi
 exit 0
 UAWRAPPER_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/update-alternatives
-    
+
     # Create opkg wrapper
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/opkg << 'OPKGWRAPPER_EOF'
 #!/bin/bash
@@ -594,7 +595,7 @@ UAWRAPPER_EOF
 exec ${AVOCADO_SDK_PREFIX}/usr/bin/opkg "$@"
 OPKGWRAPPER_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/opkg
-    
+
     # Create generic noop wrapper for commands we don't want to execute
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/noop-command << 'NOOP_EOF'
 #!/bin/bash
@@ -602,7 +603,7 @@ OPKGWRAPPER_EOF
 exit 0
 NOOP_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/noop-command
-    
+
     # Create a smart grep wrapper that pretends users/groups exist
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/grep << 'GREP_EOF'
 #!/bin/bash
@@ -623,7 +624,7 @@ ORIGINAL_PATH="${PATH#${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:}"
 exec env PATH="$ORIGINAL_PATH" grep "$@"
 GREP_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/grep
-    
+
     # Create symlinks for common scriptlet commands that should noop
     # Allowlist approach: we create wrappers for what we DON'T want, not for what we DO want
     for cmd in useradd groupadd usermod groupmod userdel groupdel chown chmod chgrp \
@@ -640,7 +641,7 @@ GREP_EOF
                bbnote bbfatal bbwarn bbdebug; do
         ln -sf noop-command $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/$cmd
     done
-    
+
     # Create shell wrapper for scriptlet interpreter
     cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh << 'SHELL_EOF'
 #!/bin/bash
@@ -658,10 +659,10 @@ export OPT="--opt"
 exec ${AVOCADO_SDK_PREFIX}/usr/bin/bash "$@"
 SHELL_EOF
     chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
-    
+
     # Update macros for extension scriptlets
     sed -i "s|^%_dbpath[[:space:]]*%{_var}/lib/rpm$|%_dbpath                %{_var}/lib/rpm|" $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros
-    
+
     # Add macro overrides for shell interpreter only
     cat >> $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros << 'MACROS_EOF'
 
@@ -726,6 +727,15 @@ export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
 # Source the environment setup if it exists
 if [ -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
     source "${AVOCADO_SDK_PREFIX}/environment-setup"
+fi
+
+# Add SSL certificate path to DNF options and CURL if it exists
+if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
+    export DNF_SDK_HOST_OPTS="${DNF_SDK_HOST_OPTS} \
+      --setopt=sslcacert=${SSL_CERT_FILE} \
+"
+
+    export CURL_CA_BUNDLE=${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt
 fi
 "#,
             );
