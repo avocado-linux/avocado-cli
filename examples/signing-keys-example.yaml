@@ -1,0 +1,45 @@
+# Example: Using signing keys with runtime configurations
+#
+# This example demonstrates how to:
+# 1. Define a local mapping of signing keys (name -> key ID)
+# 2. Reference those keys in runtime configurations
+#
+# The signing_keys section acts as a bridge between friendly names
+# and the actual key IDs from the global signing keys registry.
+
+default_target: qemux86-64
+
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+
+# Define signing keys with friendly names
+# The key IDs (right side) should match keys in the global registry
+# managed by `avocado signing-keys` commands
+signing_keys:
+  - production-key: sha256-abc123def456
+  - staging-key: sha256-789012fedcba
+  - backup-key: sha256-111222333444
+
+runtime:
+  # Production runtime uses the production signing key
+  production:
+    dependencies:
+      avocado-img-bootfiles: "*"
+      avocado-img-rootfs: "*"
+    signing:
+      key: production-key
+  
+  # Staging runtime uses a different key
+  staging:
+    dependencies:
+      avocado-img-bootfiles: "*"
+      avocado-img-rootfs: "*"
+    signing:
+      key: staging-key
+  
+  # Development runtime with no signing
+  dev:
+    dependencies:
+      avocado-img-bootfiles: "*"
+      avocado-img-rootfs: "*"
+    # No signing configuration - unsigned builds

@@ -4,9 +4,12 @@ sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 
 signing_keys:
-  - key: my-production-key
-  - key: backup-key
+  - my-production-key: sha256-abc123def456
+  - backup-key: sha256-789012fedcba
 
 runtime:
   default:
     target: x86_64-unknown-linux-gnu
+  dev:
+    signing:
+      key: my-production-key

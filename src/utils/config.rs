@@ -124,6 +124,13 @@ pub enum ConfigError {
     IoError(#[from] std::io::Error),
 }
 
+/// Signing configuration for runtime
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SigningConfig {
+    /// Name of the signing key to use (references a key from signing_keys section)
+    pub key: String,
+}
+
 /// Runtime configuration section
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -131,6 +138,8 @@ pub struct RuntimeConfig {
     pub dependencies: Option<HashMap<String, serde_yaml::Value>>,
     pub stone_include_paths: Option<Vec<String>>,
     pub stone_manifest: Option<String>,
+    /// Signing configuration for this runtime
+    pub signing: Option<SigningConfig>,
 }
 
 /// SDK configuration section
@@ -167,11 +176,34 @@ pub struct DistroConfig {
     pub version: Option<String>,
 }
 
-/// Signing key reference in configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SigningKeyRef {
-    /// Name of the signing key (as registered in global signing keys)
-    pub key: String,
+/// Helper module for deserializing signing keys list
+mod signing_keys_deserializer {
+    use serde::{Deserialize, Deserializer};
+    use std::collections::HashMap;
+
+    /// Deserialize signing_keys from a list of single-key maps
+    /// Example YAML:
+    /// ```yaml
+    /// signing_keys:
+    ///   - my-key: sha256-abc123
+    ///   - other-key: sha256-def456
+    /// ```
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<HashMap<String, String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let list = Option::<Vec<HashMap<String, String>>>::deserialize(deserializer)?;
+
+        Ok(list.map(|items| {
+            let mut result = HashMap::new();
+            for item in items {
+                for (key, value) in item {
+                    result.insert(key, value);
+                }
+            }
+            result
+        }))
+    }
 }
 
 /// Supported targets configuration - can be either "*" (all targets) or a list of specific targets
@@ -192,8 +224,10 @@ pub struct Config {
     pub runtime: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
     pub provision: Option<HashMap<String, ProvisionProfileConfig>>,
-    /// Signing keys referenced by this configuration
-    pub signing_keys: Option<Vec<SigningKeyRef>>,
+    /// Signing keys mapping friendly names to key IDs
+    /// Acts as a local bridge between the config and the global signing keys registry
+    #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
+    pub signing_keys: Option<HashMap<String, String>>,
 }
 
 impl Config {
@@ -707,19 +741,33 @@ impl Config {
             .unwrap_or(false) // Default to false (enable weak dependencies)
     }
 
-    /// Get signing keys referenced in this configuration
+    /// Get signing keys mapping (name -> keyid)
     #[allow(dead_code)] // Public API for future use
-    pub fn get_signing_keys(&self) -> Option<&Vec<SigningKeyRef>> {
+    pub fn get_signing_keys(&self) -> Option<&HashMap<String, String>> {
         self.signing_keys.as_ref()
     }
 
-    /// Get signing key names as a list of strings
+    /// Get signing key ID by name
+    #[allow(dead_code)] // Public API for future use
+    pub fn get_signing_key_id(&self, name: &str) -> Option<&String> {
+        self.signing_keys.as_ref()?.get(name)
+    }
+
+    /// Get all signing key names
     #[allow(dead_code)] // Public API for future use
     pub fn get_signing_key_names(&self) -> Vec<String> {
         self.signing_keys
             .as_ref()
-            .map(|keys| keys.iter().map(|k| k.key.clone()).collect())
+            .map(|keys| keys.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Get signing key for a specific runtime
+    #[allow(dead_code)] // Public API for future use
+    pub fn get_runtime_signing_key(&self, runtime_name: &str) -> Option<String> {
+        let runtime_config = self.runtime.as_ref()?.get(runtime_name)?;
+        let signing_key_name = &runtime_config.signing.as_ref()?.key;
+        self.get_signing_key_id(signing_key_name).cloned()
     }
 
     /// Get provision profile configuration
@@ -4551,8 +4599,13 @@ sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 
 signing_keys:
-  - key: my-production-key
-  - key: backup-key
+  - my-production-key: sha256-abc123def456
+  - backup-key: sha256-789012fedcba
+
+runtime:
+  dev:
+    signing:
+      key: my-production-key
 "#;
 
         let config = Config::load_from_yaml_str(config_content).unwrap();
@@ -4562,14 +4615,41 @@ signing_keys:
         assert!(signing_keys.is_some());
         let signing_keys = signing_keys.unwrap();
         assert_eq!(signing_keys.len(), 2);
-        assert_eq!(signing_keys[0].key, "my-production-key");
-        assert_eq!(signing_keys[1].key, "backup-key");
+        assert_eq!(
+            signing_keys.get("my-production-key"),
+            Some(&"sha256-abc123def456".to_string())
+        );
+        assert_eq!(
+            signing_keys.get("backup-key"),
+            Some(&"sha256-789012fedcba".to_string())
+        );
 
         // Test get_signing_key_names helper
         let key_names = config.get_signing_key_names();
         assert_eq!(key_names.len(), 2);
-        assert_eq!(key_names[0], "my-production-key");
-        assert_eq!(key_names[1], "backup-key");
+        assert!(key_names.contains(&"my-production-key".to_string()));
+        assert!(key_names.contains(&"backup-key".to_string()));
+
+        // Test get_signing_key_id helper
+        assert_eq!(
+            config.get_signing_key_id("my-production-key"),
+            Some(&"sha256-abc123def456".to_string())
+        );
+        assert_eq!(
+            config.get_signing_key_id("backup-key"),
+            Some(&"sha256-789012fedcba".to_string())
+        );
+        assert_eq!(config.get_signing_key_id("nonexistent"), None);
+
+        // Test runtime signing key reference
+        let runtime_key = config.get_runtime_signing_key("dev");
+        assert_eq!(runtime_key, Some("sha256-abc123def456".to_string()));
+
+        // Test runtime signing config
+        let runtime = config.runtime.as_ref().unwrap().get("dev").unwrap();
+        assert!(runtime.signing.is_some());
+        let signing = runtime.signing.as_ref().unwrap();
+        assert_eq!(signing.key, "my-production-key");
     }
 
     #[test]
