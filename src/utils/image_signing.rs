@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use blake3;
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use ed25519_compact::{SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -100,7 +100,7 @@ pub fn compute_file_hash(file_path: &Path, algorithm: &ChecksumAlgorithm) -> Res
 }
 
 /// Load a signing key from disk
-fn load_signing_key(keyid: &str) -> Result<SigningKey> {
+fn load_signing_key(keyid: &str) -> Result<SecretKey> {
     let key_file_path = super::signing_keys::get_key_file_path(keyid)?.with_extension("key");
 
     let private_key_b64 = fs::read_to_string(&key_file_path).with_context(|| {
@@ -121,7 +121,7 @@ fn load_signing_key(keyid: &str) -> Result<SigningKey> {
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&private_key_bytes);
 
-    Ok(SigningKey::from_bytes(&key_bytes))
+    SecretKey::from_slice(&key_bytes).context("Failed to create secret key from bytes")
 }
 
 /// Sign a file and save the signature
@@ -144,12 +144,15 @@ pub fn sign_file(
     })?;
 
     // Sign the hash
-    let signature: Signature = signing_key.sign(&hash);
+    let signature: Signature = signing_key.sign(&hash, None);
 
     // Create signature file content
     let sig_content = create_signature_content(
         &hash,
-        signature.to_bytes(),
+        signature
+            .as_ref()
+            .try_into()
+            .expect("signature should be 64 bytes"),
         checksum_algorithm,
         key_name,
         keyid,
@@ -310,8 +313,8 @@ pub fn sign_hash_manifest(
             )
         })?;
         Box::new(move |hash: &[u8]| {
-            let signature: Signature = signing_key.sign(hash);
-            Ok(signature.to_bytes().to_vec())
+            let signature: Signature = signing_key.sign(hash, None);
+            Ok(signature.as_ref().to_vec())
         })
     } else if is_pkcs11_uri(&entry.uri) {
         // PKCS#11 signing

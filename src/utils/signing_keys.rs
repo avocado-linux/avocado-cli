@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_compact::{KeyPair, PublicKey, SecretKey, Seed};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -131,26 +131,24 @@ pub fn get_key_file_path(keyid: &str) -> Result<PathBuf> {
 }
 
 /// Generate a key ID from a public key (SHA-256 hash, first 16 hex chars)
-pub fn generate_keyid(public_key: &VerifyingKey) -> String {
+pub fn generate_keyid(public_key: &PublicKey) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(public_key.as_bytes());
+    hasher.update(public_key.as_ref());
     let hash = hasher.finalize();
     format!("sha256-{}", hex::encode(&hash[..8]))
 }
 
 /// Generate a new ed25519 keypair
-pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
-    let mut rng = rand::thread_rng();
-    let signing_key = SigningKey::generate(&mut rng);
-    let verifying_key = signing_key.verifying_key();
-    (signing_key, verifying_key)
+pub fn generate_keypair() -> (SecretKey, PublicKey) {
+    let keypair = KeyPair::from_seed(Seed::default());
+    (keypair.sk, keypair.pk)
 }
 
 /// Save a keypair to disk
 pub fn save_keypair(
     keyid: &str,
-    signing_key: &SigningKey,
-    verifying_key: &VerifyingKey,
+    signing_key: &SecretKey,
+    verifying_key: &PublicKey,
 ) -> Result<PathBuf> {
     let keys_dir = get_signing_keys_dir()?;
     fs::create_dir_all(&keys_dir).with_context(|| {
@@ -165,7 +163,7 @@ pub fn save_keypair(
     let public_key_path = base_path.with_extension("pub");
 
     // Save private key (base64 encoded)
-    let private_key_b64 = BASE64_STANDARD.encode(signing_key.to_bytes());
+    let private_key_b64 = BASE64_STANDARD.encode(signing_key.as_ref());
     fs::write(&private_key_path, &private_key_b64).with_context(|| {
         format!(
             "Failed to write private key: {}",
@@ -187,7 +185,7 @@ pub fn save_keypair(
     }
 
     // Save public key (base64 encoded)
-    let public_key_b64 = BASE64_STANDARD.encode(verifying_key.as_bytes());
+    let public_key_b64 = BASE64_STANDARD.encode(verifying_key.as_ref());
     fs::write(&public_key_path, &public_key_b64)
         .with_context(|| format!("Failed to write public key: {}", public_key_path.display()))?;
 
