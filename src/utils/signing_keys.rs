@@ -163,7 +163,9 @@ pub fn save_keypair(
     let public_key_path = base_path.with_extension("pub");
 
     // Save private key (base64 encoded)
-    let private_key_b64 = BASE64_STANDARD.encode(signing_key.as_ref());
+    // Store the 32-byte seed, which can be used to reconstruct the key
+    let seed_bytes = signing_key.seed();
+    let private_key_b64 = BASE64_STANDARD.encode(seed_bytes.as_ref());
     fs::write(&private_key_path, &private_key_b64).with_context(|| {
         format!(
             "Failed to write private key: {}",
@@ -310,6 +312,25 @@ mod tests {
         let keyid = generate_keyid(&verifying_key);
         assert!(keyid.starts_with("sha256-"));
         assert_eq!(keyid.len(), 7 + 16); // "sha256-" + 16 hex chars
+    }
+
+    #[test]
+    fn test_key_serialization() {
+        // Test that we can save and load keys using the seed
+        let (sk, pk) = generate_keypair();
+        
+        // Serialize the seed (this is what we store on disk)
+        let seed = sk.seed();
+        let seed_bytes = seed.as_ref();
+        assert_eq!(seed_bytes.len(), 32, "Seed should be 32 bytes");
+        
+        // Reconstruct the key from the seed (this is what we do when loading)
+        let seed_reconstructed = Seed::from_slice(seed_bytes)
+            .expect("Should parse seed from bytes");
+        let keypair_reconstructed = KeyPair::from_seed(seed_reconstructed);
+        
+        // The reconstructed key should produce the same public key
+        assert_eq!(pk.as_ref(), keypair_reconstructed.pk.as_ref(), "Public keys should match");
     }
 
     #[test]

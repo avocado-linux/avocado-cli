@@ -101,6 +101,8 @@ pub fn compute_file_hash(file_path: &Path, algorithm: &ChecksumAlgorithm) -> Res
 
 /// Load a signing key from disk
 fn load_signing_key(keyid: &str) -> Result<SecretKey> {
+    use ed25519_compact::{KeyPair, Seed};
+    
     let key_file_path = super::signing_keys::get_key_file_path(keyid)?.with_extension("key");
 
     let private_key_b64 = fs::read_to_string(&key_file_path).with_context(|| {
@@ -115,13 +117,24 @@ fn load_signing_key(keyid: &str) -> Result<SecretKey> {
         .context("Failed to decode private key from base64")?;
 
     if private_key_bytes.len() != 32 {
-        anyhow::bail!("Invalid private key length");
+        anyhow::bail!(
+            "Invalid private key length: expected 32 bytes, got {}. The key may be corrupted.",
+            private_key_bytes.len()
+        );
     }
 
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&private_key_bytes);
-
-    SecretKey::from_slice(&key_bytes).context("Failed to create secret key from bytes")
+    // Load the seed (32 bytes) and create the keypair from it
+    // This works for both keys created with ed25519-dalek and ed25519-compact
+    // as both store the 32-byte seed
+    let seed = Seed::from_slice(&private_key_bytes).with_context(|| {
+        format!(
+            "Failed to parse seed bytes. The key file may be corrupted: {}",
+            key_file_path.display()
+        )
+    })?;
+    
+    let keypair = KeyPair::from_seed(seed);
+    Ok(keypair.sk)
 }
 
 /// Sign a file and save the signature
