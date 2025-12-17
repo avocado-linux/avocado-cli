@@ -1,5 +1,6 @@
 pub mod config;
 pub mod container;
+pub mod image_signing;
 pub mod interpolation;
 pub mod output;
 pub mod signing_keys;

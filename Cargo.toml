@@ -50,7 +50,9 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
+blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
+cryptoki = "0.6"
 
 [dev-dependencies]
 tokio-test = "0.4"

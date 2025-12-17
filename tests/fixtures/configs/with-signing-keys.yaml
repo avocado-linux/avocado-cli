@@ -13,3 +13,8 @@ runtime:
   dev:
     signing:
       key: my-production-key
+      checksum_algorithm: sha256
+  production:
+    signing:
+      key: backup-key
+      checksum_algorithm: blake3

@@ -234,6 +234,24 @@ impl SdkContainer {
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 
+        // Mount signing keys directory if it exists (read-only for security)
+        let signing_keys_env =
+            if let Ok(signing_keys_dir) = crate::utils::signing_keys::get_signing_keys_dir() {
+                if signing_keys_dir.exists() {
+                    container_cmd.push("-v".to_string());
+                    container_cmd.push(format!(
+                        "{}:/opt/signing-keys:ro",
+                        signing_keys_dir.display()
+                    ));
+                    // Return environment variable so container knows where keys are mounted
+                    Some("/opt/signing-keys".to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // Note: Working directory is handled in the entrypoint script based on sysroot parameters
 
         // Add environment variables
@@ -241,6 +259,12 @@ impl SdkContainer {
         container_cmd.push(format!("AVOCADO_TARGET={target}"));
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
+
+        // Add signing keys directory env var if mounted
+        if let Some(keys_dir) = signing_keys_env {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(format!("AVOCADO_SIGNING_KEYS_DIR={}", keys_dir));
+        }
 
         for (key, value) in env_vars {
             container_cmd.push("-e".to_string());
@@ -778,6 +802,171 @@ fi
         } else {
             result
         }
+    }
+
+    /// Write signature files to a Docker volume using docker cp
+    ///
+    /// This creates a temporary container, copies signature files into it,
+    /// then removes the container.
+    pub async fn write_signatures_to_volume(
+        &self,
+        volume_name: &str,
+        signatures: &[crate::utils::image_signing::SignatureData],
+    ) -> Result<()> {
+        if signatures.is_empty() {
+            return Ok(());
+        }
+
+        // Create temporary directory for signature files
+        let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+
+        // Write signature files to temp directory with flattened names
+        let mut file_mappings = Vec::new();
+        for (idx, sig) in signatures.iter().enumerate() {
+            let temp_file_name = format!("sig_{}.json", idx);
+            let temp_file_path = temp_dir.path().join(&temp_file_name);
+            std::fs::write(&temp_file_path, &sig.content).with_context(|| {
+                format!(
+                    "Failed to write signature file to temp: {}",
+                    temp_file_path.display()
+                )
+            })?;
+
+            file_mappings.push((temp_file_path, sig.container_path.clone()));
+        }
+
+        // Create a temporary container with the volume mounted
+        let container_name = format!("avocado-sig-writer-{}", uuid::Uuid::new_v4());
+        let volume_mount = format!("{}:/opt/_avocado:rw", volume_name);
+
+        let create_cmd = [
+            &self.container_tool,
+            &"create".to_string(),
+            &"--name".to_string(),
+            &container_name,
+            &"-v".to_string(),
+            &volume_mount,
+            &"alpine:latest".to_string(),
+            &"true".to_string(),
+        ];
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Creating temporary container for signature writing: {}",
+                    container_name
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        let mut cmd = AsyncCommand::new(create_cmd[0]);
+        cmd.args(&create_cmd[1..]);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .context("Failed to create temporary container")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to create temporary container: {}", stderr);
+        }
+
+        // Copy each signature file into the container
+        for (temp_path, container_path) in &file_mappings {
+            let temp_path_str = temp_path.display().to_string();
+            let container_dest = format!("{}:{}", container_name, container_path);
+
+            let cp_cmd = [
+                &self.container_tool,
+                &"cp".to_string(),
+                &temp_path_str,
+                &container_dest,
+            ];
+
+            if self.verbose {
+                print_info(
+                    &format!("Copying signature to {}", container_path),
+                    OutputLevel::Verbose,
+                );
+            }
+
+            let mut cmd = AsyncCommand::new(cp_cmd[0]);
+            cmd.args(&cp_cmd[1..]);
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+            let output = cmd.output().await.with_context(|| {
+                format!(
+                    "Failed to copy signature file to container: {}",
+                    container_path
+                )
+            })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                // Clean up container before returning error
+                let _ = self.remove_container(&container_name).await;
+
+                anyhow::bail!(
+                    "Failed to copy signature file {}: {}",
+                    container_path,
+                    stderr
+                );
+            }
+        }
+
+        // Remove the temporary container
+        self.remove_container(&container_name).await?;
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Successfully wrote {} signature file(s) to volume",
+                    signatures.len()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Remove a container by name
+    async fn remove_container(&self, container_name: &str) -> Result<()> {
+        let container_name_str = container_name.to_string();
+        let rm_cmd = [
+            &self.container_tool,
+            &"rm".to_string(),
+            &"-f".to_string(),
+            &container_name_str,
+        ];
+
+        let mut cmd = AsyncCommand::new(rm_cmd[0]);
+        cmd.args(&rm_cmd[1..]);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .context("Failed to remove temporary container")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if self.verbose {
+                print_error(
+                    &format!(
+                        "Warning: Failed to remove temporary container {}: {}",
+                        container_name, stderr
+                    ),
+                    OutputLevel::Verbose,
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 

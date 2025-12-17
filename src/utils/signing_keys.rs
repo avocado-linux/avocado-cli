@@ -104,7 +104,16 @@ pub fn get_avocado_config_dir() -> Result<PathBuf> {
 }
 
 /// Get the directory for storing signing keys
+///
+/// When running in a container, this checks the AVOCADO_SIGNING_KEYS_DIR environment variable
+/// which points to the mounted keys directory. Otherwise, it returns the host path.
 pub fn get_signing_keys_dir() -> Result<PathBuf> {
+    // Check if we're running in a container with mounted keys
+    if let Ok(container_keys_dir) = std::env::var("AVOCADO_SIGNING_KEYS_DIR") {
+        return Ok(PathBuf::from(container_keys_dir));
+    }
+
+    // Otherwise use the host path
     let config_dir = get_avocado_config_dir()?;
     Ok(config_dir.join(SIGNING_KEYS_DIR))
 }

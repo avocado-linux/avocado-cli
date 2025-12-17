@@ -21,21 +21,23 @@ signing_keys:
   - backup-key: sha256-111222333444
 
 runtime:
-  # Production runtime uses the production signing key
+  # Production runtime uses the production signing key with blake3
   production:
     dependencies:
       avocado-img-bootfiles: "*"
       avocado-img-rootfs: "*"
     signing:
       key: production-key
+      checksum_algorithm: blake3  # Use blake3 for faster checksums
   
-  # Staging runtime uses a different key
+  # Staging runtime uses a different key with sha256 (default)
   staging:
     dependencies:
       avocado-img-bootfiles: "*"
       avocado-img-rootfs: "*"
     signing:
       key: staging-key
+      # checksum_algorithm defaults to sha256 if not specified
   
   # Development runtime with no signing
   dev:

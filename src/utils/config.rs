@@ -129,6 +129,13 @@ pub enum ConfigError {
 pub struct SigningConfig {
     /// Name of the signing key to use (references a key from signing_keys section)
     pub key: String,
+    /// Checksum algorithm to use (sha256 or blake3, defaults to sha256)
+    #[serde(default = "default_checksum_algorithm")]
+    pub checksum_algorithm: String,
+}
+
+fn default_checksum_algorithm() -> String {
+    "sha256".to_string()
 }
 
 /// Runtime configuration section
@@ -4606,6 +4613,15 @@ runtime:
   dev:
     signing:
       key: my-production-key
+      checksum_algorithm: sha256
+  production:
+    signing:
+      key: backup-key
+      checksum_algorithm: blake3
+  staging:
+    signing:
+      key: my-production-key
+      # checksum_algorithm defaults to sha256
 "#;
 
         let config = Config::load_from_yaml_str(config_content).unwrap();
@@ -4650,6 +4666,21 @@ runtime:
         assert!(runtime.signing.is_some());
         let signing = runtime.signing.as_ref().unwrap();
         assert_eq!(signing.key, "my-production-key");
+        assert_eq!(signing.checksum_algorithm, "sha256");
+
+        // Test production runtime with blake3
+        let production = config.runtime.as_ref().unwrap().get("production").unwrap();
+        assert!(production.signing.is_some());
+        let prod_signing = production.signing.as_ref().unwrap();
+        assert_eq!(prod_signing.key, "backup-key");
+        assert_eq!(prod_signing.checksum_algorithm, "blake3");
+
+        // Test staging runtime with default checksum_algorithm
+        let staging = config.runtime.as_ref().unwrap().get("staging").unwrap();
+        assert!(staging.signing.is_some());
+        let staging_signing = staging.signing.as_ref().unwrap();
+        assert_eq!(staging_signing.key, "my-production-key");
+        assert_eq!(staging_signing.checksum_algorithm, "sha256"); // Default
     }
 
     #[test]
