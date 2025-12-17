@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 serde_yaml = "0.9"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
@@ -30,8 +30,8 @@ tokio = { version = "1.0", features = [
     "process",
     "io-util",
 ] }
-thiserror = "1.0"
-directories = "5.0.1"
+thiserror = "2.0"
+directories = "6.0"
 reqwest = { version = "0.12.7", default-features = false, features = [
     "json",
     "rustls-tls",
@@ -52,8 +52,8 @@ base64 = "0.22"
 sha2 = "0.10"
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
-cryptoki = "0.6"
+cryptoki = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
-serial_test = "2.0.0"
+serial_test = "3.0"
