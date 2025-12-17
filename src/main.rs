@@ -19,11 +19,13 @@ use commands::provision::ProvisionCommand;
 use commands::runtime::{
     RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDeployCommand, RuntimeDepsCommand,
     RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
+    RuntimeSignCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkRunCommand,
 };
+use commands::sign::SignCommand;
 use commands::signing_keys::{
     SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
 };
@@ -239,6 +241,27 @@ enum Commands {
     SigningKeys {
         #[command(subcommand)]
         command: SigningKeysCommands,
+    },
+    /// Sign runtime images (shortcut for 'runtime sign')
+    Sign {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Runtime name to sign (if not provided, signs all runtimes with signing config)
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
     },
 }
 
@@ -578,6 +601,27 @@ enum RuntimeCommands {
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
     },
+    /// Sign runtime images
+    Sign {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Runtime name to sign
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
 }
 
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
@@ -784,6 +828,25 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Sign {
+            config,
+            verbose,
+            runtime,
+            target,
+            container_args,
+            dnf_args,
+        } => {
+            let sign_cmd = SignCommand::new(
+                config,
+                verbose,
+                runtime,
+                target.or(cli.target),
+                container_args,
+                dnf_args,
+            );
+            sign_cmd.execute().await?;
+            Ok(())
+        }
         Commands::Runtime { command } => match command {
             RuntimeCommands::Install {
                 runtime,
@@ -928,6 +991,25 @@ async fn main() -> Result<()> {
                     dnf_args,
                 );
                 deploy_cmd.execute().await?;
+                Ok(())
+            }
+            RuntimeCommands::Sign {
+                config,
+                verbose,
+                runtime,
+                target,
+                container_args,
+                dnf_args,
+            } => {
+                let sign_cmd = RuntimeSignCommand::new(
+                    runtime,
+                    config,
+                    verbose,
+                    target.or(cli.target),
+                    container_args,
+                    dnf_args,
+                );
+                sign_cmd.execute().await?;
                 Ok(())
             }
         },
