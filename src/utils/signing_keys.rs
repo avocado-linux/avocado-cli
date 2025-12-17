@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Registry file name for storing key metadata
 const KEYS_REGISTRY_FILE: &str = "keys.json";
@@ -222,8 +222,68 @@ pub fn is_pkcs11_uri(uri: &str) -> bool {
 }
 
 /// Create a file:// URI from a path
-pub fn path_to_file_uri(path: &PathBuf) -> String {
+pub fn path_to_file_uri(path: &Path) -> String {
     format!("file://{}", path.display())
+}
+
+/// Validate that all signing key names exist in the global registry
+///
+/// Returns Ok(()) if all keys exist, or an error listing the missing keys
+#[allow(dead_code)] // Public API for future use
+pub fn validate_signing_keys(key_names: &[String]) -> Result<()> {
+    if key_names.is_empty() {
+        return Ok(());
+    }
+
+    let registry = KeysRegistry::load()?;
+    let missing: Vec<_> = key_names
+        .iter()
+        .filter(|name| !registry.keys.contains_key(*name))
+        .collect();
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "The following signing keys are referenced in the config but not found in the global registry: {}",
+            missing.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+/// Get key entries for a list of key names from the global registry
+///
+/// Returns the key entries for the specified keys, or an error if any are missing
+#[allow(dead_code)] // Public API for future use
+pub fn get_key_entries(key_names: &[String]) -> Result<Vec<(String, KeyEntry)>> {
+    if key_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let registry = KeysRegistry::load()?;
+    let mut entries = Vec::new();
+    let mut missing = Vec::new();
+
+    for name in key_names {
+        if let Some(entry) = registry.keys.get(name) {
+            entries.push((name.clone(), entry.clone()));
+        } else {
+            missing.push(name.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "The following signing keys are not found in the global registry: {}",
+            missing
+                .iter()
+                .map(|s| format!("'{}'", s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    Ok(entries)
 }
 
 // Add hex encoding since we need it for keyid generation

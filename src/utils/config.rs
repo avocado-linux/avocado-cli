@@ -167,6 +167,13 @@ pub struct DistroConfig {
     pub version: Option<String>,
 }
 
+/// Signing key reference in configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SigningKeyRef {
+    /// Name of the signing key (as registered in global signing keys)
+    pub key: String,
+}
+
 /// Supported targets configuration - can be either "*" (all targets) or a list of specific targets
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -185,6 +192,8 @@ pub struct Config {
     pub runtime: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
     pub provision: Option<HashMap<String, ProvisionProfileConfig>>,
+    /// Signing keys referenced by this configuration
+    pub signing_keys: Option<Vec<SigningKeyRef>>,
 }
 
 impl Config {
@@ -696,6 +705,21 @@ impl Config {
             .as_ref()
             .and_then(|sdk| sdk.disable_weak_dependencies)
             .unwrap_or(false) // Default to false (enable weak dependencies)
+    }
+
+    /// Get signing keys referenced in this configuration
+    #[allow(dead_code)] // Public API for future use
+    pub fn get_signing_keys(&self) -> Option<&Vec<SigningKeyRef>> {
+        self.signing_keys.as_ref()
+    }
+
+    /// Get signing key names as a list of strings
+    #[allow(dead_code)] // Public API for future use
+    pub fn get_signing_key_names(&self) -> Vec<String> {
+        self.signing_keys
+            .as_ref()
+            .map(|keys| keys.iter().map(|k| k.key.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Get provision profile configuration
@@ -4516,5 +4540,54 @@ sdk:
         assert_eq!(args[7], "BUILD_ENV=production");
         assert_eq!(args[8], "--name");
         assert_eq!(args[9], "my-container");
+    }
+
+    #[test]
+    fn test_signing_keys_parsing() {
+        let config_content = r#"
+default_target: qemux86-64
+
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+
+signing_keys:
+  - key: my-production-key
+  - key: backup-key
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+
+        // Test that signing_keys is parsed correctly
+        let signing_keys = config.get_signing_keys();
+        assert!(signing_keys.is_some());
+        let signing_keys = signing_keys.unwrap();
+        assert_eq!(signing_keys.len(), 2);
+        assert_eq!(signing_keys[0].key, "my-production-key");
+        assert_eq!(signing_keys[1].key, "backup-key");
+
+        // Test get_signing_key_names helper
+        let key_names = config.get_signing_key_names();
+        assert_eq!(key_names.len(), 2);
+        assert_eq!(key_names[0], "my-production-key");
+        assert_eq!(key_names[1], "backup-key");
+    }
+
+    #[test]
+    fn test_signing_keys_empty() {
+        let config_content = r#"
+default_target: qemux86-64
+
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+
+        // Test that signing_keys is None when not specified
+        assert!(config.get_signing_keys().is_none());
+
+        // Test get_signing_key_names returns empty vec when no keys
+        let key_names = config.get_signing_key_names();
+        assert!(key_names.is_empty());
     }
 }

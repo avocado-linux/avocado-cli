@@ -238,6 +238,7 @@ mod tests {
             runtime: None,
             sdk: None,
             provision: None,
+            signing_keys: None,
         }
     }
 
@@ -251,6 +252,7 @@ mod tests {
             runtime: None,
             sdk: None,
             provision: None,
+            signing_keys: None,
         }
     }
 
@@ -264,6 +266,7 @@ mod tests {
             runtime: None,
             sdk: None,
             provision: None,
+            signing_keys: None,
         }
     }
 
