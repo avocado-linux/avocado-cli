@@ -8,4 +8,5 @@ pub mod install;
 pub mod provision;
 pub mod runtime;
 pub mod sdk;
+pub mod signing_keys;
 pub mod upgrade;

@@ -24,6 +24,9 @@ use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkRunCommand,
 };
+use commands::signing_keys::{
+    SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
+};
 use commands::upgrade::UpgradeCommand;
 
 #[derive(Parser)]
@@ -230,6 +233,31 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+    /// Manage signing keys for extension and image signing
+    #[command(name = "signing-keys")]
+    SigningKeys {
+        #[command(subcommand)]
+        command: SigningKeysCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SigningKeysCommands {
+    /// Create a new signing key or register an external PKCS#11 key
+    Create {
+        /// Name for the key (defaults to key ID if not provided)
+        name: Option<String>,
+        /// PKCS#11 URI for hardware-backed keys (e.g., 'pkcs11:token=YubiKey;object=signing-key')
+        #[arg(long)]
+        uri: Option<String>,
+    },
+    /// List all registered signing keys
+    List,
+    /// Remove a signing key
+    Remove {
+        /// Name of the key to remove
+        name: String,
     },
 }
 
@@ -739,6 +767,23 @@ async fn main() -> Result<()> {
             deploy_cmd.execute().await?;
             Ok(())
         }
+        Commands::SigningKeys { command } => match command {
+            SigningKeysCommands::Create { name, uri } => {
+                let cmd = SigningKeysCreateCommand::new(name, uri);
+                cmd.execute()?;
+                Ok(())
+            }
+            SigningKeysCommands::List => {
+                let cmd = SigningKeysListCommand::new();
+                cmd.execute()?;
+                Ok(())
+            }
+            SigningKeysCommands::Remove { name } => {
+                let cmd = SigningKeysRemoveCommand::new(name);
+                cmd.execute()?;
+                Ok(())
+            }
+        },
         Commands::Runtime { command } => match command {
             RuntimeCommands::Install {
                 runtime,

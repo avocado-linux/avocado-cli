@@ -1,0 +1,280 @@
+//! Signing keys management utilities.
+//!
+//! Provides functionality for managing ed25519 signing keys in a global config location.
+//! Supports both file-based keys and PKCS#11 URIs for hardware security modules.
+
+use anyhow::{Context, Result};
+use base64::prelude::*;
+use chrono::{DateTime, Utc};
+use directories::ProjectDirs;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+
+/// Registry file name for storing key metadata
+const KEYS_REGISTRY_FILE: &str = "keys.json";
+
+/// Subdirectory name for signing keys within the avocado config
+const SIGNING_KEYS_DIR: &str = "signing-keys";
+
+/// Represents a single signing key entry in the registry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyEntry {
+    /// Unique key identifier (SHA-256 hash of public key)
+    pub keyid: String,
+    /// Cryptographic algorithm used (always "ed25519" for now)
+    pub algorithm: String,
+    /// Timestamp when the key was created/registered
+    pub created_at: DateTime<Utc>,
+    /// URI pointing to the key (file:// or pkcs11:)
+    pub uri: String,
+}
+
+/// Global signing keys registry
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KeysRegistry {
+    /// Map of key names to their metadata
+    pub keys: HashMap<String, KeyEntry>,
+}
+
+impl KeysRegistry {
+    /// Load the registry from disk, creating an empty one if it doesn't exist
+    pub fn load() -> Result<Self> {
+        let registry_path = get_registry_path()?;
+
+        if !registry_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let contents = fs::read_to_string(&registry_path).with_context(|| {
+            format!("Failed to read registry file: {}", registry_path.display())
+        })?;
+
+        serde_json::from_str(&contents)
+            .with_context(|| format!("Failed to parse registry file: {}", registry_path.display()))
+    }
+
+    /// Save the registry to disk
+    pub fn save(&self) -> Result<()> {
+        let registry_path = get_registry_path()?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = registry_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+
+        let contents =
+            serde_json::to_string_pretty(self).context("Failed to serialize registry")?;
+
+        fs::write(&registry_path, contents)
+            .with_context(|| format!("Failed to write registry file: {}", registry_path.display()))
+    }
+
+    /// Add a new key entry to the registry
+    pub fn add_key(&mut self, name: String, entry: KeyEntry) -> Result<()> {
+        if self.keys.contains_key(&name) {
+            anyhow::bail!("A key with name '{}' already exists", name);
+        }
+        self.keys.insert(name, entry);
+        Ok(())
+    }
+
+    /// Remove a key entry from the registry
+    pub fn remove_key(&mut self, name: &str) -> Result<KeyEntry> {
+        self.keys
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("No key found with name '{}'", name))
+    }
+
+    /// Get a key entry by name
+    pub fn get_key(&self, name: &str) -> Option<&KeyEntry> {
+        self.keys.get(name)
+    }
+}
+
+/// Get the base directory for avocado global config
+pub fn get_avocado_config_dir() -> Result<PathBuf> {
+    ProjectDirs::from("", "", "avocado")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory for your platform"))
+}
+
+/// Get the directory for storing signing keys
+pub fn get_signing_keys_dir() -> Result<PathBuf> {
+    let config_dir = get_avocado_config_dir()?;
+    Ok(config_dir.join(SIGNING_KEYS_DIR))
+}
+
+/// Get the path to the keys registry file
+pub fn get_registry_path() -> Result<PathBuf> {
+    let keys_dir = get_signing_keys_dir()?;
+    Ok(keys_dir.join(KEYS_REGISTRY_FILE))
+}
+
+/// Get the path for a key file (without extension)
+pub fn get_key_file_path(keyid: &str) -> Result<PathBuf> {
+    let keys_dir = get_signing_keys_dir()?;
+    Ok(keys_dir.join(keyid))
+}
+
+/// Generate a key ID from a public key (SHA-256 hash, first 16 hex chars)
+pub fn generate_keyid(public_key: &VerifyingKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(public_key.as_bytes());
+    let hash = hasher.finalize();
+    format!("sha256-{}", hex::encode(&hash[..8]))
+}
+
+/// Generate a new ed25519 keypair
+pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
+    let mut rng = rand::thread_rng();
+    let signing_key = SigningKey::generate(&mut rng);
+    let verifying_key = signing_key.verifying_key();
+    (signing_key, verifying_key)
+}
+
+/// Save a keypair to disk
+pub fn save_keypair(
+    keyid: &str,
+    signing_key: &SigningKey,
+    verifying_key: &VerifyingKey,
+) -> Result<PathBuf> {
+    let keys_dir = get_signing_keys_dir()?;
+    fs::create_dir_all(&keys_dir).with_context(|| {
+        format!(
+            "Failed to create signing keys directory: {}",
+            keys_dir.display()
+        )
+    })?;
+
+    let base_path = get_key_file_path(keyid)?;
+    let private_key_path = base_path.with_extension("key");
+    let public_key_path = base_path.with_extension("pub");
+
+    // Save private key (base64 encoded)
+    let private_key_b64 = BASE64_STANDARD.encode(signing_key.to_bytes());
+    fs::write(&private_key_path, &private_key_b64).with_context(|| {
+        format!(
+            "Failed to write private key: {}",
+            private_key_path.display()
+        )
+    })?;
+
+    // Set restrictive permissions on private key (Unix only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&private_key_path, permissions).with_context(|| {
+            format!(
+                "Failed to set permissions on private key: {}",
+                private_key_path.display()
+            )
+        })?;
+    }
+
+    // Save public key (base64 encoded)
+    let public_key_b64 = BASE64_STANDARD.encode(verifying_key.as_bytes());
+    fs::write(&public_key_path, &public_key_b64)
+        .with_context(|| format!("Failed to write public key: {}", public_key_path.display()))?;
+
+    Ok(base_path)
+}
+
+/// Delete key files from disk
+pub fn delete_key_files(keyid: &str) -> Result<()> {
+    let base_path = get_key_file_path(keyid)?;
+    let private_key_path = base_path.with_extension("key");
+    let public_key_path = base_path.with_extension("pub");
+
+    // Remove private key if it exists
+    if private_key_path.exists() {
+        fs::remove_file(&private_key_path).with_context(|| {
+            format!(
+                "Failed to delete private key: {}",
+                private_key_path.display()
+            )
+        })?;
+    }
+
+    // Remove public key if it exists
+    if public_key_path.exists() {
+        fs::remove_file(&public_key_path).with_context(|| {
+            format!("Failed to delete public key: {}", public_key_path.display())
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Check if a URI is a file:// URI
+pub fn is_file_uri(uri: &str) -> bool {
+    uri.starts_with("file://")
+}
+
+/// Check if a URI is a pkcs11: URI
+pub fn is_pkcs11_uri(uri: &str) -> bool {
+    uri.starts_with("pkcs11:")
+}
+
+/// Create a file:// URI from a path
+pub fn path_to_file_uri(path: &PathBuf) -> String {
+    format!("file://{}", path.display())
+}
+
+// Add hex encoding since we need it for keyid generation
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_keyid() {
+        let (_, verifying_key) = generate_keypair();
+        let keyid = generate_keyid(&verifying_key);
+        assert!(keyid.starts_with("sha256-"));
+        assert_eq!(keyid.len(), 7 + 16); // "sha256-" + 16 hex chars
+    }
+
+    #[test]
+    fn test_is_file_uri() {
+        assert!(is_file_uri("file:///path/to/key"));
+        assert!(!is_file_uri("pkcs11:token=YubiKey"));
+        assert!(!is_file_uri("/path/to/key"));
+    }
+
+    #[test]
+    fn test_is_pkcs11_uri() {
+        assert!(is_pkcs11_uri("pkcs11:token=YubiKey"));
+        assert!(!is_pkcs11_uri("file:///path/to/key"));
+        assert!(!is_pkcs11_uri("/path/to/key"));
+    }
+
+    #[test]
+    fn test_registry_serialization() {
+        let mut registry = KeysRegistry::default();
+        registry.keys.insert(
+            "test-key".to_string(),
+            KeyEntry {
+                keyid: "sha256-abcd1234abcd1234".to_string(),
+                algorithm: "ed25519".to_string(),
+                created_at: Utc::now(),
+                uri: "file:///path/to/key".to_string(),
+            },
+        );
+
+        let json = serde_json::to_string(&registry).unwrap();
+        let parsed: KeysRegistry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.keys.len(), 1);
+        assert!(parsed.keys.contains_key("test-key"));
+    }
+}

@@ -2,5 +2,6 @@ pub mod config;
 pub mod container;
 pub mod interpolation;
 pub mod output;
+pub mod signing_keys;
 pub mod target;
 pub mod volume;
