@@ -9,7 +9,6 @@ pub mod provision;
 pub mod sign;
 
 pub use build::RuntimeBuildCommand;
-pub use sign::RuntimeSignCommand;
 #[allow(unused_imports)]
 pub use clean::RuntimeCleanCommand;
 #[allow(unused_imports)]
@@ -22,3 +21,4 @@ pub use install::RuntimeInstallCommand;
 #[allow(unused_imports)]
 pub use list::RuntimeListCommand;
 pub use provision::RuntimeProvisionCommand;
+pub use sign::RuntimeSignCommand;

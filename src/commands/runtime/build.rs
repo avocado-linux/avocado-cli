@@ -192,6 +192,9 @@ impl RuntimeBuildCommand {
         let all_required_extensions =
             self.find_all_extension_dependencies(&config, &required_extensions, target_arch)?;
 
+        // Build copy commands for required extensions
+        let mut copy_commands = Vec::new();
+
         // Build extension symlink commands from config
         let mut symlink_commands = Vec::new();
         let mut processed_extensions = HashSet::new();
@@ -208,14 +211,25 @@ impl RuntimeBuildCommand {
                             .and_then(|v| v.as_str())
                             .unwrap_or("0.1.0");
 
+                        // Add copy command for this extension
+                        copy_commands.push(format!(
+                            r#"
+# Copy {ext_name}-{ext_version}.raw from output/extensions to runtime-specific directory
+if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw" ]; then
+    cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.raw"
+    echo "  Copied: {ext_name}-{ext_version}.raw"
+fi"#
+                        ));
+
                         symlink_commands.push(format!(
                             r#"
-OUTPUT_EXT=$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw
+# Link from runtime-specific extensions directory
+RUNTIME_EXT=$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.raw
 RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}-{ext_version}.raw
 
-if [ -f "$OUTPUT_EXT" ]; then
-    if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
-        ln -f $OUTPUT_EXT $RUNTIMES_EXT
+if [ -f "$RUNTIME_EXT" ]; then
+    if ! cmp -s "$RUNTIME_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
+        ln -f $RUNTIME_EXT $RUNTIMES_EXT
     fi
 else
     echo "Missing image for extension {ext_name}-{ext_version}."
@@ -231,15 +245,28 @@ fi"#
         for ext_name in &all_required_extensions {
             if !processed_extensions.contains(ext_name) {
                 // This is an external extension - use wildcard to find versioned file
+
+                // Add copy command for external extension
+                copy_commands.push(format!(
+                    r#"
+# Copy external extension {ext_name} with any version
+EXT_FILE=$(ls "$AVOCADO_PREFIX/output/extensions/{ext_name}"-*.raw 2>/dev/null | head -n 1)
+if [ -n "$EXT_FILE" ]; then
+    EXT_BASENAME=$(basename "$EXT_FILE")
+    cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
+    echo "  Copied: $EXT_BASENAME"
+fi"#
+                ));
+
                 symlink_commands.push(format!(
                     r#"
-# Find external extension {ext_name} with any version
-OUTPUT_EXT=$(ls $AVOCADO_PREFIX/output/extensions/{ext_name}-*.raw 2>/dev/null | head -n 1)
-if [ -n "$OUTPUT_EXT" ]; then
-    EXT_FILENAME=$(basename "$OUTPUT_EXT")
+# Find external extension {ext_name} with any version from runtime-specific directory
+RUNTIME_EXT=$(ls $RUNTIME_EXT_DIR/{ext_name}-*.raw 2>/dev/null | head -n 1)
+if [ -n "$RUNTIME_EXT" ]; then
+    EXT_FILENAME=$(basename "$RUNTIME_EXT")
     RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/$EXT_FILENAME
-    if ! cmp -s "$OUTPUT_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
-        ln -f "$OUTPUT_EXT" "$RUNTIMES_EXT"
+    if ! cmp -s "$RUNTIME_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
+        ln -f "$RUNTIME_EXT" "$RUNTIMES_EXT"
     fi
 else
     echo "Missing image for external extension {ext_name}."
@@ -247,6 +274,12 @@ fi"#
                 ));
             }
         }
+
+        let copy_section = if copy_commands.is_empty() {
+            "# No extensions to copy".to_string()
+        } else {
+            copy_commands.join("\n")
+        };
 
         let symlink_section = if symlink_commands.is_empty() {
             "# No extensions configured for symlinking".to_string()
@@ -281,6 +314,14 @@ mkdir -p "$VAR_DIR/lib/avocado/os-releases/$VERSION_ID"
 OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
 
+# Create runtime-specific extensions directory
+RUNTIME_EXT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/extensions"
+mkdir -p "$RUNTIME_EXT_DIR"
+
+# Copy required extension images from global output/extensions to runtime-specific location
+echo "Copying required extension images to runtime-specific directory..."
+{}
+
 {}
 
 # Create symlinks in os-releases/<VERSION_ID> pointing to enabled extensions
@@ -306,7 +347,7 @@ mkfs.btrfs -r "$VAR_DIR" \
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
 avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
-            self.runtime_name, target_arch, symlink_section
+            self.runtime_name, target_arch, copy_section, symlink_section
         );
 
         Ok(script)
@@ -577,8 +618,9 @@ ext:
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
         assert!(script.contains("test-ext-1.0.0.raw"));
-        // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
-        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext-1.0.0.raw"));
+        // Extension should be copied from output/extensions to runtime-specific extensions directory
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
+        assert!(script.contains("$RUNTIME_EXT_DIR/test-ext-1.0.0.raw"));
         assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext-1.0.0.raw"));
     }
 
@@ -618,8 +660,9 @@ ext:
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
-        // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
-        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext-1.0.0.raw"));
+        // Extension should be copied from output/extensions to runtime-specific directory
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
+        assert!(script.contains("$RUNTIME_EXT_DIR/test-ext-1.0.0.raw"));
         assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext-1.0.0.raw"));
         // Should NOT include symlinks to systemd directories (runtime will handle this)
         assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $SYSEXT"));
@@ -659,8 +702,9 @@ ext:
 
         let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
 
-        // Extension should be copied to avocado extensions directory but not symlinked to systemd directories
-        assert!(script.contains("$AVOCADO_PREFIX/output/extensions/test-ext-1.0.0.raw"));
+        // Extension should be copied from output/extensions to runtime-specific directory
+        assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
+        assert!(script.contains("$RUNTIME_EXT_DIR/test-ext-1.0.0.raw"));
         assert!(script.contains("$VAR_DIR/lib/avocado/extensions/test-ext-1.0.0.raw"));
         // Should NOT include symlinks to systemd directories (runtime will handle this)
         assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $SYSEXT"));

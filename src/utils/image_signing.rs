@@ -204,8 +204,11 @@ pub fn sign_runtime_images(
 ) -> Result<Vec<String>> {
     let mut signed_files = Vec::new();
 
-    // Sign extension images in output/extensions/
-    let ext_dir = avocado_prefix.join("output/extensions");
+    // Sign extension images in runtime-specific extensions directory
+    let ext_dir = avocado_prefix
+        .join("runtimes")
+        .join(runtime_name)
+        .join("extensions");
     if ext_dir.exists() {
         for entry in fs::read_dir(&ext_dir).with_context(|| {
             format!("Failed to read extensions directory: {}", ext_dir.display())

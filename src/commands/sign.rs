@@ -69,10 +69,7 @@ impl SignCommand {
     /// Sign a single runtime
     async fn sign_single_runtime(&self, runtime_name: &str, target: &str) -> Result<()> {
         print_info(
-            &format!(
-                "Signing runtime '{}' for target '{}'",
-                runtime_name, target
-            ),
+            &format!("Signing runtime '{}' for target '{}'", runtime_name, target),
             OutputLevel::Normal,
         );
 
@@ -85,9 +82,10 @@ impl SignCommand {
             self.dnf_args.clone(),
         );
 
-        sign_cmd.execute().await.with_context(|| {
-            format!("Failed to sign runtime '{}'", runtime_name)
-        })?;
+        sign_cmd
+            .execute()
+            .await
+            .with_context(|| format!("Failed to sign runtime '{}'", runtime_name))?;
 
         Ok(())
     }
@@ -167,9 +165,10 @@ impl SignCommand {
                 self.dnf_args.clone(),
             );
 
-            sign_cmd.execute().await.with_context(|| {
-                format!("Failed to sign runtime '{}'", runtime_name)
-            })?;
+            sign_cmd
+                .execute()
+                .await
+                .with_context(|| format!("Failed to sign runtime '{}'", runtime_name))?;
         }
 
         print_success(
@@ -205,14 +204,7 @@ mod tests {
 
     #[test]
     fn test_new_all_runtimes() {
-        let cmd = SignCommand::new(
-            "config.toml".to_string(),
-            false,
-            None,
-            None,
-            None,
-            None,
-        );
+        let cmd = SignCommand::new("config.toml".to_string(), false, None, None, None, None);
 
         assert_eq!(cmd.config_path, "config.toml");
         assert!(!cmd.verbose);

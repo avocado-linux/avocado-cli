@@ -362,8 +362,8 @@ impl RuntimeSignCommand {
         if manifest.files.is_empty() {
             print_warning(
                 &format!(
-                    "No image files found to sign. Searched in: {}/output/extensions",
-                    target_arch
+                    "No image files found to sign. Searched in: {}/runtimes/{}/extensions",
+                    target_arch, self.runtime_name
                 ),
                 OutputLevel::Normal,
             );
@@ -453,21 +453,23 @@ impl RuntimeSignCommand {
 set -e
 cd /opt/_avocado/{target}
 
-echo "=== Generating checksums for extension images only ==="
+echo "=== Generating checksums for extension images in runtime-specific directory ==="
 
-# Generate checksums ONLY for required extension .raw images
-if [ -d output/extensions ]; then
-    echo "Checking output/extensions"
-    cd output/extensions
+# Generate checksums ONLY for required extension .raw images in runtime-specific directory
+RUNTIME_EXT_DIR="runtimes/{runtime}/extensions"
+if [ -d "$RUNTIME_EXT_DIR" ]; then
+    echo "Checking $RUNTIME_EXT_DIR"
+    cd "$RUNTIME_EXT_DIR"
     {pattern_checks}
     cd /opt/_avocado/{target}
 else
-    echo "  output/extensions directory not found"
+    echo "  Runtime extensions directory not found: $RUNTIME_EXT_DIR"
 fi
 
 echo "=== Checksum generation complete ==="
 "#,
             target = target_arch,
+            runtime = self.runtime_name,
             pattern_checks = pattern_checks
         );
 
@@ -571,10 +573,10 @@ echo "=== Checksum generation complete ==="
         // Extract checksum files using docker cp
         let mut entries = Vec::new();
 
-        // Copy checksum files ONLY from extensions directory
-        let extensions_dir = format!("{}/output/extensions", target_arch);
+        // Copy checksum files from runtime-specific extensions directory
+        let extensions_dir = format!("{}/runtimes/{}/extensions", target_arch, self.runtime_name);
 
-        let search_dirs = vec![(extensions_dir.as_str(), "output/extensions")];
+        let search_dirs = vec![(extensions_dir.as_str(), "runtimes/extensions")];
 
         for (source_dir, _) in &search_dirs {
             print_info(
@@ -619,7 +621,7 @@ echo "=== Checksum generation complete ==="
         );
 
         // Docker cp copies just the final directory, not the full path
-        // So /opt/_avocado/qemuarm64/output/extensions becomes temp_dir/extensions
+        // So /opt/_avocado/qemuarm64/runtimes/<runtime>/extensions becomes temp_dir/extensions
         let dir_mapping = vec![(extensions_dir.as_str(), "extensions")];
 
         for (source_dir, dir_name) in &dir_mapping {
@@ -646,10 +648,10 @@ echo "=== Checksum generation complete ==="
                         let image_name = path.file_stem().unwrap().to_str().unwrap();
                         let size = 0; // Size not needed for signing
 
-                        // All checksums are from extensions directory
+                        // All checksums are from runtime-specific extensions directory
                         let container_path = format!(
-                            "/opt/_avocado/{}/output/extensions/{}",
-                            target_arch, image_name
+                            "/opt/_avocado/{}/runtimes/{}/extensions/{}",
+                            target_arch, self.runtime_name, image_name
                         );
 
                         print_info(

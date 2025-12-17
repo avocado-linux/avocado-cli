@@ -172,7 +172,7 @@ The signing process is split into three distinct passes to support both file-bas
 │ 2. Computes checksums ONLY for required extension .raw files│
 │    using sha256sum or b3sum                                │
 │ 3. Saves checksums as .sha256 or .blake3 files next to     │
-│    each image in output/extensions/                        │
+│    each image in runtimes/<runtime_name>/extensions/       │
 └─────────────────────────────────────────────────────────────┘
                            ↓ (checksum files)
 ┌─────────────────────────────────────────────────────────────┐
@@ -220,7 +220,7 @@ This architecture solves a key challenge: **Docker volumes are not directly acce
 
 1. **Checksum Generation**: 
    - Uses standard container utilities (`sha256sum` or `b3sum`)
-   - Only checksums `.raw` files in `output/extensions/` directory
+   - Only checksums `.raw` files in `runtimes/<runtime_name>/extensions/` directory
    - Only checksums extensions that are dependencies of the runtime being built
    - Skips files that already have checksum files to avoid recursive checksumming
    - Saves checksums as `.sha256` or `.blake3` files next to each image
@@ -237,7 +237,7 @@ This architecture solves a key challenge: **Docker volumes are not directly acce
   "checksum_algorithm": "blake3",
   "files": [
     {
-      "container_path": "/opt/_avocado/qemuarm64/output/extensions/bootfiles.raw",
+      "container_path": "/opt/_avocado/qemuarm64/runtimes/production/extensions/bootfiles.raw",
       "hash": "abc123...",
       "size": 1048576
     }
@@ -269,11 +269,14 @@ Signature files are JSON format containing:
 ### Signed Files
 
 The following files are signed during runtime builds:
-- **Extension images only**: `$AVOCADO_PREFIX/<target>/output/extensions/*.raw`
+- **Extension images only**: `$AVOCADO_PREFIX/<target>/runtimes/<runtime_name>/extensions/*.raw`
   - Only extensions that are dependencies of the runtime being built are signed
   - Each extension's `.raw` image file gets a corresponding `.sig` signature file
+  - Extensions are copied from `output/extensions/` to the runtime-specific directory during build
 
-Where `<target>` is the target architecture (e.g., `qemuarm64`, `x86_64-unknown-linux-gnu`).
+Where:
+- `<target>` is the target architecture (e.g., `qemuarm64`, `x86_64-unknown-linux-gnu`)
+- `<runtime_name>` is the name of the runtime being built (e.g., `production`, `staging`)
 
 **Note**: Currently, only extension `.raw` images are signed. Stone-generated runtime images and var images are not signed in this version.
 
