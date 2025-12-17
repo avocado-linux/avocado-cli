@@ -191,6 +191,7 @@ $DNF_SDK_HOST \
                         r#"
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot {} \
     --setopt=install_weak_deps=0 \
     --nodocs \

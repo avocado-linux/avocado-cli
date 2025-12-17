@@ -199,6 +199,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot=$AVOCADO_EXT_SYSROOTS/{extension} \
     {dnf_args_str} \
     makecache
@@ -300,6 +301,7 @@ $DNF_SDK_HOST \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot={installroot_path} \
     {dnf_args_str} \
     makecache
@@ -513,6 +515,7 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot=$AVOCADO_PREFIX/rootfs \
     {dnf_args_str} \
     makecache
@@ -591,6 +594,7 @@ $DNF_SDK_HOST \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot=$AVOCADO_SDK_PREFIX/target-sysroot \
     {dnf_args_str} \
     makecache
@@ -881,6 +885,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot=$AVOCADO_EXT_SYSROOTS/{ext_name} \
     {dnf_args_str} \
     makecache

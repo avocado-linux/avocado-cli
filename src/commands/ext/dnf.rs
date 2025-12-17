@@ -324,6 +324,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
     --installroot={installroot} \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {dnf_args_str} \
