@@ -23,9 +23,13 @@ pub struct SignRequest {
     /// Type identifier for the request
     #[serde(rename = "type")]
     pub request_type: String,
-    /// Path to the binary inside the container volume
+    /// Path to the binary inside the container (for reference in signature file)
     pub binary_path: String,
-    /// Checksum algorithm to use (sha256 or blake3)
+    /// Hex-encoded hash computed by the container
+    pub hash: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Checksum algorithm used (sha256 or blake3)
     pub checksum_algorithm: String,
 }
 
@@ -37,10 +41,8 @@ pub struct SignResponse {
     pub response_type: String,
     /// Whether the signing was successful
     pub success: bool,
-    /// Path to the signature file in the container
-    pub signature_path: Option<String>,
-    /// Content of the signature file (JSON)
-    pub signature_content: Option<String>,
+    /// The signature content (JSON format) - container writes this to .sig file
+    pub signature: Option<String>,
     /// Error message if signing failed
     pub error: Option<String>,
 }
@@ -58,8 +60,6 @@ pub struct SigningServiceConfig {
     pub key_name: String,
     /// Signing key ID
     pub keyid: String,
-    /// Volume name for reading/writing files
-    pub volume_name: String,
     /// Enable verbose logging
     pub verbose: bool,
 }
@@ -225,8 +225,8 @@ async fn handle_connection(stream: UnixStream, config: SigningServiceConfig) -> 
         );
     }
 
-    // Process the signing request
-    let response = process_signing_request(request, &config).await;
+    // Process the signing request (synchronous - just signs the pre-computed hash)
+    let response = process_signing_request(request, &config);
 
     // Send response back to container
     let response_json =
@@ -263,38 +263,53 @@ async fn handle_connection(stream: UnixStream, config: SigningServiceConfig) -> 
 }
 
 /// Process a signing request and generate a response
-async fn process_signing_request(
-    request: SignRequest,
-    config: &SigningServiceConfig,
-) -> SignResponse {
-    // Use the signing request handler to process the request
-    let request_config = crate::utils::signing_request_handler::SigningRequestConfig {
-        binary_path: &request.binary_path,
-        checksum_algorithm: &request.checksum_algorithm,
-        runtime_name: &config.runtime_name,
-        target_arch: &config.target_arch,
-        key_name: &config.key_name,
-        keyid: &config.keyid,
-        volume_name: &config.volume_name,
-        verbose: config.verbose,
-    };
-
-    match crate::utils::signing_request_handler::handle_signing_request(request_config).await {
-        Ok((sig_path, sig_content)) => SignResponse {
+///
+/// The container has already computed the hash - we just need to sign it.
+/// This is fast since there's no file I/O involved.
+fn process_signing_request(request: SignRequest, config: &SigningServiceConfig) -> SignResponse {
+    match sign_hash_from_request(&request, config) {
+        Ok(signature_content) => SignResponse {
             response_type: "sign_response".to_string(),
             success: true,
-            signature_path: Some(sig_path),
-            signature_content: Some(sig_content),
+            signature: Some(signature_content),
             error: None,
         },
         Err(e) => SignResponse {
             response_type: "sign_response".to_string(),
             success: false,
-            signature_path: None,
-            signature_content: None,
+            signature: None,
             error: Some(format!("{:#}", e)),
         },
     }
+}
+
+/// Sign a hash provided in the request
+fn sign_hash_from_request(
+    request: &SignRequest,
+    config: &SigningServiceConfig,
+) -> anyhow::Result<String> {
+    use crate::utils::image_signing::{sign_hash_manifest, HashManifest, HashManifestEntry};
+
+    // Create a manifest with the pre-computed hash from the container
+    let manifest = HashManifest {
+        runtime: config.runtime_name.clone(),
+        checksum_algorithm: request.checksum_algorithm.clone(),
+        files: vec![HashManifestEntry {
+            container_path: request.binary_path.clone(),
+            hash: request.hash.clone(),
+            size: request.size,
+        }],
+    };
+
+    // Sign the hash - this is fast, no file I/O needed
+    let signatures = sign_hash_manifest(&manifest, &config.key_name, &config.keyid)
+        .context("Failed to sign hash")?;
+
+    if signatures.is_empty() {
+        anyhow::bail!("No signature generated");
+    }
+
+    Ok(signatures[0].content.clone())
 }
 
 /// Generate the helper script for containers to request signing
@@ -303,8 +318,18 @@ pub fn generate_helper_script() -> String {
 # avocado-sign-request - Request binary signing from host CLI
 # This script is injected into containers during provisioning to enable
 # inline binary signing without breaking script execution flow.
+#
+# The script computes the hash locally in the container, sends only the hash
+# to the host for signing, and writes the signature file locally.
+# This avoids expensive file transfers between container and host.
 
 set -e
+
+# Configuration
+MAX_RETRIES=3
+RETRY_DELAY=1
+# Timeout for waiting on response (signing is fast since we only send the hash)
+SOCKET_TIMEOUT=30
 
 # Check if signing socket is available
 if [ ! -S "/run/avocado/sign.sock" ]; then
@@ -332,26 +357,98 @@ BINARY_PATH=$(realpath "$BINARY_PATH")
 # Determine checksum algorithm from environment or default to sha256
 CHECKSUM_ALGO="${AVOCADO_SIGNING_CHECKSUM:-sha256}"
 
-# Build JSON request
-REQUEST=$(cat <<EOF
-{"type":"sign_request","binary_path":"$BINARY_PATH","checksum_algorithm":"$CHECKSUM_ALGO"}
-EOF
-)
-
-# Send request to signing service via Unix socket
-# Using nc (netcat) or socat for socket communication
-if command -v socat &> /dev/null; then
-    RESPONSE=$(echo "$REQUEST" | socat - UNIX-CONNECT:/run/avocado/sign.sock 2>/dev/null)
-elif command -v nc &> /dev/null; then
-    RESPONSE=$(echo "$REQUEST" | nc -U /run/avocado/sign.sock 2>/dev/null)
-else
-    echo "Error: Neither socat nor nc available for socket communication" >&2
-    exit 2
+# Get file size
+FILE_SIZE=$(stat -c%s "$BINARY_PATH" 2>/dev/null || stat -f%z "$BINARY_PATH" 2>/dev/null)
+if [ -z "$FILE_SIZE" ]; then
+    echo "Error: Could not determine file size" >&2
+    exit 1
 fi
 
-# Check if response is empty
+# Compute hash locally in the container
+echo "Computing $CHECKSUM_ALGO hash of: $BINARY_PATH" >&2
+case "$CHECKSUM_ALGO" in
+    sha256)
+        if command -v sha256sum &> /dev/null; then
+            HASH=$(sha256sum "$BINARY_PATH" | cut -d' ' -f1)
+        elif command -v shasum &> /dev/null; then
+            HASH=$(shasum -a 256 "$BINARY_PATH" | cut -d' ' -f1)
+        else
+            echo "Error: No sha256 tool available (sha256sum or shasum)" >&2
+            exit 2
+        fi
+        ;;
+    blake3)
+        if command -v b3sum &> /dev/null; then
+            HASH=$(b3sum "$BINARY_PATH" | cut -d' ' -f1)
+        else
+            echo "Error: b3sum not available for blake3 hashing" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "Error: Unsupported checksum algorithm: $CHECKSUM_ALGO" >&2
+        exit 1
+        ;;
+esac
+
+if [ -z "$HASH" ]; then
+    echo "Error: Failed to compute hash" >&2
+    exit 1
+fi
+
+# Build JSON request with the pre-computed hash
+# Using printf to avoid issues with JSON escaping
+REQUEST=$(printf '{"type":"sign_request","binary_path":"%s","hash":"%s","size":%s,"checksum_algorithm":"%s"}' \
+    "$BINARY_PATH" "$HASH" "$FILE_SIZE" "$CHECKSUM_ALGO")
+
+# Function to send request and get response
+send_signing_request() {
+    local response=""
+    
+    # Send request to signing service via Unix socket
+    # The -t option for socat sets the timeout for half-close situations
+    if command -v socat &> /dev/null; then
+        response=$(echo "$REQUEST" | socat -t${SOCKET_TIMEOUT} -T${SOCKET_TIMEOUT} - UNIX-CONNECT:/run/avocado/sign.sock 2>/dev/null) || true
+    elif command -v nc &> /dev/null; then
+        # Try with -q option first (GNU netcat), fall back to -w only
+        if nc -h 2>&1 | grep -q '\-q'; then
+            response=$(echo "$REQUEST" | nc -w ${SOCKET_TIMEOUT} -q ${SOCKET_TIMEOUT} -U /run/avocado/sign.sock 2>/dev/null) || true
+        else
+            response=$(echo "$REQUEST" | nc -w ${SOCKET_TIMEOUT} -U /run/avocado/sign.sock 2>/dev/null) || true
+        fi
+    else
+        echo "Error: Neither socat nor nc available for socket communication" >&2
+        exit 2
+    fi
+    
+    echo "$response"
+}
+
+# Retry loop with exponential backoff
+RESPONSE=""
+ATTEMPT=1
+while [ $ATTEMPT -le $MAX_RETRIES ]; do
+    if [ $ATTEMPT -gt 1 ]; then
+        echo "Retry attempt $ATTEMPT of $MAX_RETRIES..." >&2
+        sleep $RETRY_DELAY
+        RETRY_DELAY=$((RETRY_DELAY * 2))
+    fi
+    
+    RESPONSE=$(send_signing_request)
+    
+    # Check if we got a valid response
+    if [ -n "$RESPONSE" ]; then
+        if echo "$RESPONSE" | grep -q '"success"'; then
+            break
+        fi
+    fi
+    
+    ATTEMPT=$((ATTEMPT + 1))
+done
+
+# Check if response is empty after all retries
 if [ -z "$RESPONSE" ]; then
-    echo "Error: No response from signing service" >&2
+    echo "Error: No response from signing service after $MAX_RETRIES attempts" >&2
     exit 1
 fi
 
@@ -359,6 +456,37 @@ fi
 SUCCESS=$(echo "$RESPONSE" | grep -o '"success":[^,}]*' | cut -d: -f2 | tr -d ' ')
 
 if [ "$SUCCESS" = "true" ]; then
+    # Extract signature content from response and write to .sig file
+    # The signature field contains the JSON signature content
+    SIG_PATH="${BINARY_PATH}.sig"
+    
+    # Extract the signature JSON from the response
+    # The signature is a JSON object embedded in the response
+    # We use a simple extraction since we control both ends
+    SIGNATURE=$(echo "$RESPONSE" | sed -n 's/.*"signature":"\([^"]*\)".*/\1/p' | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g')
+    
+    if [ -z "$SIGNATURE" ]; then
+        # Try alternate extraction for pretty-printed JSON
+        # Extract everything between "signature":" and the next unescaped "
+        SIGNATURE=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if 'signature' in data and data['signature']:
+        print(data['signature'])
+except:
+    pass
+" 2>/dev/null) || true
+    fi
+    
+    if [ -z "$SIGNATURE" ]; then
+        echo "Error: Could not extract signature from response" >&2
+        exit 1
+    fi
+    
+    # Write the signature file
+    echo "$SIGNATURE" > "$SIG_PATH"
+    
     echo "Successfully signed: $BINARY_PATH" >&2
     exit 0
 else
@@ -379,12 +507,16 @@ mod tests {
         let request = SignRequest {
             request_type: "sign_request".to_string(),
             binary_path: "/opt/_avocado/x86_64/runtimes/test/binary".to_string(),
+            hash: "abcd1234".to_string(),
+            size: 1024,
             checksum_algorithm: "sha256".to_string(),
         };
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("sign_request"));
         assert!(json.contains("/opt/_avocado/x86_64/runtimes/test/binary"));
+        assert!(json.contains("abcd1234"));
+        assert!(json.contains("1024"));
         assert!(json.contains("sha256"));
     }
 
@@ -393,15 +525,14 @@ mod tests {
         let response = SignResponse {
             response_type: "sign_response".to_string(),
             success: true,
-            signature_path: Some("/opt/_avocado/x86_64/runtimes/test/binary.sig".to_string()),
-            signature_content: Some("{}".to_string()),
+            signature: Some("{\"version\":\"1\"}".to_string()),
             error: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("sign_response"));
         assert!(json.contains("true"));
-        assert!(json.contains(".sig"));
+        assert!(json.contains("signature"));
     }
 
     #[test]
@@ -411,5 +542,15 @@ mod tests {
         assert!(script.contains("avocado-sign-request"));
         assert!(script.contains("/run/avocado/sign.sock"));
         assert!(script.contains("sign_request"));
+        // Verify retry logic is present
+        assert!(script.contains("MAX_RETRIES"));
+        assert!(script.contains("SOCKET_TIMEOUT"));
+        // Verify proper socat/nc timeout options
+        assert!(script.contains("-t${SOCKET_TIMEOUT}"));
+        // Verify hash computation is done locally
+        assert!(script.contains("sha256sum"));
+        assert!(script.contains("Computing"));
+        // Verify signature file is written locally
+        assert!(script.contains("SIG_PATH"));
     }
 }

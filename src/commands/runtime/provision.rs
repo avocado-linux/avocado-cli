@@ -310,12 +310,6 @@ impl RuntimeProvisionCommand {
             .map(|s| s.checksum_algorithm.as_str())
             .unwrap_or("sha256");
 
-        // Get volume name
-        let volume_manager = VolumeManager::new("docker".to_string(), self.config.verbose);
-        let volume_state = volume_manager
-            .get_or_create_volume(&std::env::current_dir()?)
-            .await?;
-
         // Create temporary directory for socket and helper script
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
         let socket_path = temp_dir.path().join("sign.sock");
@@ -346,13 +340,13 @@ impl RuntimeProvisionCommand {
         }
 
         // Start signing service
+        // Note: Hash computation happens in the container, so we don't need volume access
         let service_config = SigningServiceConfig {
             socket_path: socket_path.clone(),
             runtime_name: self.config.runtime_name.clone(),
             target_arch: target_arch.to_string(),
             key_name: signing_key_name.clone(),
             keyid,
-            volume_name: volume_state.volume_name.clone(),
             verbose: self.config.verbose,
         };
 
