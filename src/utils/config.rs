@@ -738,6 +738,11 @@ impl Config {
         self.sdk.as_ref()?.repo_release.as_ref().cloned()
     }
 
+    /// Get the distro version from configuration
+    pub fn get_distro_version(&self) -> Option<&String> {
+        self.distro.as_ref()?.version.as_ref()
+    }
+
     /// Get the SDK container args from configuration
     pub fn get_sdk_container_args(&self) -> Option<&Vec<String>> {
         self.sdk.as_ref()?.container_args.as_ref()

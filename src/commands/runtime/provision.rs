@@ -137,6 +137,14 @@ impl RuntimeProvisionCommand {
             ),
         );
 
+        // Set AVOCADO_DISTRO_VERSION if configured
+        if let Some(distro_version) = config.get_distro_version() {
+            env_vars.insert(
+                "AVOCADO_DISTRO_VERSION".to_string(),
+                distro_version.clone(),
+            );
+        }
+
         // Determine state file path and container location if a provision profile is set
         let state_file_info = if let Some(profile) = &self.config.provision_profile {
             let state_file_path = self
