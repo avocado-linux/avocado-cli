@@ -188,6 +188,11 @@ impl RuntimeProvisionCommand {
             return Err(anyhow::anyhow!("Failed to provision runtime"));
         }
 
+        // Fix file ownership if --out was specified
+        if let Some(out_path) = &self.config.out {
+            self.fix_output_permissions(out_path).await?;
+        }
+
         print_success(
             &format!(
                 "Successfully provisioned runtime '{}'",
@@ -308,6 +313,117 @@ impl RuntimeProvisionCommand {
         if let Some(service) = self.signing_service.take() {
             service.shutdown().await?;
         }
+        Ok(())
+    }
+
+    /// Fix file ownership of output directory to match calling user
+    async fn fix_output_permissions(&self, out_path: &str) -> Result<()> {
+        // Get the absolute path to the output directory
+        let src_dir = std::env::current_dir()?;
+        let out_dir = src_dir.join(out_path);
+
+        // Only proceed if the directory exists
+        if !out_dir.exists() {
+            if self.config.verbose {
+                print_info(
+                    &format!("Output directory does not exist yet: {}", out_dir.display()),
+                    OutputLevel::Verbose,
+                );
+            }
+            return Ok(());
+        }
+
+        // Get current user's UID and GID
+        #[cfg(unix)]
+        {
+            // Get the UID and GID of the calling user
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
+
+            if self.config.verbose {
+                print_info(
+                    &format!("Fixing ownership of {} to {}:{}", out_dir.display(), uid, gid),
+                    OutputLevel::Verbose,
+                );
+            }
+
+            // Load configuration to get container image
+            let config = load_config(&self.config.config_path)?;
+            let container_image = config
+                .get_sdk_image()
+                .context("No SDK container image specified in configuration")?;
+
+            // Build the chown command to run inside the container
+            let container_out_path = format!("/opt/src/{}", out_path);
+            let chown_script = format!(
+                "chown -R {}:{} '{}'",
+                uid, gid, container_out_path
+            );
+
+            // Run chown inside a container with the same volume mounts
+            let container_tool = "docker";
+            let volume_manager = VolumeManager::new(container_tool.to_string(), self.config.verbose);
+            let volume_state = volume_manager.get_or_create_volume(&src_dir).await?;
+
+            let mut chown_cmd = vec![
+                container_tool.to_string(),
+                "run".to_string(),
+                "--rm".to_string(),
+            ];
+
+            // Mount the source directory
+            chown_cmd.push("-v".to_string());
+            chown_cmd.push(format!("{}:/opt/src:rw", src_dir.display()));
+
+            // Mount the volume
+            chown_cmd.push("-v".to_string());
+            chown_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+
+            // Add the container image
+            chown_cmd.push(container_image.to_string());
+
+            // Add the command
+            chown_cmd.push("bash".to_string());
+            chown_cmd.push("-c".to_string());
+            chown_cmd.push(chown_script);
+
+            if self.config.verbose {
+                print_info(
+                    &format!("Running: {}", chown_cmd.join(" ")),
+                    OutputLevel::Verbose,
+                );
+            }
+
+            let mut cmd = tokio::process::Command::new(&chown_cmd[0]);
+            cmd.args(&chown_cmd[1..]);
+            cmd.stdout(std::process::Stdio::null())
+               .stderr(std::process::Stdio::null());
+
+            let status = cmd.status().await.context("Failed to execute chown command")?;
+
+            if !status.success() {
+                print_info(
+                    "Warning: Failed to fix ownership of output directory. Files may be owned by root.",
+                    OutputLevel::Normal,
+                );
+            } else if self.config.verbose {
+                print_info(
+                    "Successfully fixed output directory ownership",
+                    OutputLevel::Verbose,
+                );
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if self.config.verbose {
+                print_info(
+                    "Skipping ownership fix on non-Unix platform",
+                    OutputLevel::Verbose,
+                );
+            }
+        }
+
         Ok(())
     }
 

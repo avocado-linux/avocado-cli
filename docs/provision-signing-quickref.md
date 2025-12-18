@@ -51,7 +51,7 @@ fi
 ### General Variables
 - `$AVOCADO_RUNTIME_BUILD_DIR` - Full path to runtime build directory (e.g., `/opt/_avocado/x86_64/runtimes/<runtime-name>`)
 - `$AVOCADO_EXT_LIST` - Space-separated list of required extensions
-- `$AVOCADO_PROVISION_OUT` - Output directory (if `--out` specified)
+- `$AVOCADO_PROVISION_OUT` - Output directory (if `--out` specified). File ownership automatically fixed to calling user.
 - `$AVOCADO_STONE_INCLUDE_PATHS` - Stone include paths (if configured)
 - `$AVOCADO_STONE_MANIFEST` - Stone manifest path (if configured)
 
