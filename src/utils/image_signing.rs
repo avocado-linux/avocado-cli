@@ -102,7 +102,7 @@ pub fn compute_file_hash(file_path: &Path, algorithm: &ChecksumAlgorithm) -> Res
 /// Load a signing key from disk
 fn load_signing_key(keyid: &str) -> Result<SecretKey> {
     use ed25519_compact::{KeyPair, Seed};
-    
+
     let key_file_path = super::signing_keys::get_key_file_path(keyid)?.with_extension("key");
 
     let private_key_b64 = fs::read_to_string(&key_file_path).with_context(|| {
@@ -132,7 +132,7 @@ fn load_signing_key(keyid: &str) -> Result<SecretKey> {
             key_file_path.display()
         )
     })?;
-    
+
     let keypair = KeyPair::from_seed(seed);
     Ok(keypair.sk)
 }
@@ -380,32 +380,47 @@ pub fn sign_hash_manifest(
 
 /// Sign a hash using PKCS#11 hardware token
 ///
-/// This function provides basic PKCS#11 signing support. Full implementation
-/// requires proper token/slot discovery and PIN management.
-fn sign_with_pkcs11(uri: &str, _hash: &[u8]) -> Result<Vec<u8>> {
-    // Parse PKCS#11 URI (simplified - full URI parsing would be more complex)
-    // Format: pkcs11:token=TokenName;object=KeyLabel
+/// This function implements PKCS#11 signing for hardware devices (TPM, YubiKey, HSMs).
+fn sign_with_pkcs11(uri: &str, hash: &[u8]) -> Result<Vec<u8>> {
+    use super::pkcs11_devices::{
+        init_pkcs11_session, parse_pkcs11_uri, sign_with_pkcs11_device, DeviceType,
+        Pkcs11AuthMethod,
+    };
+    use std::env;
 
-    // For now, return an error with helpful message
-    // Full implementation would:
-    // 1. Initialize PKCS#11 library
-    // 2. Find slot/token
-    // 3. Open session
-    // 4. Find private key object
-    // 5. Perform signing operation
-    // 6. Return signature
+    // Parse PKCS#11 URI to extract token and object labels
+    let (token_label, object_label) =
+        parse_pkcs11_uri(uri).context("Failed to parse PKCS#11 URI")?;
 
-    anyhow::bail!(
-        "PKCS#11 signing is not yet fully implemented. URI: {}\n\
-        \n\
-        To implement PKCS#11 signing:\n\
-        1. Install PKCS#11 library for your device (e.g., opensc for YubiKey)\n\
-        2. Set PKCS11_MODULE_PATH environment variable\n\
-        3. Ensure device is connected and accessible\n\
-        \n\
-        Currently, only file-based ed25519 keys are supported for signing.",
-        uri
-    )
+    // Determine device type from token label or environment
+    let device_type = if token_label.to_lowercase().contains("tpm") {
+        DeviceType::Tpm
+    } else if token_label.to_lowercase().contains("yubikey")
+        || token_label.to_lowercase().contains("yubico")
+    {
+        DeviceType::Yubikey
+    } else {
+        DeviceType::Auto
+    };
+
+    // Get auth method from environment or use prompt
+    let auth_method = if env::var("AVOCADO_PKCS11_PIN").is_ok() {
+        Pkcs11AuthMethod::EnvVar("AVOCADO_PKCS11_PIN".to_string())
+    } else {
+        // For signing operations, we'll try without auth first
+        // Most systems cache the PIN from key creation
+        Pkcs11AuthMethod::None
+    };
+
+    // Initialize PKCS#11 and open session (no specific token, use first available)
+    let (_pkcs11, session) = init_pkcs11_session(&device_type, None, "", &auth_method)
+        .context("Failed to initialize PKCS#11 session for signing")?;
+
+    // Sign the data
+    let signature = sign_with_pkcs11_device(&session, &object_label, hash)
+        .context("Failed to sign data with PKCS#11 device")?;
+
+    Ok(signature)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

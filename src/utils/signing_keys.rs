@@ -25,7 +25,7 @@ const SIGNING_KEYS_DIR: &str = "signing-keys";
 pub struct KeyEntry {
     /// Unique key identifier (SHA-256 hash of public key)
     pub keyid: String,
-    /// Cryptographic algorithm used (always "ed25519" for now)
+    /// Cryptographic algorithm used (e.g., "ed25519", "ecdsa-p256", "ecdsa-p384", "rsa2048", "rsa4096")
     pub algorithm: String,
     /// Timestamp when the key was created/registered
     pub created_at: DateTime<Utc>,
@@ -318,19 +318,23 @@ mod tests {
     fn test_key_serialization() {
         // Test that we can save and load keys using the seed
         let (sk, pk) = generate_keypair();
-        
+
         // Serialize the seed (this is what we store on disk)
         let seed = sk.seed();
         let seed_bytes = seed.as_ref();
         assert_eq!(seed_bytes.len(), 32, "Seed should be 32 bytes");
-        
+
         // Reconstruct the key from the seed (this is what we do when loading)
-        let seed_reconstructed = Seed::from_slice(seed_bytes)
-            .expect("Should parse seed from bytes");
+        let seed_reconstructed =
+            Seed::from_slice(seed_bytes).expect("Should parse seed from bytes");
         let keypair_reconstructed = KeyPair::from_seed(seed_reconstructed);
-        
+
         // The reconstructed key should produce the same public key
-        assert_eq!(pk.as_ref(), keypair_reconstructed.pk.as_ref(), "Public keys should match");
+        assert_eq!(
+            pk.as_ref(),
+            keypair_reconstructed.pk.as_ref(),
+            "Public keys should match"
+        );
     }
 
     #[test]

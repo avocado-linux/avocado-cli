@@ -14,18 +14,98 @@ pub struct SigningKeysCreateCommand {
     pub name: Option<String>,
     /// Optional PKCS#11 URI for hardware-backed keys
     pub uri: Option<String>,
+    /// Hardware device type (tpm, yubikey, auto)
+    pub pkcs11_device: Option<String>,
+    /// PKCS#11 token label
+    pub token: Option<String>,
+    /// Label of existing key to reference in the device
+    pub key_label: Option<String>,
+    /// Generate a new key in the device
+    pub generate: bool,
+    /// Authentication method for PKCS#11 device
+    pub auth: String,
 }
 
 impl SigningKeysCreateCommand {
-    pub fn new(name: Option<String>, uri: Option<String>) -> Self {
-        Self { name, uri }
+    pub fn new(
+        name: Option<String>,
+        uri: Option<String>,
+        pkcs11_device: Option<String>,
+        token: Option<String>,
+        key_label: Option<String>,
+        generate: bool,
+        auth: String,
+    ) -> Self {
+        Self {
+            name,
+            uri,
+            pkcs11_device,
+            token,
+            key_label,
+            generate,
+            auth,
+        }
     }
 
     pub fn execute(&self) -> Result<()> {
+        use crate::utils::pkcs11_devices::{
+            build_pkcs11_uri, find_existing_key, generate_keypair as generate_pkcs11_keypair,
+            get_device_auth, init_pkcs11_session, DeviceType, KeyAlgorithm, Pkcs11AuthMethod,
+        };
+        use std::str::FromStr;
+
         let mut registry = KeysRegistry::load()?;
 
-        let (keyid, uri, key_type) = if let Some(pkcs11_uri) = &self.uri {
-            // Register an external PKCS#11 key
+        let (keyid, uri, algorithm, key_type) = if let Some(device_type_str) = &self.pkcs11_device {
+            // PKCS#11 hardware device flow
+            let device_type = DeviceType::from_str(device_type_str)?;
+            let auth_method = Pkcs11AuthMethod::from_str(&self.auth)?;
+
+            // Get authentication
+            let auth = get_device_auth(&auth_method)?;
+
+            // Initialize PKCS#11 and open session
+            let (_pkcs11, session) = init_pkcs11_session(&device_type, self.token.as_deref(), &auth, &auth_method)?;
+
+            let (_public_key_bytes, keyid, algorithm) = if self.generate {
+                // Generate new key in device
+                let label = self.name.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--name is required when generating a hardware key")
+                })?;
+
+                // Default to ECC P-256 (most widely supported)
+                let key_algorithm = KeyAlgorithm::EccP256;
+
+                generate_pkcs11_keypair(&session, label, &key_algorithm)?
+            } else if let Some(label) = &self.key_label {
+                // Reference existing key in device
+                find_existing_key(&session, label)?
+            } else {
+                anyhow::bail!("Either --generate or --key-label is required with --pkcs11-device");
+            };
+
+            // Get token info for building URI
+            let slot = session.get_session_info()?.slot_id();
+            let token_info = _pkcs11.get_token_info(slot)?;
+            let token_label = token_info.label();
+
+            // Build PKCS#11 URI
+            let object_label = self
+                .name
+                .as_ref()
+                .or(self.key_label.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("Name or key-label required"))?;
+
+            let pkcs11_uri = build_pkcs11_uri(token_label, object_label);
+
+            (
+                keyid,
+                pkcs11_uri,
+                algorithm,
+                format!("{}/PKCS#11", device_type),
+            )
+        } else if let Some(pkcs11_uri) = &self.uri {
+            // Manual PKCS#11 URI registration (existing flow)
             if !is_pkcs11_uri(pkcs11_uri) {
                 anyhow::bail!(
                     "Invalid URI: '{}'. Expected a pkcs11: URI (e.g., 'pkcs11:token=YubiKey;object=signing-key')",
@@ -33,12 +113,17 @@ impl SigningKeysCreateCommand {
                 );
             }
 
-            // For PKCS#11 keys, we generate a keyid from the URI itself
+            // For manually registered PKCS#11 keys, we generate a keyid from the URI itself
             // since we don't have direct access to the public key
             let keyid = generate_keyid_from_uri(pkcs11_uri);
-            (keyid, pkcs11_uri.clone(), "PKCS#11")
+            (
+                keyid,
+                pkcs11_uri.clone(),
+                "unknown".to_string(),
+                "PKCS#11".to_string(),
+            )
         } else {
-            // Generate a new ed25519 keypair
+            // Generate a new ed25519 keypair (file-based, existing flow)
             let (signing_key, verifying_key) = generate_keypair();
             let keyid = generate_keyid(&verifying_key);
 
@@ -46,7 +131,7 @@ impl SigningKeysCreateCommand {
             let key_path = save_keypair(&keyid, &signing_key, &verifying_key)?;
             let uri = path_to_file_uri(&key_path);
 
-            (keyid, uri, "file")
+            (keyid, uri, "ed25519".to_string(), "file".to_string())
         };
 
         // Determine the name (use provided name or fall back to keyid)
@@ -60,7 +145,7 @@ impl SigningKeysCreateCommand {
         // Create the key entry
         let entry = KeyEntry {
             keyid: keyid.clone(),
-            algorithm: "ed25519".to_string(),
+            algorithm: algorithm.clone(),
             created_at: Utc::now(),
             uri: uri.clone(),
         };
@@ -73,7 +158,7 @@ impl SigningKeysCreateCommand {
         println!("Created signing key:");
         println!("  Name:      {}", name);
         println!("  Key ID:    {}", keyid);
-        println!("  Algorithm: ed25519");
+        println!("  Algorithm: {}", algorithm);
         println!("  Type:      {}", key_type);
 
         if key_type == "file" {

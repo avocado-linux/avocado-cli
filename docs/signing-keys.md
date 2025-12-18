@@ -18,9 +18,152 @@ avocado signing-keys create my-production-key
 # Create a key (defaults to key ID as name)
 avocado signing-keys create
 
-# Register a hardware-backed PKCS#11 key
+# Register a hardware-backed PKCS#11 key (manual method)
 avocado signing-keys create yubikey-signing --uri "pkcs11:token=YubiKey;object=signing-key"
 ```
+
+### Creating Hardware-Backed Keys (TPM, YubiKey, HSMs)
+
+The avocado CLI supports hardware-backed signing keys via PKCS#11, providing unified support for TPM, YubiKey, HSMs, and other PKCS#11-compatible devices.
+
+#### TPM 2.0 Keys
+
+**Prerequisites:**
+```bash
+# Install TPM PKCS#11 module (Ubuntu/Debian)
+sudo apt install libtpm2-pkcs11-1 libtpm2-pkcs11-tools tpm2-tools
+
+# Add your user to the tss group for TPM access
+sudo usermod -a -G tss $USER
+
+# Log out and back in (or use newgrp)
+newgrp tss
+
+# For other distros:
+# Fedora/RHEL: sudo dnf install tpm2-pkcs11 tpm2-tools
+# Arch: sudo pacman -S tpm2-pkcs11 tpm2-tools
+
+# Verify installation (the CLI will auto-detect the library location)
+# On x86_64: /usr/lib/x86_64-linux-gnu/pkcs11/libtpm2_pkcs11.so
+# On ARM64: /usr/lib/aarch64-linux-gnu/pkcs11/libtpm2_pkcs11.so
+# The CLI searches all architecture-specific paths automatically
+```
+
+**Initialize TPM PKCS#11 Token (First Time Setup):**
+```bash
+# Create a PKCS#11 store in the TPM
+mkdir -p ~/.tpm2_pkcs11
+tpm2_ptool init
+
+# Create a new token (you'll be prompted to set a PIN)
+tpm2_ptool addtoken --pid=1 --label=avocado --userpin=yourpin --sopin=yoursopin
+
+# Verify the token is created
+tpm2_ptool listtoken
+```
+
+**Generate a new key in TPM:**
+```bash
+# Generate with PIN prompt (specify token name)
+avocado signing-keys create my-tpm-key --pkcs11-device tpm --token avocado --generate --auth prompt
+
+# Generate with PIN from environment variable
+export AVOCADO_PKCS11_PIN=your-tpm-pin
+avocado signing-keys create my-tpm-key --pkcs11-device tpm --token avocado --generate --auth env
+
+# Generate without specifying token (uses first available)
+avocado signing-keys create my-tpm-key --pkcs11-device tpm --generate --auth prompt
+
+# Generate without PIN (if TPM has no auth)
+avocado signing-keys create my-tpm-key --pkcs11-device tpm --token avocado --generate --auth none
+```
+
+**Reference an existing TPM key:**
+```bash
+# Reference key by label
+avocado signing-keys create prod-key --pkcs11-device tpm --token avocado --key-label existing-tpm-key --auth prompt
+```
+
+#### YubiKey Keys
+
+**Prerequisites:**
+```bash
+# Ubuntu/Debian - Option 1: YubiKey manager (recommended)
+sudo apt install yubikey-manager libykcs11-1
+
+# Ubuntu/Debian - Option 2: OpenSC (alternative)
+sudo apt install opensc-pkcs11
+
+# For other distros:
+# Fedora/RHEL: sudo dnf install ykcs11 (or opensc)
+# Arch: sudo pacman -S yubikey-manager (or opensc)
+
+# Verify installation (the CLI will auto-detect the library location)
+# The CLI automatically finds libraries across all architectures
+
+# Optional: Set module path explicitly only if auto-detection fails
+export PKCS11_MODULE_PATH=/path/to/your/libykcs11.so
+```
+
+**Generate a new key in YubiKey:**
+```bash
+# Generate in YubiKey PIV slot
+avocado signing-keys create yk-prod --pkcs11-device yubikey --generate --auth prompt
+
+# YubiKey will prompt for PIN (default: 123456)
+# Consider requiring touch for signing operations (configure via ykman)
+```
+
+**Reference an existing YubiKey key:**
+```bash
+# Reference existing PIV key
+avocado signing-keys create yk-key --pkcs11-device yubikey --key-label "PIV AUTH key" --auth prompt
+```
+
+#### Manual PKCS#11 URI Registration (Advanced)
+
+For other devices or custom configurations, you can manually register PKCS#11 keys using URIs:
+
+```bash
+# Register any PKCS#11 device
+avocado signing-keys create custom-hsm --uri "pkcs11:token=MyHSM;object=signing-key"
+
+# Example with more URI parameters
+avocado signing-keys create hsm-prod --uri "pkcs11:token=Luna%20SA;object=prod-signing;type=private"
+```
+
+#### Hardware Key Algorithm Support
+
+Hardware devices support different algorithms than file-based keys:
+
+| Device Type | Supported Algorithms | Default |
+|-------------|---------------------|---------|
+| File-based | Ed25519 | Ed25519 |
+| TPM 2.0 | ECC P-256, RSA-2048 | ECC P-256 |
+| YubiKey | ECC P-256, RSA-2048 | ECC P-256 |
+| HSMs | Varies by device | Device-dependent |
+
+**Note:** Most hardware devices do NOT support Ed25519. The CLI automatically uses ECC P-256 for hardware keys as it's universally supported.
+
+#### Authentication Methods
+
+Three authentication methods are supported:
+
+1. **`--auth prompt`** (default): Interactively prompts for PIN/password
+   ```bash
+   avocado signing-keys create my-key --pkcs11-device tpm --generate --auth prompt
+   ```
+
+2. **`--auth env`**: Reads PIN from `AVOCADO_PKCS11_PIN` environment variable
+   ```bash
+   export AVOCADO_PKCS11_PIN=my-secure-pin
+   avocado signing-keys create my-key --pkcs11-device tpm --generate --auth env
+   ```
+
+3. **`--auth none`**: No authentication (for devices without PIN protection)
+   ```bash
+   avocado signing-keys create my-key --pkcs11-device tpm --generate --auth none
+   ```
 
 ### Listing Keys
 
@@ -314,11 +457,16 @@ Successfully built runtime 'production'
 ## PKCS#11 Support Status
 
 - **Key Registration**: ✅ PKCS#11 URIs can be registered via `avocado signing-keys create --uri`
+- **Key Generation**: ✅ Generate keys in TPM, YubiKey via `--pkcs11-device` and `--generate`
+- **Key Reference**: ✅ Reference existing hardware keys via `--key-label`
 - **Key Listing**: ✅ PKCS#11 keys are listed and displayed
-- **Signing Operations**: ⚠️  PKCS#11 signing support is planned but not yet implemented
-- **Workaround**: Currently, only file-based keys (ed25519) can be used for actual signing
+- **Signing Operations**: ✅ PKCS#11 signing fully implemented and functional
+- **Supported Devices**: ✅ TPM 2.0, YubiKey, and any PKCS#11-compatible device
 
-When PKCS#11 support is fully implemented:
-- Signing will occur on the host (Pass 2 of multi-pass workflow)
-- Hardware devices (TPM, YubiKey) will be accessed directly
-- No container privileges or device passthrough required
+### How It Works
+
+- **Key Creation/Generation**: Happens on the host with direct access to hardware device
+- **Signing**: Occurs on the host (Pass 3 of multi-pass workflow) with direct hardware access
+- **No Container Passthrough**: Hardware devices stay on host, only checksums are extracted from containers
+- **Algorithm Detection**: Automatically detects key algorithm from device
+- **PIN Management**: Flexible authentication (prompt, environment variable, or none)

@@ -4,5 +4,5 @@
 
 #![allow(dead_code)]
 
-mod commands;
+pub mod commands;
 pub mod utils;

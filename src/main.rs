@@ -274,6 +274,21 @@ enum SigningKeysCommands {
         /// PKCS#11 URI for hardware-backed keys (e.g., 'pkcs11:token=YubiKey;object=signing-key')
         #[arg(long)]
         uri: Option<String>,
+        /// Hardware device type (tpm, yubikey, or auto-detect)
+        #[arg(long, value_name = "DEVICE")]
+        pkcs11_device: Option<String>,
+        /// PKCS#11 token label (e.g., 'avocado', 'YubiKey PIV'). If not provided, uses the first available token.
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Label of existing key to reference in the device
+        #[arg(long, value_name = "LABEL")]
+        key_label: Option<String>,
+        /// Generate a new key in the device
+        #[arg(long)]
+        generate: bool,
+        /// Authentication method for PKCS#11 device (none, prompt, env)
+        #[arg(long, default_value = "prompt", value_name = "METHOD")]
+        auth: String,
     },
     /// List all registered signing keys
     List,
@@ -812,8 +827,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::SigningKeys { command } => match command {
-            SigningKeysCommands::Create { name, uri } => {
-                let cmd = SigningKeysCreateCommand::new(name, uri);
+            SigningKeysCommands::Create {
+                name,
+                uri,
+                pkcs11_device,
+                token,
+                key_label,
+                generate,
+                auth,
+            } => {
+                let cmd = SigningKeysCreateCommand::new(
+                    name,
+                    uri,
+                    pkcs11_device,
+                    token,
+                    key_label,
+                    generate,
+                    auth,
+                );
                 cmd.execute()?;
                 Ok(())
             }

@@ -3,6 +3,7 @@ pub mod container;
 pub mod image_signing;
 pub mod interpolation;
 pub mod output;
+pub mod pkcs11_devices;
 pub mod signing_keys;
 pub mod target;
 pub mod volume;
