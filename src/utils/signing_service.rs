@@ -455,40 +455,65 @@ SUCCESS=$(echo "$RESPONSE" | grep -o '"success":[^,}]*' | cut -d: -f2 | tr -d ' 
 
 if [ "$SUCCESS" = "true" ]; then
     # Extract signature content from response and write to .sig file
-    # The signature field contains the JSON signature content
+    # The signature field contains the JSON signature content (escaped in the response)
     SIG_PATH="${BINARY_PATH}.sig"
     
-    # Extract the signature JSON from the response
-    # The signature is a JSON object embedded in the response
-    # We use a simple extraction since we control both ends
-    SIGNATURE=$(echo "$RESPONSE" | sed -n 's/.*"signature":"\([^"]*\)".*/\1/p' | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g')
+    # Extract the signature JSON from the response using the best available tool
+    SIGNATURE=""
     
-    if [ -z "$SIGNATURE" ]; then
-        # Try alternate extraction for pretty-printed JSON
-        # Extract everything between "signature":" and the next unescaped "
+    # Try jq first (most reliable for JSON parsing)
+    if command -v jq &> /dev/null; then
+        SIGNATURE=$(echo "$RESPONSE" | jq -r '.signature // empty' 2>/dev/null) || true
+    fi
+    
+    # Fall back to python3 if jq didn't work or isn't available
+    if [ -z "$SIGNATURE" ] && command -v python3 &> /dev/null; then
         SIGNATURE=$(echo "$RESPONSE" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
-    if 'signature' in data and data['signature']:
-        print(data['signature'])
+    sig = data.get('signature', '')
+    if sig:
+        print(sig, end='')
+except Exception as e:
+    pass
+" 2>/dev/null) || true
+    fi
+    
+    # Last resort: try python (python2 on some systems)
+    if [ -z "$SIGNATURE" ] && command -v python &> /dev/null; then
+        SIGNATURE=$(echo "$RESPONSE" | python -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    sig = data.get('signature', '')
+    if sig:
+        sys.stdout.write(sig)
 except:
     pass
 " 2>/dev/null) || true
     fi
     
     if [ -z "$SIGNATURE" ]; then
-        echo "Error: Could not extract signature from response" >&2
+        echo "Error: Could not extract signature from response. Need jq or python3." >&2
+        echo "Response was: $RESPONSE" >&2
         exit 1
     fi
     
-    # Write the signature file
-    echo "$SIGNATURE" > "$SIG_PATH"
+    # Write the signature file (use printf to avoid adding extra newline)
+    printf '%s\n' "$SIGNATURE" > "$SIG_PATH"
     
     echo "Successfully signed: $BINARY_PATH" >&2
     exit 0
 else
-    ERROR=$(echo "$RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+    # Extract error message
+    ERROR=""
+    if command -v jq &> /dev/null; then
+        ERROR=$(echo "$RESPONSE" | jq -r '.error // empty' 2>/dev/null) || true
+    fi
+    if [ -z "$ERROR" ]; then
+        ERROR=$(echo "$RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+    fi
     echo "Error signing binary: $ERROR" >&2
     exit 1
 fi
@@ -550,5 +575,7 @@ mod tests {
         assert!(script.contains("Computing"));
         // Verify signature file is written locally
         assert!(script.contains("SIG_PATH"));
+        // Verify jq is used for JSON parsing (most reliable)
+        assert!(script.contains("jq -r"));
     }
 }
