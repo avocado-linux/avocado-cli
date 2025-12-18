@@ -22,7 +22,7 @@ pub struct RuntimeProvisionConfig {
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     /// Path to state file relative to src_dir for persisting state between provision runs.
-    /// Resolved from provision profile config or defaults to `provision-{profile}.json`.
+    /// Resolved from provision profile config or defaults to `provision-{profile}.state`.
     pub state_file: Option<String>,
 }
 
@@ -150,7 +150,7 @@ impl RuntimeProvisionCommand {
                 .clone()
                 .unwrap_or_else(|| config.get_provision_state_file(profile));
             let container_state_path = format!(
-                "/opt/_avocado/{}/output/runtimes/{}/provision-state.json",
+                "/opt/_avocado/{}/output/runtimes/{}/provision-state.state",
                 target_arch, self.config.runtime_name
             );
             env_vars.insert(
