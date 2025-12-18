@@ -177,7 +177,7 @@ fn generate_keyid_from_uri(uri: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(uri.as_bytes());
     let hash = hasher.finalize();
-    format!("sha256-{}", hex_encode(&hash[..8]))
+    hex_encode(&hash)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -192,8 +192,10 @@ mod tests {
     fn test_generate_keyid_from_uri() {
         let uri = "pkcs11:token=YubiKey;object=signing-key";
         let keyid = generate_keyid_from_uri(uri);
-        assert!(keyid.starts_with("sha256-"));
-        assert_eq!(keyid.len(), 7 + 16); // "sha256-" + 16 hex chars
+        // Key ID is the full SHA-256 hash, base16 encoded (64 hex chars)
+        assert_eq!(keyid.len(), 64);
+        // Verify it's valid hex
+        assert!(keyid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

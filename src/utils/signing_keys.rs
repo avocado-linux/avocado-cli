@@ -130,12 +130,15 @@ pub fn get_key_file_path(keyid: &str) -> Result<PathBuf> {
     Ok(keys_dir.join(keyid))
 }
 
-/// Generate a key ID from a public key (SHA-256 hash, first 16 hex chars)
+/// Generate a key ID from a public key (full SHA-256 hash, base16/hex encoded)
+///
+/// Returns the full 64-character hex-encoded SHA-256 hash of the public key.
+/// This key ID is also used as the default friendly name when no name is provided.
 pub fn generate_keyid(public_key: &PublicKey) -> String {
     let mut hasher = Sha256::new();
     hasher.update(public_key.as_ref());
     let hash = hasher.finalize();
-    format!("sha256-{}", hex::encode(&hash[..8]))
+    hex::encode(&hash)
 }
 
 /// Generate a new ed25519 keypair
@@ -323,8 +326,10 @@ mod tests {
     fn test_generate_keyid() {
         let (_, verifying_key) = generate_keypair();
         let keyid = generate_keyid(&verifying_key);
-        assert!(keyid.starts_with("sha256-"));
-        assert_eq!(keyid.len(), 7 + 16); // "sha256-" + 16 hex chars
+        // Key ID is the full SHA-256 hash, base16 encoded (64 hex chars)
+        assert_eq!(keyid.len(), 64);
+        // Verify it's valid hex
+        assert!(keyid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -370,7 +375,8 @@ mod tests {
         registry.keys.insert(
             "test-key".to_string(),
             KeyEntry {
-                keyid: "sha256-abcd1234abcd1234".to_string(),
+                keyid: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
+                    .to_string(),
                 algorithm: "ed25519".to_string(),
                 created_at: Utc::now(),
                 uri: "file:///path/to/key".to_string(),

@@ -1,11 +1,15 @@
 # Example: Using signing keys with runtime configurations
 #
 # This example demonstrates how to:
-# 1. Define a local mapping of signing keys (name -> key ID)
+# 1. Define a local mapping of signing keys (name -> key ID or global name)
 # 2. Reference those keys in runtime configurations
 #
 # The signing_keys section acts as a bridge between friendly names
 # and the actual key IDs from the global signing keys registry.
+#
+# Key IDs are the full SHA-256 hash of the public key, base16/hex encoded (64 characters).
+# When you create a key with `avocado signing-keys create`, the key ID is also used
+# as the default name if you don't provide a --name argument.
 
 default_target: qemux86-64
 
@@ -13,12 +17,20 @@ sdk:
   image: docker.io/avocadolinux/avocado-sdk:apollo-edge
 
 # Define signing keys with friendly names
-# The key IDs (right side) should match keys in the global registry
-# managed by `avocado signing-keys` commands
+# The values (right side) can be either:
+# - A key ID: full 64-character hex-encoded SHA-256 hash of the public key
+# - A global registry name: the name used when creating the key with `avocado signing-keys create --name <name>`
+#
+# Example with key IDs:
 signing_keys:
-  - production-key: sha256-abc123def456
-  - staging-key: sha256-789012fedcba
-  - backup-key: sha256-111222333444
+  - production-key: abc123def456abc123def456abc123def456abc123def456abc123def456abc1
+  - staging-key: 789012fedcba789012fedcba789012fedcba789012fedcba789012fedcba7890
+  - backup-key: 111222333444111222333444111222333444111222333444111222333444dead
+
+# You can also reference keys by their global registry name:
+# signing_keys:
+#   - production-key: my-production-signing-key  # name from global registry
+#   - staging-key: my-staging-key                # will be resolved to key ID
 
 runtime:
   # Production runtime uses the production signing key with blake3

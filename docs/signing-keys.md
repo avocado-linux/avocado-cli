@@ -176,11 +176,13 @@ Output:
 Registered signing keys:
 
   my-production-key
-    Key ID:    sha256-7ca821b2d4ac87b3
+    Key ID:    abc123def456abc123def456abc123def456abc123def456abc123def456abc1
     Algorithm: ed25519
     Type:      file
     Created:   2025-12-17 15:10:22 UTC
 ```
+
+**Note:** Key IDs are the full SHA-256 hash of the public key, base16/hex encoded (64 characters). When you create a key without specifying a `--name`, the key ID is used as the default name.
 
 ### Removing Keys
 
@@ -189,8 +191,8 @@ Registered signing keys:
 # Remove by name
 avocado signing-keys remove my-production-key
 
-# Remove by key ID
-avocado signing-keys remove sha256-069beb292983492c
+# Remove by key ID (full 64-character hex hash)
+avocado signing-keys remove abc123def456abc123def456abc123def456abc123def456abc123def456abc1
 ```
 
 **Permanently delete hardware key from device (requires confirmation):**
@@ -214,13 +216,21 @@ This action cannot be undone. Continue? [y/N]:
 
 ### Mapping Keys in avocado.yaml
 
-The `signing_keys` section creates a local mapping between friendly names and key IDs:
+The `signing_keys` section creates a local mapping between friendly names and key references.
+Key references can be:
+- **Key IDs**: The full 64-character hex-encoded SHA-256 hash of the public key
+- **Global registry names**: The name used when creating the key with `avocado signing-keys create --name <name>`
 
 ```yaml
+# Using key IDs directly (64-character hex hash)
 signing_keys:
-  - production-key: sha256-abc123def456
-  - staging-key: sha256-789012fedcba
-  - backup-key: sha256-111222333444
+  - production-key: abc123def456abc123def456abc123def456abc123def456abc123def456abc1
+  - staging-key: 789012fedcba789012fedcba789012fedcba789012fedcba789012fedcba7890
+
+# Or using global registry names (will be resolved to key IDs)
+signing_keys:
+  - production-key: my-production-signing-key  # name from global registry
+  - staging-key: my-staging-key                # resolved to key ID at runtime
 ```
 
 ### Referencing Keys in Runtimes
@@ -261,10 +271,10 @@ default_target: qemux86-64
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 
-# Map friendly names to key IDs from global registry
+# Map friendly names to key IDs (64-char hex hashes) or global registry names
 signing_keys:
-  - production-key: sha256-abc123def456
-  - staging-key: sha256-789012fedcba
+  - production-key: abc123def456abc123def456abc123def456abc123def456abc123def456abc1
+  - staging-key: my-staging-key  # global registry name, resolved at runtime
 
 runtime:
   production:
@@ -293,14 +303,16 @@ The global registry is stored in `keys.json`:
 {
   "keys": {
     "my-production-key": {
-      "keyid": "sha256-abc123def456",
+      "keyid": "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
       "algorithm": "ed25519",
       "created_at": "2025-12-17T10:30:00Z",
-      "uri": "file:///home/user/.config/avocado/signing-keys/sha256-abc123"
+      "uri": "file:///home/user/.config/avocado/signing-keys/abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
     }
   }
 }
 ```
+
+**Note:** The `keyid` is the full SHA-256 hash of the public key, base16/hex encoded (64 characters). If no name is provided when creating a key, the key ID is used as the registry name.
 
 ## API Usage
 
@@ -427,7 +439,7 @@ Signature files are JSON format containing:
   "checksum": "abc123...",
   "signature": "def456...",
   "key_name": "production-key",
-  "keyid": "sha256-abc123def456"
+  "keyid": "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
 }
 ```
 

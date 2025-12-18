@@ -3,9 +3,10 @@ default_target: qemux86-64
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 
+# Key IDs are full 64-char hex-encoded SHA-256 hashes of the public key
 signing_keys:
-  - my-production-key: sha256-abc123def456
-  - backup-key: sha256-789012fedcba
+  - my-production-key: abc123def456abc123def456abc123def456abc123def456abc123def456abc1
+  - backup-key: 789012fedcba789012fedcba789012fedcba789012fedcba789012fedcba7890
 
 runtime:
   default:

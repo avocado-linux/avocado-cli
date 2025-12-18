@@ -757,13 +757,17 @@ impl Config {
             .unwrap_or(false) // Default to false (enable weak dependencies)
     }
 
-    /// Get signing keys mapping (name -> keyid)
+    /// Get signing keys mapping (name -> keyid or global name)
     #[allow(dead_code)] // Public API for future use
     pub fn get_signing_keys(&self) -> Option<&HashMap<String, String>> {
         self.signing_keys.as_ref()
     }
 
-    /// Get signing key ID by name
+    /// Get signing key ID by local config name.
+    ///
+    /// Returns the raw value from the signing_keys mapping. The value can be either:
+    /// - A key ID (64-char hex hash of the public key)
+    /// - A global registry key name (which should be resolved via `resolve_signing_key_reference`)
     #[allow(dead_code)] // Public API for future use
     pub fn get_signing_key_id(&self, name: &str) -> Option<&String> {
         self.signing_keys.as_ref()?.get(name)
@@ -778,12 +782,62 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Resolve a signing key reference to an actual key ID.
+    ///
+    /// The reference can be:
+    /// - A key ID directly (64-char hex hash of the public key)
+    /// - A global registry key name (resolved to its key ID)
+    ///
+    /// Returns (key_name, key_id) where key_name is the name in the global registry.
+    #[allow(dead_code)] // Public API for future use
+    pub fn resolve_signing_key_reference(reference: &str) -> Option<(String, String)> {
+        use crate::utils::signing_keys::KeysRegistry;
+
+        let registry = KeysRegistry::load().ok()?;
+
+        // First, try to find by global registry name
+        if let Some(entry) = registry.get_key(reference) {
+            return Some((reference.to_string(), entry.keyid.clone()));
+        }
+
+        // If not found by name, check if it's a valid key ID that exists in the registry
+        for (name, entry) in &registry.keys {
+            if entry.keyid == reference {
+                return Some((name.clone(), entry.keyid.clone()));
+            }
+        }
+
+        None
+    }
+
     /// Get signing key for a specific runtime
+    ///
+    /// The signing key reference in the config can be either:
+    /// - A key ID (64-char hex hash)
+    /// - A global registry key name
+    ///
+    /// Returns the resolved key ID.
     #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_signing_key(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtime.as_ref()?.get(runtime_name)?;
         let signing_key_name = &runtime_config.signing.as_ref()?.key;
-        self.get_signing_key_id(signing_key_name).cloned()
+
+        // First, check the local signing_keys mapping
+        if let Some(key_ref) = self.get_signing_key_id(signing_key_name) {
+            // The value can be a key ID or a global name, resolve it
+            if let Some((_, keyid)) = Self::resolve_signing_key_reference(key_ref) {
+                return Some(keyid);
+            }
+            // If resolution fails, return the value as-is (might be a key ID not yet in registry)
+            return Some(key_ref.clone());
+        }
+
+        // If not in local mapping, try resolving signing_key_name directly as a global reference
+        if let Some((_, keyid)) = Self::resolve_signing_key_reference(signing_key_name) {
+            return Some(keyid);
+        }
+
+        None
     }
 
     /// Get provision profile configuration
@@ -4662,15 +4716,20 @@ sdk:
 
     #[test]
     fn test_signing_keys_parsing() {
-        let config_content = r#"
+        // Key IDs are now full 64-char hex-encoded SHA-256 hashes
+        let production_keyid = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1";
+        let backup_keyid = "789012fedcba789012fedcba789012fedcba789012fedcba789012fedcba7890";
+
+        let config_content = format!(
+            r#"
 default_target: qemux86-64
 
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 
 signing_keys:
-  - my-production-key: sha256-abc123def456
-  - backup-key: sha256-789012fedcba
+  - my-production-key: {production_keyid}
+  - backup-key: {backup_keyid}
 
 runtime:
   dev:
@@ -4685,9 +4744,10 @@ runtime:
     signing:
       key: my-production-key
       # checksum_algorithm defaults to sha256
-"#;
+"#
+        );
 
-        let config = Config::load_from_yaml_str(config_content).unwrap();
+        let config = Config::load_from_yaml_str(&config_content).unwrap();
 
         // Test that signing_keys is parsed correctly
         let signing_keys = config.get_signing_keys();
@@ -4696,11 +4756,11 @@ runtime:
         assert_eq!(signing_keys.len(), 2);
         assert_eq!(
             signing_keys.get("my-production-key"),
-            Some(&"sha256-abc123def456".to_string())
+            Some(&production_keyid.to_string())
         );
         assert_eq!(
             signing_keys.get("backup-key"),
-            Some(&"sha256-789012fedcba".to_string())
+            Some(&backup_keyid.to_string())
         );
 
         // Test get_signing_key_names helper
@@ -4712,17 +4772,18 @@ runtime:
         // Test get_signing_key_id helper
         assert_eq!(
             config.get_signing_key_id("my-production-key"),
-            Some(&"sha256-abc123def456".to_string())
+            Some(&production_keyid.to_string())
         );
         assert_eq!(
             config.get_signing_key_id("backup-key"),
-            Some(&"sha256-789012fedcba".to_string())
+            Some(&backup_keyid.to_string())
         );
         assert_eq!(config.get_signing_key_id("nonexistent"), None);
 
-        // Test runtime signing key reference
+        // Test runtime signing key reference - returns the keyid from the mapping
+        // (without global registry, resolve_signing_key_reference returns None so we get the raw value)
         let runtime_key = config.get_runtime_signing_key("dev");
-        assert_eq!(runtime_key, Some("sha256-abc123def456".to_string()));
+        assert_eq!(runtime_key, Some(production_keyid.to_string()));
 
         // Test runtime signing config
         let runtime = config.runtime.as_ref().unwrap().get("dev").unwrap();
