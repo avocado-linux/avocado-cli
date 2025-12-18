@@ -52,6 +52,7 @@ fi
 - `$AVOCADO_RUNTIME_BUILD_DIR` - Full path to runtime build directory (e.g., `/opt/_avocado/x86_64/runtimes/<runtime-name>`)
 - `$AVOCADO_EXT_LIST` - Space-separated list of required extensions
 - `$AVOCADO_PROVISION_OUT` - Output directory (if `--out` specified). File ownership automatically fixed to calling user.
+- `$AVOCADO_PROVISION_STATE` - Path to state file for persisting state between provision runs (if `--provision-profile` specified). See State File section below.
 - `$AVOCADO_STONE_INCLUDE_PATHS` - Stone include paths (if configured)
 - `$AVOCADO_STONE_MANIFEST` - Stone manifest path (if configured)
 
@@ -125,6 +126,44 @@ fi
 **Timeout?**
 - Check binary size (signing takes longer for large files)
 - Default timeout is 30 seconds
+
+## State File
+
+When using a provision profile (`--provision-profile`), you can persist state between provision runs using a JSON state file.
+
+### Configuration
+
+```yaml
+provision:
+  production:
+    state_file: my-state.json  # Optional, defaults to provision-{profile}.json
+    container_args:
+      - --privileged
+```
+
+### Usage
+
+```bash
+#!/bin/bash
+# In your provision script
+
+if [ -f "$AVOCADO_PROVISION_STATE" ]; then
+    echo "Previous state exists, reading..."
+    DEVICE_ID=$(jq -r '.device_id' "$AVOCADO_PROVISION_STATE")
+else
+    echo "First run, creating state..."
+    DEVICE_ID=$(uuidgen)
+fi
+
+# Save state for next run
+jq -n --arg id "$DEVICE_ID" '{"device_id": $id}' > "$AVOCADO_PROVISION_STATE"
+```
+
+### How It Works
+
+1. Before provisioning: If `<src_dir>/<state_file>` exists, it's copied into the container
+2. During provisioning: Script can read/modify `$AVOCADO_PROVISION_STATE`
+3. After provisioning: If the file exists in the container, it's copied back to `<src_dir>/<state_file>` with correct ownership
 
 ## More Information
 

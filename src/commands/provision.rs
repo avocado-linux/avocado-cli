@@ -51,6 +51,13 @@ impl ProvisionCommand {
             self.config.container_args.as_ref(),
         );
 
+        // Get state file path from provision profile if available
+        let state_file = self
+            .config
+            .provision_profile
+            .as_ref()
+            .map(|profile| config.get_provision_state_file(profile));
+
         let mut runtime_provision_cmd = RuntimeProvisionCommand::new(
             crate::commands::runtime::provision::RuntimeProvisionConfig {
                 runtime_name: self.config.runtime.clone(),
@@ -63,6 +70,7 @@ impl ProvisionCommand {
                 out: self.config.out.clone(),
                 container_args: merged_container_args,
                 dnf_args: self.config.dnf_args.clone(),
+                state_file,
             },
         );
 

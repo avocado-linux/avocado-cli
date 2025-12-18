@@ -21,6 +21,9 @@ pub struct RuntimeProvisionConfig {
     pub out: Option<String>,
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
+    /// Path to state file relative to src_dir for persisting state between provision runs.
+    /// Resolved from provision profile config or defaults to `provision-{profile}.json`.
+    pub state_file: Option<String>,
 }
 
 pub struct RuntimeProvisionCommand {
@@ -128,14 +131,52 @@ impl RuntimeProvisionCommand {
         // Set AVOCADO_RUNTIME_BUILD_DIR
         env_vars.insert(
             "AVOCADO_RUNTIME_BUILD_DIR".to_string(),
-            format!("/opt/_avocado/{}/runtimes/{}", target_arch, self.config.runtime_name),
+            format!(
+                "/opt/_avocado/{}/runtimes/{}",
+                target_arch, self.config.runtime_name
+            ),
         );
+
+        // Determine state file path and container location if a provision profile is set
+        let state_file_info = if let Some(profile) = &self.config.provision_profile {
+            let state_file_path = self
+                .config
+                .state_file
+                .clone()
+                .unwrap_or_else(|| config.get_provision_state_file(profile));
+            let container_state_path = format!(
+                "/opt/_avocado/{}/output/runtimes/{}/provision-state.json",
+                target_arch, self.config.runtime_name
+            );
+            env_vars.insert(
+                "AVOCADO_PROVISION_STATE".to_string(),
+                container_state_path.clone(),
+            );
+            Some((state_file_path, container_state_path))
+        } else {
+            None
+        };
 
         let env_vars = if env_vars.is_empty() {
             None
         } else {
             Some(env_vars)
         };
+
+        // Copy state file to container volume if it exists
+        let src_dir = std::env::current_dir()?;
+        let state_file_existed =
+            if let Some((ref state_file_path, ref container_state_path)) = state_file_info {
+                self.copy_state_to_container(
+                    &src_dir,
+                    state_file_path,
+                    container_state_path,
+                    &target_arch,
+                )
+                .await?
+            } else {
+                false
+            };
 
         // Check if runtime has signing configured
         let signing_config = self.setup_signing_service(&config, &target_arch).await?;
@@ -191,6 +232,18 @@ impl RuntimeProvisionCommand {
         // Fix file ownership if --out was specified
         if let Some(out_path) = &self.config.out {
             self.fix_output_permissions(out_path).await?;
+        }
+
+        // Copy state file back from container if it exists
+        if let Some((ref state_file_path, ref container_state_path)) = state_file_info {
+            self.copy_state_from_container(
+                &src_dir,
+                state_file_path,
+                container_state_path,
+                &target_arch,
+                state_file_existed,
+            )
+            .await?;
         }
 
         print_success(
@@ -342,7 +395,12 @@ impl RuntimeProvisionCommand {
 
             if self.config.verbose {
                 print_info(
-                    &format!("Fixing ownership of {} to {}:{}", out_dir.display(), uid, gid),
+                    &format!(
+                        "Fixing ownership of {} to {}:{}",
+                        out_dir.display(),
+                        uid,
+                        gid
+                    ),
                     OutputLevel::Verbose,
                 );
             }
@@ -355,14 +413,12 @@ impl RuntimeProvisionCommand {
 
             // Build the chown command to run inside the container
             let container_out_path = format!("/opt/src/{}", out_path);
-            let chown_script = format!(
-                "chown -R {}:{} '{}'",
-                uid, gid, container_out_path
-            );
+            let chown_script = format!("chown -R {}:{} '{}'", uid, gid, container_out_path);
 
             // Run chown inside a container with the same volume mounts
             let container_tool = "docker";
-            let volume_manager = VolumeManager::new(container_tool.to_string(), self.config.verbose);
+            let volume_manager =
+                VolumeManager::new(container_tool.to_string(), self.config.verbose);
             let volume_state = volume_manager.get_or_create_volume(&src_dir).await?;
 
             let mut chown_cmd = vec![
@@ -397,9 +453,12 @@ impl RuntimeProvisionCommand {
             let mut cmd = tokio::process::Command::new(&chown_cmd[0]);
             cmd.args(&chown_cmd[1..]);
             cmd.stdout(std::process::Stdio::null())
-               .stderr(std::process::Stdio::null());
+                .stderr(std::process::Stdio::null());
 
-            let status = cmd.status().await.context("Failed to execute chown command")?;
+            let status = cmd
+                .status()
+                .await
+                .context("Failed to execute chown command")?;
 
             if !status.success() {
                 print_info(
@@ -437,6 +496,276 @@ avocado-provision-{} {}
         );
 
         Ok(script)
+    }
+
+    /// Copy state file from src_dir to container volume before provisioning.
+    /// Returns true if the state file existed and was copied, false otherwise.
+    async fn copy_state_to_container(
+        &self,
+        src_dir: &std::path::Path,
+        state_file_path: &str,
+        container_state_path: &str,
+        _target_arch: &str,
+    ) -> Result<bool> {
+        let host_state_file = src_dir.join(state_file_path);
+
+        // Check if the state file exists on the host
+        if !host_state_file.exists() {
+            if self.config.verbose {
+                print_info(
+                    &format!(
+                        "No existing state file at {}, starting fresh",
+                        host_state_file.display()
+                    ),
+                    OutputLevel::Verbose,
+                );
+            }
+            return Ok(false);
+        }
+
+        if self.config.verbose {
+            print_info(
+                &format!(
+                    "Copying state file from {} to container at {}",
+                    host_state_file.display(),
+                    container_state_path
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        // Load configuration to get container image
+        let config = load_config(&self.config.config_path)?;
+        let container_image = config
+            .get_sdk_image()
+            .context("No SDK container image specified in configuration")?;
+
+        let container_tool = "docker";
+        let volume_manager = VolumeManager::new(container_tool.to_string(), self.config.verbose);
+        let volume_state = volume_manager.get_or_create_volume(src_dir).await?;
+
+        // Ensure parent directory exists and copy file to container
+        let copy_script = format!(
+            "mkdir -p \"$(dirname '{}')\" && cp '/opt/src/{}' '{}'",
+            container_state_path, state_file_path, container_state_path
+        );
+
+        let mut copy_cmd = vec![
+            container_tool.to_string(),
+            "run".to_string(),
+            "--rm".to_string(),
+        ];
+
+        // Mount the source directory
+        copy_cmd.push("-v".to_string());
+        copy_cmd.push(format!("{}:/opt/src:ro", src_dir.display()));
+
+        // Mount the volume
+        copy_cmd.push("-v".to_string());
+        copy_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+
+        // Add the container image
+        copy_cmd.push(container_image.to_string());
+
+        // Add the command
+        copy_cmd.push("bash".to_string());
+        copy_cmd.push("-c".to_string());
+        copy_cmd.push(copy_script);
+
+        if self.config.verbose {
+            print_info(
+                &format!("Running: {}", copy_cmd.join(" ")),
+                OutputLevel::Verbose,
+            );
+        }
+
+        let mut cmd = tokio::process::Command::new(&copy_cmd[0]);
+        cmd.args(&copy_cmd[1..]);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let status = cmd
+            .status()
+            .await
+            .context("Failed to copy state file to container")?;
+
+        if !status.success() {
+            print_info(
+                "Warning: Failed to copy state file to container",
+                OutputLevel::Normal,
+            );
+            return Ok(false);
+        }
+
+        if self.config.verbose {
+            print_info(
+                "Successfully copied state file to container",
+                OutputLevel::Verbose,
+            );
+        }
+
+        Ok(true)
+    }
+
+    /// Copy state file from container volume back to src_dir after provisioning.
+    /// Only copies if the file exists in the container. If the file is empty and
+    /// the original didn't exist, no file is copied.
+    async fn copy_state_from_container(
+        &self,
+        src_dir: &std::path::Path,
+        state_file_path: &str,
+        container_state_path: &str,
+        _target_arch: &str,
+        _original_existed: bool,
+    ) -> Result<()> {
+        if self.config.verbose {
+            print_info(
+                &format!(
+                    "Checking for state file at {} in container",
+                    container_state_path
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        // Load configuration to get container image
+        let config = load_config(&self.config.config_path)?;
+        let container_image = config
+            .get_sdk_image()
+            .context("No SDK container image specified in configuration")?;
+
+        let container_tool = "docker";
+        let volume_manager = VolumeManager::new(container_tool.to_string(), self.config.verbose);
+        let volume_state = volume_manager.get_or_create_volume(src_dir).await?;
+
+        // Check if the state file exists in the container
+        let check_script = format!("test -f '{}'", container_state_path);
+
+        let mut check_cmd = vec![
+            container_tool.to_string(),
+            "run".to_string(),
+            "--rm".to_string(),
+        ];
+
+        check_cmd.push("-v".to_string());
+        check_cmd.push(format!("{}:/opt/_avocado:ro", volume_state.volume_name));
+
+        check_cmd.push(container_image.to_string());
+        check_cmd.push("bash".to_string());
+        check_cmd.push("-c".to_string());
+        check_cmd.push(check_script);
+
+        let mut cmd = tokio::process::Command::new(&check_cmd[0]);
+        cmd.args(&check_cmd[1..]);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let status = cmd
+            .status()
+            .await
+            .context("Failed to check state file existence")?;
+
+        if !status.success() {
+            // State file doesn't exist in container
+            if self.config.verbose {
+                print_info(
+                    "No state file found in container, nothing to copy back",
+                    OutputLevel::Verbose,
+                );
+            }
+            return Ok(());
+        }
+
+        // State file exists - copy it back to host
+        let host_state_file = src_dir.join(state_file_path);
+
+        if self.config.verbose {
+            print_info(
+                &format!(
+                    "Copying state file from container to {}",
+                    host_state_file.display()
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        // Get current user's UID and GID for proper ownership
+        #[cfg(unix)]
+        let (uid, gid) = {
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
+            (uid, gid)
+        };
+
+        #[cfg(not(unix))]
+        let (uid, gid) = (0u32, 0u32);
+
+        // Ensure parent directory exists on host and copy file with correct ownership
+        if let Some(parent) = host_state_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Copy from container to host src_dir with proper ownership
+        let copy_script = format!(
+            "cp '{}' '/opt/src/{}' && chown {}:{} '/opt/src/{}'",
+            container_state_path, state_file_path, uid, gid, state_file_path
+        );
+
+        let mut copy_cmd = vec![
+            container_tool.to_string(),
+            "run".to_string(),
+            "--rm".to_string(),
+        ];
+
+        // Mount the source directory (read-write to copy file back)
+        copy_cmd.push("-v".to_string());
+        copy_cmd.push(format!("{}:/opt/src:rw", src_dir.display()));
+
+        // Mount the volume
+        copy_cmd.push("-v".to_string());
+        copy_cmd.push(format!("{}:/opt/_avocado:ro", volume_state.volume_name));
+
+        // Add the container image
+        copy_cmd.push(container_image.to_string());
+
+        // Add the command
+        copy_cmd.push("bash".to_string());
+        copy_cmd.push("-c".to_string());
+        copy_cmd.push(copy_script);
+
+        if self.config.verbose {
+            print_info(
+                &format!("Running: {}", copy_cmd.join(" ")),
+                OutputLevel::Verbose,
+            );
+        }
+
+        let mut cmd = tokio::process::Command::new(&copy_cmd[0]);
+        cmd.args(&copy_cmd[1..]);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let status = cmd
+            .status()
+            .await
+            .context("Failed to copy state file from container")?;
+
+        if !status.success() {
+            print_info(
+                "Warning: Failed to copy state file from container",
+                OutputLevel::Normal,
+            );
+        } else if self.config.verbose {
+            print_info(
+                &format!(
+                    "Successfully copied state file to {}",
+                    host_state_file.display()
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        Ok(())
     }
 
     async fn collect_runtime_extensions(
@@ -624,6 +953,7 @@ mod tests {
             out: None,
             container_args: None,
             dnf_args: None,
+            state_file: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -649,6 +979,7 @@ mod tests {
             out: None,
             container_args: None,
             dnf_args: None,
+            state_file: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -696,6 +1027,7 @@ runtime:
             out: None,
             container_args: None,
             dnf_args: None,
+            state_file: None,
         };
 
         let command = RuntimeProvisionCommand::new(provision_config);
@@ -737,6 +1069,7 @@ runtime:
             out: None,
             container_args: container_args.clone(),
             dnf_args: dnf_args.clone(),
+            state_file: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -771,6 +1104,7 @@ runtime:
             out: None,
             container_args: None,
             dnf_args: None,
+            state_file: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 

@@ -947,6 +947,7 @@ async fn main() -> Result<()> {
                         out,
                         container_args,
                         dnf_args,
+                        state_file: None, // Resolved from config during execution
                     },
                 );
                 provision_cmd.execute().await?;

@@ -113,7 +113,10 @@ impl RuntimeBuildCommand {
         // Set AVOCADO_RUNTIME_BUILD_DIR
         env_vars.insert(
             "AVOCADO_RUNTIME_BUILD_DIR".to_string(),
-            format!("/opt/_avocado/{}/runtimes/{}", target_arch, self.runtime_name),
+            format!(
+                "/opt/_avocado/{}/runtimes/{}",
+                target_arch, self.runtime_name
+            ),
         );
 
         let env_vars = if env_vars.is_empty() {

@@ -116,6 +116,7 @@ The following environment variables are available in provision and build scripts
 - `AVOCADO_RUNTIME_BUILD_DIR`: Full path to the runtime build directory (e.g., `/opt/_avocado/x86_64/runtimes/<runtime-name>`)
 - `AVOCADO_EXT_LIST`: Space-separated list of extensions required by the runtime (if any)
 - `AVOCADO_PROVISION_OUT`: Output directory path in the container (if `--out` flag is specified). Files written here will have their ownership automatically fixed to match the calling user.
+- `AVOCADO_PROVISION_STATE`: Path to a state file for persisting data between provision runs (if `--provision-profile` is specified). See [State File Management](#state-file-management) section below.
 - `AVOCADO_STONE_INCLUDE_PATHS`: Stone include paths (if configured for the runtime)
 - `AVOCADO_STONE_MANIFEST`: Stone manifest path (if configured for the runtime)
 
@@ -294,6 +295,92 @@ EOF
 
 echo "Provisioning complete!"
 ```
+
+## State File Management
+
+When using a provision profile (`--provision-profile`), provision scripts can persist state between runs using a JSON state file. This is useful for:
+
+- Tracking device IDs or serial numbers across provisions
+- Storing incremental build state
+- Maintaining configuration that should persist between provision runs
+
+### Configuration
+
+The state file path can be configured per provision profile in `avocado.yaml`:
+
+```yaml
+provision:
+  production:
+    container_args:
+      - --privileged
+    # Optional: defaults to provision-{profile}.json
+    state_file: production-state.json
+  
+  development:
+    # Uses default: provision-development.json
+    container_args:
+      - --network=host
+```
+
+### How It Works
+
+1. **Before provisioning**: If the state file exists in your source directory (`<src_dir>/<state_file>`), it is copied into the container at `/opt/_avocado/{target}/output/runtimes/{runtime}/provision-state.json`
+
+2. **During provisioning**: Your provision script can read and modify the file via the `AVOCADO_PROVISION_STATE` environment variable
+
+3. **After provisioning**: If the state file exists in the container (even if empty), it is copied back to `<src_dir>/<state_file>` with the correct ownership (matching the calling user, not root)
+
+### Usage Example
+
+```bash
+#!/bin/bash
+# avocado-provision-x86_64 script with state management
+
+set -e
+
+# Check if we have previous state
+if [ -f "$AVOCADO_PROVISION_STATE" ]; then
+    echo "Reading previous provision state..."
+    PROVISION_COUNT=$(jq -r '.provision_count // 0' "$AVOCADO_PROVISION_STATE")
+    DEVICE_UUID=$(jq -r '.device_uuid // empty' "$AVOCADO_PROVISION_STATE")
+    
+    if [ -z "$DEVICE_UUID" ]; then
+        DEVICE_UUID=$(uuidgen)
+    fi
+else
+    echo "First provision run, initializing state..."
+    PROVISION_COUNT=0
+    DEVICE_UUID=$(uuidgen)
+fi
+
+# Increment provision count
+PROVISION_COUNT=$((PROVISION_COUNT + 1))
+
+echo "Device UUID: $DEVICE_UUID"
+echo "Provision count: $PROVISION_COUNT"
+
+# ... do provisioning work ...
+
+# Save state for next run
+jq -n \
+    --arg uuid "$DEVICE_UUID" \
+    --argjson count "$PROVISION_COUNT" \
+    --arg timestamp "$(date -Iseconds)" \
+    '{
+        device_uuid: $uuid,
+        provision_count: $count,
+        last_provision: $timestamp
+    }' > "$AVOCADO_PROVISION_STATE"
+
+echo "State saved successfully"
+```
+
+### Important Notes
+
+- The state file is only available when using `--provision-profile`
+- The file is stored in your source directory and should be added to `.gitignore` if you don't want to version control it
+- File ownership is automatically fixed after provisioning to match the calling user (not root)
+- If the state file doesn't exist after provisioning and didn't exist before, no file is created
 
 ## See Also
 
