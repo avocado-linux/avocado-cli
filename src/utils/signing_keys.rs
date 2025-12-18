@@ -274,10 +274,23 @@ pub fn get_key_entries(key_names: &[String]) -> Result<Vec<(String, KeyEntry)>> 
     let mut missing = Vec::new();
 
     for name in key_names {
+        // Try to find by name first
         if let Some(entry) = registry.keys.get(name) {
             entries.push((name.clone(), entry.clone()));
         } else {
-            missing.push(name.clone());
+            // Try to find by key ID
+            let mut found = false;
+            for (key_name, entry) in &registry.keys {
+                if entry.keyid == *name {
+                    entries.push((key_name.clone(), entry.clone()));
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                missing.push(name.clone());
+            }
         }
     }
 

@@ -403,22 +403,30 @@ fn sign_with_pkcs11(uri: &str, hash: &[u8]) -> Result<Vec<u8>> {
         DeviceType::Auto
     };
 
-    // Get auth method from environment or use prompt
-    let auth_method = if env::var("AVOCADO_PKCS11_PIN").is_ok() {
+    // Get auth method from environment or prompt
+    let auth_method = if let Ok(_pin) = env::var("AVOCADO_PKCS11_PIN") {
         Pkcs11AuthMethod::EnvVar("AVOCADO_PKCS11_PIN".to_string())
     } else {
-        // For signing operations, we'll try without auth first
-        // Most systems cache the PIN from key creation
-        Pkcs11AuthMethod::None
+        // For signing operations, prompt for PIN
+        // TPM and YubiKey typically require authentication for private key operations
+        Pkcs11AuthMethod::Prompt
     };
 
-    // Initialize PKCS#11 and open session (no specific token, use first available)
-    let (_pkcs11, session) = init_pkcs11_session(&device_type, None, "", &auth_method)
-        .context("Failed to initialize PKCS#11 session for signing")?;
+    // Get the authentication credential
+    let auth = super::pkcs11_devices::get_device_auth(&auth_method)
+        .context("Failed to get authentication for signing")?;
+
+    // Initialize PKCS#11 and open session with authentication
+    let (pkcs11, session) =
+        init_pkcs11_session(&device_type, Some(&token_label), &auth, &auth_method)
+            .context("Failed to initialize PKCS#11 session for signing")?;
 
     // Sign the data
-    let signature = sign_with_pkcs11_device(&session, &object_label, hash)
+    let signature = sign_with_pkcs11_device(&session, &object_label, hash, &auth)
         .context("Failed to sign data with PKCS#11 device")?;
+
+    // Explicitly keep pkcs11 alive until signing is done
+    drop(pkcs11);
 
     Ok(signature)
 }

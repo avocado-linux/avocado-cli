@@ -374,7 +374,7 @@ fn test_tpm_signing() {
 
     // Sign the hash
     let signature =
-        sign_with_pkcs11_device(&session, label, &hash).expect("Failed to sign data with TPM");
+        sign_with_pkcs11_device(&session, label, &hash, "").expect("Failed to sign data with TPM");
 
     assert!(!signature.is_empty(), "Signature should not be empty");
     println!("TPM signature size: {} bytes", signature.len());
@@ -440,7 +440,7 @@ fn test_end_to_end_tpm_workflow() {
     assert_eq!(algo_str, "ecdsa-p256");
 
     // Step 3: Find the key we just created
-    let (found_pubkey, found_keyid, _found_algo) =
+    let (found_pubkey, found_keyid, _found_algo, _priv_label) =
         find_existing_key(&session, label).expect("Failed to find existing key");
 
     println!("Step 2: Found existing key: {}", found_keyid);
@@ -467,7 +467,7 @@ fn test_end_to_end_tpm_workflow() {
     let hash = hasher.finalize();
 
     let signature =
-        sign_with_pkcs11_device(&session, label, &hash).expect("Failed to sign with TPM");
+        sign_with_pkcs11_device(&session, label, &hash, "").expect("Failed to sign with TPM");
 
     println!(
         "Step 4: Signed data, signature size: {} bytes",
@@ -516,8 +516,8 @@ fn test_tpm_key_registration_and_removal() {
 
     // First, generate the key in TPM directly
     use avocado_cli::utils::pkcs11_devices::{
-        generate_keypair as generate_pkcs11_keypair, init_pkcs11_session, DeviceType,
-        KeyAlgorithm, Pkcs11AuthMethod,
+        generate_keypair as generate_pkcs11_keypair, init_pkcs11_session, DeviceType, KeyAlgorithm,
+        Pkcs11AuthMethod,
     };
 
     let auth_method = Pkcs11AuthMethod::None;
@@ -549,10 +549,8 @@ fn test_tpm_key_registration_and_removal() {
     println!("Verified key exists in registry");
 
     // Step 4: Remove the key by name
-    let remove_cmd = SigningKeysRemoveCommand::new(key_name.to_string());
-    remove_cmd
-        .execute()
-        .expect("Failed to remove key by name");
+    let remove_cmd = SigningKeysRemoveCommand::new(key_name.to_string(), false);
+    remove_cmd.execute().expect("Failed to remove key by name");
 
     println!("Removed key by name");
 
@@ -589,7 +587,7 @@ fn test_tpm_key_registration_and_removal() {
     println!("Generated and registered second key with ID: {}", keyid2);
 
     // Remove by key ID
-    let remove_cmd2 = SigningKeysRemoveCommand::new(keyid2.clone());
+    let remove_cmd2 = SigningKeysRemoveCommand::new(keyid2.clone(), false);
     remove_cmd2
         .execute()
         .expect("Failed to remove key by key ID");
@@ -610,4 +608,3 @@ fn test_tpm_key_registration_and_removal() {
 
     println!("\n✅ TPM key registration and removal test passed!");
 }
-

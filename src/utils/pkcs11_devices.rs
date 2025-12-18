@@ -397,25 +397,105 @@ pub fn generate_keypair(
 }
 
 /// Find an existing key by label
-pub fn find_existing_key(session: &Session, label: &str) -> Result<(Vec<u8>, String, String)> {
+/// Find an existing PKCS#11 keypair and return (public_key_bytes, keyid, algorithm, private_key_label)
+pub fn find_existing_key(
+    session: &Session,
+    label: &str,
+) -> Result<(Vec<u8>, String, String, String)> {
+    // Try exact match first
     let template = vec![
         Attribute::Label(label.as_bytes().to_vec()),
         Attribute::Class(ObjectClass::PUBLIC_KEY),
     ];
 
-    session
-        .find_objects(&template)
-        .context("Failed to search for key objects")?;
-
-    let objects = session
+    let mut objects = session
         .find_objects(&template)
         .context("Failed to find key objects")?;
 
+    // If no exact match, try to find any public key and match by trimmed label
     if objects.is_empty() {
-        anyhow::bail!("No key found with label '{}'", label);
+        let all_keys_template = vec![Attribute::Class(ObjectClass::PUBLIC_KEY)];
+
+        let all_objects = session
+            .find_objects(&all_keys_template)
+            .context("Failed to list all public keys")?;
+
+        // Check each object's label
+        for obj in all_objects {
+            let attrs = session
+                .get_attributes(obj, &[AttributeType::Label])
+                .context("Failed to get key label")?;
+
+            if let Some(Attribute::Label(obj_label)) = attrs.first() {
+                let obj_label_str = String::from_utf8_lossy(obj_label).trim().to_string();
+                if obj_label_str == label.trim() {
+                    objects = vec![obj];
+                    break;
+                }
+            }
+        }
+    }
+
+    if objects.is_empty() {
+        // List available keys for helpful error message
+        let all_keys_template = vec![Attribute::Class(ObjectClass::PUBLIC_KEY)];
+        let all_objects = session.find_objects(&all_keys_template).unwrap_or_default();
+
+        let mut available_labels = Vec::new();
+        for obj in all_objects {
+            if let Ok(attrs) = session.get_attributes(obj, &[AttributeType::Label]) {
+                if let Some(Attribute::Label(obj_label)) = attrs.first() {
+                    available_labels
+                        .push(format!("'{}'", String::from_utf8_lossy(obj_label).trim()));
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "No key found with label '{}'. Available keys: {}",
+            label,
+            if available_labels.is_empty() {
+                "none".to_string()
+            } else {
+                available_labels.join(", ")
+            }
+        );
     }
 
     let public_key_handle = objects[0];
+
+    // Get the public key's CKA_ID to find the matching private key
+    let id_attrs = session
+        .get_attributes(public_key_handle, &[AttributeType::Id])
+        .context("Failed to get key ID")?;
+
+    // Find the corresponding private key using the same CKA_ID
+    let private_key_label = if let Some(Attribute::Id(key_id)) = id_attrs.first() {
+        let priv_template = vec![
+            Attribute::Id(key_id.clone()),
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+        ];
+
+        let priv_objects = session
+            .find_objects(&priv_template)
+            .context("Failed to find private key")?;
+
+        if !priv_objects.is_empty() {
+            let priv_label_attrs = session
+                .get_attributes(priv_objects[0], &[AttributeType::Label])
+                .context("Failed to get private key label")?;
+
+            if let Some(Attribute::Label(priv_label)) = priv_label_attrs.first() {
+                String::from_utf8_lossy(priv_label).trim().to_string()
+            } else {
+                label.to_string() // Fallback to input label
+            }
+        } else {
+            label.to_string() // Fallback to input label
+        }
+    } else {
+        label.to_string() // Fallback to input label
+    };
 
     // Determine algorithm from key type
     let key_type_attr = session
@@ -430,7 +510,12 @@ pub fn find_existing_key(session: &Session, label: &str) -> Result<(Vec<u8>, Str
     // Generate keyid
     let keyid = generate_keyid_from_public_key(&public_key_bytes);
 
-    Ok((public_key_bytes, keyid, algorithm.as_str().to_string()))
+    Ok((
+        public_key_bytes,
+        keyid,
+        algorithm.as_str().to_string(),
+        private_key_label,
+    ))
 }
 
 /// Extract public key bytes from a PKCS#11 object
@@ -565,7 +650,7 @@ pub fn init_pkcs11_session(
     device_type: &DeviceType,
     token_label: Option<&str>,
     auth: &str,
-    auth_method: &Pkcs11AuthMethod,
+    _auth_method: &Pkcs11AuthMethod,
 ) -> Result<(Pkcs11, Session)> {
     // Get module path
     let module_path = get_pkcs11_module_path(device_type)?;
@@ -585,27 +670,98 @@ pub fn init_pkcs11_session(
         .open_rw_session(slot)
         .context("Failed to open PKCS#11 session")?;
 
-    // Login if auth provided
-    if !auth.is_empty()
-        || matches!(
-            auth_method,
-            Pkcs11AuthMethod::Prompt | Pkcs11AuthMethod::EnvVar(_)
-        )
-    {
-        let pin = if auth.is_empty() {
-            get_device_auth(auth_method)?
-        } else {
-            auth.to_string()
-        };
-
-        if !pin.is_empty() {
-            session
-                .login(UserType::User, Some(&AuthPin::new(pin)))
-                .context("Failed to login to PKCS#11 device")?;
-        }
+    // Login - auth should contain the PIN already
+    if !auth.is_empty() {
+        let auth_pin = AuthPin::new(auth.to_string());
+        session
+            .login(UserType::User, Some(&auth_pin))
+            .context("Failed to login to PKCS#11 device")?;
     }
 
     Ok((pkcs11, session))
+}
+
+/// Delete a PKCS#11 key from hardware device
+pub fn delete_pkcs11_key(uri: &str) -> Result<()> {
+    // Parse the URI to get token and object label
+    let (token_label, object_label) = parse_pkcs11_uri(uri)?;
+
+    // Determine device type from token label (best effort)
+    let device_type = if token_label.to_lowercase().contains("tpm") {
+        DeviceType::Tpm
+    } else if token_label.to_lowercase().contains("yubi")
+        || token_label.to_lowercase().contains("piv")
+    {
+        DeviceType::Yubikey
+    } else {
+        DeviceType::Auto
+    };
+
+    // Get module path
+    let module_path = get_pkcs11_module_path(&device_type)?;
+    let pkcs11 = Pkcs11::new(module_path).context("Failed to load PKCS#11 module")?;
+
+    pkcs11
+        .initialize(CInitializeArgs::OsThreads)
+        .context("Failed to initialize PKCS#11")?;
+
+    // Find the token
+    let (slot, _token_info) = discover_device_token(&pkcs11, &device_type, Some(&token_label))?;
+
+    // Open a session
+    let session = pkcs11
+        .open_rw_session(slot)
+        .context("Failed to open session")?;
+
+    // For deletion, we need to login with PIN
+    let pin_str = rpassword::prompt_password("Enter PIN to delete hardware key: ")
+        .context("Failed to read PIN")?;
+    let auth_pin = AuthPin::new(pin_str.clone());
+
+    session
+        .login(UserType::User, Some(&auth_pin))
+        .context("Failed to login to PKCS#11 device")?;
+
+    // Find the private key object
+    let template = vec![
+        Attribute::Label(object_label.as_bytes().to_vec()),
+        Attribute::Class(ObjectClass::PRIVATE_KEY),
+    ];
+
+    let objects = session
+        .find_objects(&template)
+        .context("Failed to find objects")?;
+
+    if objects.is_empty() {
+        anyhow::bail!(
+            "Private key '{}' not found in hardware device",
+            object_label
+        );
+    }
+
+    let private_key_handle = objects[0];
+
+    // Delete the private key
+    session
+        .destroy_object(private_key_handle)
+        .context("Failed to delete private key from device")?;
+
+    // Also try to delete the corresponding public key
+    let pub_template = vec![
+        Attribute::Label(object_label.as_bytes().to_vec()),
+        Attribute::Class(ObjectClass::PUBLIC_KEY),
+    ];
+
+    let pub_objects = session
+        .find_objects(&pub_template)
+        .context("Failed to find public key")?;
+
+    if !pub_objects.is_empty() {
+        let public_key_handle = pub_objects[0];
+        let _ = session.destroy_object(public_key_handle); // Best effort, ignore errors
+    }
+
+    Ok(())
 }
 
 /// Sign data using a PKCS#11 device
@@ -613,6 +769,7 @@ pub fn sign_with_pkcs11_device(
     session: &Session,
     object_label: &str,
     data: &[u8],
+    pin: &str,
 ) -> Result<Vec<u8>> {
     // Find private key
     let template = vec![
@@ -629,6 +786,32 @@ pub fn sign_with_pkcs11_device(
     }
 
     let private_key_handle = objects[0];
+
+    // Check if the key requires always-authenticate
+    let always_auth_attr = session
+        .get_attributes(private_key_handle, &[AttributeType::AlwaysAuthenticate])
+        .ok();
+
+    let requires_auth = if let Some(attrs) = always_auth_attr {
+        if let Some(Attribute::AlwaysAuthenticate(val)) = attrs.first() {
+            *val
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if requires_auth {
+        // Key requires per-operation authentication (common with YubiKey)
+        // Use the provided PIN for context-specific login
+        let auth_pin = AuthPin::new(pin.to_string());
+
+        // Context-specific login for this operation
+        session
+            .login(UserType::ContextSpecific, Some(&auth_pin))
+            .context("Failed to authenticate for signing operation")?;
+    }
 
     // Determine the mechanism based on key type
     let key_type_attr = session
@@ -720,4 +903,3 @@ mod tests {
         assert_eq!(keyid.len(), 7 + 16); // "sha256-" + 16 hex chars
     }
 }
-

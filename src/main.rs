@@ -294,8 +294,11 @@ enum SigningKeysCommands {
     List,
     /// Remove a signing key
     Remove {
-        /// Name of the key to remove
+        /// Name or key ID of the key to remove
         name: String,
+        /// Delete hardware key from device (requires confirmation)
+        #[arg(long)]
+        delete: bool,
     },
 }
 
@@ -853,8 +856,8 @@ async fn main() -> Result<()> {
                 cmd.execute()?;
                 Ok(())
             }
-            SigningKeysCommands::Remove { name } => {
-                let cmd = SigningKeysRemoveCommand::new(name);
+            SigningKeysCommands::Remove { name, delete } => {
+                let cmd = SigningKeysRemoveCommand::new(name, delete);
                 cmd.execute()?;
                 Ok(())
             }

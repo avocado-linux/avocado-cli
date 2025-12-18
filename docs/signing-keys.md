@@ -184,9 +184,31 @@ Registered signing keys:
 
 ### Removing Keys
 
+**Remove key reference (hardware key remains intact):**
 ```bash
+# Remove by name
 avocado signing-keys remove my-production-key
+
+# Remove by key ID
+avocado signing-keys remove sha256-069beb292983492c
 ```
+
+**Permanently delete hardware key from device (requires confirmation):**
+```bash
+avocado signing-keys remove my-tpm-key --delete
+```
+
+When you run the `--delete` command, you'll be prompted:
+```
+⚠️  WARNING: This will PERMANENTLY delete the hardware key 'my-tpm-key' from the hardware device.
+This action cannot be undone. Continue? [y/N]:
+```
+
+**Important Behavior:**
+- **Without `--delete`**: Removes the key reference from avocado's registry only. The hardware key remains in the device.
+- **With `--delete`**: Prompts for confirmation, then permanently deletes the key from the hardware device via PKCS#11. Requires PIN authentication.
+- **File-based keys**: Always deleted from disk when removed (no `--delete` needed for destructive behavior).
+- **PKCS#11 keys**: Require `--delete` to delete from hardware.
 
 ## Configuration Format
 

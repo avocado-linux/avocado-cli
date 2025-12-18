@@ -65,9 +65,10 @@ impl SigningKeysCreateCommand {
             let auth = get_device_auth(&auth_method)?;
 
             // Initialize PKCS#11 and open session
-            let (_pkcs11, session) = init_pkcs11_session(&device_type, self.token.as_deref(), &auth, &auth_method)?;
+            let (_pkcs11, session) =
+                init_pkcs11_session(&device_type, self.token.as_deref(), &auth, &auth_method)?;
 
-            let (_public_key_bytes, keyid, algorithm) = if self.generate {
+            let (_public_key_bytes, keyid, algorithm, private_key_label) = if self.generate {
                 // Generate new key in device
                 let label = self.name.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("--name is required when generating a hardware key")
@@ -76,7 +77,9 @@ impl SigningKeysCreateCommand {
                 // Default to ECC P-256 (most widely supported)
                 let key_algorithm = KeyAlgorithm::EccP256;
 
-                generate_pkcs11_keypair(&session, label, &key_algorithm)?
+                let (pub_key, kid, algo) =
+                    generate_pkcs11_keypair(&session, label, &key_algorithm)?;
+                (pub_key, kid, algo, label.clone())
             } else if let Some(label) = &self.key_label {
                 // Reference existing key in device
                 find_existing_key(&session, label)?
@@ -89,14 +92,8 @@ impl SigningKeysCreateCommand {
             let token_info = _pkcs11.get_token_info(slot)?;
             let token_label = token_info.label();
 
-            // Build PKCS#11 URI
-            let object_label = self
-                .name
-                .as_ref()
-                .or(self.key_label.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("Name or key-label required"))?;
-
-            let pkcs11_uri = build_pkcs11_uri(token_label, object_label);
+            // Build PKCS#11 URI using the private key label (for signing operations)
+            let pkcs11_uri = build_pkcs11_uri(token_label, &private_key_label);
 
             (
                 keyid,
