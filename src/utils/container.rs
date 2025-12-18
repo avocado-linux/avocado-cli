@@ -267,6 +267,8 @@ impl SdkContainer {
         container_cmd.push(format!("AVOCADO_TARGET={}", config.target));
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_SDK_TARGET={}", config.target));
+        container_cmd.push("-e".to_string());
+        container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
 
         // Add signing-related environment variables
         if config.signing_socket_path.is_some() {
@@ -1053,6 +1055,8 @@ mod tests {
         assert!(cmd.contains(&"test-image".to_string()));
         assert!(cmd.contains(&"echo".to_string()));
         assert!(cmd.contains(&"test".to_string()));
+        // Verify AVOCADO_SRC_DIR is set
+        assert!(cmd.contains(&"AVOCADO_SRC_DIR=/opt/src".to_string()));
     }
 
     #[test]
