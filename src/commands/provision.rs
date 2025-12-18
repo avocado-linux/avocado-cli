@@ -51,7 +51,7 @@ impl ProvisionCommand {
             self.config.container_args.as_ref(),
         );
 
-        let runtime_provision_cmd = RuntimeProvisionCommand::new(
+        let mut runtime_provision_cmd = RuntimeProvisionCommand::new(
             crate::commands::runtime::provision::RuntimeProvisionConfig {
                 runtime_name: self.config.runtime.clone(),
                 config_path: self.config.config_path.clone(),

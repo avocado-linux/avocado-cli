@@ -2,10 +2,13 @@ use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    signing_service::{generate_helper_script, SigningService, SigningServiceConfig},
     target::resolve_target_required,
+    volume::VolumeManager,
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub struct RuntimeProvisionConfig {
     pub runtime_name: String,
@@ -22,14 +25,18 @@ pub struct RuntimeProvisionConfig {
 
 pub struct RuntimeProvisionCommand {
     config: RuntimeProvisionConfig,
+    signing_service: Option<SigningService>,
 }
 
 impl RuntimeProvisionCommand {
     pub fn new(config: RuntimeProvisionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            signing_service: None,
+        }
     }
 
-    pub async fn execute(&self) -> Result<()> {
+    pub async fn execute(&mut self) -> Result<()> {
         // Load configuration
         let config = load_config(&self.config.config_path)?;
         let content = std::fs::read_to_string(&self.config.config_path)?;
@@ -124,6 +131,9 @@ impl RuntimeProvisionCommand {
             Some(env_vars)
         };
 
+        // Check if runtime has signing configured
+        let signing_config = self.setup_signing_service(&config, &target_arch).await?;
+
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
 
@@ -134,7 +144,7 @@ impl RuntimeProvisionCommand {
             print_info("Executing provision script.", OutputLevel::Normal);
         }
 
-        let run_config = RunConfig {
+        let mut run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.clone(),
             command: provision_script,
@@ -149,10 +159,24 @@ impl RuntimeProvisionCommand {
             dnf_args: self.config.dnf_args.clone(),
             ..Default::default()
         };
+
+        // Add signing configuration to run_config if available
+        if let Some((socket_path, helper_script_path, key_name, checksum_algo)) = &signing_config {
+            run_config.signing_socket_path = Some(socket_path.clone());
+            run_config.signing_helper_script_path = Some(helper_script_path.clone());
+            run_config.signing_key_name = Some(key_name.clone());
+            run_config.signing_checksum_algorithm = Some(checksum_algo.clone());
+        }
+
         let provision_result = container_helper
             .run_in_container(run_config)
             .await
             .context("Failed to provision runtime")?;
+
+        // Shutdown signing service if it was started
+        if signing_config.is_some() {
+            self.cleanup_signing_service().await?;
+        }
 
         if !provision_result {
             return Err(anyhow::anyhow!("Failed to provision runtime"));
@@ -165,6 +189,119 @@ impl RuntimeProvisionCommand {
             ),
             OutputLevel::Normal,
         );
+        Ok(())
+    }
+
+    /// Setup signing service if signing is configured for the runtime
+    ///
+    /// Returns Some((socket_path, helper_script_path, key_name, checksum_algorithm)) if signing is enabled
+    async fn setup_signing_service(
+        &mut self,
+        config: &crate::utils::config::Config,
+        target_arch: &str,
+    ) -> Result<Option<(PathBuf, PathBuf, String, String)>> {
+        // Check if runtime has signing configuration
+        let signing_key_name = match config.get_runtime_signing_key(&self.config.runtime_name) {
+            Some(keyid) => {
+                // Get the key name from signing_keys mapping
+                let signing_keys = config.get_signing_keys();
+                signing_keys
+                    .and_then(|keys| {
+                        keys.iter()
+                            .find(|(_, v)| *v == &keyid)
+                            .map(|(k, _)| k.clone())
+                    })
+                    .context("Signing key ID not found in signing_keys mapping")?
+            }
+            None => {
+                // No signing configured for this runtime
+                if self.config.verbose {
+                    print_info(
+                        "No signing key configured for runtime. Signing service will not be started.",
+                        OutputLevel::Verbose,
+                    );
+                }
+                return Ok(None);
+            }
+        };
+
+        let keyid = config
+            .get_runtime_signing_key(&self.config.runtime_name)
+            .context("Failed to get signing key ID")?;
+
+        // Get checksum algorithm (defaults to sha256)
+        let checksum_str = config
+            .runtime
+            .as_ref()
+            .and_then(|r| r.get(&self.config.runtime_name))
+            .and_then(|rc| rc.signing.as_ref())
+            .map(|s| s.checksum_algorithm.as_str())
+            .unwrap_or("sha256");
+
+        // Get volume name
+        let volume_manager = VolumeManager::new("docker".to_string(), self.config.verbose);
+        let volume_state = volume_manager
+            .get_or_create_volume(&std::env::current_dir()?)
+            .await?;
+
+        // Create temporary directory for socket and helper script
+        let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+        let socket_path = temp_dir.path().join("sign.sock");
+        let helper_script_path = temp_dir.path().join("avocado-sign-request");
+
+        // Write helper script
+        let helper_script = generate_helper_script();
+        std::fs::write(&helper_script_path, helper_script)
+            .context("Failed to write helper script")?;
+
+        // Make helper script executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&helper_script_path, perms)
+                .context("Failed to set helper script permissions")?;
+        }
+
+        if self.config.verbose {
+            print_info(
+                &format!(
+                    "Starting signing service with key '{}' using {} checksums",
+                    signing_key_name, checksum_str
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        // Start signing service
+        let service_config = SigningServiceConfig {
+            socket_path: socket_path.clone(),
+            runtime_name: self.config.runtime_name.clone(),
+            target_arch: target_arch.to_string(),
+            key_name: signing_key_name.clone(),
+            keyid,
+            volume_name: volume_state.volume_name.clone(),
+            verbose: self.config.verbose,
+        };
+
+        let service = SigningService::start(service_config, temp_dir).await?;
+
+        // Store the service handle for cleanup
+        self.signing_service = Some(service);
+
+        Ok(Some((
+            socket_path,
+            helper_script_path,
+            signing_key_name,
+            checksum_str.to_string(),
+        )))
+    }
+
+    /// Cleanup signing service resources
+    async fn cleanup_signing_service(&mut self) -> Result<()> {
+        if let Some(service) = self.signing_service.take() {
+            service.shutdown().await?;
+        }
         Ok(())
     }
 

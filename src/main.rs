@@ -935,7 +935,7 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let provision_cmd = RuntimeProvisionCommand::new(
+                let mut provision_cmd = RuntimeProvisionCommand::new(
                     crate::commands::runtime::provision::RuntimeProvisionConfig {
                         runtime_name: runtime,
                         config_path: config,

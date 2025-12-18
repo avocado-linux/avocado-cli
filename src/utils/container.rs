@@ -32,6 +32,10 @@ pub struct RunConfig {
     pub runtime_sysroot: Option<String>,
     pub no_bootstrap: bool,
     pub disable_weak_dependencies: bool,
+    pub signing_socket_path: Option<PathBuf>,
+    pub signing_helper_script_path: Option<PathBuf>,
+    pub signing_key_name: Option<String>,
+    pub signing_checksum_algorithm: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -56,6 +60,10 @@ impl Default for RunConfig {
             runtime_sysroot: None,
             no_bootstrap: false,
             disable_weak_dependencies: false,
+            signing_socket_path: None,
+            signing_helper_script_path: None,
+            signing_key_name: None,
+            signing_checksum_algorithm: None,
         }
     }
 }
@@ -121,7 +129,7 @@ impl SdkContainer {
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
 
         // Build environment variables
-        let mut env_vars = config.env_vars.unwrap_or_default();
+        let mut env_vars = config.env_vars.clone().unwrap_or_default();
 
         // Set host platform environment variable
         let host_platform = if cfg!(target_os = "windows") {
@@ -172,18 +180,8 @@ impl SdkContainer {
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
         // Build container command with volume state
-        let container_cmd = self.build_container_command(
-            &config.container_image,
-            &bash_cmd,
-            &config.target,
-            &env_vars,
-            config.container_name.as_deref(),
-            config.detach,
-            config.rm,
-            config.interactive,
-            config.container_args.as_deref(),
-            &volume_state,
-        )?;
+        let container_cmd =
+            self.build_container_command(&config, &bash_cmd, &env_vars, &volume_state)?;
 
         // Execute the command
         self.execute_container_command(
@@ -195,34 +193,27 @@ impl SdkContainer {
     }
 
     /// Build the complete container command
-    #[allow(clippy::too_many_arguments)]
     fn build_container_command(
         &self,
-        container_image: &str,
+        config: &RunConfig,
         command: &[String],
-        target: &str,
         env_vars: &HashMap<String, String>,
-        container_name: Option<&str>,
-        detach: bool,
-        rm: bool,
-        interactive: bool,
-        container_args: Option<&[String]>,
         volume_state: &VolumeState,
     ) -> Result<Vec<String>> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
         // Container options
-        if rm {
+        if config.rm {
             container_cmd.push("--rm".to_string());
         }
-        if let Some(name) = container_name {
+        if let Some(name) = &config.container_name {
             container_cmd.push("--name".to_string());
             container_cmd.push(name.to_string());
         }
-        if detach {
+        if config.detach {
             container_cmd.push("-d".to_string());
         }
-        if interactive {
+        if config.interactive {
             container_cmd.push("-i".to_string());
             container_cmd.push("-t".to_string());
         }
@@ -233,6 +224,23 @@ impl SdkContainer {
         container_cmd.push(format!("{}:/opt/src:rw", src_path.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+
+        // Mount signing socket directory if provided
+        if let Some(socket_path) = &config.signing_socket_path {
+            if let Some(socket_dir) = socket_path.parent() {
+                container_cmd.push("-v".to_string());
+                container_cmd.push(format!("{}:/run/avocado:rw", socket_dir.display()));
+            }
+        }
+
+        // Mount signing helper script if provided
+        if let Some(helper_script_path) = &config.signing_helper_script_path {
+            container_cmd.push("-v".to_string());
+            container_cmd.push(format!(
+                "{}:/usr/local/bin/avocado-sign-request:ro",
+                helper_script_path.display()
+            ));
+        }
 
         // Mount signing keys directory if it exists (read-only for security)
         let signing_keys_env =
@@ -256,9 +264,27 @@ impl SdkContainer {
 
         // Add environment variables
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_TARGET={target}"));
+        container_cmd.push(format!("AVOCADO_TARGET={}", config.target));
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={target}"));
+        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", config.target));
+
+        // Add signing-related environment variables
+        if config.signing_socket_path.is_some() {
+            container_cmd.push("-e".to_string());
+            container_cmd.push("AVOCADO_SIGNING_SOCKET=/run/avocado/sign.sock".to_string());
+            container_cmd.push("-e".to_string());
+            container_cmd.push("AVOCADO_SIGNING_ENABLED=1".to_string());
+        }
+
+        if let Some(key_name) = &config.signing_key_name {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(format!("AVOCADO_SIGNING_KEY_NAME={}", key_name));
+        }
+
+        if let Some(checksum_algo) = &config.signing_checksum_algorithm {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(format!("AVOCADO_SIGNING_CHECKSUM={}", checksum_algo));
+        }
 
         // Add signing keys directory env var if mounted
         if let Some(keys_dir) = signing_keys_env {
@@ -272,14 +298,14 @@ impl SdkContainer {
         }
 
         // Add additional container arguments if provided
-        if let Some(args) = container_args {
+        if let Some(args) = &config.container_args {
             for arg in args {
                 container_cmd.extend(Self::parse_container_arg(arg));
             }
         }
 
         // Add the container image
-        container_cmd.push(container_image.to_string());
+        container_cmd.push(config.container_image.to_string());
 
         // Add the command to execute
         container_cmd.extend(command.iter().cloned());
@@ -294,7 +320,7 @@ impl SdkContainer {
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
 
         // Build environment variables
-        let mut env_vars = config.env_vars.unwrap_or_default();
+        let mut env_vars = config.env_vars.clone().unwrap_or_default();
 
         // Set host platform environment variable
         let host_platform = if cfg!(target_os = "windows") {
@@ -345,18 +371,8 @@ impl SdkContainer {
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
         // Build container command with volume state
-        let container_cmd = self.build_container_command(
-            &config.container_image,
-            &bash_cmd,
-            &config.target,
-            &env_vars,
-            config.container_name.as_deref(),
-            false, // Never detach when capturing output
-            config.rm,
-            false, // Never interactive when capturing output
-            config.container_args.as_deref(),
-            &volume_state,
-        )?;
+        let container_cmd =
+            self.build_container_command(&config, &bash_cmd, &env_vars, &volume_state)?;
 
         if config.verbose || self.verbose {
             print_info(
@@ -1001,18 +1017,33 @@ mod tests {
         let env_vars = HashMap::new();
         let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
 
-        let result = container.build_container_command(
-            "test-image",
-            &command,
-            "test-target",
-            &env_vars,
-            None,
-            false,
-            true,
-            false,
-            None,
-            &volume_state,
-        );
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "test-target".to_string(),
+            command: "".to_string(),
+            container_name: None,
+            detach: false,
+            rm: true,
+            env_vars: None,
+            verbose: false,
+            source_environment: false,
+            use_entrypoint: false,
+            interactive: false,
+            repo_url: None,
+            repo_release: None,
+            container_args: None,
+            dnf_args: None,
+            extension_sysroot: None,
+            runtime_sysroot: None,
+            no_bootstrap: false,
+            disable_weak_dependencies: false,
+            signing_socket_path: None,
+            signing_helper_script_path: None,
+            signing_key_name: None,
+            signing_checksum_algorithm: None,
+        };
+
+        let result = container.build_container_command(&config, &command, &env_vars, &volume_state);
 
         assert!(result.is_ok());
         let cmd = result.unwrap();
