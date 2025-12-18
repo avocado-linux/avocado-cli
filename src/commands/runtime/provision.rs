@@ -139,10 +139,7 @@ impl RuntimeProvisionCommand {
 
         // Set AVOCADO_DISTRO_VERSION if configured
         if let Some(distro_version) = config.get_distro_version() {
-            env_vars.insert(
-                "AVOCADO_DISTRO_VERSION".to_string(),
-                distro_version.clone(),
-            );
+            env_vars.insert("AVOCADO_DISTRO_VERSION".to_string(), distro_version.clone());
         }
 
         // Determine state file path and container location if a provision profile is set
@@ -187,7 +184,7 @@ impl RuntimeProvisionCommand {
             };
 
         // Check if runtime has signing configured
-        let signing_config = self.setup_signing_service(&config, &target_arch).await?;
+        let signing_config = self.setup_signing_service(&config).await?;
 
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
@@ -270,7 +267,6 @@ impl RuntimeProvisionCommand {
     async fn setup_signing_service(
         &mut self,
         config: &crate::utils::config::Config,
-        target_arch: &str,
     ) -> Result<Option<(PathBuf, PathBuf, String, String)>> {
         // Check if runtime has signing configuration
         let signing_key_name = match config.get_runtime_signing_key(&self.config.runtime_name) {
@@ -344,7 +340,6 @@ impl RuntimeProvisionCommand {
         let service_config = SigningServiceConfig {
             socket_path: socket_path.clone(),
             runtime_name: self.config.runtime_name.clone(),
-            target_arch: target_arch.to_string(),
             key_name: signing_key_name.clone(),
             keyid,
             verbose: self.config.verbose,

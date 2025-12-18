@@ -121,10 +121,7 @@ impl RuntimeBuildCommand {
 
         // Set AVOCADO_DISTRO_VERSION if configured
         if let Some(distro_version) = config.get_distro_version() {
-            env_vars.insert(
-                "AVOCADO_DISTRO_VERSION".to_string(),
-                distro_version.clone(),
-            );
+            env_vars.insert("AVOCADO_DISTRO_VERSION".to_string(), distro_version.clone());
         }
 
         let env_vars = if env_vars.is_empty() {

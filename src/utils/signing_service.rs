@@ -54,8 +54,6 @@ pub struct SigningServiceConfig {
     pub socket_path: PathBuf,
     /// Name of the runtime being provisioned
     pub runtime_name: String,
-    /// Target architecture
-    pub target_arch: String,
     /// Signing key name to use
     pub key_name: String,
     /// Signing key ID
