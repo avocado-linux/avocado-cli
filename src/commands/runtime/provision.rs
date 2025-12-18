@@ -125,6 +125,12 @@ impl RuntimeProvisionCommand {
             env_vars.insert("AVOCADO_STONE_MANIFEST".to_string(), stone_manifest);
         }
 
+        // Set AVOCADO_RUNTIME_BUILD_DIR
+        env_vars.insert(
+            "AVOCADO_RUNTIME_BUILD_DIR".to_string(),
+            format!("/opt/_avocado/{}/runtimes/{}", target_arch, self.config.runtime_name),
+        );
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {

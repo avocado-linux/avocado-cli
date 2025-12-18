@@ -48,6 +48,14 @@ fi
 
 ## Environment Variables
 
+### General Variables
+- `$AVOCADO_RUNTIME_BUILD_DIR` - Full path to runtime build directory (e.g., `/opt/_avocado/x86_64/runtimes/<runtime-name>`)
+- `$AVOCADO_EXT_LIST` - Space-separated list of required extensions
+- `$AVOCADO_PROVISION_OUT` - Output directory (if `--out` specified)
+- `$AVOCADO_STONE_INCLUDE_PATHS` - Stone include paths (if configured)
+- `$AVOCADO_STONE_MANIFEST` - Stone manifest path (if configured)
+
+### Signing Variables
 - `$AVOCADO_SIGNING_ENABLED` - Set to "1" when available
 - `$AVOCADO_SIGNING_KEY_NAME` - Key name being used
 - `$AVOCADO_SIGNING_CHECKSUM` - Algorithm (sha256/blake3)
@@ -82,7 +90,8 @@ Binary must be in one of these locations:
 
 set -e
 
-RUNTIME_DIR="/opt/_avocado/x86_64/runtimes/my-runtime"
+# Use the runtime build directory variable
+RUNTIME_DIR="$AVOCADO_RUNTIME_BUILD_DIR"
 
 # Build binary
 make firmware.bin

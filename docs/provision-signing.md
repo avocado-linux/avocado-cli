@@ -109,6 +109,18 @@ fi
 
 ## Environment Variables
 
+### General Environment Variables
+
+The following environment variables are available in provision and build scripts:
+
+- `AVOCADO_RUNTIME_BUILD_DIR`: Full path to the runtime build directory (e.g., `/opt/_avocado/x86_64/runtimes/<runtime-name>`)
+- `AVOCADO_EXT_LIST`: Space-separated list of extensions required by the runtime (if any)
+- `AVOCADO_PROVISION_OUT`: Output directory path in the container (if `--out` flag is specified)
+- `AVOCADO_STONE_INCLUDE_PATHS`: Stone include paths (if configured for the runtime)
+- `AVOCADO_STONE_MANIFEST`: Stone manifest path (if configured for the runtime)
+
+### Signing-Related Environment Variables
+
 The following environment variables are available in the container when signing is enabled:
 
 - `AVOCADO_SIGNING_ENABLED`: Set to `1` when signing is available
