@@ -102,6 +102,29 @@ impl RuntimeProvisionCommand {
             );
         }
 
+        // Set AVOCADO_VERBOSE=1 when verbose mode is enabled
+        if self.config.verbose {
+            env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
+        }
+
+        // Set standard avocado environment variables for provision scripts
+        // AVOCADO_TARGET - Used for all bundle.manifest.[].target values
+        env_vars.insert("AVOCADO_TARGET".to_string(), target_arch.clone());
+
+        // AVOCADO_RUNTIME_NAME - Runtime name (e.g., "dev")
+        env_vars.insert(
+            "AVOCADO_RUNTIME_NAME".to_string(),
+            self.config.runtime_name.clone(),
+        );
+
+        // AVOCADO_RUNTIME_VERSION - Runtime version from distro.version (e.g., "0.1.0")
+        if let Some(distro_version) = config.get_distro_version() {
+            env_vars.insert(
+                "AVOCADO_RUNTIME_VERSION".to_string(),
+                distro_version.clone(),
+            );
+        }
+
         // Set AVOCADO_PROVISION_OUT if --out is specified
         if let Some(out_path) = &self.config.out {
             // Construct the absolute path from the container's perspective

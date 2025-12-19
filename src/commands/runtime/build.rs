@@ -93,6 +93,12 @@ impl RuntimeBuildCommand {
 
         // Get stone include paths if configured
         let mut env_vars = std::collections::HashMap::new();
+
+        // Set AVOCADO_VERBOSE=1 when verbose mode is enabled
+        if self.verbose {
+            env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
+        }
+
         if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
             &target_arch,
