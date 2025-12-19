@@ -48,19 +48,23 @@ impl SdkInstallCommand {
 
     /// Execute the sdk install command
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration
-        let config = Config::load(&self.config_path)
+        // Early target validation - load basic config first
+        let basic_config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        let target = validate_and_log_target(self.target.as_deref(), &basic_config)?;
 
-        // Early target validation and logging - fail fast if target is unsupported
-        let target = validate_and_log_target(self.target.as_deref(), &config)?;
+        // Load the composed configuration (merges external configs, applies interpolation)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+
+        let config = &composed.config;
 
         // Merge container args from config with CLI args
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
-        // Read the config file content for extension parsing
-        let config_content = std::fs::read_to_string(&self.config_path)
-            .with_context(|| format!("Failed to read config file {}", self.config_path))?;
+        // Serialize the merged config back to string for extension parsing methods
+        let config_content = serde_yaml::to_string(&composed.merged_value)
+            .with_context(|| "Failed to serialize composed config")?;
 
         // Get the SDK image from configuration
         let container_image = config.get_sdk_image().ok_or_else(|| {
@@ -69,13 +73,12 @@ impl SdkInstallCommand {
 
         print_info("Installing SDK dependencies.", OutputLevel::Normal);
 
-        // Get SDK dependencies with target interpolation
-        // This re-parses the config to interpolate {{ avocado.target }} templates
+        // Get SDK dependencies from the composed config (already has external deps merged)
         let sdk_dependencies = config
             .get_sdk_dependencies_for_target(&self.config_path, &target)
             .with_context(|| "Failed to get SDK dependencies with target interpolation")?;
 
-        // Get extension SDK dependencies (including nested ones with target-specific dependencies)
+        // Get extension SDK dependencies (from the composed, interpolated config)
         let extension_sdk_dependencies = config
             .get_extension_sdk_dependencies_with_config_path_and_target(
                 &config_content,
@@ -93,7 +96,7 @@ impl SdkInstallCommand {
 
         // Use the container helper to run the installation
         let container_helper =
-            SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
         // Install SDK dependencies (into SDK)
         let mut sdk_packages = Vec::new();

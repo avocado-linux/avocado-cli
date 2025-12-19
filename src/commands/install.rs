@@ -6,7 +6,7 @@ use crate::commands::{
     ext::ExtInstallCommand, runtime::RuntimeInstallCommand, sdk::SdkInstallCommand,
 };
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::SdkContainer,
     output::{print_info, print_success, OutputLevel},
     target::validate_and_log_target,
@@ -65,16 +65,17 @@ impl InstallCommand {
 
     /// Execute the install command
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration to check what components exist
-        let config = Config::load(&self.config_path)
+        // Early target validation - load basic config first to validate target
+        let basic_config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        let _target = validate_and_log_target(self.target.as_deref(), &basic_config)?;
 
-        // Early target validation and logging - fail fast if target is unsupported
-        let _target = validate_and_log_target(self.target.as_deref(), &config)?;
+        // Load the composed configuration (merges external configs, applies interpolation)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
 
-        // Parse the configuration file for runtime/extension analysis
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         print_info(
             "Starting comprehensive install process...",
@@ -103,8 +104,7 @@ impl InstallCommand {
         );
 
         // Determine which extensions to install based on runtime dependencies and target
-        let extensions_to_install =
-            self.find_required_extensions(&config, &self.config_path, &_target)?;
+        let extensions_to_install = self.find_required_extensions(&composed, &_target)?;
 
         if !extensions_to_install.is_empty() {
             for extension_dep in &extensions_to_install {
@@ -144,7 +144,7 @@ impl InstallCommand {
                         }
 
                         // Install external extension to ${AVOCADO_PREFIX}/extensions/<ext_name>
-                        self.install_external_extension(&config, &self.config_path, name, ext_config_path, &_target).await.with_context(|| {
+                        self.install_external_extension(config, &self.config_path, name, ext_config_path, &_target).await.with_context(|| {
                             format!("Failed to install external extension '{name}' from config '{ext_config_path}'")
                         })?;
                     }
@@ -159,7 +159,7 @@ impl InstallCommand {
                         }
 
                         // Install versioned extension to its own sysroot
-                        self.install_versioned_extension(&config, name, version, &_target).await.with_context(|| {
+                        self.install_versioned_extension(config, name, version, &_target).await.with_context(|| {
                             format!("Failed to install versioned extension '{name}' version '{version}'")
                         })?;
                     }
@@ -170,7 +170,7 @@ impl InstallCommand {
         }
 
         // 3. Install runtime dependencies (filtered by target)
-        let target_runtimes = self.find_target_relevant_runtimes(&config, &parsed, &_target)?;
+        let target_runtimes = self.find_target_relevant_runtimes(config, parsed, &_target)?;
 
         if target_runtimes.is_empty() {
             print_info(
@@ -226,8 +226,7 @@ impl InstallCommand {
     /// Find all extensions required by the runtime/target, or all extensions if no runtime/target specified
     fn find_required_extensions(
         &self,
-        config: &Config,
-        config_path: &str,
+        composed: &ComposedConfig,
         target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
         use std::collections::HashSet;
@@ -235,12 +234,12 @@ impl InstallCommand {
         let mut required_extensions = HashSet::new();
         let mut visited = HashSet::new(); // For cycle detection
 
-        // Read and parse the configuration file
-        let content = std::fs::read_to_string(config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
+        let config_path = &composed.config_path;
 
         // First, find which runtimes are relevant for this target
-        let target_runtimes = self.find_target_relevant_runtimes(config, &parsed, target)?;
+        let target_runtimes = self.find_target_relevant_runtimes(config, parsed, target)?;
 
         if target_runtimes.is_empty() {
             if self.verbose {
@@ -615,12 +614,21 @@ impl InstallCommand {
                 )
             })?;
 
-        // Process the extension's dependencies (packages, not extension dependencies)
+        // First, install SDK dependencies from the external extension's config
+        self.install_external_extension_sdk_deps(
+            config,
+            base_config_path,
+            external_config_path,
+            target,
+        )
+        .await?;
+
+        // Process the extension's dependencies (packages, not extension or compile dependencies)
         if let Some(serde_yaml::Value::Mapping(deps_map)) = extension_config.get("dependencies") {
             if !deps_map.is_empty() {
                 let mut packages = Vec::new();
 
-                // Process package dependencies (not extension dependencies)
+                // Process package dependencies (not extension or compile dependencies)
                 for (package_name_val, version_spec) in deps_map {
                     // Convert package name from Value to String
                     let package_name = match package_name_val.as_str() {
@@ -628,37 +636,46 @@ impl InstallCommand {
                         None => continue, // Skip if package name is not a string
                     };
 
-                    // Skip extension dependencies (they have "ext" field) - these are handled separately
+                    // Skip non-package dependencies (extension or compile dependencies)
                     if let serde_yaml::Value::Mapping(spec_map) = version_spec {
-                        if spec_map.contains_key(serde_yaml::Value::String("ext".to_string())) {
-                            continue; // Skip extension dependencies - they're handled by the recursive logic
+                        // Skip extension dependencies (they have "ext" field) - handled by recursive logic
+                        if spec_map.get("ext").is_some() {
+                            continue;
+                        }
+                        // Skip compile dependencies (they have "compile" field) - SDK-compiled, not from repo
+                        if spec_map.get("compile").is_some() {
+                            if self.verbose {
+                                print_info(
+                                    &format!("Skipping compile dependency '{package_name}' (SDK-compiled, not from repo)"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                            continue;
                         }
                     }
 
-                    // Process package dependencies only
-                    let package_name_and_version = if version_spec.as_str().is_some() {
-                        let version = version_spec.as_str().unwrap();
-                        if version == "*" {
-                            package_name.to_string()
-                        } else {
-                            format!("{package_name}-{version}")
-                        }
-                    } else if let serde_yaml::Value::Mapping(spec_map) = version_spec {
-                        if let Some(version) = spec_map.get("version") {
-                            let version = version.as_str().unwrap_or("*");
+                    // Process package dependencies only (simple string versions or version objects)
+                    match version_spec {
+                        serde_yaml::Value::String(version) => {
                             if version == "*" {
-                                package_name.to_string()
+                                packages.push(package_name.to_string());
                             } else {
-                                format!("{package_name}-{version}")
+                                packages.push(format!("{package_name}-{version}"));
                             }
-                        } else {
-                            package_name.to_string()
                         }
-                    } else {
-                        package_name.to_string()
-                    };
-
-                    packages.push(package_name_and_version);
+                        serde_yaml::Value::Mapping(spec_map) => {
+                            // Only process if it has a "version" key (already checked it doesn't have ext/compile)
+                            if let Some(version) = spec_map.get("version").and_then(|v| v.as_str())
+                            {
+                                if version == "*" {
+                                    packages.push(package_name.to_string());
+                                } else {
+                                    packages.push(format!("{package_name}-{version}"));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
 
                 if !packages.is_empty() {
@@ -887,6 +904,189 @@ $DNF_SDK_HOST \
                 "Successfully installed versioned extension '{extension_name}' {version_msg}."
             ),
             crate::utils::output::OutputLevel::Normal,
+        );
+
+        Ok(())
+    }
+
+    /// Install SDK dependencies from an external extension's config
+    async fn install_external_extension_sdk_deps(
+        &self,
+        config: &Config,
+        base_config_path: &str,
+        external_config_path: &str,
+        target: &str,
+    ) -> Result<()> {
+        // Resolve the external config path
+        let resolved_external_config_path =
+            config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
+
+        // Load the external config
+        let external_config_content = std::fs::read_to_string(&resolved_external_config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to read external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+        let mut external_config: serde_yaml::Value = serde_yaml::from_str(&external_config_content)
+            .with_context(|| {
+                format!(
+                    "Failed to parse external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Apply interpolation to the external config
+        // This resolves templates like {{ config.distro.version }}
+        crate::utils::interpolation::interpolate_config(&mut external_config, Some(target))
+            .with_context(|| {
+                format!(
+                    "Failed to interpolate external config file: {}",
+                    resolved_external_config_path.display()
+                )
+            })?;
+
+        // Check if the external config has SDK dependencies
+        let sdk_deps = external_config
+            .get("sdk")
+            .and_then(|sdk| sdk.get("dependencies"))
+            .and_then(|deps| deps.as_mapping());
+
+        let Some(sdk_deps_map) = sdk_deps else {
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "No SDK dependencies found in external config '{external_config_path}'"
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        };
+
+        // Build list of SDK packages to install
+        let mut sdk_packages = Vec::new();
+        for (pkg_name_val, version_spec) in sdk_deps_map {
+            let pkg_name = match pkg_name_val.as_str() {
+                Some(name) => name,
+                None => continue,
+            };
+
+            match version_spec {
+                serde_yaml::Value::String(version) => {
+                    if version == "*" {
+                        sdk_packages.push(pkg_name.to_string());
+                    } else {
+                        sdk_packages.push(format!("{pkg_name}-{version}"));
+                    }
+                }
+                serde_yaml::Value::Mapping(spec_map) => {
+                    if let Some(version) = spec_map.get("version").and_then(|v| v.as_str()) {
+                        if version == "*" {
+                            sdk_packages.push(pkg_name.to_string());
+                        } else {
+                            sdk_packages.push(format!("{pkg_name}-{version}"));
+                        }
+                    } else {
+                        sdk_packages.push(pkg_name.to_string());
+                    }
+                }
+                _ => {
+                    sdk_packages.push(pkg_name.to_string());
+                }
+            }
+        }
+
+        if sdk_packages.is_empty() {
+            return Ok(());
+        }
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Installing {} SDK dependencies from external config '{external_config_path}': {}",
+                    sdk_packages.len(),
+                    sdk_packages.join(", ")
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        // Get container configuration
+        let container_image = config.get_sdk_image().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+        })?;
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+
+        let container_helper =
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+
+        // Build DNF install command for SDK dependencies
+        // Use the same pattern as sdk/install.rs
+        let yes = if self.force { "-y" } else { "" };
+        let dnf_args_str = if let Some(args) = &self.dnf_args {
+            format!(" {} ", args.join(" "))
+        } else {
+            String::new()
+        };
+
+        let install_command = format!(
+            r#"
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_REPO_CONF \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
+    {} \
+    install \
+    {} \
+    {}
+"#,
+            dnf_args_str,
+            yes,
+            sdk_packages.join(" ")
+        );
+
+        if self.verbose {
+            print_info(
+                &format!("Running SDK install command: {install_command}"),
+                OutputLevel::Normal,
+            );
+        }
+
+        let run_config = crate::utils::container::RunConfig {
+            container_image: container_image.clone(),
+            target: target.to_string(),
+            command: install_command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: !self.force,
+            repo_url,
+            repo_release,
+            container_args: merged_container_args,
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        let success = container_helper.run_in_container(run_config).await?;
+
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to install SDK dependencies from external config '{external_config_path}'"
+            ));
+        }
+
+        print_info(
+            &format!(
+                "Installed {} SDK dependencies from external config '{external_config_path}'.",
+                sdk_packages.len()
+            ),
+            OutputLevel::Normal,
         );
 
         Ok(())

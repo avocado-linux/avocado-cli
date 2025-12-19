@@ -65,27 +65,30 @@ impl BuildCommand {
 
     /// Execute the build command
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration and parse raw TOML
-        let config = Config::load(&self.config_path)
+        // Early target validation - load basic config first
+        let basic_config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
-
-        // Early target validation and logging - fail fast if target is unsupported
         let target =
-            crate::utils::target::validate_and_log_target(self.target.as_deref(), &config)?;
+            crate::utils::target::validate_and_log_target(self.target.as_deref(), &basic_config)?;
+
+        // Load the composed configuration (merges external configs, applies interpolation)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // If a specific extension is requested, build only that extension
         if let Some(ref ext_name) = self.extension {
             return self
-                .build_single_extension(&config, &parsed, ext_name, &target)
+                .build_single_extension(config, parsed, ext_name, &target)
                 .await;
         }
 
         // If a specific runtime is requested, build only that runtime and its dependencies
         if let Some(ref runtime_name) = self.runtime {
             return self
-                .build_single_runtime(&config, &parsed, runtime_name, &target)
+                .build_single_runtime(config, parsed, runtime_name, &target)
                 .await;
         }
 
@@ -95,7 +98,7 @@ impl BuildCommand {
         );
 
         // Determine which runtimes to build based on target
-        let runtimes_to_build = self.get_runtimes_to_build(&config, &parsed, &target)?;
+        let runtimes_to_build = self.get_runtimes_to_build(config, parsed, &target)?;
 
         if runtimes_to_build.is_empty() {
             print_info("No runtimes found to build.", OutputLevel::Normal);
@@ -105,7 +108,7 @@ impl BuildCommand {
         // Step 1: Analyze dependencies
         print_info("Step 1/4: Analyzing dependencies", OutputLevel::Normal);
         let required_extensions =
-            self.find_required_extensions(&config, &parsed, &runtimes_to_build, &target)?;
+            self.find_required_extensions(config, parsed, &runtimes_to_build, &target)?;
 
         // Note: SDK compile sections are now compiled on-demand when extensions are built
         // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
@@ -147,17 +150,17 @@ impl BuildCommand {
                         }
 
                         // Build external extension using its own config
-                        self.build_external_extension(&config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
+                        self.build_external_extension(config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
                             format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
                         })?;
 
                         // Create images for external extension
-                        self.create_external_extension_images(&config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
+                        self.create_external_extension_images(config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
                             format!("Failed to create images for external extension '{name}' from config '{ext_config_path}'")
                         })?;
 
                         // Copy external extension images to output directory so runtime build can find them
-                        self.copy_external_extension_images(&config, name, &target)
+                        self.copy_external_extension_images(config, name, &target)
                             .await
                             .with_context(|| {
                                 format!("Failed to copy images for external extension '{name}'")

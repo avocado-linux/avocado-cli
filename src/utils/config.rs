@@ -112,6 +112,25 @@ pub enum ExtensionLocation {
     External { name: String, config_path: String },
 }
 
+/// A composed configuration that merges the main config with external extension configs.
+///
+/// This struct provides a unified view where:
+/// - `distro`, `default_target`, `supported_targets` come from the main config only
+/// - `ext` sections are merged from both main and external configs
+/// - `sdk.dependencies` and `sdk.compile` are merged from both main and external configs
+///
+/// Interpolation is applied after merging, so external configs can reference
+/// `{{ config.distro.version }}` and resolve to the main config's values.
+#[derive(Debug, Clone)]
+pub struct ComposedConfig {
+    /// The base Config (deserialized from the merged YAML)
+    pub config: Config,
+    /// The merged YAML value (with external configs merged in, after interpolation)
+    pub merged_value: serde_yaml::Value,
+    /// The path to the main config file
+    pub config_path: String,
+}
+
 /// Configuration error type
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -333,6 +352,336 @@ impl Config {
             .with_context(|| "Failed to interpolate configuration values")?;
 
         Ok(parsed)
+    }
+
+    /// Load a composed configuration that merges the main config with external extension configs.
+    ///
+    /// This method:
+    /// 1. Loads the main config (raw, without interpolation)
+    /// 2. Discovers all external config references in runtime and ext dependencies
+    /// 3. Loads each external config (raw)
+    /// 4. Merges external `ext.*`, `sdk.dependencies`, and `sdk.compile` sections
+    /// 5. Applies interpolation to the composed model
+    ///
+    /// The `distro`, `default_target`, and `supported_targets` sections come from the main config only,
+    /// allowing external configs to reference `{{ config.distro.version }}` and resolve to main config values.
+    pub fn load_composed<P: AsRef<Path>>(
+        config_path: P,
+        target: Option<&str>,
+    ) -> Result<ComposedConfig> {
+        let path = config_path.as_ref();
+        let config_path_str = path.to_string_lossy().to_string();
+
+        // Load main config content (raw, no interpolation yet)
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let mut main_config = Self::parse_config_value(&config_path_str, &content)?;
+
+        // Discover all external config references
+        let external_refs = Self::discover_external_config_refs(&main_config);
+
+        // Load and merge each external config
+        for (ext_name, external_config_path) in &external_refs {
+            // Resolve the external config path relative to the main config's directory
+            let main_config_dir = path.parent().unwrap_or(Path::new("."));
+            let resolved_path = main_config_dir.join(external_config_path);
+
+            if !resolved_path.exists() {
+                // Skip non-existent external configs with a warning (they may be optional)
+                continue;
+            }
+
+            // Load external config (raw)
+            let external_content = fs::read_to_string(&resolved_path).with_context(|| {
+                format!(
+                    "Failed to read external config: {}",
+                    resolved_path.display()
+                )
+            })?;
+            let external_config = Self::parse_config_value(
+                resolved_path.to_str().unwrap_or(external_config_path),
+                &external_content,
+            )?;
+
+            // Merge external config into main config
+            Self::merge_external_config(&mut main_config, &external_config, ext_name);
+        }
+
+        // Apply interpolation to the composed model
+        crate::utils::interpolation::interpolate_config(&mut main_config, target)
+            .with_context(|| "Failed to interpolate composed configuration")?;
+
+        // Deserialize the merged config into the Config struct
+        let config: Config = serde_yaml::from_value(main_config.clone())
+            .with_context(|| "Failed to deserialize composed configuration")?;
+
+        Ok(ComposedConfig {
+            config,
+            merged_value: main_config,
+            config_path: config_path_str,
+        })
+    }
+
+    /// Discover all external config references in runtime and ext dependencies.
+    ///
+    /// Scans these locations:
+    /// - `runtime.<name>.dependencies.<dep>.config`
+    /// - `runtime.<name>.<target>.dependencies.<dep>.config`
+    /// - `ext.<name>.dependencies.<dep>.config`
+    ///
+    /// Returns a list of (extension_name, config_path) tuples.
+    fn discover_external_config_refs(config: &serde_yaml::Value) -> Vec<(String, String)> {
+        let mut refs = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+
+        // Scan runtime dependencies
+        if let Some(runtime_section) = config.get("runtime").and_then(|r| r.as_mapping()) {
+            for (_runtime_name, runtime_config) in runtime_section {
+                Self::collect_external_refs_from_dependencies(
+                    runtime_config,
+                    &mut refs,
+                    &mut visited,
+                );
+
+                // Also check target-specific sections within runtime
+                if let Some(runtime_table) = runtime_config.as_mapping() {
+                    for (key, value) in runtime_table {
+                        // Skip known non-target keys
+                        if let Some(key_str) = key.as_str() {
+                            if ![
+                                "dependencies",
+                                "target",
+                                "stone_include_paths",
+                                "stone_manifest",
+                                "signing",
+                            ]
+                            .contains(&key_str)
+                            {
+                                // This might be a target-specific section
+                                Self::collect_external_refs_from_dependencies(
+                                    value,
+                                    &mut refs,
+                                    &mut visited,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan ext dependencies
+        if let Some(ext_section) = config.get("ext").and_then(|e| e.as_mapping()) {
+            for (_ext_name, ext_config) in ext_section {
+                Self::collect_external_refs_from_dependencies(ext_config, &mut refs, &mut visited);
+
+                // Also check target-specific sections within ext
+                if let Some(ext_table) = ext_config.as_mapping() {
+                    for (key, value) in ext_table {
+                        // Skip known non-target keys
+                        if let Some(key_str) = key.as_str() {
+                            if ![
+                                "version",
+                                "release",
+                                "summary",
+                                "description",
+                                "license",
+                                "url",
+                                "vendor",
+                                "types",
+                                "packages",
+                                "dependencies",
+                                "sdk",
+                                "enable_services",
+                                "on_merge",
+                                "sysusers",
+                                "kernel_modules",
+                                "reload_service_manager",
+                                "ld_so_conf_d",
+                                "confext",
+                                "sysext",
+                                "overlay",
+                            ]
+                            .contains(&key_str)
+                            {
+                                // This might be a target-specific section
+                                Self::collect_external_refs_from_dependencies(
+                                    value,
+                                    &mut refs,
+                                    &mut visited,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        refs
+    }
+
+    /// Collect external config references from a dependencies section.
+    fn collect_external_refs_from_dependencies(
+        section: &serde_yaml::Value,
+        refs: &mut Vec<(String, String)>,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
+        let dependencies = section.get("dependencies").and_then(|d| d.as_mapping());
+
+        if let Some(deps_map) = dependencies {
+            for (_dep_name, dep_spec) in deps_map {
+                if let Some(spec_map) = dep_spec.as_mapping() {
+                    // Check for external extension reference
+                    if let (Some(ext_name), Some(config_path)) = (
+                        spec_map.get("ext").and_then(|v| v.as_str()),
+                        spec_map.get("config").and_then(|v| v.as_str()),
+                    ) {
+                        let key = format!("{}:{}", ext_name, config_path);
+                        if !visited.contains(&key) {
+                            visited.insert(key);
+                            refs.push((ext_name.to_string(), config_path.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge an external config into the main config.
+    ///
+    /// Merges:
+    /// - `ext.*` sections (external extensions added to main ext section)
+    /// - `sdk.dependencies` (merged, main takes precedence on conflicts)
+    /// - `sdk.compile` (merged, main takes precedence on conflicts)
+    ///
+    /// Does NOT merge:
+    /// - `distro` (main config only)
+    /// - `default_target` (main config only)
+    /// - `supported_targets` (main config only)
+    fn merge_external_config(
+        main_config: &mut serde_yaml::Value,
+        external_config: &serde_yaml::Value,
+        _ext_name: &str,
+    ) {
+        // Merge ext sections
+        if let Some(external_ext) = external_config.get("ext").and_then(|e| e.as_mapping()) {
+            let main_ext = main_config
+                .as_mapping_mut()
+                .and_then(|m| {
+                    if !m.contains_key(serde_yaml::Value::String("ext".to_string())) {
+                        m.insert(
+                            serde_yaml::Value::String("ext".to_string()),
+                            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                        );
+                    }
+                    m.get_mut(serde_yaml::Value::String("ext".to_string()))
+                })
+                .and_then(|e| e.as_mapping_mut());
+
+            if let Some(main_ext_map) = main_ext {
+                for (ext_key, ext_value) in external_ext {
+                    // Only add if not already present in main config
+                    if !main_ext_map.contains_key(ext_key) {
+                        main_ext_map.insert(ext_key.clone(), ext_value.clone());
+                    }
+                }
+            }
+        }
+
+        // Merge sdk.dependencies
+        if let Some(external_sdk_deps) = external_config
+            .get("sdk")
+            .and_then(|s| s.get("dependencies"))
+            .and_then(|d| d.as_mapping())
+        {
+            Self::ensure_sdk_dependencies_section(main_config);
+
+            if let Some(main_sdk_deps) = main_config
+                .get_mut("sdk")
+                .and_then(|s| s.get_mut("dependencies"))
+                .and_then(|d| d.as_mapping_mut())
+            {
+                for (dep_key, dep_value) in external_sdk_deps {
+                    // Only add if not already present (main takes precedence)
+                    if !main_sdk_deps.contains_key(dep_key) {
+                        main_sdk_deps.insert(dep_key.clone(), dep_value.clone());
+                    }
+                }
+            }
+        }
+
+        // Merge sdk.compile
+        if let Some(external_sdk_compile) = external_config
+            .get("sdk")
+            .and_then(|s| s.get("compile"))
+            .and_then(|c| c.as_mapping())
+        {
+            Self::ensure_sdk_compile_section(main_config);
+
+            if let Some(main_sdk_compile) = main_config
+                .get_mut("sdk")
+                .and_then(|s| s.get_mut("compile"))
+                .and_then(|c| c.as_mapping_mut())
+            {
+                for (compile_key, compile_value) in external_sdk_compile {
+                    // Only add if not already present (main takes precedence)
+                    if !main_sdk_compile.contains_key(compile_key) {
+                        main_sdk_compile.insert(compile_key.clone(), compile_value.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure the sdk.dependencies section exists in the config.
+    fn ensure_sdk_dependencies_section(config: &mut serde_yaml::Value) {
+        if let Some(main_map) = config.as_mapping_mut() {
+            // Ensure sdk section exists
+            if !main_map.contains_key(serde_yaml::Value::String("sdk".to_string())) {
+                main_map.insert(
+                    serde_yaml::Value::String("sdk".to_string()),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                );
+            }
+
+            // Ensure sdk.dependencies section exists
+            if let Some(sdk) = main_map.get_mut(serde_yaml::Value::String("sdk".to_string())) {
+                if let Some(sdk_map) = sdk.as_mapping_mut() {
+                    if !sdk_map.contains_key(serde_yaml::Value::String("dependencies".to_string()))
+                    {
+                        sdk_map.insert(
+                            serde_yaml::Value::String("dependencies".to_string()),
+                            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure the sdk.compile section exists in the config.
+    fn ensure_sdk_compile_section(config: &mut serde_yaml::Value) {
+        if let Some(main_map) = config.as_mapping_mut() {
+            // Ensure sdk section exists
+            if !main_map.contains_key(serde_yaml::Value::String("sdk".to_string())) {
+                main_map.insert(
+                    serde_yaml::Value::String("sdk".to_string()),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                );
+            }
+
+            // Ensure sdk.compile section exists
+            if let Some(sdk) = main_map.get_mut(serde_yaml::Value::String("sdk".to_string())) {
+                if let Some(sdk_map) = sdk.as_mapping_mut() {
+                    if !sdk_map.contains_key(serde_yaml::Value::String("compile".to_string())) {
+                        sdk_map.insert(
+                            serde_yaml::Value::String("compile".to_string()),
+                            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Helper function to get a nested section from YAML using dot notation
@@ -4824,5 +5173,241 @@ sdk:
         // Test get_signing_key_names returns empty vec when no keys
         let key_names = config.get_signing_key_names();
         assert!(key_names.is_empty());
+    }
+
+    #[test]
+    fn test_discover_external_config_refs_from_runtime() {
+        let config_content = r#"
+runtime:
+  prod:
+    target: qemux86-64
+    dependencies:
+      peridio:
+        ext: avocado-ext-peridio
+        config: avocado-ext-peridio/avocado.yml
+      local-ext:
+        ext: local-extension
+"#;
+
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let refs = Config::discover_external_config_refs(&parsed);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "avocado-ext-peridio");
+        assert_eq!(refs[0].1, "avocado-ext-peridio/avocado.yml");
+    }
+
+    #[test]
+    fn test_discover_external_config_refs_from_ext() {
+        let config_content = r#"
+ext:
+  main-ext:
+    types:
+      - sysext
+    dependencies:
+      external-dep:
+        ext: external-extension
+        config: external/config.yaml
+"#;
+
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let refs = Config::discover_external_config_refs(&parsed);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "external-extension");
+        assert_eq!(refs[0].1, "external/config.yaml");
+    }
+
+    #[test]
+    fn test_merge_external_config_ext_section() {
+        let main_config_content = r#"
+distro:
+  version: "1.0.0"
+ext:
+  local-ext:
+    types:
+      - sysext
+"#;
+        let external_config_content = r#"
+ext:
+  external-ext:
+    types:
+      - sysext
+    version: "{{ config.distro.version }}"
+"#;
+
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(main_config_content).unwrap();
+        let external_config: serde_yaml::Value =
+            serde_yaml::from_str(external_config_content).unwrap();
+
+        Config::merge_external_config(&mut main_config, &external_config, "external-ext");
+
+        // Check that both extensions are present
+        let ext_section = main_config.get("ext").unwrap().as_mapping().unwrap();
+        assert!(ext_section.contains_key(&serde_yaml::Value::String("local-ext".to_string())));
+        assert!(ext_section.contains_key(&serde_yaml::Value::String("external-ext".to_string())));
+    }
+
+    #[test]
+    fn test_merge_external_config_sdk_dependencies() {
+        let main_config_content = r#"
+sdk:
+  image: test-image
+  dependencies:
+    main-package: "*"
+"#;
+        let external_config_content = r#"
+sdk:
+  dependencies:
+    external-package: "1.0.0"
+    main-package: "2.0.0"  # Should not override main config
+"#;
+
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(main_config_content).unwrap();
+        let external_config: serde_yaml::Value =
+            serde_yaml::from_str(external_config_content).unwrap();
+
+        Config::merge_external_config(&mut main_config, &external_config, "test-ext");
+
+        let sdk_deps = main_config
+            .get("sdk")
+            .unwrap()
+            .get("dependencies")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+
+        // External package should be added
+        assert!(sdk_deps.contains_key(&serde_yaml::Value::String("external-package".to_string())));
+        assert_eq!(
+            sdk_deps
+                .get(&serde_yaml::Value::String("external-package".to_string()))
+                .unwrap()
+                .as_str(),
+            Some("1.0.0")
+        );
+
+        // Main package should NOT be overridden
+        assert_eq!(
+            sdk_deps
+                .get(&serde_yaml::Value::String("main-package".to_string()))
+                .unwrap()
+                .as_str(),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn test_merge_does_not_override_distro() {
+        let main_config_content = r#"
+distro:
+  version: "1.0.0"
+  channel: "stable"
+"#;
+        let external_config_content = r#"
+distro:
+  version: "2.0.0"
+  channel: "edge"
+"#;
+
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(main_config_content).unwrap();
+        let external_config: serde_yaml::Value =
+            serde_yaml::from_str(external_config_content).unwrap();
+
+        Config::merge_external_config(&mut main_config, &external_config, "test-ext");
+
+        // Distro should remain unchanged from main config
+        let distro = main_config.get("distro").unwrap();
+        assert_eq!(distro.get("version").unwrap().as_str(), Some("1.0.0"));
+        assert_eq!(distro.get("channel").unwrap().as_str(), Some("stable"));
+    }
+
+    #[test]
+    fn test_load_composed_with_interpolation() {
+        use tempfile::TempDir;
+
+        // Create a temp directory for our test configs
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create main config
+        let main_config_content = r#"
+distro:
+  version: "1.0.0"
+  channel: apollo-edge
+default_target: qemux86-64
+sdk:
+  image: "docker.io/test:{{ config.distro.channel }}"
+  dependencies:
+    main-sdk-dep: "*"
+runtime:
+  prod:
+    target: qemux86-64
+    dependencies:
+      peridio:
+        ext: test-ext
+        config: external/avocado.yml
+"#;
+        let main_config_path = temp_dir.path().join("avocado.yaml");
+        std::fs::write(&main_config_path, main_config_content).unwrap();
+
+        // Create external config directory and file
+        let external_dir = temp_dir.path().join("external");
+        std::fs::create_dir_all(&external_dir).unwrap();
+
+        let external_config_content = r#"
+ext:
+  test-ext:
+    version: "{{ config.distro.version }}"
+    types:
+      - sysext
+sdk:
+  dependencies:
+    external-sdk-dep: "*"
+"#;
+        let external_config_path = external_dir.join("avocado.yml");
+        std::fs::write(&external_config_path, external_config_content).unwrap();
+
+        // Load composed config
+        let composed = Config::load_composed(&main_config_path, Some("qemux86-64")).unwrap();
+
+        // Verify the SDK image was interpolated using main config's distro
+        assert_eq!(
+            composed
+                .config
+                .sdk
+                .as_ref()
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap(),
+            "docker.io/test:apollo-edge"
+        );
+
+        // Verify the external extension was merged
+        let ext_section = composed
+            .merged_value
+            .get("ext")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert!(ext_section.contains_key(&serde_yaml::Value::String("test-ext".to_string())));
+
+        // Verify the external extension's version was interpolated from main config's distro
+        let test_ext = ext_section
+            .get(&serde_yaml::Value::String("test-ext".to_string()))
+            .unwrap();
+        assert_eq!(test_ext.get("version").unwrap().as_str(), Some("1.0.0"));
+
+        // Verify SDK dependencies were merged
+        let sdk_deps = composed
+            .merged_value
+            .get("sdk")
+            .unwrap()
+            .get("dependencies")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert!(sdk_deps.contains_key(&serde_yaml::Value::String("main-sdk-dep".to_string())));
+        assert!(sdk_deps.contains_key(&serde_yaml::Value::String("external-sdk-dep".to_string())));
     }
 }

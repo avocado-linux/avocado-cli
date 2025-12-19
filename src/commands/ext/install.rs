@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -37,10 +37,12 @@ impl ExtInstallCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration and parse raw TOML
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load the composed configuration (merges external configs, applies interpolation)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -48,10 +50,12 @@ impl ExtInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
-        // Determine which extensions to install
-        let extensions_to_install = if let Some(extension_name) = &self.extension {
+        // Determine which extensions to install (with their locations)
+        let extensions_to_install: Vec<(String, ExtensionLocation)> = if let Some(extension_name) =
+            &self.extension
+        {
             // Single extension specified - use comprehensive lookup
             match config.find_extension_in_dependency_tree(
                 &self.config_path,
@@ -71,13 +75,15 @@ impl ExtInstallCommand {
                             }
                             ExtensionLocation::External { name, config_path } => {
                                 print_info(
-                                    &format!("Found external extension '{name}' in config '{config_path}'"),
-                                    OutputLevel::Normal,
-                                );
+                                        &format!(
+                                            "Found external extension '{name}' in config '{config_path}'"
+                                        ),
+                                        OutputLevel::Normal,
+                                    );
                             }
                         }
                     }
-                    vec![extension_name.clone()]
+                    vec![(extension_name.clone(), location)]
                 }
                 None => {
                     print_error(
@@ -93,7 +99,17 @@ impl ExtInstallCommand {
                 Some(ext_section) => match ext_section.as_mapping() {
                     Some(table) => table
                         .keys()
-                        .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                        .filter_map(|k| {
+                            k.as_str().map(|s| {
+                                (
+                                    s.to_string(),
+                                    ExtensionLocation::Local {
+                                        name: s.to_string(),
+                                        config_path: self.config_path.clone(),
+                                    },
+                                )
+                            })
+                        })
                         .collect(),
                     None => vec![],
                 },
@@ -109,11 +125,15 @@ impl ExtInstallCommand {
             return Ok(());
         }
 
+        let ext_names: Vec<&str> = extensions_to_install
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         print_info(
             &format!(
                 "Installing {} extension(s): {}.",
                 extensions_to_install.len(),
-                extensions_to_install.join(", ")
+                ext_names.join(", ")
             ),
             OutputLevel::Normal,
         );
@@ -137,14 +157,14 @@ impl ExtInstallCommand {
             .and_then(|runtime_config| runtime_config.get("target"))
             .and_then(|target| target.as_str())
             .map(|s| s.to_string());
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Use the container helper to run the setup commands
         let container_helper = SdkContainer::new();
         let total = extensions_to_install.len();
 
         // Install each extension
-        for (index, ext_name) in extensions_to_install.iter().enumerate() {
+        for (index, (ext_name, ext_location)) in extensions_to_install.iter().enumerate() {
             if self.verbose {
                 print_debug(
                     &format!("Installing ({}/{}) {}.", index + 1, total, ext_name),
@@ -152,10 +172,26 @@ impl ExtInstallCommand {
                 );
             }
 
+            // Get the config path where this extension is actually defined
+            let ext_config_path = match ext_location {
+                ExtensionLocation::Local { config_path, .. } => config_path.clone(),
+                ExtensionLocation::External { config_path, .. } => {
+                    // Resolve relative path against main config directory
+                    let main_config_dir = std::path::Path::new(&self.config_path)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."));
+                    main_config_dir
+                        .join(config_path)
+                        .to_string_lossy()
+                        .to_string()
+                }
+            };
+
             if !self
                 .install_single_extension(
-                    &parsed,
+                    config,
                     ext_name,
+                    &ext_config_path,
                     &container_helper,
                     container_image,
                     &target,
@@ -183,8 +219,9 @@ impl ExtInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn install_single_extension(
         &self,
-        config: &serde_yaml::Value,
+        config: &Config,
         extension: &str,
+        ext_config_path: &str,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
@@ -246,13 +283,12 @@ impl ExtInstallCommand {
             }
         }
 
+        // Get merged extension configuration from the correct config file
+        // This properly handles both local and external extensions
+        let ext_config = config.get_merged_ext_config(extension, target, ext_config_path)?;
+
         // Install dependencies if they exist
-        // Check if extension exists in local config (versioned extensions may not be local)
-        let dependencies = config
-            .get("ext")
-            .and_then(|ext| ext.as_mapping())
-            .and_then(|ext_table| ext_table.get(extension))
-            .and_then(|extension_config| extension_config.get("dependencies"));
+        let dependencies = ext_config.as_ref().and_then(|ec| ec.get("dependencies"));
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install and handle extension dependencies
@@ -266,53 +302,10 @@ impl ExtInstallCommand {
                     None => continue, // Skip if package name is not a string
                 };
 
-                // Handle extension dependencies
-                if let serde_yaml::Value::Mapping(spec_map) = version_spec {
-                    // Skip compile dependencies (identified by dict value with 'compile' key)
-                    if spec_map.contains_key(serde_yaml::Value::String("compile".to_string())) {
-                        continue;
-                    }
-
-                    // Check for extension dependency
-                    if let Some(ext_name) = spec_map.get("ext").and_then(|v| v.as_str()) {
-                        // Check if this is a versioned extension (has vsn field)
-                        if let Some(version) = spec_map.get("vsn").and_then(|v| v.as_str()) {
-                            extension_dependencies
-                                .push((ext_name.to_string(), Some(version.to_string())));
-                            if self.verbose {
-                                print_info(
-                                    &format!("Found versioned extension dependency: {ext_name} version {version}"),
-                                    OutputLevel::Normal,
-                                );
-                            }
-                        }
-                        // Check if this is an external extension (has config field)
-                        else if let Some(config_path) =
-                            spec_map.get("config").and_then(|v| v.as_str())
-                        {
-                            extension_dependencies.push((ext_name.to_string(), None));
-                            if self.verbose {
-                                print_info(
-                                    &format!("Found external extension dependency: {ext_name} from config {config_path}"),
-                                    OutputLevel::Normal,
-                                );
-                            }
-                        } else {
-                            // Local extension
-                            extension_dependencies.push((ext_name.to_string(), None));
-                            if self.verbose {
-                                print_info(
-                                    &format!("Found local extension dependency: {ext_name}"),
-                                    OutputLevel::Normal,
-                                );
-                            }
-                        }
-                        continue; // Skip adding to packages list
-                    }
-                }
-
-                // Handle regular package dependencies
+                // Handle different dependency types based on value format
                 match version_spec {
+                    // Simple string version: "package: version" or "package: '*'"
+                    // These are always package repository dependencies
                     serde_yaml::Value::String(version) => {
                         if version == "*" {
                             packages.push(package_name.to_string());
@@ -320,7 +313,60 @@ impl ExtInstallCommand {
                             packages.push(format!("{package_name}-{version}"));
                         }
                     }
+                    // Object/mapping value: need to check what type of dependency
                     serde_yaml::Value::Mapping(spec_map) => {
+                        // Skip compile dependencies - these are SDK-compiled, not from repo
+                        // Format: { compile: "section-name", install: "script.sh" }
+                        if spec_map.get("compile").is_some() {
+                            if self.verbose {
+                                print_debug(
+                                    &format!("Skipping compile dependency '{package_name}' (SDK-compiled, not from repo)"),
+                                    OutputLevel::Normal,
+                                );
+                            }
+                            continue;
+                        }
+
+                        // Check for extension dependency
+                        // Format: { ext: "extension-name" } or { ext: "name", config: "path" } or { ext: "name", vsn: "version" }
+                        if let Some(ext_name) = spec_map.get("ext").and_then(|v| v.as_str()) {
+                            // Check if this is a versioned extension (has vsn field)
+                            if let Some(version) = spec_map.get("vsn").and_then(|v| v.as_str()) {
+                                extension_dependencies
+                                    .push((ext_name.to_string(), Some(version.to_string())));
+                                if self.verbose {
+                                    print_info(
+                                        &format!("Found versioned extension dependency: {ext_name} version {version}"),
+                                        OutputLevel::Normal,
+                                    );
+                                }
+                            }
+                            // Check if this is an external extension (has config field)
+                            else if let Some(config_path) =
+                                spec_map.get("config").and_then(|v| v.as_str())
+                            {
+                                extension_dependencies.push((ext_name.to_string(), None));
+                                if self.verbose {
+                                    print_info(
+                                        &format!("Found external extension dependency: {ext_name} from config {config_path}"),
+                                        OutputLevel::Normal,
+                                    );
+                                }
+                            } else {
+                                // Local extension
+                                extension_dependencies.push((ext_name.to_string(), None));
+                                if self.verbose {
+                                    print_info(
+                                        &format!("Found local extension dependency: {ext_name}"),
+                                        OutputLevel::Normal,
+                                    );
+                                }
+                            }
+                            continue; // Skip adding to packages list
+                        }
+
+                        // Check for explicit version in object format
+                        // Format: { version: "1.0.0" }
                         if let Some(serde_yaml::Value::String(version)) = spec_map.get("version") {
                             if version == "*" {
                                 packages.push(package_name.to_string());
@@ -328,6 +374,8 @@ impl ExtInstallCommand {
                                 packages.push(format!("{package_name}-{version}"));
                             }
                         }
+                        // If it's a mapping without compile, ext, or version keys, skip it
+                        // (unknown format)
                     }
                     _ => {}
                 }
