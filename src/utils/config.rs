@@ -5244,8 +5244,8 @@ ext:
 
         // Check that both extensions are present
         let ext_section = main_config.get("ext").unwrap().as_mapping().unwrap();
-        assert!(ext_section.contains_key(&serde_yaml::Value::String("local-ext".to_string())));
-        assert!(ext_section.contains_key(&serde_yaml::Value::String("external-ext".to_string())));
+        assert!(ext_section.contains_key(serde_yaml::Value::String("local-ext".to_string())));
+        assert!(ext_section.contains_key(serde_yaml::Value::String("external-ext".to_string())));
     }
 
     #[test]
@@ -5278,10 +5278,10 @@ sdk:
             .unwrap();
 
         // External package should be added
-        assert!(sdk_deps.contains_key(&serde_yaml::Value::String("external-package".to_string())));
+        assert!(sdk_deps.contains_key(serde_yaml::Value::String("external-package".to_string())));
         assert_eq!(
             sdk_deps
-                .get(&serde_yaml::Value::String("external-package".to_string()))
+                .get(serde_yaml::Value::String("external-package".to_string()))
                 .unwrap()
                 .as_str(),
             Some("1.0.0")
@@ -5290,7 +5290,7 @@ sdk:
         // Main package should NOT be overridden
         assert_eq!(
             sdk_deps
-                .get(&serde_yaml::Value::String("main-package".to_string()))
+                .get(serde_yaml::Value::String("main-package".to_string()))
                 .unwrap()
                 .as_str(),
             Some("*")
@@ -5390,11 +5390,11 @@ sdk:
             .unwrap()
             .as_mapping()
             .unwrap();
-        assert!(ext_section.contains_key(&serde_yaml::Value::String("test-ext".to_string())));
+        assert!(ext_section.contains_key(serde_yaml::Value::String("test-ext".to_string())));
 
         // Verify the external extension's version was interpolated from main config's distro
         let test_ext = ext_section
-            .get(&serde_yaml::Value::String("test-ext".to_string()))
+            .get(serde_yaml::Value::String("test-ext".to_string()))
             .unwrap();
         assert_eq!(test_ext.get("version").unwrap().as_str(), Some("1.0.0"));
 
@@ -5407,7 +5407,7 @@ sdk:
             .unwrap()
             .as_mapping()
             .unwrap();
-        assert!(sdk_deps.contains_key(&serde_yaml::Value::String("main-sdk-dep".to_string())));
-        assert!(sdk_deps.contains_key(&serde_yaml::Value::String("external-sdk-dep".to_string())));
+        assert!(sdk_deps.contains_key(serde_yaml::Value::String("main-sdk-dep".to_string())));
+        assert!(sdk_deps.contains_key(serde_yaml::Value::String("external-sdk-dep".to_string())));
     }
 }
