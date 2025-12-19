@@ -579,12 +579,15 @@ fn detect_algorithm_from_attributes(attributes: &[Attribute]) -> Result<KeyAlgor
     anyhow::bail!("Unable to determine key algorithm from attributes")
 }
 
-/// Generate a keyid from public key bytes (SHA-256, first 16 hex chars)
+/// Generate a keyid from public key bytes (full SHA-256 hash, base16/hex encoded)
+///
+/// Returns the full 64-character hex-encoded SHA-256 hash of the public key.
+/// This key ID is also used as the default friendly name when no name is provided.
 pub fn generate_keyid_from_public_key(public_key_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(public_key_bytes);
     let hash = hasher.finalize();
-    format!("sha256-{}", hex_encode(&hash[..8]))
+    hex_encode(&hash)
 }
 
 /// Build a PKCS#11 URI
@@ -899,7 +902,9 @@ mod tests {
     fn test_generate_keyid_from_public_key() {
         let test_key = b"test public key data";
         let keyid = generate_keyid_from_public_key(test_key);
-        assert!(keyid.starts_with("sha256-"));
-        assert_eq!(keyid.len(), 7 + 16); // "sha256-" + 16 hex chars
+        // Key ID is the full SHA-256 hash, base16 encoded (64 hex chars)
+        assert_eq!(keyid.len(), 64);
+        // Verify it's valid hex
+        assert!(keyid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
