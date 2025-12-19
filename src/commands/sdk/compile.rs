@@ -55,8 +55,39 @@ impl SdkCompileCommand {
     /// Execute the sdk compile command
     pub async fn execute(&self) -> Result<()> {
         // Load the configuration
+        if self.verbose {
+            print_info(
+                &format!("Loading SDK compile config from: {}", self.config_path),
+                OutputLevel::Normal,
+            );
+        }
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+
+        // Debug: Check if sdk.compile was parsed
+        if self.verbose {
+            if let Some(sdk) = &config.sdk {
+                if let Some(compile) = &sdk.compile {
+                    print_info(
+                        &format!("Found {} SDK compile section(s) in config", compile.len()),
+                        OutputLevel::Normal,
+                    );
+                    for (name, cfg) in compile {
+                        print_info(
+                            &format!("  - Section '{}': compile script = {:?}", name, cfg.compile),
+                            OutputLevel::Normal,
+                        );
+                    }
+                } else {
+                    print_info(
+                        "No sdk.compile section found in config",
+                        OutputLevel::Normal,
+                    );
+                }
+            } else {
+                print_info("No sdk section found in config", OutputLevel::Normal);
+            }
+        }
 
         // Merge container args from config with CLI args
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -65,6 +96,14 @@ impl SdkCompileCommand {
         let compile_sections = self.get_compile_sections_from_config(&config);
 
         if compile_sections.is_empty() {
+            // If specific sections were requested but none found, this is an error
+            if !self.sections.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Requested compile sections {:?} not found in config '{}'",
+                    self.sections,
+                    self.config_path
+                ));
+            }
             print_success("No compile sections configured.", OutputLevel::Normal);
             return Ok(());
         }

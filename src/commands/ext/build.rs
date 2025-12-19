@@ -99,7 +99,8 @@ impl ExtBuildCommand {
             })?;
 
         // Handle compile dependencies with install scripts before building the extension
-        self.handle_compile_dependencies(&config, &ext_config, &target)
+        // Pass the ext_config_path so SDK compile sections are loaded from the correct config
+        self.handle_compile_dependencies(&config, &ext_config, &target, &ext_config_path)
             .await?;
 
         // Get extension types from the types array (defaults to ["sysext", "confext"])
@@ -1232,11 +1233,15 @@ echo "Set proper permissions on authentication files""#,
         script_lines.join("")
     }
     /// Handle compile dependencies with install scripts
+    ///
+    /// `sdk_config_path` is the path to the config file that contains the sdk.compile sections.
+    /// For external extensions, this should be the external config path, not the main config.
     async fn handle_compile_dependencies(
         &self,
         config: &Config,
         ext_config: &serde_yaml::Value,
         target: &str,
+        sdk_config_path: &str,
     ) -> Result<()> {
         // Get dependencies from extension configuration
         let dependencies = ext_config.get("dependencies").and_then(|v| v.as_mapping());
@@ -1300,8 +1305,15 @@ echo "Set proper permissions on authentication files""#,
             );
 
             // First, run the SDK compile for the specified section
+            // Use sdk_config_path which points to the config where sdk.compile sections are defined
+            if self.verbose {
+                print_info(
+                    &format!("Using config path for SDK compile: {}", sdk_config_path),
+                    OutputLevel::Normal,
+                );
+            }
             let compile_command = SdkCompileCommand::new(
-                self.config_path.clone(),
+                sdk_config_path.to_string(),
                 self.verbose,
                 vec![compile_section.clone()],
                 Some(target.to_string()),
@@ -1311,7 +1323,8 @@ echo "Set proper permissions on authentication files""#,
 
             compile_command.execute().await.with_context(|| {
                 format!(
-                    "Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'"
+                    "Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'. Config path: {}",
+                    sdk_config_path
                 )
             })?;
 
