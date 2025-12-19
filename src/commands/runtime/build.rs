@@ -248,9 +248,7 @@ RUNTIME_EXT=$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.raw
 RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{ext_name}-{ext_version}.raw
 
 if [ -f "$RUNTIME_EXT" ]; then
-    if ! cmp -s "$RUNTIME_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
-        ln -f $RUNTIME_EXT $RUNTIMES_EXT
-    fi
+    ln -f $RUNTIME_EXT $RUNTIMES_EXT
 else
     echo "Missing image for extension {ext_name}-{ext_version}."
 fi"#
@@ -285,9 +283,7 @@ RUNTIME_EXT=$(ls $RUNTIME_EXT_DIR/{ext_name}-*.raw 2>/dev/null | head -n 1)
 if [ -n "$RUNTIME_EXT" ]; then
     EXT_FILENAME=$(basename "$RUNTIME_EXT")
     RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/$EXT_FILENAME
-    if ! cmp -s "$RUNTIME_EXT" "$RUNTIMES_EXT" 2>/dev/null; then
-        ln -f "$RUNTIME_EXT" "$RUNTIMES_EXT"
-    fi
+    ln -f "$RUNTIME_EXT" "$RUNTIMES_EXT"
 else
     echo "Missing image for external extension {ext_name}."
 fi"#
@@ -337,6 +333,11 @@ mkdir -p $OUTPUT_DIR
 # Create runtime-specific extensions directory
 RUNTIME_EXT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/extensions"
 mkdir -p "$RUNTIME_EXT_DIR"
+
+# Clean up stale extensions to ensure fresh copies
+echo "Cleaning up stale extensions..."
+rm -f "$RUNTIME_EXT_DIR"/*.raw 2>/dev/null || true
+rm -f "$VAR_DIR/lib/avocado/extensions"/*.raw 2>/dev/null || true
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
