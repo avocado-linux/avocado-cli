@@ -494,6 +494,7 @@ impl Config {
                                 "sdk",
                                 "enable_services",
                                 "on_merge",
+                                "on_unmerge",
                                 "sysusers",
                                 "kernel_modules",
                                 "reload_service_manager",

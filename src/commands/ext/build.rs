@@ -146,6 +146,18 @@ impl ExtBuildCommand {
             })
             .unwrap_or_default();
 
+        // Get on_unmerge commands from configuration
+        let on_unmerge_commands = ext_config
+            .get("on_unmerge")
+            .and_then(|v| v.as_sequence())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         // Get reload_service_manager configuration (defaults to false)
         let reload_service_manager = ext_config
             .get("reload_service_manager")
@@ -280,6 +292,7 @@ impl ExtBuildCommand {
                         &processed_container_args,
                         &modprobe_modules,
                         &on_merge_commands,
+                        &on_unmerge_commands,
                         users_config,
                         groups_config,
                         reload_service_manager,
@@ -299,6 +312,7 @@ impl ExtBuildCommand {
                         &processed_container_args,
                         &enable_services,
                         &on_merge_commands,
+                        &on_unmerge_commands,
                         users_config,
                         groups_config,
                         reload_service_manager,
@@ -351,6 +365,7 @@ impl ExtBuildCommand {
         processed_container_args: &Option<Vec<String>>,
         modprobe_modules: &[String],
         on_merge_commands: &[String],
+        on_unmerge_commands: &[String],
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
@@ -362,6 +377,7 @@ impl ExtBuildCommand {
             overlay_config,
             modprobe_modules,
             on_merge_commands,
+            on_unmerge_commands,
             users_config,
             groups_config,
             reload_service_manager,
@@ -414,6 +430,7 @@ impl ExtBuildCommand {
         processed_container_args: &Option<Vec<String>>,
         enable_services: &[String],
         on_merge_commands: &[String],
+        on_unmerge_commands: &[String],
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
@@ -425,6 +442,7 @@ impl ExtBuildCommand {
             overlay_config,
             enable_services,
             on_merge_commands,
+            on_unmerge_commands,
             users_config,
             groups_config,
             reload_service_manager,
@@ -471,6 +489,7 @@ impl ExtBuildCommand {
         overlay_config: Option<&OverlayConfig>,
         modprobe_modules: &[String],
         on_merge_commands: &[String],
+        on_unmerge_commands: &[String],
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
@@ -564,6 +583,22 @@ echo "[INFO] Added custom on_merge command to release file: {command}""#
             String::new()
         };
 
+        // Create custom on_unmerge commands section
+        let custom_on_unmerge_section = if !on_unmerge_commands.is_empty() {
+            on_unmerge_commands
+                .iter()
+                .map(|command| {
+                    format!(
+                        r#"echo "AVOCADO_ON_UNMERGE=\"{command}\"" >> "$release_file"
+echo "[INFO] Added custom on_unmerge command to release file: {command}""#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+
         let users_section = self.create_users_script_section(users_config, groups_config);
 
         format!(
@@ -597,6 +632,9 @@ fi
 
 # Add custom AVOCADO_ON_MERGE commands if specified
 {}
+
+# Add custom AVOCADO_ON_UNMERGE commands if specified
+{}
 "#,
             overlay_section,
             users_section,
@@ -611,7 +649,8 @@ fi
             self.extension,
             self.extension,
             self.extension,
-            custom_on_merge_section
+            custom_on_merge_section,
+            custom_on_unmerge_section
         )
     }
 
@@ -623,6 +662,7 @@ fi
         overlay_config: Option<&OverlayConfig>,
         enable_services: &[String],
         on_merge_commands: &[String],
+        on_unmerge_commands: &[String],
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
@@ -748,6 +788,22 @@ echo "[INFO] Added custom on_merge command to release file: {command}""#
             String::new()
         };
 
+        // Create custom on_unmerge commands section for confext
+        let custom_on_unmerge_section = if !on_unmerge_commands.is_empty() {
+            on_unmerge_commands
+                .iter()
+                .map(|command| {
+                    format!(
+                        r#"echo "AVOCADO_ON_UNMERGE=\"{command}\"" >> "$release_file"
+echo "[INFO] Added custom on_unmerge command to release file: {command}""#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+
         format!(
             r#"
 set -e
@@ -777,6 +833,9 @@ fi
 # Add custom AVOCADO_ON_MERGE commands if specified
 {}
 
+# Add custom AVOCADO_ON_UNMERGE commands if specified
+{}
+
 # Add AVOCADO_ENABLE_SERVICES if enable_services is configured
 {}
 {}
@@ -793,6 +852,7 @@ fi
             self.extension,
             self.extension,
             custom_on_merge_section,
+            custom_on_unmerge_section,
             enable_services_section,
             service_linking_section
         )
@@ -1452,6 +1512,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1507,6 +1568,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1559,6 +1621,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1583,6 +1646,7 @@ mod tests {
             "2.0",
             &["system".to_string(), "portable".to_string()],
             None,
+            &[],
             &[],
             &[],
             None,
@@ -1611,6 +1675,7 @@ mod tests {
             &["system".to_string()],
             None,
             &enable_services,
+            &[],
             &[],
             None,
             None,
@@ -1649,6 +1714,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1682,6 +1748,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             Some(&overlay_config),
+            &[],
             &[],
             &[],
             None,
@@ -1721,6 +1788,7 @@ mod tests {
             Some(&overlay_config),
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1756,6 +1824,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             Some(&overlay_config),
+            &[],
             &[],
             &[],
             None,
@@ -1797,6 +1866,7 @@ mod tests {
             Some(&overlay_config),
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1832,6 +1902,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1840,6 +1911,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
+            &[],
             &[],
             &[],
             None,
@@ -1873,6 +1945,7 @@ mod tests {
             &["system".to_string()],
             None,
             &modprobe_modules,
+            &[],
             &[],
             None,
             None,
@@ -1915,6 +1988,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1950,6 +2024,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -1980,6 +2055,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2017,6 +2093,7 @@ mod tests {
             None,
             &[],
             &on_merge_commands,
+            &[],
             None,
             None,
             false,
@@ -2031,6 +2108,80 @@ mod tests {
         ));
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"echo test\\\"\" >> \"$release_file\""));
         assert!(script.contains("[INFO] Added custom on_merge command to release file: echo test"));
+    }
+
+    #[test]
+    fn test_create_sysext_build_script_with_custom_on_unmerge() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let on_unmerge_commands = vec![
+            "systemctl stop myservice.service".to_string(),
+            "echo cleanup".to_string(),
+        ];
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            &on_unmerge_commands,
+            None,
+            None,
+            false,
+        );
+
+        // Verify custom on_unmerge commands are added as separate entries
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_UNMERGE=\\\"systemctl stop myservice.service\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "[INFO] Added custom on_unmerge command to release file: systemctl stop myservice.service"
+        ));
+        assert!(script
+            .contains("echo \"AVOCADO_ON_UNMERGE=\\\"echo cleanup\\\"\" >> \"$release_file\""));
+        assert!(
+            script.contains("[INFO] Added custom on_unmerge command to release file: echo cleanup")
+        );
+    }
+
+    #[test]
+    fn test_create_confext_build_script_with_custom_on_unmerge() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+        };
+
+        let on_unmerge_commands = vec!["systemctl stop myservice.service".to_string()];
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[],
+            &[],
+            &on_unmerge_commands,
+            None,
+            None,
+            false,
+        );
+
+        // Verify custom on_unmerge commands are added as separate entries
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_UNMERGE=\\\"systemctl stop myservice.service\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "[INFO] Added custom on_unmerge command to release file: systemctl stop myservice.service"
+        ));
     }
 
     #[test]
@@ -2051,6 +2202,7 @@ mod tests {
             None,
             &[],
             &on_merge_commands,
+            &[],
             None,
             None,
             false,
@@ -2080,6 +2232,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2112,6 +2265,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -2141,6 +2295,7 @@ mod tests {
             &["system".to_string()],
             None,
             &modprobe_modules,
+            &[],
             &[],
             None,
             None,
@@ -2192,6 +2347,7 @@ mod tests {
             None,
             &modprobe_modules,
             &custom_commands,
+            &[],
             None,
             None,
             false,
@@ -2385,6 +2541,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             Some(&users_config),
             None,
             false,
@@ -2435,6 +2592,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
+            &[],
             &[],
             &[],
             Some(&users_config),
@@ -2910,6 +3068,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             true,
@@ -2934,6 +3093,7 @@ mod tests {
             "1.0",
             &["system".to_string()],
             None,
+            &[],
             &[],
             &[],
             None,
