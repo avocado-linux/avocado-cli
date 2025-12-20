@@ -448,6 +448,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_compact::{KeyPair, Seed};
 
     #[test]
     fn test_checksum_algorithm_from_str() {
@@ -478,5 +479,266 @@ mod tests {
     fn test_checksum_algorithm_name() {
         assert_eq!(ChecksumAlgorithm::Sha256.name(), "sha256");
         assert_eq!(ChecksumAlgorithm::Blake3.name(), "blake3");
+    }
+
+    #[test]
+    fn test_create_and_verify_signature_sha256() {
+        // Generate a test keypair
+        let keypair = KeyPair::from_seed(Seed::default());
+        let secret_key = keypair.sk;
+        let public_key = keypair.pk;
+
+        // Create test data
+        let test_data = b"This is test data for signing";
+        let hash = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Sha256).unwrap();
+
+        // Sign the hash
+        let signature = secret_key.sign(&hash, None);
+
+        // Create signature content
+        let sig_content = create_signature_content(
+            &hash,
+            signature
+                .as_ref()
+                .try_into()
+                .expect("signature should be 64 bytes"),
+            &ChecksumAlgorithm::Sha256,
+            "test-key",
+            "test-keyid",
+        )
+        .unwrap();
+
+        // Parse the signature JSON
+        let sig_json: serde_json::Value = serde_json::from_str(&sig_content).unwrap();
+
+        // Extract signature and checksum from JSON
+        let signature_hex = sig_json["signature"].as_str().unwrap();
+        let checksum_hex = sig_json["checksum"].as_str().unwrap();
+
+        // Decode hex signature
+        let signature_bytes = hex_decode(signature_hex).unwrap();
+        let checksum_bytes = hex_decode(checksum_hex).unwrap();
+
+        // Verify signature format
+        assert_eq!(signature_bytes.len(), 64, "Signature should be 64 bytes");
+        assert_eq!(checksum_bytes, hash, "Checksum should match original hash");
+
+        // Reconstruct signature for verification
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(&signature_bytes);
+        let reconstructed_sig = ed25519_compact::Signature::from_slice(&sig_array).unwrap();
+
+        // Verify the signature with the public key
+        let result = public_key.verify(&hash, &reconstructed_sig);
+        assert!(
+            result.is_ok(),
+            "Signature verification should succeed with original public key"
+        );
+    }
+
+    #[test]
+    fn test_create_and_verify_signature_blake3() {
+        // Generate a test keypair
+        let keypair = KeyPair::from_seed(Seed::default());
+        let secret_key = keypair.sk;
+        let public_key = keypair.pk;
+
+        // Create test data
+        let test_data = b"This is test data for BLAKE3 signing";
+        let hash = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Blake3).unwrap();
+
+        // Sign the hash
+        let signature = secret_key.sign(&hash, None);
+
+        // Create signature content
+        let sig_content = create_signature_content(
+            &hash,
+            signature
+                .as_ref()
+                .try_into()
+                .expect("signature should be 64 bytes"),
+            &ChecksumAlgorithm::Blake3,
+            "test-key-blake3",
+            "test-keyid-blake3",
+        )
+        .unwrap();
+
+        // Parse the signature JSON
+        let sig_json: serde_json::Value = serde_json::from_str(&sig_content).unwrap();
+
+        // Verify JSON structure
+        assert_eq!(sig_json["version"].as_str().unwrap(), "1");
+        assert_eq!(sig_json["checksum_algorithm"].as_str().unwrap(), "blake3");
+        assert_eq!(sig_json["key_name"].as_str().unwrap(), "test-key-blake3");
+        assert_eq!(sig_json["keyid"].as_str().unwrap(), "test-keyid-blake3");
+
+        // Extract and verify signature
+        let signature_hex = sig_json["signature"].as_str().unwrap();
+        let signature_bytes = hex_decode(signature_hex).unwrap();
+
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(&signature_bytes);
+        let reconstructed_sig = ed25519_compact::Signature::from_slice(&sig_array).unwrap();
+
+        // Verify the signature
+        let result = public_key.verify(&hash, &reconstructed_sig);
+        assert!(
+            result.is_ok(),
+            "BLAKE3 signature verification should succeed"
+        );
+    }
+
+    #[test]
+    fn test_signature_json_format() {
+        // Generate a test keypair
+        let keypair = KeyPair::from_seed(Seed::default());
+        let secret_key = keypair.sk;
+
+        // Create test hash
+        let test_hash = [0x42u8; 32]; // Simple test hash
+
+        // Sign the hash
+        let signature = secret_key.sign(&test_hash, None);
+
+        // Create signature content
+        let sig_content = create_signature_content(
+            &test_hash,
+            signature
+                .as_ref()
+                .try_into()
+                .expect("signature should be 64 bytes"),
+            &ChecksumAlgorithm::Sha256,
+            "my-key",
+            "my-keyid-123",
+        )
+        .unwrap();
+
+        // Parse JSON
+        let sig_json: serde_json::Value = serde_json::from_str(&sig_content).unwrap();
+
+        // Verify all required fields exist
+        assert!(sig_json.get("version").is_some(), "version field missing");
+        assert!(
+            sig_json.get("checksum_algorithm").is_some(),
+            "checksum_algorithm field missing"
+        );
+        assert!(sig_json.get("checksum").is_some(), "checksum field missing");
+        assert!(
+            sig_json.get("signature").is_some(),
+            "signature field missing"
+        );
+        assert!(sig_json.get("key_name").is_some(), "key_name field missing");
+        assert!(sig_json.get("keyid").is_some(), "keyid field missing");
+
+        // Verify values
+        assert_eq!(sig_json["version"].as_str().unwrap(), "1");
+        assert_eq!(sig_json["key_name"].as_str().unwrap(), "my-key");
+        assert_eq!(sig_json["keyid"].as_str().unwrap(), "my-keyid-123");
+    }
+
+    #[test]
+    fn test_hex_encode_decode_roundtrip() {
+        let original = vec![0x00, 0x01, 0xAB, 0xCD, 0xEF, 0xFF];
+
+        // Encode to hex
+        let hex = hex_encode(&original);
+
+        // Verify format
+        assert_eq!(hex.len(), original.len() * 2);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Decode back
+        let decoded = hex_decode(&hex).unwrap();
+
+        // Verify roundtrip
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_signature_with_different_keys_fails() {
+        // Generate two different keypairs
+        let keypair1 = KeyPair::from_seed(Seed::default());
+        let secret_key1 = keypair1.sk;
+
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[0] = 1; // Different seed
+        let seed2 = Seed::from_slice(&seed_bytes).unwrap();
+        let keypair2 = KeyPair::from_seed(seed2);
+        let public_key2 = keypair2.pk;
+
+        // Create test data and sign with key1
+        let test_data = b"Test data";
+        let hash = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Sha256).unwrap();
+        let signature = secret_key1.sign(&hash, None);
+
+        // Try to verify with key2 (should fail)
+        let result = public_key2.verify(&hash, &signature);
+        assert!(
+            result.is_err(),
+            "Verification should fail with different public key"
+        );
+    }
+
+    #[test]
+    fn test_signature_with_modified_hash_fails() {
+        // Generate a keypair
+        let keypair = KeyPair::from_seed(Seed::default());
+        let secret_key = keypair.sk;
+        let public_key = keypair.pk;
+
+        // Create test data and sign
+        let test_data = b"Original data";
+        let hash = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Sha256).unwrap();
+        let signature = secret_key.sign(&hash, None);
+
+        // Compute hash of different data
+        let different_data = b"Modified data";
+        let different_hash =
+            compute_file_hash_from_bytes(different_data, &ChecksumAlgorithm::Sha256).unwrap();
+
+        // Try to verify signature against different hash (should fail)
+        let result = public_key.verify(&different_hash, &signature);
+        assert!(
+            result.is_err(),
+            "Verification should fail with modified data"
+        );
+    }
+
+    #[test]
+    fn test_compute_file_hash_sha256() {
+        let test_data = b"Test data for SHA256";
+        let hash = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Sha256).unwrap();
+
+        // SHA256 produces 32 bytes
+        assert_eq!(hash.len(), 32, "SHA256 hash should be 32 bytes");
+
+        // Verify it's deterministic
+        let hash2 = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Sha256).unwrap();
+        assert_eq!(hash, hash2, "Hash should be deterministic");
+    }
+
+    #[test]
+    fn test_compute_file_hash_blake3() {
+        let test_data = b"Test data for BLAKE3";
+        let hash = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Blake3).unwrap();
+
+        // BLAKE3 produces 32 bytes
+        assert_eq!(hash.len(), 32, "BLAKE3 hash should be 32 bytes");
+
+        // Verify it's deterministic
+        let hash2 = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Blake3).unwrap();
+        assert_eq!(hash, hash2, "Hash should be deterministic");
+    }
+
+    // Helper function to compute hash from bytes (for testing)
+    fn compute_file_hash_from_bytes(data: &[u8], algorithm: &ChecksumAlgorithm) -> Result<Vec<u8>> {
+        match algorithm {
+            ChecksumAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(data);
+                Ok(hasher.finalize().to_vec())
+            }
+            ChecksumAlgorithm::Blake3 => Ok(blake3::hash(data).as_bytes().to_vec()),
+        }
     }
 }

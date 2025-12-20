@@ -578,4 +578,123 @@ mod tests {
         // Verify jq is used for JSON parsing (most reliable)
         assert!(script.contains("jq -r"));
     }
+
+    #[test]
+    fn test_signature_response_can_be_verified() {
+        use crate::utils::signing_keys::generate_keypair;
+        use sha2::{Digest, Sha256};
+
+        // Generate a test keypair
+        let (secret_key, public_key) = generate_keypair();
+
+        // Simulate file hash (what container would compute)
+        let file_content = b"Test binary content";
+        let mut hasher = Sha256::new();
+        hasher.update(file_content);
+        let file_hash = hasher.finalize();
+        let file_hash_hex: String = file_hash.iter().map(|b| format!("{:02x}", b)).collect();
+
+        // Note: In actual use, the request would be sent to the signing service
+        // Here we're just validating the data format and verification process
+
+        // Simulate signing on the host side
+        let signature = secret_key.sign(&file_hash, None);
+
+        // Create signature content in the format that would be returned
+        let sig_content = serde_json::json!({
+            "version": "1",
+            "checksum_algorithm": "sha256",
+            "checksum": file_hash_hex,
+            "signature": signature.as_ref().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            "key_name": "test-key",
+            "keyid": "test-keyid",
+        });
+
+        // Create response (what host sends back)
+        let response = SignResponse {
+            response_type: "sign_response".to_string(),
+            success: true,
+            signature: Some(serde_json::to_string_pretty(&sig_content).unwrap()),
+            error: None,
+        };
+
+        // Verify the response can be deserialized
+        let response_json = serde_json::to_string(&response).unwrap();
+        let parsed_response: SignResponse = serde_json::from_str(&response_json).unwrap();
+        assert!(parsed_response.success);
+        assert!(parsed_response.signature.is_some());
+
+        // Extract signature content and verify it
+        let sig_json_str = parsed_response.signature.unwrap();
+        let sig_json: serde_json::Value = serde_json::from_str(&sig_json_str).unwrap();
+
+        // Extract the hex-encoded signature
+        let signature_hex = sig_json["signature"].as_str().unwrap();
+
+        // Decode hex signature back to bytes
+        let signature_bytes: Vec<u8> = (0..signature_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16).unwrap())
+            .collect();
+
+        // Verify signature length
+        assert_eq!(
+            signature_bytes.len(),
+            64,
+            "Signature should be 64 bytes after decoding"
+        );
+
+        // Reconstruct signature for verification
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(&signature_bytes);
+        let reconstructed_sig = ed25519_compact::Signature::from_slice(&sig_array).unwrap();
+
+        // Verify the signature with the public key
+        let result = public_key.verify(&file_hash, &reconstructed_sig);
+        assert!(
+            result.is_ok(),
+            "Signature from response should be verifiable with original public key"
+        );
+
+        // Verify checksum in response matches original
+        let checksum_from_sig = sig_json["checksum"].as_str().unwrap();
+        assert_eq!(
+            checksum_from_sig, file_hash_hex,
+            "Checksum in signature should match original file hash"
+        );
+    }
+
+    #[test]
+    fn test_signature_response_hex_encoding() {
+        // Test that signatures are properly hex-encoded in responses
+        let test_signature_hex = "a1b2c3d4e5f67890".repeat(8); // 128 hex chars = 64 bytes
+
+        let response = SignResponse {
+            response_type: "sign_response".to_string(),
+            success: true,
+            signature: Some(format!(
+                r#"{{"version":"1","signature":"{}"}}"#,
+                test_signature_hex
+            )),
+            error: None,
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: SignResponse = serde_json::from_str(&json).unwrap();
+
+        // Extract and verify signature
+        let sig_json: serde_json::Value = serde_json::from_str(&parsed.signature.unwrap()).unwrap();
+        let extracted_sig = sig_json["signature"].as_str().unwrap();
+
+        assert_eq!(
+            extracted_sig.len(),
+            128,
+            "Hex-encoded signature should be 128 characters"
+        );
+        assert!(
+            extracted_sig.chars().all(|c| c.is_ascii_hexdigit()),
+            "Signature should be valid hex"
+        );
+    }
 }

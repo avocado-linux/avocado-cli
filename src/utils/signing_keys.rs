@@ -388,4 +388,203 @@ mod tests {
         assert_eq!(parsed.keys.len(), 1);
         assert!(parsed.keys.contains_key("test-key"));
     }
+
+    #[test]
+    fn test_sign_and_verify_with_keypair() {
+        // Generate a keypair
+        let (secret_key, public_key) = generate_keypair();
+
+        // Create a test message
+        let message = b"test message to sign";
+
+        // Sign the message
+        let signature = secret_key.sign(message, None);
+
+        // Verify the signature with the public key
+        let result = public_key.verify(message, &signature);
+        assert!(
+            result.is_ok(),
+            "Signature verification should succeed with correct public key"
+        );
+
+        // Verify that wrong message fails
+        let wrong_message = b"different message";
+        let result = public_key.verify(wrong_message, &signature);
+        assert!(
+            result.is_err(),
+            "Signature verification should fail with wrong message"
+        );
+
+        // Verify that wrong public key fails
+        let (_, wrong_public_key) = generate_keypair();
+        let result = wrong_public_key.verify(message, &signature);
+        assert!(
+            result.is_err(),
+            "Signature verification should fail with wrong public key"
+        );
+    }
+
+    #[test]
+    fn test_sign_and_verify_sha256_hash() {
+        use sha2::{Digest, Sha256};
+
+        // Generate a keypair
+        let (secret_key, public_key) = generate_keypair();
+
+        // Create a test file content and hash it
+        let file_content = b"This is a test file for signing";
+        let mut hasher = Sha256::new();
+        hasher.update(file_content);
+        let hash = hasher.finalize();
+
+        // Sign the hash (this is what avocado does)
+        let signature = secret_key.sign(&hash, None);
+
+        // Verify the signature
+        let result = public_key.verify(&hash, &signature);
+        assert!(
+            result.is_ok(),
+            "Signature verification should succeed for SHA256 hash"
+        );
+
+        // Verify signature is 64 bytes
+        assert_eq!(
+            signature.as_ref().len(),
+            64,
+            "ED25519 signature should be 64 bytes"
+        );
+    }
+
+    #[test]
+    fn test_sign_and_verify_blake3_hash() {
+        // Generate a keypair
+        let (secret_key, public_key) = generate_keypair();
+
+        // Create a test file content and hash it with BLAKE3
+        let file_content = b"This is a test file for BLAKE3 signing";
+        let hash = blake3::hash(file_content);
+
+        // Sign the hash
+        let signature = secret_key.sign(hash.as_bytes(), None);
+
+        // Verify the signature
+        let result = public_key.verify(hash.as_bytes(), &signature);
+        assert!(
+            result.is_ok(),
+            "Signature verification should succeed for BLAKE3 hash"
+        );
+    }
+
+    #[test]
+    fn test_signature_encoding_decoding() {
+        // Generate a keypair
+        let (secret_key, _public_key) = generate_keypair();
+
+        // Create and sign a message
+        let message = b"test message";
+        let signature = secret_key.sign(message, None);
+
+        // Encode signature to hex (this is what avocado does)
+        let signature_hex: String = signature
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        // Verify hex encoding
+        assert_eq!(
+            signature_hex.len(),
+            128,
+            "Hex-encoded signature should be 128 characters"
+        );
+        assert!(
+            signature_hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "Signature should be valid hex"
+        );
+
+        // Decode back from hex
+        let decoded_bytes: Vec<u8> = (0..signature_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16).unwrap())
+            .collect();
+
+        // Verify decoding works
+        assert_eq!(
+            decoded_bytes.len(),
+            64,
+            "Decoded signature should be 64 bytes"
+        );
+        assert_eq!(
+            decoded_bytes,
+            signature.as_ref(),
+            "Decoded signature should match original"
+        );
+    }
+
+    #[test]
+    fn test_public_key_encoding_decoding() {
+        use base64::prelude::*;
+
+        // Generate a keypair
+        let (_secret_key, public_key) = generate_keypair();
+
+        // Encode public key to base64 (this is what avocado does when saving .pub files)
+        let public_key_b64 = BASE64_STANDARD.encode(public_key.as_ref());
+
+        // Verify encoding
+        assert_eq!(
+            public_key.as_ref().len(),
+            32,
+            "ED25519 public key should be 32 bytes"
+        );
+
+        // Decode back from base64
+        let decoded_bytes = BASE64_STANDARD.decode(&public_key_b64).unwrap();
+
+        // Verify decoding works
+        assert_eq!(
+            decoded_bytes.len(),
+            32,
+            "Decoded public key should be 32 bytes"
+        );
+        assert_eq!(
+            decoded_bytes,
+            public_key.as_ref(),
+            "Decoded public key should match original"
+        );
+
+        // Reconstruct public key from decoded bytes
+        let reconstructed_key = PublicKey::from_slice(&decoded_bytes).unwrap();
+
+        // Verify reconstructed key matches original
+        assert_eq!(
+            reconstructed_key.as_ref(),
+            public_key.as_ref(),
+            "Reconstructed key should match original"
+        );
+    }
+
+    #[test]
+    fn test_keyid_is_hash_of_public_key() {
+        use sha2::{Digest, Sha256};
+
+        // Generate a keypair
+        let (_secret_key, public_key) = generate_keypair();
+
+        // Generate keyid using the function
+        let keyid = generate_keyid(&public_key);
+
+        // Manually compute the hash
+        let mut hasher = Sha256::new();
+        hasher.update(public_key.as_ref());
+        let manual_hash = hasher.finalize();
+        let manual_keyid = hex::encode(&manual_hash);
+
+        // Verify they match
+        assert_eq!(
+            keyid, manual_keyid,
+            "keyid should be SHA256 hash of public key"
+        );
+        assert_eq!(keyid.len(), 64, "keyid should be 64 hex characters");
+    }
 }
