@@ -720,6 +720,18 @@ fi"#,
 
         let users_section = self.create_users_script_section(users_config, groups_config);
 
+        // Create AVOCADO_ENABLE_SERVICES section for runtime
+        let enable_services_section = if !enable_services.is_empty() {
+            let services_list = enable_services.join(" ");
+            format!(
+                r#"# Add AVOCADO_ENABLE_SERVICES for runtime service enablement
+echo "AVOCADO_ENABLE_SERVICES=\"{services_list}\"" >> "$release_file"
+echo "[INFO] Added AVOCADO_ENABLE_SERVICES=\"{services_list}\" to release file""#
+            )
+        } else {
+            String::new()
+        };
+
         // Create custom on_merge commands section for confext
         let custom_on_merge_section = if !on_merge_commands.is_empty() {
             on_merge_commands
@@ -764,6 +776,9 @@ fi
 
 # Add custom AVOCADO_ON_MERGE commands if specified
 {}
+
+# Add AVOCADO_ENABLE_SERVICES if enable_services is configured
+{}
 {}
 "#,
             overlay_section,
@@ -778,6 +793,7 @@ fi
             self.extension,
             self.extension,
             custom_on_merge_section,
+            enable_services_section,
             service_linking_section
         )
     }
@@ -1610,6 +1626,10 @@ mod tests {
         assert!(script.contains(
             "echo \"Warning: Service file peridiod.service not found in extension sysroot\""
         ));
+
+        // Check that AVOCADO_ENABLE_SERVICES is written to release file
+        assert!(script.contains("echo \"AVOCADO_ENABLE_SERVICES=\\\"peridiod.service test.service\\\"\" >> \"$release_file\""));
+        assert!(script.contains("[INFO] Added AVOCADO_ENABLE_SERVICES=\\\"peridiod.service test.service\\\" to release file"));
     }
 
     #[test]
