@@ -116,8 +116,6 @@ rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw
 
 # Clean extension stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
-
-echo "Cleaned extension '{ext}': sysroot, outputs, and stamps"
 "#,
             ext = self.extension
         );
@@ -172,8 +170,6 @@ rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw
 
 # Clean extension stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
-
-echo "Cleaned extension '{ext}': sysroot, outputs, and stamps"
 "#,
             ext = self.extension
         )

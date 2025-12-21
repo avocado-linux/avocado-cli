@@ -139,9 +139,6 @@ impl CleanCommand {
         let clean_script = r#"
 if [ -d "$AVOCADO_PREFIX/.stamps" ]; then
     rm -rf "$AVOCADO_PREFIX/.stamps"
-    echo "Removed stamps directory"
-else
-    echo "No stamps directory found"
 fi
 "#;
 
@@ -157,7 +154,9 @@ fi
 
         container_helper.run_in_container(run_config).await?;
 
-        print_success("Removed stamp files.", OutputLevel::Normal);
+        if self.verbose {
+            print_success("Removed stamp files.", OutputLevel::Normal);
+        }
 
         Ok(())
     }

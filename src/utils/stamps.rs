@@ -640,7 +640,7 @@ mkdir -p "$AVOCADO_PREFIX/.stamps/$(dirname '{stamp_path}')"
 cat > "$AVOCADO_PREFIX/.stamps/{stamp_path}" << 'STAMP_EOF'
 {stamp_json}
 STAMP_EOF
-echo "Wrote stamp: $AVOCADO_PREFIX/.stamps/{stamp_path}"
+# Stamp written (use --verbose to see stamp operations)
 "#
     ))
 }

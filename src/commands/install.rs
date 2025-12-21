@@ -809,10 +809,13 @@ $DNF_SDK_HOST \
             };
 
             container_helper.run_in_container(run_config).await?;
-            crate::utils::output::print_info(
-                &format!("Wrote stamp: /opt/_avocado/{target}/.stamps/ext/{extension_name}/install.stamp"),
-                crate::utils::output::OutputLevel::Normal,
-            );
+
+            if self.verbose {
+                crate::utils::output::print_info(
+                    &format!("Wrote stamp for external extension '{extension_name}'."),
+                    crate::utils::output::OutputLevel::Normal,
+                );
+            }
         }
 
         Ok(())

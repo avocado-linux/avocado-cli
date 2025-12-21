@@ -98,8 +98,6 @@ rm -rf "$AVOCADO_PREFIX/runtimes/{runtime}"
 
 # Clean runtime stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/runtime/{runtime}"
-
-echo "Cleaned runtime '{runtime}': build directory and stamps"
 "#,
             runtime = self.runtime
         );
@@ -153,8 +151,6 @@ rm -rf "$AVOCADO_PREFIX/runtimes/{runtime}"
 
 # Clean runtime stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/runtime/{runtime}"
-
-echo "Cleaned runtime '{runtime}': build directory and stamps"
 "#,
             runtime = self.runtime
         )
