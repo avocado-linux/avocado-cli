@@ -1136,7 +1136,8 @@ async fn main() -> Result<()> {
                     verbose,
                     container_tool,
                     target.or(cli.target),
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 checkout_cmd.execute().await?;
                 Ok(())
             }
@@ -1230,7 +1231,8 @@ async fn main() -> Result<()> {
                     verbose,
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 package_cmd.execute().await?;
                 Ok(())
             }
@@ -1244,6 +1246,7 @@ async fn main() -> Result<()> {
                 target,
                 verbose,
                 port,
+                no_stamps,
             } => {
                 let hitl_cmd = HitlServerCommand {
                     config_path,
@@ -1253,6 +1256,7 @@ async fn main() -> Result<()> {
                     target: target.or(cli.target),
                     verbose,
                     port,
+                    no_stamps: no_stamps || cli.no_stamps,
                 };
                 hitl_cmd.execute().await?;
                 Ok(())
@@ -1344,7 +1348,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 compile_cmd.execute().await?;
                 Ok(())
             }
@@ -1597,6 +1602,9 @@ enum HitlCommands {
         /// NFS port number to use
         #[arg(short, long)]
         port: Option<u16>,
+        /// Disable stamp validation
+        #[arg(long)]
+        no_stamps: bool,
     },
 }
 

@@ -1,6 +1,9 @@
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
-use crate::utils::output::{print_debug, OutputLevel};
+use crate::utils::output::{print_debug, print_info, OutputLevel};
+use crate::utils::stamps::{
+    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
+};
 use crate::utils::target::validate_and_log_target;
 use anyhow::Result;
 use clap::Args;
@@ -33,6 +36,10 @@ pub struct HitlServerCommand {
 
     /// NFS port number to use
     pub port: Option<u16>,
+
+    /// Disable stamp validation
+    #[arg(long)]
+    pub no_stamps: bool,
 }
 
 impl HitlServerCommand {
@@ -62,6 +69,56 @@ impl HitlServerCommand {
                 &format!("Using SDK image: {container_image}"),
                 OutputLevel::Normal,
             );
+        }
+
+        // Validate extension stamps before starting server (unless --no-stamps)
+        if !self.no_stamps && !self.extensions.is_empty() {
+            print_info("Validating extension stamps...", OutputLevel::Normal);
+
+            // Build stamp requirements for all requested extensions
+            // Each extension needs both install AND build stamps
+            let mut requirements = vec![StampRequirement::sdk_install()];
+            for ext_name in &self.extensions {
+                requirements.push(StampRequirement::ext_install(ext_name));
+                requirements.push(StampRequirement::ext_build(ext_name));
+            }
+
+            // Batch read all stamps in a single container invocation
+            let batch_script = generate_batch_read_stamps_script(&requirements);
+            let validation_config = RunConfig {
+                container_image: container_image.clone(),
+                target: target.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(validation_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error = validation.into_error("Cannot start HITL server");
+                return Err(error.into());
+            }
+
+            if self.verbose {
+                print_debug(
+                    &format!(
+                        "All {} extension(s) have valid install and build stamps.",
+                        self.extensions.len()
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
         }
 
         // Build container arguments with HITL-specific defaults
@@ -215,6 +272,7 @@ mod tests {
             target: None,
             verbose: false,
             port: None,
+            no_stamps: false,
         };
 
         let commands = cmd.generate_export_setup_commands("x86_64");
@@ -235,6 +293,7 @@ mod tests {
             target: None,
             verbose: false,
             port: Some(2049),
+            no_stamps: false,
         };
 
         let commands = cmd.generate_export_setup_commands("x86_64");
@@ -254,6 +313,7 @@ mod tests {
             target: None,
             verbose: true,
             port: Some(3049),
+            no_stamps: false,
         };
 
         let commands = cmd.generate_export_setup_commands("x86_64");
@@ -274,6 +334,7 @@ mod tests {
             target: None,
             verbose: false,
             port: Some(4049),
+            no_stamps: false,
         };
 
         let commands = cmd.generate_export_setup_commands("aarch64");
@@ -284,5 +345,26 @@ mod tests {
         assert!(commands.contains("Export_Id = 2"));
         assert!(commands.contains("/opt/_avocado/aarch64/extensions/ext1"));
         assert!(commands.contains("/opt/_avocado/aarch64/extensions/ext2"));
+    }
+
+    #[test]
+    fn test_stamp_requirements_for_extensions() {
+        // Verify we require both install and build stamps for each extension
+        let extensions = vec!["ext1".to_string(), "ext2".to_string()];
+
+        let mut requirements = vec![StampRequirement::sdk_install()];
+        for ext_name in &extensions {
+            requirements.push(StampRequirement::ext_install(ext_name));
+            requirements.push(StampRequirement::ext_build(ext_name));
+        }
+
+        // Should have: SDK install + (install + build) for each extension
+        // 1 + (2 * 2) = 5
+        assert_eq!(requirements.len(), 5);
+        assert!(requirements.contains(&StampRequirement::sdk_install()));
+        assert!(requirements.contains(&StampRequirement::ext_install("ext1")));
+        assert!(requirements.contains(&StampRequirement::ext_build("ext1")));
+        assert!(requirements.contains(&StampRequirement::ext_install("ext2")));
+        assert!(requirements.contains(&StampRequirement::ext_build("ext2")));
     }
 }

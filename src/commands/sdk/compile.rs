@@ -6,6 +6,7 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
+    stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
     target::resolve_target_required,
 };
 
@@ -30,6 +31,8 @@ pub struct SdkCompileCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Disable stamp validation
+    pub no_stamps: bool,
 }
 
 impl SdkCompileCommand {
@@ -49,7 +52,14 @@ impl SdkCompileCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     /// Execute the sdk compile command
@@ -63,6 +73,46 @@ impl SdkCompileCommand {
         }
         let config = Config::load(&self.config_path)
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        // SDK compile requires SDK to be installed
+        if !self.no_stamps {
+            let container_image = config
+                .get_sdk_image()
+                .context("No SDK container image specified in configuration")?;
+            let target = resolve_target_required(self.target.as_deref(), &config)?;
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+            let requirements = vec![StampRequirement::sdk_install()];
+
+            let batch_script = generate_batch_read_stamps_script(&requirements);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: config.get_sdk_repo_url(),
+                repo_release: config.get_sdk_repo_release(),
+                container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            let validation =
+                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error = validation.into_error("Cannot run SDK compile");
+                return Err(error.into());
+            }
+        }
 
         // Debug: Check if sdk.compile was parsed
         if self.verbose {

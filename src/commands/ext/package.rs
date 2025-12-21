@@ -5,8 +5,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::utils::config::{Config, ExtensionLocation};
-use crate::utils::container::SdkContainer;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
+};
 use crate::utils::target::resolve_target_required;
 
 /// Command to package an extension sysroot into an RPM
@@ -19,6 +22,7 @@ pub struct ExtPackageCommand {
     pub container_args: Option<Vec<String>>,
     #[allow(dead_code)]
     pub dnf_args: Option<Vec<String>>,
+    pub no_stamps: bool,
 }
 
 impl ExtPackageCommand {
@@ -39,17 +43,68 @@ impl ExtPackageCommand {
             verbose,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
         // Load configuration
         let config = Config::load(&self.config_path)?;
+
+        // Resolve target early for stamp validation
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        // Package requires extension to be installed AND built
+        if !self.no_stamps {
+            let container_image = config
+                .get_sdk_image()
+                .context("No SDK container image specified in configuration")?;
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+            let requirements = vec![
+                StampRequirement::sdk_install(),
+                StampRequirement::ext_install(&self.extension),
+                StampRequirement::ext_build(&self.extension),
+            ];
+
+            let batch_script = generate_batch_read_stamps_script(&requirements);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: config.get_sdk_repo_url(),
+                repo_release: config.get_sdk_repo_release(),
+                container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            let validation =
+                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error = validation
+                    .into_error(&format!("Cannot package extension '{}'", self.extension));
+                return Err(error.into());
+            }
+        }
+
         // Read config content for extension SDK dependencies parsing
         let content = std::fs::read_to_string(&self.config_path)?;
-
-        // Resolve target using unified target resolution logic
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         // Find extension using comprehensive lookup
         let extension_location = config

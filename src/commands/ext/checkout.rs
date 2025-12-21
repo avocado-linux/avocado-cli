@@ -2,7 +2,13 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command as AsyncCommand;
 
+use crate::utils::config::Config;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
+};
+use crate::utils::target::resolve_target_required;
 use crate::utils::volume::VolumeManager;
 
 pub struct ExtCheckoutCommand {
@@ -13,6 +19,7 @@ pub struct ExtCheckoutCommand {
     verbose: bool,
     container_tool: String,
     target: Option<String>,
+    no_stamps: bool,
 }
 
 impl ExtCheckoutCommand {
@@ -33,11 +40,62 @@ impl ExtCheckoutCommand {
             verbose,
             container_tool,
             target,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
         let cwd = std::env::current_dir().context("Failed to get current directory")?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        // Checkout requires extension to be installed
+        if !self.no_stamps {
+            let config = Config::load(&self.config_path)?;
+            let target = resolve_target_required(self.target.as_deref(), &config)?;
+
+            if let Some(container_image) = config.get_sdk_image() {
+                let container_helper =
+                    SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+                let requirements = vec![
+                    StampRequirement::sdk_install(),
+                    StampRequirement::ext_install(&self.extension),
+                ];
+
+                let batch_script = generate_batch_read_stamps_script(&requirements);
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.clone(),
+                    command: batch_script,
+                    verbose: false,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: config.get_sdk_repo_url(),
+                    repo_release: config.get_sdk_repo_release(),
+                    container_args: config.merge_sdk_container_args(None),
+                    ..Default::default()
+                };
+
+                let output = container_helper
+                    .run_in_container_with_output(run_config)
+                    .await?;
+
+                let validation =
+                    validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+
+                if !validation.is_satisfied() {
+                    let error = validation
+                        .into_error(&format!("Cannot checkout extension '{}'", self.extension));
+                    return Err(error.into());
+                }
+            }
+        }
 
         // Get the volume state for this project
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
