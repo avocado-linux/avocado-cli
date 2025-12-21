@@ -7,6 +7,7 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    stamps::{compute_sdk_input_hash, generate_write_stamp_script, Stamp, StampOutputs},
     target::validate_and_log_target,
 };
 
@@ -24,6 +25,8 @@ pub struct SdkInstallCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Disable stamp validation and writing
+    pub no_stamps: bool,
 }
 
 impl SdkInstallCommand {
@@ -43,7 +46,14 @@ impl SdkInstallCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     /// Execute the sdk install command
@@ -257,6 +267,35 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             }
 
             print_success("Installed SDK compile dependencies.", OutputLevel::Normal);
+        }
+
+        // Write SDK install stamp (unless --no-stamps)
+        if !self.no_stamps {
+            let inputs = compute_sdk_input_hash(&composed.merged_value)?;
+            let outputs = StampOutputs::default();
+            let stamp = Stamp::sdk_install(&target, inputs, outputs);
+            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                ..Default::default()
+            };
+
+            container_helper.run_in_container(run_config).await?;
+
+            if self.verbose {
+                print_info("Wrote SDK install stamp.", OutputLevel::Normal);
+            }
         }
 
         Ok(())

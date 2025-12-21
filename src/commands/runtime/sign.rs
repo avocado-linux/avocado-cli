@@ -4,9 +4,13 @@
 
 use crate::utils::{
     config::load_config,
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     image_signing::{validate_signing_key_for_use, ChecksumAlgorithm},
     output::{print_info, print_success, print_warning, OutputLevel},
+    stamps::{
+        generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
+        validate_stamps_batch, Stamp, StampCommand, StampComponent, StampInputs, StampOutputs,
+    },
     target::resolve_target_required,
 };
 use anyhow::{Context, Result};
@@ -22,6 +26,7 @@ pub struct RuntimeSignCommand {
     container_args: Option<Vec<String>>,
     #[allow(dead_code)] // Included for API consistency with other commands
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl RuntimeSignCommand {
@@ -40,7 +45,14 @@ impl RuntimeSignCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -51,6 +63,49 @@ impl RuntimeSignCommand {
 
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        if !self.no_stamps {
+            let container_image = config
+                .get_sdk_image()
+                .context("No SDK container image specified in configuration")?;
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+            // Sign requires runtime build stamp
+            let required = resolve_required_stamps(
+                StampCommand::Sign,
+                StampComponent::Runtime,
+                Some(&self.runtime_name),
+                &[],
+            );
+
+            // Batch all stamp reads into a single container invocation for performance
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error =
+                    validation.into_error(&format!("Cannot sign runtime '{}'", self.runtime_name));
+                return Err(error.into());
+            }
+        }
 
         print_info(
             &format!(
@@ -103,6 +158,40 @@ impl RuntimeSignCommand {
             &format!("Successfully signed runtime '{}'", self.runtime_name),
             OutputLevel::Normal,
         );
+
+        // Write sign stamp (unless --no-stamps)
+        if !self.no_stamps {
+            let container_image = config
+                .get_sdk_image()
+                .context("No SDK container image specified")?;
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+            let inputs = StampInputs::new("sign".to_string());
+            let outputs = StampOutputs::default();
+            let stamp = Stamp::runtime_sign(&self.runtime_name, &target_arch, inputs, outputs);
+            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                ..Default::default()
+            };
+
+            container_helper.run_in_container(run_config).await?;
+
+            if self.verbose {
+                print_info(
+                    &format!("Wrote sign stamp for runtime '{}'.", self.runtime_name),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
         Ok(())
     }
 

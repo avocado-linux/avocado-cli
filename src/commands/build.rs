@@ -39,6 +39,8 @@ pub struct BuildCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Disable stamp validation and writing
+    pub no_stamps: bool,
 }
 
 impl BuildCommand {
@@ -60,7 +62,14 @@ impl BuildCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     /// Execute the build command
@@ -133,7 +142,8 @@ impl BuildCommand {
                             self.target.clone(),
                             self.container_args.clone(),
                             self.dnf_args.clone(),
-                        );
+                        )
+                        .with_no_stamps(self.no_stamps);
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build extension '{extension_name}'")
                         })?;
@@ -263,7 +273,8 @@ impl BuildCommand {
                 self.target.clone(),
                 self.container_args.clone(),
                 self.dnf_args.clone(),
-            );
+            )
+            .with_no_stamps(self.no_stamps);
             runtime_build_cmd
                 .execute()
                 .await
@@ -587,7 +598,8 @@ impl BuildCommand {
             Some(target.to_string()),
             self.container_args.clone(),
             self.dnf_args.clone(),
-        );
+        )
+        .with_no_stamps(self.no_stamps);
 
         // Execute the extension build using the external config
         match ext_build_cmd.execute().await {
@@ -902,7 +914,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
-                );
+                )
+                .with_no_stamps(self.no_stamps);
                 ext_build_cmd
                     .execute()
                     .await
@@ -1053,7 +1066,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             self.target.clone(),
                             self.container_args.clone(),
                             self.dnf_args.clone(),
-                        );
+                        )
+                        .with_no_stamps(self.no_stamps);
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build extension '{extension_name}'")
                         })?;
@@ -1131,7 +1145,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             self.target.clone(),
             self.container_args.clone(),
             self.dnf_args.clone(),
-        );
+        )
+        .with_no_stamps(self.no_stamps);
         runtime_build_cmd
             .execute()
             .await

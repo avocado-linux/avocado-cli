@@ -39,6 +39,8 @@ pub struct InstallCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Disable stamp validation and writing
+    pub no_stamps: bool,
 }
 
 impl InstallCommand {
@@ -60,7 +62,14 @@ impl InstallCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     /// Execute the install command
@@ -91,7 +100,8 @@ impl InstallCommand {
             self.target.clone(),
             self.container_args.clone(),
             self.dnf_args.clone(),
-        );
+        )
+        .with_no_stamps(self.no_stamps);
         sdk_install_cmd
             .execute()
             .await
@@ -125,7 +135,8 @@ impl InstallCommand {
                             self.target.clone(),
                             self.container_args.clone(),
                             self.dnf_args.clone(),
-                        );
+                        )
+                        .with_no_stamps(self.no_stamps);
                         ext_install_cmd.execute().await.with_context(|| {
                             format!(
                                 "Failed to install extension dependencies for '{extension_name}'"
@@ -209,7 +220,8 @@ impl InstallCommand {
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
-                );
+                )
+                .with_no_stamps(self.no_stamps);
                 runtime_install_cmd.execute().await.with_context(|| {
                     format!("Failed to install runtime dependencies for '{runtime_name}'")
                 })?;
@@ -753,6 +765,55 @@ $DNF_SDK_HOST \
             &format!("Successfully installed external extension '{extension_name}' from '{external_config_path}'."),
             crate::utils::output::OutputLevel::Normal,
         );
+
+        // Write install stamp for external extension (unless --no-stamps)
+        if !self.no_stamps {
+            use crate::utils::stamps::{
+                generate_write_stamp_script, Stamp, StampInputs, StampOutputs,
+            };
+
+            // Compute input hash from external config
+            let resolved_external_config_path =
+                config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
+            let external_config_content =
+                std::fs::read_to_string(&resolved_external_config_path).unwrap_or_default();
+            let input_hash = crate::utils::stamps::compute_hash(&external_config_content);
+
+            let inputs = StampInputs::new(input_hash);
+            let outputs = StampOutputs::default();
+            let stamp = Stamp::ext_install(extension_name, target, inputs, outputs);
+            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            // Get fresh container config values for stamp writing
+            let stamp_container_image = config
+                .get_sdk_image()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let stamp_repo_url = config.get_sdk_repo_url();
+            let stamp_repo_release = config.get_sdk_repo_release();
+            let stamp_container_args =
+                config.merge_sdk_container_args(self.container_args.as_ref());
+
+            let run_config = crate::utils::container::RunConfig {
+                container_image: stamp_container_image.clone(),
+                target: target.to_string(),
+                command: stamp_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: stamp_repo_url,
+                repo_release: stamp_repo_release,
+                container_args: stamp_container_args,
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            container_helper.run_in_container(run_config).await?;
+            crate::utils::output::print_info(
+                &format!("Wrote stamp: /opt/_avocado/{target}/.stamps/ext/{extension_name}/install.stamp"),
+                crate::utils::output::OutputLevel::Normal,
+            );
+        }
 
         Ok(())
     }

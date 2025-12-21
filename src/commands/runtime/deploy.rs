@@ -2,6 +2,7 @@ use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
     target::resolve_target_required,
 };
 use anyhow::{Context, Result};
@@ -15,6 +16,7 @@ pub struct RuntimeDeployCommand {
     device: String,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl RuntimeDeployCommand {
@@ -35,7 +37,14 @@ impl RuntimeDeployCommand {
             device,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -68,6 +77,46 @@ impl RuntimeDeployCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
 
+        // Initialize SDK container helper
+        let container_helper =
+            SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        if !self.no_stamps {
+            // Deploy requires provision stamp
+            let required = vec![StampRequirement::new(
+                crate::utils::stamps::StampCommand::Provision,
+                crate::utils::stamps::StampComponent::Runtime,
+                Some(&self.runtime_name),
+            )];
+
+            // Batch all stamp reads into a single container invocation for performance
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error = validation
+                    .into_error(&format!("Cannot deploy runtime '{}'", self.runtime_name));
+                return Err(error.into());
+            }
+        }
+
         print_info(
             &format!(
                 "Deploying runtime '{}' to device '{}'",
@@ -75,9 +124,6 @@ impl RuntimeDeployCommand {
             ),
             OutputLevel::Normal,
         );
-
-        // Initialize SDK container helper
-        let container_helper = SdkContainer::new();
 
         // Create deploy script
         let deploy_script = self.create_deploy_script(&target_arch)?;

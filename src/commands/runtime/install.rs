@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    compute_runtime_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
+};
 use crate::utils::target::resolve_target_required;
 
 pub struct RuntimeInstallCommand {
@@ -13,6 +16,7 @@ pub struct RuntimeInstallCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl RuntimeInstallCommand {
@@ -33,7 +37,14 @@ impl RuntimeInstallCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -137,6 +148,45 @@ impl RuntimeInstallCommand {
                     OutputLevel::Normal,
                 );
                 return Ok(());
+            }
+
+            // Write runtime install stamp (unless --no-stamps)
+            if !self.no_stamps {
+                // Get merged runtime config for stamp input hash
+                let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+                if let Some(merged_runtime) = config.get_merged_runtime_config(
+                    runtime_name,
+                    &target_arch,
+                    &self.config_path,
+                )? {
+                    let inputs = compute_runtime_input_hash(&merged_runtime, runtime_name)?;
+                    let outputs = StampOutputs::default();
+                    let stamp = Stamp::runtime_install(runtime_name, &target_arch, inputs, outputs);
+                    let stamp_script = generate_write_stamp_script(&stamp)?;
+
+                    let run_config = RunConfig {
+                        container_image: container_image.to_string(),
+                        target: target_arch.clone(),
+                        command: stamp_script,
+                        verbose: self.verbose,
+                        source_environment: true,
+                        interactive: false,
+                        repo_url: repo_url.clone(),
+                        repo_release: repo_release.clone(),
+                        container_args: merged_container_args.clone(),
+                        dnf_args: self.dnf_args.clone(),
+                        ..Default::default()
+                    };
+
+                    container_helper.run_in_container(run_config).await?;
+
+                    if self.verbose {
+                        print_info(
+                            &format!("Wrote install stamp for runtime '{runtime_name}'."),
+                            OutputLevel::Normal,
+                        );
+                    }
+                }
             }
         }
 

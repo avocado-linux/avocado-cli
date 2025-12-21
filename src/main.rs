@@ -43,6 +43,10 @@ struct Cli {
     /// Global target architecture
     #[arg(long)]
     target: Option<String>,
+
+    /// Disable stamp validation and writing
+    #[arg(long)]
+    no_stamps: bool,
 }
 
 #[derive(Subcommand)]
@@ -100,6 +104,15 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
+        /// Also remove stamp files (requires -C/--config and --target)
+        #[arg(long)]
+        stamps: bool,
+        /// Path to avocado.yaml configuration file (required when --stamps is used)
+        #[arg(short = 'C', long)]
+        config: Option<String>,
+        /// Target architecture (required when --stamps is used)
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Install all components (SDK, extensions, and runtime dependencies)
     Install {
@@ -706,9 +719,15 @@ async fn main() -> Result<()> {
             skip_volumes,
             container_tool,
             verbose,
+            stamps,
+            config,
+            target,
         } => {
             let clean_cmd =
-                CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose);
+                CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose)
+                    .with_stamps(stamps)
+                    .with_config_path(config)
+                    .with_target(target.or(cli.target.clone()));
             clean_cmd.execute().await?;
             Ok(())
         }
@@ -726,10 +745,11 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 runtime,
-                target.or(cli.target),
+                target.or(cli.target.clone()),
                 container_args,
                 dnf_args,
-            );
+            )
+            .with_no_stamps(cli.no_stamps);
             install_cmd.execute().await?;
             Ok(())
         }
@@ -747,10 +767,11 @@ async fn main() -> Result<()> {
                 verbose,
                 runtime,
                 extension,
-                target.or(cli.target),
+                target.or(cli.target.clone()),
                 container_args,
                 dnf_args,
-            );
+            )
+            .with_no_stamps(cli.no_stamps);
             build_cmd.execute().await?;
             Ok(())
         }
@@ -804,6 +825,7 @@ async fn main() -> Result<()> {
                     out,
                     container_args,
                     dnf_args,
+                    no_stamps: cli.no_stamps,
                 });
             provision_cmd.execute().await?;
             Ok(())
@@ -821,11 +843,12 @@ async fn main() -> Result<()> {
                 runtime,
                 config,
                 verbose,
-                target.or(cli.target),
+                target.or(cli.target.clone()),
                 device,
                 container_args,
                 dnf_args,
-            );
+            )
+            .with_no_stamps(cli.no_stamps);
             deploy_cmd.execute().await?;
             Ok(())
         }
@@ -896,10 +919,11 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     force,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -916,10 +940,11 @@ async fn main() -> Result<()> {
                     runtime,
                     config,
                     verbose,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 build_cmd.execute().await?;
                 Ok(())
             }
@@ -948,6 +973,7 @@ async fn main() -> Result<()> {
                         container_args,
                         dnf_args,
                         state_file: None, // Resolved from config during execution
+                        no_stamps: cli.no_stamps,
                     },
                 );
                 provision_cmd.execute().await?;
@@ -1020,11 +1046,12 @@ async fn main() -> Result<()> {
                     runtime,
                     config,
                     verbose,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     device,
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 deploy_cmd.execute().await?;
                 Ok(())
             }
@@ -1040,10 +1067,11 @@ async fn main() -> Result<()> {
                     runtime,
                     config,
                     verbose,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 sign_cmd.execute().await?;
                 Ok(())
             }
@@ -1063,10 +1091,11 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     force,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -1082,10 +1111,11 @@ async fn main() -> Result<()> {
                     extension,
                     config,
                     verbose,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 build_cmd.execute().await?;
                 Ok(())
             }
@@ -1241,10 +1271,11 @@ async fn main() -> Result<()> {
                     config,
                     verbose,
                     force,
-                    target.or(cli.target),
+                    target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 install_cmd.execute().await?;
                 Ok(())
             }

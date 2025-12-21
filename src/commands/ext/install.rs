@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    compute_ext_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
+};
 use crate::utils::target::resolve_target_required;
 
 pub struct ExtInstallCommand {
@@ -13,6 +16,7 @@ pub struct ExtInstallCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl ExtInstallCommand {
@@ -33,7 +37,14 @@ impl ExtInstallCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -203,6 +214,37 @@ impl ExtInstallCommand {
                 .await?
             {
                 return Err(anyhow::anyhow!("Failed to install extension '{ext_name}'"));
+            }
+
+            // Write extension install stamp (unless --no-stamps)
+            if !self.no_stamps {
+                let inputs = compute_ext_input_hash(parsed, ext_name)?;
+                let outputs = StampOutputs::default();
+                let stamp = Stamp::ext_install(ext_name, &target, inputs, outputs);
+                let stamp_script = generate_write_stamp_script(&stamp)?;
+
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.clone(),
+                    command: stamp_script,
+                    verbose: self.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: repo_url.clone(),
+                    repo_release: repo_release.clone(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    ..Default::default()
+                };
+
+                container_helper.run_in_container(run_config).await?;
+
+                if self.verbose {
+                    print_info(
+                        &format!("Wrote install stamp for extension '{ext_name}'."),
+                        OutputLevel::Normal,
+                    );
+                }
             }
         }
 

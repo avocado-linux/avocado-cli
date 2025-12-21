@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::utils::config::Config;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::target::resolve_target_required;
 use crate::utils::volume::{VolumeManager, VolumeState};
 
 /// Command to clean the avocado project by removing docker volumes and state files.
@@ -17,6 +20,12 @@ pub struct CleanCommand {
     container_tool: String,
     /// Verbose output
     verbose: bool,
+    /// Whether to remove stamp files
+    stamps: bool,
+    /// Path to configuration file (needed for --stamps)
+    config_path: Option<String>,
+    /// Target architecture (needed for --stamps)
+    target: Option<String>,
 }
 
 impl CleanCommand {
@@ -38,7 +47,28 @@ impl CleanCommand {
             volumes,
             container_tool: container_tool.unwrap_or_else(|| "docker".to_string()),
             verbose,
+            stamps: false,
+            config_path: None,
+            target: None,
         }
+    }
+
+    /// Set whether to clean stamps
+    pub fn with_stamps(mut self, stamps: bool) -> Self {
+        self.stamps = stamps;
+        self
+    }
+
+    /// Set the config path for stamp cleaning
+    pub fn with_config_path(mut self, config_path: Option<String>) -> Self {
+        self.config_path = config_path;
+        self
+    }
+
+    /// Set the target for stamp cleaning
+    pub fn with_target(mut self, target: Option<String>) -> Self {
+        self.target = target;
+        self
     }
 
     /// Executes the clean command, removing volumes, state files, and optionally legacy directories.
@@ -80,6 +110,54 @@ impl CleanCommand {
 
         // Clean state file
         self.clean_state_file(&directory_path)?;
+
+        // Clean stamp files if requested
+        if self.stamps {
+            self.clean_stamps(&directory_path).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Clean stamp files from the container volume
+    async fn clean_stamps(&self, _directory_path: &Path) -> Result<()> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--stamps requires a config file to be specified with -c/--config")
+        })?;
+
+        let config = Config::load(config_path)?;
+        let container_image = config
+            .get_sdk_image()
+            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration"))?;
+
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
+
+        let container_helper =
+            SdkContainer::from_config(config_path, &config)?.verbose(self.verbose);
+
+        // Remove the stamps directory
+        let clean_script = r#"
+if [ -d "$AVOCADO_PREFIX/.stamps" ]; then
+    rm -rf "$AVOCADO_PREFIX/.stamps"
+    echo "Removed stamps directory"
+else
+    echo "No stamps directory found"
+fi
+"#;
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: clean_script.to_string(),
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            ..Default::default()
+        };
+
+        container_helper.run_in_container(run_config).await?;
+
+        print_success("Removed stamp files.", OutputLevel::Normal);
 
         Ok(())
     }

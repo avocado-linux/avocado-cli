@@ -6,5 +6,6 @@ pub mod output;
 pub mod pkcs11_devices;
 pub mod signing_keys;
 pub mod signing_service;
+pub mod stamps;
 pub mod target;
 pub mod volume;

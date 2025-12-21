@@ -112,6 +112,28 @@ pub enum ExtensionLocation {
     External { name: String, config_path: String },
 }
 
+/// Represents an extension dependency for a runtime with type information
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RuntimeExtDep {
+    /// Extension defined in the main config file (needs install + build)
+    Local(String),
+    /// Extension from an external config file (needs install + build)
+    External { name: String, config_path: String },
+    /// Prebuilt extension from package repo (needs install only, no build)
+    Versioned { name: String, version: String },
+}
+
+impl RuntimeExtDep {
+    /// Get the extension name
+    pub fn name(&self) -> &str {
+        match self {
+            RuntimeExtDep::Local(name) => name,
+            RuntimeExtDep::External { name, .. } => name,
+            RuntimeExtDep::Versioned { name, .. } => name,
+        }
+    }
+}
+
 /// A composed configuration that merges the main config with external extension configs.
 ///
 /// This struct provides a unified view where:
@@ -780,6 +802,65 @@ impl Config {
     ) -> Result<Option<serde_yaml::Value>> {
         let section_path = format!("ext.{ext_name}");
         self.get_merged_section(&section_path, target, config_path)
+    }
+
+    /// Get detailed extension dependencies for a runtime (with type information)
+    ///
+    /// Returns a list of extension dependencies with their type:
+    /// - Local: extension defined in the main config file (needs install + build)
+    /// - External: extension from an external config file (needs install + build)
+    /// - Versioned: prebuilt extension from package repo (needs install only)
+    pub fn get_runtime_extension_dependencies_detailed(
+        &self,
+        runtime_name: &str,
+        target: &str,
+        config_path: &str,
+    ) -> Result<Vec<RuntimeExtDep>> {
+        let merged_runtime = self.get_merged_runtime_config(runtime_name, target, config_path)?;
+
+        let Some(runtime_config) = merged_runtime else {
+            return Ok(vec![]);
+        };
+
+        let Some(dependencies) = runtime_config
+            .get("dependencies")
+            .and_then(|d| d.as_mapping())
+        else {
+            return Ok(vec![]);
+        };
+
+        let mut ext_deps = Vec::new();
+
+        for (_dep_name, dep_spec) in dependencies {
+            // Check if this dependency references an extension
+            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                // Check if it has a version (versioned/prebuilt extension)
+                if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+                    ext_deps.push(RuntimeExtDep::Versioned {
+                        name: ext_name.to_string(),
+                        version: version.to_string(),
+                    });
+                }
+                // Check if it has an external config
+                else if let Some(external_config) =
+                    dep_spec.get("config").and_then(|v| v.as_str())
+                {
+                    ext_deps.push(RuntimeExtDep::External {
+                        name: ext_name.to_string(),
+                        config_path: external_config.to_string(),
+                    });
+                }
+                // Otherwise it's a local extension
+                else {
+                    ext_deps.push(RuntimeExtDep::Local(ext_name.to_string()));
+                }
+            }
+        }
+
+        // Sort by name for consistent ordering
+        ext_deps.sort_by(|a, b| a.name().cmp(b.name()));
+
+        Ok(ext_deps)
     }
 
     /// Get merged section for nested paths (e.g., "ext.name.dependencies", "runtime.name.dependencies")

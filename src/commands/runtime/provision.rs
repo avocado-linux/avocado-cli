@@ -3,6 +3,10 @@ use crate::utils::{
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     signing_service::{generate_helper_script, SigningService, SigningServiceConfig},
+    stamps::{
+        generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
+        validate_stamps_batch, Stamp, StampCommand, StampComponent, StampInputs, StampOutputs,
+    },
     target::resolve_target_required,
     volume::VolumeManager,
 };
@@ -24,6 +28,8 @@ pub struct RuntimeProvisionConfig {
     /// Path to state file relative to src_dir for persisting state between provision runs.
     /// Resolved from provision profile config or defaults to `provision-{profile}.state`.
     pub state_file: Option<String>,
+    /// Disable stamp validation and writing
+    pub no_stamps: bool,
 }
 
 pub struct RuntimeProvisionCommand {
@@ -73,6 +79,48 @@ impl RuntimeProvisionCommand {
 
         // Resolve target architecture
         let target_arch = resolve_target_required(self.config.target.as_deref(), &config)?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        if !self.config.no_stamps {
+            let container_helper = SdkContainer::from_config(&self.config.config_path, &config)?
+                .verbose(self.config.verbose);
+
+            // Provision requires runtime build stamp
+            let required = resolve_required_stamps(
+                StampCommand::Provision,
+                StampComponent::Runtime,
+                Some(&self.config.runtime_name),
+                &[],
+            );
+
+            // Batch all stamp reads into a single container invocation for performance
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error = validation.into_error(&format!(
+                    "Cannot provision runtime '{}'",
+                    self.config.runtime_name
+                ));
+                return Err(error.into());
+            }
+        }
 
         print_info(
             &format!("Provisioning runtime '{}'", self.config.runtime_name),
@@ -281,6 +329,41 @@ impl RuntimeProvisionCommand {
             ),
             OutputLevel::Normal,
         );
+
+        // Write provision stamp (unless --no-stamps)
+        if !self.config.no_stamps {
+            let container_helper = SdkContainer::from_config(&self.config.config_path, &config)?
+                .verbose(self.config.verbose);
+
+            let inputs = StampInputs::new("provision".to_string());
+            let outputs = StampOutputs::default();
+            let stamp =
+                Stamp::runtime_provision(&self.config.runtime_name, &target_arch, inputs, outputs);
+            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: stamp_script,
+                verbose: self.config.verbose,
+                source_environment: true,
+                interactive: false,
+                ..Default::default()
+            };
+
+            container_helper.run_in_container(run_config).await?;
+
+            if self.config.verbose {
+                print_info(
+                    &format!(
+                        "Wrote provision stamp for runtime '{}'.",
+                        self.config.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -974,6 +1057,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             state_file: None,
+            no_stamps: false,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -1000,6 +1084,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             state_file: None,
+            no_stamps: false,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -1048,6 +1133,7 @@ runtime:
             container_args: None,
             dnf_args: None,
             state_file: None,
+            no_stamps: false,
         };
 
         let command = RuntimeProvisionCommand::new(provision_config);
@@ -1090,6 +1176,7 @@ runtime:
             container_args: container_args.clone(),
             dnf_args: dnf_args.clone(),
             state_file: None,
+            no_stamps: false,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -1125,6 +1212,7 @@ runtime:
             container_args: None,
             dnf_args: None,
             state_file: None,
+            no_stamps: false,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 

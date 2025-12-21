@@ -2,6 +2,10 @@ use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    stamps::{
+        compute_runtime_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
+        resolve_required_stamps_for_runtime_build, validate_stamps_batch, Stamp, StampOutputs,
+    },
     target::resolve_target_required,
 };
 use anyhow::{Context, Result};
@@ -14,6 +18,7 @@ pub struct RuntimeBuildCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl RuntimeBuildCommand {
@@ -32,7 +37,14 @@ impl RuntimeBuildCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -73,13 +85,60 @@ impl RuntimeBuildCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
 
+        // Initialize SDK container helper
+        let container_helper =
+            SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        if !self.no_stamps {
+            // Get detailed extension dependencies for this runtime
+            // This distinguishes between local, external, and versioned extensions
+            let ext_deps = config.get_runtime_extension_dependencies_detailed(
+                &self.runtime_name,
+                &target_arch,
+                &self.config_path,
+            )?;
+
+            // Resolve required stamps for runtime build
+            // - Local/External extensions: require install + build
+            // - Versioned extensions: require install only (prebuilt from package repo)
+            let required = resolve_required_stamps_for_runtime_build(&self.runtime_name, &ext_deps);
+
+            // Batch all stamp reads into a single container invocation for performance
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: processed_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error =
+                    validation.into_error(&format!("Cannot build runtime '{}'", self.runtime_name));
+                return Err(error.into());
+            }
+        }
+
         print_info(
             &format!("Building runtime images for '{}'", self.runtime_name),
             OutputLevel::Normal,
         );
-
-        // Initialize SDK container helper
-        let container_helper = SdkContainer::new();
 
         // Build var image
         let build_script = self.create_build_script(&parsed, &target_arch)?;
@@ -143,8 +202,8 @@ impl RuntimeBuildCommand {
             verbose: self.verbose,
             source_environment: true, // need environment for build
             interactive: false,       // build script runs non-interactively
-            repo_url,
-            repo_release,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             env_vars,
@@ -163,6 +222,41 @@ impl RuntimeBuildCommand {
             &format!("Successfully built runtime '{}'", self.runtime_name),
             OutputLevel::Normal,
         );
+
+        // Write runtime build stamp (unless --no-stamps)
+        if !self.no_stamps {
+            let merged_runtime = config
+                .get_merged_runtime_config(&self.runtime_name, &target_arch, &self.config_path)?
+                .unwrap_or_default();
+            let inputs = compute_runtime_input_hash(&merged_runtime, &self.runtime_name)?;
+            let outputs = StampOutputs::default();
+            let stamp = Stamp::runtime_build(&self.runtime_name, &target_arch, inputs, outputs);
+            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: processed_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            container_helper.run_in_container(run_config).await?;
+
+            if self.verbose {
+                print_info(
+                    &format!("Wrote build stamp for runtime '{}'.", self.runtime_name),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
         Ok(())
     }
 

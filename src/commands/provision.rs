@@ -27,6 +27,8 @@ pub struct ProvisionConfig {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Disable stamp validation and writing
+    pub no_stamps: bool,
 }
 
 /// Implementation of the 'provision' command that calls through to runtime provision.
@@ -71,6 +73,7 @@ impl ProvisionCommand {
                 container_args: merged_container_args,
                 dnf_args: self.config.dnf_args.clone(),
                 state_file,
+                no_stamps: self.config.no_stamps,
             },
         );
 
@@ -98,6 +101,7 @@ mod tests {
             out: None,
             container_args: Some(vec!["--privileged".to_string()]),
             dnf_args: Some(vec!["--nogpgcheck".to_string()]),
+            no_stamps: false,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -128,6 +132,7 @@ mod tests {
             out: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -161,6 +166,7 @@ mod tests {
             out: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -181,6 +187,7 @@ mod tests {
             out: Some("output".to_string()),
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
         let cmd = ProvisionCommand::new(config);
 

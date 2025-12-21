@@ -4,6 +4,11 @@ use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
+    resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
+    StampOutputs,
+};
 use crate::utils::target::resolve_target_required;
 
 #[derive(Debug, Clone)]
@@ -25,6 +30,7 @@ pub struct ExtBuildCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl ExtBuildCommand {
@@ -43,7 +49,14 @@ impl ExtBuildCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -59,6 +72,55 @@ impl ExtBuildCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
         let target = resolve_target_required(self.target.as_deref(), &config)?;
+
+        // Get SDK configuration from interpolated config
+        let container_image = config
+            .get_sdk_image()
+            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration"))?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        if !self.no_stamps {
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+            // Resolve required stamps for extension build
+            let required = resolve_required_stamps(
+                StampCommand::Build,
+                StampComponent::Extension,
+                Some(&self.extension),
+                &[], // No extension dependencies for ext build
+            );
+
+            // Batch all stamp reads into a single container invocation for performance
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: processed_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error =
+                    validation.into_error(&format!("Cannot build extension '{}'", self.extension));
+                return Err(error.into());
+            }
+        }
 
         // Find extension using comprehensive lookup
         let extension_location = config
@@ -346,6 +408,41 @@ impl ExtBuildCommand {
             return Err(anyhow::anyhow!(
                 "Failed to build one or more extension types"
             ));
+        }
+
+        // Write extension build stamp (unless --no-stamps)
+        if !self.no_stamps {
+            let parsed: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?;
+            let inputs = compute_ext_input_hash(&parsed, &self.extension)?;
+            let outputs = StampOutputs::default();
+            let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);
+            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: processed_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+            container_helper.run_in_container(run_config).await?;
+
+            if self.verbose {
+                print_info(
+                    &format!("Wrote build stamp for extension '{}'.", self.extension),
+                    OutputLevel::Normal,
+                );
+            }
         }
 
         Ok(())
@@ -1504,6 +1601,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -1560,6 +1658,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_confext_build_script(
@@ -1613,6 +1712,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -1640,6 +1740,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_confext_build_script(
@@ -1667,6 +1768,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let enable_services = vec!["peridiod.service".to_string(), "test.service".to_string()];
@@ -1706,6 +1808,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -1738,6 +1841,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let overlay_config = OverlayConfig {
@@ -1776,6 +1880,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let overlay_config = OverlayConfig {
@@ -1814,6 +1919,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let overlay_config = OverlayConfig {
@@ -1854,6 +1960,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let overlay_config = OverlayConfig {
@@ -1894,6 +2001,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script_sysext = cmd.create_sysext_build_script(
@@ -1937,6 +2045,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let modprobe_modules = vec!["nfs".to_string(), "ext4".to_string()];
@@ -1980,6 +2089,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -2016,6 +2126,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_confext_build_script(
@@ -2049,6 +2160,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_confext_build_script(
@@ -2081,6 +2193,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let on_merge_commands = vec![
@@ -2119,6 +2232,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let on_unmerge_commands = vec![
@@ -2160,6 +2274,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let on_unmerge_commands = vec!["systemctl stop myservice.service".to_string()];
@@ -2193,6 +2308,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let on_merge_commands = vec!["systemctl restart sshd.socket".to_string()];
@@ -2226,6 +2342,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -2257,6 +2374,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -2286,6 +2404,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Test with the example modules from the user's request
@@ -2333,6 +2452,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Test with both modprobe modules and custom commands
@@ -2395,6 +2515,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create users config matching the example in the user request
@@ -2436,6 +2557,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_users_script_section(None, None);
@@ -2453,6 +2575,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create users config with a user that has a non-empty password
@@ -2489,6 +2612,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create users config with a user that has a non-string password
@@ -2521,6 +2645,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create users config matching the example in the user request
@@ -2574,6 +2699,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create users config matching the example in the user request
@@ -2625,6 +2751,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Test empty password - should show warning
@@ -2671,6 +2798,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create comprehensive groups config
@@ -2754,6 +2882,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Create comprehensive users configuration using mixed approach
@@ -3032,6 +3161,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         // Test user with just name (no fields at all)
@@ -3060,6 +3190,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_sysext_build_script(
@@ -3087,6 +3218,7 @@ mod tests {
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let script = cmd.create_confext_build_script(
@@ -3178,6 +3310,7 @@ sdk:
             target: None,
             container_args: None,
             dnf_args: None,
+            no_stamps: false,
         };
 
         let src_dir = "src";
