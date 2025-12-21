@@ -89,7 +89,20 @@ impl RuntimeCleanCommand {
         );
 
         let container_helper = SdkContainer::new();
-        let clean_command = format!("rm -rf $AVOCADO_PREFIX/runtimes/{}", self.runtime);
+
+        // Clean runtime directory and stamps
+        let clean_command = format!(
+            r#"
+# Clean runtime build directory
+rm -rf "$AVOCADO_PREFIX/runtimes/{runtime}"
+
+# Clean runtime stamps (install and build)
+rm -rf "$AVOCADO_PREFIX/.stamps/runtime/{runtime}"
+
+echo "Cleaned runtime '{runtime}': build directory and stamps"
+"#,
+            runtime = self.runtime
+        );
 
         if self.verbose {
             print_info(
@@ -128,6 +141,23 @@ impl RuntimeCleanCommand {
             );
             Err(anyhow::anyhow!("Clean command failed"))
         }
+    }
+
+    /// Generate the clean command script for testing
+    #[cfg(test)]
+    fn generate_clean_script(&self) -> String {
+        format!(
+            r#"
+# Clean runtime build directory
+rm -rf "$AVOCADO_PREFIX/runtimes/{runtime}"
+
+# Clean runtime stamps (install and build)
+rm -rf "$AVOCADO_PREFIX/.stamps/runtime/{runtime}"
+
+echo "Cleaned runtime '{runtime}': build directory and stamps"
+"#,
+            runtime = self.runtime
+        )
     }
 }
 
@@ -172,5 +202,63 @@ mod tests {
             Some(vec!["--cap-add=SYS_ADMIN".to_string()])
         );
         assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
+    }
+
+    #[test]
+    fn test_clean_script_cleans_runtime_directory() {
+        let cmd = RuntimeCleanCommand::new(
+            "production".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Should clean runtime build directory
+        assert!(script.contains(r#"rm -rf "$AVOCADO_PREFIX/runtimes/production""#));
+    }
+
+    #[test]
+    fn test_clean_script_cleans_stamps() {
+        let cmd = RuntimeCleanCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Should clean runtime stamps (install and build)
+        assert!(script.contains(r#"rm -rf "$AVOCADO_PREFIX/.stamps/runtime/dev""#));
+    }
+
+    #[test]
+    fn test_clean_script_includes_all_cleanup_targets() {
+        let cmd = RuntimeCleanCommand::new(
+            "my-runtime".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Verify both cleanup targets are present
+        assert!(
+            script.contains("runtimes/my-runtime"),
+            "Should clean runtime directory"
+        );
+        assert!(
+            script.contains(".stamps/runtime/my-runtime"),
+            "Should clean stamps"
+        );
     }
 }

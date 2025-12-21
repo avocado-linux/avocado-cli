@@ -104,7 +104,23 @@ impl ExtCleanCommand {
         );
 
         let container_helper = SdkContainer::new();
-        let clean_command = format!("rm -rf $AVOCADO_EXT_SYSROOTS/{}", self.extension);
+
+        // Clean sysroot, output files, and stamps
+        let clean_command = format!(
+            r#"
+# Clean extension sysroot
+rm -rf "$AVOCADO_EXT_SYSROOTS/{ext}"
+
+# Clean extension output files (built .raw images)
+rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw
+
+# Clean extension stamps (install and build)
+rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
+
+echo "Cleaned extension '{ext}': sysroot, outputs, and stamps"
+"#,
+            ext = self.extension
+        );
 
         if self.verbose {
             print_info(
@@ -141,5 +157,145 @@ impl ExtCleanCommand {
             );
             Err(anyhow::anyhow!("Clean command failed"))
         }
+    }
+
+    /// Generate the clean command script for testing
+    #[cfg(test)]
+    fn generate_clean_script(&self) -> String {
+        format!(
+            r#"
+# Clean extension sysroot
+rm -rf "$AVOCADO_EXT_SYSROOTS/{ext}"
+
+# Clean extension output files (built .raw images)
+rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw
+
+# Clean extension stamps (install and build)
+rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
+
+echo "Cleaned extension '{ext}': sysroot, outputs, and stamps"
+"#,
+            ext = self.extension
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let cmd = ExtCleanCommand::new(
+            "test-ext".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        assert_eq!(cmd.extension, "test-ext");
+        assert_eq!(cmd.config_path, "avocado.yaml");
+        assert!(!cmd.verbose);
+        assert_eq!(cmd.target, Some("x86_64".to_string()));
+    }
+
+    #[test]
+    fn test_new_with_verbose_and_args() {
+        let cmd = ExtCleanCommand::new(
+            "my-extension".to_string(),
+            "config.yaml".to_string(),
+            true,
+            None,
+            Some(vec!["--cap-add=SYS_ADMIN".to_string()]),
+            Some(vec!["--nogpgcheck".to_string()]),
+        );
+
+        assert_eq!(cmd.extension, "my-extension");
+        assert!(cmd.verbose);
+        assert_eq!(
+            cmd.container_args,
+            Some(vec!["--cap-add=SYS_ADMIN".to_string()])
+        );
+        assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
+    }
+
+    #[test]
+    fn test_clean_script_cleans_sysroot() {
+        let cmd = ExtCleanCommand::new(
+            "gpu-driver".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Should clean extension sysroot
+        assert!(script.contains(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/gpu-driver""#));
+    }
+
+    #[test]
+    fn test_clean_script_cleans_output_files() {
+        let cmd = ExtCleanCommand::new(
+            "network-driver".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Should clean built extension images
+        assert!(
+            script.contains(r#"rm -f "$AVOCADO_PREFIX/output/extensions/network-driver"-*.raw"#)
+        );
+    }
+
+    #[test]
+    fn test_clean_script_cleans_stamps() {
+        let cmd = ExtCleanCommand::new(
+            "app-bundle".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Should clean extension stamps (install and build)
+        assert!(script.contains(r#"rm -rf "$AVOCADO_PREFIX/.stamps/ext/app-bundle""#));
+    }
+
+    #[test]
+    fn test_clean_script_includes_all_cleanup_targets() {
+        let cmd = ExtCleanCommand::new(
+            "my-ext".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let script = cmd.generate_clean_script();
+
+        // Verify all three cleanup targets are present
+        assert!(
+            script.contains("AVOCADO_EXT_SYSROOTS"),
+            "Should clean sysroot"
+        );
+        assert!(
+            script.contains("output/extensions"),
+            "Should clean output files"
+        );
+        assert!(script.contains(".stamps/ext"), "Should clean stamps");
     }
 }
