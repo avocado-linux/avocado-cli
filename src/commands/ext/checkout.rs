@@ -530,5 +530,164 @@ mod tests {
         assert_eq!(cmd.extension, "test-ext");
         assert_eq!(cmd.ext_path, "/etc/config");
         assert_eq!(cmd.src_path, "extracted/config");
+        assert!(!cmd.no_stamps);
+    }
+
+    #[test]
+    fn test_checkout_with_no_stamps_flag() {
+        let cmd = ExtCheckoutCommand::new(
+            "test-ext".to_string(),
+            "/etc/config".to_string(),
+            "extracted/config".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            "docker".to_string(),
+            None,
+        )
+        .with_no_stamps(true);
+
+        assert!(cmd.no_stamps);
+    }
+
+    // ========================================================================
+    // Stamp Dependency Tests
+    // ========================================================================
+
+    #[test]
+    fn test_checkout_stamp_requirements() {
+        // ext checkout requires: SDK install + ext install (NOT build)
+        // Checkout is for extracting files from the installed sysroot
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("config-files"),
+        ];
+
+        // Verify correct stamp paths
+        assert_eq!(requirements[0].relative_path(), "sdk/install.stamp");
+        assert_eq!(
+            requirements[1].relative_path(),
+            "ext/config-files/install.stamp"
+        );
+
+        // Verify fix commands are correct
+        assert_eq!(requirements[0].fix_command(), "avocado sdk install");
+        assert_eq!(
+            requirements[1].fix_command(),
+            "avocado ext install -e config-files"
+        );
+    }
+
+    #[test]
+    fn test_checkout_does_not_require_build_stamp() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        // Checkout only needs SDK install and ext install - NOT ext build
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+        ];
+
+        // Provide only SDK and ext install stamps (no build)
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install = Stamp::ext_install(
+            "my-ext",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let install_json = serde_json::to_string(&ext_install).unwrap();
+
+        let output = format!(
+            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            sdk_json, install_json
+        );
+
+        let result = validate_stamps_batch(&requirements, &output, None);
+
+        // Should pass without needing build stamp
+        assert!(result.is_satisfied());
+        assert_eq!(result.satisfied.len(), 2);
+    }
+
+    #[test]
+    fn test_checkout_fails_without_ext_install() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+        ];
+
+        // Only SDK installed, not the extension
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let output = format!(
+            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::null",
+            sdk_json
+        );
+
+        let result = validate_stamps_batch(&requirements, &output, None);
+
+        assert!(!result.is_satisfied());
+        assert_eq!(result.missing.len(), 1);
+        assert_eq!(
+            result.missing[0].relative_path(),
+            "ext/my-ext/install.stamp"
+        );
+    }
+
+    #[test]
+    fn test_checkout_clean_lifecycle() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("app-config"),
+        ];
+
+        // Before clean: both stamps present
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install = Stamp::ext_install(
+            "app-config",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let install_json = serde_json::to_string(&ext_install).unwrap();
+
+        let output_before = format!(
+            "sdk/install.stamp:::{}\next/app-config/install.stamp:::{}",
+            sdk_json, install_json
+        );
+
+        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        assert!(result_before.is_satisfied(), "Should pass before clean");
+
+        // After ext clean: SDK still there, ext stamp gone
+        let output_after = format!(
+            "sdk/install.stamp:::{}\next/app-config/install.stamp:::null",
+            sdk_json
+        );
+
+        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        assert!(!result_after.is_satisfied(), "Should fail after ext clean");
+        assert_eq!(result_after.missing.len(), 1);
     }
 }

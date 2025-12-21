@@ -257,4 +257,154 @@ mod tests {
             "Should clean stamps"
         );
     }
+
+    // ========================================================================
+    // Stamp Lifecycle Tests
+    // ========================================================================
+
+    #[test]
+    fn test_clean_removes_all_runtime_stamps() {
+        use crate::utils::stamps::StampRequirement;
+
+        // Runtime has install, build, sign, provision stamps
+        let stamps = vec![
+            StampRequirement::runtime_install("dev"),
+            StampRequirement::runtime_build("dev"),
+            StampRequirement::runtime_sign("dev"),
+            StampRequirement::runtime_provision("dev"),
+        ];
+
+        // All should be under runtime/<name>/ which clean removes
+        for stamp in &stamps {
+            let path = stamp.relative_path();
+            assert!(
+                path.starts_with("runtime/dev/"),
+                "Stamp {} should be under runtime/dev/",
+                path
+            );
+        }
+
+        // Clean command removes the parent directory
+        let cmd = RuntimeCleanCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+        let script = cmd.generate_clean_script();
+        assert!(script.contains(".stamps/runtime/dev"));
+    }
+
+    #[test]
+    fn test_clean_then_build_requires_reinstall() {
+        use crate::utils::stamps::{
+            validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+        };
+
+        // Runtime build requirements after cleaning
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::runtime_install("my-runtime"),
+        ];
+
+        // Before clean: all satisfied
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let rt_install = Stamp::runtime_install(
+            "my-runtime",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let rt_json = serde_json::to_string(&rt_install).unwrap();
+
+        let output_before = format!(
+            "sdk/install.stamp:::{}\nruntime/my-runtime/install.stamp:::{}",
+            sdk_json, rt_json
+        );
+
+        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        assert!(result_before.is_satisfied());
+
+        // After runtime clean: SDK still there, runtime stamps gone
+        let output_after = format!(
+            "sdk/install.stamp:::{}\nruntime/my-runtime/install.stamp:::null",
+            sdk_json
+        );
+
+        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        assert!(!result_after.is_satisfied());
+        assert_eq!(result_after.missing.len(), 1);
+        assert_eq!(
+            result_after.missing[0].relative_path(),
+            "runtime/my-runtime/install.stamp"
+        );
+    }
+
+    #[test]
+    fn test_runtime_clean_preserves_sdk_and_ext_stamps() {
+        use crate::utils::stamps::{
+            validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+        };
+
+        // Requirements that span SDK, extensions, and runtime
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+            StampRequirement::ext_build("my-ext"),
+            StampRequirement::runtime_install("my-runtime"),
+        ];
+
+        // All present before clean
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install = Stamp::ext_install(
+            "my-ext",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_build = Stamp::ext_build(
+            "my-ext",
+            "qemux86-64",
+            StampInputs::new("hash3".to_string()),
+            StampOutputs::default(),
+        );
+        let rt_install = Stamp::runtime_install(
+            "my-runtime",
+            "qemux86-64",
+            StampInputs::new("hash4".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let ext_install_json = serde_json::to_string(&ext_install).unwrap();
+        let ext_build_json = serde_json::to_string(&ext_build).unwrap();
+        // Runtime stamp is intentionally not used - simulating it was cleaned (returns null)
+        let _rt_json = serde_json::to_string(&rt_install).unwrap();
+
+        // After runtime clean: only runtime stamp is gone
+        // SDK and ext stamps should remain
+        let output_after = format!(
+            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::{}\nruntime/my-runtime/install.stamp:::null",
+            sdk_json, ext_install_json, ext_build_json
+        );
+
+        let result = validate_stamps_batch(&requirements, &output_after, None);
+        assert!(!result.is_satisfied());
+        // Only runtime stamp should be missing
+        assert_eq!(result.satisfied.len(), 3);
+        assert_eq!(result.missing.len(), 1);
+        assert!(result.missing[0].relative_path().starts_with("runtime/"));
+    }
 }

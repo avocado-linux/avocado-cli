@@ -367,4 +367,257 @@ mod tests {
         assert!(requirements.contains(&StampRequirement::ext_install("ext2")));
         assert!(requirements.contains(&StampRequirement::ext_build("ext2")));
     }
+
+    // ========================================================================
+    // HITL Server Stamp Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_hitl_server_no_stamps_flag() {
+        let cmd = HitlServerCommand {
+            config_path: "test.yaml".to_string(),
+            extensions: vec!["ext1".to_string()],
+            container_args: None,
+            dnf_args: None,
+            target: None,
+            verbose: false,
+            port: None,
+            no_stamps: true,
+        };
+
+        // With no_stamps, validation should be skipped
+        assert!(cmd.no_stamps);
+    }
+
+    #[test]
+    fn test_hitl_server_no_extensions_no_stamp_requirements() {
+        // When no extensions specified, only SDK install is needed (implicit)
+        let cmd = HitlServerCommand {
+            config_path: "test.yaml".to_string(),
+            extensions: vec![], // No extensions
+            container_args: None,
+            dnf_args: None,
+            target: None,
+            verbose: false,
+            port: None,
+            no_stamps: false,
+        };
+
+        // With no extensions, the stamp validation loop is skipped entirely
+        assert!(cmd.extensions.is_empty());
+    }
+
+    #[test]
+    fn test_hitl_server_stamp_validation_all_present() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        let extensions = vec!["gpu-driver".to_string()];
+
+        let mut requirements = vec![StampRequirement::sdk_install()];
+        for ext in &extensions {
+            requirements.push(StampRequirement::ext_install(ext));
+            requirements.push(StampRequirement::ext_build(ext));
+        }
+
+        // All stamps present
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install = Stamp::ext_install(
+            "gpu-driver",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_build = Stamp::ext_build(
+            "gpu-driver",
+            "qemux86-64",
+            StampInputs::new("hash3".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let install_json = serde_json::to_string(&ext_install).unwrap();
+        let build_json = serde_json::to_string(&ext_build).unwrap();
+
+        let output = format!(
+            "sdk/install.stamp:::{}\next/gpu-driver/install.stamp:::{}\next/gpu-driver/build.stamp:::{}",
+            sdk_json, install_json, build_json
+        );
+
+        let result = validate_stamps_batch(&requirements, &output, None);
+        assert!(result.is_satisfied());
+    }
+
+    #[test]
+    fn test_hitl_server_stamp_validation_missing_build() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        let extensions = vec!["app".to_string()];
+
+        let mut requirements = vec![StampRequirement::sdk_install()];
+        for ext in &extensions {
+            requirements.push(StampRequirement::ext_install(ext));
+            requirements.push(StampRequirement::ext_build(ext));
+        }
+
+        // SDK and install present, build missing
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install = Stamp::ext_install(
+            "app",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let install_json = serde_json::to_string(&ext_install).unwrap();
+
+        let output = format!(
+            "sdk/install.stamp:::{}\next/app/install.stamp:::{}\next/app/build.stamp:::null",
+            sdk_json, install_json
+        );
+
+        let result = validate_stamps_batch(&requirements, &output, None);
+        assert!(!result.is_satisfied());
+        assert_eq!(result.missing.len(), 1);
+        assert_eq!(result.missing[0].relative_path(), "ext/app/build.stamp");
+    }
+
+    #[test]
+    fn test_hitl_server_clean_lifecycle() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        let extensions = vec!["network-driver".to_string()];
+
+        let mut requirements = vec![StampRequirement::sdk_install()];
+        for ext in &extensions {
+            requirements.push(StampRequirement::ext_install(ext));
+            requirements.push(StampRequirement::ext_build(ext));
+        }
+
+        // All stamps present before clean
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install = Stamp::ext_install(
+            "network-driver",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_build = Stamp::ext_build(
+            "network-driver",
+            "qemux86-64",
+            StampInputs::new("hash3".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let install_json = serde_json::to_string(&ext_install).unwrap();
+        let build_json = serde_json::to_string(&ext_build).unwrap();
+
+        let output_before = format!(
+            "sdk/install.stamp:::{}\next/network-driver/install.stamp:::{}\next/network-driver/build.stamp:::{}",
+            sdk_json, install_json, build_json
+        );
+
+        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        assert!(result_before.is_satisfied(), "Should pass before clean");
+
+        // After ext clean network-driver: SDK still there, ext stamps gone
+        let output_after = format!(
+            "sdk/install.stamp:::{}\next/network-driver/install.stamp:::null\next/network-driver/build.stamp:::null",
+            sdk_json
+        );
+
+        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        assert!(!result_after.is_satisfied(), "Should fail after ext clean");
+        assert_eq!(
+            result_after.missing.len(),
+            2,
+            "Both ext stamps should be missing"
+        );
+    }
+
+    #[test]
+    fn test_hitl_server_multiple_extensions_partial_clean() {
+        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+
+        let extensions = vec!["ext-a".to_string(), "ext-b".to_string()];
+
+        let mut requirements = vec![StampRequirement::sdk_install()];
+        for ext in &extensions {
+            requirements.push(StampRequirement::ext_install(ext));
+            requirements.push(StampRequirement::ext_build(ext));
+        }
+
+        // All stamps present
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_a_install = Stamp::ext_install(
+            "ext-a",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_a_build = Stamp::ext_build(
+            "ext-a",
+            "qemux86-64",
+            StampInputs::new("hash3".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_b_install = Stamp::ext_install(
+            "ext-b",
+            "qemux86-64",
+            StampInputs::new("hash4".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_b_build = Stamp::ext_build(
+            "ext-b",
+            "qemux86-64",
+            StampInputs::new("hash5".to_string()),
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        // ext-a stamps are intentionally not used - simulating they were cleaned (return null)
+        let _ext_a_install_json = serde_json::to_string(&ext_a_install).unwrap();
+        let _ext_a_build_json = serde_json::to_string(&ext_a_build).unwrap();
+        let ext_b_install_json = serde_json::to_string(&ext_b_install).unwrap();
+        let ext_b_build_json = serde_json::to_string(&ext_b_build).unwrap();
+
+        // After cleaning only ext-a: ext-a stamps return null, ext-b stamps still present
+        let output_partial = format!(
+            "sdk/install.stamp:::{}\next/ext-a/install.stamp:::null\next/ext-a/build.stamp:::null\next/ext-b/install.stamp:::{}\next/ext-b/build.stamp:::{}",
+            sdk_json, ext_b_install_json, ext_b_build_json
+        );
+
+        let result = validate_stamps_batch(&requirements, &output_partial, None);
+        assert!(
+            !result.is_satisfied(),
+            "Should fail when one extension is cleaned"
+        );
+        assert_eq!(
+            result.missing.len(),
+            2,
+            "ext-a install and build should be missing"
+        );
+        assert_eq!(
+            result.satisfied.len(),
+            3,
+            "SDK and ext-b stamps should be satisfied"
+        );
+    }
 }

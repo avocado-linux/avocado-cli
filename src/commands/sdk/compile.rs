@@ -420,4 +420,102 @@ dependencies = { gcc = "*" }
         let script = cmd.find_compile_script_in_section(&section_config_no_script);
         assert_eq!(script, None);
     }
+
+    // ========================================================================
+    // Stamp Dependency Tests
+    // ========================================================================
+
+    #[test]
+    fn test_compile_stamp_requirements() {
+        use crate::utils::stamps::StampRequirement;
+
+        // sdk compile requires only: SDK install
+        let requirements = vec![StampRequirement::sdk_install()];
+
+        // Verify correct stamp path
+        assert_eq!(requirements[0].relative_path(), "sdk/install.stamp");
+
+        // Verify fix command is correct
+        assert_eq!(requirements[0].fix_command(), "avocado sdk install");
+    }
+
+    #[test]
+    fn test_compile_with_no_stamps_flag() {
+        let cmd =
+            SdkCompileCommand::new("config.yaml".to_string(), false, vec![], None, None, None);
+
+        // Default should have stamps enabled
+        assert!(!cmd.no_stamps);
+
+        // Test with_no_stamps builder
+        let cmd = cmd.with_no_stamps(true);
+        assert!(cmd.no_stamps);
+    }
+
+    #[test]
+    fn test_compile_fails_without_sdk_install() {
+        use crate::utils::stamps::{validate_stamps_batch, StampRequirement};
+
+        let requirements = vec![StampRequirement::sdk_install()];
+
+        // SDK stamp missing
+        let output = "sdk/install.stamp:::null";
+        let result = validate_stamps_batch(&requirements, output, None);
+
+        assert!(!result.is_satisfied());
+        assert_eq!(result.missing.len(), 1);
+        assert_eq!(result.missing[0].fix_command(), "avocado sdk install");
+    }
+
+    #[test]
+    fn test_compile_succeeds_with_sdk_install() {
+        use crate::utils::stamps::{
+            validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+        };
+
+        let requirements = vec![StampRequirement::sdk_install()];
+
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+
+        let output = format!("sdk/install.stamp:::{}", sdk_json);
+        let result = validate_stamps_batch(&requirements, &output, None);
+
+        assert!(result.is_satisfied());
+        assert_eq!(result.satisfied.len(), 1);
+    }
+
+    #[test]
+    fn test_compile_clean_lifecycle() {
+        use crate::utils::stamps::{
+            validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+        };
+
+        let requirements = vec![StampRequirement::sdk_install()];
+
+        // Before clean: SDK stamp present
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+
+        let output_before = format!("sdk/install.stamp:::{}", sdk_json);
+        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        assert!(result_before.is_satisfied(), "Should pass before clean");
+
+        // After clean --stamps: SDK stamp gone (simulating rm -rf .stamps/)
+        let output_after = "sdk/install.stamp:::null";
+        let result_after = validate_stamps_batch(&requirements, output_after, None);
+        assert!(
+            !result_after.is_satisfied(),
+            "Should fail after clean --stamps"
+        );
+        assert_eq!(result_after.missing.len(), 1);
+    }
 }

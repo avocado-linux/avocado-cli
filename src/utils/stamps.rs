@@ -342,6 +342,18 @@ impl StampRequirement {
         Self::new(StampCommand::Build, StampComponent::Runtime, Some(name))
     }
 
+    /// Runtime sign requirement (used in tests and for API completeness)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn runtime_sign(name: &str) -> Self {
+        Self::new(StampCommand::Sign, StampComponent::Runtime, Some(name))
+    }
+
+    /// Runtime provision requirement (used in tests and for API completeness)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn runtime_provision(name: &str) -> Self {
+        Self::new(StampCommand::Provision, StampComponent::Runtime, Some(name))
+    }
+
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
     pub fn relative_path(&self) -> String {
         match (&self.component, &self.component_name) {
@@ -1505,5 +1517,354 @@ ext/my-ext/build.stamp:::null"#;
         assert!(!result.is_satisfied());
         assert!(result.satisfied.is_empty());
         assert_eq!(result.missing.len(), 2);
+    }
+
+    // ========================================================================
+    // Command Dependency Chain Tests
+    // ========================================================================
+    // These tests document the dependency requirements for each command.
+
+    #[test]
+    fn test_ext_package_requires_sdk_install_ext_install_ext_build() {
+        // ext package requires: SDK install + ext install + ext build
+        // This is the most demanding extension command
+        let reqs = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+            StampRequirement::ext_build("my-ext"),
+        ];
+
+        // Verify fix commands are correct
+        assert_eq!(reqs[0].fix_command(), "avocado sdk install");
+        assert_eq!(reqs[1].fix_command(), "avocado ext install -e my-ext");
+        assert_eq!(reqs[2].fix_command(), "avocado ext build -e my-ext");
+
+        // Verify descriptions are helpful
+        assert_eq!(reqs[0].description(), "SDK install");
+        assert_eq!(reqs[1].description(), "extension 'my-ext' install");
+        assert_eq!(reqs[2].description(), "extension 'my-ext' build");
+    }
+
+    #[test]
+    fn test_ext_checkout_requires_sdk_install_ext_install() {
+        // ext checkout requires: SDK install + ext install (but NOT build)
+        // Checkout is for extracting files from installed sysroot
+        let reqs = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+        ];
+
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].fix_command(), "avocado sdk install");
+        assert_eq!(reqs[1].fix_command(), "avocado ext install -e my-ext");
+    }
+
+    #[test]
+    fn test_sdk_compile_requires_sdk_install() {
+        // sdk compile requires: SDK install only
+        // Compile runs scripts in the SDK container after packages are installed
+        let reqs = vec![StampRequirement::sdk_install()];
+
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].fix_command(), "avocado sdk install");
+        assert_eq!(reqs[0].relative_path(), "sdk/install.stamp");
+    }
+
+    #[test]
+    fn test_hitl_server_requires_sdk_install_ext_install_ext_build_for_each_extension() {
+        // HITL server requires for each extension: SDK install + ext install + ext build
+        let extensions = vec!["ext-a", "ext-b"];
+        let mut reqs = vec![StampRequirement::sdk_install()];
+        for ext in &extensions {
+            reqs.push(StampRequirement::ext_install(ext));
+            reqs.push(StampRequirement::ext_build(ext));
+        }
+
+        // Total: 1 SDK + 2 per extension = 5
+        assert_eq!(reqs.len(), 5);
+
+        // Verify all paths are correct
+        assert_eq!(reqs[0].relative_path(), "sdk/install.stamp");
+        assert_eq!(reqs[1].relative_path(), "ext/ext-a/install.stamp");
+        assert_eq!(reqs[2].relative_path(), "ext/ext-a/build.stamp");
+        assert_eq!(reqs[3].relative_path(), "ext/ext-b/install.stamp");
+        assert_eq!(reqs[4].relative_path(), "ext/ext-b/build.stamp");
+    }
+
+    // ========================================================================
+    // Clean Lifecycle Tests
+    // ========================================================================
+    // These tests verify that clean commands remove the right stamps.
+
+    #[test]
+    fn test_ext_clean_stamp_path_matches_ext_install_and_build() {
+        // Extension clean should remove stamps at ext/<name>/
+        // Verify stamp paths are consistent with what clean removes
+        let ext_name = "gpu-driver";
+
+        let install_stamp = StampRequirement::ext_install(ext_name);
+        let build_stamp = StampRequirement::ext_build(ext_name);
+
+        // Both should be under ext/<name>/
+        assert_eq!(
+            install_stamp.relative_path(),
+            "ext/gpu-driver/install.stamp"
+        );
+        assert_eq!(build_stamp.relative_path(), "ext/gpu-driver/build.stamp");
+
+        // Clean removes: rm -rf "$AVOCADO_PREFIX/.stamps/ext/<name>"
+        // This matches the parent directory of both stamps
+        let install_path = install_stamp.relative_path();
+        let install_parent = std::path::Path::new(&install_path)
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let build_path = build_stamp.relative_path();
+        let build_parent = std::path::Path::new(&build_path)
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        assert_eq!(install_parent, "ext/gpu-driver");
+        assert_eq!(build_parent, "ext/gpu-driver");
+    }
+
+    #[test]
+    fn test_runtime_clean_stamp_path_matches_runtime_install_and_build() {
+        // Runtime clean should remove stamps at runtime/<name>/
+        let runtime_name = "my-runtime";
+
+        let install_stamp = StampRequirement::runtime_install(runtime_name);
+        let build_stamp = StampRequirement::runtime_build(runtime_name);
+        let sign_stamp = StampRequirement::runtime_sign(runtime_name);
+        let provision_stamp = StampRequirement::runtime_provision(runtime_name);
+
+        // All should be under runtime/<name>/
+        assert_eq!(
+            install_stamp.relative_path(),
+            "runtime/my-runtime/install.stamp"
+        );
+        assert_eq!(
+            build_stamp.relative_path(),
+            "runtime/my-runtime/build.stamp"
+        );
+        assert_eq!(sign_stamp.relative_path(), "runtime/my-runtime/sign.stamp");
+        assert_eq!(
+            provision_stamp.relative_path(),
+            "runtime/my-runtime/provision.stamp"
+        );
+
+        // Clean removes: rm -rf "$AVOCADO_PREFIX/.stamps/runtime/<name>"
+        // All stamps share the same parent directory
+        let stamps = [install_stamp, build_stamp, sign_stamp, provision_stamp];
+        for stamp in &stamps {
+            let path = stamp.relative_path();
+            let parent = std::path::Path::new(&path)
+                .parent()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(parent, "runtime/my-runtime");
+        }
+    }
+
+    #[test]
+    fn test_sdk_clean_stamp_path_matches_sdk_install() {
+        // SDK clean should remove stamps at sdk/
+        let install_stamp = StampRequirement::sdk_install();
+
+        assert_eq!(install_stamp.relative_path(), "sdk/install.stamp");
+
+        // Clean removes: rm -rf "$AVOCADO_PREFIX/.stamps/sdk"
+        let path = install_stamp.relative_path();
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(parent, "sdk");
+    }
+
+    #[test]
+    fn test_clean_then_build_requires_reinstall() {
+        // After cleaning, all stamps are gone, so build should require install
+        // Simulate: clean ext my-ext -> stamps gone -> ext build requires install first
+
+        // Initially satisfied
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            StampInputs::new("hash1".to_string()),
+            StampOutputs::default(),
+        );
+        let ext_install_stamp = Stamp::ext_install(
+            "my-ext",
+            "qemux86-64",
+            StampInputs::new("hash2".to_string()),
+            StampOutputs::default(),
+        );
+
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+        ];
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let ext_json = serde_json::to_string(&ext_install_stamp).unwrap();
+
+        // Before clean: all satisfied
+        let output_before = format!(
+            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            sdk_json, ext_json
+        );
+        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        assert!(result_before.is_satisfied());
+
+        // After ext clean: SDK still there, ext stamps gone
+        let output_after_ext_clean = format!(
+            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::null",
+            sdk_json
+        );
+        let result_after = validate_stamps_batch(&requirements, &output_after_ext_clean, None);
+        assert!(!result_after.is_satisfied());
+        assert_eq!(result_after.missing.len(), 1);
+        assert_eq!(
+            result_after.missing[0].relative_path(),
+            "ext/my-ext/install.stamp"
+        );
+    }
+
+    #[test]
+    fn test_clean_all_stamps_requires_full_reinstall() {
+        // After `avocado clean --stamps`, everything is gone
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("ext-a"),
+            StampRequirement::ext_build("ext-a"),
+            StampRequirement::runtime_install("my-runtime"),
+            StampRequirement::runtime_build("my-runtime"),
+        ];
+
+        // After clean --stamps: all stamps return null
+        let output = r#"sdk/install.stamp:::null
+ext/ext-a/install.stamp:::null
+ext/ext-a/build.stamp:::null
+runtime/my-runtime/install.stamp:::null
+runtime/my-runtime/build.stamp:::null"#;
+
+        let result = validate_stamps_batch(&requirements, output, None);
+
+        assert!(!result.is_satisfied());
+        assert!(result.satisfied.is_empty());
+        assert_eq!(result.missing.len(), 5);
+    }
+
+    // ========================================================================
+    // Staleness Detection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_stale_stamp_detected_after_config_change() {
+        // When config changes, stamps become stale
+        let original_inputs = StampInputs::new("sha256:original".to_string());
+        let changed_inputs = StampInputs::new("sha256:changed".to_string());
+
+        let stamp = Stamp::ext_install(
+            "my-ext",
+            "qemux86-64",
+            original_inputs,
+            StampOutputs::default(),
+        );
+        let json = serde_json::to_string(&stamp).unwrap();
+
+        let requirements = vec![StampRequirement::ext_install("my-ext")];
+        let output = format!("ext/my-ext/install.stamp:::{}", json);
+
+        // With changed inputs, stamp should be stale
+        let result = validate_stamps_batch(&requirements, &output, Some(&changed_inputs));
+
+        assert!(!result.is_satisfied());
+        assert!(result.satisfied.is_empty());
+        assert!(result.missing.is_empty());
+        assert_eq!(result.stale.len(), 1);
+    }
+
+    #[test]
+    fn test_stale_ext_requires_reinstall_before_build() {
+        // If extension install stamp is stale, build should also fail
+        let original_inputs = StampInputs::new("sha256:original".to_string());
+
+        let sdk_stamp = Stamp::sdk_install(
+            "qemux86-64",
+            original_inputs.clone(),
+            StampOutputs::default(),
+        );
+        let ext_install_stamp = Stamp::ext_install(
+            "my-ext",
+            "qemux86-64",
+            original_inputs,
+            StampOutputs::default(),
+        );
+
+        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
+        let ext_json = serde_json::to_string(&ext_install_stamp).unwrap();
+
+        // Build requirements
+        let requirements = vec![
+            StampRequirement::sdk_install(),
+            StampRequirement::ext_install("my-ext"),
+        ];
+
+        let output = format!(
+            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            sdk_json, ext_json
+        );
+
+        // With changed inputs (simulating config change)
+        let changed_inputs = StampInputs::new("sha256:config-v2".to_string());
+        let result = validate_stamps_batch(&requirements, &output, Some(&changed_inputs));
+
+        // Both should be stale since config changed
+        assert!(!result.is_satisfied());
+        assert_eq!(result.stale.len(), 2);
+    }
+
+    // ========================================================================
+    // Error Message Quality Tests
+    // ========================================================================
+
+    #[test]
+    fn test_error_message_includes_all_missing_fix_commands() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::sdk_install());
+        result.add_missing(StampRequirement::ext_install("app"));
+        result.add_missing(StampRequirement::ext_build("app"));
+
+        let error = result.into_error("Cannot build runtime");
+        let msg = error.to_string();
+
+        // Should include all fix commands
+        assert!(msg.contains("avocado sdk install"));
+        assert!(msg.contains("avocado ext install -e app"));
+        assert!(msg.contains("avocado ext build -e app"));
+    }
+
+    #[test]
+    fn test_error_message_distinguishes_missing_and_stale() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::sdk_install());
+        result.add_stale(
+            StampRequirement::ext_install("stale-ext"),
+            "config hash changed".to_string(),
+        );
+
+        let error = result.into_error("Cannot proceed");
+        let msg = error.to_string();
+
+        // Should have separate sections
+        assert!(msg.contains("Missing steps:"));
+        assert!(msg.contains("Stale steps"));
+        assert!(msg.contains("config hash changed"));
     }
 }
