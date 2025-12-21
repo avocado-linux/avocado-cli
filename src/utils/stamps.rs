@@ -1868,3 +1868,4 @@ runtime/my-runtime/build.stamp:::null"#;
         assert!(msg.contains("config hash changed"));
     }
 }
+
