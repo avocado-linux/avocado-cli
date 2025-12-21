@@ -216,7 +216,7 @@ pub struct ProvisionProfileConfig {
     #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
     /// Path to state file relative to src_dir for persisting state between provision runs.
-    /// Defaults to `provision-{profile}.state` when not specified.
+    /// Defaults to `.avocado/provision-{profile}.state` when not specified.
     /// The state file is copied into the container before provisioning and copied back after.
     pub state_file: Option<String>,
 }
@@ -1284,12 +1284,12 @@ impl Config {
     }
 
     /// Get the state file path for a provision profile.
-    /// Returns the configured state_file path, or the default `provision-{profile}.state` if not set.
+    /// Returns the configured state_file path, or the default `.avocado/provision-{profile}.state` if not set.
     /// The path is relative to src_dir.
     pub fn get_provision_state_file(&self, profile_name: &str) -> String {
         self.get_provision_profile(profile_name)
             .and_then(|p| p.state_file.clone())
-            .unwrap_or_else(|| format!("provision-{}.state", profile_name))
+            .unwrap_or_else(|| format!(".avocado/provision-{}.state", profile_name))
     }
 
     /// Get the resolved source directory path
@@ -3241,7 +3241,7 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
 
     #[test]
     fn test_provision_state_file_default() {
-        // Test that state_file defaults to provision-{profile}.state when not configured
+        // Test that state_file defaults to .avocado/provision-{profile}.state when not configured
         let config_content = r#"
 provision:
   usb:
@@ -3253,11 +3253,11 @@ provision:
 
         // Should use default pattern when state_file is not configured
         let state_file = config.get_provision_state_file("usb");
-        assert_eq!(state_file, "provision-usb.state");
+        assert_eq!(state_file, ".avocado/provision-usb.state");
 
         // Should also use default for non-existent profiles
         let state_file = config.get_provision_state_file("nonexistent");
-        assert_eq!(state_file, "provision-nonexistent.state");
+        assert_eq!(state_file, ".avocado/provision-nonexistent.state");
     }
 
     #[test]

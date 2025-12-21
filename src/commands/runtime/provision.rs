@@ -26,7 +26,7 @@ pub struct RuntimeProvisionConfig {
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     /// Path to state file relative to src_dir for persisting state between provision runs.
-    /// Resolved from provision profile config or defaults to `provision-{profile}.state`.
+    /// Resolved from provision profile config or defaults to `.avocado/provision-{profile}.state`.
     pub state_file: Option<String>,
     /// Disable stamp validation and writing
     pub no_stamps: bool,
