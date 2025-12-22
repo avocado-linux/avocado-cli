@@ -821,33 +821,47 @@ fi
             String::new()
         };
 
-        // Create service linking section
+        // Create service enabling section by parsing [Install] section and creating symlinks
         let service_linking_section = if !enable_services.is_empty() {
             let mut service_commands = Vec::new();
             for service in enable_services {
                 service_commands.push(format!(
                     r#"
-# Link service file for {}
-service_file="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/systemd/system/{}"
-service_link_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/systemd/system/multi-user.target.upholds"
-service_link="$service_link_dir/{}"
+# Enable service file for {}
+sysroot="$AVOCADO_EXT_SYSROOTS/{}"
+service="{}"
+unit_file="$sysroot/usr/lib/systemd/system/$service"
 
-if [ -f "$service_file" ]; then
-    echo "Found service file: $service_file"
-    mkdir -p "$service_link_dir"
-    ln -sf "/usr/lib/systemd/system/{}" "$service_link"
-    echo "Created systemd service link: $service_link -> /usr/lib/systemd/system/{}"
+if [ -f "$unit_file" ]; then
+    echo "Enabling service: $service in sysroot $sysroot"
+
+    # Parse WantedBy= from [Install] section and create .wants symlinks
+    wanted_by=$(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$unit_file" | tr ',' ' ')
+    for target in $wanted_by; do
+        target_dir="$sysroot/etc/systemd/system/$target.wants"
+        mkdir -p "$target_dir"
+        ln -sf "/usr/lib/systemd/system/$service" "$target_dir/$service"
+        echo "Created symlink: $target_dir/$service -> /usr/lib/systemd/system/$service"
+    done
+
+    # Parse RequiredBy= from [Install] section and create .requires symlinks
+    required_by=$(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$unit_file" | tr ',' ' ')
+    for target in $required_by; do
+        target_dir="$sysroot/etc/systemd/system/$target.requires"
+        mkdir -p "$target_dir"
+        ln -sf "/usr/lib/systemd/system/$service" "$target_dir/$service"
+        echo "Created symlink: $target_dir/$service -> /usr/lib/systemd/system/$service"
+    done
+
+    if [ -z "$wanted_by" ] && [ -z "$required_by" ]; then
+        echo "Warning: No WantedBy= or RequiredBy= found in [Install] section of $service"
+    else
+        echo "Successfully enabled $service"
+    fi
 else
-    echo "Warning: Service file {} not found in extension sysroot"
+    echo "Warning: Service file $service not found in extension sysroot"
 fi"#,
-                    service,
-                    self.extension,
-                    service,
-                    self.extension,
-                    service,
-                    service,
-                    service,
-                    service
+                    service, self.extension, service
                 ));
             }
             service_commands.join("\n")
@@ -1784,15 +1798,25 @@ mod tests {
             false,
         );
 
-        // Check that service linking commands are present
-        assert!(script.contains("# Link service file for peridiod.service"));
-        assert!(script.contains("service_file=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/systemd/system/peridiod.service\""));
-        assert!(script.contains("service_link_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/systemd/system/multi-user.target.upholds\""));
-        assert!(script.contains("ln -sf \"/usr/lib/systemd/system/peridiod.service\""));
-        assert!(script.contains("# Link service file for test.service"));
-        assert!(script.contains(
-            "echo \"Warning: Service file peridiod.service not found in extension sysroot\""
-        ));
+        // Check that service enabling commands are present using [Install] section parser
+        assert!(script.contains("# Enable service file for peridiod.service"));
+        assert!(script.contains("sysroot=\"$AVOCADO_EXT_SYSROOTS/test-ext\""));
+        assert!(script.contains("service=\"peridiod.service\""));
+        assert!(script.contains("unit_file=\"$sysroot/usr/lib/systemd/system/$service\""));
+        // Check for WantedBy= parsing
+        assert!(script.contains("wanted_by=$(sed -n"));
+        assert!(script.contains("/^WantedBy=/"));
+        assert!(script.contains("$sysroot/etc/systemd/system/$target.wants"));
+        // Check for RequiredBy= parsing
+        assert!(script.contains("required_by=$(sed -n"));
+        assert!(script.contains("/^RequiredBy=/"));
+        assert!(script.contains("$sysroot/etc/systemd/system/$target.requires"));
+        // Check for symlink creation
+        assert!(script.contains("ln -sf \"/usr/lib/systemd/system/$service\" \"$target_dir/$service\""));
+        assert!(script.contains("# Enable service file for test.service"));
+        assert!(script.contains("service=\"test.service\""));
+        assert!(script
+            .contains("echo \"Warning: Service file $service not found in extension sysroot\""));
 
         // Check that AVOCADO_ENABLE_SERVICES is written to release file
         assert!(script.contains("echo \"AVOCADO_ENABLE_SERVICES=\\\"peridiod.service test.service\\\"\" >> \"$release_file\""));
