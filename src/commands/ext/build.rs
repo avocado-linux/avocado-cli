@@ -1812,7 +1812,9 @@ mod tests {
         assert!(script.contains("/^RequiredBy=/"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.requires"));
         // Check for symlink creation
-        assert!(script.contains("ln -sf \"/usr/lib/systemd/system/$service\" \"$target_dir/$service\""));
+        assert!(
+            script.contains("ln -sf \"/usr/lib/systemd/system/$service\" \"$target_dir/$service\"")
+        );
         assert!(script.contains("# Enable service file for test.service"));
         assert!(script.contains("service=\"test.service\""));
         assert!(script
