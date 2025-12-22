@@ -28,7 +28,8 @@ jobs:
             target/
           key: security-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
       - name: Security audit
-        uses: rustsec/audit-check@v1.4.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
