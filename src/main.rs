@@ -1210,7 +1210,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_no_stamps(cli.no_stamps);
                 image_cmd.execute().await?;
                 Ok(())
             }

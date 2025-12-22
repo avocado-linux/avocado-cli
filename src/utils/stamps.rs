@@ -22,6 +22,7 @@ pub const STAMP_VERSION: u32 = 1;
 pub enum StampCommand {
     Install,
     Build,
+    Image,
     Sign,
     Provision,
 }
@@ -31,6 +32,7 @@ impl fmt::Display for StampCommand {
         match self {
             StampCommand::Install => write!(f, "install"),
             StampCommand::Build => write!(f, "build"),
+            StampCommand::Image => write!(f, "image"),
             StampCommand::Sign => write!(f, "sign"),
             StampCommand::Provision => write!(f, "provision"),
         }
@@ -187,6 +189,18 @@ impl Stamp {
         )
     }
 
+    /// Create extension image stamp
+    pub fn ext_image(name: &str, target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Image,
+            StampComponent::Extension,
+            Some(name.to_string()),
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
     /// Create runtime install stamp
     pub fn runtime_install(
         name: &str,
@@ -332,6 +346,11 @@ impl StampRequirement {
         Self::new(StampCommand::Build, StampComponent::Extension, Some(name))
     }
 
+    /// Extension image requirement
+    pub fn ext_image(name: &str) -> Self {
+        Self::new(StampCommand::Image, StampComponent::Extension, Some(name))
+    }
+
     /// Runtime install requirement
     pub fn runtime_install(name: &str) -> Self {
         Self::new(StampCommand::Install, StampComponent::Runtime, Some(name))
@@ -391,6 +410,9 @@ impl StampRequirement {
             }
             (StampComponent::Extension, Some(name), StampCommand::Build) => {
                 format!("avocado ext build -e {}", name)
+            }
+            (StampComponent::Extension, Some(name), StampCommand::Image) => {
+                format!("avocado ext image -e {}", name)
             }
             (StampComponent::Runtime, Some(name), StampCommand::Install) => {
                 format!("avocado runtime install -r {}", name)
@@ -774,6 +796,16 @@ pub fn resolve_required_stamps(
             ]
         }
 
+        // Extension image requires SDK install + own extension install + own extension build
+        (StampCommand::Image, StampComponent::Extension) => {
+            let ext_name = component_name.expect("Extension name required");
+            vec![
+                StampRequirement::sdk_install(),
+                StampRequirement::ext_install(ext_name),
+                StampRequirement::ext_build(ext_name),
+            ]
+        }
+
         // Runtime build requires SDK + own install + ALL extension deps (install AND build)
         // Note: This doesn't distinguish versioned extensions - use resolve_required_stamps_detailed
         (StampCommand::Build, StampComponent::Runtime) => {
@@ -812,10 +844,11 @@ pub fn resolve_required_stamps(
 /// Resolve required stamps for runtime build with detailed extension dependency info
 ///
 /// This properly handles different extension types:
-/// - Local extensions: require install + build stamps
-/// - External extensions: require install + build stamps
-/// - Versioned extensions: NO stamp requirements - they're package dependencies
-///   installed directly into the runtime sysroot during `runtime install`
+/// - Local extensions: require install + build + image stamps
+/// - External extensions: require install + build + image stamps
+/// - Versioned extensions: NO stamp requirements - they're prebuilt packages
+///   installed directly via DNF during `runtime install`. The package repository
+///   contains the complete extension images, so no local build/image steps needed.
 pub fn resolve_required_stamps_for_runtime_build(
     runtime_name: &str,
     ext_dependencies: &[RuntimeExtDep],
@@ -829,19 +862,22 @@ pub fn resolve_required_stamps_for_runtime_build(
         let ext_name = ext_dep.name();
 
         match ext_dep {
-            // Local extensions: require install + build stamps
+            // Local extensions: require install + build + image stamps
             RuntimeExtDep::Local(_) => {
                 reqs.push(StampRequirement::ext_install(ext_name));
                 reqs.push(StampRequirement::ext_build(ext_name));
+                reqs.push(StampRequirement::ext_image(ext_name));
             }
-            // External extensions: require install + build stamps
+            // External extensions: require install + build + image stamps
             RuntimeExtDep::External { .. } => {
                 reqs.push(StampRequirement::ext_install(ext_name));
                 reqs.push(StampRequirement::ext_build(ext_name));
+                reqs.push(StampRequirement::ext_image(ext_name));
             }
             // Versioned extensions: NO stamp requirements
-            // They're package dependencies installed directly into the runtime sysroot
-            // during `runtime install`, not separate extension installs
+            // They're prebuilt packages from the package repository, installed
+            // directly via DNF during `runtime install`. No local ext install,
+            // ext build, or ext image steps are needed.
             RuntimeExtDep::Versioned { .. } => {
                 // No stamps required - covered by runtime install
             }
@@ -1232,9 +1268,9 @@ mod tests {
         use crate::utils::config::RuntimeExtDep;
 
         // Test with mixed extension types:
-        // - local-ext: needs install + build stamps
-        // - external-ext: needs install + build stamps
-        // - versioned-ext: NO stamps (installed as package into runtime sysroot)
+        // - local-ext: needs install + build + image stamps
+        // - external-ext: needs install + build + image stamps
+        // - versioned-ext: NO stamps (prebuilt package from repo)
         let ext_deps = vec![
             RuntimeExtDep::Local("local-ext".to_string()),
             RuntimeExtDep::External {
@@ -1252,27 +1288,31 @@ mod tests {
         // Should have:
         // - SDK install (1)
         // - Runtime install (1)
-        // - local-ext install + build (2)
-        // - external-ext install + build (2)
-        // - versioned-ext: NOTHING (installed as package during runtime install)
-        assert_eq!(reqs.len(), 6);
+        // - local-ext install + build + image (3)
+        // - external-ext install + build + image (3)
+        // - versioned-ext: NOTHING (prebuilt package from repo)
+        // Total: 8
+        assert_eq!(reqs.len(), 8);
 
         // Verify SDK and runtime install are present
         assert!(reqs.contains(&StampRequirement::sdk_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("my-runtime")));
 
-        // Verify local extension has both install and build
+        // Verify local extension has install, build, and image
         assert!(reqs.contains(&StampRequirement::ext_install("local-ext")));
         assert!(reqs.contains(&StampRequirement::ext_build("local-ext")));
+        assert!(reqs.contains(&StampRequirement::ext_image("local-ext")));
 
-        // Verify external extension has both install and build
+        // Verify external extension has install, build, and image
         assert!(reqs.contains(&StampRequirement::ext_install("external-ext")));
         assert!(reqs.contains(&StampRequirement::ext_build("external-ext")));
+        assert!(reqs.contains(&StampRequirement::ext_image("external-ext")));
 
         // Verify versioned extension has NO stamps at all
-        // (they're package dependencies installed into runtime sysroot during runtime install)
+        // (they're prebuilt packages installed via DNF during runtime install)
         assert!(!reqs.contains(&StampRequirement::ext_install("versioned-ext")));
         assert!(!reqs.contains(&StampRequirement::ext_build("versioned-ext")));
+        assert!(!reqs.contains(&StampRequirement::ext_image("versioned-ext")));
     }
 
     #[test]
@@ -1281,6 +1321,7 @@ mod tests {
 
         // Runtime with ONLY versioned extensions (common for prebuilt extensions from package repo)
         // Example: avocado-ext-dev, avocado-ext-sshd-dev
+        // Versioned extensions are prebuilt packages - NO stamps required
         let ext_deps = vec![
             RuntimeExtDep::Versioned {
                 name: "avocado-ext-dev".to_string(),
@@ -1300,11 +1341,13 @@ mod tests {
         assert!(reqs.contains(&StampRequirement::sdk_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("dev")));
 
-        // Verify NO extension stamps are required
+        // Verify NO extension stamps are required for versioned extensions
         assert!(!reqs.contains(&StampRequirement::ext_install("avocado-ext-dev")));
         assert!(!reqs.contains(&StampRequirement::ext_build("avocado-ext-dev")));
+        assert!(!reqs.contains(&StampRequirement::ext_image("avocado-ext-dev")));
         assert!(!reqs.contains(&StampRequirement::ext_install("avocado-ext-sshd-dev")));
         assert!(!reqs.contains(&StampRequirement::ext_build("avocado-ext-sshd-dev")));
+        assert!(!reqs.contains(&StampRequirement::ext_image("avocado-ext-sshd-dev")));
     }
 
     #[test]
@@ -1328,16 +1371,18 @@ mod tests {
         // Should have:
         // - SDK install (1)
         // - Runtime install (1)
-        // - avocado-ext-peridio install + build (2)
-        // - custom-ext install + build (2)
-        // Total: 6
-        assert_eq!(reqs.len(), 6);
+        // - avocado-ext-peridio install + build + image (3)
+        // - custom-ext install + build + image (3)
+        // Total: 8
+        assert_eq!(reqs.len(), 8);
 
-        // Verify external extensions require both install and build
+        // Verify external extensions require install, build, and image
         assert!(reqs.contains(&StampRequirement::ext_install("avocado-ext-peridio")));
         assert!(reqs.contains(&StampRequirement::ext_build("avocado-ext-peridio")));
+        assert!(reqs.contains(&StampRequirement::ext_image("avocado-ext-peridio")));
         assert!(reqs.contains(&StampRequirement::ext_install("custom-ext")));
         assert!(reqs.contains(&StampRequirement::ext_build("custom-ext")));
+        assert!(reqs.contains(&StampRequirement::ext_image("custom-ext")));
     }
 
     #[test]
@@ -1355,16 +1400,53 @@ mod tests {
         // Should have:
         // - SDK install (1)
         // - Runtime install (1)
-        // - app install + build (2)
-        // - config-dev install + build (2)
-        // Total: 6
-        assert_eq!(reqs.len(), 6);
+        // - app install + build + image (3)
+        // - config-dev install + build + image (3)
+        // Total: 8
+        assert_eq!(reqs.len(), 8);
 
-        // Verify local extensions require both install and build
+        // Verify local extensions require install, build, and image
         assert!(reqs.contains(&StampRequirement::ext_install("app")));
         assert!(reqs.contains(&StampRequirement::ext_build("app")));
+        assert!(reqs.contains(&StampRequirement::ext_image("app")));
         assert!(reqs.contains(&StampRequirement::ext_install("config-dev")));
         assert!(reqs.contains(&StampRequirement::ext_build("config-dev")));
+        assert!(reqs.contains(&StampRequirement::ext_image("config-dev")));
+    }
+
+    #[test]
+    fn test_resolve_required_stamps_ext_image() {
+        // Extension image requires SDK install + ext install + ext build
+        let reqs = resolve_required_stamps(
+            StampCommand::Image,
+            StampComponent::Extension,
+            Some("my-ext"),
+            &[],
+        );
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0], StampRequirement::sdk_install());
+        assert_eq!(reqs[1], StampRequirement::ext_install("my-ext"));
+        assert_eq!(reqs[2], StampRequirement::ext_build("my-ext"));
+    }
+
+    #[test]
+    fn test_ext_image_stamp_creation_and_path() {
+        let inputs = StampInputs::new("sha256:abc123".to_string());
+        let outputs = StampOutputs::default();
+        let stamp = Stamp::ext_image("my-ext", "qemux86-64", inputs, outputs);
+
+        assert_eq!(stamp.command, StampCommand::Image);
+        assert_eq!(stamp.component, StampComponent::Extension);
+        assert_eq!(stamp.component_name, Some("my-ext".to_string()));
+        assert_eq!(stamp.relative_path(), "ext/my-ext/image.stamp");
+    }
+
+    #[test]
+    fn test_ext_image_requirement_description_and_fix() {
+        let req = StampRequirement::ext_image("gpu-driver");
+        assert_eq!(req.description(), "extension 'gpu-driver' image");
+        assert_eq!(req.fix_command(), "avocado ext image -e gpu-driver");
+        assert_eq!(req.relative_path(), "ext/gpu-driver/image.stamp");
     }
 
     #[test]

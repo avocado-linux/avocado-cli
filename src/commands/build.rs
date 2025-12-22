@@ -211,7 +211,8 @@ impl BuildCommand {
                             self.target.clone(),
                             self.container_args.clone(),
                             self.dnf_args.clone(),
-                        );
+                        )
+                        .with_no_stamps(self.no_stamps);
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
                         })?;
@@ -659,7 +660,8 @@ impl BuildCommand {
             Some(target.to_string()),
             self.container_args.clone(),
             self.dnf_args.clone(),
-        );
+        )
+        .with_no_stamps(self.no_stamps);
 
         // Execute the image creation
         ext_image_cmd.execute().await.with_context(|| {
@@ -951,7 +953,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
-                );
+                )
+                .with_no_stamps(self.no_stamps);
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for extension '{ext_name}'")
                 })?;
@@ -1080,7 +1083,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             self.target.clone(),
                             self.container_args.clone(),
                             self.dnf_args.clone(),
-                        );
+                        )
+                        .with_no_stamps(self.no_stamps);
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
                         })?;

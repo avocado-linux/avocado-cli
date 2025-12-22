@@ -3,6 +3,11 @@ use anyhow::{Context, Result};
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
+    resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
+    StampOutputs,
+};
 use crate::utils::target::resolve_target_required;
 
 pub struct ExtImageCommand {
@@ -12,6 +17,7 @@ pub struct ExtImageCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    no_stamps: bool,
 }
 
 impl ExtImageCommand {
@@ -30,7 +36,14 @@ impl ExtImageCommand {
             target,
             container_args,
             dnf_args,
+            no_stamps: false,
         }
+    }
+
+    /// Set the no_stamps flag
+    pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
+        self.no_stamps = no_stamps;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -46,6 +59,57 @@ impl ExtImageCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
         let target = resolve_target_required(self.target.as_deref(), &config)?;
+
+        // Get SDK configuration from interpolated config (needed for stamp validation)
+        let container_image = config
+            .get_sdk_image()
+            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
+
+        // Validate stamps before proceeding (unless --no-stamps)
+        if !self.no_stamps {
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+
+            // Resolve required stamps for extension image
+            let required = resolve_required_stamps(
+                StampCommand::Image,
+                StampComponent::Extension,
+                Some(&self.extension),
+                &[], // No extension dependencies for ext image
+            );
+
+            // Batch all stamp reads into a single container invocation for performance
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+
+            // Validate all stamps from batch output
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error = validation.into_error(&format!(
+                    "Cannot create image for extension '{}'",
+                    self.extension
+                ));
+                return Err(error.into());
+            }
+        }
 
         // Find extension using comprehensive lookup
         let extension_location = config
@@ -111,11 +175,6 @@ impl ExtImageCommand {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_else(|| vec!["sysext", "confext"]);
 
-        // Get SDK configuration from interpolated config
-        let container_image = config
-            .get_sdk_image()
-            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
-
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed
             .get("runtime")
@@ -169,6 +228,39 @@ impl ExtImageCommand {
                 ),
                 OutputLevel::Normal,
             );
+
+            // Write extension image stamp (unless --no-stamps)
+            if !self.no_stamps {
+                let inputs = compute_ext_input_hash(&parsed, &self.extension)?;
+                let outputs = StampOutputs::default();
+                let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);
+                let stamp_script = generate_write_stamp_script(&stamp)?;
+
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.clone(),
+                    command: stamp_script,
+                    verbose: self.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: repo_url.clone(),
+                    repo_release: repo_release.clone(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    ..Default::default()
+                };
+
+                let container_helper =
+                    SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                container_helper.run_in_container(run_config).await?;
+
+                if self.verbose {
+                    print_info(
+                        &format!("Wrote image stamp for extension '{}'.", self.extension),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
         } else {
             return Err(anyhow::anyhow!(
                 "Failed to create extension image for '{}-{}'",
