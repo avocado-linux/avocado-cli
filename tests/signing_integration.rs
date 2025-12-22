@@ -37,6 +37,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_helper_script_contains_required_elements() {
         use avocado_cli::utils::signing_service::generate_helper_script;
 

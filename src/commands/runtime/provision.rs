@@ -1,8 +1,9 @@
+#[cfg(unix)]
+use crate::utils::signing_service::{generate_helper_script, SigningService, SigningServiceConfig};
 use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
-    signing_service::{generate_helper_script, SigningService, SigningServiceConfig},
     stamps::{
         generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
         validate_stamps_batch, Stamp, StampCommand, StampComponent, StampInputs, StampOutputs,
@@ -34,6 +35,7 @@ pub struct RuntimeProvisionConfig {
 
 pub struct RuntimeProvisionCommand {
     config: RuntimeProvisionConfig,
+    #[cfg(unix)]
     signing_service: Option<SigningService>,
 }
 
@@ -41,6 +43,7 @@ impl RuntimeProvisionCommand {
     pub fn new(config: RuntimeProvisionConfig) -> Self {
         Self {
             config,
+            #[cfg(unix)]
             signing_service: None,
         }
     }
@@ -370,6 +373,7 @@ impl RuntimeProvisionCommand {
     /// Setup signing service if signing is configured for the runtime
     ///
     /// Returns Some((socket_path, helper_script_path, key_name, checksum_algorithm)) if signing is enabled
+    #[cfg(unix)]
     async fn setup_signing_service(
         &mut self,
         config: &crate::utils::config::Config,
@@ -423,7 +427,6 @@ impl RuntimeProvisionCommand {
             .context("Failed to write helper script")?;
 
         // Make helper script executable
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o755);
@@ -464,11 +467,28 @@ impl RuntimeProvisionCommand {
         )))
     }
 
+    /// Setup signing service stub for non-Unix platforms
+    /// Signing service requires Unix domain sockets and is not available on Windows
+    #[cfg(not(unix))]
+    async fn setup_signing_service(
+        &mut self,
+        _config: &crate::utils::config::Config,
+    ) -> Result<Option<(PathBuf, PathBuf, String, String)>> {
+        Ok(None)
+    }
+
     /// Cleanup signing service resources
+    #[cfg(unix)]
     async fn cleanup_signing_service(&mut self) -> Result<()> {
         if let Some(service) = self.signing_service.take() {
             service.shutdown().await?;
         }
+        Ok(())
+    }
+
+    /// Cleanup signing service stub for non-Unix platforms
+    #[cfg(not(unix))]
+    async fn cleanup_signing_service(&mut self) -> Result<()> {
         Ok(())
     }
 
