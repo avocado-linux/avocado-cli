@@ -598,7 +598,7 @@ mod tests {
         let test_hash = [0x42u8; 32]; // Simple test hash
 
         // Sign the hash
-        let signature = secret_key.sign(&test_hash, None);
+        let signature = secret_key.sign(test_hash, None);
 
         // Create signature content
         let sig_content = create_signature_content(

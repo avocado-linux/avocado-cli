@@ -438,10 +438,10 @@ mod tests {
         let hash = hasher.finalize();
 
         // Sign the hash (this is what avocado does)
-        let signature = secret_key.sign(&hash, None);
+        let signature = secret_key.sign(hash, None);
 
         // Verify the signature
-        let result = public_key.verify(&hash, &signature);
+        let result = public_key.verify(hash, &signature);
         assert!(
             result.is_ok(),
             "Signature verification should succeed for SHA256 hash"

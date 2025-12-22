@@ -557,7 +557,7 @@ mod tests {
     fn test_checkout_stamp_requirements() {
         // ext checkout requires: SDK install + ext install (NOT build)
         // Checkout is for extracting files from the installed sysroot
-        let requirements = vec![
+        let requirements = [
             StampRequirement::sdk_install(),
             StampRequirement::ext_install("config-files"),
         ];

@@ -1610,7 +1610,7 @@ ext/my-ext/build.stamp:::null"#;
     fn test_ext_package_requires_sdk_install_ext_install_ext_build() {
         // ext package requires: SDK install + ext install + ext build
         // This is the most demanding extension command
-        let reqs = vec![
+        let reqs = [
             StampRequirement::sdk_install(),
             StampRequirement::ext_install("my-ext"),
             StampRequirement::ext_build("my-ext"),
@@ -1631,7 +1631,7 @@ ext/my-ext/build.stamp:::null"#;
     fn test_ext_checkout_requires_sdk_install_ext_install() {
         // ext checkout requires: SDK install + ext install (but NOT build)
         // Checkout is for extracting files from installed sysroot
-        let reqs = vec![
+        let reqs = [
             StampRequirement::sdk_install(),
             StampRequirement::ext_install("my-ext"),
         ];
@@ -1645,7 +1645,7 @@ ext/my-ext/build.stamp:::null"#;
     fn test_sdk_compile_requires_sdk_install() {
         // sdk compile requires: SDK install only
         // Compile runs scripts in the SDK container after packages are installed
-        let reqs = vec![StampRequirement::sdk_install()];
+        let reqs = [StampRequirement::sdk_install()];
 
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].fix_command(), "avocado sdk install");

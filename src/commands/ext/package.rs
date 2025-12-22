@@ -1220,7 +1220,7 @@ ext:
     fn test_package_stamp_requirements() {
         // ext package requires: SDK install + ext install + ext build
         // Verify the stamp requirements are correct
-        let requirements = vec![
+        let requirements = [
             StampRequirement::sdk_install(),
             StampRequirement::ext_install("my-ext"),
             StampRequirement::ext_build("my-ext"),

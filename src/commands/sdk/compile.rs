@@ -430,7 +430,7 @@ dependencies = { gcc = "*" }
         use crate::utils::stamps::StampRequirement;
 
         // sdk compile requires only: SDK install
-        let requirements = vec![StampRequirement::sdk_install()];
+        let requirements = [StampRequirement::sdk_install()];
 
         // Verify correct stamp path
         assert_eq!(requirements[0].relative_path(), "sdk/install.stamp");

@@ -598,7 +598,7 @@ mod tests {
         // Here we're just validating the data format and verification process
 
         // Simulate signing on the host side
-        let signature = secret_key.sign(&file_hash, None);
+        let signature = secret_key.sign(file_hash, None);
 
         // Create signature content in the format that would be returned
         let sig_content = serde_json::json!({
@@ -650,7 +650,7 @@ mod tests {
         let reconstructed_sig = ed25519_compact::Signature::from_slice(&sig_array).unwrap();
 
         // Verify the signature with the public key
-        let result = public_key.verify(&file_hash, &reconstructed_sig);
+        let result = public_key.verify(file_hash, &reconstructed_sig);
         assert!(
             result.is_ok(),
             "Signature from response should be verifiable with original public key"
