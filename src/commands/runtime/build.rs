@@ -9,7 +9,7 @@ use crate::utils::{
     target::resolve_target_required,
 };
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct RuntimeBuildCommand {
     runtime_name: String,
@@ -140,8 +140,21 @@ impl RuntimeBuildCommand {
             OutputLevel::Normal,
         );
 
+        // Collect extensions with versions for AVOCADO_EXT_LIST
+        // This ensures the build scripts know exactly which extension versions to use
+        let resolved_extensions = self
+            .collect_runtime_extensions(
+                &parsed,
+                &config,
+                &self.runtime_name,
+                target_arch.as_str(),
+                &self.config_path,
+                container_image,
+            )
+            .await?;
+
         // Build var image
-        let build_script = self.create_build_script(&parsed, &target_arch)?;
+        let build_script = self.create_build_script(&parsed, &target_arch, &resolved_extensions)?;
 
         if self.verbose {
             print_info(
@@ -152,6 +165,14 @@ impl RuntimeBuildCommand {
 
         // Get stone include paths if configured
         let mut env_vars = std::collections::HashMap::new();
+
+        // Set AVOCADO_EXT_LIST with versioned extension names
+        if !resolved_extensions.is_empty() {
+            env_vars.insert(
+                "AVOCADO_EXT_LIST".to_string(),
+                resolved_extensions.join(" "),
+            );
+        }
 
         // Set AVOCADO_VERBOSE=1 when verbose mode is enabled
         if self.verbose {
@@ -260,7 +281,12 @@ impl RuntimeBuildCommand {
         Ok(())
     }
 
-    fn create_build_script(&self, parsed: &serde_yaml::Value, target_arch: &str) -> Result<String> {
+    fn create_build_script(
+        &self,
+        parsed: &serde_yaml::Value,
+        target_arch: &str,
+        resolved_extensions: &[String],
+    ) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
         let config = crate::utils::config::Config::load(&self.config_path)?;
         let merged_runtime = config
@@ -280,8 +306,7 @@ impl RuntimeBuildCommand {
 
         // Extract extension names and any type overrides from runtime dependencies
         let mut required_extensions = HashSet::new();
-        let mut extension_type_overrides: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+        let mut extension_type_overrides: HashMap<String, Vec<String>> = HashMap::new();
 
         // First, collect direct runtime dependencies
         for (_dep_name, dep_spec) in runtime_deps {
@@ -305,6 +330,26 @@ impl RuntimeBuildCommand {
         // Recursively discover all extension dependencies (including nested external extensions)
         let all_required_extensions =
             self.find_all_extension_dependencies(&config, &required_extensions, target_arch)?;
+
+        // Build a map from extension name to versioned name from resolved_extensions
+        // Format of resolved_extensions items: "ext_name-version" (e.g., "my-ext-1.0.0")
+        let mut ext_version_map: HashMap<String, String> = HashMap::new();
+        for versioned_name in resolved_extensions {
+            // Parse "ext_name-version" - find the last occurrence of -X.Y.Z pattern
+            if let Some(idx) = versioned_name.rfind('-') {
+                let (name, version_with_dash) = versioned_name.split_at(idx);
+                let version = &version_with_dash[1..]; // Skip the leading '-'
+                                                       // Verify it looks like a version (starts with a digit)
+                if version
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
+                    ext_version_map.insert(name.to_string(), versioned_name.clone());
+                }
+            }
+        }
 
         // Build copy commands for required extensions
         let mut copy_commands = Vec::new();
@@ -353,25 +398,51 @@ fi"#
             }
         }
 
-        // Process external extensions (those required but not defined locally)
+        // Process external/versioned extensions (those required but not defined locally)
         for ext_name in &all_required_extensions {
             if !processed_extensions.contains(ext_name) {
-                // This is an external extension - use wildcard to find versioned file
+                // Check if we have a resolved version for this extension
+                if let Some(versioned_name) = ext_version_map.get(ext_name) {
+                    // Use the exact versioned name from resolved_extensions
+                    copy_commands.push(format!(
+                        r#"
+# Copy external/versioned extension {versioned_name}.raw from output/extensions to runtime-specific directory
+if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
+    cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
+    echo "  Copied: {versioned_name}.raw"
+else
+    echo "ERROR: Extension image not found: $AVOCADO_PREFIX/output/extensions/{versioned_name}.raw"
+    exit 1
+fi"#
+                    ));
 
-                // Add copy command for external extension
-                copy_commands.push(format!(
-                    r#"
-# Copy external extension {ext_name} with any version
+                    symlink_commands.push(format!(
+                        r#"
+# Link external/versioned extension from runtime-specific directory
+RUNTIME_EXT=$RUNTIME_EXT_DIR/{versioned_name}.raw
+RUNTIMES_EXT=$VAR_DIR/lib/avocado/extensions/{versioned_name}.raw
+
+if [ -f "$RUNTIME_EXT" ]; then
+    ln -f "$RUNTIME_EXT" "$RUNTIMES_EXT"
+else
+    echo "Missing image for extension {versioned_name}."
+fi"#
+                    ));
+                } else {
+                    // Fallback: use wildcard (should not happen if collect_runtime_extensions works correctly)
+                    copy_commands.push(format!(
+                        r#"
+# Copy external extension {ext_name} (version not resolved, using wildcard)
 EXT_FILE=$(ls "$AVOCADO_PREFIX/output/extensions/{ext_name}"-*.raw 2>/dev/null | head -n 1)
 if [ -n "$EXT_FILE" ]; then
     EXT_BASENAME=$(basename "$EXT_FILE")
     cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
     echo "  Copied: $EXT_BASENAME"
 fi"#
-                ));
+                    ));
 
-                symlink_commands.push(format!(
-                    r#"
+                    symlink_commands.push(format!(
+                        r#"
 # Find external extension {ext_name} with any version from runtime-specific directory
 RUNTIME_EXT=$(ls $RUNTIME_EXT_DIR/{ext_name}-*.raw 2>/dev/null | head -n 1)
 if [ -n "$RUNTIME_EXT" ]; then
@@ -381,7 +452,8 @@ if [ -n "$RUNTIME_EXT" ]; then
 else
     echo "Missing image for external extension {ext_name}."
 fi"#
-                ));
+                    ));
+                }
             }
         }
 
@@ -634,6 +706,185 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 
         Ok(())
     }
+
+    /// Collect extensions required by this runtime with their resolved versions.
+    ///
+    /// Returns a list of versioned extension names in the format "ext_name-version"
+    /// (e.g., "my-ext-1.0.0"). This ensures AVOCADO_EXT_LIST and the build script
+    /// use exact versions from the configuration, not wildcards.
+    async fn collect_runtime_extensions(
+        &self,
+        parsed: &serde_yaml::Value,
+        config: &crate::utils::config::Config,
+        runtime_name: &str,
+        target_arch: &str,
+        config_path: &str,
+        container_image: &str,
+    ) -> Result<Vec<String>> {
+        let merged_runtime =
+            config.get_merged_runtime_config(runtime_name, target_arch, config_path)?;
+
+        let runtime_dep_table = merged_runtime
+            .as_ref()
+            .and_then(|value| value.get("dependencies").and_then(|d| d.as_mapping()))
+            .or_else(|| {
+                parsed
+                    .get("runtime")
+                    .and_then(|r| r.get(runtime_name))
+                    .and_then(|runtime_value| runtime_value.get("dependencies"))
+                    .and_then(|d| d.as_mapping())
+            });
+
+        let mut extensions = Vec::new();
+
+        if let Some(deps) = runtime_dep_table {
+            for dep_spec in deps.values() {
+                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    let version = self
+                        .resolve_extension_version(
+                            parsed,
+                            config,
+                            config_path,
+                            ext_name,
+                            dep_spec,
+                            container_image,
+                            target_arch,
+                        )
+                        .await?;
+                    extensions.push(format!("{ext_name}-{version}"));
+                }
+            }
+        }
+
+        extensions.sort();
+        extensions.dedup();
+
+        Ok(extensions)
+    }
+
+    /// Resolve the version for an extension dependency.
+    ///
+    /// Priority order:
+    /// 1. Explicit `vsn` field in the dependency spec (unless it's "*")
+    /// 2. Version from external config file (if `config` field is specified)
+    /// 3. Version from local `[ext]` section
+    /// 4. Query RPM database for installed version
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_extension_version(
+        &self,
+        parsed: &serde_yaml::Value,
+        config: &crate::utils::config::Config,
+        config_path: &str,
+        ext_name: &str,
+        dep_spec: &serde_yaml::Value,
+        container_image: &str,
+        target_arch: &str,
+    ) -> Result<String> {
+        // If version is explicitly specified with vsn field, use it (unless it's a wildcard)
+        if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
+            if version != "*" {
+                return Ok(version.to_string());
+            }
+            // If vsn is "*", fall through to query RPM for the actual installed version
+        }
+
+        // If external config is specified, try to get version from it
+        if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
+            let external_extensions =
+                config.load_external_extensions(config_path, external_config_path)?;
+            if let Some(ext_config) = external_extensions.get(ext_name) {
+                if let Some(version) = ext_config.get("version").and_then(|v| v.as_str()) {
+                    if version != "*" {
+                        return Ok(version.to_string());
+                    }
+                    // If version is "*", fall through to query RPM
+                }
+            }
+            // External config but no version found or version is "*" - query RPM database
+            return self
+                .query_rpm_version(ext_name, container_image, target_arch)
+                .await;
+        }
+
+        // Try to get version from local [ext] section
+        if let Some(version) = parsed
+            .get("ext")
+            .and_then(|ext_section| ext_section.as_mapping())
+            .and_then(|ext_table| ext_table.get(ext_name))
+            .and_then(|ext_config| ext_config.get("version"))
+            .and_then(|v| v.as_str())
+        {
+            if version != "*" {
+                return Ok(version.to_string());
+            }
+            // If version is "*", fall through to query RPM
+        }
+
+        // No version found in config - this is likely a package repository extension
+        // Query RPM database for the installed version
+        self.query_rpm_version(ext_name, container_image, target_arch)
+            .await
+    }
+
+    /// Query RPM database for the actual installed version of an extension.
+    ///
+    /// This queries the RPM database in the extension's sysroot at $AVOCADO_EXT_SYSROOTS/{ext_name}
+    /// to get the actual installed version. This ensures AVOCADO_EXT_LIST contains
+    /// precise version information.
+    async fn query_rpm_version(
+        &self,
+        ext_name: &str,
+        container_image: &str,
+        target: &str,
+    ) -> Result<String> {
+        let container_helper = SdkContainer::new();
+
+        let version_query_script = format!(
+            r#"
+set -e
+# Query RPM version for extension from RPM database using the same config as installation
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm -q {ext_name} --queryformat '%{{VERSION}}'
+"#
+        );
+
+        let version_query_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: version_query_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            ..Default::default()
+        };
+
+        match container_helper
+            .run_in_container_with_output(version_query_config)
+            .await
+        {
+            Ok(Some(actual_version)) => {
+                let trimmed_version = actual_version.trim();
+                if self.verbose {
+                    print_info(
+                        &format!(
+                            "Resolved extension '{ext_name}' to version '{trimmed_version}' from RPM database"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                Ok(trimmed_version.to_string())
+            }
+            Ok(None) => Err(anyhow::anyhow!(
+                "Failed to query version for extension '{ext_name}' from RPM database. \
+                    Extension may not be installed yet. Run 'avocado install' first."
+            )),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to query version for extension '{ext_name}' from RPM database: {e}. \
+                    Extension may not be installed yet. Run 'avocado install' first."
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -690,7 +941,11 @@ runtime:
             None,
         );
 
-        let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
+        // Pass empty resolved_extensions since no extensions are defined with versions
+        let resolved_extensions: Vec<String> = vec![];
+        let script = cmd
+            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .unwrap();
 
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("TARGET_ARCH=\"x86_64\""));
@@ -730,7 +985,10 @@ ext:
             None,
         );
 
-        let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .unwrap();
 
         assert!(script.contains("test-ext-1.0.0.raw"));
         // Extension should be copied from output/extensions to runtime-specific extensions directory
@@ -773,7 +1031,10 @@ ext:
             None,
         );
 
-        let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .unwrap();
 
         // Extension should be copied from output/extensions to runtime-specific directory
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
@@ -815,7 +1076,10 @@ ext:
             None,
         );
 
-        let script = cmd.create_build_script(&parsed, "x86_64").unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .unwrap();
 
         // Extension should be copied from output/extensions to runtime-specific directory
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
