@@ -252,7 +252,7 @@ fn test_tpm_connection() {
     let _tpm = SwtpmInstance::new().expect("Failed to start TPM simulator");
 
     use avocado_cli::utils::pkcs11_devices::{get_pkcs11_module_path, DeviceType};
-    use cryptoki::context::{CInitializeArgs, Pkcs11};
+    use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 
     let module_path =
         get_pkcs11_module_path(&DeviceType::Tpm).expect("Failed to find PKCS#11 module path");
@@ -262,7 +262,7 @@ fn test_tpm_connection() {
     let pkcs11 = Pkcs11::new(module_path).expect("Failed to load PKCS#11 module");
 
     pkcs11
-        .initialize(CInitializeArgs::OsThreads)
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
         .expect("Failed to initialize PKCS#11");
 
     let slots = pkcs11

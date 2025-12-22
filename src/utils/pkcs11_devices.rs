@@ -3,7 +3,7 @@
 //! Provides unified support for TPM, YubiKey, HSMs, and other PKCS#11-compatible devices.
 
 use anyhow::{Context, Result};
-use cryptoki::context::{CInitializeArgs, Pkcs11};
+use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::Mechanism;
 use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
@@ -662,7 +662,7 @@ pub fn init_pkcs11_session(
     let pkcs11 = Pkcs11::new(module_path).context("Failed to load PKCS#11 module")?;
 
     pkcs11
-        .initialize(CInitializeArgs::OsThreads)
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
         .context("Failed to initialize PKCS#11")?;
 
     // Find token
@@ -675,7 +675,7 @@ pub fn init_pkcs11_session(
 
     // Login - auth should contain the PIN already
     if !auth.is_empty() {
-        let auth_pin = AuthPin::new(auth.to_string());
+        let auth_pin = AuthPin::new(auth.to_string().into());
         session
             .login(UserType::User, Some(&auth_pin))
             .context("Failed to login to PKCS#11 device")?;
@@ -705,7 +705,7 @@ pub fn delete_pkcs11_key(uri: &str) -> Result<()> {
     let pkcs11 = Pkcs11::new(module_path).context("Failed to load PKCS#11 module")?;
 
     pkcs11
-        .initialize(CInitializeArgs::OsThreads)
+        .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
         .context("Failed to initialize PKCS#11")?;
 
     // Find the token
@@ -719,7 +719,7 @@ pub fn delete_pkcs11_key(uri: &str) -> Result<()> {
     // For deletion, we need to login with PIN
     let pin_str = rpassword::prompt_password("Enter PIN to delete hardware key: ")
         .context("Failed to read PIN")?;
-    let auth_pin = AuthPin::new(pin_str.clone());
+    let auth_pin = AuthPin::new(pin_str.clone().into());
 
     session
         .login(UserType::User, Some(&auth_pin))
@@ -808,7 +808,7 @@ pub fn sign_with_pkcs11_device(
     if requires_auth {
         // Key requires per-operation authentication (common with YubiKey)
         // Use the provided PIN for context-specific login
-        let auth_pin = AuthPin::new(pin.to_string());
+        let auth_pin = AuthPin::new(pin.to_string().into());
 
         // Context-specific login for this operation
         session

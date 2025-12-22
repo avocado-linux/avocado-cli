@@ -52,7 +52,7 @@ base64 = "0.22"
 sha2 = "0.10"
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
-cryptoki = "0.10"
+cryptoki = "0.11"
 rpassword = "7.3"
 
 [dev-dependencies]
