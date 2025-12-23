@@ -1893,12 +1893,18 @@ impl Config {
         // First pass: identify which args are flags that take a separate value argument
         // (e.g., -v, -e, --volume, --env, etc.)
         let flags_with_separate_values: HashSet<&str> = [
-            "-v", "--volume",
-            "-e", "--env",
-            "-p", "--publish",
-            "-w", "--workdir",
-            "-u", "--user",
-            "-l", "--label",
+            "-v",
+            "--volume",
+            "-e",
+            "--env",
+            "-p",
+            "--publish",
+            "-w",
+            "--workdir",
+            "-u",
+            "--user",
+            "-l",
+            "--label",
             "--mount",
             "--device",
             "--add-host",
@@ -3411,10 +3417,7 @@ container_args = ["--privileged", "--network=host", "-v", "/dev:/dev", "-v", "/s
         assert!(merged_args.contains(&"--network=host".to_string()));
         // Count occurrences of --privileged and --network=host - should be 1 each
         assert_eq!(
-            merged_args
-                .iter()
-                .filter(|a| *a == "--privileged")
-                .count(),
+            merged_args.iter().filter(|a| *a == "--privileged").count(),
             1
         );
         assert_eq!(
