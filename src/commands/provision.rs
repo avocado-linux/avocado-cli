@@ -47,12 +47,6 @@ impl ProvisionCommand {
         // Load config to access provision profiles
         let config = crate::utils::config::Config::load(&self.config.config_path)?;
 
-        // Merge provision profile container args with CLI container args
-        let merged_container_args = config.merge_provision_container_args(
-            self.config.provision_profile.as_deref(),
-            self.config.container_args.as_ref(),
-        );
-
         // Get state file path from provision profile if available
         let state_file = self
             .config
@@ -60,6 +54,8 @@ impl ProvisionCommand {
             .as_ref()
             .map(|profile| config.get_provision_state_file(profile));
 
+        // Pass raw CLI container_args - RuntimeProvisionCommand will handle merging
+        // with SDK and provision profile args to avoid double-merging
         let mut runtime_provision_cmd = RuntimeProvisionCommand::new(
             crate::commands::runtime::provision::RuntimeProvisionConfig {
                 runtime_name: self.config.runtime.clone(),
@@ -70,7 +66,7 @@ impl ProvisionCommand {
                 provision_profile: self.config.provision_profile.clone(),
                 env_vars: self.config.env_vars.clone(),
                 out: self.config.out.clone(),
-                container_args: merged_container_args,
+                container_args: self.config.container_args.clone(),
                 dnf_args: self.config.dnf_args.clone(),
                 state_file,
                 no_stamps: self.config.no_stamps,

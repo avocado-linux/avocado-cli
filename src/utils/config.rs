@@ -1842,26 +1842,122 @@ impl Config {
         }
     }
 
-    /// Merge provision profile container args with CLI args, expanding environment variables
-    /// Returns a new Vec containing provision profile args first, then CLI args
+    /// Merge SDK container args, provision profile container args, and CLI args
+    /// Returns a new Vec containing: SDK args first, then provision profile args, then CLI args
+    /// This ensures SDK defaults are used as a base, with provision profiles and CLI overriding
+    /// Duplicate args are removed (later args take precedence for flags with values)
     pub fn merge_provision_container_args(
         &self,
         provision_profile: Option<&str>,
         cli_args: Option<&Vec<String>>,
     ) -> Option<Vec<String>> {
+        let sdk_args = self.get_sdk_container_args();
         let profile_args = provision_profile
             .and_then(|profile| self.get_provision_profile_container_args(profile));
 
-        match (profile_args, cli_args) {
-            (Some(profile), Some(cli)) => {
-                let mut merged = Self::process_container_args(Some(profile)).unwrap_or_default();
-                merged.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
-                Some(merged)
-            }
-            (Some(profile), None) => Self::process_container_args(Some(profile)),
-            (None, Some(cli)) => Self::process_container_args(Some(cli)),
-            (None, None) => None,
+        // Collect all args in order: SDK first, then provision profile, then CLI
+        let mut all_args: Vec<String> = Vec::new();
+
+        if let Some(sdk) = sdk_args {
+            all_args.extend(Self::process_container_args(Some(sdk)).unwrap_or_default());
         }
+
+        if let Some(profile) = profile_args {
+            all_args.extend(Self::process_container_args(Some(profile)).unwrap_or_default());
+        }
+
+        if let Some(cli) = cli_args {
+            all_args.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
+        }
+
+        if all_args.is_empty() {
+            return None;
+        }
+
+        // Deduplicate args, keeping the last occurrence for flags with values
+        // This allows provision profile and CLI to override SDK defaults
+        let deduped = Self::deduplicate_container_args(all_args);
+
+        if deduped.is_empty() {
+            None
+        } else {
+            Some(deduped)
+        }
+    }
+
+    /// Deduplicate container args, keeping the last occurrence for each unique arg or flag
+    /// Handles both standalone flags (--privileged) and flag-value pairs (-v /dev:/dev, --network=host)
+    fn deduplicate_container_args(args: Vec<String>) -> Vec<String> {
+        use std::collections::HashSet;
+
+        // First pass: identify which args are flags that take a separate value argument
+        // (e.g., -v, -e, --volume, --env, etc.)
+        let flags_with_separate_values: HashSet<&str> = [
+            "-v", "--volume",
+            "-e", "--env",
+            "-p", "--publish",
+            "-w", "--workdir",
+            "-u", "--user",
+            "-l", "--label",
+            "--mount",
+            "--device",
+            "--add-host",
+            "--dns",
+            "--cap-add",
+            "--cap-drop",
+            "--security-opt",
+            "--ulimit",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        // Parse args into (key, full_representation) pairs for deduplication
+        // key is used for deduplication, full_representation is what we keep
+        let mut parsed_args: Vec<(String, Vec<String>)> = Vec::new();
+        let mut i = 0;
+
+        while i < args.len() {
+            let arg = &args[i];
+
+            if flags_with_separate_values.contains(arg.as_str()) && i + 1 < args.len() {
+                // Flag with separate value: combine flag and value as key
+                let value = &args[i + 1];
+                let key = format!("{} {}", arg, value);
+                parsed_args.push((key, vec![arg.clone(), value.clone()]));
+                i += 2;
+            } else if arg.starts_with('-') && arg.contains('=') {
+                // Flag with inline value (e.g., --network=host)
+                // Use just the flag name as key for network/other single-value flags
+                let flag_name = arg.split('=').next().unwrap_or(arg);
+                let key = flag_name.to_string();
+                parsed_args.push((key, vec![arg.clone()]));
+                i += 1;
+            } else if arg.starts_with('-') {
+                // Standalone flag (e.g., --privileged, --rm)
+                parsed_args.push((arg.clone(), vec![arg.clone()]));
+                i += 1;
+            } else {
+                // Non-flag argument (shouldn't happen normally, but handle it)
+                parsed_args.push((arg.clone(), vec![arg.clone()]));
+                i += 1;
+            }
+        }
+
+        // Deduplicate by key, keeping the last occurrence
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut result: Vec<Vec<String>> = Vec::new();
+
+        // Iterate in reverse to keep last occurrence, then reverse the result
+        for (key, values) in parsed_args.into_iter().rev() {
+            if !seen_keys.contains(&key) {
+                seen_keys.insert(key);
+                result.push(values);
+            }
+        }
+
+        result.reverse();
+        result.into_iter().flatten().collect()
     }
 
     /// Get compile section dependencies
@@ -3237,6 +3333,97 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
         let merged = config.merge_provision_container_args(None, None);
 
         assert!(merged.is_none());
+    }
+
+    #[test]
+    fn test_merge_provision_container_args_with_sdk_defaults() {
+        // Test that SDK container_args are included as base defaults
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+container_args = ["--privileged", "--network=host"]
+
+[provision.usb]
+container_args = ["-v", "/dev:/dev"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test merging SDK + provision profile + CLI args
+        let cli_args = vec!["--rm".to_string()];
+        let merged = config.merge_provision_container_args(Some("usb"), Some(&cli_args));
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        // Should have SDK args first, then provision profile args, then CLI args
+        assert_eq!(merged_args.len(), 5);
+        assert_eq!(merged_args[0], "--privileged");
+        assert_eq!(merged_args[1], "--network=host");
+        assert_eq!(merged_args[2], "-v");
+        assert_eq!(merged_args[3], "/dev:/dev");
+        assert_eq!(merged_args[4], "--rm");
+    }
+
+    #[test]
+    fn test_merge_provision_container_args_sdk_defaults_only() {
+        // Test that SDK container_args are used when no provision profile or CLI args
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+container_args = ["--privileged", "-v", "/dev:/dev"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        let merged = config.merge_provision_container_args(None, None);
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        assert_eq!(merged_args.len(), 3);
+        assert_eq!(merged_args[0], "--privileged");
+        assert_eq!(merged_args[1], "-v");
+        assert_eq!(merged_args[2], "/dev:/dev");
+    }
+
+    #[test]
+    fn test_merge_provision_container_args_deduplication() {
+        // Test that duplicate args are removed (keeping the last occurrence)
+        let config_content = r#"
+[sdk]
+image = "docker.io/avocadolinux/sdk:apollo-edge"
+container_args = ["--privileged", "--network=host", "-v", "/dev:/dev"]
+
+[provision.tegraflash]
+container_args = ["--privileged", "--network=host", "-v", "/dev:/dev", "-v", "/sys:/sys"]
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+
+        // Test that duplicates are removed
+        let merged = config.merge_provision_container_args(Some("tegraflash"), None);
+
+        assert!(merged.is_some());
+        let merged_args = merged.unwrap();
+        // Should only have unique args: --privileged, --network=host, -v /dev:/dev, -v /sys:/sys
+        // Note: --network=host keeps last occurrence (same value), -v /dev:/dev and -v /sys:/sys are different
+        assert_eq!(merged_args.len(), 6); // --privileged, --network=host, -v, /dev:/dev, -v, /sys:/sys
+        assert!(merged_args.contains(&"--privileged".to_string()));
+        assert!(merged_args.contains(&"--network=host".to_string()));
+        // Count occurrences of --privileged and --network=host - should be 1 each
+        assert_eq!(
+            merged_args
+                .iter()
+                .filter(|a| *a == "--privileged")
+                .count(),
+            1
+        );
+        assert_eq!(
+            merged_args
+                .iter()
+                .filter(|a| *a == "--network=host")
+                .count(),
+            1
+        );
     }
 
     #[test]
