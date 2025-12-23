@@ -148,6 +148,14 @@ runtime:
     assert_eq!(target, "{{ avocado.target }}");
 }
 
+/// Helper to get the full error chain as a string for assertions.
+fn error_chain_string(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 #[test]
 fn test_missing_config_path_error() {
     let test_yaml = r#"
@@ -159,8 +167,19 @@ reference: "{{ config.nonexistent.path }}"
     let result = avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None);
 
     assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("not found"));
+    let err = result.unwrap_err();
+    let full_error = error_chain_string(&err);
+    // Should contain both the location and the "not found" message
+    assert!(
+        full_error.contains("not found"),
+        "Expected 'not found' in error, got: {}",
+        full_error
+    );
+    assert!(
+        full_error.contains("reference"),
+        "Expected 'reference' location in error, got: {}",
+        full_error
+    );
 }
 
 #[test]

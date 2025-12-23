@@ -103,7 +103,9 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
         let root = yaml_value.clone();
         // Create a new resolving stack for each iteration
         let mut resolving_stack = HashSet::new();
-        changed = interpolate_value(yaml_value, &root, cli_target, &mut resolving_stack)?;
+        // Start with empty path at root level
+        let path: Vec<String> = Vec::new();
+        changed = interpolate_value(yaml_value, &root, cli_target, &mut resolving_stack, &path)?;
         iteration += 1;
     }
 
@@ -116,6 +118,31 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
     Ok(())
 }
 
+/// Represents where in the YAML structure a template was found.
+#[derive(Clone, Debug)]
+enum YamlLocation {
+    /// Template found in a mapping key
+    Key(String),
+    /// Template found in a value
+    Value,
+}
+
+/// Format a YAML path for display in error messages.
+fn format_yaml_path(path: &[String], location: &YamlLocation) -> String {
+    if path.is_empty() {
+        match location {
+            YamlLocation::Key(key) => format!("key \"{}\"", key),
+            YamlLocation::Value => "root value".to_string(),
+        }
+    } else {
+        let path_str = path.join(".");
+        match location {
+            YamlLocation::Key(key) => format!("{}.\"{}\" (key)", path_str, key),
+            YamlLocation::Value => path_str,
+        }
+    }
+}
+
 /// Recursively interpolate a single value.
 ///
 /// # Arguments
@@ -123,6 +150,7 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
 /// * `root` - The root YAML value for config references
 /// * `cli_target` - Optional CLI target value
 /// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
+/// * `path` - The current YAML path for error messages
 ///
 /// # Returns
 /// Result with a boolean indicating if any changes were made
@@ -131,12 +159,16 @@ fn interpolate_value(
     root: &Value,
     cli_target: Option<&str>,
     resolving_stack: &mut HashSet<String>,
+    path: &[String],
 ) -> Result<bool> {
     let mut changed = false;
 
     match value {
         Value::String(s) => {
-            if let Some(new_value) = interpolate_string(s, root, cli_target, resolving_stack)? {
+            let location = YamlLocation::Value;
+            if let Some(new_value) =
+                interpolate_string(s, root, cli_target, resolving_stack, path, &location)?
+            {
                 *s = new_value;
                 changed = true;
             }
@@ -148,8 +180,9 @@ fn interpolate_value(
 
             for (k, v) in map.iter() {
                 if let Value::String(key_str) = k {
+                    let location = YamlLocation::Key(key_str.clone());
                     if let Some(new_key) =
-                        interpolate_string(key_str, root, cli_target, resolving_stack)?
+                        interpolate_string(key_str, root, cli_target, resolving_stack, path, &location)?
                     {
                         keys_to_replace.push((k.clone(), Value::String(new_key), v.clone()));
                     }
@@ -164,15 +197,23 @@ fn interpolate_value(
             }
 
             // Then interpolate all values (including newly inserted ones)
-            for (_, v) in map.iter_mut() {
-                if interpolate_value(v, root, cli_target, resolving_stack)? {
+            for (k, v) in map.iter_mut() {
+                let key_str = match k {
+                    Value::String(s) => s.clone(),
+                    _ => format!("{:?}", k),
+                };
+                let mut child_path = path.to_vec();
+                child_path.push(key_str);
+                if interpolate_value(v, root, cli_target, resolving_stack, &child_path)? {
                     changed = true;
                 }
             }
         }
         Value::Sequence(seq) => {
-            for item in seq.iter_mut() {
-                if interpolate_value(item, root, cli_target, resolving_stack)? {
+            for (idx, item) in seq.iter_mut().enumerate() {
+                let mut child_path = path.to_vec();
+                child_path.push(format!("[{}]", idx));
+                if interpolate_value(item, root, cli_target, resolving_stack, &child_path)? {
                     changed = true;
                 }
             }
@@ -192,6 +233,8 @@ fn interpolate_value(
 /// * `root` - The root YAML value for config references
 /// * `cli_target` - Optional CLI target value
 /// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
+/// * `path` - The current YAML path for error messages
+/// * `location` - Whether this is a key or value
 ///
 /// # Returns
 /// Result with Option<String> - Some(new_string) if changes were made, None if no templates found
@@ -200,6 +243,8 @@ fn interpolate_string(
     root: &Value,
     cli_target: Option<&str>,
     resolving_stack: &mut HashSet<String>,
+    path: &[String],
+    location: &YamlLocation,
 ) -> Result<Option<String>> {
     // Regex to match {{ ... }} templates
     let re = Regex::new(r"\{\{\s*([^}]+)\s*\}\}").unwrap();
@@ -216,9 +261,20 @@ fn interpolate_string(
         let full_match = capture.get(0).unwrap().as_str();
         let template = capture.get(1).unwrap().as_str().trim();
 
-        if let Some(replacement) = resolve_template(template, root, cli_target, resolving_stack)? {
-            result = result.replace(full_match, &replacement);
-            any_replaced = true;
+        match resolve_template(template, root, cli_target, resolving_stack) {
+            Ok(Some(replacement)) => {
+                result = result.replace(full_match, &replacement);
+                any_replaced = true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Add context about where in the YAML this template was found
+                let yaml_location = format_yaml_path(path, location);
+                return Err(e.context(format!(
+                    "in template '{{{{ {} }}}}' at {}",
+                    template, yaml_location
+                )));
+            }
         }
     }
 
@@ -385,6 +441,14 @@ reference: "{{ config.nested.deep.value }}"
         );
     }
 
+    /// Helper to get the full error chain as a string for assertions.
+    fn error_chain_string(err: &anyhow::Error) -> String {
+        err.chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(": ")
+    }
+
     #[test]
     fn test_missing_config_path() {
         let mut config = parse_yaml(
@@ -393,10 +457,22 @@ reference: "{{ config.nonexistent.path }}"
 "#,
         );
 
-        // Should return an error
+        // Should return an error with location context
         let result = interpolate_config(&mut config, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        let err = result.unwrap_err();
+        let full_error = error_chain_string(&err);
+        // Should include both the location and the "not found" message
+        assert!(
+            full_error.contains("not found"),
+            "Expected 'not found' in error, got: {}",
+            full_error
+        );
+        assert!(
+            full_error.contains("reference"),
+            "Expected 'reference' location in error, got: {}",
+            full_error
+        );
     }
 
     #[test]
@@ -691,10 +767,13 @@ key: "{{ unknown.value }}"
 
         let result = interpolate_config(&mut config, None);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown template context"));
+        let err = result.unwrap_err();
+        let full_error = error_chain_string(&err);
+        assert!(
+            full_error.contains("Unknown template context"),
+            "Expected 'Unknown template context' in error, got: {}",
+            full_error
+        );
     }
 
     #[test]
