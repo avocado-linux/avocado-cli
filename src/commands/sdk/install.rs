@@ -97,9 +97,6 @@ impl SdkInstallCommand {
             )
             .with_context(|| "Failed to parse extension SDK dependencies")?;
 
-        // Get compile section dependencies
-        let compile_dependencies = config.get_compile_dependencies();
-
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
@@ -180,32 +177,50 @@ $DNF_SDK_HOST \
             print_success("No dependencies configured.", OutputLevel::Normal);
         }
 
-        // Install compile section dependencies (into target-dev sysroot)
+        // Install target-sysroot if there are any sdk.compile dependencies
+        // This aggregates all dependencies from all compile sections (main config + external extensions)
+        let compile_dependencies = config.get_compile_dependencies();
         if !compile_dependencies.is_empty() {
-            print_info("Installing SDK compile dependencies.", OutputLevel::Normal);
-            let total = compile_dependencies.len();
+            // Aggregate all compile dependencies into a single list
+            let mut all_compile_packages: Vec<String> = Vec::new();
+            for dependencies in compile_dependencies.values() {
+                let packages = self.build_package_list(dependencies);
+                all_compile_packages.extend(packages);
+            }
 
-            for (index, (section_name, dependencies)) in compile_dependencies.iter().enumerate() {
-                let compile_packages = self.build_package_list(dependencies);
+            // Deduplicate packages
+            all_compile_packages.sort();
+            all_compile_packages.dedup();
 
-                if !compile_packages.is_empty() {
-                    let installroot = "${AVOCADO_SDK_PREFIX}/target-sysroot";
-                    let yes = if self.force { "-y" } else { "" };
-                    let dnf_args_str = if let Some(args) = &self.dnf_args {
-                        format!(" {} ", args.join(" "))
-                    } else {
-                        String::new()
-                    };
-                    // For compile dependencies (target-dev sysroot), we:
-                    // - Use $DNF_NO_SCRIPTS to skip scriptlet execution (not needed for cross-compilation)
-                    // - Always disable weak dependencies (dev packages don't need them)
-                    // - Skip documentation (not needed in dev sysroot)
-                    let command = format!(
-                        r#"
+            print_info(
+                &format!(
+                    "Installing target-sysroot with {} compile dependencies.",
+                    all_compile_packages.len()
+                ),
+                OutputLevel::Normal,
+            );
+
+            let yes = if self.force { "-y" } else { "" };
+            let dnf_args_str = if let Some(args) = &self.dnf_args {
+                format!(" {} ", args.join(" "))
+            } else {
+                String::new()
+            };
+
+            // Build the target-sysroot package spec with version from distro.version
+            let target_sysroot_pkg = if let Some(version) = config.get_distro_version() {
+                format!("avocado-sdk-target-sysroot-{}", version)
+            } else {
+                "avocado-sdk-target-sysroot".to_string()
+            };
+
+            // Install the target-sysroot with packagegroup-core-standalone-sdk-target plus compile deps
+            let command = format!(
+                r#"
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     --setopt=sslcacert=${{SSL_CERT_FILE}} \
-    --installroot {} \
+    --installroot ${{AVOCADO_SDK_PREFIX}}/target-sysroot \
     --setopt=install_weak_deps=0 \
     --nodocs \
     $DNF_SDK_TARGET_REPO_CONF \
@@ -213,60 +228,42 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     {} \
     install \
     {} \
+    {} \
     {}
 "#,
-                        installroot,
-                        dnf_args_str,
-                        yes,
-                        compile_packages.join(" ")
-                    );
+                dnf_args_str,
+                yes,
+                target_sysroot_pkg,
+                all_compile_packages.join(" ")
+            );
 
-                    print_info(
-                        &format!(
-                            "Installing ({}/{}) compile dependencies for section '{}'",
-                            index + 1,
-                            total,
-                            section_name
-                        ),
-                        OutputLevel::Normal,
-                    );
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.clone(),
+                command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: !self.force,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                ..Default::default()
+            };
 
-                    // Use the container helper's run_in_container method with target-dev installroot
-                    let run_config = RunConfig {
-                        container_image: container_image.to_string(),
-                        target: target.clone(),
-                        command,
-                        verbose: self.verbose,
-                        source_environment: true,
-                        interactive: !self.force,
-                        repo_url: repo_url.clone(),
-                        repo_release: repo_release.clone(),
-                        container_args: merged_container_args.clone(),
-                        dnf_args: self.dnf_args.clone(),
-                        disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                        ..Default::default()
-                    };
-                    let install_success = container_helper.run_in_container(run_config).await?;
+            let install_success = container_helper.run_in_container(run_config).await?;
 
-                    if !install_success {
-                        return Err(anyhow::anyhow!(
-                            "Failed to install dependencies for compile section '{section_name}'."
-                        ));
-                    }
-                } else {
-                    print_info(
-                        &format!(
-                            "({}/{}) [{}] No dependencies configured.",
-                            index + 1,
-                            total,
-                            section_name
-                        ),
-                        OutputLevel::Normal,
-                    );
-                }
+            if install_success {
+                print_success(
+                    "Installed target-sysroot with compile dependencies.",
+                    OutputLevel::Normal,
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Failed to install target-sysroot with compile dependencies."
+                ));
             }
-
-            print_success("Installed SDK compile dependencies.", OutputLevel::Normal);
         }
 
         // Write SDK install stamp (unless --no-stamps)

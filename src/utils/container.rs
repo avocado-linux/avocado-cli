@@ -729,15 +729,6 @@ MACROS_EOF
     RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
       $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
       -y --installroot $AVOCADO_PREFIX/rootfs install avocado-pkg-rootfs
-
-    echo "[INFO] Installing SDK target sysroot."
-    RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-    $DNF_SDK_HOST $DNF_NO_SCRIPTS \
-        $DNF_SDK_TARGET_REPO_CONF \
-        -y \
-        --installroot ${AVOCADO_SDK_PREFIX}/target-sysroot \
-        install \
-        packagegroup-core-standalone-sdk-target
 fi
 "#);
         }
