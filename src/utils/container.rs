@@ -724,11 +724,6 @@ MACROS_EOF
     RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
         RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
         $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF -y install avocado-sdk-bootstrap
-
-    echo "[INFO] Installing rootfs sysroot."
-    RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-      $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
-      -y --installroot $AVOCADO_PREFIX/rootfs install avocado-pkg-rootfs
 fi
 "#);
         }

@@ -177,6 +177,60 @@ $DNF_SDK_HOST \
             print_success("No dependencies configured.", OutputLevel::Normal);
         }
 
+        // Install rootfs sysroot with version from distro.version
+        print_info("Installing rootfs sysroot.", OutputLevel::Normal);
+
+        let rootfs_pkg = if let Some(version) = config.get_distro_version() {
+            format!("avocado-pkg-rootfs-{}", version)
+        } else {
+            "avocado-pkg-rootfs".to_string()
+        };
+
+        let yes = if self.force { "-y" } else { "" };
+        let dnf_args_str = if let Some(args) = &self.dnf_args {
+            format!(" {} ", args.join(" "))
+        } else {
+            String::new()
+        };
+
+        let rootfs_command = format!(
+            r#"
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
+    --installroot ${{AVOCADO_PREFIX}}/rootfs \
+    $DNF_SDK_TARGET_REPO_CONF \
+    {} \
+    install \
+    {} \
+    {}
+"#,
+            dnf_args_str, yes, rootfs_pkg
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: rootfs_command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: !self.force,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        let rootfs_success = container_helper.run_in_container(run_config).await?;
+
+        if rootfs_success {
+            print_success("Installed rootfs sysroot.", OutputLevel::Normal);
+        } else {
+            return Err(anyhow::anyhow!("Failed to install rootfs sysroot."));
+        }
+
         // Install target-sysroot if there are any sdk.compile dependencies
         // This aggregates all dependencies from all compile sections (main config + external extensions)
         let compile_dependencies = config.get_compile_dependencies();
