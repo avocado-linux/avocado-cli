@@ -713,17 +713,6 @@ SHELL_EOF
 %__sh                   $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
 MACROS_EOF
 
-    RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
-        RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF -y install "avocado-sdk-$AVOCADO_TARGET"
-
-    RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
-        RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF check-update
-
-    RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
-        RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
-        $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF -y install avocado-sdk-bootstrap
 fi
 "#);
         }

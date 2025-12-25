@@ -105,6 +105,176 @@ impl SdkInstallCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
+        // Install avocado-sdk-{target} with version from distro.version
+        print_info(
+            &format!("Installing SDK for target '{}'.", target),
+            OutputLevel::Normal,
+        );
+
+        let sdk_target_pkg = if let Some(version) = config.get_distro_version() {
+            format!("avocado-sdk-{}-{}", target, version)
+        } else {
+            format!("avocado-sdk-{}", target)
+        };
+
+        let sdk_target_command = format!(
+            r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_HOST_REPO_CONF \
+    -y \
+    install \
+    {}
+"#,
+            sdk_target_pkg
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: sdk_target_command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        let sdk_target_success = container_helper.run_in_container(run_config).await?;
+
+        if sdk_target_success {
+            print_success(
+                &format!("Installed SDK for target '{}'.", target),
+                OutputLevel::Normal,
+            );
+        } else {
+            return Err(anyhow::anyhow!(
+                "Failed to install SDK for target '{}'.",
+                target
+            ));
+        }
+
+        // Run check-update to refresh metadata
+        let check_update_command = r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_REPO_CONF \
+    check-update || true
+"#;
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: check_update_command.to_string(),
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        container_helper.run_in_container(run_config).await?;
+
+        // Install avocado-sdk-bootstrap with version from distro.version
+        print_info("Installing SDK bootstrap.", OutputLevel::Normal);
+
+        let bootstrap_pkg = if let Some(version) = config.get_distro_version() {
+            format!("avocado-sdk-bootstrap-{}", version)
+        } else {
+            "avocado-sdk-bootstrap".to_string()
+        };
+
+        let bootstrap_command = format!(
+            r#"
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_REPO_CONF \
+    -y \
+    install \
+    {}
+"#,
+            bootstrap_pkg
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: bootstrap_command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        let bootstrap_success = container_helper.run_in_container(run_config).await?;
+
+        if bootstrap_success {
+            print_success("Installed SDK bootstrap.", OutputLevel::Normal);
+        } else {
+            return Err(anyhow::anyhow!("Failed to install SDK bootstrap."));
+        }
+
+        // After bootstrap, source environment-setup and configure SSL certs for subsequent commands
+        if self.verbose {
+            print_info(
+                "Configuring SDK environment after bootstrap.",
+                OutputLevel::Normal,
+            );
+        }
+
+        let env_setup_command = r#"
+# Source the environment setup if it exists
+if [ -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
+    source "${AVOCADO_SDK_PREFIX}/environment-setup"
+    echo "[INFO] Sourced SDK environment setup."
+fi
+
+# Add SSL certificate path to DNF options and CURL if it exists
+if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
+    export DNF_SDK_HOST_OPTS="${DNF_SDK_HOST_OPTS} \
+      --setopt=sslcacert=${SSL_CERT_FILE} \
+"
+    export CURL_CA_BUNDLE=${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt
+    echo "[INFO] SSL certificates configured."
+fi
+"#;
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: env_setup_command.to_string(),
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        container_helper.run_in_container(run_config).await?;
+
         // Install SDK dependencies (into SDK)
         let mut sdk_packages = Vec::new();
 
@@ -142,8 +312,8 @@ $DNF_SDK_HOST \
     $DNF_SDK_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
-    install \
     {} \
+    install \
     {}
 "#,
                 dnf_args_str,
@@ -195,15 +365,9 @@ $DNF_SDK_HOST \
 
         let rootfs_command = format!(
             r#"
-RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-$DNF_SDK_HOST $DNF_NO_SCRIPTS \
-    --setopt=sslcacert=${{SSL_CERT_FILE}} \
-    --installroot ${{AVOCADO_PREFIX}}/rootfs \
-    $DNF_SDK_TARGET_REPO_CONF \
-    {} \
-    install \
-    {} \
-    {}
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
+    {} {} --installroot $AVOCADO_PREFIX/rootfs install {}
 "#,
             dnf_args_str, yes, rootfs_pkg
         );
@@ -213,7 +377,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             target: target.clone(),
             command: rootfs_command,
             verbose: self.verbose,
-            source_environment: true,
+            source_environment: false,
             interactive: !self.force,
             repo_url: repo_url.clone(),
             repo_release: repo_release.clone(),
@@ -268,22 +432,15 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
                 "avocado-sdk-target-sysroot".to_string()
             };
 
-            // Install the target-sysroot with packagegroup-core-standalone-sdk-target plus compile deps
+            // Install the target-sysroot with avocado-sdk-target-sysroot plus compile deps
             let command = format!(
                 r#"
-RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-$DNF_SDK_HOST $DNF_NO_SCRIPTS \
-    --setopt=sslcacert=${{SSL_CERT_FILE}} \
-    --installroot ${{AVOCADO_SDK_PREFIX}}/target-sysroot \
-    --setopt=install_weak_deps=0 \
-    --nodocs \
-    $DNF_SDK_TARGET_REPO_CONF \
+unset RPM_CONFIGDIR
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
-    {} \
-    install \
-    {} \
-    {} \
-    {}
+    {} {} --installroot ${{AVOCADO_SDK_PREFIX}}/target-sysroot \
+    install {} {}
 "#,
                 dnf_args_str,
                 yes,
