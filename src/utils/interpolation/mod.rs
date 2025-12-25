@@ -181,9 +181,14 @@ fn interpolate_value(
             for (k, v) in map.iter() {
                 if let Value::String(key_str) = k {
                     let location = YamlLocation::Key(key_str.clone());
-                    if let Some(new_key) =
-                        interpolate_string(key_str, root, cli_target, resolving_stack, path, &location)?
-                    {
+                    if let Some(new_key) = interpolate_string(
+                        key_str,
+                        root,
+                        cli_target,
+                        resolving_stack,
+                        path,
+                        &location,
+                    )? {
                         keys_to_replace.push((k.clone(), Value::String(new_key), v.clone()));
                     }
                 }

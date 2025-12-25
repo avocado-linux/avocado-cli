@@ -616,9 +616,9 @@ fi
 # Copy overlay directory to extension sysroot (opaque mode)
 if [ -d "/opt/src/{}" ]; then
     echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
-    # Use cp -r to replace directory contents completely
-    cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
-    # Fix ownership to root:root for copied overlay files only
+    # Use cp -a to replace directory contents completely while preserving permissions
+    cp -a /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+    # Fix ownership to root:root for copied overlay files only (permissions are preserved)
     echo "Setting ownership to root:root for overlay files"
     find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
         relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
@@ -789,9 +789,9 @@ fi
 # Copy overlay directory to extension sysroot (opaque mode)
 if [ -d "/opt/src/{}" ]; then
     echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
-    # Use cp -r to replace directory contents completely
-    cp -r /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
-    # Fix ownership to root:root for copied overlay files only
+    # Use cp -a to replace directory contents completely while preserving permissions
+    cp -a /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+    # Fix ownership to root:root for copied overlay files only (permissions are preserved)
     echo "Setting ownership to root:root for overlay files"
     find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
         relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
@@ -1970,7 +1970,7 @@ mod tests {
         assert!(script.contains(
             "echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""
         ));
-        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
+        assert!(script.contains("cp -a /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
         assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
@@ -2011,7 +2011,7 @@ mod tests {
         assert!(script.contains(
             "echo \"Copying overlay directory 'peridio' to extension sysroot (opaque mode)\""
         ));
-        assert!(script.contains("cp -r /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
+        assert!(script.contains("cp -a /opt/src/peridio/* \"$AVOCADO_EXT_SYSROOTS/opaque-ext/\""));
         assert!(script.contains("echo \"Setting ownership to root:root for overlay files\""));
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
