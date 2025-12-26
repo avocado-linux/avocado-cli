@@ -477,7 +477,9 @@ impl SdkContainer {
 
         match self.run_in_container_with_output(run_config).await? {
             Some(output) => {
-                let versions = crate::utils::lockfile::parse_rpm_query_output(&output);
+                // For SDK sysroots, strip architecture to make lock file portable across host architectures
+                let strip_arch = matches!(sysroot, crate::utils::lockfile::SysrootType::Sdk);
+                let versions = crate::utils::lockfile::parse_rpm_query_output(&output, strip_arch);
                 if self.verbose {
                     print_info(
                         &format!(
