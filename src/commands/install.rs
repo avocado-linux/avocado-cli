@@ -1,6 +1,7 @@
 //! Install command implementation that runs SDK, extension, and runtime installs.
 
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 use crate::commands::{
     ext::ExtInstallCommand, runtime::RuntimeInstallCommand, sdk::SdkInstallCommand,
@@ -8,6 +9,7 @@ use crate::commands::{
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::SdkContainer,
+    lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_info, print_success, OutputLevel},
     target::validate_and_log_target,
 };
@@ -91,6 +93,19 @@ impl InstallCommand {
             OutputLevel::Normal,
         );
 
+        // Load lock file for reproducible builds (used for versioned extensions in this command)
+        let src_dir = config
+            .get_resolved_src_dir(&self.config_path)
+            .unwrap_or_else(|| {
+                PathBuf::from(&self.config_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+
+        // We'll load the lock file lazily when needed (for external/versioned extensions)
+        let mut lock_file;
+
         // 1. Install SDK dependencies
         print_info("Step 1/3: Installing SDK dependencies", OutputLevel::Normal);
         let sdk_install_cmd = SdkInstallCommand::new(
@@ -154,8 +169,11 @@ impl InstallCommand {
                             );
                         }
 
+                        // Reload lock file from disk to get latest state from previous installs
+                        lock_file = LockFile::load(&src_dir)?;
+
                         // Install external extension to ${AVOCADO_PREFIX}/extensions/<ext_name>
-                        self.install_external_extension(config, &self.config_path, name, ext_config_path, &_target).await.with_context(|| {
+                        self.install_external_extension(config, &self.config_path, name, ext_config_path, &_target, &mut lock_file).await.with_context(|| {
                             format!("Failed to install external extension '{name}' from config '{ext_config_path}'")
                         })?;
                     }
@@ -169,8 +187,11 @@ impl InstallCommand {
                             );
                         }
 
+                        // Reload lock file from disk to get latest state from previous installs
+                        lock_file = LockFile::load(&src_dir)?;
+
                         // Install versioned extension to its own sysroot
-                        self.install_versioned_extension(config, name, version, &_target).await.with_context(|| {
+                        self.install_versioned_extension(config, name, version, &_target, &mut lock_file).await.with_context(|| {
                             format!("Failed to install versioned extension '{name}' version '{version}'")
                         })?;
                     }
@@ -533,6 +554,7 @@ impl InstallCommand {
         extension_name: &str,
         external_config_path: &str,
         target: &str,
+        lock_file: &mut LockFile,
     ) -> Result<()> {
         // Load the external extension configuration
         let external_extensions =
@@ -632,13 +654,17 @@ impl InstallCommand {
             base_config_path,
             external_config_path,
             target,
+            lock_file,
         )
         .await?;
 
         // Process the extension's dependencies (packages, not extension or compile dependencies)
+        let sysroot = SysrootType::Extension(extension_name.to_string());
+
         if let Some(serde_yaml::Value::Mapping(deps_map)) = extension_config.get("dependencies") {
             if !deps_map.is_empty() {
                 let mut packages = Vec::new();
+                let mut package_names = Vec::new();
 
                 // Process package dependencies (not extension or compile dependencies)
                 for (package_name_val, version_spec) in deps_map {
@@ -667,27 +693,28 @@ impl InstallCommand {
                     }
 
                     // Process package dependencies only (simple string versions or version objects)
-                    match version_spec {
-                        serde_yaml::Value::String(version) => {
-                            if version == "*" {
-                                packages.push(package_name.to_string());
-                            } else {
-                                packages.push(format!("{package_name}-{version}"));
-                            }
-                        }
+                    let config_version = match version_spec {
+                        serde_yaml::Value::String(version) => version.clone(),
                         serde_yaml::Value::Mapping(spec_map) => {
                             // Only process if it has a "version" key (already checked it doesn't have ext/compile)
-                            if let Some(version) = spec_map.get("version").and_then(|v| v.as_str())
-                            {
-                                if version == "*" {
-                                    packages.push(package_name.to_string());
-                                } else {
-                                    packages.push(format!("{package_name}-{version}"));
-                                }
-                            }
+                            spec_map
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("*")
+                                .to_string()
                         }
-                        _ => {}
-                    }
+                        _ => continue,
+                    };
+
+                    let package_spec = build_package_spec_with_lock(
+                        lock_file,
+                        target,
+                        &sysroot,
+                        package_name,
+                        &config_version,
+                    );
+                    packages.push(package_spec);
+                    package_names.push(package_name.to_string());
                 }
 
                 if !packages.is_empty() {
@@ -737,9 +764,9 @@ $DNF_SDK_HOST \
                         verbose: self.verbose,
                         source_environment: false, // don't source environment
                         interactive: !self.force,  // interactive if not forced
-                        repo_url,
-                        repo_release,
-                        container_args: merged_container_args,
+                        repo_url: repo_url.clone(),
+                        repo_release: repo_release.clone(),
+                        container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
                         disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                         ..Default::default()
@@ -752,6 +779,45 @@ $DNF_SDK_HOST \
                                 &format!("Installed {} package(s) for external extension '{extension_name}'.", packages.len()),
                                 crate::utils::output::OutputLevel::Normal,
                             );
+
+                        // Query installed versions and update lock file
+                        if !package_names.is_empty() {
+                            let installed_versions = container_helper
+                                .query_installed_packages(
+                                    &sysroot,
+                                    &package_names,
+                                    container_image,
+                                    target,
+                                    repo_url,
+                                    repo_release,
+                                    merged_container_args,
+                                )
+                                .await?;
+
+                            if !installed_versions.is_empty() {
+                                lock_file.update_sysroot_versions(
+                                    target,
+                                    &sysroot,
+                                    installed_versions,
+                                );
+                                if self.verbose {
+                                    print_info(
+                                        &format!("Updated lock file with external extension '{extension_name}' package versions."),
+                                        crate::utils::output::OutputLevel::Normal,
+                                    );
+                                }
+                                // Save lock file immediately after external extension install
+                                let src_dir = PathBuf::from(&self.config_path)
+                                    .parent()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Failed to get parent directory of config file"
+                                        )
+                                    })?
+                                    .to_path_buf();
+                                lock_file.save(&src_dir)?;
+                            }
+                        }
                     } else {
                         return Err(anyhow::anyhow!(
                             "Failed to install package dependencies for external extension '{extension_name}'"
@@ -828,9 +894,10 @@ $DNF_SDK_HOST \
         extension_name: &str,
         version: &str,
         target: &str,
+        lock_file: &mut LockFile,
     ) -> Result<()> {
         // Get container configuration
-        let container_helper = SdkContainer::new();
+        let container_helper = SdkContainer::new().verbose(self.verbose);
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
         })?;
@@ -892,11 +959,11 @@ $DNF_SDK_HOST \
         }
 
         // Install the versioned extension package using DNF
-        let package_spec = if version == "*" {
-            extension_name.to_string()
-        } else {
-            format!("{extension_name}-{version}")
-        };
+        // Use the sysroot_name for lock file key (this is the extension name)
+        // Note: VersionedExtension uses different RPM_CONFIGDIR than local extensions
+        let sysroot = SysrootType::VersionedExtension(sysroot_name.clone());
+        let package_spec =
+            build_package_spec_with_lock(lock_file, target, &sysroot, extension_name, version);
 
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{sysroot_name}");
         let yes = if self.force { "-y" } else { "" };
@@ -941,9 +1008,9 @@ $DNF_SDK_HOST \
             verbose: self.verbose,
             source_environment: false,
             interactive: !self.force,
-            repo_url,
-            repo_release,
-            container_args: merged_container_args,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             ..Default::default()
@@ -955,6 +1022,37 @@ $DNF_SDK_HOST \
             return Err(anyhow::anyhow!(
                 "Failed to install versioned extension '{extension_name}' version '{version}' (package: {package_spec})"
             ));
+        }
+
+        // Query installed version and update lock file
+        let installed_versions = container_helper
+            .query_installed_packages(
+                &sysroot,
+                &[extension_name.to_string()],
+                container_image,
+                target,
+                repo_url,
+                repo_release,
+                merged_container_args,
+            )
+            .await?;
+
+        if !installed_versions.is_empty() {
+            lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "Updated lock file with versioned extension '{extension_name}' version."
+                    ),
+                    crate::utils::output::OutputLevel::Normal,
+                );
+            }
+            // Save lock file immediately after versioned extension install
+            let src_dir = PathBuf::from(&self.config_path)
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get parent directory of config file"))?
+                .to_path_buf();
+            lock_file.save(&src_dir)?;
         }
 
         let version_msg = if version == "*" {
@@ -980,6 +1078,7 @@ $DNF_SDK_HOST \
         base_config_path: &str,
         external_config_path: &str,
         target: &str,
+        lock_file: &mut LockFile,
     ) -> Result<()> {
         // Resolve the external config path
         let resolved_external_config_path =
@@ -1029,37 +1128,34 @@ $DNF_SDK_HOST \
             return Ok(());
         };
 
-        // Build list of SDK packages to install
+        // Build list of SDK packages to install (using lock file for version pinning)
         let mut sdk_packages = Vec::new();
+        let mut sdk_package_names = Vec::new();
         for (pkg_name_val, version_spec) in sdk_deps_map {
             let pkg_name = match pkg_name_val.as_str() {
                 Some(name) => name,
                 None => continue,
             };
 
-            match version_spec {
-                serde_yaml::Value::String(version) => {
-                    if version == "*" {
-                        sdk_packages.push(pkg_name.to_string());
-                    } else {
-                        sdk_packages.push(format!("{pkg_name}-{version}"));
-                    }
-                }
-                serde_yaml::Value::Mapping(spec_map) => {
-                    if let Some(version) = spec_map.get("version").and_then(|v| v.as_str()) {
-                        if version == "*" {
-                            sdk_packages.push(pkg_name.to_string());
-                        } else {
-                            sdk_packages.push(format!("{pkg_name}-{version}"));
-                        }
-                    } else {
-                        sdk_packages.push(pkg_name.to_string());
-                    }
-                }
-                _ => {
-                    sdk_packages.push(pkg_name.to_string());
-                }
-            }
+            let config_version = match version_spec {
+                serde_yaml::Value::String(version) => version.clone(),
+                serde_yaml::Value::Mapping(spec_map) => spec_map
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*")
+                    .to_string(),
+                _ => "*".to_string(),
+            };
+
+            let package_spec = build_package_spec_with_lock(
+                lock_file,
+                target,
+                &SysrootType::Sdk,
+                pkg_name,
+                &config_version,
+            );
+            sdk_packages.push(package_spec);
+            sdk_package_names.push(pkg_name.to_string());
         }
 
         if sdk_packages.is_empty() {
@@ -1129,9 +1225,9 @@ $DNF_SDK_HOST \
             verbose: self.verbose,
             source_environment: true,
             interactive: !self.force,
-            repo_url,
-            repo_release,
-            container_args: merged_container_args,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             ..Default::default()
@@ -1143,6 +1239,39 @@ $DNF_SDK_HOST \
             return Err(anyhow::anyhow!(
                 "Failed to install SDK dependencies from external config '{external_config_path}'"
             ));
+        }
+
+        // Query installed versions and update lock file
+        if !sdk_package_names.is_empty() {
+            let installed_versions = container_helper
+                .query_installed_packages(
+                    &SysrootType::Sdk,
+                    &sdk_package_names,
+                    container_image,
+                    target,
+                    repo_url,
+                    repo_release,
+                    merged_container_args,
+                )
+                .await?;
+
+            if !installed_versions.is_empty() {
+                lock_file.update_sysroot_versions(target, &SysrootType::Sdk, installed_versions);
+                if self.verbose {
+                    print_info(
+                        &format!("Updated lock file with SDK dependencies from external config '{external_config_path}'."),
+                        OutputLevel::Normal,
+                    );
+                }
+                // Save lock file immediately after external extension SDK deps install
+                let src_dir = PathBuf::from(base_config_path)
+                    .parent()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Failed to get parent directory of config file")
+                    })?
+                    .to_path_buf();
+                lock_file.save(&src_dir)?;
+            }
         }
 
         print_info(

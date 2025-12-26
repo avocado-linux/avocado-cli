@@ -415,6 +415,111 @@ impl SdkContainer {
         }
     }
 
+    /// Query installed package versions from a sysroot using rpm -q
+    ///
+    /// This runs an rpm query command inside the container to get the actual
+    /// installed versions of packages. Used for lock file generation.
+    ///
+    /// # Arguments
+    /// * `sysroot` - The sysroot type to query
+    /// * `packages` - List of package names to query
+    /// * `container_image` - Container image to use
+    /// * `target` - Target architecture
+    /// * `repo_url` - Optional repository URL
+    /// * `repo_release` - Optional repository release
+    /// * `container_args` - Optional additional container arguments
+    ///
+    /// # Returns
+    /// A HashMap of package name to version string (NEVRA format without name prefix)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_installed_packages(
+        &self,
+        sysroot: &crate::utils::lockfile::SysrootType,
+        packages: &[String],
+        container_image: &str,
+        target: &str,
+        repo_url: Option<String>,
+        repo_release: Option<String>,
+        container_args: Option<Vec<String>>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if packages.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rpm_config = sysroot.get_rpm_query_config();
+        let query_command = rpm_config.build_query_command(packages);
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Querying installed packages for lock file (sysroot: {:?}): {}",
+                    sysroot, query_command
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: query_command,
+            verbose: self.verbose,
+            // Don't source environment-setup for RPM queries - we only need the
+            // basic env vars which are set in the entrypoint, not the full SDK env
+            source_environment: false,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url,
+            repo_release,
+            container_args,
+            ..Default::default()
+        };
+
+        match self.run_in_container_with_output(run_config).await? {
+            Some(output) => {
+                let versions = crate::utils::lockfile::parse_rpm_query_output(&output);
+                if self.verbose {
+                    print_info(
+                        &format!(
+                            "Found {} installed package versions for lock file",
+                            versions.len()
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    for (name, version) in &versions {
+                        print_info(&format!("  {} = {}", name, version), OutputLevel::Normal);
+                    }
+                }
+                // Warn if we expected packages but got none (likely a parse or query issue)
+                if versions.is_empty() && !packages.is_empty() && self.verbose {
+                    print_info(
+                        &format!(
+                            "Warning: RPM query returned no parseable packages. Raw output: {}",
+                            if output.len() > 200 {
+                                format!("{}...", &output[..200])
+                            } else {
+                                output
+                            }
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                Ok(versions)
+            }
+            None => {
+                // Command failed - this is important for lock file accuracy, so always warn
+                print_info(
+                    &format!(
+                        "Warning: RPM query for lock file failed for packages: {}",
+                        packages.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+                Ok(std::collections::HashMap::new())
+            }
+        }
+    }
+
     /// Execute the container command
     async fn execute_container_command(
         &self,

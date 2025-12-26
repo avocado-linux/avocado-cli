@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::stamps::{
     compute_runtime_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
@@ -120,7 +122,25 @@ impl RuntimeInstallCommand {
             .context("No SDK container image specified in configuration")?;
 
         // Initialize container helper
-        let container_helper = SdkContainer::new();
+        let container_helper = SdkContainer::new().verbose(self.verbose);
+
+        // Load lock file for reproducible builds
+        let src_dir = config
+            .get_resolved_src_dir(&self.config_path)
+            .unwrap_or_else(|| {
+                PathBuf::from(&self.config_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+        let mut lock_file = LockFile::load(&src_dir).with_context(|| "Failed to load lock file")?;
+
+        if self.verbose && !lock_file.is_empty() {
+            print_info(
+                "Using existing lock file for version pinning.",
+                OutputLevel::Normal,
+            );
+        }
 
         // Install dependencies for each runtime
         for runtime_name in &runtimes_to_install {
@@ -139,6 +159,8 @@ impl RuntimeInstallCommand {
                     repo_url.as_ref(),
                     repo_release.as_ref(),
                     &merged_container_args,
+                    &mut lock_file,
+                    &src_dir,
                 )
                 .await?;
 
@@ -212,6 +234,8 @@ impl RuntimeInstallCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
+        lock_file: &mut LockFile,
+        src_dir: &Path,
     ) -> Result<bool> {
         // Get runtime configuration
         let runtime_config = config_toml["runtime"][runtime].clone();
@@ -286,9 +310,12 @@ impl RuntimeInstallCommand {
             .as_ref()
             .and_then(|merged| merged.get("dependencies"));
 
+        let sysroot = SysrootType::Runtime(runtime.to_string());
+
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install (excluding extension references)
             let mut packages = Vec::new();
+            let mut package_names = Vec::new();
             for (package_name_val, version_spec) in deps_map {
                 // Convert package name from Value to String
                 let package_name = match package_name_val.as_str() {
@@ -322,29 +349,27 @@ impl RuntimeInstallCommand {
                     }
                 }
 
-                let package_name_and_version = if version_spec.as_str().is_some() {
-                    let version = version_spec.as_str().unwrap();
-                    if version == "*" {
-                        package_name.to_string()
-                    } else {
-                        format!("{package_name}-{version}")
-                    }
+                let config_version = if let Some(version) = version_spec.as_str() {
+                    version.to_string()
                 } else if let serde_yaml::Value::Mapping(spec_map) = version_spec {
-                    if let Some(version) = spec_map.get("version") {
-                        let version = version.as_str().unwrap_or("*");
-                        if version == "*" {
-                            package_name.to_string()
-                        } else {
-                            format!("{package_name}-{version}")
-                        }
-                    } else {
-                        package_name.to_string()
-                    }
+                    spec_map
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("*")
+                        .to_string()
                 } else {
-                    package_name.to_string()
+                    "*".to_string()
                 };
 
-                packages.push(package_name_and_version);
+                let package_spec = build_package_spec_with_lock(
+                    lock_file,
+                    &target_arch,
+                    &sysroot,
+                    package_name,
+                    &config_version,
+                );
+                packages.push(package_spec);
+                package_names.push(package_name.to_string());
             }
 
             if !packages.is_empty() {
@@ -393,7 +418,7 @@ $DNF_SDK_HOST \
                     target: target_arch.clone(),
                     command: dnf_command,
                     verbose: self.verbose,
-                    source_environment: true, // need environment for DNF
+                    source_environment: false, // Don't source environment - matches rootfs install behavior
                     interactive: !self.force,
                     repo_url: repo_url.cloned(),
                     repo_release: repo_release.cloned(),
@@ -416,6 +441,39 @@ $DNF_SDK_HOST \
                     &format!("Successfully installed packages for runtime '{runtime}'"),
                     OutputLevel::Normal,
                 );
+
+                // Query installed versions and update lock file
+                if !package_names.is_empty() {
+                    let installed_versions = container_helper
+                        .query_installed_packages(
+                            &sysroot,
+                            &package_names,
+                            container_image,
+                            &target_arch,
+                            repo_url.cloned(),
+                            repo_release.cloned(),
+                            merged_container_args.clone(),
+                        )
+                        .await?;
+
+                    if !installed_versions.is_empty() {
+                        lock_file.update_sysroot_versions(
+                            &target_arch,
+                            &sysroot,
+                            installed_versions,
+                        );
+                        if self.verbose {
+                            print_info(
+                                &format!(
+                                    "Updated lock file with runtime '{runtime}' package versions."
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        // Save lock file immediately after runtime install
+                        lock_file.save(src_dir)?;
+                    }
+                }
             } else {
                 print_info(
                     &format!("No packages to install for runtime '{runtime}'"),

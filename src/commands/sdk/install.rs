@@ -2,10 +2,12 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
+    lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_info, print_success, OutputLevel},
     stamps::{compute_sdk_input_hash, generate_write_stamp_script, Stamp, StampOutputs},
     target::validate_and_log_target,
@@ -104,6 +106,24 @@ impl SdkInstallCommand {
         // Use the container helper to run the installation
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+
+        // Load lock file for reproducible builds
+        let src_dir = config
+            .get_resolved_src_dir(&self.config_path)
+            .unwrap_or_else(|| {
+                PathBuf::from(&self.config_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+        let mut lock_file = LockFile::load(&src_dir).with_context(|| "Failed to load lock file")?;
+
+        if self.verbose && !lock_file.is_empty() {
+            print_info(
+                "Using existing lock file for version pinning.",
+                OutputLevel::Normal,
+            );
+        }
 
         // Initialize SDK environment first (creates directories, copies configs, sets up wrappers)
         print_info("Initializing SDK environment.", OutputLevel::Normal);
@@ -284,11 +304,19 @@ MACROS_EOF
             OutputLevel::Normal,
         );
 
-        let sdk_target_pkg = if let Some(version) = config.get_distro_version() {
-            format!("avocado-sdk-{}-{}", target, version)
-        } else {
-            format!("avocado-sdk-{}", target)
-        };
+        // Build package name and spec with lock file support
+        let sdk_target_pkg_name = format!("avocado-sdk-{}", target);
+        let sdk_target_config_version = config
+            .get_distro_version()
+            .map(|s| s.as_str())
+            .unwrap_or("*");
+        let sdk_target_pkg = build_package_spec_with_lock(
+            &lock_file,
+            &target,
+            &SysrootType::Sdk,
+            &sdk_target_pkg_name,
+            sdk_target_config_version,
+        );
 
         let sdk_target_command = format!(
             r#"
@@ -321,11 +349,16 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 
         let sdk_target_success = container_helper.run_in_container(run_config).await?;
 
+        // Track all SDK packages installed for lock file update at the end
+        let mut all_sdk_package_names: Vec<String> = Vec::new();
+
         if sdk_target_success {
             print_success(
                 &format!("Installed SDK for target '{}'.", target),
                 OutputLevel::Normal,
             );
+            // Add to list for later query (after environment is fully set up)
+            all_sdk_package_names.push(sdk_target_pkg_name);
         } else {
             return Err(anyhow::anyhow!(
                 "Failed to install SDK for target '{}'.",
@@ -363,11 +396,18 @@ $DNF_SDK_HOST \
         // Install avocado-sdk-bootstrap with version from distro.version
         print_info("Installing SDK bootstrap.", OutputLevel::Normal);
 
-        let bootstrap_pkg = if let Some(version) = config.get_distro_version() {
-            format!("avocado-sdk-bootstrap-{}", version)
-        } else {
-            "avocado-sdk-bootstrap".to_string()
-        };
+        let bootstrap_pkg_name = "avocado-sdk-bootstrap";
+        let bootstrap_config_version = config
+            .get_distro_version()
+            .map(|s| s.as_str())
+            .unwrap_or("*");
+        let bootstrap_pkg = build_package_spec_with_lock(
+            &lock_file,
+            &target,
+            &SysrootType::Sdk,
+            bootstrap_pkg_name,
+            bootstrap_config_version,
+        );
 
         let bootstrap_command = format!(
             r#"
@@ -402,6 +442,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 
         if bootstrap_success {
             print_success("Installed SDK bootstrap.", OutputLevel::Normal);
+            // Add to list for later query (after environment is fully set up)
+            all_sdk_package_names.push(bootstrap_pkg_name.to_string());
         } else {
             return Err(anyhow::anyhow!("Failed to install SDK bootstrap."));
         }
@@ -450,10 +492,17 @@ fi
 
         // Install SDK dependencies (into SDK)
         let mut sdk_packages = Vec::new();
+        let mut sdk_package_names = Vec::new();
 
         // Add regular SDK dependencies
         if let Some(ref dependencies) = sdk_dependencies {
-            sdk_packages.extend(self.build_package_list(dependencies));
+            sdk_packages.extend(self.build_package_list_with_lock(
+                dependencies,
+                &lock_file,
+                &target,
+                &SysrootType::Sdk,
+            ));
+            sdk_package_names.extend(self.extract_package_names(dependencies));
         }
 
         // Add extension SDK dependencies to the package list
@@ -464,8 +513,10 @@ fi
                     OutputLevel::Normal,
                 );
             }
-            let ext_packages = self.build_package_list(ext_deps);
+            let ext_packages =
+                self.build_package_list_with_lock(ext_deps, &lock_file, &target, &SysrootType::Sdk);
             sdk_packages.extend(ext_packages);
+            sdk_package_names.extend(self.extract_package_names(ext_deps));
         }
 
         if !sdk_packages.is_empty() {
@@ -513,6 +564,8 @@ $DNF_SDK_HOST \
 
             if install_success {
                 print_success("Installed SDK dependencies.", OutputLevel::Normal);
+                // Add SDK dependency package names to the list
+                all_sdk_package_names.extend(sdk_package_names);
             } else {
                 return Err(anyhow::anyhow!("Failed to install SDK package(s)."));
             }
@@ -520,14 +573,52 @@ $DNF_SDK_HOST \
             print_success("No dependencies configured.", OutputLevel::Normal);
         }
 
+        // Query all SDK packages at once (bootstrap + dependencies)
+        // This is done after environment-setup is sourced for reliability
+        if !all_sdk_package_names.is_empty() {
+            let installed_versions = container_helper
+                .query_installed_packages(
+                    &SysrootType::Sdk,
+                    &all_sdk_package_names,
+                    container_image,
+                    &target,
+                    repo_url.clone(),
+                    repo_release.clone(),
+                    merged_container_args.clone(),
+                )
+                .await?;
+
+            if !installed_versions.is_empty() {
+                lock_file.update_sysroot_versions(&target, &SysrootType::Sdk, installed_versions);
+                if self.verbose {
+                    print_info(
+                        &format!(
+                            "Updated lock file with {} SDK package versions.",
+                            all_sdk_package_names.len()
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                // Save lock file immediately after SDK install
+                lock_file.save(&src_dir)?;
+            }
+        }
+
         // Install rootfs sysroot with version from distro.version
         print_info("Installing rootfs sysroot.", OutputLevel::Normal);
 
-        let rootfs_pkg = if let Some(version) = config.get_distro_version() {
-            format!("avocado-pkg-rootfs-{}", version)
-        } else {
-            "avocado-pkg-rootfs".to_string()
-        };
+        let rootfs_base_pkg = "avocado-pkg-rootfs";
+        let rootfs_config_version = config
+            .get_distro_version()
+            .map(|s| s.as_str())
+            .unwrap_or("*");
+        let rootfs_pkg = build_package_spec_with_lock(
+            &lock_file,
+            &target,
+            &SysrootType::Rootfs,
+            rootfs_base_pkg,
+            rootfs_config_version,
+        );
 
         let yes = if self.force { "-y" } else { "" };
         let dnf_args_str = if let Some(args) = &self.dnf_args {
@@ -564,6 +655,35 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
         if rootfs_success {
             print_success("Installed rootfs sysroot.", OutputLevel::Normal);
+
+            // Query installed version and update lock file
+            let installed_versions = container_helper
+                .query_installed_packages(
+                    &SysrootType::Rootfs,
+                    &[rootfs_base_pkg.to_string()],
+                    container_image,
+                    &target,
+                    repo_url.clone(),
+                    repo_release.clone(),
+                    merged_container_args.clone(),
+                )
+                .await?;
+
+            if !installed_versions.is_empty() {
+                lock_file.update_sysroot_versions(
+                    &target,
+                    &SysrootType::Rootfs,
+                    installed_versions,
+                );
+                if self.verbose {
+                    print_info(
+                        "Updated lock file with rootfs package version.",
+                        OutputLevel::Normal,
+                    );
+                }
+                // Save lock file immediately after rootfs install
+                lock_file.save(&src_dir)?;
+            }
         } else {
             return Err(anyhow::anyhow!("Failed to install rootfs sysroot."));
         }
@@ -572,16 +692,25 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // This aggregates all dependencies from all compile sections (main config + external extensions)
         let compile_dependencies = config.get_compile_dependencies();
         if !compile_dependencies.is_empty() {
-            // Aggregate all compile dependencies into a single list
+            // Aggregate all compile dependencies into a single list (with lock file support)
             let mut all_compile_packages: Vec<String> = Vec::new();
+            let mut all_compile_package_names: Vec<String> = Vec::new();
             for dependencies in compile_dependencies.values() {
-                let packages = self.build_package_list(dependencies);
+                let packages = self.build_package_list_with_lock(
+                    dependencies,
+                    &lock_file,
+                    &target,
+                    &SysrootType::TargetSysroot,
+                );
                 all_compile_packages.extend(packages);
+                all_compile_package_names.extend(self.extract_package_names(dependencies));
             }
 
             // Deduplicate packages
             all_compile_packages.sort();
             all_compile_packages.dedup();
+            all_compile_package_names.sort();
+            all_compile_package_names.dedup();
 
             print_info(
                 &format!(
@@ -598,12 +727,19 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 String::new()
             };
 
-            // Build the target-sysroot package spec with version from distro.version
-            let target_sysroot_pkg = if let Some(version) = config.get_distro_version() {
-                format!("avocado-sdk-target-sysroot-{}", version)
-            } else {
-                "avocado-sdk-target-sysroot".to_string()
-            };
+            // Build the target-sysroot package spec with version from distro.version (with lock)
+            let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
+            let target_sysroot_config_version = config
+                .get_distro_version()
+                .map(|s| s.as_str())
+                .unwrap_or("*");
+            let target_sysroot_pkg = build_package_spec_with_lock(
+                &lock_file,
+                &target,
+                &SysrootType::TargetSysroot,
+                target_sysroot_base_pkg,
+                target_sysroot_config_version,
+            );
 
             // Install the target-sysroot with avocado-sdk-target-sysroot plus compile deps
             let command = format!(
@@ -626,7 +762,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 target: target.clone(),
                 command,
                 verbose: self.verbose,
-                source_environment: true,
+                source_environment: false, // Don't source environment - matches rootfs install behavior
                 interactive: !self.force,
                 repo_url: repo_url.clone(),
                 repo_release: repo_release.clone(),
@@ -643,6 +779,38 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     "Installed target-sysroot with compile dependencies.",
                     OutputLevel::Normal,
                 );
+
+                // Query installed versions and update lock file
+                let mut packages_to_query = all_compile_package_names;
+                packages_to_query.push(target_sysroot_base_pkg.to_string());
+
+                let installed_versions = container_helper
+                    .query_installed_packages(
+                        &SysrootType::TargetSysroot,
+                        &packages_to_query,
+                        container_image,
+                        &target,
+                        repo_url.clone(),
+                        repo_release.clone(),
+                        merged_container_args.clone(),
+                    )
+                    .await?;
+
+                if !installed_versions.is_empty() {
+                    lock_file.update_sysroot_versions(
+                        &target,
+                        &SysrootType::TargetSysroot,
+                        installed_versions,
+                    );
+                    if self.verbose {
+                        print_info(
+                            "Updated lock file with target-sysroot package versions.",
+                            OutputLevel::Normal,
+                        );
+                    }
+                    // Save lock file immediately after target-sysroot install
+                    lock_file.save(&src_dir)?;
+                }
             } else {
                 return Err(anyhow::anyhow!(
                     "Failed to install target-sysroot with compile dependencies."
@@ -682,29 +850,42 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         Ok(())
     }
 
-    /// Build a list of packages from dependencies HashMap
-    fn build_package_list(&self, dependencies: &HashMap<String, serde_yaml::Value>) -> Vec<String> {
+    /// Build a list of packages from dependencies HashMap, using lock file for pinned versions
+    fn build_package_list_with_lock(
+        &self,
+        dependencies: &HashMap<String, serde_yaml::Value>,
+        lock_file: &LockFile,
+        target: &str,
+        sysroot: &SysrootType,
+    ) -> Vec<String> {
         let mut packages = Vec::new();
 
         for (package_name, version) in dependencies {
-            match version {
-                serde_yaml::Value::String(v) if v == "*" => {
-                    packages.push(package_name.clone());
-                }
-                serde_yaml::Value::String(v) => {
-                    packages.push(format!("{package_name}-{v}"));
-                }
-                serde_yaml::Value::Mapping(_) => {
-                    // Handle dictionary version format like {'core2_64': '*'}
-                    packages.push(package_name.clone());
-                }
-                _ => {
-                    packages.push(package_name.clone());
-                }
-            }
+            let config_version = match version {
+                serde_yaml::Value::String(v) => v.clone(),
+                serde_yaml::Value::Mapping(_) => "*".to_string(),
+                _ => "*".to_string(),
+            };
+
+            let package_spec = build_package_spec_with_lock(
+                lock_file,
+                target,
+                sysroot,
+                package_name,
+                &config_version,
+            );
+            packages.push(package_spec);
         }
 
         packages
+    }
+
+    /// Extract just the package names from a dependencies HashMap
+    fn extract_package_names(
+        &self,
+        dependencies: &HashMap<String, serde_yaml::Value>,
+    ) -> Vec<String> {
+        dependencies.keys().cloned().collect()
     }
 }
 
@@ -715,8 +896,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_build_package_list() {
+    fn test_build_package_list_with_lock() {
         let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
+        let lock_file = LockFile::new();
+        let target = "qemux86-64";
 
         let mut deps = HashMap::new();
         deps.insert("package1".to_string(), Value::String("*".to_string()));
@@ -726,12 +909,42 @@ mod tests {
             serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
         );
 
-        let packages = cmd.build_package_list(&deps);
+        let packages =
+            cmd.build_package_list_with_lock(&deps, &lock_file, target, &SysrootType::Sdk);
 
         assert_eq!(packages.len(), 3);
         assert!(packages.contains(&"package1".to_string()));
         assert!(packages.contains(&"package2-1.0.0".to_string()));
         assert!(packages.contains(&"package3".to_string()));
+    }
+
+    #[test]
+    fn test_build_package_list_with_lock_uses_locked_version() {
+        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
+        let mut lock_file = LockFile::new();
+        let target = "qemux86-64";
+
+        // Add a locked version for package1
+        lock_file.update_sysroot_versions(
+            target,
+            &SysrootType::Sdk,
+            [("package1".to_string(), "2.0.0-r0.x86_64".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let mut deps = HashMap::new();
+        deps.insert("package1".to_string(), Value::String("*".to_string()));
+        deps.insert("package2".to_string(), Value::String("1.0.0".to_string()));
+
+        let packages =
+            cmd.build_package_list_with_lock(&deps, &lock_file, target, &SysrootType::Sdk);
+
+        assert_eq!(packages.len(), 2);
+        // package1 should use locked version instead of "*"
+        assert!(packages.contains(&"package1-2.0.0-r0.x86_64".to_string()));
+        // package2 has no lock entry, uses config version
+        assert!(packages.contains(&"package2-1.0.0".to_string()));
     }
 
     #[test]

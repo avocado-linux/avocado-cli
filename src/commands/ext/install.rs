@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::stamps::{
     compute_ext_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
@@ -171,8 +173,26 @@ impl ExtInstallCommand {
         let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Use the container helper to run the setup commands
-        let container_helper = SdkContainer::new();
+        let container_helper = SdkContainer::new().verbose(self.verbose);
         let total = extensions_to_install.len();
+
+        // Load lock file for reproducible builds
+        let src_dir = config
+            .get_resolved_src_dir(&self.config_path)
+            .unwrap_or_else(|| {
+                PathBuf::from(&self.config_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+        let mut lock_file = LockFile::load(&src_dir).with_context(|| "Failed to load lock file")?;
+
+        if self.verbose && !lock_file.is_empty() {
+            print_info(
+                "Using existing lock file for version pinning.",
+                OutputLevel::Normal,
+            );
+        }
 
         // Install each extension
         for (index, (ext_name, ext_location)) in extensions_to_install.iter().enumerate() {
@@ -210,6 +230,8 @@ impl ExtInstallCommand {
                     repo_release.as_ref(),
                     &merged_container_args,
                     config.get_sdk_disable_weak_dependencies(),
+                    &mut lock_file,
+                    &src_dir,
                 )
                 .await?
             {
@@ -271,6 +293,8 @@ impl ExtInstallCommand {
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
         disable_weak_dependencies: bool,
+        lock_file: &mut LockFile,
+        src_dir: &Path,
     ) -> Result<bool> {
         // Create the commands to check and set up the directory structure
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
@@ -332,9 +356,12 @@ impl ExtInstallCommand {
         // Install dependencies if they exist
         let dependencies = ext_config.as_ref().and_then(|ec| ec.get("dependencies"));
 
+        let sysroot = SysrootType::Extension(extension.to_string());
+
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install and handle extension dependencies
             let mut packages = Vec::new();
+            let mut package_names = Vec::new();
             let mut extension_dependencies = Vec::new();
 
             for (package_name_val, version_spec) in deps_map {
@@ -349,11 +376,15 @@ impl ExtInstallCommand {
                     // Simple string version: "package: version" or "package: '*'"
                     // These are always package repository dependencies
                     serde_yaml::Value::String(version) => {
-                        if version == "*" {
-                            packages.push(package_name.to_string());
-                        } else {
-                            packages.push(format!("{package_name}-{version}"));
-                        }
+                        let package_spec = build_package_spec_with_lock(
+                            lock_file,
+                            target,
+                            &sysroot,
+                            package_name,
+                            version,
+                        );
+                        packages.push(package_spec);
+                        package_names.push(package_name.to_string());
                     }
                     // Object/mapping value: need to check what type of dependency
                     serde_yaml::Value::Mapping(spec_map) => {
@@ -410,11 +441,15 @@ impl ExtInstallCommand {
                         // Check for explicit version in object format
                         // Format: { version: "1.0.0" }
                         if let Some(serde_yaml::Value::String(version)) = spec_map.get("version") {
-                            if version == "*" {
-                                packages.push(package_name.to_string());
-                            } else {
-                                packages.push(format!("{package_name}-{version}"));
-                            }
+                            let package_spec = build_package_spec_with_lock(
+                                lock_file,
+                                target,
+                                &sysroot,
+                                package_name,
+                                version,
+                            );
+                            packages.push(package_spec);
+                            package_names.push(package_name.to_string());
                         }
                         // If it's a mapping without compile, ext, or version keys, skip it
                         // (unknown format)
@@ -510,6 +545,33 @@ $DNF_SDK_HOST \
                         OutputLevel::Normal,
                     );
                     return Ok(false);
+                }
+
+                // Query installed versions and update lock file
+                if !package_names.is_empty() {
+                    let installed_versions = container_helper
+                        .query_installed_packages(
+                            &sysroot,
+                            &package_names,
+                            container_image,
+                            target,
+                            repo_url.cloned(),
+                            repo_release.cloned(),
+                            merged_container_args.clone(),
+                        )
+                        .await?;
+
+                    if !installed_versions.is_empty() {
+                        lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
+                        if self.verbose {
+                            print_info(
+                                &format!("Updated lock file with extension '{extension}' package versions."),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        // Save lock file immediately after extension install
+                        lock_file.save(src_dir)?;
+                    }
                 }
             } else if self.verbose {
                 print_debug(
