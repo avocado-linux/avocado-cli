@@ -121,6 +121,9 @@ enum Commands {
         /// Target architecture (required when --stamps is used)
         #[arg(long)]
         target: Option<String>,
+        /// Force removal by killing and removing containers using the volume
+        #[arg(short, long)]
+        force: bool,
     },
     /// Install all components (SDK, extensions, and runtime dependencies)
     Install {
@@ -730,12 +733,14 @@ async fn main() -> Result<()> {
             stamps,
             config,
             target,
+            force,
         } => {
             let clean_cmd =
                 CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose)
                     .with_stamps(stamps)
                     .with_config_path(config)
-                    .with_target(target.or(cli.target.clone()));
+                    .with_target(target.or(cli.target.clone()))
+                    .with_force(force);
             clean_cmd.execute().await?;
             Ok(())
         }

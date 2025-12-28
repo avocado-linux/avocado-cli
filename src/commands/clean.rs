@@ -26,6 +26,8 @@ pub struct CleanCommand {
     config_path: Option<String>,
     /// Target architecture (needed for --stamps)
     target: Option<String>,
+    /// Force removal by killing and removing containers using the volume
+    force: bool,
 }
 
 impl CleanCommand {
@@ -50,6 +52,7 @@ impl CleanCommand {
             stamps: false,
             config_path: None,
             target: None,
+            force: false,
         }
     }
 
@@ -68,6 +71,12 @@ impl CleanCommand {
     /// Set the target for stamp cleaning
     pub fn with_target(mut self, target: Option<String>) -> Self {
         self.target = target;
+        self
+    }
+
+    /// Set whether to force removal by killing containers
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
         self
     }
 
@@ -174,12 +183,25 @@ fi
                 );
             }
 
-            volume_manager
-                .remove_volume(&volume_state.volume_name)
-                .await
-                .with_context(|| {
-                    format!("Failed to remove volume: {}", volume_state.volume_name)
-                })?;
+            if self.force {
+                // Force removal: kill and remove all containers using the volume first
+                volume_manager
+                    .force_remove_volume(&volume_state.volume_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to force remove volume: {}",
+                            volume_state.volume_name
+                        )
+                    })?;
+            } else {
+                volume_manager
+                    .remove_volume(&volume_state.volume_name)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to remove volume: {}", volume_state.volume_name)
+                    })?;
+            }
 
             print_success(
                 &format!("Removed docker volume: {}", volume_state.volume_name),
