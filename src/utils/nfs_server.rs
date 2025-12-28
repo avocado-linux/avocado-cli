@@ -99,6 +99,7 @@ impl NfsServerConfig {
     }
 
     /// Add an export to the configuration
+    #[allow(dead_code)]
     pub fn add_export(&mut self, local_path: PathBuf, pseudo_path: String) -> &mut Self {
         let export_id = (self.exports.len() + 1) as u32;
         self.exports
@@ -211,6 +212,7 @@ impl NfsServer {
     /// 1. Generate the Ganesha configuration file
     /// 2. Start ganesha.nfsd in foreground mode
     /// 3. Return the running server handle
+    #[allow(dead_code)]
     pub async fn start(config: NfsServerConfig) -> Result<Self> {
         // Verify ganesha.nfsd is available
         let ganesha_check = AsyncCommand::new("which")
@@ -557,10 +559,12 @@ impl Drop for NfsServer {
 }
 
 /// Builder for creating NFS server configurations
+#[allow(dead_code)]
 pub struct NfsServerBuilder {
     config: NfsServerConfig,
 }
 
+#[allow(dead_code)]
 impl NfsServerBuilder {
     /// Create a new builder with auto-selected port
     pub fn new() -> Result<Self> {

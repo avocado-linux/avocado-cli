@@ -23,6 +23,7 @@ enum OverlayMode {
     Opaque, // cp -r (replace directory contents)
 }
 
+#[derive(Default)]
 pub struct ExtBuildCommand {
     pub extension: String,
     pub config_path: String,
@@ -33,22 +34,6 @@ pub struct ExtBuildCommand {
     pub no_stamps: bool,
     pub runs_on: Option<String>,
     pub nfs_port: Option<u16>,
-}
-
-impl Default for ExtBuildCommand {
-    fn default() -> Self {
-        Self {
-            extension: String::new(),
-            config_path: String::new(),
-            verbose: false,
-            target: None,
-            container_args: None,
-            dnf_args: None,
-            no_stamps: false,
-            runs_on: None,
-            nfs_port: None,
-        }
-    }
 }
 
 impl ExtBuildCommand {

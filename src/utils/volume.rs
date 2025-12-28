@@ -180,6 +180,84 @@ impl VolumeManager {
 
         Ok(())
     }
+
+    /// Force remove a docker volume by first stopping and removing all containers using it
+    pub async fn force_remove_volume(&self, volume_name: &str) -> Result<()> {
+        // Get containers using this volume
+        let containers = self.get_containers_using_volume(volume_name).await?;
+
+        if !containers.is_empty() {
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "Found {} container(s) using volume, stopping and removing...",
+                        containers.len()
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+
+            for container_id in &containers {
+                // Kill the container (faster than stop)
+                let _ = AsyncCommand::new(&self.container_tool)
+                    .args(["kill", container_id])
+                    .output()
+                    .await;
+
+                // Remove the container
+                let output = AsyncCommand::new(&self.container_tool)
+                    .args(["rm", "-f", container_id])
+                    .output()
+                    .await
+                    .with_context(|| format!("Failed to remove container {}", container_id))?;
+
+                if self.verbose && output.status.success() {
+                    print_info(
+                        &format!(
+                            "Removed container: {}",
+                            &container_id[..12.min(container_id.len())]
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
+        // Now remove the volume
+        self.remove_volume(volume_name).await
+    }
+
+    /// Get list of container IDs using a specific volume
+    async fn get_containers_using_volume(&self, volume_name: &str) -> Result<Vec<String>> {
+        // Use docker ps with filter to find containers using this volume
+        // This includes both running and stopped containers
+        let output = AsyncCommand::new(&self.container_tool)
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("volume={}", volume_name),
+                "--format",
+                "{{.ID}}",
+            ])
+            .output()
+            .await
+            .with_context(|| "Failed to list containers using volume")?;
+
+        if !output.status.success() {
+            // If the command fails, return empty list (volume might not exist)
+            return Ok(Vec::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let containers: Vec<String> = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        Ok(containers)
+    }
 }
 
 /// Information about a docker volume

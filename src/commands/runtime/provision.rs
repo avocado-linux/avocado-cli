@@ -721,7 +721,7 @@ avocado-provision-{} {}
             .verbose(self.config.verbose);
 
         let success = container_helper
-            .run_simple_command(&container_image, &copy_script, true)
+            .run_simple_command(container_image, &copy_script, true)
             .await?;
 
         if !success {
