@@ -169,6 +169,11 @@ impl SdkContainer {
         if config.verbose || self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
+        // Pass SDK image for error messages
+        env_vars.insert(
+            "AVOCADO_SDK_IMAGE".to_string(),
+            config.container_image.clone(),
+        );
 
         // Build the complete command
         let mut full_command = String::new();
@@ -266,6 +271,11 @@ impl SdkContainer {
         let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
         env_vars.insert("AVOCADO_HOST_UID".to_string(), host_uid.to_string());
         env_vars.insert("AVOCADO_HOST_GID".to_string(), host_gid.to_string());
+        // Pass SDK image for error messages
+        env_vars.insert(
+            "AVOCADO_SDK_IMAGE".to_string(),
+            config.container_image.clone(),
+        );
 
         // Build the complete command with entrypoint
         // NFS src volume is mounted to /mnt/src, bindfs remaps to /opt/src with UID translation
@@ -289,6 +299,8 @@ impl SdkContainer {
             "/dev/fuse".to_string(),
             "--cap-add".to_string(),
             "SYS_ADMIN".to_string(),
+            "--security-opt".to_string(),
+            "label=disable".to_string(),
         ];
 
         if let Some(ref args) = config.container_args {
@@ -361,6 +373,9 @@ impl SdkContainer {
         container_cmd.push("/dev/fuse".to_string());
         container_cmd.push("--cap-add".to_string());
         container_cmd.push("SYS_ADMIN".to_string());
+        // Disable SELinux labeling to allow FUSE mounts (required on Fedora/RHEL hosts)
+        container_cmd.push("--security-opt".to_string());
+        container_cmd.push("label=disable".to_string());
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         // Source is mounted to /mnt/src, then bindfs remounts it to /opt/src with permission translation
@@ -503,6 +518,11 @@ impl SdkContainer {
         if config.verbose || self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
+        // Pass SDK image for error messages
+        env_vars.insert(
+            "AVOCADO_SDK_IMAGE".to_string(),
+            config.container_image.clone(),
+        );
 
         // Build the complete command
         let mut full_command = String::new();
@@ -764,6 +784,9 @@ impl SdkContainer {
         container_cmd.push("/dev/fuse".to_string());
         container_cmd.push("--cap-add".to_string());
         container_cmd.push("SYS_ADMIN".to_string());
+        // Disable SELinux labeling to allow FUSE mounts (required on Fedora/RHEL hosts)
+        container_cmd.push("--security-opt".to_string());
+        container_cmd.push("label=disable".to_string());
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
@@ -778,6 +801,9 @@ impl SdkContainer {
         container_cmd.push(format!("AVOCADO_HOST_UID={}", host_uid));
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_HOST_GID={}", host_gid));
+        // Pass SDK image for error messages
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_SDK_IMAGE={}", container_image));
 
         // Add the container image
         container_cmd.push(container_image.to_string());
@@ -798,21 +824,10 @@ impl SdkContainer {
                 r#"if ! command -v bindfs >/dev/null 2>&1; then
     echo "[ERROR] bindfs is not installed in this container image."
     echo ""
-    echo "bindfs is required for proper file permission handling between the host and container."
+    echo "To resolve this, update the SDK container by running one of the following:"
     echo ""
-    echo "To install bindfs in your container image, add one of the following to your Dockerfile:"
-    echo ""
-    echo "  # For Ubuntu/Debian-based images:"
-    echo "  RUN apt-get update && apt-get install -y bindfs"
-    echo ""
-    echo "  # For Fedora/RHEL-based images:"
-    echo "  RUN dnf install -y bindfs"
-    echo ""
-    echo "  # For Alpine-based images:"
-    echo "  RUN apk add --no-cache bindfs"
-    echo ""
-    echo "  # For Arch-based images:"
-    echo "  RUN pacman -S --noconfirm bindfs"
+    echo "  avocado fetch"
+    echo "  docker pull $AVOCADO_SDK_IMAGE"
     echo ""
     exit 1
 fi
@@ -884,7 +899,11 @@ mkdir -p /opt/src
 if ! command -v bindfs >/dev/null 2>&1; then
     echo "[ERROR] bindfs is not installed in this container image."
     echo ""
-    echo "bindfs is required for proper file permission handling."
+    echo "To resolve this, update the SDK container by running one of the following:"
+    echo ""
+    echo "  avocado fetch"
+    echo "  docker pull $AVOCADO_SDK_IMAGE"
+    echo ""
     exit 1
 fi
 
@@ -1050,21 +1069,10 @@ mkdir -p /opt/src
 if ! command -v bindfs >/dev/null 2>&1; then
     echo "[ERROR] bindfs is not installed in this container image."
     echo ""
-    echo "bindfs is required for proper file permission handling between the host and container."
+    echo "To resolve this, update the SDK container by running one of the following:"
     echo ""
-    echo "To install bindfs in your container image, add one of the following to your Dockerfile:"
-    echo ""
-    echo "  # For Ubuntu/Debian-based images:"
-    echo "  RUN apt-get update && apt-get install -y bindfs"
-    echo ""
-    echo "  # For Fedora/RHEL-based images:"
-    echo "  RUN dnf install -y bindfs"
-    echo ""
-    echo "  # For Alpine-based images:"
-    echo "  RUN apk add --no-cache bindfs"
-    echo ""
-    echo "  # For Arch-based images:"
-    echo "  RUN pacman -S --noconfirm bindfs"
+    echo "  avocado fetch"
+    echo "  docker pull $AVOCADO_SDK_IMAGE"
     echo ""
     exit 1
 fi
@@ -1481,6 +1489,8 @@ mod tests {
         assert!(cmd.contains(&"/dev/fuse".to_string()));
         assert!(cmd.contains(&"--cap-add".to_string()));
         assert!(cmd.contains(&"SYS_ADMIN".to_string()));
+        assert!(cmd.contains(&"--security-opt".to_string()));
+        assert!(cmd.contains(&"label=disable".to_string()));
         // Verify host UID/GID are passed as env vars
         let has_uid_env = cmd.iter().any(|s| s.starts_with("AVOCADO_HOST_UID="));
         let has_gid_env = cmd.iter().any(|s| s.starts_with("AVOCADO_HOST_GID="));
