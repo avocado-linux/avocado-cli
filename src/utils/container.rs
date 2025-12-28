@@ -218,10 +218,17 @@ impl SdkContainer {
             container_cmd.push("-t".to_string());
         }
 
+        // Add FUSE device and capability for bindfs support
+        container_cmd.push("--device".to_string());
+        container_cmd.push("/dev/fuse".to_string());
+        container_cmd.push("--cap-add".to_string());
+        container_cmd.push("SYS_ADMIN".to_string());
+
         // Volume mounts: docker volume for persistent state, bind mount for source
+        // Source is mounted to /mnt/src, then bindfs remounts it to /opt/src with permission translation
         container_cmd.push("-v".to_string());
         let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
-        container_cmd.push(format!("{}:/opt/src:rw", src_path.display()));
+        container_cmd.push(format!("{}:/mnt/src:rw", src_path.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 
@@ -269,6 +276,13 @@ impl SdkContainer {
         container_cmd.push(format!("AVOCADO_SDK_TARGET={}", config.target));
         container_cmd.push("-e".to_string());
         container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
+
+        // Pass host UID/GID for bindfs permission translation
+        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_HOST_UID={}", host_uid));
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_HOST_GID={}", host_gid));
 
         // Add signing-related environment variables
         if config.signing_socket_path.is_some() {
@@ -379,7 +393,7 @@ impl SdkContainer {
         if config.verbose || self.verbose {
             print_info(
                 &format!(
-                    "Mounting source directory: {} -> /opt/src",
+                    "Mounting source directory: {} -> /mnt/src (bindfs -> /opt/src)",
                     self.cwd.display()
                 ),
                 OutputLevel::Normal,
@@ -532,7 +546,7 @@ impl SdkContainer {
         if verbose {
             print_info(
                 &format!(
-                    "Mounting source directory: {} -> /opt/src",
+                    "Mounting source directory: {} -> /mnt/src (bindfs -> /opt/src)",
                     self.cwd.display()
                 ),
                 OutputLevel::Normal,
@@ -579,6 +593,123 @@ impl SdkContainer {
         }
     }
 
+    /// Run a simple command in the container without the full SDK entrypoint.
+    ///
+    /// This is useful for quick one-off operations like chown, cp, etc.
+    /// that don't need the SDK environment setup.
+    ///
+    /// # Arguments
+    /// * `container_image` - The container image to use
+    /// * `command` - The bash command to run
+    /// * `rm` - Whether to remove the container after exit
+    ///
+    /// # Returns
+    /// `true` if the command succeeded, `false` otherwise
+    pub async fn run_simple_command(
+        &self,
+        container_image: &str,
+        command: &str,
+        rm: bool,
+    ) -> Result<bool> {
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
+
+        if rm {
+            container_cmd.push("--rm".to_string());
+        }
+
+        // Add FUSE device and capability for bindfs support
+        container_cmd.push("--device".to_string());
+        container_cmd.push("/dev/fuse".to_string());
+        container_cmd.push("--cap-add".to_string());
+        container_cmd.push("SYS_ADMIN".to_string());
+
+        // Volume mounts: docker volume for persistent state, bind mount for source
+        container_cmd.push("-v".to_string());
+        let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        container_cmd.push(format!("{}:/mnt/src:rw", src_path.display()));
+        container_cmd.push("-v".to_string());
+        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+
+        // Pass host UID/GID for bindfs permission translation
+        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_HOST_UID={}", host_uid));
+        container_cmd.push("-e".to_string());
+        container_cmd.push(format!("AVOCADO_HOST_GID={}", host_gid));
+
+        // Add the container image
+        container_cmd.push(container_image.to_string());
+
+        // Add the command
+        container_cmd.push("bash".to_string());
+        container_cmd.push("-c".to_string());
+
+        // Prepend bindfs check and setup to the command
+        // If host UID is 0 (root), skip bindfs and use simple bind mount
+        let full_command = if host_uid == 0 && host_gid == 0 {
+            format!(
+                "mkdir -p /opt/src && mount --bind /mnt/src /opt/src && {}",
+                command
+            )
+        } else {
+            format!(
+                r#"if ! command -v bindfs >/dev/null 2>&1; then
+    echo "[ERROR] bindfs is not installed in this container image."
+    echo ""
+    echo "bindfs is required for proper file permission handling between the host and container."
+    echo ""
+    echo "To install bindfs in your container image, add one of the following to your Dockerfile:"
+    echo ""
+    echo "  # For Ubuntu/Debian-based images:"
+    echo "  RUN apt-get update && apt-get install -y bindfs"
+    echo ""
+    echo "  # For Fedora/RHEL-based images:"
+    echo "  RUN dnf install -y bindfs"
+    echo ""
+    echo "  # For Alpine-based images:"
+    echo "  RUN apk add --no-cache bindfs"
+    echo ""
+    echo "  # For Arch-based images:"
+    echo "  RUN pacman -S --noconfirm bindfs"
+    echo ""
+    exit 1
+fi
+mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src && {}"#,
+                command
+            )
+        };
+        container_cmd.push(full_command);
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Mounting source directory: {} -> /mnt/src (bindfs -> /opt/src)",
+                    src_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+            print_info(
+                &format!("Simple container command: {}", container_cmd.join(" ")),
+                OutputLevel::Normal,
+            );
+        }
+
+        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        cmd.args(&container_cmd[1..]);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+        let status = cmd
+            .status()
+            .await
+            .with_context(|| "Failed to execute simple container command")?;
+
+        Ok(status.success())
+    }
+
     /// Create the entrypoint script for SDK initialization
     pub fn create_entrypoint_script(
         &self,
@@ -599,6 +730,51 @@ impl SdkContainer {
         let mut script = format!(
             r#"
 set -e
+
+# Remount source directory with permission translation via bindfs
+# This maps host UID/GID to root inside the container for seamless file access
+mkdir -p /opt/src
+
+# Check if bindfs is available
+if ! command -v bindfs >/dev/null 2>&1; then
+    echo "[ERROR] bindfs is not installed in this container image."
+    echo ""
+    echo "bindfs is required for proper file permission handling between the host and container."
+    echo ""
+    echo "To install bindfs in your container image, add one of the following to your Dockerfile:"
+    echo ""
+    echo "  # For Ubuntu/Debian-based images:"
+    echo "  RUN apt-get update && apt-get install -y bindfs"
+    echo ""
+    echo "  # For Fedora/RHEL-based images:"
+    echo "  RUN dnf install -y bindfs"
+    echo ""
+    echo "  # For Alpine-based images:"
+    echo "  RUN apk add --no-cache bindfs"
+    echo ""
+    echo "  # For Arch-based images:"
+    echo "  RUN pacman -S --noconfirm bindfs"
+    echo ""
+    exit 1
+fi
+
+if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
+    # If host user is already root (UID 0), no mapping needed - just bind mount
+    if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
+        mount --bind /mnt/src /opt/src
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)"; fi
+    else
+        # Use --map with colon-separated user and group mappings
+        # Maps host UID -> 0 (root) and host GID -> 0 (root group)
+        # Format: --map=uid1/uid2:@gid1/@gid2
+        bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src with UID/GID mapping ($AVOCADO_HOST_UID:$AVOCADO_HOST_GID -> 0:0)"; fi
+    fi
+else
+    # Fallback: simple bind mount without permission translation
+    mount --bind /mnt/src /opt/src
+    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)"; fi
+fi
 
 # Get repo url from environment or default to prod
 if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
@@ -986,6 +1162,19 @@ mod tests {
         assert!(cmd.contains(&"test".to_string()));
         // Verify AVOCADO_SRC_DIR is set
         assert!(cmd.contains(&"AVOCADO_SRC_DIR=/opt/src".to_string()));
+        // Verify FUSE device and capability for bindfs support
+        assert!(cmd.contains(&"--device".to_string()));
+        assert!(cmd.contains(&"/dev/fuse".to_string()));
+        assert!(cmd.contains(&"--cap-add".to_string()));
+        assert!(cmd.contains(&"SYS_ADMIN".to_string()));
+        // Verify host UID/GID are passed as env vars
+        let has_uid_env = cmd.iter().any(|s| s.starts_with("AVOCADO_HOST_UID="));
+        let has_gid_env = cmd.iter().any(|s| s.starts_with("AVOCADO_HOST_GID="));
+        assert!(has_uid_env, "AVOCADO_HOST_UID should be set");
+        assert!(has_gid_env, "AVOCADO_HOST_GID should be set");
+        // Verify source mount uses /mnt/src (bindfs will remount to /opt/src)
+        let has_mnt_src_mount = cmd.iter().any(|s| s.contains(":/mnt/src:"));
+        assert!(has_mnt_src_mount, "Source should be mounted to /mnt/src");
     }
 
     #[test]
@@ -996,6 +1185,15 @@ mod tests {
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
         assert!(script.contains("cd /opt/src"));
+        // Verify bindfs check is included
+        assert!(script.contains("command -v bindfs"));
+        assert!(script.contains("[ERROR] bindfs is not installed"));
+        // Verify bindfs setup is included with correct syntax
+        // --map=uid1/uid2:@gid1/@gid2 for combined user and group mapping
+        assert!(script.contains(
+            "bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src"
+        ));
+        assert!(script.contains("mkdir -p /opt/src"));
     }
 
     #[test]

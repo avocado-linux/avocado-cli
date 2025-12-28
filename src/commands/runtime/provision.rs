@@ -308,10 +308,8 @@ impl RuntimeProvisionCommand {
             return Err(anyhow::anyhow!("Failed to provision runtime"));
         }
 
-        // Fix file ownership if --out was specified
-        if let Some(out_path) = &self.config.out {
-            self.fix_output_permissions(out_path).await?;
-        }
+        // Note: File ownership is automatically handled by bindfs permission translation,
+        // so no explicit chown is needed for the output directory.
 
         // Copy state file back from container if it exists
         if let Some((ref state_file_path, ref container_state_path)) = state_file_info {
@@ -489,123 +487,6 @@ impl RuntimeProvisionCommand {
     /// Cleanup signing service stub for non-Unix platforms
     #[cfg(not(unix))]
     async fn cleanup_signing_service(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    /// Fix file ownership of output directory to match calling user
-    async fn fix_output_permissions(&self, out_path: &str) -> Result<()> {
-        // Get the absolute path to the output directory
-        let src_dir = std::env::current_dir()?;
-        let out_dir = src_dir.join(out_path);
-
-        // Only proceed if the directory exists
-        if !out_dir.exists() {
-            if self.config.verbose {
-                print_info(
-                    &format!("Output directory does not exist yet: {}", out_dir.display()),
-                    OutputLevel::Verbose,
-                );
-            }
-            return Ok(());
-        }
-
-        // Get current user's UID and GID
-        #[cfg(unix)]
-        {
-            // Get the UID and GID of the calling user
-            let uid = unsafe { libc::getuid() };
-            let gid = unsafe { libc::getgid() };
-
-            if self.config.verbose {
-                print_info(
-                    &format!(
-                        "Fixing ownership of {} to {}:{}",
-                        out_dir.display(),
-                        uid,
-                        gid
-                    ),
-                    OutputLevel::Verbose,
-                );
-            }
-
-            // Load configuration to get container image
-            let config = load_config(&self.config.config_path)?;
-            let container_image = config
-                .get_sdk_image()
-                .context("No SDK container image specified in configuration")?;
-
-            // Build the chown command to run inside the container
-            let container_out_path = format!("/opt/src/{}", out_path);
-            let chown_script = format!("chown -R {}:{} '{}'", uid, gid, container_out_path);
-
-            // Run chown inside a container with the same volume mounts
-            let container_tool = "docker";
-            let volume_manager =
-                VolumeManager::new(container_tool.to_string(), self.config.verbose);
-            let volume_state = volume_manager.get_or_create_volume(&src_dir).await?;
-
-            let mut chown_cmd = vec![
-                container_tool.to_string(),
-                "run".to_string(),
-                "--rm".to_string(),
-            ];
-
-            // Mount the source directory
-            chown_cmd.push("-v".to_string());
-            chown_cmd.push(format!("{}:/opt/src:rw", src_dir.display()));
-
-            // Mount the volume
-            chown_cmd.push("-v".to_string());
-            chown_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
-
-            // Add the container image
-            chown_cmd.push(container_image.to_string());
-
-            // Add the command
-            chown_cmd.push("bash".to_string());
-            chown_cmd.push("-c".to_string());
-            chown_cmd.push(chown_script);
-
-            if self.config.verbose {
-                print_info(
-                    &format!("Running: {}", chown_cmd.join(" ")),
-                    OutputLevel::Verbose,
-                );
-            }
-
-            let mut cmd = tokio::process::Command::new(&chown_cmd[0]);
-            cmd.args(&chown_cmd[1..]);
-            cmd.stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-
-            let status = cmd
-                .status()
-                .await
-                .context("Failed to execute chown command")?;
-
-            if !status.success() {
-                print_info(
-                    "Warning: Failed to fix ownership of output directory. Files may be owned by root.",
-                    OutputLevel::Normal,
-                );
-            } else if self.config.verbose {
-                print_info(
-                    "Successfully fixed output directory ownership",
-                    OutputLevel::Verbose,
-                );
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            if self.config.verbose {
-                print_info(
-                    "Skipping ownership fix on non-Unix platform",
-                    OutputLevel::Verbose,
-                );
-            }
-        }
-
         Ok(())
     }
 
@@ -812,68 +693,28 @@ avocado-provision-{} {}
             );
         }
 
-        // Get current user's UID and GID for proper ownership
-        #[cfg(unix)]
-        let (uid, gid) = {
-            let uid = unsafe { libc::getuid() };
-            let gid = unsafe { libc::getgid() };
-            (uid, gid)
-        };
-
-        #[cfg(not(unix))]
-        let (uid, gid) = (0u32, 0u32);
-
-        // Ensure parent directory exists on host and copy file with correct ownership
+        // Ensure parent directory exists on host
         if let Some(parent) = host_state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Copy from container to host src_dir with proper ownership
+        // Copy from container to host src_dir
+        // Note: File ownership is automatically handled by bindfs permission translation
         let copy_script = format!(
-            "cp '{}' '/opt/src/{}' && chown {}:{} '/opt/src/{}'",
-            container_state_path, state_file_path, uid, gid, state_file_path
+            "cp '{}' '/opt/src/{}'",
+            container_state_path, state_file_path
         );
 
-        let mut copy_cmd = vec![
-            container_tool.to_string(),
-            "run".to_string(),
-            "--rm".to_string(),
-        ];
+        // Use shared SdkContainer for running the command
+        let container_helper = SdkContainer::new()
+            .with_src_dir(Some(src_dir.to_path_buf()))
+            .verbose(self.config.verbose);
 
-        // Mount the source directory (read-write to copy file back)
-        copy_cmd.push("-v".to_string());
-        copy_cmd.push(format!("{}:/opt/src:rw", src_dir.display()));
+        let success = container_helper
+            .run_simple_command(&container_image, &copy_script, true)
+            .await?;
 
-        // Mount the volume
-        copy_cmd.push("-v".to_string());
-        copy_cmd.push(format!("{}:/opt/_avocado:ro", volume_state.volume_name));
-
-        // Add the container image
-        copy_cmd.push(container_image.to_string());
-
-        // Add the command
-        copy_cmd.push("bash".to_string());
-        copy_cmd.push("-c".to_string());
-        copy_cmd.push(copy_script);
-
-        if self.config.verbose {
-            print_info(
-                &format!("Running: {}", copy_cmd.join(" ")),
-                OutputLevel::Verbose,
-            );
-        }
-
-        let mut cmd = tokio::process::Command::new(&copy_cmd[0]);
-        cmd.args(&copy_cmd[1..]);
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
-        let status = cmd
-            .status()
-            .await
-            .context("Failed to copy state file from container")?;
-
-        if !status.success() {
+        if !success {
             print_info(
                 "Warning: Failed to copy state file from container",
                 OutputLevel::Normal,

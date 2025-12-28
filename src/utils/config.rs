@@ -201,6 +201,10 @@ pub struct SdkConfig {
     #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
     pub disable_weak_dependencies: Option<bool>,
+    /// Host UID for bindfs permission translation (overrides libc::getuid())
+    pub host_uid: Option<u32>,
+    /// Host GID for bindfs permission translation (overrides libc::getgid())
+    pub host_gid: Option<u32>,
 }
 
 /// Compile configuration for SDK
@@ -2520,6 +2524,12 @@ fn merge_sdk_configs(mut base: SdkConfig, target: SdkConfig) -> SdkConfig {
     if target.container_args.is_some() {
         base.container_args = target.container_args;
     }
+    if target.host_uid.is_some() {
+        base.host_uid = target.host_uid;
+    }
+    if target.host_gid.is_some() {
+        base.host_gid = target.host_gid;
+    }
 
     // For dependencies and compile, merge the HashMaps
     if let Some(target_deps) = target.dependencies {
@@ -2553,6 +2563,63 @@ fn merge_sdk_configs(mut base: SdkConfig, target: SdkConfig) -> SdkConfig {
     }
 
     base
+}
+
+/// Resolve host UID/GID for bindfs permission translation.
+///
+/// Priority (highest first):
+/// 1. Environment variables: `AVOCADO_HOST_UID` / `AVOCADO_HOST_GID`
+/// 2. Config file: `sdk.host_uid` / `sdk.host_gid`
+/// 3. libc calls: `libc::getuid()` / `libc::getgid()` (default fallback)
+///
+/// # Arguments
+/// * `config` - Optional SDK configuration to check for host_uid/host_gid
+///
+/// # Returns
+/// Tuple of (uid, gid) resolved according to priority chain
+pub fn resolve_host_uid_gid(config: Option<&SdkConfig>) -> (u32, u32) {
+    // Get fallback values from libc
+    #[cfg(unix)]
+    let (fallback_uid, fallback_gid) = {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        (uid, gid)
+    };
+
+    #[cfg(not(unix))]
+    let (fallback_uid, fallback_gid) = (0u32, 0u32);
+
+    // Resolve UID: env var > config > libc
+    let uid = if let Ok(env_uid) = env::var("AVOCADO_HOST_UID") {
+        env_uid.parse::<u32>().unwrap_or_else(|_| {
+            eprintln!(
+                "Warning: Invalid AVOCADO_HOST_UID '{}', using fallback",
+                env_uid
+            );
+            fallback_uid
+        })
+    } else if let Some(cfg) = config {
+        cfg.host_uid.unwrap_or(fallback_uid)
+    } else {
+        fallback_uid
+    };
+
+    // Resolve GID: env var > config > libc
+    let gid = if let Ok(env_gid) = env::var("AVOCADO_HOST_GID") {
+        env_gid.parse::<u32>().unwrap_or_else(|_| {
+            eprintln!(
+                "Warning: Invalid AVOCADO_HOST_GID '{}', using fallback",
+                env_gid
+            );
+            fallback_gid
+        })
+    } else if let Some(cfg) = config {
+        cfg.host_gid.unwrap_or(fallback_gid)
+    } else {
+        fallback_gid
+    };
+
+    (uid, gid)
 }
 
 /// Convenience function to load a config file

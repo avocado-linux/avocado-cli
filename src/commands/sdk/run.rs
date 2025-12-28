@@ -5,9 +5,8 @@ use anyhow::{Context, Result};
 use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
-    output::{print_error, print_success, OutputLevel},
+    output::{print_success, OutputLevel},
     target::validate_and_log_target,
-    volume::VolumeManager,
 };
 
 /// Implementation of the 'sdk run' command.
@@ -159,11 +158,14 @@ impl SdkRunCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
 
-        // Create shared RunConfig for all execution modes
+        // Create RunConfig - detach mode is now handled by the shared run_in_container
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.clone(),
             command: command.clone(),
+            container_name: self.name.clone(),
+            detach: self.detach,
+            rm: self.rm,
             verbose: self.verbose,
             source_environment: self.env,
             interactive: self.interactive,
@@ -177,95 +179,14 @@ impl SdkRunCommand {
             ..Default::default()
         };
 
-        let success = if self.detach {
-            self.run_detached_container(&container_helper, &run_config)
-                .await?
-        } else {
-            container_helper.run_in_container(run_config).await?
-        };
+        // Use shared run_in_container for both detached and non-detached modes
+        let success = container_helper.run_in_container(run_config).await?;
 
         if success {
             print_success("SDK command completed successfully.", OutputLevel::Normal);
         }
 
         Ok(())
-    }
-
-    /// Run container in detached mode
-    async fn run_detached_container(
-        &self,
-        container_helper: &SdkContainer,
-        config: &RunConfig,
-    ) -> Result<bool> {
-        // Get or create docker volume for persistent state
-        let volume_manager = VolumeManager::new(container_helper.container_tool.clone(), false);
-        let volume_state = volume_manager
-            .get_or_create_volume(&container_helper.cwd)
-            .await?;
-        // Build container command for detached mode
-        let mut container_cmd = vec![
-            container_helper.container_tool.clone(),
-            "run".to_string(),
-            "-d".to_string(),
-        ];
-
-        if self.rm {
-            container_cmd.push("--rm".to_string());
-        }
-
-        if let Some(ref name) = self.name {
-            container_cmd.push("--name".to_string());
-            container_cmd.push(name.clone());
-        }
-
-        // Volume mounts: docker volume for persistent state, bind mount for source
-        container_cmd.push("-v".to_string());
-        let src_path = container_helper
-            .src_dir
-            .as_ref()
-            .unwrap_or(&container_helper.cwd);
-        container_cmd.push(format!("{}:/opt/src:rw", src_path.display()));
-        container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
-
-        // Add environment variables
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_TARGET={}", config.target));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_TARGET={}", config.target));
-
-        // Add merged container args
-        if let Some(args) = &config.container_args {
-            container_cmd.extend_from_slice(args);
-        }
-
-        // Add the container image
-        container_cmd.push(config.container_image.clone());
-
-        // Add the command
-        container_cmd.push("bash".to_string());
-        container_cmd.push("-c".to_string());
-        container_cmd.push(config.command.clone());
-
-        // Execute using tokio Command
-        let output = tokio::process::Command::new(&container_cmd[0])
-            .args(&container_cmd[1..])
-            .output()
-            .await
-            .with_context(|| "Failed to execute detached container command")?;
-
-        if output.status.success() {
-            let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            println!("Container started in detached mode with ID: {container_id}");
-            Ok(true)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            print_error(
-                &format!("Container execution failed: {stderr}"),
-                OutputLevel::Normal,
-            );
-            Ok(false)
-        }
     }
 }
 
