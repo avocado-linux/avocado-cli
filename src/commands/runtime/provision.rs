@@ -118,9 +118,20 @@ impl RuntimeProvisionCommand {
                 .run_in_container_with_output(run_config)
                 .await?;
 
+            // If output is None, the container command failed - show a helpful error
+            let output_str = match output {
+                Some(ref s) => s.as_str(),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to check stamps: container command failed.\n\
+                        This may be caused by mount permission issues.\n\
+                        Try running with --verbose or use --no-stamps to skip validation."
+                    ));
+                }
+            };
+
             // Validate all stamps from batch output
-            let validation =
-                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+            let validation = validate_stamps_batch(&required, output_str, None);
 
             if !validation.is_satisfied() {
                 let error = validation.into_error(&format!(

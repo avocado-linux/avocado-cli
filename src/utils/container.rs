@@ -3,12 +3,64 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
 use crate::utils::volume::{VolumeManager, VolumeState};
+
+/// Check if SELinux is enabled on the host system.
+/// Returns true if SELinux is present and enabled (enforcing or permissive).
+fn is_selinux_enabled() -> bool {
+    // Check if /sys/fs/selinux exists (SELinux is compiled into the kernel)
+    if !Path::new("/sys/fs/selinux").exists() {
+        return false;
+    }
+
+    // Check the enforce file to see if SELinux is actually enabled
+    // If we can't read it, assume SELinux is enabled to be safe
+    match std::fs::read_to_string("/sys/fs/selinux/enforce") {
+        Ok(content) => {
+            // Content is "0" for permissive, "1" for enforcing
+            // Both mean SELinux is active and we need to disable labeling
+            content.trim() == "0" || content.trim() == "1"
+        }
+        Err(_) => {
+            // If we can't read, check if the directory exists as a fallback
+            Path::new("/sys/fs/selinux").is_dir()
+        }
+    }
+}
+
+/// Check if AppArmor is enabled on the host system.
+/// Returns true if AppArmor is present and enabled (Ubuntu/Debian systems).
+fn is_apparmor_enabled() -> bool {
+    // Check if AppArmor is enabled via /sys/module/apparmor
+    if Path::new("/sys/module/apparmor").exists() {
+        return true;
+    }
+
+    // Alternative check: /sys/kernel/security/apparmor exists
+    Path::new("/sys/kernel/security/apparmor").exists()
+}
+
+/// Add security options to container command based on host security module.
+/// - SELinux (Fedora/RHEL): adds --security-opt label=disable
+/// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined
+fn add_security_opts(container_cmd: &mut Vec<String>) {
+    if is_selinux_enabled() {
+        // Disable SELinux labeling to allow FUSE mounts
+        container_cmd.push("--security-opt".to_string());
+        container_cmd.push("label=disable".to_string());
+    }
+
+    if is_apparmor_enabled() {
+        // Disable AppArmor confinement to allow FUSE mounts
+        container_cmd.push("--security-opt".to_string());
+        container_cmd.push("apparmor=unconfined".to_string());
+    }
+}
 
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
@@ -373,9 +425,8 @@ impl SdkContainer {
         container_cmd.push("/dev/fuse".to_string());
         container_cmd.push("--cap-add".to_string());
         container_cmd.push("SYS_ADMIN".to_string());
-        // Disable SELinux labeling to allow FUSE mounts (required on Fedora/RHEL hosts)
-        container_cmd.push("--security-opt".to_string());
-        container_cmd.push("label=disable".to_string());
+        // Add security options based on host security module (SELinux/AppArmor)
+        add_security_opts(&mut container_cmd);
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         // Source is mounted to /mnt/src, then bindfs remounts it to /opt/src with permission translation
@@ -577,9 +628,18 @@ impl SdkContainer {
             Ok(Some(stdout))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Always log the error for debugging - this helps diagnose container failures
+            // that might otherwise be silently converted to "missing stamps" errors
             if config.verbose || self.verbose {
                 print_error(
                     &format!("Container execution failed: {stderr}"),
+                    OutputLevel::Normal,
+                );
+            } else if !stderr.is_empty() || !stdout.is_empty() {
+                // Even in non-verbose mode, print a hint about the failure
+                print_error(
+                    "Container command failed. Run with --verbose to see details.",
                     OutputLevel::Normal,
                 );
             }
@@ -784,9 +844,8 @@ impl SdkContainer {
         container_cmd.push("/dev/fuse".to_string());
         container_cmd.push("--cap-add".to_string());
         container_cmd.push("SYS_ADMIN".to_string());
-        // Disable SELinux labeling to allow FUSE mounts (required on Fedora/RHEL hosts)
-        container_cmd.push("--security-opt".to_string());
-        container_cmd.push("label=disable".to_string());
+        // Add security options based on host security module (SELinux/AppArmor)
+        add_security_opts(&mut container_cmd);
 
         // Volume mounts: docker volume for persistent state, bind mount for source
         container_cmd.push("-v".to_string());
@@ -1489,8 +1548,16 @@ mod tests {
         assert!(cmd.contains(&"/dev/fuse".to_string()));
         assert!(cmd.contains(&"--cap-add".to_string()));
         assert!(cmd.contains(&"SYS_ADMIN".to_string()));
-        assert!(cmd.contains(&"--security-opt".to_string()));
-        assert!(cmd.contains(&"label=disable".to_string()));
+        // Security options are added based on host security module
+        if is_selinux_enabled() || is_apparmor_enabled() {
+            assert!(cmd.contains(&"--security-opt".to_string()));
+        }
+        if is_selinux_enabled() {
+            assert!(cmd.contains(&"label=disable".to_string()));
+        }
+        if is_apparmor_enabled() {
+            assert!(cmd.contains(&"apparmor=unconfined".to_string()));
+        }
         // Verify host UID/GID are passed as env vars
         let has_uid_env = cmd.iter().any(|s| s.starts_with("AVOCADO_HOST_UID="));
         let has_gid_env = cmd.iter().any(|s| s.starts_with("AVOCADO_HOST_GID="));
