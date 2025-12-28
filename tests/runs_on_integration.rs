@@ -1182,7 +1182,8 @@ mod container_command_tests {
              -v {}:/opt/src:rw \
              -v {}:/opt/_avocado:rw \
              --device /dev/fuse \
-             --cap-add SYS_ADMIN",
+             --cap-add SYS_ADMIN \
+             --security-opt label=disable",
             container_tool, src_volume, state_volume
         );
 
@@ -1223,6 +1224,14 @@ mod container_command_tests {
             build_container_command("docker", "src", "state", "image", "cmd", &HashMap::new());
 
         assert!(cmd.contains("--cap-add SYS_ADMIN"));
+    }
+
+    #[test]
+    fn test_container_command_has_selinux_label_disable() {
+        let cmd =
+            build_container_command("docker", "src", "state", "image", "cmd", &HashMap::new());
+
+        assert!(cmd.contains("--security-opt label=disable"));
     }
 
     #[test]

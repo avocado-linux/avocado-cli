@@ -353,7 +353,8 @@ impl RunsOnContext {
              -v {}:/mnt/src:rw \
              -v {}:/opt/_avocado:rw \
              --device /dev/fuse \
-             --cap-add SYS_ADMIN",
+             --cap-add SYS_ADMIN \
+             --security-opt label=disable",
             self.container_tool, src_volume, state_volume
         );
 
