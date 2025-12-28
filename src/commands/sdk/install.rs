@@ -29,6 +29,10 @@ pub struct SdkInstallCommand {
     pub dnf_args: Option<Vec<String>>,
     /// Disable stamp validation and writing
     pub no_stamps: bool,
+    /// Remote host to run on (format: user@host)
+    pub runs_on: Option<String>,
+    /// NFS port for remote execution
+    pub nfs_port: Option<u16>,
 }
 
 impl SdkInstallCommand {
@@ -49,12 +53,21 @@ impl SdkInstallCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set remote execution options
+    pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
+        self.runs_on = runs_on;
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -287,6 +300,8 @@ MACROS_EOF
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 
@@ -344,6 +359,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 
@@ -388,6 +405,8 @@ $DNF_SDK_HOST \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 
@@ -435,6 +454,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 
@@ -485,6 +506,8 @@ fi
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 
@@ -648,6 +671,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 

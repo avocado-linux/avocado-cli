@@ -19,6 +19,8 @@ pub struct RuntimeInstallCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    runs_on: Option<String>,
+    nfs_port: Option<u16>,
 }
 
 impl RuntimeInstallCommand {
@@ -40,12 +42,21 @@ impl RuntimeInstallCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set remote execution options
+    pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
+        self.runs_on = runs_on;
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -197,6 +208,8 @@ impl RuntimeInstallCommand {
                         repo_release: repo_release.clone(),
                         container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
+                        runs_on: self.runs_on.clone(),
+                        nfs_port: self.nfs_port,
                         ..Default::default()
                     };
 
@@ -268,6 +281,8 @@ impl RuntimeInstallCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
         let installroot_exists = container_helper.run_in_container(run_config).await?;
@@ -285,6 +300,8 @@ impl RuntimeInstallCommand {
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
             let success = container_helper.run_in_container(run_config).await?;
@@ -425,6 +442,8 @@ $DNF_SDK_HOST \
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                    runs_on: self.runs_on.clone(),
+                    nfs_port: self.nfs_port,
                     ..Default::default()
                 };
                 let success = container_helper.run_in_container(run_config).await?;

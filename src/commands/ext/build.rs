@@ -24,13 +24,31 @@ enum OverlayMode {
 }
 
 pub struct ExtBuildCommand {
-    extension: String,
-    config_path: String,
-    verbose: bool,
-    target: Option<String>,
-    container_args: Option<Vec<String>>,
-    dnf_args: Option<Vec<String>>,
-    no_stamps: bool,
+    pub extension: String,
+    pub config_path: String,
+    pub verbose: bool,
+    pub target: Option<String>,
+    pub container_args: Option<Vec<String>>,
+    pub dnf_args: Option<Vec<String>>,
+    pub no_stamps: bool,
+    pub runs_on: Option<String>,
+    pub nfs_port: Option<u16>,
+}
+
+impl Default for ExtBuildCommand {
+    fn default() -> Self {
+        Self {
+            extension: String::new(),
+            config_path: String::new(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+        }
+    }
 }
 
 impl ExtBuildCommand {
@@ -50,12 +68,21 @@ impl ExtBuildCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set remote execution options
+    pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
+        self.runs_on = runs_on;
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -1616,6 +1643,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -1673,6 +1701,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_confext_build_script(
@@ -1727,6 +1756,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -1755,6 +1785,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_confext_build_script(
@@ -1783,6 +1814,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let enable_services = vec!["peridiod.service".to_string(), "test.service".to_string()];
@@ -1835,6 +1867,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -1868,6 +1901,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let overlay_config = OverlayConfig {
@@ -1907,6 +1941,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let overlay_config = OverlayConfig {
@@ -1946,6 +1981,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let overlay_config = OverlayConfig {
@@ -1987,6 +2023,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let overlay_config = OverlayConfig {
@@ -2028,6 +2065,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script_sysext = cmd.create_sysext_build_script(
@@ -2072,6 +2110,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let modprobe_modules = vec!["nfs".to_string(), "ext4".to_string()];
@@ -2116,6 +2155,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -2153,6 +2193,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_confext_build_script(
@@ -2187,6 +2228,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_confext_build_script(
@@ -2220,6 +2262,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let on_merge_commands = vec![
@@ -2259,6 +2302,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let on_unmerge_commands = vec![
@@ -2301,6 +2345,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let on_unmerge_commands = vec!["systemctl stop myservice.service".to_string()];
@@ -2335,6 +2380,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let on_merge_commands = vec!["systemctl restart sshd.socket".to_string()];
@@ -2369,6 +2415,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -2401,6 +2448,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -2431,6 +2479,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Test with the example modules from the user's request
@@ -2479,6 +2528,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Test with both modprobe modules and custom commands
@@ -2542,6 +2592,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create users config matching the example in the user request
@@ -2584,6 +2635,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_users_script_section(None, None);
@@ -2602,6 +2654,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create users config with a user that has a non-empty password
@@ -2639,6 +2692,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create users config with a user that has a non-string password
@@ -2672,6 +2726,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create users config matching the example in the user request
@@ -2726,6 +2781,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create users config matching the example in the user request
@@ -2778,6 +2834,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Test empty password - should show warning
@@ -2825,6 +2882,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create comprehensive groups config
@@ -2909,6 +2967,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Create comprehensive users configuration using mixed approach
@@ -3188,6 +3247,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         // Test user with just name (no fields at all)
@@ -3217,6 +3277,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_sysext_build_script(
@@ -3245,6 +3306,7 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let script = cmd.create_confext_build_script(
@@ -3337,6 +3399,7 @@ sdk:
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            ..Default::default()
         };
 
         let src_dir = "src";

@@ -47,6 +47,14 @@ struct Cli {
     /// Disable stamp validation and writing
     #[arg(long)]
     no_stamps: bool,
+
+    /// Run command on remote host using local volume via NFS (format: user@host)
+    #[arg(long, value_name = "USER@HOST", global = true)]
+    runs_on: Option<String>,
+
+    /// NFS port for remote execution (auto-selects from 12050-12099 if not specified)
+    #[arg(long, global = true)]
+    nfs_port: Option<u16>,
 }
 
 #[derive(Subcommand)]
@@ -749,7 +757,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             )
-            .with_no_stamps(cli.no_stamps);
+            .with_no_stamps(cli.no_stamps)
+            .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
             install_cmd.execute().await?;
             Ok(())
         }
@@ -771,7 +780,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             )
-            .with_no_stamps(cli.no_stamps);
+            .with_no_stamps(cli.no_stamps)
+            .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
             build_cmd.execute().await?;
             Ok(())
         }
@@ -826,6 +836,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                     no_stamps: cli.no_stamps,
+                    runs_on: cli.runs_on.clone(),
+                    nfs_port: cli.nfs_port,
                 });
             provision_cmd.execute().await?;
             Ok(())
@@ -974,6 +986,8 @@ async fn main() -> Result<()> {
                         dnf_args,
                         state_file: None, // Resolved from config during execution
                         no_stamps: cli.no_stamps,
+                        runs_on: cli.runs_on.clone(),
+                        nfs_port: cli.nfs_port,
                     },
                 );
                 provision_cmd.execute().await?;
@@ -1280,7 +1294,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
                 install_cmd.execute().await?;
                 Ok(())
             }

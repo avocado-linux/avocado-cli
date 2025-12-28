@@ -31,6 +31,10 @@ pub struct RuntimeProvisionConfig {
     pub state_file: Option<String>,
     /// Disable stamp validation and writing
     pub no_stamps: bool,
+    /// Remote host to run on (format: user@host)
+    pub runs_on: Option<String>,
+    /// NFS port for remote execution
+    pub nfs_port: Option<u16>,
 }
 
 pub struct RuntimeProvisionCommand {
@@ -105,6 +109,8 @@ impl RuntimeProvisionCommand {
                 verbose: false,
                 source_environment: true,
                 interactive: false,
+                runs_on: self.config.runs_on.clone(),
+                nfs_port: self.config.nfs_port,
                 ..Default::default()
             };
 
@@ -283,6 +289,8 @@ impl RuntimeProvisionCommand {
                 self.config.container_args.as_ref(),
             ),
             dnf_args: self.config.dnf_args.clone(),
+            runs_on: self.config.runs_on.clone(),
+            nfs_port: self.config.nfs_port,
             ..Default::default()
         };
 
@@ -349,6 +357,8 @@ impl RuntimeProvisionCommand {
                 verbose: self.config.verbose,
                 source_environment: true,
                 interactive: false,
+                runs_on: self.config.runs_on.clone(),
+                nfs_port: self.config.nfs_port,
                 ..Default::default()
             };
 
@@ -869,6 +879,8 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             verbose: self.config.verbose,
             source_environment: true,
             interactive: false,
+            runs_on: self.config.runs_on.clone(),
+            nfs_port: self.config.nfs_port,
             ..Default::default()
         };
 
@@ -919,6 +931,8 @@ mod tests {
             dnf_args: None,
             state_file: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -946,6 +960,8 @@ mod tests {
             dnf_args: None,
             state_file: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -995,6 +1011,8 @@ runtime:
             dnf_args: None,
             state_file: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
 
         let command = RuntimeProvisionCommand::new(provision_config);
@@ -1038,6 +1056,8 @@ runtime:
             dnf_args: dnf_args.clone(),
             state_file: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -1074,6 +1094,8 @@ runtime:
             dnf_args: None,
             state_file: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 

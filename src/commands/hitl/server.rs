@@ -1,5 +1,6 @@
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::nfs_server::{NfsExport, HITL_DEFAULT_PORT};
 use crate::utils::output::{print_debug, print_info, OutputLevel};
 use crate::utils::stamps::{
     generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
@@ -7,6 +8,7 @@ use crate::utils::stamps::{
 use crate::utils::target::validate_and_log_target;
 use anyhow::Result;
 use clap::Args;
+use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub struct HitlServerCommand {
@@ -204,7 +206,8 @@ impl HitlServerCommand {
         commands.push(update_config_cmd);
 
         // Update NFS_Port if a port is specified (it's nested inside NFS_Core_Param block)
-        if let Some(port) = self.port {
+        let port = self.port.unwrap_or(HITL_DEFAULT_PORT);
+        if self.port.is_some() {
             let port_update_cmd = format!(
                 "sed -i '/NFS_Core_Param {{/,/}}/s/NFS_Port = [0-9]\\+;/NFS_Port = {port};/' {config_file}"
             );
@@ -221,27 +224,22 @@ impl HitlServerCommand {
             return format!("{} &&", commands.join(" && "));
         }
 
+        // Use shared NfsExport to generate export configurations
         for (index, extension) in self.extensions.iter().enumerate() {
-            let export_id = index + 1;
-
-            // Expand the AVOCADO_PREFIX variable to its actual path
+            let export_id = (index + 1) as u32;
             let extensions_path = format!("/opt/_avocado/{target}/extensions/{extension}");
+            let pseudo_path = format!("/{extension}");
 
-            let export_content = format!(
-                "EXPORT {{\n\
-                \x20\x20Export_Id = {export_id};\n\
-                \x20\x20Path = {extensions_path};\n\
-                \x20\x20Pseudo = /{extension};\n\
-                \x20\x20FSAL {{\n\
-                \x20\x20\x20\x20name = VFS;\n\
-                \x20\x20}}\n\
-                }}"
-            );
+            // Create NfsExport using the shared type
+            let export = NfsExport::new(export_id, PathBuf::from(&extensions_path), pseudo_path);
+
+            // Generate the export config content using the shared method
+            let export_content = Self::generate_ganesha_export_block(&export);
 
             let export_file =
                 format!("${{AVOCADO_SDK_PREFIX}}/etc/avocado/exports.d/{extension}.conf");
 
-            // Create a command that writes the export content to the file using echo -e to avoid here-doc issues
+            // Create a command that writes the export content to the file
             let escaped_content = export_content.replace('\\', "\\\\").replace('"', "\\\"");
             let write_command = format!("echo -e \"{escaped_content}\" > {export_file}");
 
@@ -255,6 +253,23 @@ impl HitlServerCommand {
         }
 
         format!("{} &&", commands.join(" && "))
+    }
+
+    /// Generate a Ganesha EXPORT block for the given export config
+    fn generate_ganesha_export_block(export: &NfsExport) -> String {
+        format!(
+            "EXPORT {{\n\
+            \x20\x20Export_Id = {};\n\
+            \x20\x20Path = {};\n\
+            \x20\x20Pseudo = {};\n\
+            \x20\x20FSAL {{\n\
+            \x20\x20\x20\x20name = VFS;\n\
+            \x20\x20}}\n\
+            }}",
+            export.export_id,
+            export.local_path.display(),
+            export.pseudo_path
+        )
     }
 }
 

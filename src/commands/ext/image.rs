@@ -18,6 +18,8 @@ pub struct ExtImageCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    runs_on: Option<String>,
+    nfs_port: Option<u16>,
 }
 
 impl ExtImageCommand {
@@ -37,12 +39,21 @@ impl ExtImageCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set remote execution options
+    pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
+        self.runs_on = runs_on;
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -91,6 +102,8 @@ impl ExtImageCommand {
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 
@@ -303,6 +316,8 @@ impl ExtImageCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;

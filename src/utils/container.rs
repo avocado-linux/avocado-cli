@@ -36,6 +36,10 @@ pub struct RunConfig {
     pub signing_helper_script_path: Option<PathBuf>,
     pub signing_key_name: Option<String>,
     pub signing_checksum_algorithm: Option<String>,
+    /// Remote host to run on (format: user@host)
+    pub runs_on: Option<String>,
+    /// NFS port for remote execution (auto-selected if None)
+    pub nfs_port: Option<u16>,
 }
 
 impl Default for RunConfig {
@@ -64,6 +68,8 @@ impl Default for RunConfig {
             signing_helper_script_path: None,
             signing_key_name: None,
             signing_checksum_algorithm: None,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 }
@@ -124,6 +130,11 @@ impl SdkContainer {
 
     /// Run a command in the container
     pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
+        // Check if we should run on a remote host
+        if let Some(ref runs_on) = config.runs_on {
+            return self.run_in_container_remote(&config, runs_on).await;
+        }
+
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
@@ -190,6 +201,133 @@ impl SdkContainer {
             config.verbose || self.verbose,
         )
         .await
+    }
+
+    /// Run a command in a container on a remote host via NFS
+    async fn run_in_container_remote(&self, config: &RunConfig, runs_on: &str) -> Result<bool> {
+        use crate::utils::runs_on::RunsOnContext;
+
+        // Get or create local docker volume (we need this to export via NFS)
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
+
+        print_info(
+            &format!("Setting up remote execution on {}...", runs_on),
+            OutputLevel::Normal,
+        );
+
+        // Setup remote execution context
+        let mut context = RunsOnContext::setup(
+            runs_on,
+            config.nfs_port,
+            src_dir,
+            &volume_state.volume_name,
+            &self.container_tool,
+            &config.container_image,
+            config.verbose || self.verbose,
+        )
+        .await
+        .context("Failed to setup remote execution")?;
+
+        // Setup signing tunnel if signing is configured
+        #[cfg(unix)]
+        if let Some(ref socket_path) = config.signing_socket_path {
+            let _ = context.setup_signing_tunnel(socket_path).await;
+        }
+
+        // Build environment variables
+        let mut env_vars = config.env_vars.clone().unwrap_or_default();
+
+        // Set host platform - the remote is running the container
+        env_vars.insert("AVOCADO_HOST_PLATFORM".to_string(), "linux".to_string());
+
+        if let Some(url) = &config.repo_url {
+            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
+        }
+        if let Some(release) = &config.repo_release {
+            env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
+        }
+        if let Some(dnf_args) = &config.dnf_args {
+            env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
+        }
+        if config.verbose || self.verbose {
+            env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
+        }
+
+        // Set target and SDK-related env vars
+        env_vars.insert("AVOCADO_TARGET".to_string(), config.target.clone());
+        env_vars.insert("AVOCADO_SDK_TARGET".to_string(), config.target.clone());
+        env_vars.insert("AVOCADO_SRC_DIR".to_string(), "/opt/src".to_string());
+
+        // Set host UID/GID for bindfs permission mapping on remote
+        // This maps the local host user's files to root inside the container
+        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
+        env_vars.insert("AVOCADO_HOST_UID".to_string(), host_uid.to_string());
+        env_vars.insert("AVOCADO_HOST_GID".to_string(), host_gid.to_string());
+
+        // Build the complete command with entrypoint
+        // NFS src volume is mounted to /mnt/src, bindfs remaps to /opt/src with UID translation
+        let mut full_command = String::new();
+        if config.use_entrypoint {
+            full_command.push_str(&self.create_entrypoint_script_for_remote(
+                config.source_environment,
+                config.extension_sysroot.as_deref(),
+                config.runtime_sysroot.as_deref(),
+                &config.target,
+                config.no_bootstrap,
+                config.disable_weak_dependencies,
+            ));
+            full_command.push('\n');
+        }
+        full_command.push_str(&config.command);
+
+        // Build extra Docker args
+        let mut extra_args: Vec<String> = vec![
+            "--device".to_string(),
+            "/dev/fuse".to_string(),
+            "--cap-add".to_string(),
+            "SYS_ADMIN".to_string(),
+        ];
+
+        if let Some(ref args) = config.container_args {
+            extra_args.extend(args.clone());
+        }
+
+        if config.interactive {
+            extra_args.push("-it".to_string());
+        }
+
+        let extra_args_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
+
+        print_info(
+            &format!("Running command on remote host {}...", runs_on),
+            OutputLevel::Normal,
+        );
+
+        // Run the container on the remote
+        let result = context
+            .run_container_command(
+                &config.container_image,
+                &full_command,
+                env_vars,
+                &extra_args_refs
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+
+        // Always cleanup, even on error
+        if let Err(e) = context.teardown().await {
+            print_error(
+                &format!("Warning: Failed to cleanup remote resources: {}", e),
+                OutputLevel::Normal,
+            );
+        }
+
+        result.context("Remote container execution failed")
     }
 
     /// Build the complete container command
@@ -710,6 +848,178 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
         Ok(status.success())
     }
 
+    /// Create the entrypoint script for remote execution (NFS volumes)
+    /// This skips the bindfs setup since NFS volumes are already mounted to /opt/src and /opt/_avocado
+    pub fn create_entrypoint_script_for_remote(
+        &self,
+        source_environment: bool,
+        extension_sysroot: Option<&str>,
+        runtime_sysroot: Option<&str>,
+        target: &str,
+        _no_bootstrap: bool,
+        disable_weak_dependencies: bool,
+    ) -> String {
+        // Conditionally add install_weak_deps flag
+        let weak_deps_flag = if disable_weak_dependencies {
+            "--setopt=install_weak_deps=0 \\\n"
+        } else {
+            ""
+        };
+
+        // For remote execution:
+        // - NFS src volume is mounted to /mnt/src (needs bindfs for UID mapping)
+        // - NFS state volume is mounted directly to /opt/_avocado (no mapping needed)
+        let mut script = format!(
+            r#"
+set -e
+
+# Remote execution mode - NFS volumes mounted
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Remote execution mode - using NFS-mounted volumes"; fi
+
+# Remount source directory with permission translation via bindfs
+# This maps host UID/GID to root inside the container for seamless file access
+mkdir -p /opt/src
+
+# Check if bindfs is available
+if ! command -v bindfs >/dev/null 2>&1; then
+    echo "[ERROR] bindfs is not installed in this container image."
+    echo ""
+    echo "bindfs is required for proper file permission handling."
+    exit 1
+fi
+
+if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
+    # If host user is already root (UID 0), no mapping needed - just bind mount
+    if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
+        mount --bind /mnt/src /opt/src
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)"; fi
+    else
+        # Use --map with colon-separated user and group mappings
+        # Maps host UID -> 0 (root) and host GID -> 0 (root group)
+        bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src with UID/GID mapping ($AVOCADO_HOST_UID:$AVOCADO_HOST_GID -> 0:0)"; fi
+    fi
+else
+    # Fallback: simple bind mount without permission translation
+    mount --bind /mnt/src /opt/src
+    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)"; fi
+fi
+
+# Get repo url from environment or default to prod
+if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
+    REPO_URL="$AVOCADO_SDK_REPO_URL"
+else
+    REPO_URL="https://repo.avocadolinux.org"
+fi
+
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'"; fi
+
+# Get repo release from environment or default to prod
+if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
+    REPO_RELEASE="$AVOCADO_SDK_REPO_RELEASE"
+else
+    REPO_RELEASE="https://repo.avocadolinux.org"
+
+    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found
+    if [ -f /etc/os-release ]; then
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    fi
+    REPO_RELEASE=${{REPO_RELEASE:-dev}}
+fi
+
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
+
+export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
+export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk"
+export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
+export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
+export DNF_SDK_TARGET_PREFIX="${{AVOCADO_SDK_PREFIX}}/target-repoconf"
+export DNF_SDK_HOST="\
+dnf \
+--releasever="$REPO_RELEASE" \
+--best \
+{weak_deps_flag}--setopt=check_config_file_age=0 \
+${{AVOCADO_DNF_ARGS:-}} \
+"
+
+export DNF_NO_SCRIPTS="--setopt=tsflags=noscripts"
+export SSL_CERT_FILE=${{AVOCADO_SDK_PREFIX}}/etc/ssl/certs/ca-certificates.crt
+
+export DNF_SDK_HOST_OPTS="\
+--setopt=cachedir=${{DNF_SDK_HOST_PREFIX}}/var/cache \
+--setopt=logdir=${{DNF_SDK_HOST_PREFIX}}/var/log \
+--setopt=persistdir=${{DNF_SDK_HOST_PREFIX}}/var/lib/dnf \
+"
+
+export DNF_SDK_HOST_REPO_CONF="\
+--setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d \
+"
+
+export DNF_SDK_REPO_CONF="\
+--setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+"
+
+export DNF_SDK_TARGET_REPO_CONF="\
+--setopt=varsdir=${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+"
+
+mkdir -p /etc/dnf/vars
+mkdir -p ${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars
+mkdir -p ${{AVOCADO_SDK_PREFIX}}/target-repoconf/etc/dnf/vars
+
+echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
+echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url
+echo "${{REPO_URL}}" > ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars/repo_url
+"#
+        );
+
+        script.push_str(
+            r#"
+export RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"
+
+"#,
+        );
+
+        // Conditionally change to sysroot directory or default to /opt/src
+        if let Some(extension_name) = extension_sysroot {
+            script.push_str(&format!(
+                "cd /opt/_avocado/{target}/extensions/{extension_name}\n"
+            ));
+        } else if let Some(runtime_name) = runtime_sysroot {
+            script.push_str(&format!(
+                "cd /opt/_avocado/{target}/runtimes/{runtime_name}\n"
+            ));
+        } else {
+            script.push_str("cd /opt/src\n");
+        }
+
+        // Conditionally add environment sourcing based on the source_environment parameter
+        if source_environment {
+            script.push_str(
+                r#"
+# Source the environment setup if it exists
+if [ -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
+    source "${AVOCADO_SDK_PREFIX}/environment-setup"
+fi
+
+# Add SSL certificate path to DNF options and CURL if it exists
+if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
+    export DNF_SDK_HOST_OPTS="${DNF_SDK_HOST_OPTS} \
+      --setopt=sslcacert=${SSL_CERT_FILE} \
+"
+
+    export CURL_CA_BUNDLE=${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt
+fi
+"#,
+            );
+        }
+
+        script
+    }
+
     /// Create the entrypoint script for SDK initialization
     pub fn create_entrypoint_script(
         &self,
@@ -1148,6 +1458,8 @@ mod tests {
             signing_helper_script_path: None,
             signing_key_name: None,
             signing_checksum_algorithm: None,
+            runs_on: None,
+            nfs_port: None,
         };
 
         let result = container.build_container_command(&config, &command, &env_vars, &volume_state);
@@ -1190,9 +1502,8 @@ mod tests {
         assert!(script.contains("[ERROR] bindfs is not installed"));
         // Verify bindfs setup is included with correct syntax
         // --map=uid1/uid2:@gid1/@gid2 for combined user and group mapping
-        assert!(script.contains(
-            "bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src"
-        ));
+        assert!(script
+            .contains("bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src"));
         assert!(script.contains("mkdir -p /opt/src"));
     }
 

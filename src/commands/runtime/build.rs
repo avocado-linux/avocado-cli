@@ -19,6 +19,8 @@ pub struct RuntimeBuildCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    runs_on: Option<String>,
+    nfs_port: Option<u16>,
 }
 
 impl RuntimeBuildCommand {
@@ -38,12 +40,21 @@ impl RuntimeBuildCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set remote execution options
+    pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
+        self.runs_on = runs_on;
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -117,6 +128,8 @@ impl RuntimeBuildCommand {
                 repo_release: repo_release.clone(),
                 container_args: processed_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 
@@ -228,6 +241,8 @@ impl RuntimeBuildCommand {
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             env_vars,
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
         let complete_result = container_helper
@@ -265,6 +280,8 @@ impl RuntimeBuildCommand {
                 repo_release: repo_release.clone(),
                 container_args: processed_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 
@@ -856,6 +873,8 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
 

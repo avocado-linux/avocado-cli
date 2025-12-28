@@ -43,6 +43,10 @@ pub struct InstallCommand {
     pub dnf_args: Option<Vec<String>>,
     /// Disable stamp validation and writing
     pub no_stamps: bool,
+    /// Remote host to run on (format: user@host)
+    pub runs_on: Option<String>,
+    /// NFS port for remote execution
+    pub nfs_port: Option<u16>,
 }
 
 impl InstallCommand {
@@ -65,12 +69,21 @@ impl InstallCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set remote execution options
+    pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
+        self.runs_on = runs_on;
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -116,7 +129,8 @@ impl InstallCommand {
             self.container_args.clone(),
             self.dnf_args.clone(),
         )
-        .with_no_stamps(self.no_stamps);
+        .with_no_stamps(self.no_stamps)
+        .with_runs_on(self.runs_on.clone(), self.nfs_port);
         sdk_install_cmd
             .execute()
             .await
@@ -151,7 +165,8 @@ impl InstallCommand {
                             self.container_args.clone(),
                             self.dnf_args.clone(),
                         )
-                        .with_no_stamps(self.no_stamps);
+                        .with_no_stamps(self.no_stamps)
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
                         ext_install_cmd.execute().await.with_context(|| {
                             format!(
                                 "Failed to install extension dependencies for '{extension_name}'"
@@ -242,7 +257,8 @@ impl InstallCommand {
                     self.container_args.clone(),
                     self.dnf_args.clone(),
                 )
-                .with_no_stamps(self.no_stamps);
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port);
                 runtime_install_cmd.execute().await.with_context(|| {
                     format!("Failed to install runtime dependencies for '{runtime_name}'")
                 })?;

@@ -29,6 +29,10 @@ pub struct ProvisionConfig {
     pub dnf_args: Option<Vec<String>>,
     /// Disable stamp validation and writing
     pub no_stamps: bool,
+    /// Remote host to run on (format: user@host)
+    pub runs_on: Option<String>,
+    /// NFS port for remote execution
+    pub nfs_port: Option<u16>,
 }
 
 /// Implementation of the 'provision' command that calls through to runtime provision.
@@ -70,6 +74,8 @@ impl ProvisionCommand {
                 dnf_args: self.config.dnf_args.clone(),
                 state_file,
                 no_stamps: self.config.no_stamps,
+                runs_on: self.config.runs_on.clone(),
+                nfs_port: self.config.nfs_port,
             },
         );
 
@@ -98,6 +104,8 @@ mod tests {
             container_args: Some(vec!["--privileged".to_string()]),
             dnf_args: Some(vec!["--nogpgcheck".to_string()]),
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -129,6 +137,8 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -163,6 +173,8 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -184,6 +196,8 @@ mod tests {
             container_args: None,
             dnf_args: None,
             no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
         };
         let cmd = ProvisionCommand::new(config);
 
