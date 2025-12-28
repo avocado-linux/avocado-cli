@@ -64,9 +64,8 @@ impl RuntimeBuildCommand {
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
-        // Process container args with environment variable expansion
-        let processed_container_args =
-            crate::utils::config::Config::process_container_args(self.container_args.as_ref());
+        // Merge container args from config and CLI with environment variable expansion
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
@@ -126,7 +125,7 @@ impl RuntimeBuildCommand {
                 interactive: false,
                 repo_url: repo_url.clone(),
                 repo_release: repo_release.clone(),
-                container_args: processed_container_args.clone(),
+                container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
@@ -163,6 +162,7 @@ impl RuntimeBuildCommand {
                 target_arch.as_str(),
                 &self.config_path,
                 container_image,
+                merged_container_args.clone(),
             )
             .await?;
 
@@ -238,7 +238,7 @@ impl RuntimeBuildCommand {
             interactive: false,       // build script runs non-interactively
             repo_url: repo_url.clone(),
             repo_release: repo_release.clone(),
-            container_args: processed_container_args.clone(),
+            container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             env_vars,
             runs_on: self.runs_on.clone(),
@@ -278,7 +278,7 @@ impl RuntimeBuildCommand {
                 interactive: false,
                 repo_url: repo_url.clone(),
                 repo_release: repo_release.clone(),
-                container_args: processed_container_args.clone(),
+                container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
@@ -729,6 +729,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
     /// Returns a list of versioned extension names in the format "ext_name-version"
     /// (e.g., "my-ext-1.0.0"). This ensures AVOCADO_EXT_LIST and the build script
     /// use exact versions from the configuration, not wildcards.
+    #[allow(clippy::too_many_arguments)]
     async fn collect_runtime_extensions(
         &self,
         parsed: &serde_yaml::Value,
@@ -737,6 +738,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         target_arch: &str,
         config_path: &str,
         container_image: &str,
+        container_args: Option<Vec<String>>,
     ) -> Result<Vec<String>> {
         let merged_runtime =
             config.get_merged_runtime_config(runtime_name, target_arch, config_path)?;
@@ -766,6 +768,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
                             dep_spec,
                             container_image,
                             target_arch,
+                            container_args.clone(),
                         )
                         .await?;
                     extensions.push(format!("{ext_name}-{version}"));
@@ -796,6 +799,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         dep_spec: &serde_yaml::Value,
         container_image: &str,
         target_arch: &str,
+        container_args: Option<Vec<String>>,
     ) -> Result<String> {
         // If version is explicitly specified with vsn field, use it (unless it's a wildcard)
         if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
@@ -819,7 +823,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
             }
             // External config but no version found or version is "*" - query RPM database
             return self
-                .query_rpm_version(ext_name, container_image, target_arch)
+                .query_rpm_version(ext_name, container_image, target_arch, container_args)
                 .await;
         }
 
@@ -839,7 +843,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
 
         // No version found in config - this is likely a package repository extension
         // Query RPM database for the installed version
-        self.query_rpm_version(ext_name, container_image, target_arch)
+        self.query_rpm_version(ext_name, container_image, target_arch, container_args)
             .await
     }
 
@@ -853,6 +857,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         ext_name: &str,
         container_image: &str,
         target: &str,
+        container_args: Option<Vec<String>>,
     ) -> Result<String> {
         let container_helper = SdkContainer::new();
 
@@ -875,6 +880,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             interactive: false,
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
+            container_args,
             ..Default::default()
         };
 

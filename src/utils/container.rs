@@ -930,7 +930,8 @@ fi
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
 
 export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
-export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk"
+export AVOCADO_SDK_ARCH="$(uname -m)"
+export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
 export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
 export DNF_SDK_TARGET_PREFIX="${{AVOCADO_SDK_PREFIX}}/target-repoconf"
@@ -1111,7 +1112,8 @@ fi
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
 
 export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
-export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk"
+export AVOCADO_SDK_ARCH="$(uname -m)"
+export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
 export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
 export DNF_SDK_TARGET_PREFIX="${{AVOCADO_SDK_PREFIX}}/target-repoconf"
