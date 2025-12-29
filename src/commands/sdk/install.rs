@@ -10,7 +10,8 @@ use crate::utils::{
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_info, print_success, OutputLevel},
     stamps::{
-        compute_sdk_input_hash, generate_write_stamp_script, get_local_arch, Stamp, StampOutputs,
+        compute_sdk_input_hash, generate_write_sdk_stamp_script_dynamic_arch,
+        generate_write_stamp_script, get_local_arch, Stamp, StampOutputs,
     },
     target::validate_and_log_target,
 };
@@ -583,6 +584,8 @@ $DNF_SDK_HOST \
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
             let install_success = container_helper.run_in_container(run_config).await?;
@@ -796,6 +799,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 
@@ -851,10 +856,20 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // to detect if the SDK is installed for the remote's architecture.
         if !self.no_stamps {
             let inputs = compute_sdk_input_hash(&composed.merged_value)?;
-            let outputs = StampOutputs::default();
-            let host_arch = get_local_arch();
-            let stamp = Stamp::sdk_install(host_arch, inputs, outputs);
-            let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            // When using --runs-on, we need to detect the remote architecture dynamically
+            // since the remote host may have a different CPU arch than the local machine.
+            // Otherwise, use the local architecture.
+            let stamp_script = if self.runs_on.is_some() {
+                // Use dynamic arch detection for remote execution
+                generate_write_sdk_stamp_script_dynamic_arch(inputs)
+            } else {
+                // Use local architecture for local execution
+                let outputs = StampOutputs::default();
+                let host_arch = get_local_arch();
+                let stamp = Stamp::sdk_install(host_arch, inputs, outputs);
+                generate_write_stamp_script(&stamp)?
+            };
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -868,6 +883,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 

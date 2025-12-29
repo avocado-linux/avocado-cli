@@ -758,6 +758,47 @@ STAMP_EOF
     ))
 }
 
+/// Generate shell script to write an SDK install stamp with dynamic architecture detection.
+///
+/// This is used when running with --runs-on where the remote host may have a different
+/// architecture than the local machine. The arch is determined at runtime using `uname -m`
+/// or the AVOCADO_SDK_ARCH environment variable (set by the entrypoint).
+pub fn generate_write_sdk_stamp_script_dynamic_arch(inputs: StampInputs) -> String {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let cli_version = env!("CARGO_PKG_VERSION");
+
+    // Build the stamp JSON with shell variable substitution for the arch
+    // Note: We use double quotes for the heredoc to allow $SDK_ARCH substitution
+    format!(
+        r#"
+# Write SDK install stamp with dynamic architecture detection
+SDK_ARCH="${{AVOCADO_SDK_ARCH:-$(uname -m)}}"
+mkdir -p "$AVOCADO_PREFIX/.stamps/sdk/$SDK_ARCH"
+cat > "$AVOCADO_PREFIX/.stamps/sdk/$SDK_ARCH/install.stamp" << STAMP_EOF
+{{
+  "version": {version},
+  "command": "install",
+  "component": "sdk",
+  "component_name": null,
+  "target": "$SDK_ARCH",
+  "timestamp": "{timestamp}",
+  "success": true,
+  "inputs": {{
+    "config_hash": "{config_hash}"
+  }},
+  "outputs": {{}},
+  "cli_version": "{cli_version}"
+}}
+STAMP_EOF
+# SDK stamp written for architecture: $SDK_ARCH
+"#,
+        version = STAMP_VERSION,
+        timestamp = timestamp,
+        config_hash = inputs.config_hash,
+        cli_version = cli_version
+    )
+}
+
 /// Generate shell script to read a stamp file
 /// Generate a single shell script that reads multiple stamps and outputs them in a parseable format.
 /// Each stamp is output as: `STAMP_PATH:::JSON_CONTENT` (or `STAMP_PATH:::null` if missing)

@@ -45,6 +45,16 @@ fn is_apparmor_enabled() -> bool {
     Path::new("/sys/kernel/security/apparmor").exists()
 }
 
+/// Check if we're running on Docker Desktop (macOS or Windows).
+///
+/// Docker Desktop doesn't support `--network=host` properly - it only gives
+/// access to the Linux VM's network, not the actual host network. For services
+/// that need to be accessible from other machines, use `-p 0.0.0.0:PORT:PORT`
+/// instead.
+pub fn is_docker_desktop() -> bool {
+    cfg!(target_os = "macos") || cfg!(target_os = "windows")
+}
+
 /// Add security options to container command based on host security module.
 /// - SELinux (Fedora/RHEL): adds --security-opt label=disable
 /// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined

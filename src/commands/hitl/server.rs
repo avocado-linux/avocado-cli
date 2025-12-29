@@ -1,5 +1,5 @@
 use crate::utils::config::Config;
-use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::container::{is_docker_desktop, RunConfig, SdkContainer};
 use crate::utils::nfs_server::{NfsExport, HITL_DEFAULT_PORT};
 use crate::utils::output::{print_debug, print_info, OutputLevel};
 use crate::utils::stamps::{
@@ -123,13 +123,34 @@ impl HitlServerCommand {
             }
         }
 
+        // Get the NFS port (used for both Ganesha and port publishing)
+        let nfs_port = self.port.unwrap_or(HITL_DEFAULT_PORT);
+
         // Build container arguments with HITL-specific defaults
-        let mut container_args = vec![
-            "--net=host".to_string(),
-            "--cap-add".to_string(),
-            "DAC_READ_SEARCH".to_string(),
-            "--init".to_string(),
-        ];
+        // On Docker Desktop (macOS/Windows), --network=host doesn't expose ports to the
+        // actual host network (only to the Linux VM), so we use explicit port publishing.
+        let mut container_args = if is_docker_desktop() {
+            if self.verbose {
+                print_debug(
+                    "Docker Desktop detected: using port publishing instead of host networking",
+                    OutputLevel::Normal,
+                );
+            }
+            vec![
+                "-p".to_string(),
+                format!("0.0.0.0:{}:{}", nfs_port, nfs_port),
+                "--cap-add".to_string(),
+                "DAC_READ_SEARCH".to_string(),
+                "--init".to_string(),
+            ]
+        } else {
+            vec![
+                "--net=host".to_string(),
+                "--cap-add".to_string(),
+                "DAC_READ_SEARCH".to_string(),
+                "--init".to_string(),
+            ]
+        };
 
         // Add any additional container arguments with environment variable expansion
         if let Some(ref additional_args) = self.container_args {
@@ -206,17 +227,16 @@ impl HitlServerCommand {
 
         // Update NFS_Port if a port is specified (it's nested inside NFS_Core_Param block)
         let port = self.port.unwrap_or(HITL_DEFAULT_PORT);
-        if self.port.is_some() {
-            let port_update_cmd = format!(
-                "sed -i '/NFS_Core_Param {{/,/}}/s/NFS_Port = [0-9]\\+;/NFS_Port = {port};/' {config_file}"
-            );
-            commands.push(port_update_cmd);
+        // Always update the port to ensure consistency, especially on Docker Desktop
+        let port_update_cmd = format!(
+            "sed -i '/NFS_Core_Param {{/,/}}/s/NFS_Port = [0-9]\\+;/NFS_Port = {port};/' {config_file}"
+        );
+        commands.push(port_update_cmd);
 
-            if self.verbose {
-                commands.push(format!(
-                    "echo \"[DEBUG] Updated NFS_Port to {port} in NFS_Core_Param block in hitl-nfs.conf\""
-                ));
-            }
+        if self.verbose && self.port.is_some() {
+            commands.push(format!(
+                "echo \"[DEBUG] Updated NFS_Port to {port} in NFS_Core_Param block in hitl-nfs.conf\""
+            ));
         }
 
         if self.extensions.is_empty() {
@@ -291,10 +311,11 @@ mod tests {
 
         let commands = cmd.generate_export_setup_commands();
 
-        // Should create directories and exports.d directive but no port update
+        // Should create directories and exports.d directive
         assert!(commands.contains("mkdir -p ${AVOCADO_SDK_PREFIX}/etc/avocado/exports.d"));
         assert!(commands.contains("echo \"%dir ${AVOCADO_SDK_PREFIX}/etc/avocado/exports.d\""));
-        assert!(!commands.contains("NFS_Port ="));
+        // Port is now always set to ensure consistency (uses default 12049)
+        assert!(commands.contains("NFS_Port = 12049"));
     }
 
     #[test]

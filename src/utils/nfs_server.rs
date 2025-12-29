@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::{Child, Command as AsyncCommand};
 
+use crate::utils::container::is_docker_desktop;
 use crate::utils::output::{print_info, OutputLevel};
 
 /// Default port range for NFS server auto-selection
@@ -44,10 +45,17 @@ impl NfsExport {
         format!(
             r#"EXPORT {{
   Export_Id = {};
-  Path = {};
-  Pseudo = {};
+  Path = "{}";
+  Pseudo = "{}";
+  SecType = sys,none;
+  Access_Type = RW;
+  Squash = No_Root_Squash;
   FSAL {{
     name = VFS;
+  }}
+  CLIENT {{
+    Clients = *;
+    Access_Type = RW;
   }}
 }}
 "#,
@@ -344,6 +352,8 @@ impl NfsServer {
         }
 
         // Build container command
+        // On Docker Desktop (macOS/Windows), --network=host doesn't expose ports to the
+        // actual host network (only to the Linux VM), so we use explicit port publishing.
         let mut args: Vec<String> = vec![
             "run".to_string(),
             "--rm".to_string(),
@@ -351,9 +361,21 @@ impl NfsServer {
             "--name".to_string(),
             container_name.clone(),
             "--privileged".to_string(), // Required for NFS
-            "--network".to_string(),
-            "host".to_string(), // Use host networking for NFS port
         ];
+
+        if is_docker_desktop() {
+            if config.verbose {
+                print_info(
+                    "Docker Desktop detected: using port publishing instead of host networking",
+                    OutputLevel::Normal,
+                );
+            }
+            args.push("-p".to_string());
+            args.push(format!("0.0.0.0:{}:{}", config.port, config.port));
+        } else {
+            args.push("--network".to_string());
+            args.push("host".to_string());
+        }
 
         // Mount the config file
         args.push("-v".to_string());
@@ -367,19 +389,24 @@ impl NfsServer {
         args.push(format!("{}:/var/run/ganesha", temp_dir.path().display()));
 
         // Add volume mounts for exported paths
+        // Keep track of container paths we've already mounted to avoid duplicates
+        let mut mounted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for (host_path, container_path) in &volume_mounts {
             args.push("-v".to_string());
             args.push(format!("{}:{}", host_path, container_path));
+            mounted_paths.insert(container_path.clone());
         }
 
-        // Also mount the exported paths from config
+        // Also mount the exported paths from config (if not already mounted)
         for export in &config.exports {
-            args.push("-v".to_string());
-            args.push(format!(
-                "{}:{}",
-                export.local_path.display(),
-                export.local_path.display()
-            ));
+            let export_path = export.local_path.to_string_lossy().to_string();
+            // Skip if this path is already mounted (e.g., on Docker Desktop where we mount by volume name)
+            if !mounted_paths.contains(&export_path) {
+                args.push("-v".to_string());
+                args.push(format!("{}:{}", export_path, export_path));
+                mounted_paths.insert(export_path);
+            }
         }
 
         // Container image and command
@@ -412,8 +439,9 @@ impl NfsServer {
             );
         }
 
-        // Give it a moment to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        // Give Ganesha time to fully initialize and load exports
+        // 2 seconds is more reliable, especially on slower systems or with many exports
+        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
 
         // Verify container is running
         let check_output = AsyncCommand::new(container_tool)
@@ -670,8 +698,11 @@ mod tests {
         let config = export.to_ganesha_config();
 
         assert!(config.contains("Export_Id = 1"));
-        assert!(config.contains("Path = /home/user/project"));
-        assert!(config.contains("Pseudo = /src"));
+        assert!(config.contains(r#"Path = "/home/user/project""#));
+        assert!(config.contains(r#"Pseudo = "/src""#));
+        assert!(config.contains("SecType = sys,none"));
+        assert!(config.contains("Access_Type = RW"));
+        assert!(config.contains("Clients = *"));
         assert!(config.contains("FSAL {"));
         assert!(config.contains("name = VFS"));
     }
@@ -690,8 +721,8 @@ mod tests {
         assert!(ganesha_config.contains("NFS_Port = 12050"));
         assert!(ganesha_config.contains("Export_Id = 1"));
         assert!(ganesha_config.contains("Export_Id = 2"));
-        assert!(ganesha_config.contains("Pseudo = /src"));
-        assert!(ganesha_config.contains("Pseudo = /state"));
+        assert!(ganesha_config.contains(r#"Pseudo = "/src""#));
+        assert!(ganesha_config.contains(r#"Pseudo = "/state""#));
         assert!(ganesha_config.contains("Protocols = 4"));
         assert!(ganesha_config.contains("Squash = No_Root_Squash"));
     }

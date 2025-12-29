@@ -170,6 +170,9 @@ impl SshClient {
         }
 
         // Try to get the remote avocado version
+        // Note: We need to source profile files because non-interactive SSH sessions
+        // don't load .bashrc/.profile, so avocado might not be in PATH if it's in
+        // ~/.cargo/bin, ~/.local/bin, or other user-specific locations.
         let output = AsyncCommand::new("ssh")
             .args([
                 "-o",
@@ -179,7 +182,7 @@ impl SshClient {
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 &self.remote.ssh_target(),
-                "avocado --version 2>/dev/null || echo 'not-installed'",
+                "source ~/.profile 2>/dev/null; source ~/.bashrc 2>/dev/null; avocado --version 2>/dev/null || echo 'not-installed'",
             ])
             .output()
             .await
@@ -579,7 +582,7 @@ pub async fn get_local_ip_for_remote(remote_host: &str) -> Result<IpAddr> {
     // (no actual connection is made for UDP, but the OS figures out which
     // local interface would be used)
 
-    use std::net::UdpSocket;
+    use std::net::{SocketAddr, UdpSocket};
 
     // First, try to resolve the remote host
     let remote_addrs: Vec<_> = tokio::net::lookup_host(format!("{}:22", remote_host))
@@ -591,16 +594,69 @@ pub async fn get_local_ip_for_remote(remote_host: &str) -> Result<IpAddr> {
         anyhow::bail!("Could not resolve remote host '{}'", remote_host);
     }
 
-    // Create a UDP socket and "connect" to the remote to determine local interface
-    let socket = UdpSocket::bind("0.0.0.0:0").context("Failed to create UDP socket")?;
+    // Try each resolved address, preferring IPv4
+    // Sort to try IPv4 first (more likely to work on typical local networks)
+    let mut sorted_addrs = remote_addrs.clone();
+    sorted_addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
 
-    socket
-        .connect(remote_addrs[0])
-        .context("Failed to determine route to remote host")?;
+    let mut last_error = None;
+    for remote_addr in sorted_addrs {
+        // Create a socket matching the address family
+        let bind_addr: SocketAddr = if remote_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
 
-    let local_addr = socket.local_addr().context("Failed to get local address")?;
+        let socket = match UdpSocket::bind(bind_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
 
-    Ok(local_addr.ip())
+        if let Err(e) = socket.connect(remote_addr) {
+            last_error = Some(e);
+            continue;
+        }
+
+        match socket.local_addr() {
+            Ok(local_addr) => return Ok(local_addr.ip()),
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        }
+    }
+
+    // If UDP method fails, try asking SSH for the connection info
+    // This is a fallback that works on macOS and other systems where
+    // the UDP trick might fail
+    if let Ok(output) = AsyncCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            remote_host,
+            "echo $SSH_CLIENT | cut -d' ' -f1",
+        ])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                return Ok(ip);
+            }
+        }
+    }
+
+    // Return the last error we got
+    Err(last_error
+        .map(|e| anyhow::anyhow!("Failed to determine route to remote host: {}", e))
+        .unwrap_or_else(|| anyhow::anyhow!("No valid addresses found for remote host")))
 }
 
 /// Check if a remote version is compatible with the local version

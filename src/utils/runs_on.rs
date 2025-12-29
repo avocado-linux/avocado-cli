@@ -5,9 +5,10 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use crate::utils::container::is_docker_desktop;
 use crate::utils::nfs_server::{
     find_available_port, get_docker_volume_mountpoint, is_port_available, NfsExport, NfsServer,
     NfsServerConfig, DEFAULT_NFS_PORT_RANGE,
@@ -138,22 +139,60 @@ impl RunsOnContext {
             );
         }
 
-        // Get the mountpoint of the local Docker volume
-        let volume_mountpoint = get_docker_volume_mountpoint(container_tool, local_volume_name)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to get mountpoint for volume '{}'",
-                    local_volume_name
-                )
-            })?;
+        // On Docker Desktop (macOS/Windows), the volume mountpoint returned by Docker
+        // is inside the Docker Desktop VM and not accessible from the host filesystem.
+        // We need to mount by volume name instead of host path.
+        let (state_export_path, volume_mounts) = if is_docker_desktop() {
+            if verbose {
+                print_info(
+                    "Docker Desktop detected: mounting volume by name",
+                    OutputLevel::Normal,
+                );
+            }
+            // Use a fixed container path for the state volume
+            let container_state_path = PathBuf::from("/opt/nfs-state");
+            let mounts = vec![
+                (
+                    src_dir.to_string_lossy().to_string(),
+                    src_dir.to_string_lossy().to_string(),
+                ),
+                // Mount Docker volume by name to a container path
+                (
+                    local_volume_name.to_string(),
+                    container_state_path.to_string_lossy().to_string(),
+                ),
+            ];
+            (container_state_path, mounts)
+        } else {
+            // On native Docker (Linux), we can use the host volume mountpoint directly
+            let volume_mountpoint = get_docker_volume_mountpoint(container_tool, local_volume_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to get mountpoint for volume '{}'",
+                        local_volume_name
+                    )
+                })?;
 
-        if verbose {
-            print_info(
-                &format!("Local volume mountpoint: {}", volume_mountpoint.display()),
-                OutputLevel::Normal,
-            );
-        }
+            if verbose {
+                print_info(
+                    &format!("Local volume mountpoint: {}", volume_mountpoint.display()),
+                    OutputLevel::Normal,
+                );
+            }
+
+            let mounts = vec![
+                (
+                    src_dir.to_string_lossy().to_string(),
+                    src_dir.to_string_lossy().to_string(),
+                ),
+                (
+                    volume_mountpoint.to_string_lossy().to_string(),
+                    volume_mountpoint.to_string_lossy().to_string(),
+                ),
+            ];
+            (volume_mountpoint, mounts)
+        };
 
         // Create and start NFS server inside the SDK container
         // The container has ganesha.nfsd installed
@@ -161,23 +200,11 @@ impl RunsOnContext {
             port,
             exports: vec![
                 NfsExport::new(1, src_dir.to_path_buf(), "/src".to_string()),
-                NfsExport::new(2, volume_mountpoint.clone(), "/state".to_string()),
+                NfsExport::new(2, state_export_path.clone(), "/state".to_string()),
             ],
             verbose,
             bind_addr: "0.0.0.0".to_string(),
         };
-
-        // Volume mounts for the container to access the paths
-        let volume_mounts = vec![
-            (
-                src_dir.to_string_lossy().to_string(),
-                src_dir.to_string_lossy().to_string(),
-            ),
-            (
-                volume_mountpoint.to_string_lossy().to_string(),
-                volume_mountpoint.to_string_lossy().to_string(),
-            ),
-        ];
 
         let nfs_server =
             NfsServer::start_in_container(config, container_tool, container_image, volume_mounts)
@@ -235,7 +262,7 @@ impl RunsOnContext {
         print_info(
             &format!(
                 "📂 _avocado: {} → remote:/opt/_avocado",
-                volume_mountpoint.display()
+                state_export_path.display()
             ),
             OutputLevel::Normal,
         );
