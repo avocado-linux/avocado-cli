@@ -16,6 +16,7 @@ use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
 use commands::install::InstallCommand;
 use commands::provision::ProvisionCommand;
+use commands::prune::PruneCommand;
 use commands::runtime::{
     RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDeployCommand, RuntimeDepsCommand,
     RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
@@ -286,6 +287,18 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+    /// Remove abandoned Docker volumes no longer associated with active configs
+    Prune {
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker")]
+        container_tool: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Perform a dry run without actually removing volumes
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -919,6 +932,15 @@ async fn main() -> Result<()> {
                 dnf_args,
             );
             sign_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Prune {
+            container_tool,
+            verbose,
+            dry_run,
+        } => {
+            let prune_cmd = PruneCommand::new(Some(container_tool), verbose, dry_run);
+            prune_cmd.execute().await?;
             Ok(())
         }
         Commands::Runtime { command } => match command {

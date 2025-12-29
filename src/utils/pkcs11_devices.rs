@@ -645,7 +645,11 @@ fn uri_decode(s: &str) -> Result<String> {
 
 /// Hex encode bytes
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+        let _ = write!(acc, "{:02x}", b);
+        acc
+    })
 }
 
 /// Initialize PKCS#11 and open session

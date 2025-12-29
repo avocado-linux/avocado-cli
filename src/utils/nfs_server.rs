@@ -456,10 +456,7 @@ impl NfsServer {
                 Ok(_) => {
                     if config.verbose {
                         print_info(
-                            &format!(
-                                "NFS server ready after {}ms",
-                                start.elapsed().as_millis()
-                            ),
+                            &format!("NFS server ready after {}ms", start.elapsed().as_millis()),
                             OutputLevel::Verbose,
                         );
                     }

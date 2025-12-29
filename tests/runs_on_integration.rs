@@ -74,8 +74,8 @@ mod nfs_config_tests {
 
         assert!(ganesha_config.contains("NFS_Port = 12050"));
         assert!(ganesha_config.contains("Export_Id = 1"));
-        assert!(ganesha_config.contains("Path = /home/user/src"));
-        assert!(ganesha_config.contains("Pseudo = /src"));
+        assert!(ganesha_config.contains(r#"Path = "/home/user/src""#));
+        assert!(ganesha_config.contains(r#"Pseudo = "/src""#));
     }
 
     #[test]
@@ -92,8 +92,8 @@ mod nfs_config_tests {
         // Verify both exports are present
         assert!(ganesha_config.contains("Export_Id = 1"));
         assert!(ganesha_config.contains("Export_Id = 2"));
-        assert!(ganesha_config.contains("Pseudo = /src"));
-        assert!(ganesha_config.contains("Pseudo = /state"));
+        assert!(ganesha_config.contains(r#"Pseudo = "/src""#));
+        assert!(ganesha_config.contains(r#"Pseudo = "/state""#));
 
         // Verify security settings for remote access
         assert!(ganesha_config.contains("Squash = No_Root_Squash"));
@@ -126,8 +126,8 @@ mod nfs_config_tests {
 
         assert!(block.contains("EXPORT {"));
         assert!(block.contains("Export_Id = 42"));
-        assert!(block.contains("Path = /var/lib/docker/volumes/test/_data"));
-        assert!(block.contains("Pseudo = /state"));
+        assert!(block.contains(r#"Path = "/var/lib/docker/volumes/test/_data""#));
+        assert!(block.contains(r#"Pseudo = "/state""#));
         assert!(block.contains("FSAL {"));
         assert!(block.contains("name = VFS"));
     }
@@ -291,8 +291,8 @@ mod port_selection_tests {
     fn test_port_becomes_unavailable_after_bind() {
         use std::net::TcpListener;
 
-        // Bind to a port
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bind to a port on 0.0.0.0 (same as is_port_available checks)
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
         // Port should no longer be available

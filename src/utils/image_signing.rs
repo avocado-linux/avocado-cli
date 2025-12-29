@@ -432,7 +432,11 @@ fn sign_with_pkcs11(uri: &str, hash: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+        let _ = write!(acc, "{:02x}", b);
+        acc
+    })
 }
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {

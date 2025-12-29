@@ -6,6 +6,7 @@ pub mod hitl;
 pub mod init;
 pub mod install;
 pub mod provision;
+pub mod prune;
 pub mod runtime;
 pub mod sdk;
 pub mod sign;

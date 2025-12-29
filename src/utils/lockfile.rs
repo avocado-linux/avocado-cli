@@ -25,7 +25,7 @@ pub enum SysrootType {
     Sdk,
     /// Rootfs sysroot ($AVOCADO_PREFIX/rootfs)
     Rootfs,
-    /// Target sysroot ($AVOCADO_SDK_PREFIX/target-sysroot)
+    /// Target sysroot ($AVOCADO_PREFIX/sdk/target-sysroot)
     TargetSysroot,
     /// Local/external extension sysroot ($AVOCADO_EXT_SYSROOTS/{name})
     /// Uses ext-rpm-config-scripts for RPM database
