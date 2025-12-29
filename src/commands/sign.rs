@@ -102,34 +102,60 @@ impl SignCommand {
 
         // Collect runtimes that have signing configuration
         let mut runtimes_to_sign = Vec::new();
+        let mut runtimes_with_unresolved_keys = Vec::new();
 
         for runtime_name_val in runtime_section.keys() {
             if let Some(runtime_name) = runtime_name_val.as_str() {
-                // Check if this runtime has signing configuration
-                if config.get_runtime_signing_key(runtime_name).is_some() {
-                    // Check target compatibility
-                    let merged_runtime = config.get_merged_runtime_config(
-                        runtime_name,
-                        target,
-                        &self.config_path,
-                    )?;
+                // Check if this runtime declares a signing key
+                if let Some(declared_key) = config.get_runtime_signing_key_name(runtime_name) {
+                    // Check if the signing key can be resolved
+                    if config.get_runtime_signing_key(runtime_name).is_some() {
+                        // Check target compatibility
+                        let merged_runtime = config.get_merged_runtime_config(
+                            runtime_name,
+                            target,
+                            &self.config_path,
+                        )?;
 
-                    if let Some(merged_value) = merged_runtime {
-                        // Check if runtime has explicit target
-                        if let Some(runtime_target) =
-                            merged_value.get("target").and_then(|t| t.as_str())
-                        {
-                            // Runtime has explicit target - only include if it matches
-                            if runtime_target == target {
+                        if let Some(merged_value) = merged_runtime {
+                            // Check if runtime has explicit target
+                            if let Some(runtime_target) =
+                                merged_value.get("target").and_then(|t| t.as_str())
+                            {
+                                // Runtime has explicit target - only include if it matches
+                                if runtime_target == target {
+                                    runtimes_to_sign.push(runtime_name.to_string());
+                                }
+                            } else {
+                                // Runtime has no target specified - include for all targets
                                 runtimes_to_sign.push(runtime_name.to_string());
                             }
-                        } else {
-                            // Runtime has no target specified - include for all targets
-                            runtimes_to_sign.push(runtime_name.to_string());
                         }
+                    } else {
+                        // Runtime declares a signing key but it can't be resolved
+                        runtimes_with_unresolved_keys
+                            .push((runtime_name.to_string(), declared_key));
                     }
                 }
             }
+        }
+
+        // If any runtimes have unresolved signing keys, return an error
+        if !runtimes_with_unresolved_keys.is_empty() {
+            let runtime_details: Vec<String> = runtimes_with_unresolved_keys
+                .iter()
+                .map(|(runtime, key)| format!("  - runtime '{}' references key '{}'", runtime, key))
+                .collect();
+
+            anyhow::bail!(
+                "The following runtimes have signing configuration with keys that could not be resolved:\n\
+                {}\n\n\
+                Please check that:\n\
+                  1. A top-level `signing_keys` section exists in your config (note: underscore, not hyphen)\n\
+                  2. The referenced keys are defined in the `signing_keys` section\n\
+                  3. The keys are available on this host (check with: avocado signing-keys list)",
+                runtime_details.join("\n")
+            );
         }
 
         if runtimes_to_sign.is_empty() {

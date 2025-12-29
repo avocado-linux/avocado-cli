@@ -1340,7 +1340,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                     no_bootstrap,
-                );
+                )
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
                 run_cmd.execute().await?;
                 Ok(())
             }

@@ -329,9 +329,12 @@ RETRY_DELAY=1
 # Timeout for waiting on response (signing is fast since we only send the hash)
 SOCKET_TIMEOUT=30
 
+# Socket path from environment or default
+SIGNING_SOCKET="${AVOCADO_SIGNING_SOCKET:-/run/avocado/sign.sock}"
+
 # Check if signing socket is available
-if [ ! -S "/run/avocado/sign.sock" ]; then
-    echo "Error: Signing socket not available" >&2
+if [ ! -S "$SIGNING_SOCKET" ]; then
+    echo "Error: Signing socket not available at $SIGNING_SOCKET" >&2
     exit 2  # Signing unavailable
 fi
 
@@ -406,13 +409,13 @@ send_signing_request() {
     # Send request to signing service via Unix socket
     # The -t option for socat sets the timeout for half-close situations
     if command -v socat &> /dev/null; then
-        response=$(echo "$REQUEST" | socat -t${SOCKET_TIMEOUT} -T${SOCKET_TIMEOUT} - UNIX-CONNECT:/run/avocado/sign.sock 2>/dev/null) || true
+        response=$(echo "$REQUEST" | socat -t${SOCKET_TIMEOUT} -T${SOCKET_TIMEOUT} - UNIX-CONNECT:"$SIGNING_SOCKET" 2>/dev/null) || true
     elif command -v nc &> /dev/null; then
         # Try with -q option first (GNU netcat), fall back to -w only
         if nc -h 2>&1 | grep -q '\-q'; then
-            response=$(echo "$REQUEST" | nc -w ${SOCKET_TIMEOUT} -q ${SOCKET_TIMEOUT} -U /run/avocado/sign.sock 2>/dev/null) || true
+            response=$(echo "$REQUEST" | nc -w ${SOCKET_TIMEOUT} -q ${SOCKET_TIMEOUT} -U "$SIGNING_SOCKET" 2>/dev/null) || true
         else
-            response=$(echo "$REQUEST" | nc -w ${SOCKET_TIMEOUT} -U /run/avocado/sign.sock 2>/dev/null) || true
+            response=$(echo "$REQUEST" | nc -w ${SOCKET_TIMEOUT} -U "$SIGNING_SOCKET" 2>/dev/null) || true
         fi
     else
         echo "Error: Neither socat nor nc available for socket communication" >&2

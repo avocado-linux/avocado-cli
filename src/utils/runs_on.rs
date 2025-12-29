@@ -48,6 +48,9 @@ pub struct RunsOnContext {
     /// SSH tunnel for signing
     #[cfg(unix)]
     signing_tunnel: Option<SshTunnel>,
+    /// Remote path to the signing helper script
+    #[cfg(unix)]
+    remote_helper_script: Option<String>,
     /// Enable verbose output
     verbose: bool,
 }
@@ -250,6 +253,8 @@ impl RunsOnContext {
             remote_state_volume: Some(state_volume_name),
             #[cfg(unix)]
             signing_tunnel: None,
+            #[cfg(unix)]
+            remote_helper_script: None,
             verbose,
         })
     }
@@ -281,10 +286,14 @@ impl RunsOnContext {
     /// Setup SSH tunnel for signing
     ///
     /// This creates an SSH tunnel that forwards signing requests from the remote
-    /// back to the local signing service.
+    /// back to the local signing service. It also creates the helper script on
+    /// the remote host.
     #[cfg(unix)]
     pub async fn setup_signing_tunnel(&mut self, local_socket: &Path) -> Result<String> {
+        use crate::utils::signing_service::generate_helper_script;
+
         let remote_socket = format!("/tmp/avocado-sign-{}.sock", self.session_id);
+        let remote_helper_path = format!("/tmp/avocado-sign-request-{}", self.session_id);
 
         if self.verbose {
             print_info(
@@ -297,12 +306,35 @@ impl RunsOnContext {
             );
         }
 
+        // Create the signing tunnel
         let tunnel = SshTunnel::create(&self.remote_host, local_socket, &remote_socket)
             .await
             .context("Failed to create SSH tunnel for signing")?;
 
+        // Create the helper script on the remote host
+        let helper_script = generate_helper_script();
+        // Escape the script content for shell
+        let escaped_script = helper_script.replace("'", "'\\''");
+        let create_script_cmd = format!(
+            "printf '%s' '{}' > {} && chmod +x {}",
+            escaped_script, remote_helper_path, remote_helper_path
+        );
+
+        self.ssh
+            .run_command(&create_script_cmd)
+            .await
+            .context("Failed to create signing helper script on remote")?;
+
+        if self.verbose {
+            print_info(
+                &format!("Created signing helper script at {}", remote_helper_path),
+                OutputLevel::Normal,
+            );
+        }
+
         let socket_path = tunnel.remote_socket().to_string();
         self.signing_tunnel = Some(tunnel);
+        self.remote_helper_script = Some(remote_helper_path);
 
         Ok(socket_path)
     }
@@ -363,7 +395,7 @@ impl RunsOnContext {
             docker_cmd.push_str(&format!(" -e {}={}", key, shell_escape(value)));
         }
 
-        // Add signing socket if tunnel is active
+        // Add signing socket and helper script if tunnel is active
         #[cfg(unix)]
         if let Some(ref tunnel) = self.signing_tunnel {
             docker_cmd.push_str(&format!(
@@ -372,6 +404,14 @@ impl RunsOnContext {
                 tunnel.remote_socket(),
                 tunnel.remote_socket()
             ));
+
+            // Mount the helper script if it exists
+            if let Some(ref helper_path) = self.remote_helper_script {
+                docker_cmd.push_str(&format!(
+                    " -v {}:/usr/local/bin/avocado-sign-request:ro",
+                    helper_path
+                ));
+            }
         }
 
         // Add extra Docker arguments
@@ -407,6 +447,15 @@ impl RunsOnContext {
         #[cfg(unix)]
         if let Some(tunnel) = self.signing_tunnel.take() {
             let _ = tunnel.close().await;
+        }
+
+        // Remove remote helper script
+        #[cfg(unix)]
+        if let Some(ref helper_path) = self.remote_helper_script {
+            let _ = self
+                .ssh
+                .run_command(&format!("rm -f {}", helper_path))
+                .await;
         }
 
         // Remove remote volumes

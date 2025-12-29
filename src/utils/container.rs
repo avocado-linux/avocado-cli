@@ -329,6 +329,21 @@ impl SdkContainer {
             config.container_image.clone(),
         );
 
+        // Add signing-related environment variables for remote execution
+        // (AVOCADO_SIGNING_SOCKET is set separately in runs_on.rs when the tunnel is active)
+        if config.signing_socket_path.is_some() {
+            env_vars.insert("AVOCADO_SIGNING_ENABLED".to_string(), "1".to_string());
+        }
+        if let Some(ref key_name) = config.signing_key_name {
+            env_vars.insert("AVOCADO_SIGNING_KEY_NAME".to_string(), key_name.clone());
+        }
+        if let Some(ref checksum_algo) = config.signing_checksum_algorithm {
+            env_vars.insert(
+                "AVOCADO_SIGNING_CHECKSUM".to_string(),
+                checksum_algo.clone(),
+            );
+        }
+
         // Build the complete command with entrypoint
         // NFS src volume is mounted to /mnt/src, bindfs remaps to /opt/src with UID translation
         let mut full_command = String::new();

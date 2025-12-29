@@ -1245,6 +1245,16 @@ impl Config {
         None
     }
 
+    /// Get the declared signing key name for a runtime (without resolving it).
+    ///
+    /// Returns Some(key_name) if the runtime has a signing configuration declared,
+    /// None if the runtime doesn't exist or has no signing section.
+    #[allow(dead_code)] // Public API for future use
+    pub fn get_runtime_signing_key_name(&self, runtime_name: &str) -> Option<String> {
+        let runtime_config = self.runtime.as_ref()?.get(runtime_name)?;
+        Some(runtime_config.signing.as_ref()?.key.clone())
+    }
+
     /// Get signing key for a specific runtime
     ///
     /// The signing key reference in the config can be either:
@@ -5512,6 +5522,100 @@ sdk:
         // Test get_signing_key_names returns empty vec when no keys
         let key_names = config.get_signing_key_names();
         assert!(key_names.is_empty());
+    }
+
+    #[test]
+    fn test_get_runtime_signing_key_name() {
+        // Test that get_runtime_signing_key_name returns the declared key name
+        // even when the key cannot be resolved (e.g., signing_keys section missing)
+        let config_content = r#"
+default_target: qemux86-64
+
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+
+runtime:
+  dev:
+    signing:
+      key: my-key
+  prod:
+    signing:
+      key: production-key
+  no-signing:
+    dependencies:
+      some-package: '*'
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+
+        // Test that we can get the declared key name for runtimes with signing config
+        assert_eq!(
+            config.get_runtime_signing_key_name("dev"),
+            Some("my-key".to_string())
+        );
+        assert_eq!(
+            config.get_runtime_signing_key_name("prod"),
+            Some("production-key".to_string())
+        );
+
+        // Test that runtimes without signing config return None
+        assert_eq!(config.get_runtime_signing_key_name("no-signing"), None);
+
+        // Test that non-existent runtimes return None
+        assert_eq!(config.get_runtime_signing_key_name("nonexistent"), None);
+
+        // Since signing_keys section is missing, get_runtime_signing_key should return None
+        // while get_runtime_signing_key_name still returns the declared key name
+        assert!(config.get_runtime_signing_key("dev").is_none());
+        assert!(config.get_runtime_signing_key("prod").is_none());
+    }
+
+    #[test]
+    fn test_runtime_signing_key_declared_but_not_in_signing_keys() {
+        // Test scenario where runtime references a key that exists in signing_keys
+        // but uses a different name
+        let keyid = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1";
+
+        let config_content = format!(
+            r#"
+default_target: qemux86-64
+
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+
+signing_keys:
+  - existing-key: {keyid}
+
+runtime:
+  dev:
+    signing:
+      key: missing-key
+  prod:
+    signing:
+      key: existing-key
+"#
+        );
+
+        let config = Config::load_from_yaml_str(&config_content).unwrap();
+
+        // dev references 'missing-key' which is not in signing_keys
+        assert_eq!(
+            config.get_runtime_signing_key_name("dev"),
+            Some("missing-key".to_string())
+        );
+        // get_runtime_signing_key returns None because 'missing-key' is not resolvable
+        assert!(config.get_runtime_signing_key("dev").is_none());
+
+        // prod references 'existing-key' which is in signing_keys
+        assert_eq!(
+            config.get_runtime_signing_key_name("prod"),
+            Some("existing-key".to_string())
+        );
+        // get_runtime_signing_key returns the keyid because 'existing-key' is resolvable
+        assert_eq!(
+            config.get_runtime_signing_key("prod"),
+            Some(keyid.to_string())
+        );
     }
 
     #[test]
