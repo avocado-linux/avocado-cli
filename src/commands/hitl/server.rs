@@ -140,7 +140,7 @@ impl HitlServerCommand {
         }
 
         // Generate NFS export setup commands
-        let export_setup = self.generate_export_setup_commands(&target);
+        let export_setup = self.generate_export_setup_commands();
 
         // Create the command to set up netconfig symlink, ganesha symlink, exports, and start HITL server
         let setup_command = format!(
@@ -186,22 +186,21 @@ impl HitlServerCommand {
     }
 
     /// Generate shell commands to create NFS export configuration files
-    fn generate_export_setup_commands(&self, target: &str) -> String {
+    fn generate_export_setup_commands(&self) -> String {
         let mut commands = vec![
             "mkdir -p ${AVOCADO_SDK_PREFIX}/etc/avocado/exports.d".to_string(),
             "mkdir -p ${AVOCADO_SDK_PREFIX}/etc/avocado".to_string(),
         ];
 
         // Add/update the hitl-nfs.conf file with the exports.d directory directive
-        let exports_dir_line = format!("%dir /opt/_avocado/{target}/sdk/etc/avocado/exports.d");
-        let config_file = "${AVOCADO_SDK_PREFIX}/etc/avocado/hitl-nfs.conf".to_string();
+        let config_file = "${AVOCADO_SDK_PREFIX}/etc/avocado/hitl-nfs.conf";
 
-        // Check if the line exists, if not add it
+        // Remove any existing %dir line (may have old unexpanded variable) and add correct one
+        // Use double quotes so shell expands ${AVOCADO_SDK_PREFIX} when writing
         let update_config_cmd = format!(
             "touch {config_file} && \
-             if ! grep -q '^%dir /opt/_avocado/{target}/sdk/etc/avocado/exports.d$' {config_file}; then \
-               echo '{exports_dir_line}' >> {config_file}; \
-             fi"
+             sed -i '/^%dir .*\\/etc\\/avocado\\/exports\\.d$/d' {config_file} && \
+             echo \"%dir ${{AVOCADO_SDK_PREFIX}}/etc/avocado/exports.d\" >> {config_file}"
         );
         commands.push(update_config_cmd);
 
@@ -227,7 +226,7 @@ impl HitlServerCommand {
         // Use shared NfsExport to generate export configurations
         for (index, extension) in self.extensions.iter().enumerate() {
             let export_id = (index + 1) as u32;
-            let extensions_path = format!("/opt/_avocado/{target}/extensions/{extension}");
+            let extensions_path = format!("${{AVOCADO_EXT_SYSROOTS}}/{extension}");
             let pseudo_path = format!("/{extension}");
 
             // Create NfsExport using the shared type
@@ -290,11 +289,11 @@ mod tests {
             no_stamps: false,
         };
 
-        let commands = cmd.generate_export_setup_commands("x86_64");
+        let commands = cmd.generate_export_setup_commands();
 
         // Should create directories and exports.d directive but no port update
         assert!(commands.contains("mkdir -p ${AVOCADO_SDK_PREFIX}/etc/avocado/exports.d"));
-        assert!(commands.contains("%dir /opt/_avocado/x86_64/sdk/etc/avocado/exports.d"));
+        assert!(commands.contains("echo \"%dir ${AVOCADO_SDK_PREFIX}/etc/avocado/exports.d\""));
         assert!(!commands.contains("NFS_Port ="));
     }
 
@@ -311,7 +310,7 @@ mod tests {
             no_stamps: false,
         };
 
-        let commands = cmd.generate_export_setup_commands("x86_64");
+        let commands = cmd.generate_export_setup_commands();
 
         // Should include port update commands that search within NFS_Core_Param block
         assert!(commands.contains("NFS_Port = 2049"));
@@ -331,7 +330,7 @@ mod tests {
             no_stamps: false,
         };
 
-        let commands = cmd.generate_export_setup_commands("x86_64");
+        let commands = cmd.generate_export_setup_commands();
 
         // Should include port update commands and debug message
         assert!(commands.contains("NFS_Port = 3049"));
@@ -352,14 +351,14 @@ mod tests {
             no_stamps: false,
         };
 
-        let commands = cmd.generate_export_setup_commands("aarch64");
+        let commands = cmd.generate_export_setup_commands();
 
         // Should include both port update and extension configurations
         assert!(commands.contains("NFS_Port = 4049"));
         assert!(commands.contains("Export_Id = 1"));
         assert!(commands.contains("Export_Id = 2"));
-        assert!(commands.contains("/opt/_avocado/aarch64/extensions/ext1"));
-        assert!(commands.contains("/opt/_avocado/aarch64/extensions/ext2"));
+        assert!(commands.contains("${AVOCADO_EXT_SYSROOTS}/ext1"));
+        assert!(commands.contains("${AVOCADO_EXT_SYSROOTS}/ext2"));
     }
 
     #[test]

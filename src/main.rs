@@ -342,8 +342,8 @@ enum SdkCommands {
         /// Run container in background and print container ID
         #[arg(short, long)]
         detach: bool,
-        /// Automatically remove the container when it exits
-        #[arg(long)]
+        /// Automatically remove the container when it exits (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         rm: bool,
         /// Drop into interactive shell in container
         #[arg(short, long)]
