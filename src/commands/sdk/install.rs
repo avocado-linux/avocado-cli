@@ -9,7 +9,9 @@ use crate::utils::{
     container::{RunConfig, SdkContainer},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_info, print_success, OutputLevel},
-    stamps::{compute_sdk_input_hash, generate_write_stamp_script, Stamp, StampOutputs},
+    stamps::{
+        compute_sdk_input_hash, generate_write_stamp_script, get_local_arch, Stamp, StampOutputs,
+    },
     target::validate_and_log_target,
 };
 
@@ -844,10 +846,14 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         }
 
         // Write SDK install stamp (unless --no-stamps)
+        // The stamp uses the host architecture (CPU arch where SDK runs) rather than
+        // the target architecture (what you're building for). This allows --runs-on
+        // to detect if the SDK is installed for the remote's architecture.
         if !self.no_stamps {
             let inputs = compute_sdk_input_hash(&composed.merged_value)?;
             let outputs = StampOutputs::default();
-            let stamp = Stamp::sdk_install(&target, inputs, outputs);
+            let host_arch = get_local_arch();
+            let stamp = Stamp::sdk_install(host_arch, inputs, outputs);
             let stamp_script = generate_write_stamp_script(&stamp)?;
 
             let run_config = RunConfig {

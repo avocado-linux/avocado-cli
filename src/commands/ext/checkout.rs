@@ -555,6 +555,8 @@ mod tests {
 
     #[test]
     fn test_checkout_stamp_requirements() {
+        use crate::utils::stamps::get_local_arch;
+
         // ext checkout requires: SDK install + ext install (NOT build)
         // Checkout is for extracting files from the installed sysroot
         let requirements = [
@@ -562,8 +564,11 @@ mod tests {
             StampRequirement::ext_install("config-files"),
         ];
 
-        // Verify correct stamp paths
-        assert_eq!(requirements[0].relative_path(), "sdk/install.stamp");
+        // Verify correct stamp paths (SDK path includes local architecture)
+        assert_eq!(
+            requirements[0].relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
         assert_eq!(
             requirements[1].relative_path(),
             "ext/config-files/install.stamp"
@@ -579,7 +584,9 @@ mod tests {
 
     #[test]
     fn test_checkout_does_not_require_build_stamp() {
-        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+        use crate::utils::stamps::{
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        };
 
         // Checkout only needs SDK install and ext install - NOT ext build
         let requirements = vec![
@@ -589,7 +596,7 @@ mod tests {
 
         // Provide only SDK and ext install stamps (no build)
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
@@ -604,8 +611,10 @@ mod tests {
         let install_json = serde_json::to_string(&ext_install).unwrap();
 
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
-            sdk_json, install_json
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            install_json
         );
 
         let result = validate_stamps_batch(&requirements, &output, None);
@@ -617,7 +626,9 @@ mod tests {
 
     #[test]
     fn test_checkout_fails_without_ext_install() {
-        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+        use crate::utils::stamps::{
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        };
 
         let requirements = vec![
             StampRequirement::sdk_install(),
@@ -626,14 +637,15 @@ mod tests {
 
         // Only SDK installed, not the extension
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
 
         let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::null",
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::null",
+            get_local_arch(),
             sdk_json
         );
 
@@ -649,7 +661,9 @@ mod tests {
 
     #[test]
     fn test_checkout_clean_lifecycle() {
-        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+        use crate::utils::stamps::{
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        };
 
         let requirements = vec![
             StampRequirement::sdk_install(),
@@ -658,7 +672,7 @@ mod tests {
 
         // Before clean: both stamps present
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
@@ -673,8 +687,10 @@ mod tests {
         let install_json = serde_json::to_string(&ext_install).unwrap();
 
         let output_before = format!(
-            "sdk/install.stamp:::{}\next/app-config/install.stamp:::{}",
-            sdk_json, install_json
+            "sdk/{}/install.stamp:::{}\next/app-config/install.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            install_json
         );
 
         let result_before = validate_stamps_batch(&requirements, &output_before, None);
@@ -682,7 +698,8 @@ mod tests {
 
         // After ext clean: SDK still there, ext stamp gone
         let output_after = format!(
-            "sdk/install.stamp:::{}\next/app-config/install.stamp:::null",
+            "sdk/{}/install.stamp:::{}\next/app-config/install.stamp:::null",
+            get_local_arch(),
             sdk_json
         );
 

@@ -301,6 +301,58 @@ impl SshClient {
     pub fn remote(&self) -> &RemoteHost {
         &self.remote
     }
+
+    /// Get the CPU architecture of the remote host
+    ///
+    /// Returns the architecture string from `uname -m` (e.g., "x86_64", "aarch64").
+    /// This is used to verify that the SDK installed locally is compatible with the
+    /// remote host's architecture when using `--runs-on`.
+    pub async fn get_architecture(&self) -> Result<String> {
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Checking CPU architecture on {}...",
+                    self.remote.ssh_target()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        let output = AsyncCommand::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                &self.remote.ssh_target(),
+                "uname -m",
+            ])
+            .output()
+            .await
+            .context("Failed to get remote architecture")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Failed to get architecture from '{}': {}",
+                self.remote.ssh_target(),
+                stderr.trim()
+            );
+        }
+
+        let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if self.verbose {
+            print_info(
+                &format!("Remote architecture: {}", arch),
+                OutputLevel::Normal,
+            );
+        }
+
+        Ok(arch)
+    }
 }
 
 /// Manager for creating and removing NFS-backed Docker volumes on remote hosts

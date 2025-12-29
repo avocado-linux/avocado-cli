@@ -1218,6 +1218,8 @@ ext:
 
     #[test]
     fn test_package_stamp_requirements() {
+        use crate::utils::stamps::get_local_arch;
+
         // ext package requires: SDK install + ext install + ext build
         // Verify the stamp requirements are correct
         let requirements = [
@@ -1226,8 +1228,11 @@ ext:
             StampRequirement::ext_build("my-ext"),
         ];
 
-        // Verify correct stamp paths
-        assert_eq!(requirements[0].relative_path(), "sdk/install.stamp");
+        // Verify correct stamp paths (SDK path includes local architecture)
+        assert_eq!(
+            requirements[0].relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
         assert_eq!(requirements[1].relative_path(), "ext/my-ext/install.stamp");
         assert_eq!(requirements[2].relative_path(), "ext/my-ext/build.stamp");
 
@@ -1262,7 +1267,7 @@ ext:
 
     #[test]
     fn test_package_fails_without_sdk_install() {
-        use crate::utils::stamps::validate_stamps_batch;
+        use crate::utils::stamps::{get_local_arch, validate_stamps_batch};
 
         let requirements = vec![
             StampRequirement::sdk_install(),
@@ -1271,8 +1276,11 @@ ext:
         ];
 
         // All stamps missing
-        let output = "sdk/install.stamp:::null\next/my-ext/install.stamp:::null\next/my-ext/build.stamp:::null";
-        let result = validate_stamps_batch(&requirements, output, None);
+        let output = format!(
+            "sdk/{}/install.stamp:::null\next/my-ext/install.stamp:::null\next/my-ext/build.stamp:::null",
+            get_local_arch()
+        );
+        let result = validate_stamps_batch(&requirements, &output, None);
 
         assert!(!result.is_satisfied());
         assert_eq!(result.missing.len(), 3);
@@ -1280,7 +1288,9 @@ ext:
 
     #[test]
     fn test_package_fails_without_ext_build() {
-        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+        use crate::utils::stamps::{
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        };
 
         let requirements = vec![
             StampRequirement::sdk_install(),
@@ -1290,7 +1300,7 @@ ext:
 
         // SDK and ext install present, but build missing
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
@@ -1305,8 +1315,10 @@ ext:
         let ext_json = serde_json::to_string(&ext_install_stamp).unwrap();
 
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::null",
-            sdk_json, ext_json
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::null",
+            get_local_arch(),
+            sdk_json,
+            ext_json
         );
 
         let result = validate_stamps_batch(&requirements, &output, None);
@@ -1318,7 +1330,9 @@ ext:
 
     #[test]
     fn test_package_succeeds_with_all_stamps() {
-        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+        use crate::utils::stamps::{
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        };
 
         let requirements = vec![
             StampRequirement::sdk_install(),
@@ -1328,7 +1342,7 @@ ext:
 
         // All stamps present
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
@@ -1350,8 +1364,11 @@ ext:
         let ext_build_json = serde_json::to_string(&ext_build_stamp).unwrap();
 
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::{}",
-            sdk_json, ext_install_json, ext_build_json
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            ext_install_json,
+            ext_build_json
         );
 
         let result = validate_stamps_batch(&requirements, &output, None);
@@ -1362,7 +1379,9 @@ ext:
 
     #[test]
     fn test_package_clean_lifecycle() {
-        use crate::utils::stamps::{validate_stamps_batch, Stamp, StampInputs, StampOutputs};
+        use crate::utils::stamps::{
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        };
 
         let requirements = vec![
             StampRequirement::sdk_install(),
@@ -1372,7 +1391,7 @@ ext:
 
         // Before clean: all stamps present
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
@@ -1394,8 +1413,11 @@ ext:
         let build_json = serde_json::to_string(&ext_build).unwrap();
 
         let output_before = format!(
-            "sdk/install.stamp:::{}\next/gpu-driver/install.stamp:::{}\next/gpu-driver/build.stamp:::{}",
-            sdk_json, install_json, build_json
+            "sdk/{}/install.stamp:::{}\next/gpu-driver/install.stamp:::{}\next/gpu-driver/build.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            install_json,
+            build_json
         );
 
         let result_before = validate_stamps_batch(&requirements, &output_before, None);
@@ -1406,7 +1428,8 @@ ext:
 
         // After ext clean: SDK still there, ext stamps gone (simulating rm -rf .stamps/ext/gpu-driver)
         let output_after = format!(
-            "sdk/install.stamp:::{}\next/gpu-driver/install.stamp:::null\next/gpu-driver/build.stamp:::null",
+            "sdk/{}/install.stamp:::{}\next/gpu-driver/install.stamp:::null\next/gpu-driver/build.stamp:::null",
+            get_local_arch(),
             sdk_json
         );
 

@@ -13,6 +13,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+/// Get the local machine's CPU architecture
+///
+/// Returns the architecture string (e.g., "x86_64", "aarch64") for the current machine.
+/// This is used to track which host architecture the SDK was installed for.
+pub fn get_local_arch() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        std::env::consts::ARCH
+    }
+}
+
 /// Current stamp format version
 pub const STAMP_VERSION: u32 = 1;
 
@@ -270,9 +289,12 @@ impl Stamp {
     }
 
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
+    ///
+    /// For SDK stamps, the path includes the target architecture (which represents
+    /// the host architecture where the SDK runs) to support --runs-on with different architectures.
     pub fn relative_path(&self) -> String {
         match (&self.component, &self.component_name) {
-            (StampComponent::Sdk, _) => format!("sdk/{}.stamp", self.command),
+            (StampComponent::Sdk, _) => format!("sdk/{}/{}.stamp", self.target, self.command),
             (StampComponent::Extension, Some(name)) => {
                 format!("ext/{}/{}.stamp", name, self.command)
             }
@@ -320,6 +342,11 @@ pub struct StampRequirement {
     pub command: StampCommand,
     pub component: StampComponent,
     pub component_name: Option<String>,
+    /// Host architecture for SDK stamps (e.g., "x86_64", "aarch64").
+    /// This tracks the CPU architecture of the machine running the SDK container,
+    /// which is different from the target architecture (what you're building FOR).
+    /// Required for SDK stamps to support --runs-on with different architectures.
+    pub host_arch: Option<String>,
 }
 
 impl StampRequirement {
@@ -328,12 +355,26 @@ impl StampRequirement {
             command,
             component,
             component_name: name.map(|s| s.to_string()),
+            host_arch: None,
         }
     }
 
-    /// SDK install requirement
+    /// SDK install requirement for the local host architecture
     pub fn sdk_install() -> Self {
-        Self::new(StampCommand::Install, StampComponent::Sdk, None)
+        Self::sdk_install_for_arch(get_local_arch())
+    }
+
+    /// SDK install requirement for a specific host architecture
+    ///
+    /// Use this when checking SDK stamps for --runs-on with a remote host
+    /// that may have a different architecture than the local machine.
+    pub fn sdk_install_for_arch(arch: &str) -> Self {
+        Self {
+            command: StampCommand::Install,
+            component: StampComponent::Sdk,
+            component_name: None,
+            host_arch: Some(arch.to_string()),
+        }
     }
 
     /// Extension install requirement
@@ -374,13 +415,22 @@ impl StampRequirement {
     }
 
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
+    ///
+    /// For SDK stamps, the path includes the host architecture to support
+    /// running on remotes with different CPU architectures via --runs-on.
     pub fn relative_path(&self) -> String {
-        match (&self.component, &self.component_name) {
-            (StampComponent::Sdk, _) => format!("sdk/{}.stamp", self.command),
-            (StampComponent::Extension, Some(name)) => {
+        match (&self.component, &self.component_name, &self.host_arch) {
+            (StampComponent::Sdk, _, Some(arch)) => {
+                format!("sdk/{}/{}.stamp", arch, self.command)
+            }
+            (StampComponent::Sdk, _, None) => {
+                // Fallback for SDK without explicit arch (use local arch)
+                format!("sdk/{}/{}.stamp", get_local_arch(), self.command)
+            }
+            (StampComponent::Extension, Some(name), _) => {
                 format!("ext/{}/{}.stamp", name, self.command)
             }
-            (StampComponent::Runtime, Some(name)) => {
+            (StampComponent::Runtime, Some(name), _) => {
                 format!("runtime/{}/{}.stamp", name, self.command)
             }
             _ => panic!("Component name required for Extension and Runtime"),
@@ -389,12 +439,15 @@ impl StampRequirement {
 
     /// Human-readable description
     pub fn description(&self) -> String {
-        match (&self.component, &self.component_name) {
-            (StampComponent::Sdk, _) => format!("SDK {}", self.command),
-            (StampComponent::Extension, Some(name)) => {
+        match (&self.component, &self.component_name, &self.host_arch) {
+            (StampComponent::Sdk, _, Some(arch)) => {
+                format!("SDK {} ({})", self.command, arch)
+            }
+            (StampComponent::Sdk, _, None) => format!("SDK {}", self.command),
+            (StampComponent::Extension, Some(name), _) => {
                 format!("extension '{}' {}", name, self.command)
             }
-            (StampComponent::Runtime, Some(name)) => {
+            (StampComponent::Runtime, Some(name), _) => {
                 format!("runtime '{}' {}", name, self.command)
             }
             _ => format!("{} {}", self.component, self.command),
@@ -402,9 +455,21 @@ impl StampRequirement {
     }
 
     /// Suggested fix command
+    ///
+    /// For SDK stamps with a specific host architecture (from --runs-on), the fix
+    /// command will suggest running on the remote to install the SDK for that arch.
+    #[allow(dead_code)]
     pub fn fix_command(&self) -> String {
+        self.fix_command_with_remote(None)
+    }
+
+    /// Suggested fix command with optional remote host for --runs-on
+    pub fn fix_command_with_remote(&self, runs_on: Option<&str>) -> String {
         match (&self.component, &self.component_name, &self.command) {
-            (StampComponent::Sdk, _, StampCommand::Install) => "avocado sdk install".to_string(),
+            (StampComponent::Sdk, _, StampCommand::Install) => match runs_on {
+                Some(remote) => format!("avocado sdk install --runs-on {}", remote),
+                None => "avocado sdk install".to_string(),
+            },
             (StampComponent::Extension, Some(name), StampCommand::Install) => {
                 format!("avocado ext install -e {}", name)
             }
@@ -491,11 +556,22 @@ impl StampValidationResult {
     }
 
     /// Convert to an error with actionable messages
+    /// Convert to an error with actionable messages
     pub fn into_error(self, context: &str) -> StampValidationError {
+        self.into_error_with_runs_on(context, None)
+    }
+
+    /// Convert to an error with actionable messages, including --runs-on hint
+    pub fn into_error_with_runs_on(
+        self,
+        context: &str,
+        runs_on: Option<&str>,
+    ) -> StampValidationError {
         StampValidationError {
             context: context.to_string(),
             missing: self.missing,
             stale: self.stale,
+            runs_on: runs_on.map(|s| s.to_string()),
         }
     }
 }
@@ -506,6 +582,8 @@ pub struct StampValidationError {
     pub context: String,
     pub missing: Vec<StampRequirement>,
     pub stale: Vec<(StampRequirement, String)>,
+    /// Remote host if using --runs-on (for fix command suggestions)
+    pub runs_on: Option<String>,
 }
 
 impl std::error::Error for StampValidationError {}
@@ -538,12 +616,13 @@ impl fmt::Display for StampValidationError {
 
         writeln!(f, "To fix:")?;
 
-        // Collect unique fix commands
+        // Collect unique fix commands, using runs_on hint for SDK install commands
+        let runs_on_ref = self.runs_on.as_deref();
         let mut fixes: Vec<String> = self
             .missing
             .iter()
             .chain(self.stale.iter().map(|(req, _)| req))
-            .map(|req| req.fix_command())
+            .map(|req| req.fix_command_with_remote(runs_on_ref))
             .collect();
         fixes.sort();
         fixes.dedup();
@@ -773,34 +852,54 @@ pub fn resolve_required_stamps(
     component_name: Option<&str>,
     ext_dependencies: &[String],
 ) -> Vec<StampRequirement> {
+    resolve_required_stamps_for_arch(cmd, component, component_name, ext_dependencies, None)
+}
+
+/// Resolve required stamps with a specific host architecture for SDK stamps
+///
+/// Use this when using `--runs-on` with a remote host that may have a different
+/// CPU architecture than the local machine. The `host_arch` parameter specifies
+/// the architecture of the remote host (e.g., "aarch64", "x86_64").
+///
+/// When `host_arch` is None, the local machine's architecture is used.
+pub fn resolve_required_stamps_for_arch(
+    cmd: StampCommand,
+    component: StampComponent,
+    component_name: Option<&str>,
+    ext_dependencies: &[String],
+    host_arch: Option<&str>,
+) -> Vec<StampRequirement> {
+    // Helper to create SDK install requirement with the correct arch
+    let sdk_install = || match host_arch {
+        Some(arch) => StampRequirement::sdk_install_for_arch(arch),
+        None => StampRequirement::sdk_install(),
+    };
+
     match (cmd, component) {
         // SDK install has no dependencies
         (StampCommand::Install, StampComponent::Sdk) => vec![],
 
         // Extension install requires SDK install
         (StampCommand::Install, StampComponent::Extension) => {
-            vec![StampRequirement::sdk_install()]
+            vec![sdk_install()]
         }
 
         // Runtime install requires SDK install
         (StampCommand::Install, StampComponent::Runtime) => {
-            vec![StampRequirement::sdk_install()]
+            vec![sdk_install()]
         }
 
         // Extension build requires SDK install + own extension install
         (StampCommand::Build, StampComponent::Extension) => {
             let ext_name = component_name.expect("Extension name required");
-            vec![
-                StampRequirement::sdk_install(),
-                StampRequirement::ext_install(ext_name),
-            ]
+            vec![sdk_install(), StampRequirement::ext_install(ext_name)]
         }
 
         // Extension image requires SDK install + own extension install + own extension build
         (StampCommand::Image, StampComponent::Extension) => {
             let ext_name = component_name.expect("Extension name required");
             vec![
-                StampRequirement::sdk_install(),
+                sdk_install(),
                 StampRequirement::ext_install(ext_name),
                 StampRequirement::ext_build(ext_name),
             ]
@@ -811,7 +910,7 @@ pub fn resolve_required_stamps(
         (StampCommand::Build, StampComponent::Runtime) => {
             let runtime_name = component_name.expect("Runtime name required");
             let mut reqs = vec![
-                StampRequirement::sdk_install(),
+                sdk_install(),
                 StampRequirement::runtime_install(runtime_name),
             ];
 
@@ -853,10 +952,24 @@ pub fn resolve_required_stamps_for_runtime_build(
     runtime_name: &str,
     ext_dependencies: &[RuntimeExtDep],
 ) -> Vec<StampRequirement> {
-    let mut reqs = vec![
-        StampRequirement::sdk_install(),
-        StampRequirement::runtime_install(runtime_name),
-    ];
+    resolve_required_stamps_for_runtime_build_with_arch(runtime_name, ext_dependencies, None)
+}
+
+/// Resolve required stamps for runtime build with a specific host architecture
+///
+/// Use this when using `--runs-on` with a remote host that may have a different
+/// CPU architecture than the local machine.
+pub fn resolve_required_stamps_for_runtime_build_with_arch(
+    runtime_name: &str,
+    ext_dependencies: &[RuntimeExtDep],
+    host_arch: Option<&str>,
+) -> Vec<StampRequirement> {
+    let sdk_install = match host_arch {
+        Some(arch) => StampRequirement::sdk_install_for_arch(arch),
+        None => StampRequirement::sdk_install(),
+    };
+
+    let mut reqs = vec![sdk_install, StampRequirement::runtime_install(runtime_name)];
 
     for ext_dep in ext_dependencies {
         let ext_name = ext_dep.name();
@@ -967,8 +1080,12 @@ mod tests {
         let inputs = StampInputs::new("sha256:abc123".to_string());
         let outputs = StampOutputs::default();
 
-        let sdk_stamp = Stamp::sdk_install("qemux86-64", inputs.clone(), outputs.clone());
-        assert_eq!(sdk_stamp.relative_path(), "sdk/install.stamp");
+        // SDK stamps now include the host architecture in the path
+        let sdk_stamp = Stamp::sdk_install("x86_64", inputs.clone(), outputs.clone());
+        assert_eq!(sdk_stamp.relative_path(), "sdk/x86_64/install.stamp");
+
+        let sdk_stamp_arm = Stamp::sdk_install("aarch64", inputs.clone(), outputs.clone());
+        assert_eq!(sdk_stamp_arm.relative_path(), "sdk/aarch64/install.stamp");
 
         let ext_stamp = Stamp::ext_install("my-ext", "qemux86-64", inputs.clone(), outputs.clone());
         assert_eq!(ext_stamp.relative_path(), "ext/my-ext/install.stamp");
@@ -983,7 +1100,11 @@ mod tests {
     #[test]
     fn test_stamp_requirement_description() {
         let req = StampRequirement::sdk_install();
-        assert_eq!(req.description(), "SDK install");
+        // SDK description now includes architecture
+        assert_eq!(
+            req.description(),
+            format!("SDK install ({})", get_local_arch())
+        );
         assert_eq!(req.fix_command(), "avocado sdk install");
 
         let req = StampRequirement::ext_install("gpu-driver");
@@ -1184,7 +1305,8 @@ mod tests {
         // Check error message contains key elements
         assert!(error_str.contains("Cannot build runtime 'my-runtime'"));
         assert!(error_str.contains("Missing steps:"));
-        assert!(error_str.contains("sdk/install.stamp"));
+        // SDK stamp path now includes local architecture
+        assert!(error_str.contains(&format!("sdk/{}/install.stamp", get_local_arch())));
         assert!(error_str.contains("ext/gpu-driver/install.stamp"));
         assert!(error_str.contains("Stale steps"));
         assert!(error_str.contains("config changed"));
@@ -1494,8 +1616,8 @@ mod tests {
 
         let script = generate_batch_read_stamps_script(&requirements);
 
-        // Should contain all three stamp paths
-        assert!(script.contains("sdk/install.stamp"));
+        // Should contain all three stamp paths (SDK path includes local arch)
+        assert!(script.contains(&format!("sdk/{}/install.stamp", get_local_arch())));
         assert!(script.contains("ext/my-ext/install.stamp"));
         assert!(script.contains("ext/my-ext/build.stamp"));
 
@@ -1509,14 +1631,21 @@ mod tests {
 
     #[test]
     fn test_parse_batch_stamps_output() {
-        let output = r#"sdk/install.stamp:::{"version":"1.0.0","command":"install","component":"sdk"}
-ext/my-ext/install.stamp:::{"version":"1.0.0","command":"install","component":"ext"}
-ext/my-ext/build.stamp:::null"#;
+        let arch = get_local_arch();
+        let output = format!(
+            r#"sdk/{}/install.stamp:::{{"version":"1.0.0","command":"install","component":"sdk"}}
+ext/my-ext/install.stamp:::{{"version":"1.0.0","command":"install","component":"ext"}}
+ext/my-ext/build.stamp:::null"#,
+            arch
+        );
 
-        let result = parse_batch_stamps_output(output);
+        let result = parse_batch_stamps_output(&output);
 
         assert_eq!(result.len(), 3);
-        assert!(result.get("sdk/install.stamp").unwrap().is_some());
+        assert!(result
+            .get(&format!("sdk/{}/install.stamp", arch))
+            .unwrap()
+            .is_some());
         assert!(result.get("ext/my-ext/install.stamp").unwrap().is_some());
         assert!(result.get("ext/my-ext/build.stamp").unwrap().is_none());
     }
@@ -1546,8 +1675,10 @@ ext/my-ext/build.stamp:::null"#;
         let ext_json = serde_json::to_string(&ext_stamp).unwrap();
 
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
-            sdk_json, ext_json
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            ext_json
         );
 
         let result = validate_stamps_batch(&requirements, &output, None);
@@ -1575,7 +1706,8 @@ ext/my-ext/build.stamp:::null"#;
         let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
 
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::null\next/my-ext/build.stamp:::null",
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::null\next/my-ext/build.stamp:::null",
+            get_local_arch(),
             sdk_json
         );
 
@@ -1621,8 +1753,11 @@ ext/my-ext/build.stamp:::null"#;
         assert_eq!(reqs[1].fix_command(), "avocado ext install -e my-ext");
         assert_eq!(reqs[2].fix_command(), "avocado ext build -e my-ext");
 
-        // Verify descriptions are helpful
-        assert_eq!(reqs[0].description(), "SDK install");
+        // Verify descriptions are helpful (SDK now includes architecture)
+        assert_eq!(
+            reqs[0].description(),
+            format!("SDK install ({})", get_local_arch())
+        );
         assert_eq!(reqs[1].description(), "extension 'my-ext' install");
         assert_eq!(reqs[2].description(), "extension 'my-ext' build");
     }
@@ -1649,7 +1784,10 @@ ext/my-ext/build.stamp:::null"#;
 
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].fix_command(), "avocado sdk install");
-        assert_eq!(reqs[0].relative_path(), "sdk/install.stamp");
+        assert_eq!(
+            reqs[0].relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
     }
 
     #[test]
@@ -1665,8 +1803,11 @@ ext/my-ext/build.stamp:::null"#;
         // Total: 1 SDK + 2 per extension = 5
         assert_eq!(reqs.len(), 5);
 
-        // Verify all paths are correct
-        assert_eq!(reqs[0].relative_path(), "sdk/install.stamp");
+        // Verify all paths are correct (SDK path includes local arch)
+        assert_eq!(
+            reqs[0].relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
         assert_eq!(reqs[1].relative_path(), "ext/ext-a/install.stamp");
         assert_eq!(reqs[2].relative_path(), "ext/ext-a/build.stamp");
         assert_eq!(reqs[3].relative_path(), "ext/ext-b/install.stamp");
@@ -1754,19 +1895,22 @@ ext/my-ext/build.stamp:::null"#;
 
     #[test]
     fn test_sdk_clean_stamp_path_matches_sdk_install() {
-        // SDK clean should remove stamps at sdk/
+        // SDK clean should remove stamps at sdk/{arch}/
         let install_stamp = StampRequirement::sdk_install();
 
-        assert_eq!(install_stamp.relative_path(), "sdk/install.stamp");
+        assert_eq!(
+            install_stamp.relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
 
-        // Clean removes: rm -rf "$AVOCADO_PREFIX/.stamps/sdk"
+        // Clean removes: rm -rf "$AVOCADO_PREFIX/.stamps/sdk/{arch}"
         let path = install_stamp.relative_path();
         let parent = std::path::Path::new(&path)
             .parent()
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(parent, "sdk");
+        assert_eq!(parent, format!("sdk/{}", get_local_arch()));
     }
 
     #[test]
@@ -1797,15 +1941,18 @@ ext/my-ext/build.stamp:::null"#;
 
         // Before clean: all satisfied
         let output_before = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
-            sdk_json, ext_json
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            ext_json
         );
         let result_before = validate_stamps_batch(&requirements, &output_before, None);
         assert!(result_before.is_satisfied());
 
         // After ext clean: SDK still there, ext stamps gone
         let output_after_ext_clean = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::null",
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::null",
+            get_local_arch(),
             sdk_json
         );
         let result_after = validate_stamps_batch(&requirements, &output_after_ext_clean, None);
@@ -1829,13 +1976,16 @@ ext/my-ext/build.stamp:::null"#;
         ];
 
         // After clean --stamps: all stamps return null
-        let output = r#"sdk/install.stamp:::null
+        let output = format!(
+            r#"sdk/{}/install.stamp:::null
 ext/ext-a/install.stamp:::null
 ext/ext-a/build.stamp:::null
 runtime/my-runtime/install.stamp:::null
-runtime/my-runtime/build.stamp:::null"#;
+runtime/my-runtime/build.stamp:::null"#,
+            get_local_arch()
+        );
 
-        let result = validate_stamps_batch(&requirements, output, None);
+        let result = validate_stamps_batch(&requirements, &output, None);
 
         assert!(!result.is_satisfied());
         assert!(result.satisfied.is_empty());
@@ -1899,8 +2049,10 @@ runtime/my-runtime/build.stamp:::null"#;
         ];
 
         let output = format!(
-            "sdk/install.stamp:::{}\next/my-ext/install.stamp:::{}",
-            sdk_json, ext_json
+            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}",
+            get_local_arch(),
+            sdk_json,
+            ext_json
         );
 
         // With changed inputs (simulating config change)
@@ -1948,5 +2100,105 @@ runtime/my-runtime/build.stamp:::null"#;
         assert!(msg.contains("Missing steps:"));
         assert!(msg.contains("Stale steps"));
         assert!(msg.contains("config hash changed"));
+    }
+
+    // ========================================================================
+    // Architecture-Specific SDK Stamp Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sdk_install_stamp_uses_host_architecture() {
+        // SDK stamps now use the host architecture in the path
+        let local_arch = get_local_arch();
+
+        let req = StampRequirement::sdk_install();
+        assert_eq!(req.host_arch, Some(local_arch.to_string()));
+        assert_eq!(
+            req.relative_path(),
+            format!("sdk/{}/install.stamp", local_arch)
+        );
+    }
+
+    #[test]
+    fn test_sdk_install_for_specific_architecture() {
+        // Test creating SDK stamp requirement for a specific architecture
+        let req_x86 = StampRequirement::sdk_install_for_arch("x86_64");
+        assert_eq!(req_x86.host_arch, Some("x86_64".to_string()));
+        assert_eq!(req_x86.relative_path(), "sdk/x86_64/install.stamp");
+
+        let req_arm = StampRequirement::sdk_install_for_arch("aarch64");
+        assert_eq!(req_arm.host_arch, Some("aarch64".to_string()));
+        assert_eq!(req_arm.relative_path(), "sdk/aarch64/install.stamp");
+    }
+
+    #[test]
+    fn test_sdk_stamps_for_different_architectures_are_distinct() {
+        // Stamps for different architectures should have different paths
+        let req_x86 = StampRequirement::sdk_install_for_arch("x86_64");
+        let req_arm = StampRequirement::sdk_install_for_arch("aarch64");
+
+        assert_ne!(req_x86.relative_path(), req_arm.relative_path());
+        assert_ne!(req_x86, req_arm);
+    }
+
+    #[test]
+    fn test_resolve_required_stamps_for_arch() {
+        // Resolving stamps for a specific architecture
+        // Runtime build (which provision depends on) requires SDK install
+        let reqs = resolve_required_stamps_for_arch(
+            StampCommand::Build,
+            StampComponent::Runtime,
+            Some("my-runtime"),
+            &[],
+            Some("aarch64"),
+        );
+
+        // Should include SDK stamp for aarch64 (runtime build requires SDK)
+        assert!(reqs
+            .iter()
+            .any(|r| r.relative_path() == "sdk/aarch64/install.stamp"));
+    }
+
+    #[test]
+    fn test_sdk_description_includes_architecture() {
+        let req = StampRequirement::sdk_install_for_arch("aarch64");
+        assert!(req.description().contains("aarch64"));
+    }
+
+    #[test]
+    fn test_fix_command_with_runs_on() {
+        let req = StampRequirement::sdk_install_for_arch("aarch64");
+
+        // Without runs-on, should suggest regular install
+        assert_eq!(req.fix_command(), "avocado sdk install");
+
+        // With runs-on, should suggest install on the remote
+        assert_eq!(
+            req.fix_command_with_remote(Some("user@remote")),
+            "avocado sdk install --runs-on user@remote"
+        );
+    }
+
+    #[test]
+    fn test_validation_error_includes_runs_on_hint() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::sdk_install_for_arch("aarch64"));
+
+        // Without runs_on, fix should be regular install
+        let error = result.into_error("Cannot provision");
+        let msg = error.to_string();
+        assert!(msg.contains("avocado sdk install"));
+        assert!(!msg.contains("--runs-on"));
+    }
+
+    #[test]
+    fn test_validation_error_with_runs_on_includes_remote_in_fix() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::sdk_install_for_arch("aarch64"));
+
+        // With runs_on, fix should include the remote
+        let error = result.into_error_with_runs_on("Cannot provision", Some("user@remote"));
+        let msg = error.to_string();
+        assert!(msg.contains("avocado sdk install --runs-on user@remote"));
     }
 }

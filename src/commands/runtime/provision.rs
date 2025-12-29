@@ -4,9 +4,11 @@ use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    remote::{RemoteHost, SshClient},
     stamps::{
-        generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
-        validate_stamps_batch, Stamp, StampCommand, StampComponent, StampInputs, StampOutputs,
+        generate_batch_read_stamps_script, generate_write_stamp_script,
+        resolve_required_stamps_for_arch, validate_stamps_batch, Stamp, StampCommand,
+        StampComponent, StampInputs, StampOutputs,
     },
     target::resolve_target_required,
     volume::VolumeManager,
@@ -87,17 +89,38 @@ impl RuntimeProvisionCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.config.target.as_deref(), &config)?;
 
+        // Detect remote host architecture if using --runs-on
+        // This is needed to check if the SDK is installed for the remote's architecture
+        let remote_arch = if let Some(ref runs_on) = self.config.runs_on {
+            let remote_host = RemoteHost::parse(runs_on)?;
+            let ssh = SshClient::new(remote_host).with_verbose(self.config.verbose);
+            let arch = ssh.get_architecture().await.with_context(|| {
+                format!("Failed to detect architecture of remote host '{}'", runs_on)
+            })?;
+            if self.config.verbose {
+                print_info(
+                    &format!("Remote host architecture: {}", arch),
+                    OutputLevel::Normal,
+                );
+            }
+            Some(arch)
+        } else {
+            None
+        };
+
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.config.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config.config_path, &config)?
                 .verbose(self.config.verbose);
 
             // Provision requires runtime build stamp
-            let required = resolve_required_stamps(
+            // When using --runs-on, check for SDK stamp matching remote's architecture
+            let required = resolve_required_stamps_for_arch(
                 StampCommand::Provision,
                 StampComponent::Runtime,
                 Some(&self.config.runtime_name),
                 &[],
+                remote_arch.as_deref(),
             );
 
             // Batch all stamp reads into a single container invocation for performance
@@ -134,10 +157,11 @@ impl RuntimeProvisionCommand {
             let validation = validate_stamps_batch(&required, output_str, None);
 
             if !validation.is_satisfied() {
-                let error = validation.into_error(&format!(
-                    "Cannot provision runtime '{}'",
-                    self.config.runtime_name
-                ));
+                // Include the --runs-on target in error message for SDK install hints
+                let error = validation.into_error_with_runs_on(
+                    &format!("Cannot provision runtime '{}'", self.config.runtime_name),
+                    self.config.runs_on.as_deref(),
+                );
                 return Err(error.into());
             }
         }

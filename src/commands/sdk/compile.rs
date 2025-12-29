@@ -427,13 +427,16 @@ dependencies = { gcc = "*" }
 
     #[test]
     fn test_compile_stamp_requirements() {
-        use crate::utils::stamps::StampRequirement;
+        use crate::utils::stamps::{get_local_arch, StampRequirement};
 
         // sdk compile requires only: SDK install
         let requirements = [StampRequirement::sdk_install()];
 
-        // Verify correct stamp path
-        assert_eq!(requirements[0].relative_path(), "sdk/install.stamp");
+        // Verify correct stamp path (now includes local architecture)
+        assert_eq!(
+            requirements[0].relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
 
         // Verify fix command is correct
         assert_eq!(requirements[0].fix_command(), "avocado sdk install");
@@ -454,13 +457,13 @@ dependencies = { gcc = "*" }
 
     #[test]
     fn test_compile_fails_without_sdk_install() {
-        use crate::utils::stamps::{validate_stamps_batch, StampRequirement};
+        use crate::utils::stamps::{get_local_arch, validate_stamps_batch, StampRequirement};
 
         let requirements = vec![StampRequirement::sdk_install()];
 
         // SDK stamp missing
-        let output = "sdk/install.stamp:::null";
-        let result = validate_stamps_batch(&requirements, output, None);
+        let output = format!("sdk/{}/install.stamp:::null", get_local_arch());
+        let result = validate_stamps_batch(&requirements, &output, None);
 
         assert!(!result.is_satisfied());
         assert_eq!(result.missing.len(), 1);
@@ -470,19 +473,21 @@ dependencies = { gcc = "*" }
     #[test]
     fn test_compile_succeeds_with_sdk_install() {
         use crate::utils::stamps::{
-            validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+            StampRequirement,
         };
 
         let requirements = vec![StampRequirement::sdk_install()];
 
+        // SDK stamp now uses host architecture
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
         let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
 
-        let output = format!("sdk/install.stamp:::{}", sdk_json);
+        let output = format!("sdk/{}/install.stamp:::{}", get_local_arch(), sdk_json);
         let result = validate_stamps_batch(&requirements, &output, None);
 
         assert!(result.is_satisfied());
@@ -492,26 +497,27 @@ dependencies = { gcc = "*" }
     #[test]
     fn test_compile_clean_lifecycle() {
         use crate::utils::stamps::{
-            validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+            StampRequirement,
         };
 
         let requirements = vec![StampRequirement::sdk_install()];
 
         // Before clean: SDK stamp present
         let sdk_stamp = Stamp::sdk_install(
-            "qemux86-64",
+            get_local_arch(),
             StampInputs::new("hash1".to_string()),
             StampOutputs::default(),
         );
         let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
 
-        let output_before = format!("sdk/install.stamp:::{}", sdk_json);
+        let output_before = format!("sdk/{}/install.stamp:::{}", get_local_arch(), sdk_json);
         let result_before = validate_stamps_batch(&requirements, &output_before, None);
         assert!(result_before.is_satisfied(), "Should pass before clean");
 
         // After clean --stamps: SDK stamp gone (simulating rm -rf .stamps/)
-        let output_after = "sdk/install.stamp:::null";
-        let result_after = validate_stamps_batch(&requirements, output_after, None);
+        let output_after = format!("sdk/{}/install.stamp:::null", get_local_arch());
+        let result_after = validate_stamps_batch(&requirements, &output_after, None);
         assert!(
             !result_after.is_satisfied(),
             "Should fail after clean --stamps"
