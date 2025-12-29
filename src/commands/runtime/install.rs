@@ -5,6 +5,7 @@ use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
     compute_runtime_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
@@ -135,6 +136,59 @@ impl RuntimeInstallCommand {
         // Initialize container helper
         let container_helper = SdkContainer::new().verbose(self.verbose);
 
+        // Create shared RunsOnContext if running on remote host
+        let mut runs_on_context: Option<RunsOnContext> = if let Some(ref runs_on) = self.runs_on {
+            Some(
+                container_helper
+                    .create_runs_on_context(runs_on, self.nfs_port, container_image, self.verbose)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        // Execute installation and ensure cleanup
+        let result = self
+            .execute_install_internal(
+                &parsed,
+                &config,
+                &runtimes_to_install,
+                &container_helper,
+                container_image,
+                repo_url.as_ref(),
+                repo_release.as_ref(),
+                &merged_container_args,
+                runs_on_context.as_ref(),
+            )
+            .await;
+
+        // Always teardown the context if it was created
+        if let Some(ref mut context) = runs_on_context {
+            if let Err(e) = context.teardown().await {
+                print_error(
+                    &format!("Warning: Failed to cleanup remote resources: {}", e),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Internal implementation of the install logic
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_install_internal(
+        &self,
+        parsed: &serde_yaml::Value,
+        config: &Config,
+        runtimes_to_install: &[String],
+        container_helper: &SdkContainer,
+        container_image: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+    ) -> Result<()> {
         // Load lock file for reproducible builds
         let src_dir = config
             .get_resolved_src_dir(&self.config_path)
@@ -154,7 +208,7 @@ impl RuntimeInstallCommand {
         }
 
         // Install dependencies for each runtime
-        for runtime_name in &runtimes_to_install {
+        for runtime_name in runtimes_to_install {
             print_info(
                 &format!("Installing dependencies for runtime '{runtime_name}'"),
                 OutputLevel::Normal,
@@ -162,16 +216,17 @@ impl RuntimeInstallCommand {
 
             let success = self
                 .install_single_runtime(
-                    &parsed,
-                    &config,
+                    parsed,
+                    config,
                     runtime_name,
-                    &container_helper,
+                    container_helper,
                     container_image,
-                    repo_url.as_ref(),
-                    repo_release.as_ref(),
-                    &merged_container_args,
+                    repo_url,
+                    repo_release,
+                    merged_container_args,
                     &mut lock_file,
                     &src_dir,
+                    runs_on_context,
                 )
                 .await?;
 
@@ -186,7 +241,7 @@ impl RuntimeInstallCommand {
             // Write runtime install stamp (unless --no-stamps)
             if !self.no_stamps {
                 // Get merged runtime config for stamp input hash
-                let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+                let target_arch = resolve_target_required(self.target.as_deref(), config)?;
                 if let Some(merged_runtime) = config.get_merged_runtime_config(
                     runtime_name,
                     &target_arch,
@@ -204,16 +259,15 @@ impl RuntimeInstallCommand {
                         verbose: self.verbose,
                         source_environment: true,
                         interactive: false,
-                        repo_url: repo_url.clone(),
-                        repo_release: repo_release.clone(),
+                        repo_url: repo_url.cloned(),
+                        repo_release: repo_release.cloned(),
                         container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
-                        runs_on: self.runs_on.clone(),
-                        nfs_port: self.nfs_port,
+                        // runs_on handled by shared context
                         ..Default::default()
                     };
 
-                    container_helper.run_in_container(run_config).await?;
+                    run_container_command(container_helper, run_config, runs_on_context).await?;
 
                     if self.verbose {
                         print_info(
@@ -249,6 +303,7 @@ impl RuntimeInstallCommand {
         merged_container_args: &Option<Vec<String>>,
         lock_file: &mut LockFile,
         src_dir: &Path,
+        runs_on_context: Option<&RunsOnContext>,
     ) -> Result<bool> {
         // Get runtime configuration
         let runtime_config = config_toml["runtime"][runtime].clone();
@@ -281,11 +336,11 @@ impl RuntimeInstallCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
-        let installroot_exists = container_helper.run_in_container(run_config).await?;
+        let installroot_exists =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if !installroot_exists {
             // Create the installroot
@@ -300,11 +355,11 @@ impl RuntimeInstallCommand {
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
-            let success = container_helper.run_in_container(run_config).await?;
+            let success =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
 
             if success {
                 print_success(
@@ -442,11 +497,11 @@ $DNF_SDK_HOST \
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                    runs_on: self.runs_on.clone(),
-                    nfs_port: self.nfs_port,
+                    // runs_on handled by shared context
                     ..Default::default()
                 };
-                let success = container_helper.run_in_container(run_config).await?;
+                let success =
+                    run_container_command(container_helper, run_config, runs_on_context).await?;
 
                 if !success {
                     print_error(
@@ -507,6 +562,21 @@ $DNF_SDK_HOST \
         }
 
         Ok(true)
+    }
+}
+
+/// Helper function to run a container command, using shared context if available
+async fn run_container_command(
+    container_helper: &SdkContainer,
+    config: RunConfig,
+    runs_on_context: Option<&RunsOnContext>,
+) -> Result<bool> {
+    if let Some(context) = runs_on_context {
+        container_helper
+            .run_in_container_with_context(&config, context)
+            .await
+    } else {
+        container_helper.run_in_container(config).await
     }
 }
 

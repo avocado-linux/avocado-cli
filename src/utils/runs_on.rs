@@ -460,13 +460,34 @@ impl RunsOnContext {
         self.ssh.run_command_interactive(&docker_cmd).await
     }
 
+    /// Check if the context is still active (not yet torn down)
+    pub fn is_active(&self) -> bool {
+        self.nfs_server.is_some()
+    }
+
+    /// Get the remote host
+    pub fn remote_host(&self) -> &RemoteHost {
+        &self.remote_host
+    }
+
     /// Clean up all resources
     ///
     /// This will:
     /// - Remove NFS-backed volumes from remote
     /// - Close SSH tunnel (if any)
     /// - Stop NFS server
-    pub async fn teardown(mut self) -> Result<()> {
+    ///
+    /// After calling this method, the context should not be used for running commands.
+    /// This method can be called multiple times safely (subsequent calls are no-ops).
+    pub async fn teardown(&mut self) -> Result<()> {
+        // If already torn down, return early
+        if !self.is_active()
+            && self.remote_src_volume.is_none()
+            && self.remote_state_volume.is_none()
+        {
+            return Ok(());
+        }
+
         println!();
         print_info("🧹 Cleaning up remote resources...", OutputLevel::Normal);
 
@@ -478,7 +499,7 @@ impl RunsOnContext {
 
         // Remove remote helper script
         #[cfg(unix)]
-        if let Some(ref helper_path) = self.remote_helper_script {
+        if let Some(helper_path) = self.remote_helper_script.take() {
             let _ = self
                 .ssh
                 .run_command(&format!("rm -f {}", helper_path))
@@ -493,26 +514,26 @@ impl RunsOnContext {
 
         let mut cleanup_errors = Vec::new();
 
-        if let Some(ref volume) = self.remote_src_volume {
+        if let Some(volume) = self.remote_src_volume.take() {
             if self.verbose {
                 print_info(
                     &format!("Removing remote volume: {}", volume),
                     OutputLevel::Normal,
                 );
             }
-            if let Err(e) = remote_vm.remove_volume(volume).await {
+            if let Err(e) = remote_vm.remove_volume(&volume).await {
                 cleanup_errors.push(format!("Failed to remove {}: {}", volume, e));
             }
         }
 
-        if let Some(ref volume) = self.remote_state_volume {
+        if let Some(volume) = self.remote_state_volume.take() {
             if self.verbose {
                 print_info(
                     &format!("Removing remote volume: {}", volume),
                     OutputLevel::Normal,
                 );
             }
-            if let Err(e) = remote_vm.remove_volume(volume).await {
+            if let Err(e) = remote_vm.remove_volume(&volume).await {
                 cleanup_errors.push(format!("Failed to remove {}: {}", volume, e));
             }
         }

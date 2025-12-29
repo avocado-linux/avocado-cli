@@ -190,6 +190,55 @@ impl SdkContainer {
         Ok(Self::new().with_src_dir(src_dir))
     }
 
+    /// Create a shared RunsOnContext for running multiple commands on a remote host
+    ///
+    /// This sets up the NFS server and remote volumes once, which can then be reused
+    /// for multiple container invocations via `run_in_container_with_context()`.
+    ///
+    /// The caller is responsible for calling `context.teardown()` when done.
+    ///
+    /// # Arguments
+    /// * `runs_on` - Remote host specification (user@host)
+    /// * `nfs_port` - Optional specific NFS port (None = auto-select)
+    /// * `container_image` - SDK container image to use
+    /// * `verbose` - Enable verbose output
+    ///
+    /// # Returns
+    /// A `RunsOnContext` that can be reused for multiple container commands
+    pub async fn create_runs_on_context(
+        &self,
+        runs_on: &str,
+        nfs_port: Option<u16>,
+        container_image: &str,
+        verbose: bool,
+    ) -> Result<crate::utils::runs_on::RunsOnContext> {
+        use crate::utils::runs_on::RunsOnContext;
+
+        // Get or create local docker volume (we need this to export via NFS)
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
+
+        print_info(
+            &format!("Setting up remote execution on {}...", runs_on),
+            OutputLevel::Normal,
+        );
+
+        // Setup remote execution context
+        RunsOnContext::setup(
+            runs_on,
+            nfs_port,
+            src_dir,
+            &volume_state.volume_name,
+            &self.container_tool,
+            container_image,
+            verbose || self.verbose,
+        )
+        .await
+        .context("Failed to setup remote execution context")
+    }
+
     /// Run a command in the container
     pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
         // Check if we should run on a remote host
@@ -271,6 +320,9 @@ impl SdkContainer {
     }
 
     /// Run a command in a container on a remote host via NFS
+    ///
+    /// This creates a new RunsOnContext for each call. For running multiple
+    /// commands with a shared context, use `run_in_container_with_context()`.
     async fn run_in_container_remote(&self, config: &RunConfig, runs_on: &str) -> Result<bool> {
         use crate::utils::runs_on::RunsOnContext;
 
@@ -304,6 +356,53 @@ impl SdkContainer {
             let _ = context.setup_signing_tunnel(socket_path).await;
         }
 
+        // Run the command using the shared implementation
+        let result = self
+            .execute_remote_command(&context, config)
+            .await
+            .context("Remote container execution failed");
+
+        // Always cleanup, even on error
+        if let Err(e) = context.teardown().await {
+            print_error(
+                &format!("Warning: Failed to cleanup remote resources: {}", e),
+                OutputLevel::Normal,
+            );
+        }
+
+        result
+    }
+
+    /// Run a command in a container on a remote host using a shared RunsOnContext
+    ///
+    /// This method allows reusing the same NFS server and remote volumes across
+    /// multiple container invocations, which is significantly faster than creating
+    /// a new context for each call.
+    ///
+    /// The caller is responsible for calling `context.teardown()` when done.
+    pub async fn run_in_container_with_context(
+        &self,
+        config: &RunConfig,
+        context: &crate::utils::runs_on::RunsOnContext,
+    ) -> Result<bool> {
+        if !context.is_active() {
+            anyhow::bail!("RunsOnContext is not active (already torn down)");
+        }
+
+        self.execute_remote_command(context, config)
+            .await
+            .context("Remote container execution failed")
+    }
+
+    /// Execute a command on a remote host using an existing RunsOnContext
+    ///
+    /// This is the shared implementation used by both `run_in_container_remote`
+    /// and `run_in_container_with_context`.
+    async fn execute_remote_command(
+        &self,
+        context: &crate::utils::runs_on::RunsOnContext,
+        config: &RunConfig,
+    ) -> Result<bool> {
         // Build environment variables
         let mut env_vars = config.env_vars.clone().unwrap_or_default();
 
@@ -391,12 +490,15 @@ impl SdkContainer {
         let extra_args_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
 
         print_info(
-            &format!("Running command on remote host {}...", runs_on),
+            &format!(
+                "Running command on remote host {}...",
+                context.remote_host().ssh_target()
+            ),
             OutputLevel::Normal,
         );
 
         // Run the container on the remote
-        let result = context
+        context
             .run_container_command(
                 &config.container_image,
                 &full_command,
@@ -406,17 +508,7 @@ impl SdkContainer {
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>(),
             )
-            .await;
-
-        // Always cleanup, even on error
-        if let Err(e) = context.teardown().await {
-            print_error(
-                &format!("Warning: Failed to cleanup remote resources: {}", e),
-                OutputLevel::Normal,
-            );
-        }
-
-        result.context("Remote container execution failed")
+            .await
     }
 
     /// Build the complete container command

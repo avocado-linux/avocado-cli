@@ -5,6 +5,7 @@ use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
     compute_ext_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
@@ -185,6 +186,62 @@ impl ExtInstallCommand {
 
         // Use the container helper to run the setup commands
         let container_helper = SdkContainer::new().verbose(self.verbose);
+
+        // Create shared RunsOnContext if running on remote host
+        let mut runs_on_context: Option<RunsOnContext> = if let Some(ref runs_on) = self.runs_on {
+            Some(
+                container_helper
+                    .create_runs_on_context(runs_on, self.nfs_port, container_image, self.verbose)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        // Execute the installation and ensure cleanup
+        let result = self
+            .execute_install_internal(
+                config,
+                parsed,
+                &extensions_to_install,
+                &container_helper,
+                container_image,
+                &target,
+                repo_url.as_ref(),
+                repo_release.as_ref(),
+                &merged_container_args,
+                runs_on_context.as_ref(),
+            )
+            .await;
+
+        // Always teardown the context if it was created
+        if let Some(ref mut context) = runs_on_context {
+            if let Err(e) = context.teardown().await {
+                print_error(
+                    &format!("Warning: Failed to cleanup remote resources: {}", e),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Internal implementation of the install logic
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_install_internal(
+        &self,
+        config: &Config,
+        parsed: &serde_yaml::Value,
+        extensions_to_install: &[(String, ExtensionLocation)],
+        container_helper: &SdkContainer,
+        container_image: &str,
+        target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+    ) -> Result<()> {
         let total = extensions_to_install.len();
 
         // Load lock file for reproducible builds
@@ -234,15 +291,16 @@ impl ExtInstallCommand {
                     config,
                     ext_name,
                     &ext_config_path,
-                    &container_helper,
+                    container_helper,
                     container_image,
-                    &target,
-                    repo_url.as_ref(),
-                    repo_release.as_ref(),
-                    &merged_container_args,
+                    target,
+                    repo_url,
+                    repo_release,
+                    merged_container_args,
                     config.get_sdk_disable_weak_dependencies(),
                     &mut lock_file,
                     &src_dir,
+                    runs_on_context,
                 )
                 .await?
             {
@@ -253,26 +311,25 @@ impl ExtInstallCommand {
             if !self.no_stamps {
                 let inputs = compute_ext_input_hash(parsed, ext_name)?;
                 let outputs = StampOutputs::default();
-                let stamp = Stamp::ext_install(ext_name, &target, inputs, outputs);
+                let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;
 
                 let run_config = RunConfig {
                     container_image: container_image.to_string(),
-                    target: target.clone(),
+                    target: target.to_string(),
                     command: stamp_script,
                     verbose: self.verbose,
                     source_environment: true,
                     interactive: false,
-                    repo_url: repo_url.clone(),
-                    repo_release: repo_release.clone(),
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
-                    runs_on: self.runs_on.clone(),
-                    nfs_port: self.nfs_port,
+                    // runs_on handled by shared context
                     ..Default::default()
                 };
 
-                container_helper.run_in_container(run_config).await?;
+                run_container_command(container_helper, run_config, runs_on_context).await?;
 
                 if self.verbose {
                     print_info(
@@ -308,6 +365,7 @@ impl ExtInstallCommand {
         disable_weak_dependencies: bool,
         lock_file: &mut LockFile,
         src_dir: &Path,
+        runs_on_context: Option<&RunsOnContext>,
     ) -> Result<bool> {
         // Create the commands to check and set up the directory structure
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
@@ -327,11 +385,11 @@ impl ExtInstallCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
-        let sysroot_exists = container_helper.run_in_container(run_config).await?;
+        let sysroot_exists =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if !sysroot_exists {
             // Create the sysroot
@@ -346,11 +404,11 @@ impl ExtInstallCommand {
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
-            let success = container_helper.run_in_container(run_config).await?;
+            let success =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
 
             if success {
                 print_success(
@@ -552,11 +610,11 @@ $DNF_SDK_HOST \
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     disable_weak_dependencies,
-                    runs_on: self.runs_on.clone(),
-                    nfs_port: self.nfs_port,
+                    // runs_on handled by shared context
                     ..Default::default()
                 };
-                let install_success = container_helper.run_in_container(run_config).await?;
+                let install_success =
+                    run_container_command(container_helper, run_config, runs_on_context).await?;
 
                 if !install_success {
                     print_error(
@@ -606,5 +664,20 @@ $DNF_SDK_HOST \
         }
 
         Ok(true)
+    }
+}
+
+/// Helper function to run a container command, using shared context if available
+async fn run_container_command(
+    container_helper: &SdkContainer,
+    config: RunConfig,
+    runs_on_context: Option<&RunsOnContext>,
+) -> Result<bool> {
+    if let Some(context) = runs_on_context {
+        container_helper
+            .run_in_container_with_context(&config, context)
+            .await
+    } else {
+        container_helper.run_in_container(config).await
     }
 }

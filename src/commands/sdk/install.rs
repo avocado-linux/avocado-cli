@@ -8,7 +8,8 @@ use crate::utils::{
     config::Config,
     container::{RunConfig, SdkContainer},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
-    output::{print_info, print_success, OutputLevel},
+    output::{print_error, print_info, print_success, OutputLevel},
+    runs_on::RunsOnContext,
     stamps::{
         compute_sdk_input_hash, generate_write_sdk_stamp_script_dynamic_arch,
         generate_write_stamp_script, get_local_arch, Stamp, StampOutputs,
@@ -123,6 +124,64 @@ impl SdkInstallCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
+        // Create shared RunsOnContext if running on remote host
+        // This allows reusing the NFS server and volumes for all container runs
+        let mut runs_on_context: Option<RunsOnContext> = if let Some(ref runs_on) = self.runs_on {
+            Some(
+                container_helper
+                    .create_runs_on_context(runs_on, self.nfs_port, container_image, self.verbose)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        // Execute the main installation logic, ensuring cleanup on error
+        let result = self
+            .execute_install(
+                config,
+                &composed,
+                &target,
+                container_image,
+                &sdk_dependencies,
+                &extension_sdk_dependencies,
+                repo_url.as_deref(),
+                repo_release.as_deref(),
+                &container_helper,
+                merged_container_args.as_ref(),
+                runs_on_context.as_ref(),
+            )
+            .await;
+
+        // Always teardown the context if it was created
+        if let Some(ref mut context) = runs_on_context {
+            if let Err(e) = context.teardown().await {
+                print_error(
+                    &format!("Warning: Failed to cleanup remote resources: {}", e),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Internal implementation of the install logic
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_install(
+        &self,
+        config: &Config,
+        composed: &crate::utils::config::ComposedConfig,
+        target: &str,
+        container_image: &str,
+        sdk_dependencies: &Option<HashMap<String, serde_yaml::Value>>,
+        extension_sdk_dependencies: &HashMap<String, HashMap<String, serde_yaml::Value>>,
+        repo_url: Option<&str>,
+        repo_release: Option<&str>,
+        container_helper: &SdkContainer,
+        merged_container_args: Option<&Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+    ) -> Result<()> {
         // Load lock file for reproducible builds
         let src_dir = config
             .get_resolved_src_dir(&self.config_path)
@@ -293,22 +352,22 @@ MACROS_EOF
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target.clone(),
+            target: target.to_string(),
             command: sdk_init_command.to_string(),
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
 
-        let init_success = container_helper.run_in_container(run_config).await?;
+        let init_success =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if init_success {
             print_success("Initialized SDK environment.", OutputLevel::Normal);
@@ -330,7 +389,7 @@ MACROS_EOF
             .unwrap_or("*");
         let sdk_target_pkg = build_package_spec_with_lock(
             &lock_file,
-            &target,
+            target,
             &SysrootType::Sdk,
             &sdk_target_pkg_name,
             sdk_target_config_version,
@@ -352,22 +411,22 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target.clone(),
+            target: target.to_string(),
             command: sdk_target_command,
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
 
-        let sdk_target_success = container_helper.run_in_container(run_config).await?;
+        let sdk_target_success =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
         // Track all SDK packages installed for lock file update at the end
         let mut all_sdk_package_names: Vec<String> = Vec::new();
@@ -398,22 +457,21 @@ $DNF_SDK_HOST \
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target.clone(),
+            target: target.to_string(),
             command: check_update_command.to_string(),
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
 
-        container_helper.run_in_container(run_config).await?;
+        run_container_command(container_helper, run_config, runs_on_context).await?;
 
         // Install avocado-sdk-bootstrap with version from distro.version
         print_info("Installing SDK bootstrap.", OutputLevel::Normal);
@@ -425,7 +483,7 @@ $DNF_SDK_HOST \
             .unwrap_or("*");
         let bootstrap_pkg = build_package_spec_with_lock(
             &lock_file,
-            &target,
+            target,
             &SysrootType::Sdk,
             bootstrap_pkg_name,
             bootstrap_config_version,
@@ -447,22 +505,22 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target.clone(),
+            target: target.to_string(),
             command: bootstrap_command,
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
 
-        let bootstrap_success = container_helper.run_in_container(run_config).await?;
+        let bootstrap_success =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if bootstrap_success {
             print_success("Installed SDK bootstrap.", OutputLevel::Normal);
@@ -499,22 +557,21 @@ fi
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target.clone(),
+            target: target.to_string(),
             command: env_setup_command.to_string(),
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
 
-        container_helper.run_in_container(run_config).await?;
+        run_container_command(container_helper, run_config, runs_on_context).await?;
 
         // Install SDK dependencies (into SDK)
         let mut sdk_packages = Vec::new();
@@ -525,14 +582,14 @@ fi
             sdk_packages.extend(self.build_package_list_with_lock(
                 dependencies,
                 &lock_file,
-                &target,
+                target,
                 &SysrootType::Sdk,
             ));
             sdk_package_names.extend(self.extract_package_names(dependencies));
         }
 
         // Add extension SDK dependencies to the package list
-        for (ext_name, ext_deps) in &extension_sdk_dependencies {
+        for (ext_name, ext_deps) in extension_sdk_dependencies {
             if self.verbose {
                 print_info(
                     &format!("Adding SDK dependencies from extension '{ext_name}'"),
@@ -540,7 +597,7 @@ fi
                 );
             }
             let ext_packages =
-                self.build_package_list_with_lock(ext_deps, &lock_file, &target, &SysrootType::Sdk);
+                self.build_package_list_with_lock(ext_deps, &lock_file, target, &SysrootType::Sdk);
             sdk_packages.extend(ext_packages);
             sdk_package_names.extend(self.extract_package_names(ext_deps));
         }
@@ -574,21 +631,21 @@ $DNF_SDK_HOST \
             // Use the container helper's run_in_container method
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
-                target: target.clone(),
+                target: target.to_string(),
                 command,
                 verbose: self.verbose,
                 source_environment: true,
                 interactive: !self.force,
-                repo_url: repo_url.clone(),
-                repo_release: repo_release.clone(),
-                container_args: merged_container_args.clone(),
+                repo_url: repo_url.map(|s| s.to_string()),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
-            let install_success = container_helper.run_in_container(run_config).await?;
+            let install_success =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
 
             if install_success {
                 print_success("Installed SDK dependencies.", OutputLevel::Normal);
@@ -609,15 +666,15 @@ $DNF_SDK_HOST \
                     &SysrootType::Sdk,
                     &all_sdk_package_names,
                     container_image,
-                    &target,
-                    repo_url.clone(),
-                    repo_release.clone(),
-                    merged_container_args.clone(),
+                    target,
+                    repo_url.map(|s| s.to_string()),
+                    repo_release.map(|s| s.to_string()),
+                    merged_container_args.cloned(),
                 )
                 .await?;
 
             if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(&target, &SysrootType::Sdk, installed_versions);
+                lock_file.update_sysroot_versions(target, &SysrootType::Sdk, installed_versions);
                 if self.verbose {
                     print_info(
                         &format!(
@@ -642,7 +699,7 @@ $DNF_SDK_HOST \
             .unwrap_or("*");
         let rootfs_pkg = build_package_spec_with_lock(
             &lock_file,
-            &target,
+            target,
             &SysrootType::Rootfs,
             rootfs_base_pkg,
             rootfs_config_version,
@@ -666,22 +723,22 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target.clone(),
+            target: target.to_string(),
             command: rootfs_command,
             verbose: self.verbose,
             source_environment: false,
             interactive: !self.force,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
 
-        let rootfs_success = container_helper.run_in_container(run_config).await?;
+        let rootfs_success =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if rootfs_success {
             print_success("Installed rootfs sysroot.", OutputLevel::Normal);
@@ -692,16 +749,16 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     &SysrootType::Rootfs,
                     &[rootfs_base_pkg.to_string()],
                     container_image,
-                    &target,
-                    repo_url.clone(),
-                    repo_release.clone(),
-                    merged_container_args.clone(),
+                    target,
+                    repo_url.map(|s| s.to_string()),
+                    repo_release.map(|s| s.to_string()),
+                    merged_container_args.cloned(),
                 )
                 .await?;
 
             if !installed_versions.is_empty() {
                 lock_file.update_sysroot_versions(
-                    &target,
+                    target,
                     &SysrootType::Rootfs,
                     installed_versions,
                 );
@@ -729,7 +786,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 let packages = self.build_package_list_with_lock(
                     dependencies,
                     &lock_file,
-                    &target,
+                    target,
                     &SysrootType::TargetSysroot,
                 );
                 all_compile_packages.extend(packages);
@@ -765,7 +822,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 .unwrap_or("*");
             let target_sysroot_pkg = build_package_spec_with_lock(
                 &lock_file,
-                &target,
+                target,
                 &SysrootType::TargetSysroot,
                 target_sysroot_base_pkg,
                 target_sysroot_config_version,
@@ -789,22 +846,22 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
-                target: target.clone(),
+                target: target.to_string(),
                 command,
                 verbose: self.verbose,
                 source_environment: false, // Don't source environment - matches rootfs install behavior
                 interactive: !self.force,
-                repo_url: repo_url.clone(),
-                repo_release: repo_release.clone(),
-                container_args: merged_container_args.clone(),
+                repo_url: repo_url.map(|s| s.to_string()),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
 
-            let install_success = container_helper.run_in_container(run_config).await?;
+            let install_success =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
 
             if install_success {
                 print_success(
@@ -821,16 +878,16 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         &SysrootType::TargetSysroot,
                         &packages_to_query,
                         container_image,
-                        &target,
-                        repo_url.clone(),
-                        repo_release.clone(),
-                        merged_container_args.clone(),
+                        target,
+                        repo_url.map(|s| s.to_string()),
+                        repo_release.map(|s| s.to_string()),
+                        merged_container_args.cloned(),
                     )
                     .await?;
 
                 if !installed_versions.is_empty() {
                     lock_file.update_sysroot_versions(
-                        &target,
+                        target,
                         &SysrootType::TargetSysroot,
                         installed_versions,
                     );
@@ -873,22 +930,21 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
-                target: target.clone(),
+                target: target.to_string(),
                 command: stamp_script,
                 verbose: self.verbose,
                 source_environment: true,
                 interactive: false,
-                repo_url: repo_url.clone(),
-                repo_release: repo_release.clone(),
-                container_args: merged_container_args.clone(),
+                repo_url: repo_url.map(|s| s.to_string()),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
 
-            container_helper.run_in_container(run_config).await?;
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
             if self.verbose {
                 print_info("Wrote SDK install stamp.", OutputLevel::Normal);
@@ -934,6 +990,23 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         dependencies: &HashMap<String, serde_yaml::Value>,
     ) -> Vec<String> {
         dependencies.keys().cloned().collect()
+    }
+}
+
+/// Helper function to run a container command, using shared context if available
+async fn run_container_command(
+    container_helper: &SdkContainer,
+    config: RunConfig,
+    runs_on_context: Option<&RunsOnContext>,
+) -> Result<bool> {
+    if let Some(context) = runs_on_context {
+        // Use the shared context - don't set runs_on in config as we're handling it
+        container_helper
+            .run_in_container_with_context(&config, context)
+            .await
+    } else {
+        // No shared context - use regular execution (may create its own context if runs_on is set)
+        container_helper.run_in_container(config).await
     }
 }
 

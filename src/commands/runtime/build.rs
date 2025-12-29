@@ -1,7 +1,8 @@
 use crate::utils::{
     config::load_config,
     container::{RunConfig, SdkContainer},
-    output::{print_info, print_success, OutputLevel},
+    output::{print_error, print_info, print_success, OutputLevel},
+    runs_on::RunsOnContext,
     stamps::{
         compute_runtime_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
         resolve_required_stamps_for_runtime_build, validate_stamps_batch, Stamp, StampOutputs,
@@ -99,13 +100,66 @@ impl RuntimeBuildCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
 
+        // Create shared RunsOnContext if running on remote host
+        let mut runs_on_context: Option<RunsOnContext> = if let Some(ref runs_on) = self.runs_on {
+            Some(
+                container_helper
+                    .create_runs_on_context(runs_on, self.nfs_port, container_image, self.verbose)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        // Execute the build and ensure cleanup
+        let result = self
+            .execute_build_internal(
+                &config,
+                &parsed,
+                container_image,
+                &target_arch,
+                &merged_container_args,
+                repo_url.as_ref(),
+                repo_release.as_ref(),
+                &container_helper,
+                runs_on_context.as_ref(),
+            )
+            .await;
+
+        // Always teardown the context if it was created
+        if let Some(ref mut context) = runs_on_context {
+            if let Err(e) = context.teardown().await {
+                print_error(
+                    &format!("Warning: Failed to cleanup remote resources: {}", e),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Internal implementation of the build logic
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_build_internal(
+        &self,
+        config: &crate::utils::config::Config,
+        parsed: &serde_yaml::Value,
+        container_image: &str,
+        target_arch: &str,
+        merged_container_args: &Option<Vec<String>>,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        container_helper: &SdkContainer,
+        runs_on_context: Option<&RunsOnContext>,
+    ) -> Result<()> {
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             // Get detailed extension dependencies for this runtime
             // This distinguishes between local, external, and versioned extensions
             let ext_deps = config.get_runtime_extension_dependencies_detailed(
                 &self.runtime_name,
-                &target_arch,
+                target_arch,
                 &self.config_path,
             )?;
 
@@ -118,17 +172,16 @@ impl RuntimeBuildCommand {
             let batch_script = generate_batch_read_stamps_script(&required);
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
-                target: target_arch.clone(),
+                target: target_arch.to_string(),
                 command: batch_script,
                 verbose: false,
                 source_environment: true,
                 interactive: false,
-                repo_url: repo_url.clone(),
-                repo_release: repo_release.clone(),
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
 
@@ -156,10 +209,10 @@ impl RuntimeBuildCommand {
         // This ensures the build scripts know exactly which extension versions to use
         let resolved_extensions = self
             .collect_runtime_extensions(
-                &parsed,
-                &config,
+                parsed,
+                config,
                 &self.runtime_name,
-                target_arch.as_str(),
+                target_arch,
                 &self.config_path,
                 container_image,
                 merged_container_args.clone(),
@@ -167,7 +220,7 @@ impl RuntimeBuildCommand {
             .await?;
 
         // Build var image
-        let build_script = self.create_build_script(&parsed, &target_arch, &resolved_extensions)?;
+        let build_script = self.create_build_script(parsed, target_arch, &resolved_extensions)?;
 
         if self.verbose {
             print_info(
@@ -194,7 +247,7 @@ impl RuntimeBuildCommand {
 
         if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
-            &target_arch,
+            target_arch,
             &self.config_path,
         )? {
             env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
@@ -203,7 +256,7 @@ impl RuntimeBuildCommand {
         // Get stone manifest if configured
         if let Some(stone_manifest) = config.get_stone_manifest_for_runtime(
             &self.runtime_name,
-            &target_arch,
+            target_arch,
             &self.config_path,
         )? {
             env_vars.insert("AVOCADO_STONE_MANIFEST".to_string(), stone_manifest);
@@ -231,22 +284,20 @@ impl RuntimeBuildCommand {
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
-            target: target_arch.clone(),
+            target: target_arch.to_string(),
             command: build_script,
             verbose: self.verbose,
             source_environment: true, // need environment for build
             interactive: false,       // build script runs non-interactively
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             env_vars,
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             ..Default::default()
         };
-        let complete_result = container_helper
-            .run_in_container(run_config)
+        let complete_result = run_container_command(container_helper, run_config, runs_on_context)
             .await
             .context("Failed to build complete image")?;
 
@@ -262,30 +313,29 @@ impl RuntimeBuildCommand {
         // Write runtime build stamp (unless --no-stamps)
         if !self.no_stamps {
             let merged_runtime = config
-                .get_merged_runtime_config(&self.runtime_name, &target_arch, &self.config_path)?
+                .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
                 .unwrap_or_default();
             let inputs = compute_runtime_input_hash(&merged_runtime, &self.runtime_name)?;
             let outputs = StampOutputs::default();
-            let stamp = Stamp::runtime_build(&self.runtime_name, &target_arch, inputs, outputs);
+            let stamp = Stamp::runtime_build(&self.runtime_name, target_arch, inputs, outputs);
             let stamp_script = generate_write_stamp_script(&stamp)?;
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
-                target: target_arch.clone(),
+                target: target_arch.to_string(),
                 command: stamp_script,
                 verbose: self.verbose,
                 source_environment: true,
                 interactive: false,
-                repo_url: repo_url.clone(),
-                repo_release: repo_release.clone(),
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
+                // runs_on handled by shared context
                 ..Default::default()
             };
 
-            container_helper.run_in_container(run_config).await?;
+            run_container_command(container_helper, run_config, runs_on_context).await?;
 
             if self.verbose {
                 print_info(
@@ -878,8 +928,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
+            // runs_on handled by shared context
             container_args,
             ..Default::default()
         };
@@ -909,6 +958,21 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
                     Extension may not be installed yet. Run 'avocado install' first."
             )),
         }
+    }
+}
+
+/// Helper function to run a container command, using shared context if available
+async fn run_container_command(
+    container_helper: &SdkContainer,
+    config: RunConfig,
+    runs_on_context: Option<&RunsOnContext>,
+) -> Result<bool> {
+    if let Some(context) = runs_on_context {
+        container_helper
+            .run_in_container_with_context(&config, context)
+            .await
+    } else {
+        container_helper.run_in_container(config).await
     }
 }
 
