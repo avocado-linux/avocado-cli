@@ -387,11 +387,16 @@ impl RemoteVolumeManager {
         nfs_port: u16,
         export_path: &str,
     ) -> Result<()> {
+        // Mount options:
+        // - actimeo=3: Short attribute cache timeout (3 seconds) for fresher metadata
+        // - lookupcache=positive: Only cache successful lookups, not failures
+        // These help with stale handle issues from Docker Desktop's VirtioFS
+        // while maintaining reasonable performance
         let command = format!(
             "{} volume create \
              --driver local \
              --opt type=nfs \
-             --opt o=addr={},rw,nfsvers=4,port={} \
+             --opt o=addr={},rw,nfsvers=4,port={},actimeo=3,lookupcache=positive \
              --opt device=:{} \
              {}",
             self.container_tool, nfs_host, nfs_port, export_path, volume_name

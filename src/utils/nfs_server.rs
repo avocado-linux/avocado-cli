@@ -135,8 +135,8 @@ NFS_Core_Param {{
   Nb_Max_Fd = 65536;
   Max_Open_Files = 10000;
   DRC_Max_Size = 32768;
-  # Reduce attribute cache time for fresher file metadata during builds
-  Attr_Expiration_Time = 10;
+  # Short attribute cache for fresher file metadata during builds
+  Attr_Expiration_Time = 3;
   # Single-client use case doesn't need many workers
   Nb_Worker = 32;
   Bind_addr = {};
@@ -149,6 +149,8 @@ NFSV4 {{
   Lease_Lifetime = 30;
   Allow_Numeric_Owners = true;
   Only_Numeric_Owners = true;
+  # Disable delegations to prevent stale handle issues with VirtioFS
+  Delegations = false;
 }}
 
 # Defaults that all EXPORT{{}} blocks inherit unless they override
