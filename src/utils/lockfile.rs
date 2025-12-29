@@ -96,7 +96,7 @@ impl SysrootType {
                 // Target-sysroot: same approach as rootfs - unset config and use --root
                 rpm_etcconfigdir: None,
                 rpm_configdir: None,
-                root_path: Some("$AVOCADO_SDK_PREFIX/target-sysroot".to_string()),
+                root_path: Some("$AVOCADO_PREFIX/sdk/target-sysroot".to_string()),
             },
             SysrootType::Extension(name) => RpmQueryConfig {
                 // Local/external extensions use ext-rpm-config-scripts
@@ -993,7 +993,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         assert!(target_config.rpm_configdir.is_none());
         assert_eq!(
             target_config.root_path,
-            Some("$AVOCADO_SDK_PREFIX/target-sysroot".to_string())
+            Some("$AVOCADO_PREFIX/sdk/target-sysroot".to_string())
         );
     }
 

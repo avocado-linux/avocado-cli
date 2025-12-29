@@ -135,13 +135,18 @@ NFS_Core_Param {{
   Nb_Max_Fd = 65536;
   Max_Open_Files = 10000;
   DRC_Max_Size = 32768;
-  Attr_Expiration_Time = 60;
-  Nb_Worker = 256;
+  # Reduce attribute cache time for fresher file metadata during builds
+  Attr_Expiration_Time = 10;
+  # Single-client use case doesn't need many workers
+  Nb_Worker = 32;
   Bind_addr = {};
 }}
 
 NFSV4 {{
-  Graceless = false;
+  # Skip grace period - we're a fresh server with no prior client state to recover
+  Graceless = true;
+  # Shorter lease for faster client issue detection
+  Lease_Lifetime = 30;
   Allow_Numeric_Owners = true;
   Only_Numeric_Owners = true;
 }}
@@ -439,9 +444,42 @@ impl NfsServer {
             );
         }
 
-        // Give Ganesha time to fully initialize and load exports
-        // 2 seconds is more reliable, especially on slower systems or with many exports
-        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+        // Wait for Ganesha to be ready by polling the port
+        // This is faster than a static sleep on systems where ganesha starts quickly
+        let max_wait = tokio::time::Duration::from_millis(2000);
+        let poll_interval = tokio::time::Duration::from_millis(100);
+        let start = std::time::Instant::now();
+
+        loop {
+            // Try to connect to the NFS port to check if ganesha is listening
+            match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", config.port)).await {
+                Ok(_) => {
+                    if config.verbose {
+                        print_info(
+                            &format!(
+                                "NFS server ready after {}ms",
+                                start.elapsed().as_millis()
+                            ),
+                            OutputLevel::Verbose,
+                        );
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if start.elapsed() >= max_wait {
+                        // Timeout - continue anyway and let the container check handle failures
+                        if config.verbose {
+                            print_info(
+                                "NFS server port check timed out, continuing...",
+                                OutputLevel::Verbose,
+                            );
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        }
 
         // Verify container is running
         let check_output = AsyncCommand::new(container_tool)

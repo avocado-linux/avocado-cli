@@ -1129,7 +1129,7 @@ export AVOCADO_SDK_ARCH="$(uname -m)"
 export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
 export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
-export DNF_SDK_TARGET_PREFIX="${{AVOCADO_SDK_PREFIX}}/target-repoconf"
+export DNF_SDK_TARGET_PREFIX="${{AVOCADO_PREFIX}}/sdk/target-repoconf"
 export DNF_SDK_HOST="\
 dnf \
 --releasever="$REPO_RELEASE" \
@@ -1164,7 +1164,7 @@ export DNF_SDK_TARGET_REPO_CONF="\
 
 mkdir -p /etc/dnf/vars
 mkdir -p ${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars
-mkdir -p ${{AVOCADO_SDK_PREFIX}}/target-repoconf/etc/dnf/vars
+mkdir -p ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars
 
 echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url
@@ -1300,7 +1300,7 @@ export AVOCADO_SDK_ARCH="$(uname -m)"
 export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
 export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
-export DNF_SDK_TARGET_PREFIX="${{AVOCADO_SDK_PREFIX}}/target-repoconf"
+export DNF_SDK_TARGET_PREFIX="${{AVOCADO_PREFIX}}/sdk/target-repoconf"
 export DNF_SDK_HOST="\
 dnf \
 --releasever="$REPO_RELEASE" \
@@ -1335,7 +1335,7 @@ export DNF_SDK_TARGET_REPO_CONF="\
 
 mkdir -p /etc/dnf/vars
 mkdir -p ${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars
-mkdir -p ${{AVOCADO_SDK_PREFIX}}/target-repoconf/etc/dnf/vars
+mkdir -p ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars
 
 echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url

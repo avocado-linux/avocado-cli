@@ -757,11 +757,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 .await?;
 
             if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(
-                    target,
-                    &SysrootType::Rootfs,
-                    installed_versions,
-                );
+                lock_file.update_sysroot_versions(target, &SysrootType::Rootfs, installed_versions);
                 if self.verbose {
                     print_info(
                         "Updated lock file with rootfs package version.",
@@ -835,7 +831,7 @@ unset RPM_CONFIGDIR
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
-    {} {} --installroot ${{AVOCADO_SDK_PREFIX}}/target-sysroot \
+    {} {} --installroot ${{AVOCADO_PREFIX}}/sdk/target-sysroot \
     install {} {}
 "#,
                 dnf_args_str,

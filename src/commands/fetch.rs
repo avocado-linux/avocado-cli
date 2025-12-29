@@ -559,7 +559,7 @@ $DNF_SDK_HOST \
         print_info("Fetching SDK target sysroot metadata", OutputLevel::Normal);
 
         // Check if SDK target sysroot exists
-        let check_command = "[ -d $AVOCADO_SDK_PREFIX/target-sysroot ]";
+        let check_command = "[ -d $AVOCADO_PREFIX/sdk/target-sysroot ]";
         let run_config = RunConfig {
             container_image: container_config.image.to_string(),
             target: container_config.target_arch.to_string(),
@@ -595,7 +595,7 @@ RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_TARGET_REPO_CONF \
     --setopt=sslcacert=${{SSL_CERT_FILE}} \
-    --installroot=$AVOCADO_SDK_PREFIX/target-sysroot \
+    --installroot=$AVOCADO_PREFIX/sdk/target-sysroot \
     {dnf_args_str} \
     makecache
 "#
