@@ -1997,6 +1997,20 @@ impl Config {
         compile_deps
     }
 
+    /// Check if there are any compile sections defined (regardless of whether they have dependencies)
+    ///
+    /// This is used to determine if the target-sysroot should be installed.
+    /// The target-sysroot is needed whenever there's any sdk.compile.<name> section,
+    /// even if it doesn't define any dependencies.
+    pub fn has_compile_sections(&self) -> bool {
+        if let Some(sdk) = &self.sdk {
+            if let Some(compile) = &sdk.compile {
+                return !compile.is_empty();
+            }
+        }
+        false
+    }
+
     /// Get extension SDK dependencies from configuration
     /// Returns a HashMap where keys are extension names and values are their SDK dependencies
     pub fn get_extension_sdk_dependencies(
@@ -4158,6 +4172,53 @@ libfoo-dev-arm64 = "*"
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_has_compile_sections() {
+        // Test with compile sections defined
+        let config_with_compile = r#"
+default_target = "qemux86-64"
+
+[sdk.compile.app]
+compile = "make"
+
+[sdk.compile.app.dependencies]
+libfoo = "*"
+"#;
+
+        let config = Config::load_from_str(config_with_compile).unwrap();
+        assert!(config.has_compile_sections());
+
+        // Test with compile sections but no dependencies
+        let config_no_deps = r#"
+default_target = "qemux86-64"
+
+[sdk.compile.app]
+compile = "make"
+"#;
+
+        let config = Config::load_from_str(config_no_deps).unwrap();
+        assert!(config.has_compile_sections());
+
+        // Test with no compile sections
+        let config_no_compile = r#"
+default_target = "qemux86-64"
+
+[sdk]
+image = "my-sdk-image"
+"#;
+
+        let config = Config::load_from_str(config_no_compile).unwrap();
+        assert!(!config.has_compile_sections());
+
+        // Test with empty config (minimal)
+        let config_minimal = r#"
+default_target = "qemux86-64"
+"#;
+
+        let config = Config::load_from_str(config_minimal).unwrap();
+        assert!(!config.has_compile_sections());
     }
 
     #[test]

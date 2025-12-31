@@ -182,10 +182,12 @@ fn generate_keyid_from_uri(uri: &str) -> String {
 
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-        let _ = write!(acc, "{:02x}", b);
-        acc
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{:02x}", b);
+            acc
+        })
 }
 
 #[cfg(test)]

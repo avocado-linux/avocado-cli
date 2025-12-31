@@ -771,11 +771,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             return Err(anyhow::anyhow!("Failed to install rootfs sysroot."));
         }
 
-        // Install target-sysroot if there are any sdk.compile dependencies
-        // This aggregates all dependencies from all compile sections (main config + external extensions)
-        let compile_dependencies = config.get_compile_dependencies();
-        if !compile_dependencies.is_empty() {
+        // Install target-sysroot if there are any sdk.compile sections defined
+        // (regardless of whether they have dependencies).
+        // This is needed for cross-compilation support.
+        // The composed config already has external extension compile sections merged in.
+        if config.has_compile_sections() {
             // Aggregate all compile dependencies into a single list (with lock file support)
+            let compile_dependencies = config.get_compile_dependencies();
             let mut all_compile_packages: Vec<String> = Vec::new();
             let mut all_compile_package_names: Vec<String> = Vec::new();
             for dependencies in compile_dependencies.values() {

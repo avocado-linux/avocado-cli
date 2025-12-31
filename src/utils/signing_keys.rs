@@ -315,10 +315,12 @@ pub fn get_key_entries(key_names: &[String]) -> Result<Vec<(String, KeyEntry)>> 
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         use std::fmt::Write;
-        bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{:02x}", b);
-            acc
-        })
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                let _ = write!(acc, "{:02x}", b);
+                acc
+            })
     }
 }
 
