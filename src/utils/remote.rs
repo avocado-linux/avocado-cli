@@ -173,6 +173,8 @@ impl SshClient {
         // Note: We need to source profile files because non-interactive SSH sessions
         // don't load .bashrc/.profile, so avocado might not be in PATH if it's in
         // ~/.cargo/bin, ~/.local/bin, or other user-specific locations.
+        // We use POSIX-compatible syntax (test -f && . instead of source) because
+        // some embedded systems use /bin/sh which doesn't support bash-specific commands.
         let output = AsyncCommand::new("ssh")
             .args([
                 "-o",
@@ -182,7 +184,7 @@ impl SshClient {
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 &self.remote.ssh_target(),
-                "source ~/.profile 2>/dev/null; source ~/.bashrc 2>/dev/null; avocado --version 2>/dev/null || echo 'not-installed'",
+                "test -f ~/.profile && . ~/.profile; test -f ~/.bashrc && . ~/.bashrc; avocado --version 2>/dev/null || echo 'not-installed'",
             ])
             .output()
             .await
