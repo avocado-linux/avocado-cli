@@ -278,7 +278,7 @@ mod port_selection_tests {
         let port = find_available_port(60000..=60010);
         assert!(port.is_some());
         let p = port.unwrap();
-        assert!(p >= 60000 && p <= 60010);
+        assert!((60000..=60010).contains(&p));
     }
 
     #[test]
@@ -685,11 +685,7 @@ fn test_localhost_ownership_preservation() {
         .parse()
         .expect("Failed to parse UID");
 
-    assert_eq!(
-        remote_uid, local_uid,
-        "Owner UID should be preserved (local: {}, remote: {})",
-        local_uid, remote_uid
-    );
+    assert_eq!(remote_uid, local_uid, "Owner UID should be preserved");
 
     fs::remove_dir_all(&temp_dir).ok();
 }
