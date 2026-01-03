@@ -445,13 +445,15 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             ));
         }
 
-        // Run check-update to refresh metadata
+        // Run check-update to refresh metadata using the combined repo config.
+        // This uses arch-specific varsdir for correct architecture filtering,
+        // with repos from both arch-specific SDK and target-repoconf.
         let check_update_command = r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
-    $DNF_SDK_REPO_CONF \
+    $DNF_SDK_COMBINED_REPO_CONF \
     check-update || true
 "#;
 
@@ -489,13 +491,16 @@ $DNF_SDK_HOST \
             bootstrap_config_version,
         );
 
+        // Use combined repo config for bootstrap installation.
+        // The bootstrap package is a nativesdk package that needs both the base repos
+        // (from arch-specific SDK) and target-specific repos (from target-repoconf).
         let bootstrap_command = format!(
             r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     $DNF_SDK_HOST_OPTS \
-    $DNF_SDK_REPO_CONF \
+    $DNF_SDK_COMBINED_REPO_CONF \
     -y \
     install \
     {}
@@ -610,13 +615,18 @@ fi
                 String::new()
             };
 
+            // Use combined repo config for SDK dependencies.
+            // SDK dependencies are nativesdk packages that need both the base repos
+            // (from arch-specific SDK) and target-specific repos (from target-repoconf).
+            // The combined config uses arch-specific varsdir for correct architecture
+            // filtering, which is critical for --runs-on with cross-arch targets.
             let command = format!(
                 r#"
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
-    $DNF_SDK_REPO_CONF \
+    $DNF_SDK_COMBINED_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
     {} \
@@ -670,6 +680,7 @@ $DNF_SDK_HOST \
                     repo_url.map(|s| s.to_string()),
                     repo_release.map(|s| s.to_string()),
                     merged_container_args.cloned(),
+                    runs_on_context,
                 )
                 .await?;
 
@@ -753,6 +764,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     repo_url.map(|s| s.to_string()),
                     repo_release.map(|s| s.to_string()),
                     merged_container_args.cloned(),
+                    runs_on_context,
                 )
                 .await?;
 
@@ -880,6 +892,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         repo_url.map(|s| s.to_string()),
                         repo_release.map(|s| s.to_string()),
                         merged_container_args.cloned(),
+                        runs_on_context,
                     )
                     .await?;
 

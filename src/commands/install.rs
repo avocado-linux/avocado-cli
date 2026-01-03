@@ -807,6 +807,7 @@ $DNF_SDK_HOST \
                                     repo_url,
                                     repo_release,
                                     merged_container_args,
+                                    None, // TODO: Add runs_on_context support to install.rs
                                 )
                                 .await?;
 
@@ -1050,6 +1051,7 @@ $DNF_SDK_HOST \
                 repo_url,
                 repo_release,
                 merged_container_args,
+                None, // TODO: Add runs_on_context support to install.rs
             )
             .await?;
 
@@ -1268,6 +1270,7 @@ $DNF_SDK_HOST \
                     repo_url,
                     repo_release,
                     merged_container_args,
+                    None, // TODO: Add runs_on_context support to install.rs
                 )
                 .await?;
 

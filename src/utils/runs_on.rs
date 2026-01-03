@@ -14,7 +14,9 @@ use crate::utils::nfs_server::{
     NfsServerConfig, DEFAULT_NFS_PORT_RANGE,
 };
 use crate::utils::output::{print_info, print_success, OutputLevel};
-use crate::utils::remote::{get_local_ip_for_remote, RemoteHost, RemoteVolumeManager, SshClient};
+use crate::utils::remote::{
+    get_local_ip_for_remote, RemoteHost, RemoteVolumeManager, SshClient, SshControlMaster,
+};
 
 #[cfg(unix)]
 use crate::utils::remote::SshTunnel;
@@ -22,13 +24,16 @@ use crate::utils::remote::SshTunnel;
 /// Context for remote execution via `--runs-on`
 ///
 /// This manages the lifecycle of:
+/// - SSH ControlMaster for connection reuse
 /// - NFS server on the local host
 /// - NFS-backed Docker volumes on the remote host
 /// - SSH tunnel for signing (if needed)
 pub struct RunsOnContext {
     /// The remote host
     remote_host: RemoteHost,
-    /// SSH client for remote operations
+    /// SSH ControlMaster for connection reuse
+    ssh_master: Option<SshControlMaster>,
+    /// SSH client for remote operations (uses ControlMaster if available)
     ssh: SshClient,
     /// The running NFS server
     nfs_server: Option<NfsServer>,
@@ -88,23 +93,35 @@ impl RunsOnContext {
         println!();
         print_info(
             &format!(
-                "🌐 Remote execution mode: running on {}",
+                "Remote execution mode: running on {}",
                 remote_host.ssh_target()
             ),
             OutputLevel::Normal,
         );
         println!();
 
-        // Create SSH client and verify connectivity
+        // Start SSH ControlMaster for connection reuse
+        // This creates a persistent SSH connection that all subsequent commands will share
+        print_info(
+            "Establishing persistent SSH connection...",
+            OutputLevel::Normal,
+        );
+        let ssh_master = SshControlMaster::start(remote_host.clone(), verbose)
+            .await
+            .context("Failed to establish SSH ControlMaster connection")?;
+
+        // Create SSH client that uses the ControlMaster
+        let ssh = ssh_master.create_client();
+
+        // Verify connectivity using the multiplexed connection
         print_info("Checking SSH connectivity...", OutputLevel::Normal);
-        let ssh = SshClient::new(remote_host.clone()).with_verbose(verbose);
         ssh.check_connectivity().await?;
 
         // Check remote CLI version compatibility
         print_info("Checking remote avocado version...", OutputLevel::Normal);
         let remote_version = ssh.check_cli_version().await?;
         print_success(
-            &format!("Remote avocado version: {} ✓", remote_version),
+            &format!("Remote avocado version: {}", remote_version),
             OutputLevel::Normal,
         );
 
@@ -221,15 +238,12 @@ impl RunsOnContext {
         let src_volume_name = format!("avocado-src-{}", session_id);
         let state_volume_name = format!("avocado-state-{}", session_id);
 
-        // Create NFS-backed volumes on remote
+        // Create NFS-backed volumes on remote (use ControlMaster client)
         print_info(
             "Creating NFS volumes on remote host...",
             OutputLevel::Normal,
         );
-        let remote_vm = RemoteVolumeManager::new(
-            SshClient::new(remote_host.clone()).with_verbose(verbose),
-            container_tool.to_string(),
-        );
+        let remote_vm = RemoteVolumeManager::new(ssh_master.create_client(), container_tool.to_string());
 
         // Create source volume
         remote_vm
@@ -253,15 +267,15 @@ impl RunsOnContext {
                 )
             })?;
 
-        print_success("Remote NFS volumes ready ✓", OutputLevel::Normal);
+        print_success("Remote NFS volumes ready.", OutputLevel::Normal);
         println!();
         print_info(
-            &format!("📂 src_dir: {} → remote:/opt/src", src_dir.display()),
+            &format!("src_dir: {} -> remote:/opt/src", src_dir.display()),
             OutputLevel::Normal,
         );
         print_info(
             &format!(
-                "📂 _avocado: {} → remote:/opt/_avocado",
+                "_avocado: {} -> remote:/opt/_avocado",
                 state_export_path.display()
             ),
             OutputLevel::Normal,
@@ -270,6 +284,7 @@ impl RunsOnContext {
 
         Ok(Self {
             remote_host,
+            ssh_master: Some(ssh_master),
             ssh,
             nfs_server: Some(nfs_server),
             nfs_port: port,
@@ -389,6 +404,69 @@ impl RunsOnContext {
         env_vars: HashMap<String, String>,
         extra_docker_args: &[String],
     ) -> Result<bool> {
+        let docker_cmd = self.build_docker_command(image, command, &env_vars, extra_docker_args)?;
+
+        print_info(
+            &format!("Executing on {}...", self.remote_host.ssh_target()),
+            OutputLevel::Normal,
+        );
+        println!();
+
+        if self.verbose {
+            print_info(
+                &format!("Running on remote: {}", docker_cmd),
+                OutputLevel::Verbose,
+            );
+        }
+
+        // Execute on remote
+        self.ssh.run_command_interactive(&docker_cmd).await
+    }
+
+    /// Run a command on the remote host inside a container and capture output
+    ///
+    /// This is similar to `run_container_command` but captures stdout instead
+    /// of inheriting it. Used for commands that need to return output (like rpm queries).
+    ///
+    /// # Arguments
+    /// * `image` - Container image to use
+    /// * `command` - Command to run inside the container
+    /// * `env_vars` - Environment variables to set
+    /// * `extra_docker_args` - Additional Docker arguments
+    ///
+    /// # Returns
+    /// Some(output) if the command succeeded, None if it failed
+    pub async fn run_container_command_with_output(
+        &self,
+        image: &str,
+        command: &str,
+        env_vars: HashMap<String, String>,
+        extra_docker_args: &[String],
+    ) -> Result<Option<String>> {
+        let docker_cmd = self.build_docker_command(image, command, &env_vars, extra_docker_args)?;
+
+        if self.verbose {
+            print_info(
+                &format!("Running on remote (capturing output): {}", docker_cmd),
+                OutputLevel::Verbose,
+            );
+        }
+
+        // Execute on remote and capture output
+        match self.ssh.run_command(&docker_cmd).await {
+            Ok(output) => Ok(Some(output)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Build the docker run command string
+    fn build_docker_command(
+        &self,
+        image: &str,
+        command: &str,
+        env_vars: &HashMap<String, String>,
+        extra_docker_args: &[String],
+    ) -> Result<String> {
         let src_volume = self
             .remote_src_volume
             .as_ref()
@@ -397,12 +475,6 @@ impl RunsOnContext {
             .remote_state_volume
             .as_ref()
             .context("State volume not created")?;
-
-        print_info(
-            &format!("▶ Executing on {}...", self.remote_host.ssh_target()),
-            OutputLevel::Normal,
-        );
-        println!();
 
         // Build the docker run command with --rm to ensure cleanup
         // Mount src volume to /mnt/src so bindfs can remap to /opt/src with UID translation
@@ -418,7 +490,7 @@ impl RunsOnContext {
         );
 
         // Add environment variables
-        for (key, value) in &env_vars {
+        for (key, value) in env_vars {
             docker_cmd.push_str(&format!(" -e {}={}", key, shell_escape(value)));
         }
 
@@ -449,15 +521,7 @@ impl RunsOnContext {
         // Add image and command
         docker_cmd.push_str(&format!(" {} bash -c {}", image, shell_escape(command)));
 
-        if self.verbose {
-            print_info(
-                &format!("Running on remote: {}", docker_cmd),
-                OutputLevel::Verbose,
-            );
-        }
-
-        // Execute on remote
-        self.ssh.run_command_interactive(&docker_cmd).await
+        Ok(docker_cmd)
     }
 
     /// Check if the context is still active (not yet torn down)
@@ -476,6 +540,7 @@ impl RunsOnContext {
     /// - Remove NFS-backed volumes from remote
     /// - Close SSH tunnel (if any)
     /// - Stop NFS server
+    /// - Stop SSH ControlMaster
     ///
     /// After calling this method, the context should not be used for running commands.
     /// This method can be called multiple times safely (subsequent calls are no-ops).
@@ -484,12 +549,13 @@ impl RunsOnContext {
         if !self.is_active()
             && self.remote_src_volume.is_none()
             && self.remote_state_volume.is_none()
+            && self.ssh_master.is_none()
         {
             return Ok(());
         }
 
         println!();
-        print_info("🧹 Cleaning up remote resources...", OutputLevel::Normal);
+        print_info("Cleaning up remote resources...", OutputLevel::Normal);
 
         // Close signing tunnel first
         #[cfg(unix)]
@@ -506,11 +572,14 @@ impl RunsOnContext {
                 .await;
         }
 
-        // Remove remote volumes
-        let remote_vm = RemoteVolumeManager::new(
-            SshClient::new(self.remote_host.clone()).with_verbose(self.verbose),
-            self.container_tool.clone(),
-        );
+        // Remove remote volumes - use the existing SSH client which has ControlMaster
+        // Create a new client from the master if available, otherwise use a plain one
+        let cleanup_ssh = if let Some(ref master) = self.ssh_master {
+            master.create_client()
+        } else {
+            SshClient::new(self.remote_host.clone()).with_verbose(self.verbose)
+        };
+        let remote_vm = RemoteVolumeManager::new(cleanup_ssh, self.container_tool.clone());
 
         let mut cleanup_errors = Vec::new();
 
@@ -548,16 +617,26 @@ impl RunsOnContext {
             }
         }
 
+        // Stop SSH ControlMaster (do this last since other cleanup uses it)
+        if self.verbose {
+            print_info("Closing SSH connection...", OutputLevel::Normal);
+        }
+        if let Some(mut master) = self.ssh_master.take() {
+            if let Err(e) = master.stop().await {
+                cleanup_errors.push(format!("Failed to stop SSH ControlMaster: {}", e));
+            }
+        }
+
         // Report any cleanup errors (but don't fail - cleanup is best-effort)
         if !cleanup_errors.is_empty() {
             for error in &cleanup_errors {
-                print_info(&format!("⚠ {}", error), OutputLevel::Normal);
+                print_info(&format!("Warning: {}", error), OutputLevel::Normal);
             }
         }
 
         print_success(
             &format!(
-                "🌐 Remote volumes cleaned up on {}",
+                "Remote resources cleaned up on {}.",
                 self.remote_host.ssh_target()
             ),
             OutputLevel::Normal,

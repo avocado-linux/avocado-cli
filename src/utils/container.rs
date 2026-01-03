@@ -777,6 +777,7 @@ impl SdkContainer {
     /// * `repo_url` - Optional repository URL
     /// * `repo_release` - Optional repository release
     /// * `container_args` - Optional additional container arguments
+    /// * `runs_on_context` - Optional remote execution context for --runs-on support
     ///
     /// # Returns
     /// A HashMap of package name to version string (NEVRA format without name prefix)
@@ -790,6 +791,7 @@ impl SdkContainer {
         repo_url: Option<String>,
         repo_release: Option<String>,
         container_args: Option<Vec<String>>,
+        runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
     ) -> Result<std::collections::HashMap<String, String>> {
         if packages.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -824,7 +826,15 @@ impl SdkContainer {
             ..Default::default()
         };
 
-        match self.run_in_container_with_output(run_config).await? {
+        // Use remote execution context if provided, otherwise run locally
+        let output = if let Some(context) = runs_on_context {
+            self.run_in_container_with_output_remote(&run_config, context)
+                .await?
+        } else {
+            self.run_in_container_with_output(run_config).await?
+        };
+
+        match output {
             Some(output) => {
                 // For SDK sysroots, strip architecture to make lock file portable across host architectures
                 let strip_arch = matches!(sysroot, crate::utils::lockfile::SysrootType::Sdk);
@@ -869,6 +879,92 @@ impl SdkContainer {
                 Ok(std::collections::HashMap::new())
             }
         }
+    }
+
+    /// Run a command in a remote container and capture its output
+    ///
+    /// This is similar to `run_in_container_with_output` but uses the provided
+    /// RunsOnContext for remote execution.
+    async fn run_in_container_with_output_remote(
+        &self,
+        config: &RunConfig,
+        context: &crate::utils::runs_on::RunsOnContext,
+    ) -> Result<Option<String>> {
+        if !context.is_active() {
+            anyhow::bail!("RunsOnContext is not active (already torn down)");
+        }
+
+        // Build environment variables
+        let mut env_vars = config.env_vars.clone().unwrap_or_default();
+
+        // Set host platform - the remote is running the container
+        env_vars.insert("AVOCADO_HOST_PLATFORM".to_string(), "linux".to_string());
+
+        if let Some(url) = &config.repo_url {
+            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
+        }
+        if let Some(release) = &config.repo_release {
+            env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
+        }
+        if let Some(dnf_args) = &config.dnf_args {
+            env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
+        }
+        if config.verbose || self.verbose {
+            env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
+        }
+
+        // Set target and SDK-related env vars
+        env_vars.insert("AVOCADO_TARGET".to_string(), config.target.clone());
+        env_vars.insert("AVOCADO_SDK_TARGET".to_string(), config.target.clone());
+        env_vars.insert("AVOCADO_SRC_DIR".to_string(), "/opt/src".to_string());
+
+        // Set host UID/GID for bindfs permission mapping on remote
+        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
+        env_vars.insert("AVOCADO_HOST_UID".to_string(), host_uid.to_string());
+        env_vars.insert("AVOCADO_HOST_GID".to_string(), host_gid.to_string());
+        env_vars.insert(
+            "AVOCADO_SDK_IMAGE".to_string(),
+            config.container_image.clone(),
+        );
+
+        // Build the complete command with entrypoint
+        let mut full_command = String::new();
+        if config.use_entrypoint {
+            full_command.push_str(&self.create_entrypoint_script_for_remote(
+                config.source_environment,
+                config.extension_sysroot.as_deref(),
+                config.runtime_sysroot.as_deref(),
+                &config.target,
+                config.no_bootstrap,
+                config.disable_weak_dependencies,
+            ));
+            full_command.push('\n');
+        }
+        full_command.push_str(&config.command);
+
+        // Build extra Docker args
+        let mut extra_args: Vec<String> = vec![
+            "--device".to_string(),
+            "/dev/fuse".to_string(),
+            "--cap-add".to_string(),
+            "SYS_ADMIN".to_string(),
+            "--security-opt".to_string(),
+            "label=disable".to_string(),
+        ];
+
+        if let Some(ref args) = config.container_args {
+            extra_args.extend(args.clone());
+        }
+
+        // Run the container on the remote and capture output
+        context
+            .run_container_command_with_output(
+                &config.container_image,
+                &full_command,
+                env_vars,
+                &extra_args,
+            )
+            .await
     }
 
     /// Execute the container command
@@ -1157,6 +1253,16 @@ export DNF_SDK_REPO_CONF="\
 --setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
 "
 
+# Combined repo config for SDK package installations (nativesdk packages).
+# Uses arch-specific varsdir for correct architecture filtering, but includes
+# BOTH repo directories: arch-specific SDK repos (base repos from container)
+# and target-repoconf repos (target-specific repos like {target}-sdk).
+# This ensures correct arch selection when running --runs-on with cross-arch targets.
+export DNF_SDK_COMBINED_REPO_CONF="\
+--setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d,${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+"
+
 export DNF_SDK_TARGET_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars \
 --setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
@@ -1326,6 +1432,16 @@ export DNF_SDK_HOST_REPO_CONF="\
 export DNF_SDK_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
 --setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+"
+
+# Combined repo config for SDK package installations (nativesdk packages).
+# Uses arch-specific varsdir for correct architecture filtering, but includes
+# BOTH repo directories: arch-specific SDK repos (base repos from container)
+# and target-repoconf repos (target-specific repos like {target}-sdk).
+# This ensures correct arch selection when running --runs-on with cross-arch targets.
+export DNF_SDK_COMBINED_REPO_CONF="\
+--setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d,${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
 "
 
 export DNF_SDK_TARGET_REPO_CONF="\

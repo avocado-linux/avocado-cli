@@ -69,6 +69,8 @@ impl RemoteHost {
 pub struct SshClient {
     remote: RemoteHost,
     verbose: bool,
+    /// Optional path to SSH ControlMaster socket for connection reuse
+    control_path: Option<std::path::PathBuf>,
 }
 
 impl SshClient {
@@ -77,6 +79,7 @@ impl SshClient {
         Self {
             remote,
             verbose: false,
+            control_path: None,
         }
     }
 
@@ -84,6 +87,30 @@ impl SshClient {
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
+    }
+
+    /// Set the ControlMaster socket path for SSH connection reuse
+    pub fn with_control_path(mut self, control_path: std::path::PathBuf) -> Self {
+        self.control_path = Some(control_path);
+        self
+    }
+
+    /// Get base SSH arguments including ControlMaster options if configured
+    fn base_ssh_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+
+        // If ControlMaster is configured, use the existing connection
+        if let Some(ref control_path) = self.control_path {
+            args.push("-o".to_string());
+            args.push(format!("ControlPath={}", control_path.display()));
+        }
+
+        args
     }
 
     /// Check SSH connectivity to the remote host
@@ -100,18 +127,17 @@ impl SshClient {
             );
         }
 
+        let mut args = self.base_ssh_args();
+        args.extend([
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            self.remote.ssh_target(),
+            "echo".to_string(),
+            "ok".to_string(),
+        ]);
+
         let output = AsyncCommand::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &self.remote.ssh_target(),
-                "echo",
-                "ok",
-            ])
+            .args(&args)
             .output()
             .await
             .context("Failed to execute SSH command")?;
@@ -175,17 +201,16 @@ impl SshClient {
         // ~/.cargo/bin, ~/.local/bin, or other user-specific locations.
         // We use POSIX-compatible syntax (test -f && . instead of source) because
         // some embedded systems use /bin/sh which doesn't support bash-specific commands.
+        let mut args = self.base_ssh_args();
+        args.extend([
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            self.remote.ssh_target(),
+            "test -f ~/.profile && . ~/.profile; test -f ~/.bashrc && . ~/.bashrc; avocado --version 2>/dev/null || echo 'not-installed'".to_string(),
+        ]);
+
         let output = AsyncCommand::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &self.remote.ssh_target(),
-                "test -f ~/.profile && . ~/.profile; test -f ~/.bashrc && . ~/.bashrc; avocado --version 2>/dev/null || echo 'not-installed'",
-            ])
+            .args(&args)
             .output()
             .await
             .context("Failed to check remote avocado version")?;
@@ -248,15 +273,11 @@ impl SshClient {
             );
         }
 
+        let mut args = self.base_ssh_args();
+        args.extend([self.remote.ssh_target(), command.to_string()]);
+
         let output = AsyncCommand::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &self.remote.ssh_target(),
-                command,
-            ])
+            .args(&args)
             .output()
             .await
             .with_context(|| format!("Failed to run command on remote: {}", command))?;
@@ -273,7 +294,10 @@ impl SshClient {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Run a command on the remote host, inheriting stdout/stderr
+    /// Run a command on the remote host, inheriting stdin/stdout/stderr
+    ///
+    /// This method properly forwards Ctrl+C and other signals to the remote process
+    /// by allocating a pseudo-terminal and inheriting all standard streams.
     pub async fn run_command_interactive(&self, command: &str) -> Result<bool> {
         if self.verbose {
             print_info(
@@ -282,16 +306,28 @@ impl SshClient {
             );
         }
 
+        // Build args manually for interactive commands to avoid BatchMode=yes
+        // which can interfere with signal handling
+        let mut args = vec![
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+        ];
+
+        // If ControlMaster is configured, use the existing connection
+        if let Some(ref control_path) = self.control_path {
+            args.push("-o".to_string());
+            args.push(format!("ControlPath={}", control_path.display()));
+        }
+
+        args.extend([
+            "-tt".to_string(), // Force pseudo-terminal allocation (double -t for forced allocation)
+            self.remote.ssh_target(),
+            command.to_string(),
+        ]);
+
         let status = AsyncCommand::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-t", // Force pseudo-terminal allocation for interactive commands
-                &self.remote.ssh_target(),
-                command,
-            ])
+            .args(&args)
+            .stdin(Stdio::inherit()) // Inherit stdin for Ctrl+C forwarding
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
@@ -323,17 +359,16 @@ impl SshClient {
             );
         }
 
+        let mut args = self.base_ssh_args();
+        args.extend([
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            self.remote.ssh_target(),
+            "uname -m".to_string(),
+        ]);
+
         let output = AsyncCommand::new("ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &self.remote.ssh_target(),
-                "uname -m",
-            ])
+            .args(&args)
             .output()
             .await
             .context("Failed to get remote architecture")?;
@@ -357,6 +392,158 @@ impl SshClient {
         }
 
         Ok(arch)
+    }
+}
+
+/// SSH ControlMaster for persistent SSH connection reuse
+///
+/// This creates a background SSH connection that can be reused by multiple
+/// SSH commands via the ControlPath socket. This significantly reduces
+/// connection overhead when running many commands on the same remote host.
+pub struct SshControlMaster {
+    /// Path to the control socket
+    control_path: std::path::PathBuf,
+    /// The master SSH process
+    process: Option<tokio::process::Child>,
+    /// Remote host for connection
+    remote: RemoteHost,
+    /// Whether verbose output is enabled
+    verbose: bool,
+}
+
+impl SshControlMaster {
+    /// Create and start a new ControlMaster connection
+    pub async fn start(remote: RemoteHost, verbose: bool) -> Result<Self> {
+        // Create a unique control socket path
+        let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let control_path =
+            std::path::PathBuf::from(format!("/tmp/avocado-ssh-{}-{}", remote.host, session_id));
+
+        if verbose {
+            print_info(
+                &format!(
+                    "Starting SSH ControlMaster for {}...",
+                    remote.ssh_target()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        // Start the ControlMaster connection
+        // -M: Master mode
+        // -N: Don't execute a remote command
+        // -f: Go to background after authentication
+        // -o ControlPath: Path to the control socket
+        // -o ControlPersist: Keep the master connection alive
+        let process = AsyncCommand::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=10",
+                "-M", // Master mode
+                "-N", // Don't execute a remote command
+                "-o",
+                &format!("ControlPath={}", control_path.display()),
+                "-o",
+                "ControlPersist=yes",
+                &remote.ssh_target(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to start SSH ControlMaster")?;
+
+        // Give it a moment to establish the connection
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Verify the control socket was created
+        if !control_path.exists() {
+            // Wait a bit longer and try again
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        }
+
+        if verbose {
+            print_info(
+                &format!(
+                    "SSH ControlMaster established at {}",
+                    control_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        Ok(Self {
+            control_path,
+            process: Some(process),
+            remote,
+            verbose,
+        })
+    }
+
+    /// Get the control socket path
+    #[allow(dead_code)]
+    pub fn control_path(&self) -> &std::path::Path {
+        &self.control_path
+    }
+
+    /// Create an SshClient that uses this ControlMaster
+    pub fn create_client(&self) -> SshClient {
+        SshClient::new(self.remote.clone())
+            .with_verbose(self.verbose)
+            .with_control_path(self.control_path.clone())
+    }
+
+    /// Stop the ControlMaster connection
+    pub async fn stop(&mut self) -> Result<()> {
+        if self.verbose {
+            print_info("Stopping SSH ControlMaster...", OutputLevel::Normal);
+        }
+
+        // Send exit command to the control socket
+        let _ = AsyncCommand::new("ssh")
+            .args([
+                "-o",
+                &format!("ControlPath={}", self.control_path.display()),
+                "-O",
+                "exit",
+                &self.remote.ssh_target(),
+            ])
+            .output()
+            .await;
+
+        // Kill the process if still running
+        if let Some(mut process) = self.process.take() {
+            let _ = process.kill().await;
+        }
+
+        // Clean up the socket file
+        if self.control_path.exists() {
+            let _ = std::fs::remove_file(&self.control_path);
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for SshControlMaster {
+    fn drop(&mut self) {
+        // Best effort cleanup
+        if let Some(ref mut process) = self.process {
+            #[cfg(unix)]
+            if let Some(pid) = process.id() {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+
+        // Clean up the socket file
+        if self.control_path.exists() {
+            let _ = std::fs::remove_file(&self.control_path);
+        }
     }
 }
 
