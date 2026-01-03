@@ -475,6 +475,74 @@ impl LockFile {
                     && target_locks.runtimes.is_empty()
             })
     }
+
+    /// Clear all SDK entries for a specific target (all architectures)
+    pub fn clear_sdk(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.sdk.clear();
+        }
+    }
+
+    /// Clear rootfs entries for a specific target
+    pub fn clear_rootfs(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.rootfs.clear();
+        }
+    }
+
+    /// Clear target-sysroot entries for a specific target
+    pub fn clear_target_sysroot(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.target_sysroot.clear();
+        }
+    }
+
+    /// Clear a specific extension's entries for a target
+    pub fn clear_extension(&mut self, target: &str, extension_name: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.extensions.remove(extension_name);
+        }
+    }
+
+    /// Clear all extension entries for a target
+    #[allow(dead_code)]
+    pub fn clear_all_extensions(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.extensions.clear();
+        }
+    }
+
+    /// Clear a specific runtime's entries for a target
+    pub fn clear_runtime(&mut self, target: &str, runtime_name: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.runtimes.remove(runtime_name);
+        }
+    }
+
+    /// Clear all runtime entries for a target
+    #[allow(dead_code)]
+    pub fn clear_all_runtimes(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.runtimes.clear();
+        }
+    }
+
+    /// Clear all entries for a target (SDK, rootfs, target-sysroot, extensions, runtimes)
+    pub fn clear_all(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.sdk.clear();
+            target_locks.rootfs.clear();
+            target_locks.target_sysroot.clear();
+            target_locks.extensions.clear();
+            target_locks.runtimes.clear();
+        }
+    }
+
+    /// Get all target names in the lock file
+    #[allow(dead_code)]
+    pub fn get_targets(&self) -> Vec<String> {
+        self.targets.keys().cloned().collect()
+    }
 }
 
 /// Parse rpm -q output into a map of package names to versions

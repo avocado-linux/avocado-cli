@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
 use crate::utils::volume::{VolumeManager, VolumeState};
@@ -22,12 +23,14 @@ pub struct CleanCommand {
     verbose: bool,
     /// Whether to remove stamp files
     stamps: bool,
-    /// Path to configuration file (needed for --stamps)
+    /// Path to configuration file (needed for --stamps and --unlock)
     config_path: Option<String>,
-    /// Target architecture (needed for --stamps)
+    /// Target architecture (needed for --stamps and --unlock)
     target: Option<String>,
     /// Force removal by killing and removing containers using the volume
     force: bool,
+    /// Whether to unlock (clear lock file entries) for all sysroots
+    unlock: bool,
 }
 
 impl CleanCommand {
@@ -53,6 +56,7 @@ impl CleanCommand {
             config_path: None,
             target: None,
             force: false,
+            unlock: false,
         }
     }
 
@@ -77,6 +81,12 @@ impl CleanCommand {
     /// Set whether to force removal by killing containers
     pub fn with_force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    /// Set whether to unlock (clear lock file entries) for all sysroots
+    pub fn with_unlock(mut self, unlock: bool) -> Self {
+        self.unlock = unlock;
         self
     }
 
@@ -124,6 +134,61 @@ impl CleanCommand {
         if self.stamps {
             self.clean_stamps(&directory_path).await?;
         }
+
+        // Unlock (clear lock file entries) if requested
+        if self.unlock {
+            self.unlock_all(&directory_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Unlock (clear lock file entries) for all sysroots
+    fn unlock_all(&self, _directory_path: &Path) -> Result<()> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--unlock requires a config file to be specified with -C/--config")
+        })?;
+
+        let config = Config::load(config_path)?;
+        let target = resolve_target_required(self.target.as_deref(), &config)?;
+
+        // Get src_dir from config
+        let src_dir = config.get_resolved_src_dir(config_path).unwrap_or_else(|| {
+            Path::new(config_path)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
+
+        // Load lock file
+        let mut lock_file = LockFile::load(&src_dir)
+            .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;
+
+        if lock_file.is_empty() {
+            if self.verbose {
+                print_info("Lock file is empty, nothing to unlock.", OutputLevel::Normal);
+            }
+            return Ok(());
+        }
+
+        // Clear all entries for the target
+        if self.verbose {
+            print_info(
+                &format!("Unlocking all entries for target '{}'", target),
+                OutputLevel::Normal,
+            );
+        }
+        lock_file.clear_all(&target);
+
+        // Save updated lock file
+        lock_file
+            .save(&src_dir)
+            .with_context(|| "Failed to save lock file")?;
+
+        print_success(
+            &format!("Unlocked all entries for target '{}'.", target),
+            OutputLevel::Normal,
+        );
 
         Ok(())
     }

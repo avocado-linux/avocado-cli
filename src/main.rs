@@ -30,6 +30,7 @@ use commands::sign::SignCommand;
 use commands::signing_keys::{
     SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
 };
+use commands::unlock::UnlockCommand;
 use commands::upgrade::UpgradeCommand;
 
 #[derive(Parser)]
@@ -116,15 +117,18 @@ enum Commands {
         /// Also remove stamp files (requires -C/--config and --target)
         #[arg(long)]
         stamps: bool,
-        /// Path to avocado.yaml configuration file (required when --stamps is used)
+        /// Path to avocado.yaml configuration file (required when --stamps or --unlock is used)
         #[arg(short = 'C', long)]
         config: Option<String>,
-        /// Target architecture (required when --stamps is used)
+        /// Target architecture (required when --stamps or --unlock is used)
         #[arg(long)]
         target: Option<String>,
         /// Force removal by killing and removing containers using the volume
         #[arg(short, long)]
         force: bool,
+        /// Also unlock (clear lock file entries) for all sysroots (requires -C/--config)
+        #[arg(long)]
+        unlock: bool,
     },
     /// Install all components (SDK, extensions, and runtime dependencies)
     Install {
@@ -299,6 +303,27 @@ enum Commands {
         /// Perform a dry run without actually removing volumes
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Unlock (remove lock entries for) sysroots to allow package updates
+    Unlock {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Unlock a specific extension
+        #[arg(short = 'e', long = "extension")]
+        extension: Option<String>,
+        /// Unlock a specific runtime
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
+        /// Unlock SDK (rootfs, target-sysroot, and all SDK arches)
+        #[arg(long)]
+        sdk: bool,
     },
 }
 
@@ -747,13 +772,15 @@ async fn main() -> Result<()> {
             config,
             target,
             force,
+            unlock,
         } => {
             let clean_cmd =
                 CleanCommand::new(directory, !skip_volumes, Some(container_tool), verbose)
                     .with_stamps(stamps)
                     .with_config_path(config)
                     .with_target(target.or(cli.target.clone()))
-                    .with_force(force);
+                    .with_force(force)
+                    .with_unlock(unlock);
             clean_cmd.execute().await?;
             Ok(())
         }
@@ -941,6 +968,25 @@ async fn main() -> Result<()> {
         } => {
             let prune_cmd = PruneCommand::new(Some(container_tool), verbose, dry_run);
             prune_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Unlock {
+            config,
+            verbose,
+            target,
+            extension,
+            runtime,
+            sdk,
+        } => {
+            let unlock_cmd = UnlockCommand::new(
+                config,
+                verbose,
+                target.or(cli.target),
+                extension,
+                runtime,
+                sdk,
+            );
+            unlock_cmd.execute()?;
             Ok(())
         }
         Commands::Runtime { command } => match command {
