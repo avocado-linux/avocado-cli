@@ -325,6 +325,14 @@ impl RunsOnContext {
         self.remote_state_volume.as_deref()
     }
 
+    /// Get the CPU architecture of the remote host
+    ///
+    /// Returns the architecture string from `uname -m` (e.g., "x86_64", "aarch64").
+    /// This is used to track SDK packages per host architecture in the lock file.
+    pub async fn get_host_arch(&self) -> anyhow::Result<String> {
+        self.ssh.get_architecture().await
+    }
+
     /// Setup SSH tunnel for signing
     ///
     /// This creates an SSH tunnel that forwards signing requests from the remote

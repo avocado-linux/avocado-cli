@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Current lock file format version
-const LOCKFILE_VERSION: u32 = 1;
+/// Version 2: SDK packages are now keyed by host architecture (sdk/{arch}) instead of just "sdk"
+const LOCKFILE_VERSION: u32 = 2;
 
 /// Lock file name
 const LOCKFILE_NAME: &str = "lock.json";
@@ -21,8 +22,11 @@ const LOCKFILE_DIR: &str = ".avocado";
 /// Represents different sysroot types for package installation
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SysrootType {
-    /// SDK sysroot ($AVOCADO_SDK_PREFIX)
-    Sdk,
+    /// SDK sysroot ($AVOCADO_SDK_PREFIX) - keyed by host architecture
+    /// SDK packages are nativesdk packages that run on the host, so they need
+    /// to be tracked per host architecture (e.g., x86_64, aarch64).
+    /// The String parameter is the host architecture.
+    Sdk(String),
     /// Rootfs sysroot ($AVOCADO_PREFIX/rootfs)
     Rootfs,
     /// Target sysroot ($AVOCADO_PREFIX/sdk/target-sysroot)
@@ -38,38 +42,6 @@ pub enum SysrootType {
 }
 
 impl SysrootType {
-    /// Convert sysroot type to its string key for the lock file
-    pub fn to_key(&self) -> String {
-        match self {
-            SysrootType::Sdk => "sdk".to_string(),
-            SysrootType::Rootfs => "rootfs".to_string(),
-            SysrootType::TargetSysroot => "target-sysroot".to_string(),
-            // Both Extension and VersionedExtension use the same key format
-            // They're distinguished at query time but stored the same in lock file
-            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
-                format!("extensions/{}", name)
-            }
-            SysrootType::Runtime(name) => format!("runtimes/{}", name),
-        }
-    }
-
-    /// Parse a string key back to a SysrootType
-    #[allow(dead_code)]
-    pub fn from_key(key: &str) -> Option<Self> {
-        match key {
-            "sdk" => Some(SysrootType::Sdk),
-            "rootfs" => Some(SysrootType::Rootfs),
-            "target-sysroot" => Some(SysrootType::TargetSysroot),
-            _ if key.starts_with("extensions/") => Some(SysrootType::Extension(
-                key.strip_prefix("extensions/")?.to_string(),
-            )),
-            _ if key.starts_with("runtimes/") => Some(SysrootType::Runtime(
-                key.strip_prefix("runtimes/")?.to_string(),
-            )),
-            _ => None,
-        }
-    }
-
     /// Get the RPM query command environment and root path for this sysroot type
     /// Returns (rpm_etcconfigdir, rpm_configdir, root_path) as shell variable expressions
     ///
@@ -78,7 +50,8 @@ impl SysrootType {
     /// point to $AVOCADO_SDK_PREFIX/var/lib/rpm.
     pub fn get_rpm_query_config(&self) -> RpmQueryConfig {
         match self {
-            SysrootType::Sdk => RpmQueryConfig {
+            // SDK config is the same regardless of which host arch we're tracking
+            SysrootType::Sdk(_arch) => RpmQueryConfig {
                 // SDK needs custom RPM config to find the SDK's RPM database
                 rpm_etcconfigdir: Some("$AVOCADO_SDK_PREFIX".to_string()),
                 rpm_configdir: Some("$AVOCADO_SDK_PREFIX/usr/lib/rpm".to_string()),
@@ -184,15 +157,50 @@ impl RpmQueryConfig {
     }
 }
 
+/// Package versions map: package_name -> version
+pub type PackageVersions = HashMap<String, String>;
+
+/// Nested package versions map: sub_key -> package_name -> version
+/// Used for SDK (keyed by host arch), extensions (keyed by name), runtimes (keyed by name)
+pub type NestedPackageVersions = HashMap<String, PackageVersions>;
+
+/// Lock data for a single target
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetLocks {
+    /// SDK packages keyed by host architecture (x86_64, aarch64, etc.)
+    /// SDK packages are nativesdk packages that run on the host, so versions
+    /// can differ per host architecture.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sdk: NestedPackageVersions,
+
+    /// Rootfs packages (shared across all host architectures)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rootfs: PackageVersions,
+
+    /// Target-sysroot packages (shared across all host architectures)
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        rename = "target-sysroot"
+    )]
+    pub target_sysroot: PackageVersions,
+
+    /// Extension packages keyed by extension name
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extensions: NestedPackageVersions,
+
+    /// Runtime packages keyed by runtime name
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub runtimes: NestedPackageVersions,
+}
+
 /// Lock file structure for tracking installed package versions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockFile {
     /// Lock file format version
     pub version: u32,
-    /// Package versions organized by target architecture, then by sysroot
-    /// Structure: targets -> target_name -> sysroot_key -> package_name -> version
-    /// Example: targets["qemux86-64"]["sdk"]["avocado-sdk-toolchain"] = "0.1.0-r0.x86_64"
-    pub targets: HashMap<String, HashMap<String, HashMap<String, String>>>,
+    /// Package versions organized by target
+    pub targets: HashMap<String, TargetLocks>,
 }
 
 impl Default for LockFile {
@@ -216,6 +224,10 @@ impl LockFile {
     }
 
     /// Load lock file from disk, or return a new one if it doesn't exist
+    ///
+    /// This function also handles migration from older lock file versions:
+    /// - Version 1 -> 2: SDK packages now nested under arch key, extensions/runtimes
+    ///   restructured. Old format is migrated automatically.
     pub fn load(src_dir: &Path) -> Result<Self> {
         let path = Self::get_path(src_dir);
 
@@ -226,19 +238,106 @@ impl LockFile {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
 
-        let lock_file: LockFile = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
-
-        // Check version compatibility
-        if lock_file.version > LOCKFILE_VERSION {
-            anyhow::bail!(
-                "Lock file version {} is newer than supported version {}. Please upgrade avocado-cli.",
-                lock_file.version,
-                LOCKFILE_VERSION
-            );
+        // First, try to parse as v2 format
+        if let Ok(lock_file) = serde_json::from_str::<LockFile>(&content) {
+            if lock_file.version >= LOCKFILE_VERSION {
+                if lock_file.version > LOCKFILE_VERSION {
+                    anyhow::bail!(
+                        "Lock file version {} is newer than supported version {}. Please upgrade avocado-cli.",
+                        lock_file.version,
+                        LOCKFILE_VERSION
+                    );
+                }
+                return Ok(lock_file);
+            }
         }
 
-        Ok(lock_file)
+        // Try to parse as v1 format and migrate
+        let v1_lock: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
+
+        let version = v1_lock
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+
+        if version == 1 {
+            return Ok(Self::migrate_v1_to_v2(&v1_lock));
+        }
+
+        // Unknown format
+        anyhow::bail!("Unable to parse lock file format");
+    }
+
+    /// Migrate lock file from version 1 to version 2
+    ///
+    /// Version 1 stored:
+    /// - SDK packages under flat "sdk" key
+    /// - Extensions under "extensions/{name}"
+    /// - Runtimes under "runtimes/{name}"
+    ///
+    /// Version 2 stores:
+    /// - SDK packages under nested sdk -> {arch} -> packages
+    /// - Extensions under nested extensions -> {name} -> packages
+    /// - Runtimes under nested runtimes -> {name} -> packages
+    ///
+    /// Since we can't know what architecture the v1 SDK packages were installed for,
+    /// we discard them. Users will need to re-run `avocado sdk install`.
+    fn migrate_v1_to_v2(v1_lock: &serde_json::Value) -> LockFile {
+        let mut lock_file = LockFile::new();
+
+        if let Some(targets) = v1_lock.get("targets").and_then(|t| t.as_object()) {
+            for (target_name, sysroots) in targets {
+                let target_locks = lock_file
+                    .targets
+                    .entry(target_name.clone())
+                    .or_default();
+
+                if let Some(sysroots_map) = sysroots.as_object() {
+                    for (key, packages) in sysroots_map {
+                        if let Some(packages_map) = packages.as_object() {
+                            let pkg_versions: PackageVersions = packages_map
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.clone(), s.to_string()))
+                                })
+                                .collect();
+
+                            match key.as_str() {
+                                "sdk" => {
+                                    // Discard - we don't know the host arch
+                                }
+                                "rootfs" => {
+                                    target_locks.rootfs = pkg_versions;
+                                }
+                                "target-sysroot" => {
+                                    target_locks.target_sysroot = pkg_versions;
+                                }
+                                _ if key.starts_with("extensions/") => {
+                                    if let Some(name) = key.strip_prefix("extensions/") {
+                                        target_locks
+                                            .extensions
+                                            .insert(name.to_string(), pkg_versions);
+                                    }
+                                }
+                                _ if key.starts_with("runtimes/") => {
+                                    if let Some(name) = key.strip_prefix("runtimes/") {
+                                        target_locks
+                                            .runtimes
+                                            .insert(name.to_string(), pkg_versions);
+                                    }
+                                }
+                                _ => {
+                                    // Unknown key, ignore
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        lock_file
     }
 
     /// Save lock file to disk using JSON Canonicalization Scheme (RFC 8785)
@@ -273,11 +372,24 @@ impl LockFile {
         sysroot: &SysrootType,
         package: &str,
     ) -> Option<&String> {
-        let sysroot_key = sysroot.to_key();
-        self.targets
-            .get(target)
-            .and_then(|sysroots| sysroots.get(&sysroot_key))
-            .and_then(|packages| packages.get(package))
+        let target_locks = self.targets.get(target)?;
+
+        match sysroot {
+            SysrootType::Sdk(arch) => target_locks
+                .sdk
+                .get(arch)
+                .and_then(|pkgs| pkgs.get(package)),
+            SysrootType::Rootfs => target_locks.rootfs.get(package),
+            SysrootType::TargetSysroot => target_locks.target_sysroot.get(package),
+            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => target_locks
+                .extensions
+                .get(name)
+                .and_then(|pkgs| pkgs.get(package)),
+            SysrootType::Runtime(name) => target_locks
+                .runtimes
+                .get(name)
+                .and_then(|pkgs| pkgs.get(package)),
+        }
     }
 
     /// Set the locked version for a package in a specific target and sysroot
@@ -289,13 +401,19 @@ impl LockFile {
         package: &str,
         version: &str,
     ) {
-        let sysroot_key = sysroot.to_key();
-        self.targets
-            .entry(target.to_string())
-            .or_default()
-            .entry(sysroot_key)
-            .or_default()
-            .insert(package.to_string(), version.to_string());
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+
+        let packages = match sysroot {
+            SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
+            SysrootType::Rootfs => &mut target_locks.rootfs,
+            SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
+            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
+                target_locks.extensions.entry(name.clone()).or_default()
+            }
+            SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
+        };
+
+        packages.insert(package.to_string(), version.to_string());
     }
 
     /// Update multiple package versions for a target and sysroot at once
@@ -305,36 +423,56 @@ impl LockFile {
         sysroot: &SysrootType,
         versions: HashMap<String, String>,
     ) {
-        let sysroot_key = sysroot.to_key();
-        let entry = self
-            .targets
-            .entry(target.to_string())
-            .or_default()
-            .entry(sysroot_key)
-            .or_default();
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+
+        let packages = match sysroot {
+            SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
+            SysrootType::Rootfs => &mut target_locks.rootfs,
+            SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
+            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
+                target_locks.extensions.entry(name.clone()).or_default()
+            }
+            SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
+        };
+
         for (package, version) in versions {
-            entry.insert(package, version);
+            packages.insert(package, version);
         }
     }
 
     /// Get all locked versions for a target and sysroot
+    /// Returns None if no packages are recorded for this sysroot
     #[allow(dead_code)]
     pub fn get_sysroot_versions(
         &self,
         target: &str,
         sysroot: &SysrootType,
     ) -> Option<&HashMap<String, String>> {
-        let sysroot_key = sysroot.to_key();
-        self.targets
-            .get(target)
-            .and_then(|sysroots| sysroots.get(&sysroot_key))
+        let target_locks = self.targets.get(target)?;
+
+        let result = match sysroot {
+            SysrootType::Sdk(arch) => target_locks.sdk.get(arch),
+            SysrootType::Rootfs => Some(&target_locks.rootfs),
+            SysrootType::TargetSysroot => Some(&target_locks.target_sysroot),
+            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
+                target_locks.extensions.get(name)
+            }
+            SysrootType::Runtime(name) => target_locks.runtimes.get(name),
+        };
+
+        // Return None for empty collections (matches expected behavior)
+        result.filter(|m| !m.is_empty())
     }
 
     /// Check if the lock file has any entries
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
-            || self.targets.values().all(|sysroots| {
-                sysroots.is_empty() || sysroots.values().all(|packages| packages.is_empty())
+            || self.targets.values().all(|target_locks| {
+                target_locks.sdk.is_empty()
+                    && target_locks.rootfs.is_empty()
+                    && target_locks.target_sysroot.is_empty()
+                    && target_locks.extensions.is_empty()
+                    && target_locks.runtimes.is_empty()
             })
     }
 }
@@ -422,46 +560,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_sysroot_type_to_key() {
-        assert_eq!(SysrootType::Sdk.to_key(), "sdk");
-        assert_eq!(SysrootType::Rootfs.to_key(), "rootfs");
-        assert_eq!(SysrootType::TargetSysroot.to_key(), "target-sysroot");
-        assert_eq!(
-            SysrootType::Extension("my-app".to_string()).to_key(),
-            "extensions/my-app"
-        );
-        // VersionedExtension and Extension produce the same key format
-        // They're only distinguished at query time, not in the lock file
-        assert_eq!(
-            SysrootType::VersionedExtension("my-versioned-app".to_string()).to_key(),
-            "extensions/my-versioned-app"
-        );
-        assert_eq!(
-            SysrootType::Runtime("dev".to_string()).to_key(),
-            "runtimes/dev"
-        );
-    }
-
-    #[test]
-    fn test_sysroot_type_from_key() {
-        assert_eq!(SysrootType::from_key("sdk"), Some(SysrootType::Sdk));
-        assert_eq!(SysrootType::from_key("rootfs"), Some(SysrootType::Rootfs));
-        assert_eq!(
-            SysrootType::from_key("target-sysroot"),
-            Some(SysrootType::TargetSysroot)
-        );
-        assert_eq!(
-            SysrootType::from_key("extensions/my-app"),
-            Some(SysrootType::Extension("my-app".to_string()))
-        );
-        assert_eq!(
-            SysrootType::from_key("runtimes/dev"),
-            Some(SysrootType::Runtime("dev".to_string()))
-        );
-        assert_eq!(SysrootType::from_key("invalid"), None);
-    }
-
-    #[test]
     fn test_lock_file_new() {
         let lock = LockFile::new();
         assert_eq!(lock.version, LOCKFILE_VERSION);
@@ -472,16 +570,24 @@ mod tests {
     fn test_lock_file_get_set_version() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
 
-        lock.set_locked_version(target, &SysrootType::Sdk, "test-package", "1.0.0-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "test-package", "1.0.0-r0.x86_64");
 
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "test-package"),
+            lock.get_locked_version(target, &sdk_x86, "test-package"),
             Some(&"1.0.0-r0.x86_64".to_string())
         );
 
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "nonexistent"),
+            lock.get_locked_version(target, &sdk_x86, "nonexistent"),
+            None
+        );
+
+        // Different host architecture should not have the package
+        assert_eq!(
+            lock.get_locked_version(target, &sdk_aarch64, "test-package"),
             None
         );
 
@@ -492,7 +598,7 @@ mod tests {
 
         // Different target should not have the package
         assert_eq!(
-            lock.get_locked_version("qemuarm64", &SysrootType::Sdk, "test-package"),
+            lock.get_locked_version("qemuarm64", &sdk_x86, "test-package"),
             None
         );
     }
@@ -566,29 +672,37 @@ wget 1.21-r0.core2_64
     fn test_build_package_spec_with_lock() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
-        lock.set_locked_version(target, &SysrootType::Sdk, "curl", "7.88.1-r0.x86_64");
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
+        lock.set_locked_version(target, &sdk_x86, "curl", "7.88.1-r0.x86_64");
 
         // Should use locked version
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &SysrootType::Sdk, "curl", "*"),
+            build_package_spec_with_lock(&lock, target, &sdk_x86, "curl", "*"),
             "curl-7.88.1-r0.x86_64"
         );
 
         // No lock, config says latest
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &SysrootType::Sdk, "wget", "*"),
+            build_package_spec_with_lock(&lock, target, &sdk_x86, "wget", "*"),
             "wget"
         );
 
         // No lock, config specifies version
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &SysrootType::Sdk, "wget", "1.21"),
+            build_package_spec_with_lock(&lock, target, &sdk_x86, "wget", "1.21"),
             "wget-1.21"
         );
 
         // Different target should not have curl locked
         assert_eq!(
-            build_package_spec_with_lock(&lock, "qemuarm64", &SysrootType::Sdk, "curl", "*"),
+            build_package_spec_with_lock(&lock, "qemuarm64", &sdk_x86, "curl", "*"),
+            "curl"
+        );
+
+        // Different host architecture should not have curl locked
+        assert_eq!(
+            build_package_spec_with_lock(&lock, target, &sdk_aarch64, "curl", "*"),
             "curl"
         );
     }
@@ -627,39 +741,49 @@ wget 1.21-r0.core2_64
     fn test_update_sysroot_versions() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
         let mut versions = HashMap::new();
         versions.insert("pkg1".to_string(), "1.0.0-r0.x86_64".to_string());
         versions.insert("pkg2".to_string(), "2.0.0-r0.x86_64".to_string());
 
-        lock.update_sysroot_versions(target, &SysrootType::Sdk, versions);
+        lock.update_sysroot_versions(target, &sdk_x86, versions);
 
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "pkg1"),
+            lock.get_locked_version(target, &sdk_x86, "pkg1"),
             Some(&"1.0.0-r0.x86_64".to_string())
         );
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "pkg2"),
+            lock.get_locked_version(target, &sdk_x86, "pkg2"),
             Some(&"2.0.0-r0.x86_64".to_string())
         );
     }
 
     #[test]
-    fn test_multiple_targets() {
+    fn test_multiple_targets_and_host_archs() {
         let mut lock = LockFile::new();
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
 
-        // Set versions for two different targets
-        lock.set_locked_version("qemux86-64", &SysrootType::Sdk, "curl", "7.88.1-r0.x86_64");
-        lock.set_locked_version("qemuarm64", &SysrootType::Sdk, "curl", "7.88.1-r0.aarch64");
+        // Set versions for two different targets on same host arch
+        lock.set_locked_version("qemux86-64", &sdk_x86, "curl", "7.88.1-r0");
+        lock.set_locked_version("qemuarm64", &sdk_x86, "curl", "7.88.1-r0");
 
-        // Each target should have its own version
+        // Set version for same target but different host arch
+        lock.set_locked_version("qemux86-64", &sdk_aarch64, "curl", "7.88.1-r0.4");
+
+        // Each target+arch combo should have its own version
         assert_eq!(
-            lock.get_locked_version("qemux86-64", &SysrootType::Sdk, "curl"),
-            Some(&"7.88.1-r0.x86_64".to_string())
+            lock.get_locked_version("qemux86-64", &sdk_x86, "curl"),
+            Some(&"7.88.1-r0".to_string())
         );
         assert_eq!(
-            lock.get_locked_version("qemuarm64", &SysrootType::Sdk, "curl"),
-            Some(&"7.88.1-r0.aarch64".to_string())
+            lock.get_locked_version("qemuarm64", &sdk_x86, "curl"),
+            Some(&"7.88.1-r0".to_string())
+        );
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sdk_aarch64, "curl"),
+            Some(&"7.88.1-r0.4".to_string())
         );
     }
 
@@ -669,7 +793,8 @@ wget 1.21-r0.core2_64
         assert!(lock.is_empty());
 
         let mut lock = LockFile::new();
-        lock.set_locked_version("qemux86-64", &SysrootType::Sdk, "curl", "7.88.1-r0.x86_64");
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        lock.set_locked_version("qemux86-64", &sdk_x86, "curl", "7.88.1-r0.x86_64");
         assert!(!lock.is_empty());
     }
 
@@ -686,9 +811,10 @@ wget 1.21-r0.core2_64
     fn test_multiple_sysroots_same_target() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
         // Set versions for different sysroots under the same target
-        lock.set_locked_version(target, &SysrootType::Sdk, "toolchain", "1.0.0-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "toolchain", "1.0.0-r0.x86_64");
         lock.set_locked_version(
             target,
             &SysrootType::Rootfs,
@@ -716,7 +842,7 @@ wget 1.21-r0.core2_64
 
         // Verify each sysroot has its package
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "toolchain"),
+            lock.get_locked_version(target, &sdk_x86, "toolchain"),
             Some(&"1.0.0-r0.x86_64".to_string())
         );
         assert_eq!(
@@ -746,7 +872,7 @@ wget 1.21-r0.core2_64
 
         // Verify cross-sysroot isolation
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "base-files"),
+            lock.get_locked_version(target, &sdk_x86, "base-files"),
             None
         );
     }
@@ -755,17 +881,18 @@ wget 1.21-r0.core2_64
     fn test_version_update_overwrites() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
-        lock.set_locked_version(target, &SysrootType::Sdk, "curl", "7.88.0-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "curl", "7.88.0-r0.x86_64");
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "curl"),
+            lock.get_locked_version(target, &sdk_x86, "curl"),
             Some(&"7.88.0-r0.x86_64".to_string())
         );
 
         // Update to new version
-        lock.set_locked_version(target, &SysrootType::Sdk, "curl", "7.88.1-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "curl", "7.88.1-r0.x86_64");
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "curl"),
+            lock.get_locked_version(target, &sdk_x86, "curl"),
             Some(&"7.88.1-r0.x86_64".to_string())
         );
     }
@@ -774,24 +901,25 @@ wget 1.21-r0.core2_64
     fn test_update_sysroot_versions_merges() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
         // Add initial packages
         let mut versions1 = HashMap::new();
         versions1.insert("pkg1".to_string(), "1.0.0-r0.x86_64".to_string());
-        lock.update_sysroot_versions(target, &SysrootType::Sdk, versions1);
+        lock.update_sysroot_versions(target, &sdk_x86, versions1);
 
         // Add more packages (should merge, not replace)
         let mut versions2 = HashMap::new();
         versions2.insert("pkg2".to_string(), "2.0.0-r0.x86_64".to_string());
-        lock.update_sysroot_versions(target, &SysrootType::Sdk, versions2);
+        lock.update_sysroot_versions(target, &sdk_x86, versions2);
 
         // Both packages should exist
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "pkg1"),
+            lock.get_locked_version(target, &sdk_x86, "pkg1"),
             Some(&"1.0.0-r0.x86_64".to_string())
         );
         assert_eq!(
-            lock.get_locked_version(target, &SysrootType::Sdk, "pkg2"),
+            lock.get_locked_version(target, &sdk_x86, "pkg2"),
             Some(&"2.0.0-r0.x86_64".to_string())
         );
     }
@@ -800,11 +928,12 @@ wget 1.21-r0.core2_64
     fn test_get_sysroot_versions() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
-        lock.set_locked_version(target, &SysrootType::Sdk, "pkg1", "1.0.0-r0.x86_64");
-        lock.set_locked_version(target, &SysrootType::Sdk, "pkg2", "2.0.0-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "pkg1", "1.0.0-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "pkg2", "2.0.0-r0.x86_64");
 
-        let versions = lock.get_sysroot_versions(target, &SysrootType::Sdk);
+        let versions = lock.get_sysroot_versions(target, &sdk_x86);
         assert!(versions.is_some());
         let versions = versions.unwrap();
         assert_eq!(versions.len(), 2);
@@ -818,7 +947,7 @@ wget 1.21-r0.core2_64
 
         // Non-existent target should return None
         assert!(lock
-            .get_sysroot_versions("nonexistent", &SysrootType::Sdk)
+            .get_sysroot_versions("nonexistent", &sdk_x86)
             .is_none());
     }
 
@@ -939,13 +1068,19 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     #[test]
     fn test_sysroot_type_get_rpm_query_config() {
         // Test SDK config - no root_path because SDK uses native container with custom RPM_CONFIGDIR
-        let sdk_config = SysrootType::Sdk.get_rpm_query_config();
+        // The arch in SDK sysroot type doesn't affect the RPM query config
+        let sdk_config = SysrootType::Sdk("x86_64".to_string()).get_rpm_query_config();
         assert_eq!(
             sdk_config.rpm_etcconfigdir,
             Some("$AVOCADO_SDK_PREFIX".to_string())
         );
         assert!(sdk_config.rpm_configdir.is_some());
         assert!(sdk_config.root_path.is_none()); // SDK doesn't use --root
+
+        // Different arch should produce the same RPM query config
+        let sdk_config_aarch64 = SysrootType::Sdk("aarch64".to_string()).get_rpm_query_config();
+        assert_eq!(sdk_config.rpm_etcconfigdir, sdk_config_aarch64.rpm_etcconfigdir);
+        assert_eq!(sdk_config.rpm_configdir, sdk_config_aarch64.rpm_configdir);
 
         // Test Rootfs config - installroots don't need RPM_ETCCONFIGDIR, just --root
         let rootfs_config = SysrootType::Rootfs.get_rpm_query_config();
@@ -1000,35 +1135,41 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     #[test]
     fn test_lock_file_json_format() {
         let mut lock = LockFile::new();
-        lock.set_locked_version("qemux86-64", &SysrootType::Sdk, "curl", "7.88.1-r0.x86_64");
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
+        lock.set_locked_version("qemux86-64", &sdk_x86, "curl", "7.88.1-r0.x86_64");
         lock.set_locked_version(
             "qemux86-64",
             &SysrootType::Extension("app".to_string()),
             "libfoo",
             "1.0.0-r0.core2_64",
         );
-        lock.set_locked_version("qemuarm64", &SysrootType::Sdk, "curl", "7.88.1-r0.aarch64");
+        lock.set_locked_version("qemuarm64", &sdk_aarch64, "curl", "7.88.1-r0.aarch64");
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
 
-        // Verify JSON structure
+        // Verify JSON structure - SDK is nested under arch, extensions under name
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["version"], 1);
-        assert!(parsed["targets"]["qemux86-64"]["sdk"]["curl"].is_string());
-        assert!(parsed["targets"]["qemux86-64"]["extensions/app"]["libfoo"].is_string());
-        assert!(parsed["targets"]["qemuarm64"]["sdk"]["curl"].is_string());
+        assert_eq!(parsed["version"], 2);
+        // SDK packages nested under sdk -> {arch} -> {package}
+        assert!(parsed["targets"]["qemux86-64"]["sdk"]["x86_64"]["curl"].is_string());
+        // Extensions nested under extensions -> {name} -> {package}
+        assert!(parsed["targets"]["qemux86-64"]["extensions"]["app"]["libfoo"].is_string());
+        assert!(parsed["targets"]["qemuarm64"]["sdk"]["aarch64"]["curl"].is_string());
     }
 
     #[test]
     fn test_lock_file_persistence_multiple_targets() {
         let temp_dir = TempDir::new().unwrap();
         let src_dir = temp_dir.path();
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
 
         // Create lock file with multiple targets and sysroots
         let mut lock = LockFile::new();
         lock.set_locked_version(
             "qemux86-64",
-            &SysrootType::Sdk,
+            &sdk_x86,
             "toolchain",
             "1.0.0-r0.x86_64",
         );
@@ -1040,7 +1181,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         );
         lock.set_locked_version(
             "qemuarm64",
-            &SysrootType::Sdk,
+            &sdk_aarch64,
             "toolchain",
             "1.0.0-r0.aarch64",
         );
@@ -1057,7 +1198,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let loaded = LockFile::load(src_dir).unwrap();
 
         assert_eq!(
-            loaded.get_locked_version("qemux86-64", &SysrootType::Sdk, "toolchain"),
+            loaded.get_locked_version("qemux86-64", &sdk_x86, "toolchain"),
             Some(&"1.0.0-r0.x86_64".to_string())
         );
         assert_eq!(
@@ -1065,7 +1206,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             Some(&"1.0.0-r0.core2_64".to_string())
         );
         assert_eq!(
-            loaded.get_locked_version("qemuarm64", &SysrootType::Sdk, "toolchain"),
+            loaded.get_locked_version("qemuarm64", &sdk_aarch64, "toolchain"),
             Some(&"1.0.0-r0.aarch64".to_string())
         );
         assert_eq!(
@@ -1082,19 +1223,20 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     fn test_build_package_spec_locked_overrides_config() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
         // Set a locked version
-        lock.set_locked_version(target, &SysrootType::Sdk, "curl", "7.88.1-r0.x86_64");
+        lock.set_locked_version(target, &sdk_x86, "curl", "7.88.1-r0.x86_64");
 
         // Even if config specifies a different version, locked version should be used
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &SysrootType::Sdk, "curl", "7.80.0"),
+            build_package_spec_with_lock(&lock, target, &sdk_x86, "curl", "7.80.0"),
             "curl-7.88.1-r0.x86_64"
         );
 
         // And if config says "*", locked version should still be used
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &SysrootType::Sdk, "curl", "*"),
+            build_package_spec_with_lock(&lock, target, &sdk_x86, "curl", "*"),
             "curl-7.88.1-r0.x86_64"
         );
     }
@@ -1113,23 +1255,25 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 
         let temp_dir = TempDir::new().unwrap();
         let src_dir = temp_dir.path();
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
 
         // Create a lock file with packages in non-alphabetical order
         let mut lock1 = LockFile::new();
-        lock1.set_locked_version("qemux86-64", &SysrootType::Sdk, "zebra", "1.0.0-r0");
-        lock1.set_locked_version("qemux86-64", &SysrootType::Sdk, "alpha", "2.0.0-r0");
+        lock1.set_locked_version("qemux86-64", &sdk_x86, "zebra", "1.0.0-r0");
+        lock1.set_locked_version("qemux86-64", &sdk_x86, "alpha", "2.0.0-r0");
         lock1.set_locked_version("qemux86-64", &SysrootType::Rootfs, "beta", "3.0.0-r0");
-        lock1.set_locked_version("qemuarm64", &SysrootType::Sdk, "gamma", "4.0.0-r0");
+        lock1.set_locked_version("qemuarm64", &sdk_aarch64, "gamma", "4.0.0-r0");
 
         lock1.save(src_dir).unwrap();
         let content1 = fs::read_to_string(LockFile::get_path(src_dir)).unwrap();
 
         // Create another lock file with same data but added in different order
         let mut lock2 = LockFile::new();
-        lock2.set_locked_version("qemuarm64", &SysrootType::Sdk, "gamma", "4.0.0-r0");
+        lock2.set_locked_version("qemuarm64", &sdk_aarch64, "gamma", "4.0.0-r0");
         lock2.set_locked_version("qemux86-64", &SysrootType::Rootfs, "beta", "3.0.0-r0");
-        lock2.set_locked_version("qemux86-64", &SysrootType::Sdk, "alpha", "2.0.0-r0");
-        lock2.set_locked_version("qemux86-64", &SysrootType::Sdk, "zebra", "1.0.0-r0");
+        lock2.set_locked_version("qemux86-64", &sdk_x86, "alpha", "2.0.0-r0");
+        lock2.set_locked_version("qemux86-64", &sdk_x86, "zebra", "1.0.0-r0");
 
         // Remove the first lock file and save the second
         fs::remove_file(LockFile::get_path(src_dir)).unwrap();
@@ -1148,13 +1292,79 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             "Target keys should be alphabetically sorted"
         );
 
-        // Verify package keys are sorted within each sysroot
+        // Verify package keys are sorted within sdk -> x86_64 nested object
         let sdk_start = content1.find("\"sdk\"").unwrap();
-        let alpha_pos = content1[sdk_start..].find("\"alpha\"").unwrap() + sdk_start;
-        let zebra_pos = content1[sdk_start..].find("\"zebra\"").unwrap() + sdk_start;
+        let x86_start = content1[sdk_start..].find("\"x86_64\"").unwrap() + sdk_start;
+        let alpha_pos = content1[x86_start..].find("\"alpha\"").unwrap() + x86_start;
+        let zebra_pos = content1[x86_start..].find("\"zebra\"").unwrap() + x86_start;
         assert!(
             alpha_pos < zebra_pos,
             "Package keys should be alphabetically sorted"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v1_to_v2() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path();
+
+        // Create a v1 lock file manually (with old flat key format)
+        // v1 had: "sdk", "rootfs", "extensions/name", "runtimes/name" as flat keys
+        let v1_content = r#"{"targets":{"jetson-orin-nano-devkit":{"extensions/my-app":{"libfoo":"1.0.0-r0"},"rootfs":{"avocado-pkg-rootfs":"0.1.0-r0.0.avocado_jetson_orin_nano_devkit"},"runtimes/dev":{"runtime-base":"2.0.0-r0"},"sdk":{"avocado-sdk-bootstrap":"0.1.0-r0.0","avocado-sdk-toolchain":"0.1.0-r0.4"}}},"version":1}
+"#;
+
+        let lock_path = LockFile::get_path(src_dir);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, v1_content).unwrap();
+
+        // Load the lock file - should trigger migration
+        let lock = LockFile::load(src_dir).unwrap();
+
+        // Version should be updated to 2
+        assert_eq!(lock.version, 2);
+
+        // Old "sdk" entries should be removed (we can't determine their host arch)
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        let sdk_aarch64 = SysrootType::Sdk("aarch64".to_string());
+        assert_eq!(
+            lock.get_locked_version("jetson-orin-nano-devkit", &sdk_x86, "avocado-sdk-toolchain"),
+            None
+        );
+        assert_eq!(
+            lock.get_locked_version("jetson-orin-nano-devkit", &sdk_aarch64, "avocado-sdk-toolchain"),
+            None
+        );
+
+        // Rootfs entries should be preserved (they're not arch-dependent)
+        assert_eq!(
+            lock.get_locked_version(
+                "jetson-orin-nano-devkit",
+                &SysrootType::Rootfs,
+                "avocado-pkg-rootfs"
+            ),
+            Some(&"0.1.0-r0.0.avocado_jetson_orin_nano_devkit".to_string())
+        );
+
+        // Extensions should be migrated from "extensions/name" to nested structure
+        assert_eq!(
+            lock.get_locked_version(
+                "jetson-orin-nano-devkit",
+                &SysrootType::Extension("my-app".to_string()),
+                "libfoo"
+            ),
+            Some(&"1.0.0-r0".to_string())
+        );
+
+        // Runtimes should be migrated from "runtimes/name" to nested structure
+        assert_eq!(
+            lock.get_locked_version(
+                "jetson-orin-nano-devkit",
+                &SysrootType::Runtime("dev".to_string()),
+                "runtime-base"
+            ),
+            Some(&"2.0.0-r0".to_string())
         );
     }
 }

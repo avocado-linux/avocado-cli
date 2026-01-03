@@ -11,6 +11,7 @@ use crate::utils::{
     container::SdkContainer,
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_info, print_success, OutputLevel},
+    stamps::get_local_arch,
     target::validate_and_log_target,
 };
 
@@ -1147,6 +1148,9 @@ $DNF_SDK_HOST \
         };
 
         // Build list of SDK packages to install (using lock file for version pinning)
+        // SDK packages are keyed by host architecture since they run on the host
+        let sdk_sysroot = SysrootType::Sdk(get_local_arch().to_string());
+
         let mut sdk_packages = Vec::new();
         let mut sdk_package_names = Vec::new();
         for (pkg_name_val, version_spec) in sdk_deps_map {
@@ -1168,7 +1172,7 @@ $DNF_SDK_HOST \
             let package_spec = build_package_spec_with_lock(
                 lock_file,
                 target,
-                &SysrootType::Sdk,
+                &sdk_sysroot,
                 pkg_name,
                 &config_version,
             );
@@ -1263,7 +1267,7 @@ $DNF_SDK_HOST \
         if !sdk_package_names.is_empty() {
             let installed_versions = container_helper
                 .query_installed_packages(
-                    &SysrootType::Sdk,
+                    &sdk_sysroot,
                     &sdk_package_names,
                     container_image,
                     target,
@@ -1275,7 +1279,7 @@ $DNF_SDK_HOST \
                 .await?;
 
             if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(target, &SysrootType::Sdk, installed_versions);
+                lock_file.update_sysroot_versions(target, &sdk_sysroot, installed_versions);
                 if self.verbose {
                     print_info(
                         &format!("Updated lock file with SDK dependencies from external config '{external_config_path}'."),

@@ -182,6 +182,24 @@ impl SdkInstallCommand {
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<()> {
+        // Determine host architecture for SDK package tracking
+        // For remote execution, query the remote host; for local, use local arch
+        let host_arch = if let Some(context) = runs_on_context {
+            context.get_host_arch().await.with_context(|| "Failed to get remote host architecture")?
+        } else {
+            get_local_arch().to_string()
+        };
+
+        // Create SDK sysroot type with the host architecture
+        let sdk_sysroot = SysrootType::Sdk(host_arch.clone());
+
+        if self.verbose {
+            print_info(
+                &format!("Using host architecture '{}' for SDK package tracking.", host_arch),
+                OutputLevel::Normal,
+            );
+        }
+
         // Load lock file for reproducible builds
         let src_dir = config
             .get_resolved_src_dir(&self.config_path)
@@ -390,7 +408,7 @@ MACROS_EOF
         let sdk_target_pkg = build_package_spec_with_lock(
             &lock_file,
             target,
-            &SysrootType::Sdk,
+            &sdk_sysroot,
             &sdk_target_pkg_name,
             sdk_target_config_version,
         );
@@ -486,7 +504,7 @@ $DNF_SDK_HOST \
         let bootstrap_pkg = build_package_spec_with_lock(
             &lock_file,
             target,
-            &SysrootType::Sdk,
+            &sdk_sysroot,
             bootstrap_pkg_name,
             bootstrap_config_version,
         );
@@ -588,7 +606,7 @@ fi
                 dependencies,
                 &lock_file,
                 target,
-                &SysrootType::Sdk,
+                &sdk_sysroot,
             ));
             sdk_package_names.extend(self.extract_package_names(dependencies));
         }
@@ -602,7 +620,7 @@ fi
                 );
             }
             let ext_packages =
-                self.build_package_list_with_lock(ext_deps, &lock_file, target, &SysrootType::Sdk);
+                self.build_package_list_with_lock(ext_deps, &lock_file, target, &sdk_sysroot);
             sdk_packages.extend(ext_packages);
             sdk_package_names.extend(self.extract_package_names(ext_deps));
         }
@@ -673,7 +691,7 @@ $DNF_SDK_HOST \
         if !all_sdk_package_names.is_empty() {
             let installed_versions = container_helper
                 .query_installed_packages(
-                    &SysrootType::Sdk,
+                    &sdk_sysroot,
                     &all_sdk_package_names,
                     container_image,
                     target,
@@ -685,7 +703,7 @@ $DNF_SDK_HOST \
                 .await?;
 
             if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(target, &SysrootType::Sdk, installed_versions);
+                lock_file.update_sysroot_versions(target, &sdk_sysroot, installed_versions);
                 if self.verbose {
                     print_info(
                         &format!(
@@ -1032,6 +1050,7 @@ mod tests {
         let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
         let lock_file = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
         let mut deps = HashMap::new();
         deps.insert("package1".to_string(), Value::String("*".to_string()));
@@ -1042,7 +1061,7 @@ mod tests {
         );
 
         let packages =
-            cmd.build_package_list_with_lock(&deps, &lock_file, target, &SysrootType::Sdk);
+            cmd.build_package_list_with_lock(&deps, &lock_file, target, &sdk_x86);
 
         assert_eq!(packages.len(), 3);
         assert!(packages.contains(&"package1".to_string()));
@@ -1055,11 +1074,12 @@ mod tests {
         let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
         let mut lock_file = LockFile::new();
         let target = "qemux86-64";
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
 
         // Add a locked version for package1
         lock_file.update_sysroot_versions(
             target,
-            &SysrootType::Sdk,
+            &sdk_x86,
             [("package1".to_string(), "2.0.0-r0.x86_64".to_string())]
                 .into_iter()
                 .collect(),
@@ -1070,7 +1090,7 @@ mod tests {
         deps.insert("package2".to_string(), Value::String("1.0.0".to_string()));
 
         let packages =
-            cmd.build_package_list_with_lock(&deps, &lock_file, target, &SysrootType::Sdk);
+            cmd.build_package_list_with_lock(&deps, &lock_file, target, &sdk_x86);
 
         assert_eq!(packages.len(), 2);
         // package1 should use locked version instead of "*"
