@@ -185,7 +185,10 @@ impl SdkInstallCommand {
         // Determine host architecture for SDK package tracking
         // For remote execution, query the remote host; for local, use local arch
         let host_arch = if let Some(context) = runs_on_context {
-            context.get_host_arch().await.with_context(|| "Failed to get remote host architecture")?
+            context
+                .get_host_arch()
+                .await
+                .with_context(|| "Failed to get remote host architecture")?
         } else {
             get_local_arch().to_string()
         };
@@ -195,7 +198,10 @@ impl SdkInstallCommand {
 
         if self.verbose {
             print_info(
-                &format!("Using host architecture '{}' for SDK package tracking.", host_arch),
+                &format!(
+                    "Using host architecture '{}' for SDK package tracking.",
+                    host_arch
+                ),
                 OutputLevel::Normal,
             );
         }
@@ -1060,8 +1066,7 @@ mod tests {
             serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
         );
 
-        let packages =
-            cmd.build_package_list_with_lock(&deps, &lock_file, target, &sdk_x86);
+        let packages = cmd.build_package_list_with_lock(&deps, &lock_file, target, &sdk_x86);
 
         assert_eq!(packages.len(), 3);
         assert!(packages.contains(&"package1".to_string()));
@@ -1089,8 +1094,7 @@ mod tests {
         deps.insert("package1".to_string(), Value::String("*".to_string()));
         deps.insert("package2".to_string(), Value::String("1.0.0".to_string()));
 
-        let packages =
-            cmd.build_package_list_with_lock(&deps, &lock_file, target, &sdk_x86);
+        let packages = cmd.build_package_list_with_lock(&deps, &lock_file, target, &sdk_x86);
 
         assert_eq!(packages.len(), 2);
         // package1 should use locked version instead of "*"

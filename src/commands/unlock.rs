@@ -71,7 +71,10 @@ impl UnlockCommand {
             .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;
 
         if lock_file.is_empty() {
-            print_info("Lock file is empty, nothing to unlock.", OutputLevel::Normal);
+            print_info(
+                "Lock file is empty, nothing to unlock.",
+                OutputLevel::Normal,
+            );
             return Ok(());
         }
 
@@ -123,10 +126,7 @@ impl UnlockCommand {
             if let Some(ref ext_name) = self.extension {
                 if self.verbose {
                     print_info(
-                        &format!(
-                            "Unlocking extension '{}' for target '{}'",
-                            ext_name, target
-                        ),
+                        &format!("Unlocking extension '{}' for target '{}'", ext_name, target),
                         OutputLevel::Normal,
                     );
                 }
@@ -278,7 +278,11 @@ runtime:
             .get_locked_version("qemux86-64", &SysrootType::Rootfs, "test-rootfs-pkg")
             .is_none());
         assert!(lock
-            .get_locked_version("qemux86-64", &SysrootType::TargetSysroot, "test-sysroot-pkg")
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::TargetSysroot,
+                "test-sysroot-pkg"
+            )
             .is_none());
         // Extensions and runtimes should still be present
         assert!(lock
@@ -367,4 +371,3 @@ runtime:
             .is_some());
     }
 }
-

@@ -134,12 +134,18 @@ NFS_Core_Param {{
   allow_set_io_flusher_fail = true;
   Nb_Max_Fd = 65536;
   Max_Open_Files = 10000;
-  DRC_Max_Size = 32768;
+  # Large duplicate request cache for builds with many files
+  DRC_Max_Size = 65536;
   # Short attribute cache for fresher file metadata during builds
   Attr_Expiration_Time = 3;
   # Single-client use case doesn't need many workers
   Nb_Worker = 32;
   Bind_addr = {};
+  # TCP keepalive for long-running builds over potentially unstable networks
+  Enable_TCP_Keepalive = true;
+  TCP_Keepidle = 60;
+  TCP_Keepintvl = 10;
+  TCP_Keepcnt = 5;
 }}
 
 NFSV4 {{

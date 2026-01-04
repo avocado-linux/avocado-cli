@@ -256,10 +256,7 @@ impl LockFile {
         let v1_lock: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
 
-        let version = v1_lock
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+        let version = v1_lock.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
         if version == 1 {
             return Ok(Self::migrate_v1_to_v2(&v1_lock));
@@ -288,19 +285,14 @@ impl LockFile {
 
         if let Some(targets) = v1_lock.get("targets").and_then(|t| t.as_object()) {
             for (target_name, sysroots) in targets {
-                let target_locks = lock_file
-                    .targets
-                    .entry(target_name.clone())
-                    .or_default();
+                let target_locks = lock_file.targets.entry(target_name.clone()).or_default();
 
                 if let Some(sysroots_map) = sysroots.as_object() {
                     for (key, packages) in sysroots_map {
                         if let Some(packages_map) = packages.as_object() {
                             let pkg_versions: PackageVersions = packages_map
                                 .iter()
-                                .filter_map(|(k, v)| {
-                                    v.as_str().map(|s| (k.clone(), s.to_string()))
-                                })
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                                 .collect();
 
                             match key.as_str() {
@@ -1014,9 +1006,7 @@ wget 1.21-r0.core2_64
             .is_none());
 
         // Non-existent target should return None
-        assert!(lock
-            .get_sysroot_versions("nonexistent", &sdk_x86)
-            .is_none());
+        assert!(lock.get_sysroot_versions("nonexistent", &sdk_x86).is_none());
     }
 
     #[test]
@@ -1147,7 +1137,10 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 
         // Different arch should produce the same RPM query config
         let sdk_config_aarch64 = SysrootType::Sdk("aarch64".to_string()).get_rpm_query_config();
-        assert_eq!(sdk_config.rpm_etcconfigdir, sdk_config_aarch64.rpm_etcconfigdir);
+        assert_eq!(
+            sdk_config.rpm_etcconfigdir,
+            sdk_config_aarch64.rpm_etcconfigdir
+        );
         assert_eq!(sdk_config.rpm_configdir, sdk_config_aarch64.rpm_configdir);
 
         // Test Rootfs config - installroots don't need RPM_ETCCONFIGDIR, just --root
@@ -1235,24 +1228,14 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 
         // Create lock file with multiple targets and sysroots
         let mut lock = LockFile::new();
-        lock.set_locked_version(
-            "qemux86-64",
-            &sdk_x86,
-            "toolchain",
-            "1.0.0-r0.x86_64",
-        );
+        lock.set_locked_version("qemux86-64", &sdk_x86, "toolchain", "1.0.0-r0.x86_64");
         lock.set_locked_version(
             "qemux86-64",
             &SysrootType::Rootfs,
             "base",
             "1.0.0-r0.core2_64",
         );
-        lock.set_locked_version(
-            "qemuarm64",
-            &sdk_aarch64,
-            "toolchain",
-            "1.0.0-r0.aarch64",
-        );
+        lock.set_locked_version("qemuarm64", &sdk_aarch64, "toolchain", "1.0.0-r0.aarch64");
         lock.set_locked_version(
             "qemuarm64",
             &SysrootType::Extension("app".to_string()),
@@ -1401,7 +1384,11 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             None
         );
         assert_eq!(
-            lock.get_locked_version("jetson-orin-nano-devkit", &sdk_aarch64, "avocado-sdk-toolchain"),
+            lock.get_locked_version(
+                "jetson-orin-nano-devkit",
+                &sdk_aarch64,
+                "avocado-sdk-toolchain"
+            ),
             None
         );
 

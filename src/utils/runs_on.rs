@@ -243,7 +243,8 @@ impl RunsOnContext {
             "Creating NFS volumes on remote host...",
             OutputLevel::Normal,
         );
-        let remote_vm = RemoteVolumeManager::new(ssh_master.create_client(), container_tool.to_string());
+        let remote_vm =
+            RemoteVolumeManager::new(ssh_master.create_client(), container_tool.to_string());
 
         // Create source volume
         remote_vm

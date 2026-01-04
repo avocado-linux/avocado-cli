@@ -166,7 +166,10 @@ impl CleanCommand {
 
         if lock_file.is_empty() {
             if self.verbose {
-                print_info("Lock file is empty, nothing to unlock.", OutputLevel::Normal);
+                print_info(
+                    "Lock file is empty, nothing to unlock.",
+                    OutputLevel::Normal,
+                );
             }
             return Ok(());
         }

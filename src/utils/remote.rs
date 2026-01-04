@@ -421,10 +421,7 @@ impl SshControlMaster {
 
         if verbose {
             print_info(
-                &format!(
-                    "Starting SSH ControlMaster for {}...",
-                    remote.ssh_target()
-                ),
+                &format!("Starting SSH ControlMaster for {}...", remote.ssh_target()),
                 OutputLevel::Normal,
             );
         }
@@ -576,26 +573,84 @@ impl RemoteVolumeManager {
         nfs_port: u16,
         export_path: &str,
     ) -> Result<()> {
-        // Mount options:
+        // Mount options for reliability:
+        // - hard: Never give up retrying requests (safer for builds)
+        // - timeo=600: 60-second timeout per retry (in tenths of seconds)
+        // - retrans=5: Retry 5 times before marking server unreachable
         // - actimeo=3: Short attribute cache timeout (3 seconds) for fresher metadata
         // - lookupcache=positive: Only cache successful lookups, not failures
-        // These help with stale handle issues from Docker Desktop's VirtioFS
-        // while maintaining reasonable performance
+        // - noatime: Don't update access times (reduces NFS traffic)
+        // - nconnect=4: Use multiple TCP connections for better throughput (kernel 5.3+)
+        // These help with stale handle issues and network reliability
         let command = format!(
             "{} volume create \
              --driver local \
              --opt type=nfs \
-             --opt o=addr={},rw,nfsvers=4,port={},actimeo=3,lookupcache=positive \
+             --opt o=addr={},rw,nfsvers=4,port={},hard,timeo=600,retrans=5,actimeo=3,lookupcache=positive,noatime,nconnect=4 \
              --opt device=:{} \
              {}",
             self.container_tool, nfs_host, nfs_port, export_path, volume_name
         );
 
-        self.ssh.run_command(&command).await?;
+        // Retry logic for transient network issues
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY_SECS: u64 = 2;
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            match self.ssh.run_command(&command).await {
+                Ok(_) => {
+                    if self.ssh.verbose {
+                        print_info(
+                            &format!("Created NFS volume '{}' on remote", volume_name),
+                            OutputLevel::Normal,
+                        );
+                    }
+
+                    // Verify the mount is functional by doing a quick I/O test
+                    self.verify_nfs_volume(volume_name).await?;
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES {
+                        if self.ssh.verbose {
+                            print_info(
+                                &format!(
+                                    "NFS volume creation attempt {}/{} failed, retrying in {}s...",
+                                    attempt, MAX_RETRIES, RETRY_DELAY_SECS
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Failed to create NFS volume")))
+    }
+
+    /// Verify an NFS volume is functional by performing a quick I/O test
+    async fn verify_nfs_volume(&self, volume_name: &str) -> Result<()> {
+        // Run a quick container that writes and removes a test file
+        // This verifies the NFS mount is actually working
+        let verify_command = format!(
+            "{} run --rm -v {}:/test:rw alpine:latest sh -c 'touch /test/.nfs-health-check && rm /test/.nfs-health-check'",
+            self.container_tool, volume_name
+        );
+
+        self.ssh
+            .run_command(&verify_command)
+            .await
+            .context("NFS volume health check failed - mount may not be functional")?;
 
         if self.ssh.verbose {
             print_info(
-                &format!("Created NFS volume '{}' on remote", volume_name),
+                &format!("NFS volume '{}' health check passed", volume_name),
                 OutputLevel::Normal,
             );
         }
