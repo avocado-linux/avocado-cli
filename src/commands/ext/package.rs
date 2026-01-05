@@ -395,7 +395,7 @@ mkdir -p BUILD RPMS SOURCES SPECS SRPMS
 
 # Create spec file
 # Package root (/) maps to the extension's src_dir
-cat > SPECS/package.spec << 'SPEC_EOF'
+cat > SPECS/package.spec << SPEC_EOF
 %define _buildhost reproducible
 AutoReqProv: no
 
@@ -422,7 +422,7 @@ Group: {group}{url_line}
 %install
 mkdir -p %{{buildroot}}
 # Copy src_dir contents to buildroot root
-# This allows installation to $AVOCADO_PREFIX/includes/<ext_name>/
+# This allows installation to \$AVOCADO_PREFIX/includes/<ext_name>/
 cp -rp "$EXT_SRC_DIR"/* %{{buildroot}}/
 
 %clean
