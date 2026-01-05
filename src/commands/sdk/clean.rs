@@ -21,6 +21,8 @@ pub struct SdkCleanCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl SdkCleanCommand {
@@ -38,7 +40,14 @@ impl SdkCleanCommand {
             target,
             container_args,
             dnf_args,
+            sdk_arch: None,
         }
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
+        self
     }
 
     /// Execute the sdk clean command
@@ -74,7 +83,7 @@ impl SdkCleanCommand {
         }
 
         let remove_command = "rm -rf $AVOCADO_SDK_PREFIX";
-        let config = RunConfig {
+        let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.clone(),
             command: remove_command.to_string(),
@@ -85,9 +94,10 @@ impl SdkCleanCommand {
             repo_release,
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
-        let success = container_helper.run_in_container(config).await?;
+        let success = container_helper.run_in_container(run_config).await?;
 
         if success {
             print_success("Successfully removed SDK directory.", OutputLevel::Normal);

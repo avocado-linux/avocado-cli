@@ -37,6 +37,8 @@ pub struct SdkInstallCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl SdkInstallCommand {
@@ -59,6 +61,7 @@ impl SdkInstallCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -72,6 +75,12 @@ impl SdkInstallCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -431,8 +440,13 @@ MACROS_EOF
             ..Default::default()
         };
 
-        let init_success =
-            run_container_command(container_helper, run_config, runs_on_context).await?;
+        let init_success = run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
 
         if init_success {
             print_success("Initialized SDK environment.", OutputLevel::Normal);
@@ -489,8 +503,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             ..Default::default()
         };
 
-        let sdk_target_success =
-            run_container_command(container_helper, run_config, runs_on_context).await?;
+        let sdk_target_success = run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
 
         // Track all SDK packages installed for lock file update at the end
         let mut all_sdk_package_names: Vec<String> = Vec::new();
@@ -536,7 +555,13 @@ $DNF_SDK_HOST \
             ..Default::default()
         };
 
-        run_container_command(container_helper, run_config, runs_on_context).await?;
+        run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
 
         // Install avocado-sdk-bootstrap with version from distro.version
         print_info("Installing SDK bootstrap.", OutputLevel::Normal);
@@ -586,8 +611,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             ..Default::default()
         };
 
-        let bootstrap_success =
-            run_container_command(container_helper, run_config, runs_on_context).await?;
+        let bootstrap_success = run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
 
         if bootstrap_success {
             print_success("Installed SDK bootstrap.", OutputLevel::Normal);
@@ -638,7 +668,13 @@ fi
             ..Default::default()
         };
 
-        run_container_command(container_helper, run_config, runs_on_context).await?;
+        run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
 
         // Install SDK dependencies (into SDK)
         let mut sdk_packages = Vec::new();
@@ -716,8 +752,13 @@ $DNF_SDK_HOST \
                 // runs_on handled by shared context
                 ..Default::default()
             };
-            let install_success =
-                run_container_command(container_helper, run_config, runs_on_context).await?;
+            let install_success = run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
 
             if install_success {
                 print_success("Installed SDK dependencies.", OutputLevel::Normal);
@@ -809,8 +850,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             ..Default::default()
         };
 
-        let rootfs_success =
-            run_container_command(container_helper, run_config, runs_on_context).await?;
+        let rootfs_success = run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
 
         if rootfs_success {
             print_success("Installed rootfs sysroot.", OutputLevel::Normal);
@@ -931,8 +977,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 ..Default::default()
             };
 
-            let install_success =
-                run_container_command(container_helper, run_config, runs_on_context).await?;
+            let install_success = run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
 
             if install_success {
                 print_success(
@@ -1016,7 +1067,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 ..Default::default()
             };
 
-            run_container_command(container_helper, run_config, runs_on_context).await?;
+            run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
 
             if self.verbose {
                 print_info("Wrote SDK install stamp.", OutputLevel::Normal);
@@ -1068,9 +1125,15 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 /// Helper function to run a container command, using shared context if available
 async fn run_container_command(
     container_helper: &SdkContainer,
-    config: RunConfig,
+    mut config: RunConfig,
     runs_on_context: Option<&RunsOnContext>,
+    sdk_arch: Option<&String>,
 ) -> Result<bool> {
+    // Inject sdk_arch if provided
+    if let Some(arch) = sdk_arch {
+        config.sdk_arch = Some(arch.clone());
+    }
+
     if let Some(context) = runs_on_context {
         // Use the shared context - don't set runs_on in config as we're handling it
         container_helper

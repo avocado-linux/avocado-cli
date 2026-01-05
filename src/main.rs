@@ -57,6 +57,10 @@ struct Cli {
     /// NFS port for remote execution (auto-selects from 12050-12099 if not specified)
     #[arg(long, global = true)]
     nfs_port: Option<u16>,
+
+    /// SDK container architecture for cross-arch emulation via Docker buildx/QEMU (aarch64 or x86-64)
+    #[arg(long, value_name = "ARCH", global = true)]
+    sdk_arch: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1387,7 +1391,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -1428,7 +1433,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                     no_bootstrap,
                 )
-                .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 run_cmd.execute().await?;
                 Ok(())
             }
@@ -1458,7 +1464,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 compile_cmd.execute().await?;
                 Ok(())
             }
@@ -1477,7 +1484,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -1494,7 +1502,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 clean_cmd.execute().await?;
                 Ok(())
             }

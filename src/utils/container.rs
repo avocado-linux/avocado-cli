@@ -55,6 +55,24 @@ pub fn is_docker_desktop() -> bool {
     cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
+/// Convert SDK arch specification to Docker platform format.
+///
+/// # Arguments
+/// * `sdk_arch` - Architecture string (e.g., "aarch64", "x86-64", "arm64", "amd64")
+///
+/// # Returns
+/// Docker platform string (e.g., "linux/arm64", "linux/amd64")
+pub fn sdk_arch_to_platform(sdk_arch: &str) -> Result<String> {
+    match sdk_arch.to_lowercase().as_str() {
+        "aarch64" | "arm64" => Ok("linux/arm64".to_string()),
+        "x86-64" | "x86_64" | "amd64" => Ok("linux/amd64".to_string()),
+        _ => Err(anyhow::anyhow!(
+            "Unsupported SDK architecture: '{}'. Supported values: aarch64, x86-64",
+            sdk_arch
+        )),
+    }
+}
+
 /// Add security options to container command based on host security module.
 /// - SELinux (Fedora/RHEL): adds --security-opt label=disable
 /// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined
@@ -102,6 +120,8 @@ pub struct RunConfig {
     pub runs_on: Option<String>,
     /// NFS port for remote execution (auto-selected if None)
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation (e.g., "aarch64", "x86-64")
+    pub sdk_arch: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -132,6 +152,7 @@ impl Default for RunConfig {
             signing_checksum_algorithm: None,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 }
@@ -494,6 +515,13 @@ impl SdkContainer {
             "label=disable".to_string(),
         ];
 
+        // Add platform flag for cross-architecture emulation via Docker buildx/QEMU
+        if let Some(ref sdk_arch) = config.sdk_arch {
+            let platform = sdk_arch_to_platform(sdk_arch)?;
+            extra_args.push("--platform".to_string());
+            extra_args.push(platform);
+        }
+
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
         }
@@ -535,6 +563,13 @@ impl SdkContainer {
         volume_state: &VolumeState,
     ) -> Result<Vec<String>> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
+
+        // Add platform flag for cross-architecture emulation via Docker buildx/QEMU
+        if let Some(ref sdk_arch) = config.sdk_arch {
+            let platform = sdk_arch_to_platform(sdk_arch)?;
+            container_cmd.push("--platform".to_string());
+            container_cmd.push(platform);
+        }
 
         // Container options
         if config.rm {
@@ -965,6 +1000,13 @@ impl SdkContainer {
             "--security-opt".to_string(),
             "label=disable".to_string(),
         ];
+
+        // Add platform flag for cross-architecture emulation via Docker buildx/QEMU
+        if let Some(ref sdk_arch) = config.sdk_arch {
+            let platform = sdk_arch_to_platform(sdk_arch)?;
+            extra_args.push("--platform".to_string());
+            extra_args.push(platform);
+        }
 
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
@@ -1840,6 +1882,7 @@ mod tests {
             signing_checksum_algorithm: None,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
 
         let result = container.build_container_command(&config, &command, &env_vars, &volume_state);
@@ -1976,5 +2019,51 @@ mod tests {
             result,
             vec!["-e", "VAR=value with spaces", "--name", "test"]
         );
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_aarch64() {
+        let result = sdk_arch_to_platform("aarch64").unwrap();
+        assert_eq!(result, "linux/arm64");
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_arm64() {
+        let result = sdk_arch_to_platform("arm64").unwrap();
+        assert_eq!(result, "linux/arm64");
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_x86_64() {
+        let result = sdk_arch_to_platform("x86-64").unwrap();
+        assert_eq!(result, "linux/amd64");
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_x86_64_underscore() {
+        let result = sdk_arch_to_platform("x86_64").unwrap();
+        assert_eq!(result, "linux/amd64");
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_amd64() {
+        let result = sdk_arch_to_platform("amd64").unwrap();
+        assert_eq!(result, "linux/amd64");
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_case_insensitive() {
+        let result = sdk_arch_to_platform("AARCH64").unwrap();
+        assert_eq!(result, "linux/arm64");
+    }
+
+    #[test]
+    fn test_sdk_arch_to_platform_unsupported() {
+        let result = sdk_arch_to_platform("riscv64");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported SDK architecture"));
     }
 }

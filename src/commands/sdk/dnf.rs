@@ -23,6 +23,8 @@ pub struct SdkDnfCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl SdkDnfCommand {
@@ -42,7 +44,14 @@ impl SdkDnfCommand {
             target,
             container_args,
             dnf_args,
+            sdk_arch: None,
         }
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
+        self
     }
 
     /// Execute the sdk dnf command
@@ -134,6 +143,7 @@ impl SdkDnfCommand {
             repo_release: repo_release.cloned(),
             container_args: container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         container_helper.run_in_container(config).await

@@ -47,6 +47,8 @@ pub struct SdkRunCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
     /// Signing service handle (Unix only)
     #[cfg(unix)]
     signing_service: Option<SigningService>,
@@ -88,6 +90,7 @@ impl SdkRunCommand {
             no_bootstrap,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
             #[cfg(unix)]
             signing_service: None,
         }
@@ -97,6 +100,12 @@ impl SdkRunCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -326,6 +335,7 @@ impl SdkRunCommand {
             no_bootstrap: self.no_bootstrap,
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 

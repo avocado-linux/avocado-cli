@@ -33,6 +33,8 @@ pub struct SdkCompileCommand {
     pub dnf_args: Option<Vec<String>>,
     /// Disable stamp validation
     pub no_stamps: bool,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl SdkCompileCommand {
@@ -53,12 +55,19 @@ impl SdkCompileCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            sdk_arch: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -98,6 +107,7 @@ impl SdkCompileCommand {
                 repo_release: config.get_sdk_repo_release(),
                 container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
                 dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -242,6 +252,7 @@ impl SdkCompileCommand {
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(config).await?;
