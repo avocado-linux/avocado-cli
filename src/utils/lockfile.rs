@@ -3,6 +3,9 @@
 //! This module provides functionality to track and pin package versions
 //! across different sysroots to ensure reproducible builds.
 
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,8 +37,12 @@ pub enum SysrootType {
     /// Local/external extension sysroot ($AVOCADO_EXT_SYSROOTS/{name})
     /// Uses ext-rpm-config-scripts for RPM database
     Extension(String),
-    /// Versioned extension sysroot ($AVOCADO_EXT_SYSROOTS/{name})
-    /// Uses ext-rpm-config for RPM database (different location than local extensions)
+    /// DEPRECATED: Versioned extension sysroot
+    /// The vsn: syntax is no longer supported. Remote extensions are now defined
+    /// in the ext section with source: field and are treated as local extensions
+    /// after being fetched to $AVOCADO_PREFIX/includes/<ext_name>/.
+    #[deprecated(since = "0.23.0", note = "Use Extension variant for all extensions")]
+    #[allow(dead_code)]
     VersionedExtension(String),
     /// Runtime sysroot ($AVOCADO_PREFIX/runtimes/{name})
     Runtime(String),

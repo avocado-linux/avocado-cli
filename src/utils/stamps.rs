@@ -7,6 +7,9 @@
 //! 2. Detects staleness via content-addressable hashing (config + package list)
 //! 3. Enforces command ordering with dependency resolution from config
 
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -986,9 +989,8 @@ pub fn resolve_required_stamps_for_arch(
 /// This properly handles different extension types:
 /// - Local extensions: require install + build + image stamps
 /// - External extensions: require install + build + image stamps
-/// - Versioned extensions: NO stamp requirements - they're prebuilt packages
-///   installed directly via DNF during `runtime install`. The package repository
-///   contains the complete extension images, so no local build/image steps needed.
+/// - Versioned extensions: DEPRECATED - should error during config parsing
+///   Remote extensions are now defined in the ext section with source: field
 pub fn resolve_required_stamps_for_runtime_build(
     runtime_name: &str,
     ext_dependencies: &[RuntimeExtDep],
@@ -1028,12 +1030,12 @@ pub fn resolve_required_stamps_for_runtime_build_with_arch(
                 reqs.push(StampRequirement::ext_build(ext_name));
                 reqs.push(StampRequirement::ext_image(ext_name));
             }
-            // Versioned extensions: NO stamp requirements
-            // They're prebuilt packages from the package repository, installed
-            // directly via DNF during `runtime install`. No local ext install,
-            // ext build, or ext image steps are needed.
+            // DEPRECATED: Versioned extensions with vsn: syntax
+            // This case should not be reached as vsn: syntax now errors early.
+            // Remote extensions are now handled through the ext section with source: field,
+            // and are treated as local extensions after being fetched.
             RuntimeExtDep::Versioned { .. } => {
-                // No stamps required - covered by runtime install
+                // Should not be reached - vsn: syntax errors during config parsing
             }
         }
     }

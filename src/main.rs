@@ -9,7 +9,7 @@ use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
-    ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
+    ExtFetchCommand, ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
 };
 use commands::fetch::FetchCommand;
 use commands::hitl::HitlServerCommand;
@@ -1186,6 +1186,25 @@ async fn main() -> Result<()> {
                 install_cmd.execute().await?;
                 Ok(())
             }
+            ExtCommands::Fetch {
+                config,
+                verbose,
+                force,
+                extension,
+                target,
+                container_args,
+            } => {
+                let fetch_cmd = ExtFetchCommand::new(
+                    config,
+                    extension,
+                    verbose,
+                    force,
+                    target.or(cli.target.clone()),
+                    container_args,
+                );
+                fetch_cmd.execute().await?;
+                Ok(())
+            }
             ExtCommands::Build {
                 extension,
                 config,
@@ -1508,6 +1527,27 @@ enum ExtCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+    /// Fetch remote extensions from repo, git, or path sources
+    Fetch {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force re-fetch even if already installed
+        #[arg(short, long)]
+        force: bool,
+        /// Name of the extension to fetch (if not provided, fetches all remote extensions)
+        #[arg(short = 'e', long = "extension")]
+        extension: Option<String>,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
     },
     /// Build sysext and/or confext extensions from configuration
     Build {

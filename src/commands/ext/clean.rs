@@ -1,3 +1,6 @@
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::Result;
 
 use crate::utils::config::{Config, ExtensionLocation};
@@ -71,6 +74,12 @@ impl ExtCleanCommand {
                                 &format!(
                                     "Found external extension '{name}' in config '{config_path}'"
                                 ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        ExtensionLocation::Remote { name, source } => {
+                            print_info(
+                                &format!("Found remote extension '{name}' with source: {source:?}"),
                                 OutputLevel::Normal,
                             );
                         }

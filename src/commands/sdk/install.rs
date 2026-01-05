@@ -82,7 +82,12 @@ impl SdkInstallCommand {
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
         let target = validate_and_log_target(self.target.as_deref(), &basic_config)?;
 
+        // Fetch remote extensions before loading composed config
+        // This ensures their configs can be merged in
+        self.fetch_remote_extensions(&basic_config, &target).await?;
+
         // Load the composed configuration (merges external configs, applies interpolation)
+        // This now includes configs from fetched remote extensions
         let composed = Config::load_composed(&self.config_path, self.target.as_deref())
             .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
 
@@ -164,6 +169,45 @@ impl SdkInstallCommand {
         }
 
         result
+    }
+
+    /// Fetch remote extensions before SDK install
+    ///
+    /// This discovers extensions with a `source` field and fetches them
+    /// to `$AVOCADO_PREFIX/includes/` so their configs can be merged.
+    async fn fetch_remote_extensions(&self, _config: &Config, target: &str) -> Result<()> {
+        use crate::commands::ext::ExtFetchCommand;
+
+        // Discover remote extensions
+        let remote_extensions = Config::discover_remote_extensions(&self.config_path)?;
+
+        if remote_extensions.is_empty() {
+            return Ok(());
+        }
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Fetching {} remote extension(s) before SDK install...",
+                    remote_extensions.len()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        // Use ExtFetchCommand to fetch extensions
+        let fetch_cmd = ExtFetchCommand::new(
+            self.config_path.clone(),
+            None, // Fetch all remote extensions
+            self.verbose,
+            false, // Don't force re-fetch
+            Some(target.to_string()),
+            self.container_args.clone(),
+        );
+
+        fetch_cmd.execute().await?;
+
+        Ok(())
     }
 
     /// Internal implementation of the install logic

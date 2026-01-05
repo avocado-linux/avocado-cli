@@ -3,6 +3,7 @@ pub mod checkout;
 pub mod clean;
 pub mod deps;
 pub mod dnf;
+pub mod fetch;
 pub mod image;
 pub mod install;
 pub mod list;
@@ -17,6 +18,7 @@ pub use clean::ExtCleanCommand;
 pub use deps::ExtDepsCommand;
 #[allow(unused_imports)]
 pub use dnf::ExtDnfCommand;
+pub use fetch::ExtFetchCommand;
 pub use image::ExtImageCommand;
 pub use install::ExtInstallCommand;
 #[allow(unused_imports)]

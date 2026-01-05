@@ -1,5 +1,8 @@
 //! Configuration utilities for Avocado CLI.
 
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,23 +106,65 @@ mod container_args_deserializer {
     }
 }
 
-/// Represents the location of an extension (local or external)
+/// Represents the location of an extension
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionLocation {
     /// Extension defined in the main config file
     Local { name: String, config_path: String },
-    /// Extension defined in an external config file
+    /// DEPRECATED: Extension from an external config file
+    /// Use source: path in the ext section instead
+    #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
     External { name: String, config_path: String },
+    /// Remote extension fetched from a source (repo, git, or path)
+    #[allow(dead_code)]
+    Remote {
+        name: String,
+        source: ExtensionSource,
+    },
+}
+
+/// Represents the source configuration for fetching a remote extension
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ExtensionSource {
+    /// Extension from the avocado package repository
+    Repo {
+        /// Version to fetch (e.g., "0.1.0" or "*")
+        version: String,
+        /// Optional custom repository name
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repo_name: Option<String>,
+    },
+    /// Extension from a git repository
+    Git {
+        /// Git repository URL
+        url: String,
+        /// Git ref (branch, tag, or commit hash)
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+        git_ref: Option<String>,
+        /// Optional sparse checkout paths
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sparse_checkout: Option<Vec<String>>,
+    },
+    /// Extension from a local filesystem path
+    Path {
+        /// Path to the extension directory (relative to config or absolute)
+        path: String,
+    },
 }
 
 /// Represents an extension dependency for a runtime with type information
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RuntimeExtDep {
-    /// Extension defined in the main config file (needs install + build)
+    /// Extension defined in the config (local or fetched remote)
     Local(String),
-    /// Extension from an external config file (needs install + build)
+    /// DEPRECATED: Extension from an external config file
+    /// Use source: path in the ext section instead
+    #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
     External { name: String, config_path: String },
-    /// Prebuilt extension from package repo (needs install only, no build)
+    /// DEPRECATED: Prebuilt extension from package repo
+    /// Use source: repo in the ext section instead
+    #[deprecated(since = "0.23.0", note = "Use Local with source: repo instead")]
     Versioned { name: String, version: String },
 }
 
@@ -132,6 +177,64 @@ impl RuntimeExtDep {
             RuntimeExtDep::Versioned { name, .. } => name,
         }
     }
+}
+
+/// Result of parsing an extension reference from a dependency spec
+#[derive(Debug, Clone)]
+pub enum ExtRefParsed {
+    /// Extension reference found
+    Extension {
+        /// Extension name
+        name: String,
+        /// Optional external config path
+        config: Option<String>,
+        /// Optional version (for versioned/deprecated syntax)
+        version: Option<String>,
+    },
+    /// Not an extension reference (e.g., package dependency)
+    NotExtension,
+}
+
+/// Parse an extension reference from a dependency specification.
+///
+/// Handles both shorthand and object forms:
+/// - `key: ext` → Extension { name: key, config: None, version: None }
+/// - `key: { ext: name }` → Extension { name, config: None, version: None }
+/// - `key: { ext: name, config: path }` → Extension { name, config: Some(path), version: None }
+/// - `key: { ext: name, vsn: ver }` → Extension { name, config: None, version: Some(ver) } (deprecated)
+/// - `key: "version"` → NotExtension (package dependency)
+pub fn parse_ext_ref(dep_name: &str, dep_spec: &serde_yaml::Value) -> ExtRefParsed {
+    // Shorthand: "my-ext: ext" means { ext: my-ext }
+    if let Some(value_str) = dep_spec.as_str() {
+        if value_str == "ext" {
+            return ExtRefParsed::Extension {
+                name: dep_name.to_string(),
+                config: None,
+                version: None,
+            };
+        }
+        // Otherwise it's a package dependency with version string
+        return ExtRefParsed::NotExtension;
+    }
+
+    // Object form: { ext: name, ... }
+    if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+        let config = dep_spec
+            .get("config")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let version = dep_spec
+            .get("vsn")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return ExtRefParsed::Extension {
+            name: ext_name.to_string(),
+            config,
+            version,
+        };
+    }
+
+    ExtRefParsed::NotExtension
 }
 
 /// A composed configuration that merges the main config with external extension configs.
@@ -151,6 +254,94 @@ pub struct ComposedConfig {
     pub merged_value: serde_yaml::Value,
     /// The path to the main config file
     pub config_path: String,
+    /// Maps extension names to their source config file paths.
+    ///
+    /// This is used to resolve relative paths within extension configs.
+    /// Extensions from the main config will map to the main config path.
+    /// Extensions from remote/external sources will map to their respective config paths.
+    pub extension_sources: std::collections::HashMap<String, String>,
+}
+
+impl ComposedConfig {
+    /// Get the source config path for an extension.
+    ///
+    /// Returns the path to the config file where the extension is defined.
+    /// Falls back to the main config path if the extension is not found.
+    #[allow(dead_code)]
+    pub fn get_extension_source_config(&self, ext_name: &str) -> &str {
+        self.extension_sources
+            .get(ext_name)
+            .map(|s| s.as_str())
+            .unwrap_or(&self.config_path)
+    }
+
+    /// Resolve a path relative to an extension's source directory.
+    ///
+    /// For extensions from remote/external sources, paths are resolved relative to
+    /// that extension's src_dir (or config directory if src_dir is not specified).
+    /// For extensions from the main config, paths resolve relative to the main src_dir.
+    ///
+    /// # Arguments
+    /// * `ext_name` - The name of the extension
+    /// * `path` - The path to resolve (may be relative or absolute)
+    ///
+    /// # Returns
+    /// The resolved absolute path
+    #[allow(dead_code)]
+    pub fn resolve_path_for_extension(&self, ext_name: &str, path: &str) -> PathBuf {
+        let target_path = Path::new(path);
+
+        // If it's already absolute, return as-is
+        if target_path.is_absolute() {
+            return target_path.to_path_buf();
+        }
+
+        // Get the source config path for this extension
+        let source_config = self.get_extension_source_config(ext_name);
+        let source_config_path = Path::new(source_config);
+
+        // Try to load the source config to get its src_dir
+        // This handles the case where the extension's config has its own src_dir
+        if let Ok(content) = fs::read_to_string(source_config_path) {
+            if let Ok(parsed) = Config::parse_config_value(source_config, &content) {
+                if let Ok(ext_config) = serde_yaml::from_value::<Config>(parsed) {
+                    // Use the extension's resolved src_dir
+                    if let Some(src_dir) = ext_config.get_resolved_src_dir(source_config) {
+                        return src_dir.join(target_path);
+                    }
+                }
+            }
+        }
+
+        // Fallback: resolve relative to the source config's directory
+        let config_dir = source_config_path.parent().unwrap_or(Path::new("."));
+        config_dir.join(target_path)
+    }
+
+    /// Get the src_dir for an extension.
+    ///
+    /// Returns the src_dir from the extension's source config, or the directory
+    /// containing that config file if src_dir is not specified.
+    #[allow(dead_code)]
+    pub fn get_extension_src_dir(&self, ext_name: &str) -> PathBuf {
+        let source_config = self.get_extension_source_config(ext_name);
+        let source_config_path = Path::new(source_config);
+        let config_dir = source_config_path.parent().unwrap_or(Path::new("."));
+
+        // Try to load the source config to get its src_dir
+        if let Ok(content) = fs::read_to_string(source_config_path) {
+            if let Ok(parsed) = Config::parse_config_value(source_config, &content) {
+                if let Ok(ext_config) = serde_yaml::from_value::<Config>(parsed) {
+                    if let Some(src_dir) = ext_config.get_resolved_src_dir(source_config) {
+                        return src_dir;
+                    }
+                }
+            }
+        }
+
+        // Fallback: use the config directory
+        config_dir.to_path_buf()
+    }
 }
 
 /// Configuration error type
@@ -384,10 +575,11 @@ impl Config {
     ///
     /// This method:
     /// 1. Loads the main config (raw, without interpolation)
-    /// 2. Discovers all external config references in runtime and ext dependencies
-    /// 3. Loads each external config (raw)
-    /// 4. Merges external `ext.*`, `sdk.dependencies`, and `sdk.compile` sections
-    /// 5. Applies interpolation to the composed model
+    /// 2. Discovers installed remote extensions in avocado-extensions/ and merges their configs
+    /// 3. Discovers all external config references in runtime and ext dependencies
+    /// 4. Loads each external config (raw)
+    /// 5. Merges external `ext.*`, `sdk.dependencies`, and `sdk.compile` sections
+    /// 6. Applies interpolation to the composed model
     ///
     /// The `distro`, `default_target`, and `supported_targets` sections come from the main config only,
     /// allowing external configs to reference `{{ config.distro.version }}` and resolve to main config values.
@@ -398,10 +590,30 @@ impl Config {
         let path = config_path.as_ref();
         let config_path_str = path.to_string_lossy().to_string();
 
+        // Track which config file each extension comes from
+        let mut extension_sources: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         // Load main config content (raw, no interpolation yet)
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
         let mut main_config = Self::parse_config_value(&config_path_str, &content)?;
+
+        // Record extensions from the main config
+        if let Some(ext_section) = main_config.get("ext").and_then(|e| e.as_mapping()) {
+            for (ext_key, _) in ext_section {
+                if let Some(ext_name) = ext_key.as_str() {
+                    extension_sources.insert(ext_name.to_string(), config_path_str.clone());
+                }
+            }
+        }
+
+        // Discover and merge installed remote extension configs
+        // Remote extensions are those with a 'source' field that have been fetched
+        // to $AVOCADO_PREFIX/includes/<ext_name>/
+        let remote_ext_sources =
+            Self::merge_installed_remote_extensions(&mut main_config, path, target)?;
+        extension_sources.extend(remote_ext_sources);
 
         // Discover all external config references
         let external_refs = Self::discover_external_config_refs(&main_config);
@@ -431,6 +643,22 @@ impl Config {
 
             // Merge external config into main config
             Self::merge_external_config(&mut main_config, &external_config, ext_name);
+
+            // Record this extension's source (the external config path)
+            let resolved_path_str = resolved_path.to_string_lossy().to_string();
+            extension_sources.insert(ext_name.clone(), resolved_path_str.clone());
+
+            // Also record any extensions defined within this external config
+            if let Some(nested_ext_section) =
+                external_config.get("ext").and_then(|e| e.as_mapping())
+            {
+                for (nested_ext_key, _) in nested_ext_section {
+                    if let Some(nested_ext_name) = nested_ext_key.as_str() {
+                        extension_sources
+                            .insert(nested_ext_name.to_string(), resolved_path_str.clone());
+                    }
+                }
+            }
         }
 
         // Apply interpolation to the composed model
@@ -445,7 +673,111 @@ impl Config {
             config,
             merged_value: main_config,
             config_path: config_path_str,
+            extension_sources,
         })
+    }
+
+    /// Merge installed remote extension configs into the main config
+    ///
+    /// For each extension with a `source` field that has been installed to
+    /// `$AVOCADO_PREFIX/includes/<ext_name>/`, load and merge its avocado.yaml
+    ///
+    /// Returns a HashMap mapping extension names to their source config file paths.
+    fn merge_installed_remote_extensions(
+        main_config: &mut serde_yaml::Value,
+        config_path: &Path,
+        target: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut extension_sources: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // Discover remote extensions from the main config
+        let remote_extensions = Self::discover_remote_extensions_from_value(main_config)?;
+
+        if remote_extensions.is_empty() {
+            return Ok(extension_sources);
+        }
+
+        // Get the src_dir and target to find the extensions directory
+        // First deserialize just to get src_dir and default_target
+        let temp_config: Config =
+            serde_yaml::from_value(main_config.clone()).unwrap_or_else(|_| Config {
+                default_target: None,
+                supported_targets: None,
+                src_dir: None,
+                distro: None,
+                runtime: None,
+                sdk: None,
+                provision: None,
+                signing_keys: None,
+            });
+
+        // Resolve target: CLI arg > env var > config default
+        let resolved_target = target
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("AVOCADO_TARGET").ok())
+            .or_else(|| temp_config.default_target.clone());
+
+        // If we don't have a target, we can't determine the extensions path
+        let resolved_target = match resolved_target {
+            Some(t) => t,
+            None => {
+                // No target available - can't locate extensions, skip merging
+                return Ok(extension_sources);
+            }
+        };
+
+        // Get extensions directory from volume or fallback path
+        let extensions_dir =
+            temp_config.get_extensions_dir(&config_path.to_string_lossy(), &resolved_target);
+
+        // For each remote extension, check if it's installed and merge its config
+        for (ext_name, _source) in remote_extensions {
+            let ext_install_path = extensions_dir.join(&ext_name);
+
+            // Try to find the extension's config file
+            let ext_config_path = if ext_install_path.join("avocado.yaml").exists() {
+                ext_install_path.join("avocado.yaml")
+            } else if ext_install_path.join("avocado.yml").exists() {
+                ext_install_path.join("avocado.yml")
+            } else if ext_install_path.join("avocado.toml").exists() {
+                ext_install_path.join("avocado.toml")
+            } else {
+                // Extension not installed yet, skip
+                continue;
+            };
+
+            // Load the remote extension's config
+            let ext_content = fs::read_to_string(&ext_config_path).with_context(|| {
+                format!(
+                    "Failed to read remote extension config: {}",
+                    ext_config_path.display()
+                )
+            })?;
+            let ext_config = Self::parse_config_value(
+                ext_config_path.to_str().unwrap_or(&ext_name),
+                &ext_content,
+            )?;
+
+            // Record this extension's source config path
+            let ext_config_path_str = ext_config_path.to_string_lossy().to_string();
+            extension_sources.insert(ext_name.clone(), ext_config_path_str.clone());
+
+            // Also record any extensions defined within this remote extension's config
+            if let Some(nested_ext_section) = ext_config.get("ext").and_then(|e| e.as_mapping()) {
+                for (nested_ext_key, _) in nested_ext_section {
+                    if let Some(nested_ext_name) = nested_ext_key.as_str() {
+                        extension_sources
+                            .insert(nested_ext_name.to_string(), ext_config_path_str.clone());
+                    }
+                }
+            }
+
+            // Merge the remote extension config
+            Self::merge_external_config(main_config, &ext_config, &ext_name);
+        }
+
+        Ok(extension_sources)
     }
 
     /// Discover all external config references in runtime and ext dependencies.
@@ -835,28 +1167,31 @@ impl Config {
 
         let mut ext_deps = Vec::new();
 
-        for (_dep_name, dep_spec) in dependencies {
-            // Check if this dependency references an extension
-            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                // Check if it has a version (versioned/prebuilt extension)
-                if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-                    ext_deps.push(RuntimeExtDep::Versioned {
-                        name: ext_name.to_string(),
-                        version: version.to_string(),
-                    });
+        for (dep_name, dep_spec) in dependencies {
+            let dep_name_str = dep_name.as_str().unwrap_or("");
+
+            match parse_ext_ref(dep_name_str, dep_spec) {
+                ExtRefParsed::Extension {
+                    name,
+                    config,
+                    version,
+                } => {
+                    if let Some(ver) = version {
+                        // Versioned extension (deprecated syntax)
+                        ext_deps.push(RuntimeExtDep::Versioned { name, version: ver });
+                    } else if let Some(cfg_path) = config {
+                        // External extension with config path
+                        ext_deps.push(RuntimeExtDep::External {
+                            name,
+                            config_path: cfg_path,
+                        });
+                    } else {
+                        // Local extension
+                        ext_deps.push(RuntimeExtDep::Local(name));
+                    }
                 }
-                // Check if it has an external config
-                else if let Some(external_config) =
-                    dep_spec.get("config").and_then(|v| v.as_str())
-                {
-                    ext_deps.push(RuntimeExtDep::External {
-                        name: ext_name.to_string(),
-                        config_path: external_config.to_string(),
-                    });
-                }
-                // Otherwise it's a local extension
-                else {
-                    ext_deps.push(RuntimeExtDep::Local(ext_name.to_string()));
+                ExtRefParsed::NotExtension => {
+                    // Package dependency, skip
                 }
             }
         }
@@ -1489,6 +1824,159 @@ impl Config {
         Ok(external_extensions)
     }
 
+    /// Parse the source field from an extension configuration
+    ///
+    /// Returns Some(ExtensionSource) if the extension has a source field,
+    /// None if it's a local extension (no source field)
+    pub fn parse_extension_source(
+        ext_config: &serde_yaml::Value,
+    ) -> Result<Option<ExtensionSource>> {
+        let source = ext_config.get("source");
+
+        match source {
+            None => Ok(None), // Local extension
+            Some(source_value) => {
+                // Deserialize the source block into ExtensionSource
+                let source: ExtensionSource = serde_yaml::from_value(source_value.clone())
+                    .with_context(|| "Failed to parse extension source configuration")?;
+                Ok(Some(source))
+            }
+        }
+    }
+
+    /// Discover all remote extensions in the configuration
+    ///
+    /// Returns a list of (extension_name, ExtensionSource) tuples for extensions
+    /// that have a `source` field in their configuration
+    pub fn discover_remote_extensions(config_path: &str) -> Result<Vec<(String, ExtensionSource)>> {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read config file: {config_path}"))?;
+        let parsed = Self::parse_config_value(config_path, &content)?;
+
+        Self::discover_remote_extensions_from_value(&parsed)
+    }
+
+    /// Discover remote extensions from a parsed config value
+    pub fn discover_remote_extensions_from_value(
+        parsed: &serde_yaml::Value,
+    ) -> Result<Vec<(String, ExtensionSource)>> {
+        let mut remote_extensions = Vec::new();
+
+        if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+            for (ext_name_key, ext_config) in ext_section {
+                if let Some(ext_name) = ext_name_key.as_str() {
+                    if let Some(source) = Self::parse_extension_source(ext_config)? {
+                        remote_extensions.push((ext_name.to_string(), source));
+                    }
+                }
+            }
+        }
+
+        Ok(remote_extensions)
+    }
+
+    /// Get the path where remote extensions should be installed on the host filesystem.
+    ///
+    /// This resolves the Docker volume mountpoint to access `$AVOCADO_PREFIX/includes` from the host.
+    /// Returns: `<volume_mountpoint>/<target>/includes/`
+    ///
+    /// Falls back to `<src_dir>/.avocado/<target>/includes/` if volume state is not available.
+    pub fn get_extensions_dir(&self, config_path: &str, target: &str) -> PathBuf {
+        let src_dir = self.get_resolved_src_dir(config_path).unwrap_or_else(|| {
+            PathBuf::from(config_path)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
+
+        // Try to load volume state and get the mountpoint
+        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_dir(&src_dir) {
+            // Use synchronous Docker inspect to get the mountpoint
+            if let Ok(mountpoint) = Self::get_volume_mountpoint_sync(&volume_state) {
+                return mountpoint.join(target).join("includes");
+            }
+        }
+
+        // Fallback: use a local path in src_dir for development/testing
+        src_dir.join(".avocado").join(target).join("includes")
+    }
+
+    /// Get the path where a specific remote extension should be installed
+    ///
+    /// Returns: `<volume_mountpoint>/<target>/includes/<ext_name>/`
+    pub fn get_extension_install_path(
+        &self,
+        config_path: &str,
+        ext_name: &str,
+        target: &str,
+    ) -> PathBuf {
+        self.get_extensions_dir(config_path, target).join(ext_name)
+    }
+
+    /// Get the container path expression for extensions directory
+    ///
+    /// Returns: `$AVOCADO_PREFIX/includes`
+    #[allow(dead_code)]
+    pub fn get_extensions_container_path() -> &'static str {
+        "$AVOCADO_PREFIX/includes"
+    }
+
+    /// Get the volume mountpoint synchronously (for use in non-async contexts)
+    fn get_volume_mountpoint_sync(
+        volume_state: &crate::utils::volume::VolumeState,
+    ) -> Result<PathBuf> {
+        let output = std::process::Command::new(&volume_state.container_tool)
+            .args([
+                "volume",
+                "inspect",
+                &volume_state.volume_name,
+                "--format",
+                "{{.Mountpoint}}",
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to inspect Docker volume '{}'",
+                    volume_state.volume_name
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Failed to get mountpoint for volume '{}': {}",
+                volume_state.volume_name,
+                stderr
+            );
+        }
+
+        let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if mountpoint.is_empty() {
+            anyhow::bail!(
+                "Docker volume '{}' has no mountpoint",
+                volume_state.volume_name
+            );
+        }
+
+        Ok(PathBuf::from(mountpoint))
+    }
+
+    /// Check if a remote extension is already installed
+    #[allow(dead_code)]
+    pub fn is_remote_extension_installed(
+        &self,
+        config_path: &str,
+        ext_name: &str,
+        target: &str,
+    ) -> bool {
+        let install_path = self.get_extension_install_path(config_path, ext_name, target);
+        // Check if the directory exists and contains an avocado.yaml or avocado.toml
+        install_path.exists()
+            && (install_path.join("avocado.yaml").exists()
+                || install_path.join("avocado.yml").exists()
+                || install_path.join("avocado.toml").exists())
+    }
+
     /// Find an extension in the full dependency tree (local and external)
     /// This is a comprehensive search that looks through all runtime dependencies
     /// and their transitive extension dependencies
@@ -1581,6 +2069,7 @@ impl Config {
             let found_name = match &ext_location {
                 ExtensionLocation::Local { name, .. } => name,
                 ExtensionLocation::External { name, .. } => name,
+                ExtensionLocation::Remote { name, .. } => name,
             };
 
             if found_name == extension_name {
@@ -1612,6 +2101,11 @@ impl Config {
                     all_extensions,
                     visited,
                 );
+            }
+            ExtensionLocation::Remote { .. } => {
+                // Remote extensions don't have nested dependencies to discover here
+                // Their configs are merged separately after fetching
+                return Ok(());
             }
         };
 

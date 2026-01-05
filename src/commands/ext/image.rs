@@ -1,3 +1,6 @@
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 
 use crate::utils::config::{Config, ExtensionLocation};
@@ -135,6 +138,15 @@ impl ExtImageCommand {
         let ext_config_path = match &extension_location {
             ExtensionLocation::Local { config_path, .. } => config_path.clone(),
             ExtensionLocation::External { config_path, .. } => config_path.clone(),
+            ExtensionLocation::Remote { name, .. } => {
+                // Remote extensions are installed to $AVOCADO_PREFIX/includes/<name>/
+                let ext_install_path =
+                    config.get_extension_install_path(&self.config_path, name, &target);
+                ext_install_path
+                    .join("avocado.yaml")
+                    .to_string_lossy()
+                    .to_string()
+            }
         };
 
         if self.verbose {
@@ -148,6 +160,12 @@ impl ExtImageCommand {
                 ExtensionLocation::External { name, config_path } => {
                     print_info(
                         &format!("Found external extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                ExtensionLocation::Remote { name, source } => {
+                    print_info(
+                        &format!("Found remote extension '{name}' with source: {source:?}"),
                         OutputLevel::Normal,
                     );
                 }

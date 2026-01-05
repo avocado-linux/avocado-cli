@@ -1,5 +1,8 @@
 //! Install command implementation that runs SDK, extension, and runtime installs.
 
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -15,14 +18,18 @@ use crate::utils::{
     target::validate_and_log_target,
 };
 
-/// Represents an extension dependency that can be either local or external
+/// Represents an extension dependency
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionDependency {
-    /// Extension defined in the main config file
+    /// Extension defined in the config (local or fetched remote)
     Local(String),
-    /// Extension defined in an external config file
+    /// DEPRECATED: Extension from an external config file
+    /// Use source: path in the ext section instead
+    #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
     External { name: String, config_path: String },
-    /// Extension resolved via DNF with a version specification
+    /// DEPRECATED: Extension resolved via DNF with a version specification
+    /// Use source: repo in the ext section instead
+    #[deprecated(since = "0.23.0", note = "Use Local with source: repo instead")]
     Versioned { name: String, version: String },
 }
 
@@ -108,7 +115,7 @@ impl InstallCommand {
         );
 
         // Load lock file for reproducible builds (used for versioned extensions in this command)
-        let src_dir = config
+        let _src_dir = config
             .get_resolved_src_dir(&self.config_path)
             .unwrap_or_else(|| {
                 PathBuf::from(&self.config_path)
@@ -117,8 +124,8 @@ impl InstallCommand {
                     .to_path_buf()
             });
 
-        // We'll load the lock file lazily when needed (for external/versioned extensions)
-        let mut lock_file;
+        // Note: Lock file loading for external/versioned extensions has been removed
+        // as those deprecated code paths now error out with migration messages
 
         // 1. Install SDK dependencies
         print_info("Step 1/3: Installing SDK dependencies", OutputLevel::Normal);
@@ -178,38 +185,31 @@ impl InstallCommand {
                         name,
                         config_path: ext_config_path,
                     } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Installing external extension dependencies for '{name}' from config '{ext_config_path}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Reload lock file from disk to get latest state from previous installs
-                        lock_file = LockFile::load(&src_dir)?;
-
-                        // Install external extension to ${AVOCADO_PREFIX}/extensions/<ext_name>
-                        self.install_external_extension(config, &self.config_path, name, ext_config_path, &_target, &mut lock_file).await.with_context(|| {
-                            format!("Failed to install external extension '{name}' from config '{ext_config_path}'")
-                        })?;
+                        // DEPRECATED: config: syntax is no longer supported
+                        // Users should migrate to the new source-based approach in the ext section
+                        return Err(anyhow::anyhow!(
+                            "Deprecated 'config:' syntax found for extension '{name}' with config '{ext_config_path}'.\n\n\
+                            The 'config:' syntax for external extensions is no longer supported.\n\n\
+                            To use extensions from another path, define them in the 'ext' section with a 'source' field:\n\n\
+                            ext:\n  {name}:\n    source:\n      type: path\n      path: \"{ext_config_path}\"\n\n\
+                            Then reference the extension in runtime dependencies simply by name:\n\n\
+                            runtime:\n  your-runtime:\n    dependencies:\n      {name}: ext\n\n\
+                            Path-based extensions are automatically processed during config loading."
+                        ));
                     }
                     ExtensionDependency::Versioned { name, version } => {
-                        if self.verbose {
-                            print_info(
-                                &format!(
-                                    "Installing versioned extension '{name}' version '{version}'"
-                                ),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Reload lock file from disk to get latest state from previous installs
-                        lock_file = LockFile::load(&src_dir)?;
-
-                        // Install versioned extension to its own sysroot
-                        self.install_versioned_extension(config, name, version, &_target, &mut lock_file).await.with_context(|| {
-                            format!("Failed to install versioned extension '{name}' version '{version}'")
-                        })?;
+                        // DEPRECATED: vsn: syntax is no longer supported
+                        // Users should migrate to the new source-based approach in the ext section
+                        return Err(anyhow::anyhow!(
+                            "Deprecated 'vsn:' syntax found for extension '{name}' version '{version}'.\n\n\
+                            The 'vsn:' syntax for versioned extensions is no longer supported.\n\n\
+                            To use remote extensions, define them in the 'ext' section with a 'source' field:\n\n\
+                            ext:\n  {name}:\n    source:\n      type: repo\n      version: \"{version}\"\n\n\
+                            Then reference the extension in runtime dependencies simply by name:\n\n\
+                            runtime:\n  your-runtime:\n    dependencies:\n      {name}: ext\n\n\
+                            Remote extensions are automatically fetched during 'avocado sdk install' or\n\
+                            can be manually fetched with 'avocado ext fetch'."
+                        ));
                     }
                 }
             }
@@ -564,6 +564,7 @@ impl InstallCommand {
     }
 
     /// Install an external extension to ${AVOCADO_PREFIX}/extensions/<ext_name>
+    #[allow(dead_code)]
     async fn install_external_extension(
         &self,
         config: &Config,
@@ -906,6 +907,7 @@ $DNF_SDK_HOST \
     }
 
     /// Install a versioned extension using DNF to its own sysroot
+    #[allow(dead_code)]
     async fn install_versioned_extension(
         &self,
         config: &Config,
@@ -1091,6 +1093,7 @@ $DNF_SDK_HOST \
     }
 
     /// Install SDK dependencies from an external extension's config
+    #[allow(dead_code)]
     async fn install_external_extension_sdk_deps(
         &self,
         config: &Config,

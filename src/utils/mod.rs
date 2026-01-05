@@ -1,5 +1,6 @@
 pub mod config;
 pub mod container;
+pub mod ext_fetch;
 pub mod image_signing;
 pub mod interpolation;
 pub mod lockfile;

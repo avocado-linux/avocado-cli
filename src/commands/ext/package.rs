@@ -1,3 +1,6 @@
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 
 use std::collections::HashMap;
@@ -5,11 +8,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::utils::config::{Config, ExtensionLocation};
-use crate::utils::container::{RunConfig, SdkContainer};
-use crate::utils::output::{print_info, print_success, OutputLevel};
-use crate::utils::stamps::{
-    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
-};
+use crate::utils::container::SdkContainer;
+use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
+// Note: Stamp imports removed - we no longer validate build stamps for packaging
+// since we now package src_dir instead of built sysroot
 use crate::utils::target::resolve_target_required;
 
 /// Command to package an extension sysroot into an RPM
@@ -22,6 +24,9 @@ pub struct ExtPackageCommand {
     pub container_args: Option<Vec<String>>,
     #[allow(dead_code)]
     pub dnf_args: Option<Vec<String>>,
+    /// Note: no_stamps is kept for API compatibility but is not used for ext package
+    /// since we now package src_dir directly without requiring build stamps.
+    #[allow(dead_code)]
     pub no_stamps: bool,
 }
 
@@ -57,54 +62,22 @@ impl ExtPackageCommand {
         // Load configuration
         let config = Config::load(&self.config_path)?;
 
-        // Resolve target early for stamp validation
+        // Resolve target
         let target = resolve_target_required(self.target.as_deref(), &config)?;
 
-        // Validate stamps before proceeding (unless --no-stamps)
-        // Package requires extension to be installed AND built
-        if !self.no_stamps {
-            let container_image = config
-                .get_sdk_image()
-                .context("No SDK container image specified in configuration")?;
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+        // With the new src_dir packaging approach, we no longer require
+        // ext_install and ext_build stamps. We're packaging the source directory,
+        // not the built sysroot. The consumer will build the extension themselves.
+        //
+        // Issue a warning to remind users to test builds before packaging.
+        print_warning(
+            "Packaging extension source directory. It is recommended to run \
+             'avocado ext build' before packaging to verify the extension builds correctly.",
+            OutputLevel::Normal,
+        );
 
-            let requirements = vec![
-                StampRequirement::sdk_install(),
-                StampRequirement::ext_install(&self.extension),
-                StampRequirement::ext_build(&self.extension),
-            ];
-
-            let batch_script = generate_batch_read_stamps_script(&requirements);
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.clone(),
-                command: batch_script,
-                verbose: false,
-                source_environment: true,
-                interactive: false,
-                repo_url: config.get_sdk_repo_url(),
-                repo_release: config.get_sdk_repo_release(),
-                container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
-                ..Default::default()
-            };
-
-            let output = container_helper
-                .run_in_container_with_output(run_config)
-                .await?;
-
-            let validation =
-                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
-
-            if !validation.is_satisfied() {
-                let error = validation
-                    .into_error(&format!("Cannot package extension '{}'", self.extension));
-                return Err(error.into());
-            }
-        }
-
-        // Read config content for extension SDK dependencies parsing
-        let content = std::fs::read_to_string(&self.config_path)?;
+        // Note: We no longer need to parse SDK dependencies since they're merged
+        // from the extension's config when it's installed
 
         // Find extension using comprehensive lookup
         let extension_location = config
@@ -117,6 +90,15 @@ impl ExtPackageCommand {
         let ext_config_path = match &extension_location {
             ExtensionLocation::Local { config_path, .. } => config_path.clone(),
             ExtensionLocation::External { config_path, .. } => config_path.clone(),
+            ExtensionLocation::Remote { name, .. } => {
+                // Remote extensions are installed to $AVOCADO_PREFIX/includes/<name>/
+                let ext_install_path =
+                    config.get_extension_install_path(&self.config_path, name, &target);
+                ext_install_path
+                    .join("avocado.yaml")
+                    .to_string_lossy()
+                    .to_string()
+            }
         };
 
         if self.verbose {
@@ -130,6 +112,12 @@ impl ExtPackageCommand {
                 ExtensionLocation::External { name, config_path } => {
                     print_info(
                         &format!("Found external extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                ExtensionLocation::Remote { name, source } => {
+                    print_info(
+                        &format!("Found remote extension '{name}' with source: {source:?}"),
                         OutputLevel::Normal,
                     );
                 }
@@ -158,8 +146,9 @@ impl ExtPackageCommand {
         }
 
         // Create main RPM package in container
+        // This packages the extension's src_dir (directory containing avocado.yaml)
         let output_path = self
-            .create_rpm_package_in_container(&rpm_metadata, &config, &target)
+            .create_rpm_package_in_container(&rpm_metadata, &config, &target, &ext_config_path)
             .await?;
 
         print_success(
@@ -170,36 +159,8 @@ impl ExtPackageCommand {
             OutputLevel::Normal,
         );
 
-        // Check if extension has SDK dependencies and create SDK package if needed
-        let sdk_dependencies = self.get_extension_sdk_dependencies(&config, &content, &target)?;
-        if !sdk_dependencies.is_empty() {
-            if self.verbose {
-                print_info(
-                    &format!(
-                        "Extension '{}' has SDK dependencies, creating SDK package...",
-                        self.extension
-                    ),
-                    OutputLevel::Normal,
-                );
-            }
-
-            let sdk_output_path = self
-                .create_sdk_rpm_package_in_container(
-                    &rpm_metadata,
-                    &config,
-                    &sdk_dependencies,
-                    &target,
-                )
-                .await?;
-
-            print_success(
-                &format!(
-                    "Successfully created SDK RPM package: {}",
-                    sdk_output_path.display()
-                ),
-                OutputLevel::Normal,
-            );
-        }
+        // Note: SDK dependencies are now merged from the extension's config when installed,
+        // so we no longer need to create a separate SDK package.
 
         Ok(())
     }
@@ -348,12 +309,17 @@ impl ExtPackageCommand {
         Ok(())
     }
 
-    /// Create the RPM package inside the container at $AVOCADO_PREFIX/output/extensions
+    /// Create the RPM package containing the extension's src_dir
+    ///
+    /// The package root (/) maps to the extension's src_dir contents.
+    /// This allows the extension to be installed to $AVOCADO_PREFIX/includes/<ext_name>/
+    /// and its config merged into the main config.
     async fn create_rpm_package_in_container(
         &self,
         metadata: &RpmMetadata,
         config: &Config,
         target: &str,
+        ext_config_path: &str,
     ) -> Result<PathBuf> {
         let container_image = config
             .get_sdk_image()
@@ -367,6 +333,20 @@ impl ExtPackageCommand {
             crate::utils::volume::VolumeManager::new("docker".to_string(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&cwd).await?;
 
+        // Determine the extension's src_dir (directory containing avocado.yaml)
+        let ext_src_dir = std::path::Path::new(ext_config_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_string_lossy()
+            .to_string();
+
+        // Convert to container path (relative paths become /opt/src/<path>)
+        let container_src_dir = if ext_src_dir.starts_with('/') {
+            ext_src_dir.clone()
+        } else {
+            format!("/opt/src/{}", ext_src_dir)
+        };
+
         // Create the RPM filename
         let rpm_filename = format!(
             "{}-{}-{}.{}.rpm",
@@ -374,23 +354,35 @@ impl ExtPackageCommand {
         );
 
         // Create RPM using rpmbuild in container
+        // Package root (/) maps to the extension's src_dir contents
         let rpm_build_script = format!(
             r#"
+set -e
+
+# Extension source directory
+EXT_SRC_DIR="{container_src_dir}"
+
 # Ensure output directory exists
 mkdir -p $AVOCADO_PREFIX/output/extensions
 
-# Check if extension sysroot exists
-if [ ! -d "$AVOCADO_EXT_SYSROOTS/{}" ]; then
-    echo "Extension sysroot not found: $AVOCADO_EXT_SYSROOTS/{}"
+# Check if extension source directory exists
+if [ ! -d "$EXT_SRC_DIR" ]; then
+    echo "Extension source directory not found: $EXT_SRC_DIR"
+    exit 1
+fi
+
+# Check for avocado config file
+if [ ! -f "$EXT_SRC_DIR/avocado.yaml" ] && [ ! -f "$EXT_SRC_DIR/avocado.yml" ] && [ ! -f "$EXT_SRC_DIR/avocado.toml" ]; then
+    echo "No avocado.yaml/yml/toml found in $EXT_SRC_DIR"
     exit 1
 fi
 
 # Count files
-FILE_COUNT=$(find "$AVOCADO_EXT_SYSROOTS/{}" -type f | wc -l)
-echo "Creating RPM with $FILE_COUNT files..."
+FILE_COUNT=$(find "$EXT_SRC_DIR" -type f | wc -l)
+echo "Creating RPM with $FILE_COUNT files from source directory..."
 
 if [ "$FILE_COUNT" -eq 0 ]; then
-    echo "No files found in sysroot"
+    echo "No files found in source directory"
     exit 1
 fi
 
@@ -402,20 +394,21 @@ cd "$TMPDIR"
 mkdir -p BUILD RPMS SOURCES SPECS SRPMS
 
 # Create spec file
+# Package root (/) maps to the extension's src_dir
 cat > SPECS/package.spec << 'SPEC_EOF'
 %define _buildhost reproducible
 AutoReqProv: no
 
-Name: {}
-Version: {}
-Release: {}
-Summary: {}
-License: {}
-Vendor: {}
-Group: {}{}
+Name: {name}
+Version: {version}
+Release: {release}
+Summary: {summary}
+License: {license}
+Vendor: {vendor}
+Group: {group}{url_line}
 
 %description
-{}
+{description}
 
 %files
 /*
@@ -428,7 +421,9 @@ Group: {}{}
 
 %install
 mkdir -p %{{buildroot}}
-cp -rp $AVOCADO_EXT_SYSROOTS/{}/* %{{buildroot}}/
+# Copy src_dir contents to buildroot root
+# This allows installation to $AVOCADO_PREFIX/includes/<ext_name>/
+cp -rp "$EXT_SRC_DIR"/* %{{buildroot}}/
 
 %clean
 # Skip clean section - not needed for our use case
@@ -436,45 +431,38 @@ cp -rp $AVOCADO_EXT_SYSROOTS/{}/* %{{buildroot}}/
 %changelog
 SPEC_EOF
 
-# Build the RPM with custom architecture target and define the arch macro
-rpmbuild --define "_topdir $TMPDIR" --define "_arch {}" --target {} -bb SPECS/package.spec
+# Build the RPM with custom architecture target
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --target {arch} -bb SPECS/package.spec
 
 # Move RPM to output directory
-mv RPMS/{}/*.rpm $AVOCADO_PREFIX/output/extensions/{} || {{
-    mv RPMS/*/*.rpm $AVOCADO_PREFIX/output/extensions/{} 2>/dev/null || {{
+mv RPMS/{arch}/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} || {{
+    mv RPMS/*/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} 2>/dev/null || {{
         echo "Failed to find built RPM"
         exit 1
     }}
 }}
 
-echo "RPM created successfully: $AVOCADO_PREFIX/output/extensions/{}"
+echo "RPM created successfully: $AVOCADO_PREFIX/output/extensions/{rpm_filename}"
 
 # Cleanup
 rm -rf "$TMPDIR"
 "#,
-            self.extension,
-            self.extension,
-            self.extension,
-            metadata.name,
-            metadata.version,
-            metadata.release,
-            metadata.summary,
-            metadata.license,
-            metadata.vendor,
-            metadata.group,
-            if let Some(url) = &metadata.url {
+            name = metadata.name,
+            version = metadata.version,
+            release = metadata.release,
+            summary = metadata.summary,
+            license = metadata.license,
+            vendor = metadata.vendor,
+            group = metadata.group,
+            url_line = if let Some(url) = &metadata.url {
                 format!("\nURL: {url}")
             } else {
                 String::new()
             },
-            metadata.description,
-            self.extension,
-            metadata.arch,
-            metadata.arch,
-            metadata.arch,
-            rpm_filename,
-            rpm_filename,
-            rpm_filename,
+            description = metadata.description,
+            arch = metadata.arch,
+            rpm_filename = rpm_filename,
+            container_src_dir = container_src_dir,
         );
 
         // Run the RPM build in the container
@@ -636,6 +624,7 @@ rm -rf "$TMPDIR"
     }
 
     /// Get SDK dependencies for the current extension
+    #[allow(dead_code)]
     fn get_extension_sdk_dependencies(
         &self,
         config: &Config,
@@ -657,6 +646,7 @@ rm -rf "$TMPDIR"
     }
 
     /// Create the SDK RPM package inside the container at $AVOCADO_PREFIX/output/extensions
+    #[allow(dead_code)]
     async fn create_sdk_rpm_package_in_container(
         &self,
         metadata: &RpmMetadata,
@@ -1213,37 +1203,20 @@ ext:
     }
 
     // ========================================================================
-    // Stamp Dependency Tests
+    // Note: Stamp Dependency Tests Removed
     // ========================================================================
-
-    #[test]
-    fn test_package_stamp_requirements() {
-        use crate::utils::stamps::get_local_arch;
-
-        // ext package requires: SDK install + ext install + ext build
-        // Verify the stamp requirements are correct
-        let requirements = [
-            StampRequirement::sdk_install(),
-            StampRequirement::ext_install("my-ext"),
-            StampRequirement::ext_build("my-ext"),
-        ];
-
-        // Verify correct stamp paths (SDK path includes local architecture)
-        assert_eq!(
-            requirements[0].relative_path(),
-            format!("sdk/{}/install.stamp", get_local_arch())
-        );
-        assert_eq!(requirements[1].relative_path(), "ext/my-ext/install.stamp");
-        assert_eq!(requirements[2].relative_path(), "ext/my-ext/build.stamp");
-
-        // Verify fix commands are correct
-        assert_eq!(requirements[0].fix_command(), "avocado sdk install");
-        assert_eq!(
-            requirements[1].fix_command(),
-            "avocado ext install -e my-ext"
-        );
-        assert_eq!(requirements[2].fix_command(), "avocado ext build -e my-ext");
-    }
+    // The stamp validation tests have been removed because ext package now
+    // packages the extension's src_dir directly instead of the built sysroot.
+    // This means we no longer require ext_install and ext_build stamps before
+    // packaging - the consumer will build the extension themselves.
+    //
+    // The old behavior required:
+    // - SDK install stamp
+    // - Extension install stamp
+    // - Extension build stamp
+    //
+    // The new behavior only requires the extension's avocado.yaml to exist
+    // in its src_dir.
 
     #[test]
     fn test_package_with_no_stamps_flag() {
@@ -1257,192 +1230,11 @@ ext:
             None,
         );
 
-        // Default should have stamps enabled
+        // Default should have stamps enabled (though not used for src_dir packaging)
         assert!(!cmd.no_stamps);
 
         // Test with_no_stamps builder
         let cmd = cmd.with_no_stamps(true);
         assert!(cmd.no_stamps);
-    }
-
-    #[test]
-    fn test_package_fails_without_sdk_install() {
-        use crate::utils::stamps::{get_local_arch, validate_stamps_batch};
-
-        let requirements = vec![
-            StampRequirement::sdk_install(),
-            StampRequirement::ext_install("my-ext"),
-            StampRequirement::ext_build("my-ext"),
-        ];
-
-        // All stamps missing
-        let output = format!(
-            "sdk/{}/install.stamp:::null\next/my-ext/install.stamp:::null\next/my-ext/build.stamp:::null",
-            get_local_arch()
-        );
-        let result = validate_stamps_batch(&requirements, &output, None);
-
-        assert!(!result.is_satisfied());
-        assert_eq!(result.missing.len(), 3);
-    }
-
-    #[test]
-    fn test_package_fails_without_ext_build() {
-        use crate::utils::stamps::{
-            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
-        };
-
-        let requirements = vec![
-            StampRequirement::sdk_install(),
-            StampRequirement::ext_install("my-ext"),
-            StampRequirement::ext_build("my-ext"),
-        ];
-
-        // SDK and ext install present, but build missing
-        let sdk_stamp = Stamp::sdk_install(
-            get_local_arch(),
-            StampInputs::new("hash1".to_string()),
-            StampOutputs::default(),
-        );
-        let ext_install_stamp = Stamp::ext_install(
-            "my-ext",
-            "qemux86-64",
-            StampInputs::new("hash2".to_string()),
-            StampOutputs::default(),
-        );
-
-        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
-        let ext_json = serde_json::to_string(&ext_install_stamp).unwrap();
-
-        let output = format!(
-            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::null",
-            get_local_arch(),
-            sdk_json,
-            ext_json
-        );
-
-        let result = validate_stamps_batch(&requirements, &output, None);
-
-        assert!(!result.is_satisfied());
-        assert_eq!(result.missing.len(), 1);
-        assert_eq!(result.missing[0].relative_path(), "ext/my-ext/build.stamp");
-    }
-
-    #[test]
-    fn test_package_succeeds_with_all_stamps() {
-        use crate::utils::stamps::{
-            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
-        };
-
-        let requirements = vec![
-            StampRequirement::sdk_install(),
-            StampRequirement::ext_install("my-ext"),
-            StampRequirement::ext_build("my-ext"),
-        ];
-
-        // All stamps present
-        let sdk_stamp = Stamp::sdk_install(
-            get_local_arch(),
-            StampInputs::new("hash1".to_string()),
-            StampOutputs::default(),
-        );
-        let ext_install_stamp = Stamp::ext_install(
-            "my-ext",
-            "qemux86-64",
-            StampInputs::new("hash2".to_string()),
-            StampOutputs::default(),
-        );
-        let ext_build_stamp = Stamp::ext_build(
-            "my-ext",
-            "qemux86-64",
-            StampInputs::new("hash3".to_string()),
-            StampOutputs::default(),
-        );
-
-        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
-        let ext_install_json = serde_json::to_string(&ext_install_stamp).unwrap();
-        let ext_build_json = serde_json::to_string(&ext_build_stamp).unwrap();
-
-        let output = format!(
-            "sdk/{}/install.stamp:::{}\next/my-ext/install.stamp:::{}\next/my-ext/build.stamp:::{}",
-            get_local_arch(),
-            sdk_json,
-            ext_install_json,
-            ext_build_json
-        );
-
-        let result = validate_stamps_batch(&requirements, &output, None);
-
-        assert!(result.is_satisfied());
-        assert_eq!(result.satisfied.len(), 3);
-    }
-
-    #[test]
-    fn test_package_clean_lifecycle() {
-        use crate::utils::stamps::{
-            get_local_arch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
-        };
-
-        let requirements = vec![
-            StampRequirement::sdk_install(),
-            StampRequirement::ext_install("gpu-driver"),
-            StampRequirement::ext_build("gpu-driver"),
-        ];
-
-        // Before clean: all stamps present
-        let sdk_stamp = Stamp::sdk_install(
-            get_local_arch(),
-            StampInputs::new("hash1".to_string()),
-            StampOutputs::default(),
-        );
-        let ext_install = Stamp::ext_install(
-            "gpu-driver",
-            "qemux86-64",
-            StampInputs::new("hash2".to_string()),
-            StampOutputs::default(),
-        );
-        let ext_build = Stamp::ext_build(
-            "gpu-driver",
-            "qemux86-64",
-            StampInputs::new("hash3".to_string()),
-            StampOutputs::default(),
-        );
-
-        let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
-        let install_json = serde_json::to_string(&ext_install).unwrap();
-        let build_json = serde_json::to_string(&ext_build).unwrap();
-
-        let output_before = format!(
-            "sdk/{}/install.stamp:::{}\next/gpu-driver/install.stamp:::{}\next/gpu-driver/build.stamp:::{}",
-            get_local_arch(),
-            sdk_json,
-            install_json,
-            build_json
-        );
-
-        let result_before = validate_stamps_batch(&requirements, &output_before, None);
-        assert!(
-            result_before.is_satisfied(),
-            "Should be satisfied before clean"
-        );
-
-        // After ext clean: SDK still there, ext stamps gone (simulating rm -rf .stamps/ext/gpu-driver)
-        let output_after = format!(
-            "sdk/{}/install.stamp:::{}\next/gpu-driver/install.stamp:::null\next/gpu-driver/build.stamp:::null",
-            get_local_arch(),
-            sdk_json
-        );
-
-        let result_after = validate_stamps_batch(&requirements, &output_after, None);
-        assert!(!result_after.is_satisfied(), "Should fail after clean");
-        assert_eq!(
-            result_after.missing.len(),
-            2,
-            "Both ext stamps should be missing"
-        );
-        assert!(
-            result_after.satisfied.len() == 1,
-            "Only SDK should be satisfied"
-        );
     }
 }

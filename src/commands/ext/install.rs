@@ -1,3 +1,6 @@
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -105,6 +108,14 @@ impl ExtInstallCommand {
                                         ),
                                         OutputLevel::Normal,
                                     );
+                            }
+                            ExtensionLocation::Remote { name, source } => {
+                                print_info(
+                                    &format!(
+                                        "Found remote extension '{name}' with source: {source:?}"
+                                    ),
+                                    OutputLevel::Normal,
+                                );
                             }
                         }
                     }
@@ -281,6 +292,15 @@ impl ExtInstallCommand {
                         .unwrap_or(std::path::Path::new("."));
                     main_config_dir
                         .join(config_path)
+                        .to_string_lossy()
+                        .to_string()
+                }
+                ExtensionLocation::Remote { name, .. } => {
+                    // Remote extensions are installed to $AVOCADO_PREFIX/includes/<name>/
+                    let ext_install_path =
+                        config.get_extension_install_path(&self.config_path, name, target);
+                    ext_install_path
+                        .join("avocado.yaml")
                         .to_string_lossy()
                         .to_string()
                 }

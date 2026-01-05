@@ -1,3 +1,6 @@
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use tokio::process::Command as AsyncCommand;

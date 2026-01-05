@@ -1,3 +1,6 @@
+// Allow deprecated variants for backward compatibility during migration
+#![allow(deprecated)]
+
 use anyhow::Result;
 
 use crate::utils::config::{Config, ExtensionLocation};
@@ -91,6 +94,12 @@ impl ExtDnfCommand {
                                 OutputLevel::Normal,
                             );
                         }
+                        ExtensionLocation::Remote { name, source } => {
+                            print_info(
+                                &format!("Found remote extension '{name}' with source: {source:?}"),
+                                OutputLevel::Normal,
+                            );
+                        }
                     }
                 }
                 Ok(location)
@@ -173,6 +182,7 @@ impl ExtDnfCommand {
         let extension_name = match extension_location {
             ExtensionLocation::Local { name, .. } => name,
             ExtensionLocation::External { name, .. } => name,
+            ExtensionLocation::Remote { name, .. } => name,
         };
         let check_cmd = format!("test -d $AVOCADO_EXT_SYSROOTS/{extension_name}");
 
@@ -222,6 +232,7 @@ impl ExtDnfCommand {
         let extension_name = match extension_location {
             ExtensionLocation::Local { name, .. } => name,
             ExtensionLocation::External { name, .. } => name,
+            ExtensionLocation::Remote { name, .. } => name,
         };
         let setup_cmd = format!(
             "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension_name}/var/lib"
@@ -306,6 +317,7 @@ impl ExtDnfCommand {
         let extension_name = match extension_location {
             ExtensionLocation::Local { name, .. } => name,
             ExtensionLocation::External { name, .. } => name,
+            ExtensionLocation::Remote { name, .. } => name,
         };
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension_name}");
         let command_args_str = self.command.join(" ");
