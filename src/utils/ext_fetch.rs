@@ -5,7 +5,7 @@
 //! - Git repositories (with optional sparse checkout)
 //! - Local filesystem paths
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use crate::utils::config::ExtensionSource;
@@ -132,7 +132,7 @@ impl ExtensionFetcher {
         version: &str,
         package: Option<&str>,
         repo_name: Option<&str>,
-        install_path: &Path,
+        _install_path: &Path, // Host path - not used, we use container path instead
     ) -> Result<()> {
         // Use explicit package name if provided, otherwise fall back to extension name
         let package_name = package.unwrap_or(ext_name);
@@ -146,14 +146,6 @@ impl ExtensionFetcher {
             );
         }
 
-        // Create the install directory
-        std::fs::create_dir_all(install_path).with_context(|| {
-            format!(
-                "Failed to create extension directory: {}",
-                install_path.display()
-            )
-        })?;
-
         // Build the package spec using the package name (not extension name)
         let package_spec = if version == "*" {
             package_name.to_string()
@@ -165,9 +157,12 @@ impl ExtensionFetcher {
         // We use --downloadonly and then extract the RPM contents
         let repo_arg = repo_name.map(|r| format!("--repo={r}")).unwrap_or_default();
 
-        let install_path_str = install_path.to_string_lossy();
+        // Use container path $AVOCADO_PREFIX/includes/<ext_name> instead of host path
+        // This ensures the directory is created inside the container with proper permissions
+        let container_install_path = format!("$AVOCADO_PREFIX/includes/{ext_name}");
 
         // The fetch script downloads the package and extracts it to the install path
+        // Use $DNF_SDK_HOST with $DNF_SDK_COMBINED_REPO_CONF to access target-specific repos
         let fetch_script = format!(
             r#"
 set -e
@@ -175,8 +170,19 @@ set -e
 # Create temp directory for download
 TMPDIR=$(mktemp -d)
 
-# Download the extension package using dnf install --downloadonly
-dnf install -y {repo_arg} --downloadonly --downloaddir="$TMPDIR" {package_spec}
+# Download the extension package using SDK DNF with combined repo config
+# This includes both SDK repos and target-specific repos (like $AVOCADO_TARGET-ext)
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_COMBINED_REPO_CONF \
+    {repo_arg} \
+    --downloadonly \
+    --downloaddir="$TMPDIR" \
+    -y \
+    install \
+    {package_spec}
 
 # Find the downloaded RPM
 RPM_FILE=$(ls -1 "$TMPDIR"/*.rpm 2>/dev/null | head -1)
@@ -185,13 +191,13 @@ if [ -z "$RPM_FILE" ]; then
     exit 1
 fi
 
-# Extract RPM contents to install path
+# Extract RPM contents to install path (using container path)
 # The package root / maps to the extension's src_dir
-mkdir -p "{install_path_str}"
-cd "{install_path_str}"
+mkdir -p "{container_install_path}"
+cd "{container_install_path}"
 rpm2cpio "$RPM_FILE" | cpio -idmv
 
-echo "Successfully fetched extension '{ext_name}' (package: {package_spec}) to {install_path_str}"
+echo "Successfully fetched extension '{ext_name}' (package: {package_spec}) to {container_install_path}"
 
 # Cleanup
 rm -rf "$TMPDIR"
@@ -230,7 +236,7 @@ rm -rf "$TMPDIR"
         url: &str,
         git_ref: Option<&str>,
         sparse_checkout: Option<&[String]>,
-        install_path: &Path,
+        _install_path: &Path, // Host path - not used, we use container path instead
     ) -> Result<()> {
         if self.verbose {
             print_info(
@@ -239,14 +245,8 @@ rm -rf "$TMPDIR"
             );
         }
 
-        // Create parent directory
-        if let Some(parent) = install_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory: {}", parent.display())
-            })?;
-        }
-
-        let install_path_str = install_path.to_string_lossy();
+        // Use container path $AVOCADO_PREFIX/includes/<ext_name> instead of host path
+        let container_install_path = format!("$AVOCADO_PREFIX/includes/{ext_name}");
         let ref_arg = git_ref.unwrap_or("HEAD");
 
         // Build the git clone command
@@ -256,9 +256,9 @@ rm -rf "$TMPDIR"
             format!(
                 r#"
 set -e
-rm -rf "{install_path_str}"
-mkdir -p "{install_path_str}"
-cd "{install_path_str}"
+rm -rf "{container_install_path}"
+mkdir -p "{container_install_path}"
+cd "{container_install_path}"
 git init
 git remote add origin "{url}"
 git config core.sparseCheckout true
@@ -278,10 +278,10 @@ echo "Successfully fetched extension '{ext_name}' from git"
             format!(
                 r#"
 set -e
-rm -rf "{install_path_str}"
-git clone --depth 1 --branch {ref_arg} "{url}" "{install_path_str}" || \
-git clone --depth 1 "{url}" "{install_path_str}"
-cd "{install_path_str}"
+rm -rf "{container_install_path}"
+git clone --depth 1 --branch {ref_arg} "{url}" "{container_install_path}" || \
+git clone --depth 1 "{url}" "{container_install_path}"
+cd "{container_install_path}"
 if [ "{ref_arg}" != "HEAD" ]; then
     git checkout {ref_arg} 2>/dev/null || true
 fi
@@ -320,7 +320,7 @@ echo "Successfully fetched extension '{ext_name}' from git"
         &self,
         ext_name: &str,
         source_path: &str,
-        install_path: &Path,
+        _install_path: &Path, // Host path - not used, we use container path instead
     ) -> Result<()> {
         if self.verbose {
             print_info(
@@ -346,55 +346,44 @@ echo "Successfully fetched extension '{ext_name}' from git"
             ));
         }
 
-        // Create the install directory
-        if let Some(parent) = install_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory: {}", parent.display())
-            })?;
-        }
+        // Use container path $AVOCADO_PREFIX/includes/<ext_name>
+        let container_install_path = format!("$AVOCADO_PREFIX/includes/{ext_name}");
 
-        // Remove existing install path if it exists
-        if install_path.exists() {
-            std::fs::remove_dir_all(install_path).with_context(|| {
-                format!(
-                    "Failed to remove existing directory: {}",
-                    install_path.display()
-                )
-            })?;
-        }
+        // The source path needs to be accessible from inside the container
+        // Since the workspace is mounted at $AVOCADO_SRC_DIR, convert the path
+        let resolved_source_str = resolved_source.to_string_lossy();
 
-        // Copy the directory (or create symlink for efficiency)
-        // For now, we'll copy to ensure isolation
-        Self::copy_dir_recursive(&resolved_source, install_path)?;
+        // Build copy command to run inside the container
+        let copy_cmd = format!(
+            r#"
+set -e
+rm -rf "{container_install_path}"
+mkdir -p "{container_install_path}"
+cp -r "{resolved_source_str}/." "{container_install_path}/"
+echo "Successfully copied extension '{ext_name}' from {resolved_source_str} to {container_install_path}"
+"#
+        );
 
-        if self.verbose {
-            print_info(
-                &format!(
-                    "Successfully copied extension '{ext_name}' from {} to {}",
-                    resolved_source.display(),
-                    install_path.display()
-                ),
-                OutputLevel::Normal,
-            );
-        }
+        let container_helper = SdkContainer::new().verbose(self.verbose);
+        let run_config = RunConfig {
+            container_image: self.container_image.clone(),
+            target: self.target.clone(),
+            command: copy_cmd,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: self.repo_url.clone(),
+            repo_release: self.repo_release.clone(),
+            container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        };
 
-        Ok(())
-    }
-
-    /// Recursively copy a directory
-    fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-        std::fs::create_dir_all(dst)?;
-
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-
-            if src_path.is_dir() {
-                Self::copy_dir_recursive(&src_path, &dst_path)?;
-            } else {
-                std::fs::copy(&src_path, &dst_path)?;
-            }
+        let success = container_helper.run_in_container(run_config).await?;
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to copy extension '{ext_name}' from path"
+            ));
         }
 
         Ok(())

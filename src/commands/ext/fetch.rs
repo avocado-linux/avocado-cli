@@ -26,6 +26,10 @@ pub struct ExtFetchCommand {
     pub container_args: Option<Vec<String>>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Run command on remote host
+    pub runs_on: Option<String>,
+    /// NFS port for remote execution
+    pub nfs_port: Option<u16>,
 }
 
 impl ExtFetchCommand {
@@ -46,12 +50,21 @@ impl ExtFetchCommand {
             target,
             container_args,
             sdk_arch: None,
+            runs_on: None,
+            nfs_port: None,
         }
     }
 
     /// Set SDK container architecture for cross-arch emulation
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
+        self
+    }
+
+    /// Set remote execution host and NFS port
+    pub fn with_runs_on(mut self, runs_on: String, nfs_port: Option<u16>) -> Self {
+        self.runs_on = Some(runs_on);
+        self.nfs_port = nfs_port;
         self
     }
 
@@ -102,16 +115,9 @@ impl ExtFetchCommand {
             return Ok(());
         }
 
-        // Get the extensions install directory
+        // Get the extensions install directory (container path)
+        // The directory will be created inside the container, not on the host
         let extensions_dir = config.get_extensions_dir(&self.config_path, &target);
-
-        // Ensure the extensions directory exists
-        std::fs::create_dir_all(&extensions_dir).with_context(|| {
-            format!(
-                "Failed to create extensions directory: {}",
-                extensions_dir.display()
-            )
-        })?;
 
         if self.verbose {
             print_info(
@@ -125,6 +131,14 @@ impl ExtFetchCommand {
         }
 
         // Create the fetcher
+        // If container_args were already passed (e.g., from sdk install), use them directly
+        // Otherwise, merge from config
+        let effective_container_args = if self.container_args.is_some() {
+            self.container_args.clone()
+        } else {
+            config.merge_sdk_container_args(None)
+        };
+
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
             target.clone(),
@@ -133,7 +147,7 @@ impl ExtFetchCommand {
         )
         .with_repo_url(config.get_sdk_repo_url())
         .with_repo_release(config.get_sdk_repo_release())
-        .with_container_args(config.merge_sdk_container_args(self.container_args.as_ref()))
+        .with_container_args(effective_container_args)
         .with_sdk_arch(self.sdk_arch.clone());
 
         // Fetch each extension

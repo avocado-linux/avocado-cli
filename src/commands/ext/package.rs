@@ -177,7 +177,7 @@ impl ExtPackageCommand {
     fn extract_rpm_metadata(
         &self,
         ext_config: &serde_yaml::Value,
-        target: &str,
+        _target: &str, // Not used - extensions default to noarch
     ) -> Result<RpmMetadata> {
         // Version is required
         let version = ext_config
@@ -225,11 +225,13 @@ impl ExtPackageCommand {
             .unwrap_or("Unspecified")
             .to_string();
 
+        // Default to noarch for extension source packages since they contain
+        // configs/code, not compiled binaries. Can be overridden in ext config.
         let arch = ext_config
             .get("arch")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| self.generate_arch_from_target(target));
+            .unwrap_or_else(|| "noarch".to_string());
 
         let vendor = ext_config
             .get("vendor")
@@ -282,6 +284,9 @@ impl ExtPackageCommand {
     }
 
     /// Generate architecture from target by replacing dashes with underscores
+    /// Generate a target-specific architecture name (for binaries)
+    /// Note: Extension source packages should use "noarch" instead
+    #[allow(dead_code)]
     fn generate_arch_from_target(&self, target: &str) -> String {
         format!("avocado_{}", target.replace('-', "_"))
     }
@@ -994,7 +999,7 @@ mod tests {
             "System extension package for test-extension"
         );
         assert_eq!(metadata.license, "Unspecified");
-        assert_eq!(metadata.arch, "avocado_x86_64_unknown_linux_gnu");
+        assert_eq!(metadata.arch, "noarch"); // Extension source packages default to noarch
         assert_eq!(metadata.vendor, "Unspecified");
         assert_eq!(metadata.group, "system-extension");
         assert_eq!(metadata.url, None);
@@ -1088,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arch_generation_with_different_targets() {
+    fn test_arch_defaults_to_noarch_for_all_targets() {
         let cmd = ExtPackageCommand::new(
             "test.yaml".to_string(),
             "test-ext".to_string(),
@@ -1105,30 +1110,23 @@ mod tests {
             serde_yaml::Value::String("1.0.0".to_string()),
         );
 
-        // Test various target architectures
-        let test_cases = vec![
-            (
-                "x86_64-unknown-linux-gnu",
-                "avocado_x86_64_unknown_linux_gnu",
-            ),
-            (
-                "aarch64-unknown-linux-gnu",
-                "avocado_aarch64_unknown_linux_gnu",
-            ),
-            (
-                "riscv64-unknown-linux-gnu",
-                "avocado_riscv64_unknown_linux_gnu",
-            ),
-            ("i686-unknown-linux-gnu", "avocado_i686_unknown_linux_gnu"),
-            (
-                "armv7-unknown-linux-gnueabihf",
-                "avocado_armv7_unknown_linux_gnueabihf",
-            ),
+        // Extension source packages should default to noarch regardless of target
+        // since they contain configs/code, not compiled binaries
+        let targets = vec![
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "riscv64-unknown-linux-gnu",
+            "i686-unknown-linux-gnu",
+            "armv7-unknown-linux-gnueabihf",
+            "raspberrypi4",
         ];
 
-        for (target, expected_arch) in test_cases {
+        for target in targets {
             let metadata = cmd.extract_rpm_metadata(&ext_config, target).unwrap();
-            assert_eq!(metadata.arch, expected_arch, "Failed for target: {target}");
+            assert_eq!(
+                metadata.arch, "noarch",
+                "Extension should default to noarch for target: {target}"
+            );
         }
     }
 

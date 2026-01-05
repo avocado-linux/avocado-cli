@@ -91,12 +91,8 @@ impl SdkInstallCommand {
             .with_context(|| format!("Failed to load config from {}", self.config_path))?;
         let target = validate_and_log_target(self.target.as_deref(), &basic_config)?;
 
-        // Fetch remote extensions before loading composed config
-        // This ensures their configs can be merged in
-        self.fetch_remote_extensions(&basic_config, &target).await?;
-
-        // Load the composed configuration (merges external configs, applies interpolation)
-        // This now includes configs from fetched remote extensions
+        // Load initial composed configuration (without remote extensions yet)
+        // Remote extensions will be fetched after SDK bootstrap when repos are available
         let composed = Config::load_composed(&self.config_path, self.target.as_deref())
             .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
 
@@ -104,10 +100,6 @@ impl SdkInstallCommand {
 
         // Merge container args from config with CLI args
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
-
-        // Serialize the merged config back to string for extension parsing methods
-        let config_content = serde_yaml::to_string(&composed.merged_value)
-            .with_context(|| "Failed to serialize composed config")?;
 
         // Get the SDK image from configuration
         let container_image = config.get_sdk_image().ok_or_else(|| {
@@ -121,14 +113,8 @@ impl SdkInstallCommand {
             .get_sdk_dependencies_for_target(&self.config_path, &target)
             .with_context(|| "Failed to get SDK dependencies with target interpolation")?;
 
-        // Get extension SDK dependencies (from the composed, interpolated config)
-        let extension_sdk_dependencies = config
-            .get_extension_sdk_dependencies_with_config_path_and_target(
-                &config_content,
-                Some(&self.config_path),
-                Some(&target),
-            )
-            .with_context(|| "Failed to parse extension SDK dependencies")?;
+        // Note: extension_sdk_dependencies is computed inside execute_install after
+        // fetching remote extensions, since we need SDK repos to be available first
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
@@ -154,11 +140,9 @@ impl SdkInstallCommand {
         let result = self
             .execute_install(
                 config,
-                &composed,
                 &target,
                 container_image,
                 &sdk_dependencies,
-                &extension_sdk_dependencies,
                 repo_url.as_deref(),
                 repo_release.as_deref(),
                 &container_helper,
@@ -180,11 +164,15 @@ impl SdkInstallCommand {
         result
     }
 
-    /// Fetch remote extensions before SDK install
+    /// Fetch remote extensions after SDK bootstrap
     ///
     /// This discovers extensions with a `source` field and fetches them
-    /// to `$AVOCADO_PREFIX/includes/` so their configs can be merged.
-    async fn fetch_remote_extensions(&self, _config: &Config, target: &str) -> Result<()> {
+    /// using the SDK environment where repos are already configured.
+    async fn fetch_remote_extensions_in_sdk(
+        &self,
+        target: &str,
+        merged_container_args: Option<&Vec<String>>,
+    ) -> Result<()> {
         use crate::commands::ext::ExtFetchCommand;
 
         // Discover remote extensions (with target interpolation for extension names)
@@ -195,25 +183,29 @@ impl SdkInstallCommand {
             return Ok(());
         }
 
-        if self.verbose {
-            print_info(
-                &format!(
-                    "Fetching {} remote extension(s) before SDK install...",
-                    remote_extensions.len()
-                ),
-                OutputLevel::Normal,
-            );
-        }
+        print_info(
+            &format!(
+                "Fetching {} remote extension(s)...",
+                remote_extensions.len()
+            ),
+            OutputLevel::Normal,
+        );
 
-        // Use ExtFetchCommand to fetch extensions
-        let fetch_cmd = ExtFetchCommand::new(
+        // Use ExtFetchCommand to fetch extensions with SDK environment
+        let mut fetch_cmd = ExtFetchCommand::new(
             self.config_path.clone(),
             None, // Fetch all remote extensions
             self.verbose,
             false, // Don't force re-fetch
             Some(target.to_string()),
-            self.container_args.clone(),
-        );
+            merged_container_args.cloned(),
+        )
+        .with_sdk_arch(self.sdk_arch.clone());
+
+        // Pass through the runs_on context for remote execution
+        if let Some(runs_on) = &self.runs_on {
+            fetch_cmd = fetch_cmd.with_runs_on(runs_on.clone(), self.nfs_port);
+        }
 
         fetch_cmd.execute().await?;
 
@@ -225,11 +217,9 @@ impl SdkInstallCommand {
     async fn execute_install(
         &self,
         config: &Config,
-        composed: &crate::utils::config::ComposedConfig,
         target: &str,
         container_image: &str,
         sdk_dependencies: &Option<HashMap<String, serde_yaml::Value>>,
-        extension_sdk_dependencies: &HashMap<String, HashMap<String, serde_yaml::Value>>,
         repo_url: Option<&str>,
         repo_release: Option<&str>,
         container_helper: &SdkContainer,
@@ -628,6 +618,27 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             return Err(anyhow::anyhow!("Failed to install SDK bootstrap."));
         }
 
+        // Fetch remote extensions now that SDK repos are available
+        // This uses the SDK environment with configured repos to download extension packages
+        self.fetch_remote_extensions_in_sdk(target, merged_container_args)
+            .await?;
+
+        // Reload composed config to include extension configs
+        let composed = Config::load_composed(&self.config_path, Some(target))
+            .with_context(|| "Failed to reload composed config after fetching extensions")?;
+        let config = &composed.config;
+
+        // Re-compute extension SDK dependencies now that extension configs are available
+        let config_content = serde_yaml::to_string(&composed.merged_value)
+            .with_context(|| "Failed to serialize composed config")?;
+        let extension_sdk_dependencies = config
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                &config_content,
+                Some(&self.config_path),
+                Some(target),
+            )
+            .with_context(|| "Failed to parse extension SDK dependencies")?;
+
         // After bootstrap, source environment-setup and configure SSL certs for subsequent commands
         if self.verbose {
             print_info(
@@ -693,7 +704,7 @@ fi
         }
 
         // Add extension SDK dependencies to the package list
-        for (ext_name, ext_deps) in extension_sdk_dependencies {
+        for (ext_name, ext_deps) in &extension_sdk_dependencies {
             if self.verbose {
                 print_info(
                     &format!("Adding SDK dependencies from extension '{ext_name}'"),
