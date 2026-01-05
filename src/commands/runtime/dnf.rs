@@ -13,6 +13,7 @@ pub struct RuntimeDnfCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    sdk_arch: Option<String>,
 }
 
 impl RuntimeDnfCommand {
@@ -33,7 +34,14 @@ impl RuntimeDnfCommand {
             target,
             container_args,
             dnf_args,
+            sdk_arch: None,
         }
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -160,6 +168,7 @@ impl RuntimeDnfCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let dir_exists = container_helper.run_in_container(config).await?;
@@ -205,6 +214,7 @@ impl RuntimeDnfCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let setup_success = container_helper.run_in_container(config).await?;
@@ -256,6 +266,7 @@ impl RuntimeDnfCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_helper.run_in_container(config).await?;

@@ -25,6 +25,7 @@ pub struct ExtInstallCommand {
     no_stamps: bool,
     runs_on: Option<String>,
     nfs_port: Option<u16>,
+    sdk_arch: Option<String>,
 }
 
 impl ExtInstallCommand {
@@ -48,6 +49,7 @@ impl ExtInstallCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -61,6 +63,12 @@ impl ExtInstallCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -346,6 +354,7 @@ impl ExtInstallCommand {
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     // runs_on handled by shared context
+                    sdk_arch: self.sdk_arch.clone(),
                     ..Default::default()
                 };
 
@@ -631,6 +640,7 @@ $DNF_SDK_HOST \
                     dnf_args: self.dnf_args.clone(),
                     disable_weak_dependencies,
                     // runs_on handled by shared context
+                    sdk_arch: self.sdk_arch.clone(),
                     ..Default::default()
                 };
                 let install_success =

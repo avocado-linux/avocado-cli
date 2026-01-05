@@ -42,6 +42,10 @@ pub struct HitlServerCommand {
     /// Disable stamp validation
     #[arg(long)]
     pub no_stamps: bool,
+
+    /// SDK container architecture for cross-arch emulation
+    #[arg(skip)]
+    pub sdk_arch: Option<String>,
 }
 
 impl HitlServerCommand {
@@ -96,6 +100,7 @@ impl HitlServerCommand {
                 interactive: false,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -198,6 +203,7 @@ impl HitlServerCommand {
             repo_release: repo_release.cloned(),
             container_args: Some(container_args),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 
@@ -307,6 +313,7 @@ mod tests {
             verbose: false,
             port: None,
             no_stamps: false,
+            sdk_arch: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -329,6 +336,7 @@ mod tests {
             verbose: false,
             port: Some(2049),
             no_stamps: false,
+            sdk_arch: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -349,6 +357,7 @@ mod tests {
             verbose: true,
             port: Some(3049),
             no_stamps: false,
+            sdk_arch: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -370,6 +379,7 @@ mod tests {
             verbose: false,
             port: Some(4049),
             no_stamps: false,
+            sdk_arch: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -418,6 +428,7 @@ mod tests {
             verbose: false,
             port: None,
             no_stamps: true,
+            sdk_arch: None,
         };
 
         // With no_stamps, validation should be skipped
@@ -436,6 +447,7 @@ mod tests {
             verbose: false,
             port: None,
             no_stamps: false,
+            sdk_arch: None,
         };
 
         // With no extensions, the stamp validation loop is skipped entirely

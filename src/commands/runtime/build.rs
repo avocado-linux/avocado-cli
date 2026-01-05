@@ -22,6 +22,7 @@ pub struct RuntimeBuildCommand {
     no_stamps: bool,
     runs_on: Option<String>,
     nfs_port: Option<u16>,
+    sdk_arch: Option<String>,
 }
 
 impl RuntimeBuildCommand {
@@ -43,6 +44,7 @@ impl RuntimeBuildCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -56,6 +58,12 @@ impl RuntimeBuildCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -182,6 +190,7 @@ impl RuntimeBuildCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 // runs_on handled by shared context
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -295,6 +304,7 @@ impl RuntimeBuildCommand {
             dnf_args: self.dnf_args.clone(),
             env_vars,
             // runs_on handled by shared context
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let complete_result = run_container_command(container_helper, run_config, runs_on_context)
@@ -332,6 +342,7 @@ impl RuntimeBuildCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 // runs_on handled by shared context
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -930,6 +941,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             interactive: false,
             // runs_on handled by shared context
             container_args,
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 

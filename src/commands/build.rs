@@ -45,6 +45,8 @@ pub struct BuildCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl BuildCommand {
@@ -69,6 +71,7 @@ impl BuildCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -82,6 +85,12 @@ impl BuildCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 

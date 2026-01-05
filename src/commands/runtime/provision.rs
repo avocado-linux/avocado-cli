@@ -37,6 +37,8 @@ pub struct RuntimeProvisionConfig {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 pub struct RuntimeProvisionCommand {
@@ -134,6 +136,7 @@ impl RuntimeProvisionCommand {
                 interactive: false,
                 runs_on: self.config.runs_on.clone(),
                 nfs_port: self.config.nfs_port,
+                sdk_arch: self.config.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -326,6 +329,7 @@ impl RuntimeProvisionCommand {
             dnf_args: self.config.dnf_args.clone(),
             runs_on: self.config.runs_on.clone(),
             nfs_port: self.config.nfs_port,
+            sdk_arch: self.config.sdk_arch.clone(),
             ..Default::default()
         };
 
@@ -394,6 +398,7 @@ impl RuntimeProvisionCommand {
                 interactive: false,
                 runs_on: self.config.runs_on.clone(),
                 nfs_port: self.config.nfs_port,
+                sdk_arch: self.config.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -960,6 +965,7 @@ mod tests {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -989,6 +995,7 @@ mod tests {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -1040,6 +1047,7 @@ runtime:
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
 
         let command = RuntimeProvisionCommand::new(provision_config);
@@ -1085,6 +1093,7 @@ runtime:
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
@@ -1123,6 +1132,7 @@ runtime:
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = RuntimeProvisionCommand::new(config);
 

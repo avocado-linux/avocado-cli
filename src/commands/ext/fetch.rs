@@ -24,6 +24,8 @@ pub struct ExtFetchCommand {
     pub target: Option<String>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl ExtFetchCommand {
@@ -43,7 +45,14 @@ impl ExtFetchCommand {
             force,
             target,
             container_args,
+            sdk_arch: None,
         }
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
+        self
     }
 
     /// Execute the fetch command
@@ -60,8 +69,9 @@ impl ExtFetchCommand {
             .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration"))?;
 
-        // Discover remote extensions
-        let remote_extensions = Config::discover_remote_extensions(&self.config_path)?;
+        // Discover remote extensions (with target interpolation for extension names)
+        let remote_extensions =
+            Config::discover_remote_extensions(&self.config_path, Some(&target))?;
 
         if remote_extensions.is_empty() {
             print_info(
@@ -123,7 +133,8 @@ impl ExtFetchCommand {
         )
         .with_repo_url(config.get_sdk_repo_url())
         .with_repo_release(config.get_sdk_repo_release())
-        .with_container_args(config.merge_sdk_container_args(self.container_args.as_ref()));
+        .with_container_args(config.merge_sdk_container_args(self.container_args.as_ref()))
+        .with_sdk_arch(self.sdk_arch.clone());
 
         // Fetch each extension
         let mut fetched_count = 0;
@@ -189,7 +200,7 @@ impl ExtFetchCommand {
     /// Get the list of remote extensions that would be fetched
     #[allow(dead_code)]
     pub fn get_remote_extensions(&self) -> Result<Vec<(String, ExtensionSource)>> {
-        Config::discover_remote_extensions(&self.config_path)
+        Config::discover_remote_extensions(&self.config_path, self.target.as_deref())
     }
 }
 

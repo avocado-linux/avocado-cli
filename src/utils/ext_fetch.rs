@@ -28,6 +28,8 @@ pub struct ExtensionFetcher {
     repo_release: Option<String>,
     /// Container arguments
     container_args: Option<Vec<String>>,
+    /// SDK container architecture for cross-arch emulation
+    sdk_arch: Option<String>,
 }
 
 impl ExtensionFetcher {
@@ -46,6 +48,7 @@ impl ExtensionFetcher {
             repo_url: None,
             repo_release: None,
             container_args: None,
+            sdk_arch: None,
         }
     }
 
@@ -67,6 +70,12 @@ impl ExtensionFetcher {
         self
     }
 
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
+        self
+    }
+
     /// Fetch an extension based on its source configuration
     ///
     /// Returns the path where the extension was installed
@@ -79,9 +88,19 @@ impl ExtensionFetcher {
         let ext_install_path = install_dir.join(ext_name);
 
         match source {
-            ExtensionSource::Repo { version, repo_name } => {
-                self.fetch_from_repo(ext_name, version, repo_name.as_deref(), &ext_install_path)
-                    .await?;
+            ExtensionSource::Repo {
+                version,
+                package,
+                repo_name,
+            } => {
+                self.fetch_from_repo(
+                    ext_name,
+                    version,
+                    package.as_deref(),
+                    repo_name.as_deref(),
+                    &ext_install_path,
+                )
+                .await?;
             }
             ExtensionSource::Git {
                 url,
@@ -111,13 +130,17 @@ impl ExtensionFetcher {
         &self,
         ext_name: &str,
         version: &str,
+        package: Option<&str>,
         repo_name: Option<&str>,
         install_path: &Path,
     ) -> Result<()> {
+        // Use explicit package name if provided, otherwise fall back to extension name
+        let package_name = package.unwrap_or(ext_name);
+
         if self.verbose {
             print_info(
                 &format!(
-                    "Fetching extension '{ext_name}' version '{version}' from package repository"
+                    "Fetching extension '{ext_name}' (package: '{package_name}') version '{version}' from package repository"
                 ),
                 OutputLevel::Normal,
             );
@@ -131,11 +154,11 @@ impl ExtensionFetcher {
             )
         })?;
 
-        // Build the package spec
+        // Build the package spec using the package name (not extension name)
         let package_spec = if version == "*" {
-            ext_name.to_string()
+            package_name.to_string()
         } else {
-            format!("{ext_name}-{version}")
+            format!("{package_name}-{version}")
         };
 
         // Build the DNF command to download and extract the package
@@ -151,15 +174,14 @@ set -e
 
 # Create temp directory for download
 TMPDIR=$(mktemp -d)
-cd "$TMPDIR"
 
-# Download the extension package
-dnf download {repo_arg} --destdir="$TMPDIR" {package_spec}
+# Download the extension package using dnf install --downloadonly
+dnf install -y {repo_arg} --downloadonly --downloaddir="$TMPDIR" {package_spec}
 
 # Find the downloaded RPM
-RPM_FILE=$(ls -1 *.rpm 2>/dev/null | head -1)
+RPM_FILE=$(ls -1 "$TMPDIR"/*.rpm 2>/dev/null | head -1)
 if [ -z "$RPM_FILE" ]; then
-    echo "ERROR: Failed to download extension package '{ext_name}'"
+    echo "ERROR: Failed to download package '{package_spec}' for extension '{ext_name}'"
     exit 1
 fi
 
@@ -167,9 +189,9 @@ fi
 # The package root / maps to the extension's src_dir
 mkdir -p "{install_path_str}"
 cd "{install_path_str}"
-rpm2cpio "$TMPDIR/$RPM_FILE" | cpio -idmv
+rpm2cpio "$RPM_FILE" | cpio -idmv
 
-echo "Successfully fetched extension '{ext_name}' to {install_path_str}"
+echo "Successfully fetched extension '{ext_name}' (package: {package_spec}) to {install_path_str}"
 
 # Cleanup
 rm -rf "$TMPDIR"
@@ -187,6 +209,7 @@ rm -rf "$TMPDIR"
             repo_url: self.repo_url.clone(),
             repo_release: self.repo_release.clone(),
             container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 
@@ -278,6 +301,7 @@ echo "Successfully fetched extension '{ext_name}' from git"
             repo_url: self.repo_url.clone(),
             repo_release: self.repo_release.clone(),
             container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 

@@ -73,6 +73,31 @@ pub fn sdk_arch_to_platform(sdk_arch: &str) -> Result<String> {
     }
 }
 
+/// Get the host's native platform in Docker format (e.g., "linux/amd64" or "linux/arm64").
+/// This is used to explicitly request the native platform variant from multi-arch images,
+/// ensuring Docker keeps both variants cached when switching between native and emulated runs.
+pub fn get_host_platform() -> String {
+    let arch = std::env::consts::ARCH;
+    match arch {
+        "x86_64" => "linux/amd64".to_string(),
+        "aarch64" => "linux/arm64".to_string(),
+        // Fallback for other architectures
+        "arm" => "linux/arm/v7".to_string(),
+        "riscv64" => "linux/riscv64".to_string(),
+        _ => format!("linux/{}", arch),
+    }
+}
+
+/// Get the platform to use for container execution.
+/// If sdk_arch is specified, use that platform (for cross-arch emulation).
+/// Otherwise, use the host's native platform to ensure Docker pulls/uses the correct variant.
+pub fn get_container_platform(sdk_arch: Option<&str>) -> Result<String> {
+    match sdk_arch {
+        Some(arch) => sdk_arch_to_platform(arch),
+        None => Ok(get_host_platform()),
+    }
+}
+
 /// Add security options to container command based on host security module.
 /// - SELinux (Fedora/RHEL): adds --security-opt label=disable
 /// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined
@@ -515,12 +540,12 @@ impl SdkContainer {
             "label=disable".to_string(),
         ];
 
-        // Add platform flag for cross-architecture emulation via Docker buildx/QEMU
-        if let Some(ref sdk_arch) = config.sdk_arch {
-            let platform = sdk_arch_to_platform(sdk_arch)?;
-            extra_args.push("--platform".to_string());
-            extra_args.push(platform);
-        }
+        // Always add platform flag to ensure Docker uses the correct image variant.
+        // This prevents Docker from caching only one variant when switching between
+        // native and cross-arch emulated runs.
+        let platform = get_container_platform(config.sdk_arch.as_deref())?;
+        extra_args.push("--platform".to_string());
+        extra_args.push(platform);
 
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
@@ -564,12 +589,12 @@ impl SdkContainer {
     ) -> Result<Vec<String>> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
-        // Add platform flag for cross-architecture emulation via Docker buildx/QEMU
-        if let Some(ref sdk_arch) = config.sdk_arch {
-            let platform = sdk_arch_to_platform(sdk_arch)?;
-            container_cmd.push("--platform".to_string());
-            container_cmd.push(platform);
-        }
+        // Always add platform flag to ensure Docker uses the correct image variant.
+        // This prevents Docker from caching only one variant when switching between
+        // native and cross-arch emulated runs.
+        let platform = get_container_platform(config.sdk_arch.as_deref())?;
+        container_cmd.push("--platform".to_string());
+        container_cmd.push(platform);
 
         // Container options
         if config.rm {
@@ -1001,12 +1026,12 @@ impl SdkContainer {
             "label=disable".to_string(),
         ];
 
-        // Add platform flag for cross-architecture emulation via Docker buildx/QEMU
-        if let Some(ref sdk_arch) = config.sdk_arch {
-            let platform = sdk_arch_to_platform(sdk_arch)?;
-            extra_args.push("--platform".to_string());
-            extra_args.push(platform);
-        }
+        // Always add platform flag to ensure Docker uses the correct image variant.
+        // This prevents Docker from caching only one variant when switching between
+        // native and cross-arch emulated runs.
+        let platform = get_container_platform(config.sdk_arch.as_deref())?;
+        extra_args.push("--platform".to_string());
+        extra_args.push(platform);
 
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
@@ -2065,5 +2090,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Unsupported SDK architecture"));
+    }
+
+    #[test]
+    fn test_get_host_platform_returns_valid_format() {
+        let platform = get_host_platform();
+        assert!(platform.starts_with("linux/"));
+        // Should be one of the common architectures
+        let valid_archs = ["amd64", "arm64", "arm/v7", "riscv64"];
+        let arch_part = platform.strip_prefix("linux/").unwrap();
+        assert!(
+            valid_archs.contains(&arch_part) || !arch_part.is_empty(),
+            "Unexpected platform: {}",
+            platform
+        );
+    }
+
+    #[test]
+    fn test_get_container_platform_with_sdk_arch() {
+        let result = get_container_platform(Some("aarch64")).unwrap();
+        assert_eq!(result, "linux/arm64");
+
+        let result = get_container_platform(Some("x86-64")).unwrap();
+        assert_eq!(result, "linux/amd64");
+    }
+
+    #[test]
+    fn test_get_container_platform_without_sdk_arch() {
+        let result = get_container_platform(None).unwrap();
+        // Should return the host platform
+        assert!(result.starts_with("linux/"));
+        assert_eq!(result, get_host_platform());
     }
 }

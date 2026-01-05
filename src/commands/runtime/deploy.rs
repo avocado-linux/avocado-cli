@@ -17,6 +17,7 @@ pub struct RuntimeDeployCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    sdk_arch: Option<String>,
 }
 
 impl RuntimeDeployCommand {
@@ -38,12 +39,19 @@ impl RuntimeDeployCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            sdk_arch: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -99,6 +107,7 @@ impl RuntimeDeployCommand {
                 verbose: false,
                 source_environment: true,
                 interactive: false,
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -149,6 +158,7 @@ impl RuntimeDeployCommand {
             env_vars: Some(env_vars),
             container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let deploy_result = container_helper

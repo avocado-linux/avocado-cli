@@ -187,8 +187,9 @@ impl SdkInstallCommand {
     async fn fetch_remote_extensions(&self, _config: &Config, target: &str) -> Result<()> {
         use crate::commands::ext::ExtFetchCommand;
 
-        // Discover remote extensions
-        let remote_extensions = Config::discover_remote_extensions(&self.config_path)?;
+        // Discover remote extensions (with target interpolation for extension names)
+        let remote_extensions =
+            Config::discover_remote_extensions(&self.config_path, Some(target))?;
 
         if remote_extensions.is_empty() {
             return Ok(());

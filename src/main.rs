@@ -807,7 +807,8 @@ async fn main() -> Result<()> {
                 dnf_args,
             )
             .with_no_stamps(cli.no_stamps)
-            .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
+            .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+            .with_sdk_arch(cli.sdk_arch.clone());
             install_cmd.execute().await?;
             Ok(())
         }
@@ -830,7 +831,8 @@ async fn main() -> Result<()> {
                 dnf_args,
             )
             .with_no_stamps(cli.no_stamps)
-            .with_runs_on(cli.runs_on.clone(), cli.nfs_port);
+            .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+            .with_sdk_arch(cli.sdk_arch.clone());
             build_cmd.execute().await?;
             Ok(())
         }
@@ -851,7 +853,8 @@ async fn main() -> Result<()> {
                 target.or(cli.target),
                 container_args,
                 dnf_args,
-            );
+            )
+            .with_sdk_arch(cli.sdk_arch.clone());
             fetch_cmd.execute().await?;
             Ok(())
         }
@@ -887,6 +890,7 @@ async fn main() -> Result<()> {
                     no_stamps: cli.no_stamps,
                     runs_on: cli.runs_on.clone(),
                     nfs_port: cli.nfs_port,
+                    sdk_arch: cli.sdk_arch.clone(),
                 });
             provision_cmd.execute().await?;
             Ok(())
@@ -909,7 +913,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             )
-            .with_no_stamps(cli.no_stamps);
+            .with_no_stamps(cli.no_stamps)
+            .with_sdk_arch(cli.sdk_arch.clone());
             deploy_cmd.execute().await?;
             Ok(())
         }
@@ -1012,7 +1017,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -1033,7 +1039,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 build_cmd.execute().await?;
                 Ok(())
             }
@@ -1065,6 +1072,7 @@ async fn main() -> Result<()> {
                         no_stamps: cli.no_stamps,
                         runs_on: cli.runs_on.clone(),
                         nfs_port: cli.nfs_port,
+                        sdk_arch: cli.sdk_arch.clone(),
                     },
                 );
                 provision_cmd.execute().await?;
@@ -1101,7 +1109,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -1120,7 +1129,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -1142,7 +1152,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 deploy_cmd.execute().await?;
                 Ok(())
             }
@@ -1162,7 +1173,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 sign_cmd.execute().await?;
                 Ok(())
             }
@@ -1186,7 +1198,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -1205,7 +1218,8 @@ async fn main() -> Result<()> {
                     force,
                     target.or(cli.target.clone()),
                     container_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 fetch_cmd.execute().await?;
                 Ok(())
             }
@@ -1225,7 +1239,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 build_cmd.execute().await?;
                 Ok(())
             }
@@ -1247,7 +1262,8 @@ async fn main() -> Result<()> {
                     container_tool,
                     target.or(cli.target),
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 checkout_cmd.execute().await?;
                 Ok(())
             }
@@ -1282,7 +1298,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -1301,7 +1318,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                     container_args,
                     dnf_args,
-                );
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -1321,7 +1339,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 image_cmd.execute().await?;
                 Ok(())
             }
@@ -1343,7 +1362,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_no_stamps(cli.no_stamps);
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
                 package_cmd.execute().await?;
                 Ok(())
             }
@@ -1368,6 +1388,7 @@ async fn main() -> Result<()> {
                     verbose,
                     port,
                     no_stamps: no_stamps || cli.no_stamps,
+                    sdk_arch: cli.sdk_arch.clone(),
                 };
                 hitl_cmd.execute().await?;
                 Ok(())

@@ -28,6 +28,7 @@ pub struct ExtPackageCommand {
     /// since we now package src_dir directly without requiring build stamps.
     #[allow(dead_code)]
     pub no_stamps: bool,
+    pub sdk_arch: Option<String>,
 }
 
 impl ExtPackageCommand {
@@ -49,12 +50,19 @@ impl ExtPackageCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            sdk_arch: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -478,6 +486,7 @@ rm -rf "$TMPDIR"
             repo_release: config.get_sdk_repo_release(),
             container_args: merged_container_args,
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 
@@ -800,6 +809,7 @@ rm -rf "$TMPDIR"
             repo_release: config.get_sdk_repo_release(),
             container_args: merged_container_args,
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 

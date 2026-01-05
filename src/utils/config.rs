@@ -131,6 +131,9 @@ pub enum ExtensionSource {
     Repo {
         /// Version to fetch (e.g., "0.1.0" or "*")
         version: String,
+        /// Optional RPM package name (defaults to extension name if not specified)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        package: Option<String>,
         /// Optional custom repository name
         #[serde(skip_serializing_if = "Option::is_none")]
         repo_name: Option<String>,
@@ -691,13 +694,6 @@ impl Config {
         let mut extension_sources: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        // Discover remote extensions from the main config
-        let remote_extensions = Self::discover_remote_extensions_from_value(main_config)?;
-
-        if remote_extensions.is_empty() {
-            return Ok(extension_sources);
-        }
-
         // Get the src_dir and target to find the extensions directory
         // First deserialize just to get src_dir and default_target
         let temp_config: Config =
@@ -726,6 +722,14 @@ impl Config {
                 return Ok(extension_sources);
             }
         };
+
+        // Discover remote extensions from the main config (with target interpolation)
+        let remote_extensions =
+            Self::discover_remote_extensions_from_value(main_config, Some(&resolved_target))?;
+
+        if remote_extensions.is_empty() {
+            return Ok(extension_sources);
+        }
 
         // Get extensions directory from volume or fallback path
         let extensions_dir =
@@ -1829,6 +1833,7 @@ impl Config {
     /// Returns Some(ExtensionSource) if the extension has a source field,
     /// None if it's a local extension (no source field)
     pub fn parse_extension_source(
+        ext_name: &str,
         ext_config: &serde_yaml::Value,
     ) -> Result<Option<ExtensionSource>> {
         let source = ext_config.get("source");
@@ -1838,7 +1843,12 @@ impl Config {
             Some(source_value) => {
                 // Deserialize the source block into ExtensionSource
                 let source: ExtensionSource = serde_yaml::from_value(source_value.clone())
-                    .with_context(|| "Failed to parse extension source configuration")?;
+                    .with_context(|| {
+                        format!(
+                            "Failed to parse source configuration for extension '{}'",
+                            ext_name
+                        )
+                    })?;
                 Ok(Some(source))
             }
         }
@@ -1847,26 +1857,45 @@ impl Config {
     /// Discover all remote extensions in the configuration
     ///
     /// Returns a list of (extension_name, ExtensionSource) tuples for extensions
-    /// that have a `source` field in their configuration
-    pub fn discover_remote_extensions(config_path: &str) -> Result<Vec<(String, ExtensionSource)>> {
+    /// that have a `source` field in their configuration.
+    ///
+    /// If `target` is provided, extension names containing `{{ avocado.target }}`
+    /// will be interpolated with the target value.
+    pub fn discover_remote_extensions(
+        config_path: &str,
+        target: Option<&str>,
+    ) -> Result<Vec<(String, ExtensionSource)>> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {config_path}"))?;
         let parsed = Self::parse_config_value(config_path, &content)?;
 
-        Self::discover_remote_extensions_from_value(&parsed)
+        Self::discover_remote_extensions_from_value(&parsed, target)
     }
 
     /// Discover remote extensions from a parsed config value
+    ///
+    /// If `target` is provided, extension names containing `{{ avocado.target }}`
+    /// will be interpolated with the target value.
     pub fn discover_remote_extensions_from_value(
         parsed: &serde_yaml::Value,
+        target: Option<&str>,
     ) -> Result<Vec<(String, ExtensionSource)>> {
+        use crate::utils::interpolation::interpolate_name;
+
         let mut remote_extensions = Vec::new();
 
         if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
             for (ext_name_key, ext_config) in ext_section {
-                if let Some(ext_name) = ext_name_key.as_str() {
-                    if let Some(source) = Self::parse_extension_source(ext_config)? {
-                        remote_extensions.push((ext_name.to_string(), source));
+                if let Some(raw_ext_name) = ext_name_key.as_str() {
+                    // Interpolate extension name if target is provided
+                    let ext_name = if let Some(t) = target {
+                        interpolate_name(raw_ext_name, t)
+                    } else {
+                        raw_ext_name.to_string()
+                    };
+
+                    if let Some(source) = Self::parse_extension_source(&ext_name, ext_config)? {
+                        remote_extensions.push((ext_name, source));
                     }
                 }
             }

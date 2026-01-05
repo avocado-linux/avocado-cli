@@ -32,6 +32,7 @@ pub struct FetchCommand {
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
+    sdk_arch: Option<String>,
 }
 
 impl FetchCommand {
@@ -52,7 +53,14 @@ impl FetchCommand {
             target,
             container_args,
             dnf_args,
+            sdk_arch: None,
         }
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
+        self
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -177,6 +185,7 @@ impl FetchCommand {
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let sysroot_exists = container_config.helper.run_in_container(run_config).await?;
@@ -227,6 +236,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_config.helper.run_in_container(run_config).await?;
@@ -280,6 +290,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let sysroot_exists = container_config.helper.run_in_container(run_config).await?;
@@ -329,6 +340,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_config.helper.run_in_container(run_config).await?;
@@ -464,6 +476,7 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_config.helper.run_in_container(run_config).await?;
@@ -495,6 +508,7 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let rootfs_exists = container_config.helper.run_in_container(run_config).await?;
@@ -543,6 +557,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_config.helper.run_in_container(run_config).await?;
@@ -574,6 +589,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let target_sysroot_exists = container_config.helper.run_in_container(run_config).await?;
@@ -622,6 +638,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_config.helper.run_in_container(run_config).await?;
@@ -859,6 +876,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let sysroot_exists = container_config.helper.run_in_container(run_config).await?;
@@ -913,6 +931,7 @@ $DNF_SDK_HOST \
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let success = container_config.helper.run_in_container(run_config).await?;

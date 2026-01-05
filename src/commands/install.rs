@@ -55,6 +55,8 @@ pub struct InstallCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 impl InstallCommand {
@@ -79,6 +81,7 @@ impl InstallCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -92,6 +95,12 @@ impl InstallCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -611,6 +620,7 @@ impl InstallCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let sysroot_exists = container_helper.run_in_container(run_config).await?;
@@ -632,6 +642,7 @@ impl InstallCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(run_config).await?;
@@ -787,6 +798,7 @@ $DNF_SDK_HOST \
                         container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
                         disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                        sdk_arch: self.sdk_arch.clone(),
                         ..Default::default()
                     };
 
@@ -890,6 +902,7 @@ $DNF_SDK_HOST \
                 repo_release: stamp_repo_release,
                 container_args: stamp_container_args,
                 dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -942,6 +955,7 @@ $DNF_SDK_HOST \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let sysroot_exists = container_helper.run_in_container(run_config).await?;
@@ -962,6 +976,7 @@ $DNF_SDK_HOST \
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(run_config).await?;
@@ -1033,6 +1048,7 @@ $DNF_SDK_HOST \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 
@@ -1255,6 +1271,7 @@ $DNF_SDK_HOST \
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
 

@@ -37,6 +37,7 @@ pub struct ExtBuildCommand {
     pub no_stamps: bool,
     pub runs_on: Option<String>,
     pub nfs_port: Option<u16>,
+    pub sdk_arch: Option<String>,
 }
 
 impl ExtBuildCommand {
@@ -58,6 +59,7 @@ impl ExtBuildCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -71,6 +73,12 @@ impl ExtBuildCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -119,6 +127,7 @@ impl ExtBuildCommand {
                 repo_release: repo_release.clone(),
                 container_args: processed_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -460,6 +469,7 @@ impl ExtBuildCommand {
                 repo_release: repo_release.clone(),
                 container_args: processed_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -529,6 +539,7 @@ impl ExtBuildCommand {
             repo_release: repo_release.cloned(),
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -594,6 +605,7 @@ impl ExtBuildCommand {
             repo_release: repo_release.cloned(),
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -1579,6 +1591,7 @@ echo "Set proper permissions on authentication files""#,
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 

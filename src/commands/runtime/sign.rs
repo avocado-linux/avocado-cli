@@ -27,6 +27,7 @@ pub struct RuntimeSignCommand {
     #[allow(dead_code)] // Included for API consistency with other commands
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    sdk_arch: Option<String>,
 }
 
 impl RuntimeSignCommand {
@@ -46,12 +47,19 @@ impl RuntimeSignCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            sdk_arch: None,
         }
     }
 
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -89,6 +97,7 @@ impl RuntimeSignCommand {
                 verbose: false,
                 source_environment: true,
                 interactive: false,
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -179,6 +188,7 @@ impl RuntimeSignCommand {
                 verbose: self.verbose,
                 source_environment: true,
                 interactive: false,
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 

@@ -23,6 +23,7 @@ pub struct ExtImageCommand {
     no_stamps: bool,
     runs_on: Option<String>,
     nfs_port: Option<u16>,
+    sdk_arch: Option<String>,
 }
 
 impl ExtImageCommand {
@@ -44,6 +45,7 @@ impl ExtImageCommand {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         }
     }
 
@@ -57,6 +59,12 @@ impl ExtImageCommand {
     pub fn with_runs_on(mut self, runs_on: Option<String>, nfs_port: Option<u16>) -> Self {
         self.runs_on = runs_on;
         self.nfs_port = nfs_port;
+        self
+    }
+
+    /// Set SDK container architecture for cross-arch emulation
+    pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
+        self.sdk_arch = sdk_arch;
         self
     }
 
@@ -107,6 +115,7 @@ impl ExtImageCommand {
                 dnf_args: self.dnf_args.clone(),
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
+                sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
 
@@ -278,6 +287,7 @@ impl ExtImageCommand {
                     repo_release: repo_release.clone(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
                     ..Default::default()
                 };
 

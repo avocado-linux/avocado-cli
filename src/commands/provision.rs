@@ -33,6 +33,8 @@ pub struct ProvisionConfig {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// SDK container architecture for cross-arch emulation
+    pub sdk_arch: Option<String>,
 }
 
 /// Implementation of the 'provision' command that calls through to runtime provision.
@@ -76,6 +78,7 @@ impl ProvisionCommand {
                 no_stamps: self.config.no_stamps,
                 runs_on: self.config.runs_on.clone(),
                 nfs_port: self.config.nfs_port,
+                sdk_arch: self.config.sdk_arch.clone(),
             },
         );
 
@@ -106,6 +109,7 @@ mod tests {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -139,6 +143,7 @@ mod tests {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -175,6 +180,7 @@ mod tests {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = ProvisionCommand::new(config);
 
@@ -198,6 +204,7 @@ mod tests {
             no_stamps: false,
             runs_on: None,
             nfs_port: None,
+            sdk_arch: None,
         };
         let cmd = ProvisionCommand::new(config);
 

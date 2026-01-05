@@ -54,6 +54,29 @@ pub mod env;
 
 const MAX_ITERATIONS: usize = 100;
 
+/// Interpolate a simple string with the target value.
+///
+/// This is a lightweight interpolation for extension names and other strings
+/// that only need `{{ avocado.target }}` interpolation without the full config context.
+///
+/// # Arguments
+/// * `input` - The string to interpolate
+/// * `target` - The target architecture value
+///
+/// # Returns
+/// The interpolated string with `{{ avocado.target }}` replaced
+///
+/// # Examples
+/// ```
+/// # use avocado_cli::utils::interpolation::interpolate_name;
+/// let result = interpolate_name("my-ext-{{ avocado.target }}", "raspberrypi4");
+/// assert_eq!(result, "my-ext-raspberrypi4");
+/// ```
+pub fn interpolate_name(input: &str, target: &str) -> String {
+    let re = Regex::new(r"\{\{\s*avocado\.target\s*\}\}").unwrap();
+    re.replace_all(input, target).to_string()
+}
+
 /// Interpolate configuration values in a YAML structure.
 ///
 /// This function recursively walks the YAML structure and replaces template strings
