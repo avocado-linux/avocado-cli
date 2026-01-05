@@ -445,7 +445,8 @@ cp -rp "$EXT_SRC_DIR"/* %{{buildroot}}/
 SPEC_EOF
 
 # Build the RPM with custom architecture target
-rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --target {arch} -bb SPECS/package.spec
+# Override %__rm macro since /usr/bin/rm may not exist in container
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --define "__rm /bin/rm" --target {arch} -bb SPECS/package.spec
 
 # Move RPM to output directory
 mv RPMS/{arch}/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} || {{
@@ -764,7 +765,8 @@ Group: {}{}
 SPEC_EOF
 
 # Build the RPM with custom architecture target and define the arch macro
-rpmbuild --define "_topdir $TMPDIR" --define "_arch {}" --target {} -bb SPECS/sdk-package.spec
+# Override %__rm macro since /usr/bin/rm may not exist in container
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {}" --define "__rm /bin/rm" --target {} -bb SPECS/sdk-package.spec
 
 # Move RPM to output directory
 mv RPMS/{}/*.rpm $AVOCADO_PREFIX/output/extensions/{} || {{
