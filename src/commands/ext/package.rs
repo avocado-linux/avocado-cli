@@ -143,6 +143,9 @@ impl ExtPackageCommand {
         // Extract RPM metadata with defaults
         let rpm_metadata = self.extract_rpm_metadata(&ext_config, &target)?;
 
+        // Determine which files to package
+        let package_files = self.get_package_files(&ext_config);
+
         if self.verbose {
             print_info(
                 &format!(
@@ -151,12 +154,22 @@ impl ExtPackageCommand {
                 ),
                 OutputLevel::Normal,
             );
+            print_info(
+                &format!("Package files: {:?}", package_files),
+                OutputLevel::Normal,
+            );
         }
 
         // Create main RPM package in container
         // This packages the extension's src_dir (directory containing avocado.yaml)
         let output_path = self
-            .create_rpm_package_in_container(&rpm_metadata, &config, &target, &ext_config_path)
+            .create_rpm_package_in_container(
+                &rpm_metadata,
+                &config,
+                &target,
+                &ext_config_path,
+                &package_files,
+            )
             .await?;
 
         print_success(
@@ -171,6 +184,45 @@ impl ExtPackageCommand {
         // so we no longer need to create a separate SDK package.
 
         Ok(())
+    }
+
+    /// Determine which files to package based on the extension configuration.
+    ///
+    /// If `package_files` is specified in the extension config, use those patterns.
+    /// Otherwise, default to:
+    /// - The avocado config file (avocado.yaml, avocado.yml, or avocado.toml)
+    /// - The overlay directory if defined
+    fn get_package_files(&self, ext_config: &serde_yaml::Value) -> Vec<String> {
+        // Check if package_files is explicitly defined
+        if let Some(package_files) = ext_config.get("package_files") {
+            if let Some(files_array) = package_files.as_sequence() {
+                let files: Vec<String> = files_array
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if !files.is_empty() {
+                    return files;
+                }
+            }
+        }
+
+        // Default behavior: avocado.yaml + overlay directory if defined
+        let mut default_files = vec!["avocado.yaml".to_string()];
+
+        // Check for overlay configuration
+        if let Some(overlay) = ext_config.get("overlay") {
+            if let Some(overlay_dir) = overlay.as_str() {
+                // Simple string format: overlay = "directory"
+                default_files.push(overlay_dir.to_string());
+            } else if let Some(overlay_table) = overlay.as_mapping() {
+                // Table format: overlay = { dir = "directory", ... }
+                if let Some(dir) = overlay_table.get("dir").and_then(|d| d.as_str()) {
+                    default_files.push(dir.to_string());
+                }
+            }
+        }
+
+        default_files
     }
 
     /// Extract RPM metadata from extension configuration with defaults
@@ -327,12 +379,20 @@ impl ExtPackageCommand {
     /// The package root (/) maps to the extension's src_dir contents.
     /// This allows the extension to be installed to $AVOCADO_PREFIX/includes/<ext_name>/
     /// and its config merged into the main config.
+    ///
+    /// # Arguments
+    /// * `metadata` - RPM metadata for the package
+    /// * `config` - The avocado configuration
+    /// * `target` - The target architecture
+    /// * `ext_config_path` - Path to the extension's config file
+    /// * `package_files` - List of files/directories to package (supports glob patterns like * and **)
     async fn create_rpm_package_in_container(
         &self,
         metadata: &RpmMetadata,
         config: &Config,
         target: &str,
         ext_config_path: &str,
+        package_files: &[String],
     ) -> Result<PathBuf> {
         let container_image = config
             .get_sdk_image()
@@ -366,6 +426,9 @@ impl ExtPackageCommand {
             metadata.name, metadata.version, metadata.release, metadata.arch
         );
 
+        // Convert package_files to a space-separated string for the shell script
+        let package_files_str = package_files.join(" ");
+
         // Create RPM using rpmbuild in container
         // Package root (/) maps to the extension's src_dir contents
         let rpm_build_script = format!(
@@ -374,6 +437,9 @@ set -e
 
 # Extension source directory
 EXT_SRC_DIR="{container_src_dir}"
+
+# Package files patterns (may contain globs like * and **)
+PACKAGE_FILES="{package_files_str}"
 
 # Ensure output directory exists
 mkdir -p $AVOCADO_PREFIX/output/extensions
@@ -390,21 +456,48 @@ if [ ! -f "$EXT_SRC_DIR/avocado.yaml" ] && [ ! -f "$EXT_SRC_DIR/avocado.yml" ] &
     exit 1
 fi
 
-# Count files
-FILE_COUNT=$(find "$EXT_SRC_DIR" -type f | wc -l)
-echo "Creating RPM with $FILE_COUNT files from source directory..."
-
-if [ "$FILE_COUNT" -eq 0 ]; then
-    echo "No files found in source directory"
-    exit 1
-fi
-
 # Create temporary directory for RPM build
 TMPDIR=$(mktemp -d)
+STAGING_DIR="$TMPDIR/staging"
+mkdir -p "$STAGING_DIR"
 cd "$TMPDIR"
 
 # Create directory structure for rpmbuild
 mkdir -p BUILD RPMS SOURCES SPECS SRPMS
+
+# Enable globstar for ** pattern support
+shopt -s globstar nullglob
+
+# Copy files matching patterns to staging directory
+cd "$EXT_SRC_DIR"
+FILE_COUNT=0
+for pattern in $PACKAGE_FILES; do
+    # Expand the glob pattern
+    for file in $pattern; do
+        if [ -e "$file" ]; then
+            # Create parent directory in staging and copy
+            parent_dir=$(dirname "$file")
+            if [ "$parent_dir" != "." ]; then
+                mkdir -p "$STAGING_DIR/$parent_dir"
+            fi
+            cp -rp "$file" "$STAGING_DIR/$file"
+            if [ -f "$file" ]; then
+                FILE_COUNT=$((FILE_COUNT + 1))
+            elif [ -d "$file" ]; then
+                dir_files=$(find "$file" -type f | wc -l)
+                FILE_COUNT=$((FILE_COUNT + dir_files))
+            fi
+        fi
+    done
+done
+cd "$TMPDIR"
+
+echo "Creating RPM with $FILE_COUNT files from source directory..."
+
+if [ "$FILE_COUNT" -eq 0 ]; then
+    echo "No files matched the package_files patterns: $PACKAGE_FILES"
+    exit 1
+fi
 
 # Create spec file
 # Package root (/) maps to the extension's src_dir
@@ -434,9 +527,9 @@ Group: {group}{url_line}
 
 %install
 mkdir -p %{{buildroot}}
-# Copy src_dir contents to buildroot root
+# Copy staged files to buildroot root
 # This allows installation to \$AVOCADO_PREFIX/includes/<ext_name>/
-cp -rp "$EXT_SRC_DIR"/* %{{buildroot}}/
+cp -rp "$STAGING_DIR"/* %{{buildroot}}/
 
 %clean
 # Skip clean section - not needed for our use case
@@ -445,8 +538,7 @@ cp -rp "$EXT_SRC_DIR"/* %{{buildroot}}/
 SPEC_EOF
 
 # Build the RPM with custom architecture target
-# Override %__rm macro since /usr/bin/rm may not exist in container
-rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --define "__rm /bin/rm" --target {arch} -bb SPECS/package.spec
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --target {arch} -bb SPECS/package.spec
 
 # Move RPM to output directory
 mv RPMS/{arch}/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} || {{
@@ -477,6 +569,7 @@ rm -rf "$TMPDIR"
             arch = metadata.arch,
             rpm_filename = rpm_filename,
             container_src_dir = container_src_dir,
+            package_files_str = package_files_str,
         );
 
         // Run the RPM build in the container
@@ -765,8 +858,7 @@ Group: {}{}
 SPEC_EOF
 
 # Build the RPM with custom architecture target and define the arch macro
-# Override %__rm macro since /usr/bin/rm may not exist in container
-rpmbuild --define "_topdir $TMPDIR" --define "_arch {}" --define "__rm /bin/rm" --target {} -bb SPECS/sdk-package.spec
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {}" --target {} -bb SPECS/sdk-package.spec
 
 # Move RPM to output directory
 mv RPMS/{}/*.rpm $AVOCADO_PREFIX/output/extensions/{} || {{
@@ -1246,5 +1338,177 @@ ext:
         // Test with_no_stamps builder
         let cmd = cmd.with_no_stamps(true);
         assert!(cmd.no_stamps);
+    }
+
+    #[test]
+    fn test_get_package_files_default_no_overlay() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Config without package_files or overlay - should default to just avocado.yaml
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        ext_config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
+        );
+
+        let files = cmd.get_package_files(&ext_config);
+        assert_eq!(files, vec!["avocado.yaml".to_string()]);
+    }
+
+    #[test]
+    fn test_get_package_files_default_with_overlay_string() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Config with overlay as string - should include avocado.yaml and overlay dir
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let config_map = ext_config.as_mapping_mut().unwrap();
+        config_map.insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("overlay".to_string()),
+            serde_yaml::Value::String("my-overlay".to_string()),
+        );
+
+        let files = cmd.get_package_files(&ext_config);
+        assert_eq!(
+            files,
+            vec!["avocado.yaml".to_string(), "my-overlay".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_package_files_default_with_overlay_table() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Config with overlay as table { dir = "..." } - should include avocado.yaml and overlay dir
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let config_map = ext_config.as_mapping_mut().unwrap();
+        config_map.insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
+        );
+
+        let mut overlay_table = serde_yaml::Mapping::new();
+        overlay_table.insert(
+            serde_yaml::Value::String("dir".to_string()),
+            serde_yaml::Value::String("overlays/prod".to_string()),
+        );
+        overlay_table.insert(
+            serde_yaml::Value::String("mode".to_string()),
+            serde_yaml::Value::String("opaque".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("overlay".to_string()),
+            serde_yaml::Value::Mapping(overlay_table),
+        );
+
+        let files = cmd.get_package_files(&ext_config);
+        assert_eq!(
+            files,
+            vec!["avocado.yaml".to_string(), "overlays/prod".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_package_files_explicit_list() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Config with explicit package_files list
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let config_map = ext_config.as_mapping_mut().unwrap();
+        config_map.insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
+        );
+
+        let package_files = vec![
+            serde_yaml::Value::String("avocado.yaml".to_string()),
+            serde_yaml::Value::String("config/**".to_string()),
+            serde_yaml::Value::String("scripts/*.sh".to_string()),
+            serde_yaml::Value::String("README.md".to_string()),
+        ];
+        config_map.insert(
+            serde_yaml::Value::String("package_files".to_string()),
+            serde_yaml::Value::Sequence(package_files),
+        );
+
+        // Also add overlay - should be ignored when package_files is set
+        config_map.insert(
+            serde_yaml::Value::String("overlay".to_string()),
+            serde_yaml::Value::String("my-overlay".to_string()),
+        );
+
+        let files = cmd.get_package_files(&ext_config);
+        assert_eq!(
+            files,
+            vec![
+                "avocado.yaml".to_string(),
+                "config/**".to_string(),
+                "scripts/*.sh".to_string(),
+                "README.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_get_package_files_empty_list_uses_default() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Config with empty package_files list - should fall back to default
+        let mut ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let config_map = ext_config.as_mapping_mut().unwrap();
+        config_map.insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("package_files".to_string()),
+            serde_yaml::Value::Sequence(vec![]),
+        );
+
+        let files = cmd.get_package_files(&ext_config);
+        assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 }
