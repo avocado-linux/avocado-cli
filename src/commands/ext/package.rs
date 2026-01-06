@@ -139,11 +139,15 @@ impl ExtPackageCommand {
                 anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
             })?;
 
+        // Also get the raw (unmerged) extension config to find all target-specific overlays
+        let raw_ext_config = self.get_raw_extension_config(&ext_config_path)?;
+
         // Extract RPM metadata with defaults
         let rpm_metadata = self.extract_rpm_metadata(&ext_config, &target)?;
 
         // Determine which files to package
-        let package_files = self.get_package_files(&ext_config);
+        // Pass both merged config (for package_files) and raw config (for all target overlays)
+        let package_files = self.get_package_files(&ext_config, raw_ext_config.as_ref());
 
         if self.verbose {
             print_info(
@@ -185,13 +189,60 @@ impl ExtPackageCommand {
         Ok(())
     }
 
+    /// Get the raw (unmerged) extension configuration from the config file.
+    ///
+    /// This is used to find all target-specific overlays that should be included
+    /// in the package (since the package is noarch and needs all target overlays).
+    fn get_raw_extension_config(&self, ext_config_path: &str) -> Result<Option<serde_yaml::Value>> {
+        let content = fs::read_to_string(ext_config_path)
+            .with_context(|| format!("Failed to read config file: {ext_config_path}"))?;
+
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {ext_config_path}"))?;
+
+        // Get the ext section
+        let ext_section = parsed.get("ext");
+        if ext_section.is_none() {
+            return Ok(None);
+        }
+
+        // Get this specific extension's config
+        Ok(ext_section
+            .and_then(|ext| ext.get(&self.extension))
+            .cloned())
+    }
+
+    /// Extract overlay directory from an overlay configuration value.
+    fn extract_overlay_dir(overlay_value: &serde_yaml::Value) -> Option<String> {
+        if let Some(overlay_dir) = overlay_value.as_str() {
+            // Simple string format: overlay = "directory"
+            Some(overlay_dir.to_string())
+        } else if let Some(overlay_table) = overlay_value.as_mapping() {
+            // Table format: overlay = { dir = "directory", ... }
+            overlay_table
+                .get("dir")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Determine which files to package based on the extension configuration.
     ///
     /// If `package_files` is specified in the extension config, use those patterns.
     /// Otherwise, default to:
     /// - The avocado config file (avocado.yaml, avocado.yml, or avocado.toml)
-    /// - The overlay directory if defined
-    fn get_package_files(&self, ext_config: &serde_yaml::Value) -> Vec<String> {
+    /// - All overlay directories (base level and target-specific)
+    ///
+    /// # Arguments
+    /// * `ext_config` - The merged extension config (for package_files check)
+    /// * `raw_ext_config` - The raw unmerged extension config (to find all target-specific overlays)
+    fn get_package_files(
+        &self,
+        ext_config: &serde_yaml::Value,
+        raw_ext_config: Option<&serde_yaml::Value>,
+    ) -> Vec<String> {
         // Check if package_files is explicitly defined
         if let Some(package_files) = ext_config.get("package_files") {
             if let Some(files_array) = package_files.as_sequence() {
@@ -205,18 +256,39 @@ impl ExtPackageCommand {
             }
         }
 
-        // Default behavior: avocado.yaml + overlay directory if defined
+        // Default behavior: avocado.yaml + all overlay directories
         let mut default_files = vec!["avocado.yaml".to_string()];
+        let mut seen_overlays = std::collections::HashSet::new();
 
-        // Check for overlay configuration
-        if let Some(overlay) = ext_config.get("overlay") {
-            if let Some(overlay_dir) = overlay.as_str() {
-                // Simple string format: overlay = "directory"
-                default_files.push(overlay_dir.to_string());
-            } else if let Some(overlay_table) = overlay.as_mapping() {
-                // Table format: overlay = { dir = "directory", ... }
-                if let Some(dir) = overlay_table.get("dir").and_then(|d| d.as_str()) {
-                    default_files.push(dir.to_string());
+        // If we have the raw extension config, scan for all overlays
+        if let Some(raw_config) = raw_ext_config {
+            if let Some(mapping) = raw_config.as_mapping() {
+                for (key, value) in mapping {
+                    // Check if this is the base-level overlay
+                    if key.as_str() == Some("overlay") {
+                        if let Some(overlay_dir) = Self::extract_overlay_dir(value) {
+                            if seen_overlays.insert(overlay_dir.clone()) {
+                                default_files.push(overlay_dir);
+                            }
+                        }
+                    }
+                    // Check if this is a target-specific section with an overlay
+                    else if let Some(target_config) = value.as_mapping() {
+                        if let Some(overlay_value) = target_config.get("overlay") {
+                            if let Some(overlay_dir) = Self::extract_overlay_dir(overlay_value) {
+                                if seen_overlays.insert(overlay_dir.clone()) {
+                                    default_files.push(overlay_dir);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: just check the merged config for overlay (current target only)
+            if let Some(overlay) = ext_config.get("overlay") {
+                if let Some(overlay_dir) = Self::extract_overlay_dir(overlay) {
+                    default_files.push(overlay_dir);
                 }
             }
         }
@@ -1011,7 +1083,7 @@ mod tests {
             serde_yaml::Value::String("1.0.0".to_string()),
         );
 
-        let files = cmd.get_package_files(&ext_config);
+        let files = cmd.get_package_files(&ext_config, None);
         assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 
@@ -1039,7 +1111,8 @@ mod tests {
             serde_yaml::Value::String("my-overlay".to_string()),
         );
 
-        let files = cmd.get_package_files(&ext_config);
+        // Use the same config as raw config to test overlay extraction
+        let files = cmd.get_package_files(&ext_config, Some(&ext_config));
         assert_eq!(
             files,
             vec!["avocado.yaml".to_string(), "my-overlay".to_string()]
@@ -1080,7 +1153,8 @@ mod tests {
             serde_yaml::Value::Mapping(overlay_table),
         );
 
-        let files = cmd.get_package_files(&ext_config);
+        // Use the same config as raw config to test overlay extraction
+        let files = cmd.get_package_files(&ext_config, Some(&ext_config));
         assert_eq!(
             files,
             vec!["avocado.yaml".to_string(), "overlays/prod".to_string()]
@@ -1124,7 +1198,7 @@ mod tests {
             serde_yaml::Value::String("my-overlay".to_string()),
         );
 
-        let files = cmd.get_package_files(&ext_config);
+        let files = cmd.get_package_files(&ext_config, Some(&ext_config));
         assert_eq!(
             files,
             vec![
@@ -1160,7 +1234,74 @@ mod tests {
             serde_yaml::Value::Sequence(vec![]),
         );
 
-        let files = cmd.get_package_files(&ext_config);
+        let files = cmd.get_package_files(&ext_config, None);
         assert_eq!(files, vec!["avocado.yaml".to_string()]);
+    }
+
+    #[test]
+    fn test_get_package_files_with_target_specific_overlays() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        // Create a raw config that simulates target-specific overlays
+        // like: ext.test-ext.reterminal.overlay and ext.test-ext.reterminal-dm.overlay
+        let mut raw_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let config_map = raw_config.as_mapping_mut().unwrap();
+
+        config_map.insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String("1.0.0".to_string()),
+        );
+
+        // Target: reterminal with overlay
+        let mut reterminal_config = serde_yaml::Mapping::new();
+        reterminal_config.insert(
+            serde_yaml::Value::String("overlay".to_string()),
+            serde_yaml::Value::String("overlays/reterminal".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("reterminal".to_string()),
+            serde_yaml::Value::Mapping(reterminal_config),
+        );
+
+        // Target: reterminal-dm with overlay
+        let mut reterminal_dm_config = serde_yaml::Mapping::new();
+        reterminal_dm_config.insert(
+            serde_yaml::Value::String("overlay".to_string()),
+            serde_yaml::Value::String("overlays/reterminal-dm".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("reterminal-dm".to_string()),
+            serde_yaml::Value::Mapping(reterminal_dm_config),
+        );
+
+        // Target: icam-540 without overlay (should not add anything)
+        let mut icam_config = serde_yaml::Mapping::new();
+        icam_config.insert(
+            serde_yaml::Value::String("some_other_setting".to_string()),
+            serde_yaml::Value::String("value".to_string()),
+        );
+        config_map.insert(
+            serde_yaml::Value::String("icam-540".to_string()),
+            serde_yaml::Value::Mapping(icam_config),
+        );
+
+        // Merged config (for a specific target, but package_files not set)
+        let merged_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        let files = cmd.get_package_files(&merged_config, Some(&raw_config));
+
+        // Should include avocado.yaml and both target-specific overlays
+        assert!(files.contains(&"avocado.yaml".to_string()));
+        assert!(files.contains(&"overlays/reterminal".to_string()));
+        assert!(files.contains(&"overlays/reterminal-dm".to_string()));
+        assert_eq!(files.len(), 3);
     }
 }
