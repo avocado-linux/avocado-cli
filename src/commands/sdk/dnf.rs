@@ -84,13 +84,15 @@ impl SdkDnfCommand {
         let container_helper = SdkContainer::new();
 
         // Build DNF command
+        // Use $DNF_SDK_COMBINED_REPO_CONF to include both SDK repos and target-specific repos
+        // (including the extension repo: ${AVOCADO_TARGET}-target-ext)
         let dnf_args_str = if let Some(args) = &self.dnf_args {
             format!(" {} ", args.join(" "))
         } else {
             String::new()
         };
         let command = format!(
-            "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_REPO_CONF --disablerepo=${{AVOCADO_TARGET}}-target-ext {} {}",
+            "RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {} {}",
             dnf_args_str,
             self.command.join(" ")
         );
