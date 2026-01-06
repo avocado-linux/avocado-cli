@@ -12,7 +12,7 @@ runtime:
       avocado-img-initramfs: '*'
       avocado-bsp:
         ext: avocado-bsp-{{ avocado.target }}
-        config: bsp/{{ avocado.target }}/avocado.toml
+        vsn: "*"
       config:
         ext: config
       app:
