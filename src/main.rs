@@ -9,7 +9,7 @@ use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
-    ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
+    ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand, ExtSbomCommand,
 };
 use commands::fetch::FetchCommand;
 use commands::hitl::HitlServerCommand;
@@ -20,7 +20,7 @@ use commands::prune::PruneCommand;
 use commands::runtime::{
     RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDeployCommand, RuntimeDepsCommand,
     RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
-    RuntimeSignCommand,
+    RuntimeSbomCommand, RuntimeSignCommand,
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
@@ -702,6 +702,30 @@ enum RuntimeCommands {
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
     },
+    /// Generate SBOM (Software Bill of Materials) for a runtime
+    Sbom {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Runtime name to generate SBOM for
+        #[arg(short = 'r', long = "runtime", required = true)]
+        runtime: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Output file path relative to src_dir (if not specified, outputs to stdout)
+        #[arg(long = "out")]
+        out: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
 }
 
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
@@ -1162,6 +1186,27 @@ async fn main() -> Result<()> {
                 sign_cmd.execute().await?;
                 Ok(())
             }
+            RuntimeCommands::Sbom {
+                config,
+                verbose,
+                runtime,
+                target,
+                out,
+                container_args,
+                dnf_args,
+            } => {
+                let sbom_cmd = RuntimeSbomCommand::new(
+                    runtime,
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    out,
+                    container_args,
+                    dnf_args,
+                );
+                sbom_cmd.execute().await?;
+                Ok(())
+            }
         },
         Commands::Ext { command } => match command {
             ExtCommands::Install {
@@ -1322,6 +1367,27 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps);
                 package_cmd.execute().await?;
+                Ok(())
+            }
+            ExtCommands::Sbom {
+                config,
+                verbose,
+                extension,
+                target,
+                out,
+                container_args,
+                dnf_args,
+            } => {
+                let sbom_cmd = ExtSbomCommand::new(
+                    extension,
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    out,
+                    container_args,
+                    dnf_args,
+                );
+                sbom_cmd.execute().await?;
                 Ok(())
             }
         },
@@ -1658,6 +1724,30 @@ enum ExtCommands {
         /// Output directory on host for the RPM package (relative or absolute path). If not specified, RPM stays in container at $AVOCADO_PREFIX/output/extensions
         #[arg(long = "out-dir")]
         output_dir: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Generate SBOM (Software Bill of Materials) for an extension
+    Sbom {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Name of the extension to generate SBOM for
+        #[arg(short = 'e', long = "extension", required = true)]
+        extension: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Output file path relative to src_dir (if not specified, outputs to stdout)
+        #[arg(long = "out")]
+        out: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

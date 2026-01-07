@@ -7,6 +7,7 @@ pub mod image;
 pub mod install;
 pub mod list;
 pub mod package;
+pub mod sbom;
 
 pub use build::ExtBuildCommand;
 #[allow(unused_imports)]
@@ -23,3 +24,5 @@ pub use install::ExtInstallCommand;
 pub use list::ExtListCommand;
 #[allow(unused_imports)]
 pub use package::ExtPackageCommand;
+#[allow(unused_imports)]
+pub use sbom::ExtSbomCommand;

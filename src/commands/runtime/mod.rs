@@ -6,6 +6,7 @@ pub mod dnf;
 pub mod install;
 pub mod list;
 pub mod provision;
+pub mod sbom;
 pub mod sign;
 
 pub use build::RuntimeBuildCommand;
@@ -21,4 +22,6 @@ pub use install::RuntimeInstallCommand;
 #[allow(unused_imports)]
 pub use list::RuntimeListCommand;
 pub use provision::RuntimeProvisionCommand;
+#[allow(unused_imports)]
+pub use sbom::RuntimeSbomCommand;
 pub use sign::RuntimeSignCommand;

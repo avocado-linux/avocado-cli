@@ -8,6 +8,7 @@ pub mod output;
 pub mod pkcs11_devices;
 pub mod remote;
 pub mod runs_on;
+pub mod sbom;
 pub mod signing_keys;
 #[cfg(unix)]
 pub mod signing_service;
