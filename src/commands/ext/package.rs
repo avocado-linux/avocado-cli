@@ -66,11 +66,14 @@ impl ExtPackageCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration
-        let config = Config::load(&self.config_path)?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Resolve target
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // With the new src_dir packaging approach, we no longer require
         // ext_install and ext_build stamps. We're packaging the source directory,
@@ -131,16 +134,53 @@ impl ExtPackageCommand {
             }
         }
 
-        // Get merged extension configuration with target-specific overrides and interpolation
-        // Use the config path where the extension is actually defined for proper interpolation
-        let ext_config = config
-            .get_merged_ext_config(&self.extension, &target, &ext_config_path)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-            })?;
+        // Get extension configuration from the composed/merged config
+        // For remote extensions, this comes from the merged remote extension config (already read via container)
+        // For local extensions, this uses get_merged_ext_config which reads from the file
+        let ext_config = match &extension_location {
+            ExtensionLocation::Remote { .. } => {
+                // Use the already-merged config from `parsed` which contains remote extension configs
+                // Then apply target-specific overrides manually
+                let ext_section = parsed.get("ext").and_then(|ext| ext.get(&self.extension));
+                if let Some(ext_val) = ext_section {
+                    let base_ext = ext_val.clone();
+                    // Check for target-specific override within this extension
+                    let target_override = ext_val.get(&target).cloned();
+                    if let Some(override_val) = target_override {
+                        // Merge target override into base, filtering out other target sections
+                        Some(config.merge_target_override(base_ext, override_val, &target))
+                    } else {
+                        Some(base_ext)
+                    }
+                } else {
+                    None
+                }
+            }
+            ExtensionLocation::Local { config_path, .. } => {
+                // For local extensions, read from the file with proper target merging
+                config.get_merged_ext_config(&self.extension, &target, config_path)?
+            }
+            #[allow(deprecated)]
+            ExtensionLocation::External { config_path, .. } => {
+                // For deprecated external configs, read from the file
+                config.get_merged_ext_config(&self.extension, &target, config_path)?
+            }
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+        })?;
 
         // Also get the raw (unmerged) extension config to find all target-specific overlays
-        let raw_ext_config = self.get_raw_extension_config(&ext_config_path)?;
+        // For remote extensions, use the parsed config; for local, read from file
+        let raw_ext_config = match &extension_location {
+            ExtensionLocation::Remote { .. } => {
+                parsed
+                    .get("ext")
+                    .and_then(|ext| ext.get(&self.extension))
+                    .cloned()
+            }
+            _ => self.get_raw_extension_config(&ext_config_path)?,
+        };
 
         // Extract RPM metadata with defaults
         let rpm_metadata = self.extract_rpm_metadata(&ext_config, &target)?;

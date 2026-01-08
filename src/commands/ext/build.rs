@@ -87,7 +87,7 @@ impl ExtBuildCommand {
         let composed = Config::load_composed(&self.config_path, self.target.as_deref())
             .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
         let config = &composed.config;
-        let _parsed = &composed.merged_value;
+        let parsed = &composed.merged_value;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let processed_container_args =
@@ -192,13 +192,41 @@ impl ExtBuildCommand {
             }
         }
 
-        // Get merged extension configuration with target-specific overrides
-        // Use the config path where the extension is actually defined for proper interpolation
-        let ext_config = config
-            .get_merged_ext_config(&self.extension, &target, &ext_config_path)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-            })?;
+        // Get extension configuration from the composed/merged config
+        // For remote extensions, this comes from the merged remote extension config (already read via container)
+        // For local extensions, this uses get_merged_ext_config which reads from the file
+        let ext_config = match &extension_location {
+            ExtensionLocation::Remote { .. } => {
+                // Use the already-merged config from `parsed` which contains remote extension configs
+                // Then apply target-specific overrides manually
+                let ext_section = parsed.get("ext").and_then(|ext| ext.get(&self.extension));
+                if let Some(ext_val) = ext_section {
+                    let base_ext = ext_val.clone();
+                    // Check for target-specific override within this extension
+                    let target_override = ext_val.get(&target).cloned();
+                    if let Some(override_val) = target_override {
+                        // Merge target override into base, filtering out other target sections
+                        Some(config.merge_target_override(base_ext, override_val, &target))
+                    } else {
+                        Some(base_ext)
+                    }
+                } else {
+                    None
+                }
+            }
+            ExtensionLocation::Local { config_path, .. } => {
+                // For local extensions, read from the file with proper target merging
+                config.get_merged_ext_config(&self.extension, &target, config_path)?
+            }
+            #[allow(deprecated)]
+            ExtensionLocation::External { config_path, .. } => {
+                // For deprecated external configs, read from the file
+                config.get_merged_ext_config(&self.extension, &target, config_path)?
+            }
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+        })?;
 
         // Handle compile dependencies with install scripts before building the extension
         // Pass the ext_config_path so SDK compile sections are loaded from the correct config
@@ -371,6 +399,18 @@ impl ExtBuildCommand {
         // Initialize SDK container helper
         let container_helper = SdkContainer::from_config(&self.config_path, &config)?;
 
+        // Determine the extension source path for overlay resolution
+        // For remote extensions, files are in $AVOCADO_PREFIX/includes/<ext-name>/
+        // For local extensions, files are in /opt/src (the mounted src_dir)
+        let ext_src_path = match &extension_location {
+            ExtensionLocation::Remote { name, .. } => {
+                format!("$AVOCADO_PREFIX/includes/{name}")
+            }
+            ExtensionLocation::Local { .. } | ExtensionLocation::External { .. } => {
+                "/opt/src".to_string()
+            }
+        };
+
         // Build extensions based on configuration
         let mut overall_success = true;
 
@@ -398,6 +438,7 @@ impl ExtBuildCommand {
                         users_config,
                         groups_config,
                         reload_service_manager,
+                        &ext_src_path,
                     )
                     .await?
                 }
@@ -418,6 +459,7 @@ impl ExtBuildCommand {
                         users_config,
                         groups_config,
                         reload_service_manager,
+                        &ext_src_path,
                     )
                     .await?
                 }
@@ -507,6 +549,7 @@ impl ExtBuildCommand {
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
+        ext_src_path: &str,
     ) -> Result<bool> {
         // Create the build script for sysext extension
         let build_script = self.create_sysext_build_script(
@@ -519,6 +562,7 @@ impl ExtBuildCommand {
             users_config,
             groups_config,
             reload_service_manager,
+            ext_src_path,
         );
 
         // Execute the build script in the SDK container
@@ -573,6 +617,7 @@ impl ExtBuildCommand {
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
+        ext_src_path: &str,
     ) -> Result<bool> {
         // Create the build script for confext extension
         let build_script = self.create_confext_build_script(
@@ -585,6 +630,7 @@ impl ExtBuildCommand {
             users_config,
             groups_config,
             reload_service_manager,
+            ext_src_path,
         );
 
         // Execute the build script in the SDK container
@@ -633,58 +679,52 @@ impl ExtBuildCommand {
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
+        ext_src_path: &str,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
                 OverlayMode::Merge => format!(
                     r#"
 # Merge overlay directory into extension sysroot
-if [ -d "/opt/src/{}" ]; then
-    echo "Merging overlay directory '{}' into extension sysroot with root:root ownership"
+if [ -d "{src_path}/{overlay_dir}" ]; then
+    echo "Merging overlay directory '{overlay_dir}' into extension sysroot with root:root ownership"
     # Use rsync to merge directories and set ownership during copy
-    rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+    rsync -a --chown=root:root {src_path}/{overlay_dir}/ "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
 else
-    echo "Error: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{overlay_dir}' not found in source"
     exit 1
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    src_path = ext_src_path,
+                    overlay_dir = overlay_config.dir,
+                    ext_name = self.extension,
                 ),
                 OverlayMode::Opaque => format!(
                     r#"
 # Copy overlay directory to extension sysroot (opaque mode)
-if [ -d "/opt/src/{}" ]; then
-    echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
+if [ -d "{src_path}/{overlay_dir}" ]; then
+    echo "Copying overlay directory '{overlay_dir}' to extension sysroot (opaque mode)"
     # Use cp -a to replace directory contents completely while preserving permissions
-    cp -a /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+    cp -a {src_path}/{overlay_dir}/* "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
     # Fix ownership to root:root for copied overlay files only (permissions are preserved)
     echo "Setting ownership to root:root for overlay files"
-    find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
-        relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
+    find "{src_path}/{overlay_dir}" -mindepth 1 | while IFS= read -r srcpath; do
+        relpath="$(echo "$srcpath" | sed "s|^{src_path}/{overlay_dir}||" | sed "s|^/||")"
         if [ -n "$relpath" ]; then
-            destpath="$AVOCADO_EXT_SYSROOTS/{}/$relpath"
+            destpath="$AVOCADO_EXT_SYSROOTS/{ext_name}/$relpath"
             if [ -e "$destpath" ]; then
                 chown root:root "$destpath" 2>/dev/null || true
             fi
         fi
     done
 else
-    echo "Error: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{overlay_dir}' not found in source"
     exit 1
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    src_path = ext_src_path,
+                    overlay_dir = overlay_config.dir,
+                    ext_name = self.extension,
                 ),
             }
         } else {
@@ -806,58 +846,52 @@ fi
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
+        ext_src_path: &str,
     ) -> String {
         let overlay_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
                 OverlayMode::Merge => format!(
                     r#"
 # Merge overlay directory into extension sysroot
-if [ -d "/opt/src/{}" ]; then
-    echo "Merging overlay directory '{}' into extension sysroot with root:root ownership"
+if [ -d "{src_path}/{overlay_dir}" ]; then
+    echo "Merging overlay directory '{overlay_dir}' into extension sysroot with root:root ownership"
     # Use rsync to merge directories and set ownership during copy
-    rsync -a --chown=root:root /opt/src/{}/ "$AVOCADO_EXT_SYSROOTS/{}/"
+    rsync -a --chown=root:root {src_path}/{overlay_dir}/ "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
 else
-    echo "Error: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{overlay_dir}' not found in source"
     exit 1
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    src_path = ext_src_path,
+                    overlay_dir = overlay_config.dir,
+                    ext_name = self.extension,
                 ),
                 OverlayMode::Opaque => format!(
                     r#"
 # Copy overlay directory to extension sysroot (opaque mode)
-if [ -d "/opt/src/{}" ]; then
-    echo "Copying overlay directory '{}' to extension sysroot (opaque mode)"
+if [ -d "{src_path}/{overlay_dir}" ]; then
+    echo "Copying overlay directory '{overlay_dir}' to extension sysroot (opaque mode)"
     # Use cp -a to replace directory contents completely while preserving permissions
-    cp -a /opt/src/{}/* "$AVOCADO_EXT_SYSROOTS/{}/"
+    cp -a {src_path}/{overlay_dir}/* "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
     # Fix ownership to root:root for copied overlay files only (permissions are preserved)
     echo "Setting ownership to root:root for overlay files"
-    find "/opt/src/{}" -mindepth 1 | while IFS= read -r srcpath; do
-        relpath="$(echo "$srcpath" | sed "s|^/opt/src/{}||" | sed "s|^/||")"
+    find "{src_path}/{overlay_dir}" -mindepth 1 | while IFS= read -r srcpath; do
+        relpath="$(echo "$srcpath" | sed "s|^{src_path}/{overlay_dir}||" | sed "s|^/||")"
         if [ -n "$relpath" ]; then
-            destpath="$AVOCADO_EXT_SYSROOTS/{}/$relpath"
+            destpath="$AVOCADO_EXT_SYSROOTS/{ext_name}/$relpath"
             if [ -e "$destpath" ]; then
                 chown root:root "$destpath" 2>/dev/null || true
             fi
         fi
     done
 else
-    echo "Error: Overlay directory '{}' not found in source"
+    echo "Error: Overlay directory '{overlay_dir}' not found in source"
     exit 1
 fi
 "#,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir,
-                    overlay_config.dir,
-                    self.extension,
-                    overlay_config.dir
+                    src_path = ext_src_path,
+                    overlay_dir = overlay_config.dir,
+                    ext_name = self.extension,
                 ),
             }
         } else {
@@ -1672,6 +1706,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Print the actual script for debugging
@@ -1730,6 +1765,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         assert!(script
@@ -1785,6 +1821,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         assert!(script.contains("echo \"SYSEXT_SCOPE=system portable\" >> \"$release_file\""));
@@ -1814,6 +1851,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         assert!(script.contains("echo \"CONFEXT_SCOPE=system portable\" >> \"$release_file\""));
@@ -1844,6 +1882,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Check that service enabling commands are present using [Install] section parser
@@ -1896,6 +1935,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify the find command looks for common kernel module extensions
@@ -1934,6 +1974,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify overlay merging commands are present
@@ -1974,6 +2015,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify overlay merging commands are present
@@ -2014,6 +2056,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify overlay opaque mode commands are present
@@ -2056,6 +2099,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify overlay opaque mode commands are present
@@ -2094,6 +2138,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
         let script_confext = cmd.create_confext_build_script(
             "1.0",
@@ -2105,6 +2150,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify no overlay merging commands are present
@@ -2140,6 +2186,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify separate AVOCADO_ON_MERGE entries are added for kernel modules and modprobe commands
@@ -2184,6 +2231,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify sysusers.d detection logic is present
@@ -2222,6 +2270,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify sysusers.d detection logic is present for confext
@@ -2257,6 +2306,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify ld.so.conf.d detection logic is present for confext
@@ -2295,6 +2345,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify custom on_merge commands are added as separate entries
@@ -2335,6 +2386,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify custom on_unmerge commands are added as separate entries
@@ -2375,6 +2427,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify custom on_unmerge commands are added as separate entries
@@ -2410,6 +2463,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify custom on_merge commands are added as separate entries
@@ -2444,6 +2498,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify both kernel modules and sysusers.d are handled correctly with separate lines
@@ -2477,6 +2532,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify that without modprobe modules, only depmod is added when kernel modules are found
@@ -2510,6 +2566,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify separate AVOCADO_ON_MERGE entries are added
@@ -2563,6 +2620,7 @@ mod tests {
             None,
             None,
             false,
+            "/opt/src",
         );
 
         // Verify that each command gets its own separate AVOCADO_ON_MERGE entry
@@ -2767,6 +2825,7 @@ mod tests {
             Some(&users_config),
             None,
             false,
+            "/opt/src",
         );
 
         // Verify the complete build script includes users functionality
@@ -2822,6 +2881,7 @@ mod tests {
             Some(&users_config),
             None,
             false,
+            "/opt/src",
         );
 
         // Verify the complete build script includes users functionality
@@ -3306,6 +3366,7 @@ mod tests {
             None,
             None,
             true,
+            "/opt/src",
         );
 
         // Verify that reload_service_manager = true sets EXTENSION_RELOAD_MANAGER=1
@@ -3335,6 +3396,7 @@ mod tests {
             None,
             None,
             true,
+            "/opt/src",
         );
 
         // Verify that reload_service_manager = true sets EXTENSION_RELOAD_MANAGER=1

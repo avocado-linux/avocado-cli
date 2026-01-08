@@ -8,19 +8,21 @@ use crate::commands::{
     runtime::RuntimeBuildCommand,
 };
 use crate::utils::{
-    config::Config,
+    config::{Config, ExtensionSource},
     output::{print_info, print_success, OutputLevel},
 };
 
-/// Represents an extension dependency that can be either local, external, or version-based
+/// Represents an extension dependency that can be either local, external, remote, or version-based
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionDependency {
     /// Extension defined in the main config file
     Local(String),
-    /// Extension defined in an external config file
+    /// Extension defined in an external config file (deprecated)
     External { name: String, config_path: String },
     /// Extension resolved via DNF with a version specification
     Versioned { name: String, version: String },
+    /// Remote extension with source field (repo, git, or path)
+    Remote { name: String, source: ExtensionSource },
 }
 
 /// Implementation of the 'build' command that runs all build subcommands.
@@ -208,6 +210,29 @@ impl BuildCommand {
                         }
                         // Versioned extensions are installed via DNF and don't need building
                     }
+                    ExtensionDependency::Remote { name, source: _ } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Building remote extension '{name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Build remote extension - ExtBuildCommand will load config from container
+                        let ext_build_cmd = ExtBuildCommand::new(
+                            name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        )
+                        .with_no_stamps(self.no_stamps)
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        ext_build_cmd.execute().await.with_context(|| {
+                            format!("Failed to build remote extension '{name}'")
+                        })?;
+                    }
                 }
             }
         } else {
@@ -265,6 +290,29 @@ impl BuildCommand {
                         // Create image for versioned extension from its sysroot
                         self.create_versioned_extension_image(name, &target).await.with_context(|| {
                             format!("Failed to create image for versioned extension '{name}' version '{version}'")
+                        })?;
+                    }
+                    ExtensionDependency::Remote { name, source: _ } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Creating image for remote extension '{name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Create image for remote extension - ExtImageCommand will load config from container
+                        let ext_image_cmd = ExtImageCommand::new(
+                            name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        )
+                        .with_no_stamps(self.no_stamps)
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        ext_image_cmd.execute().await.with_context(|| {
+                            format!("Failed to create image for remote extension '{name}'")
                         })?;
                     }
                 }
@@ -436,9 +484,24 @@ impl BuildCommand {
                                     &mut visited,
                                 )?;
                             } else {
-                                // Local extension
-                                required_extensions
-                                    .insert(ExtensionDependency::Local(ext_name.to_string()));
+                                // Check if this extension has a source: field (remote extension)
+                                let ext_source = parsed
+                                    .get("ext")
+                                    .and_then(|e| e.get(ext_name))
+                                    .and_then(|ext| ext.get("source"))
+                                    .and_then(|s| ExtensionSource::from_yaml(s));
+
+                                if let Some(source) = ext_source {
+                                    // Remote extension with source field
+                                    required_extensions.insert(ExtensionDependency::Remote {
+                                        name: ext_name.to_string(),
+                                        source,
+                                    });
+                                } else {
+                                    // Local extension
+                                    required_extensions
+                                        .insert(ExtensionDependency::Local(ext_name.to_string()));
+                                }
                             }
                         }
                     }
@@ -452,11 +515,13 @@ impl BuildCommand {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
                 ExtensionDependency::Versioned { name, .. } => name,
+                ExtensionDependency::Remote { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
                 ExtensionDependency::Versioned { name, .. } => name,
+                ExtensionDependency::Remote { name, .. } => name,
             };
             name_a.cmp(name_b)
         });
@@ -475,6 +540,7 @@ impl BuildCommand {
             ExtensionDependency::External { name, config_path } => (name, config_path),
             ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
             ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
+            ExtensionDependency::Remote { .. } => return Ok(()), // Remote extensions are handled separately
         };
 
         // Cycle detection: check if we've already processed this extension
@@ -964,6 +1030,22 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     "Cannot build individual versioned extension '{name}' version '{version}'. Versioned extensions are installed via DNF."
                 ));
             }
+            ExtensionDependency::Remote { name, source: _ } => {
+                let ext_build_cmd = ExtBuildCommand::new(
+                    name.clone(),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                ext_build_cmd
+                    .execute()
+                    .await
+                    .with_context(|| format!("Failed to build remote extension '{name}'"))?;
+            }
         }
 
         // Step 2: Create extension image
@@ -1006,6 +1088,21 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 return Err(anyhow::anyhow!(
                     "Cannot create image for individual versioned extension '{name}' version '{version}'. Versioned extensions are installed via DNF."
                 ));
+            }
+            ExtensionDependency::Remote { name, source: _ } => {
+                let ext_image_cmd = ExtImageCommand::new(
+                    name.clone(),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                ext_image_cmd.execute().await.with_context(|| {
+                    format!("Failed to create image for remote extension '{name}'")
+                })?;
             }
         }
 
@@ -1161,6 +1258,44 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             format!("Failed to create image for versioned extension '{name}' version '{version}'")
                         })?;
                     }
+                    ExtensionDependency::Remote { name, source: _ } => {
+                        if self.verbose {
+                            print_info(
+                                &format!("Building remote extension '{name}'"),
+                                OutputLevel::Normal,
+                            );
+                        }
+
+                        // Build remote extension
+                        let ext_build_cmd = ExtBuildCommand::new(
+                            name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        )
+                        .with_no_stamps(self.no_stamps)
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        ext_build_cmd.execute().await.with_context(|| {
+                            format!("Failed to build remote extension '{name}'")
+                        })?;
+
+                        // Create extension image
+                        let ext_image_cmd = ExtImageCommand::new(
+                            name.clone(),
+                            self.config_path.clone(),
+                            self.verbose,
+                            self.target.clone(),
+                            self.container_args.clone(),
+                            self.dnf_args.clone(),
+                        )
+                        .with_no_stamps(self.no_stamps)
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        ext_image_cmd.execute().await.with_context(|| {
+                            format!("Failed to create image for remote extension '{name}'")
+                        })?;
+                    }
                 }
             }
         } else {
@@ -1261,11 +1396,13 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
                 ExtensionDependency::Versioned { name, .. } => name,
+                ExtensionDependency::Remote { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
                 ExtensionDependency::Versioned { name, .. } => name,
+                ExtensionDependency::Remote { name, .. } => name,
             };
             name_a.cmp(name_b)
         });
@@ -1359,6 +1496,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 ExtensionDependency::Local(name) => name,
                 ExtensionDependency::External { name, .. } => name,
                 ExtensionDependency::Versioned { name, .. } => name,
+                ExtensionDependency::Remote { name, .. } => name,
             };
 
             if found_name == extension_name {
@@ -1390,6 +1528,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 );
             }
             ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
+            ExtensionDependency::Remote { .. } => return Ok(()), // Remote extensions are handled separately
         };
 
         // Cycle detection: check if we've already processed this extension

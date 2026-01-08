@@ -69,10 +69,11 @@ impl ExtImageCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Merge container args from config and CLI
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -136,15 +137,49 @@ impl ExtImageCommand {
             }
         }
 
-        // Find extension using comprehensive lookup
-        let extension_location = config
-            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-            })?;
+        // Determine extension location by checking the composed (interpolated) config
+        // This is more reliable than find_extension_in_dependency_tree which reads the raw file
+        // and may not find templated extension names like "avocado-bsp-{{ avocado.target }}"
+        let extension_location = {
+            // First check if extension exists in the composed config's ext section
+            let ext_in_composed = parsed
+                .get("ext")
+                .and_then(|e| e.get(&self.extension));
+
+            if let Some(ext_config) = ext_in_composed {
+                // Check if it has a source: field (indicating remote extension)
+                if ext_config.get("source").is_some() {
+                    // Parse the source to get ExtensionSource
+                    let source = Config::parse_extension_source(&self.extension, ext_config)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Extension '{}' has source field but failed to parse it",
+                                self.extension
+                            )
+                        })?;
+                    ExtensionLocation::Remote {
+                        name: self.extension.clone(),
+                        source,
+                    }
+                } else {
+                    // Local extension defined in main config
+                    ExtensionLocation::Local {
+                        name: self.extension.clone(),
+                        config_path: self.config_path.clone(),
+                    }
+                }
+            } else {
+                // Fall back to comprehensive lookup for external extensions
+                config
+                    .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+                    })?
+            }
+        };
 
         // Get the config path where this extension is actually defined
-        let ext_config_path = match &extension_location {
+        let _ext_config_path = match &extension_location {
             ExtensionLocation::Local { config_path, .. } => config_path.clone(),
             ExtensionLocation::External { config_path, .. } => config_path.clone(),
             ExtensionLocation::Remote { name, .. } => {
@@ -181,13 +216,77 @@ impl ExtImageCommand {
             }
         }
 
-        // Get merged extension configuration with target-specific overrides
-        // Use the config path where the extension is actually defined for proper interpolation
-        let ext_config = config
-            .get_merged_ext_config(&self.extension, &target, &ext_config_path)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-            })?;
+        // Get extension configuration from the composed/merged config
+        // For remote extensions, this comes from the merged remote extension config (already read via container)
+        // For local extensions, this uses get_merged_ext_config which reads from the file
+        let ext_config = match &extension_location {
+            ExtensionLocation::Remote { .. } => {
+                // Use the already-merged config from `parsed` which contains remote extension configs
+                // Then apply target-specific overrides manually
+                let ext_section = parsed.get("ext").and_then(|ext| ext.get(&self.extension));
+
+                if self.verbose {
+                    if let Some(all_ext) = parsed.get("ext") {
+                        if let Some(ext_map) = all_ext.as_mapping() {
+                            let ext_names: Vec<_> = ext_map
+                                .keys()
+                                .filter_map(|k| k.as_str())
+                                .collect();
+                            eprintln!(
+                                "[DEBUG] Available extensions in composed config: {:?}",
+                                ext_names
+                            );
+                        }
+                    }
+                    eprintln!(
+                        "[DEBUG] Looking for extension '{}' in composed config, found: {}",
+                        self.extension,
+                        ext_section.is_some()
+                    );
+                    if let Some(ext_val) = &ext_section {
+                        eprintln!(
+                            "[DEBUG] Extension '{}' config:\n{}",
+                            self.extension,
+                            serde_yaml::to_string(ext_val).unwrap_or_default()
+                        );
+                    }
+                }
+
+                if let Some(ext_val) = ext_section {
+                    let base_ext = ext_val.clone();
+                    // Check for target-specific override within this extension
+                    let target_override = ext_val.get(&target).cloned();
+                    if let Some(override_val) = target_override {
+                        // Merge target override into base, filtering out other target sections
+                        Some(config.merge_target_override(base_ext, override_val, &target))
+                    } else {
+                        Some(base_ext)
+                    }
+                } else {
+                    None
+                }
+            }
+            ExtensionLocation::Local { config_path, .. } => {
+                // For local extensions, read from the file with proper target merging
+                config.get_merged_ext_config(&self.extension, &target, config_path)?
+            }
+            #[allow(deprecated)]
+            ExtensionLocation::External { config_path, .. } => {
+                // For deprecated external configs, read from the file
+                config.get_merged_ext_config(&self.extension, &target, config_path)?
+            }
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+        })?;
+
+        if self.verbose {
+            eprintln!(
+                "[DEBUG] Final ext_config for '{}':\n{}",
+                self.extension,
+                serde_yaml::to_string(&ext_config).unwrap_or_default()
+            );
+        }
 
         // Get extension version
         let ext_version = ext_config

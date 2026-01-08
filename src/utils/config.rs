@@ -216,6 +216,89 @@ impl ExtensionSource {
         }
         false
     }
+
+    /// Parse ExtensionSource from a YAML value
+    pub fn from_yaml(value: &serde_yaml::Value) -> Option<Self> {
+        let map = value.as_mapping()?;
+
+        // Check for "repo" source type
+        if let Some(repo_val) = map.get(&serde_yaml::Value::String("repo".to_string())) {
+            let version = repo_val.as_str().unwrap_or("*").to_string();
+            let package = map
+                .get(&serde_yaml::Value::String("package".to_string()))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let repo_name = map
+                .get(&serde_yaml::Value::String("repo_name".to_string()))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let include = map
+                .get(&serde_yaml::Value::String("include".to_string()))
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                });
+            return Some(ExtensionSource::Repo {
+                version,
+                package,
+                repo_name,
+                include,
+            });
+        }
+
+        // Check for "git" source type
+        if let Some(git_val) = map.get(&serde_yaml::Value::String("git".to_string())) {
+            let url = git_val.as_str()?.to_string();
+            let git_ref = map
+                .get(&serde_yaml::Value::String("ref".to_string()))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let sparse_checkout = map
+                .get(&serde_yaml::Value::String("sparse_checkout".to_string()))
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                });
+            let include = map
+                .get(&serde_yaml::Value::String("include".to_string()))
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                });
+            return Some(ExtensionSource::Git {
+                url,
+                git_ref,
+                sparse_checkout,
+                include,
+            });
+        }
+
+        // Check for "path" source type
+        if let Some(path_val) = map.get(&serde_yaml::Value::String("path".to_string())) {
+            let path = path_val.as_str()?.to_string();
+            let include = map
+                .get(&serde_yaml::Value::String("include".to_string()))
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                });
+            return Some(ExtensionSource::Path { path, include });
+        }
+
+        None
+    }
 }
 
 /// Represents an extension dependency for a runtime with type information
@@ -820,34 +903,132 @@ impl Config {
             .ok()
             .flatten();
 
-        // For each remote extension, try to read its config via container
+        // Check for verbose/debug mode via environment variable
+        let verbose = std::env::var("AVOCADO_DEBUG").is_ok()
+            || std::env::var("AVOCADO_VERBOSE").is_ok();
+
+        // Always output merge info to stderr for debugging (TODO: remove after fixing)
+        eprintln!(
+            "[DEBUG-MERGE] merge_installed_remote_extensions: found {} remote extensions: {:?}",
+            remote_extensions.len(),
+            remote_extensions.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[DEBUG-MERGE] resolved_target: {}, volume_state: {:?}",
+            resolved_target,
+            volume_state.as_ref().map(|v| &v.volume_name)
+        );
+
+        if verbose {
+            eprintln!(
+                "[DEBUG] merge_installed_remote_extensions: found {} remote extensions: {:?}",
+                remote_extensions.len(),
+                remote_extensions.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            );
+        }
+
+        // For each remote extension, try to read its config
         for (ext_name, source) in remote_extensions {
-            // Try to read extension config via container command
-            let ext_content = match &volume_state {
-                Some(vs) => {
+            // Try multiple methods to read the extension config:
+            // 1. Direct container path (when running inside a container)
+            // 2. Via container command (when running on host)
+            // 3. Local fallback path (for development)
+
+            let ext_content = {
+                // Method 1: Check if we're inside a container and can read directly
+                // The standard container path is /opt/_avocado/<target>/includes/<ext>/avocado.yaml
+                let container_direct_path = format!(
+                    "/opt/_avocado/{}/includes/{}/avocado.yaml",
+                    resolved_target, ext_name
+                );
+                let container_path = Path::new(&container_direct_path);
+
+                // Always output for debugging (TODO: remove after fixing)
+                eprintln!(
+                    "[DEBUG-MERGE] Checking for '{}' config at: {} (exists: {})",
+                    ext_name, container_direct_path, container_path.exists()
+                );
+
+                if verbose {
+                    eprintln!(
+                        "[DEBUG] Checking for remote extension '{}' config at: {}",
+                        ext_name, container_direct_path
+                    );
+                    eprintln!(
+                        "[DEBUG]   Path exists: {}",
+                        container_path.exists()
+                    );
+                }
+
+                if container_path.exists() {
+                    // We're inside a container, read directly
+                    match fs::read_to_string(container_path) {
+                        Ok(content) => {
+                            if verbose {
+                                eprintln!(
+                                    "[DEBUG]   Read {} bytes from container path",
+                                    content.len()
+                                );
+                            }
+                            content
+                        }
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("[DEBUG]   Failed to read: {}", e);
+                            }
+                            continue;
+                        }
+                    }
+                } else if let Some(vs) = &volume_state {
+                    // Method 2: Use container command to read from Docker volume
+                    if verbose {
+                        eprintln!(
+                            "[DEBUG]   Trying via container command (volume: {})",
+                            vs.volume_name
+                        );
+                    }
                     match Self::read_extension_config_via_container(vs, &resolved_target, &ext_name)
                     {
-                        Ok(content) => content,
-                        Err(_) => {
+                        Ok(content) => {
+                            if verbose {
+                                eprintln!(
+                                    "[DEBUG]   Read {} bytes via container",
+                                    content.len()
+                                );
+                            }
+                            content
+                        }
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("[DEBUG]   Container read failed: {}", e);
+                            }
                             // Extension not installed yet or config not found, skip
                             continue;
                         }
                     }
-                }
-                None => {
-                    // No volume state - try fallback to local path (for development)
+                } else {
+                    // Method 3: Fallback to local path (for development)
                     let fallback_dir = src_dir
                         .join(".avocado")
                         .join(&resolved_target)
                         .join("includes")
                         .join(&ext_name);
                     let config_path_local = fallback_dir.join("avocado.yaml");
+                    if verbose {
+                        eprintln!(
+                            "[DEBUG]   Trying fallback path: {}",
+                            config_path_local.display()
+                        );
+                    }
                     if config_path_local.exists() {
                         match fs::read_to_string(&config_path_local) {
                             Ok(content) => content,
                             Err(_) => continue,
                         }
                     } else {
+                        if verbose {
+                            eprintln!("[DEBUG]   No config found for '{}', skipping", ext_name);
+                        }
                         continue;
                     }
                 }
@@ -856,8 +1037,42 @@ impl Config {
             // Use a .yaml extension so parse_config_value knows to parse as YAML
             let ext_config_path = format!("{ext_name}/avocado.yaml");
             let ext_config = match Self::parse_config_value(&ext_config_path, &ext_content) {
-                Ok(cfg) => cfg,
-                Err(_) => {
+                Ok(cfg) => {
+                    if verbose {
+                        eprintln!("[DEBUG] Successfully parsed config for '{}'", ext_name);
+                        // Show what extensions are defined in this remote config
+                        if let Some(ext_section) = cfg.get("ext").and_then(|e| e.as_mapping()) {
+                            let ext_names: Vec<_> = ext_section
+                                .keys()
+                                .filter_map(|k| k.as_str())
+                                .collect();
+                            eprintln!(
+                                "[DEBUG]   Remote config defines extensions: {:?}",
+                                ext_names
+                            );
+                            // Show the extension section that matches our name
+                            if let Some(our_ext) = ext_section.get(serde_yaml::Value::String(ext_name.clone())) {
+                                eprintln!(
+                                    "[DEBUG]   Extension '{}' in remote config:\n{}",
+                                    ext_name,
+                                    serde_yaml::to_string(our_ext).unwrap_or_default()
+                                );
+                            } else {
+                                eprintln!(
+                                    "[DEBUG]   Extension '{}' NOT found in remote config's ext section",
+                                    ext_name
+                                );
+                            }
+                        } else {
+                            eprintln!("[DEBUG]   Remote config has no 'ext' section");
+                        }
+                    }
+                    cfg
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[DEBUG] Failed to parse config for '{}': {}", ext_name, e);
+                    }
                     // Failed to parse config, skip this extension
                     continue;
                 }
@@ -885,6 +1100,19 @@ impl Config {
             let auto_include_compile =
                 Self::find_compile_dependencies_in_ext(&ext_config, &ext_name);
 
+            // Always output for debugging (TODO: remove after fixing)
+            eprintln!(
+                "[DEBUG-MERGE] Merging '{}' into main config",
+                ext_name
+            );
+
+            if verbose {
+                eprintln!(
+                    "[DEBUG] Merging '{}' with include_patterns: {:?}, auto_include_compile: {:?}",
+                    ext_name, include_patterns, auto_include_compile
+                );
+            }
+
             // Merge the remote extension config with include patterns
             Self::merge_external_config(
                 main_config,
@@ -893,6 +1121,26 @@ impl Config {
                 include_patterns,
                 &auto_include_compile,
             );
+
+            // Always output for debugging (TODO: remove after fixing)
+            if let Some(main_ext) = main_config.get("ext").and_then(|e| e.get(&ext_name)) {
+                eprintln!(
+                    "[DEBUG-MERGE] After merge, ext.{}:\n{}",
+                    ext_name,
+                    serde_yaml::to_string(main_ext).unwrap_or_default()
+                );
+            }
+
+            if verbose {
+                // Show what the main config's ext section looks like after merge
+                if let Some(main_ext) = main_config.get("ext").and_then(|e| e.get(&ext_name)) {
+                    eprintln!(
+                        "[DEBUG] After merge, main config ext.{}:\n{}",
+                        ext_name,
+                        serde_yaml::to_string(main_ext).unwrap_or_default()
+                    );
+                }
+            }
         }
 
         Ok(extension_sources)
@@ -1132,11 +1380,47 @@ impl Config {
                 // This handles the case where main config has a stub with just `source:`
                 // and the remote extension has the full definition with `dependencies:` etc.
                 let ext_key = serde_yaml::Value::String(ext_name.to_string());
-                if let Some(ext_value) = external_ext.get(&ext_key) {
-                    if let Some(existing_ext) = main_ext_map.get_mut(&ext_key) {
-                        // Deep-merge: add fields from remote that don't exist in main
-                        // Main config values take precedence on conflicts
-                        Self::deep_merge_ext_section(existing_ext, ext_value);
+
+                // Try to find the extension's config in the remote extension's config.
+                // We use multiple strategies:
+                // 1. Exact match (e.g., "avocado-bsp-raspberrypi4")
+                // 2. Base name match (e.g., "avocado-bsp" when looking for "avocado-bsp-raspberrypi4")
+                // 3. Single extension in remote config (if there's only one, use it)
+                let ext_value = external_ext
+                    .get(&ext_key)
+                    .or_else(|| {
+                        // Try base name: strip common target suffixes from ext_name
+                        let base_names = Self::get_base_extension_names(ext_name);
+                        for base in &base_names {
+                            let base_key = serde_yaml::Value::String(base.clone());
+                            if let Some(val) = external_ext.get(&base_key) {
+                                return Some(val);
+                            }
+                        }
+                        None
+                    })
+                    .or_else(|| {
+                        // If remote config has exactly one extension defined, use it
+                        if external_ext.len() == 1 {
+                            external_ext.values().next()
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(ext_value) = ext_value {
+                    // Try to find the existing key in main config that matches ext_name.
+                    // This handles template keys like "avocado-bsp-{{ avocado.target }}"
+                    // that interpolate to "avocado-bsp-raspberrypi4".
+                    let existing_key = Self::find_matching_ext_key(main_ext_map, ext_name);
+
+                    if let Some(existing_key) = existing_key {
+                        // Found an existing key (possibly a template) - merge into it
+                        if let Some(existing_ext) = main_ext_map.get_mut(&existing_key) {
+                            // Deep-merge: add fields from remote that don't exist in main
+                            // Main config values take precedence on conflicts
+                            Self::deep_merge_ext_section(existing_ext, ext_value);
+                        }
                     } else {
                         // Extension not in main config, just add it
                         main_ext_map.insert(ext_key, ext_value.clone());
@@ -1226,6 +1510,69 @@ impl Config {
         }
     }
 
+    /// Find a matching extension key in the main config's ext section.
+    ///
+    /// This handles the case where the main config has template keys like
+    /// "avocado-bsp-{{ avocado.target }}" that should match the interpolated
+    /// name "avocado-bsp-raspberrypi4".
+    ///
+    /// Returns the original key (possibly a template) if found.
+    fn find_matching_ext_key(
+        ext_map: &serde_yaml::Mapping,
+        interpolated_name: &str,
+    ) -> Option<serde_yaml::Value> {
+        // First try exact match
+        let exact_key = serde_yaml::Value::String(interpolated_name.to_string());
+        if ext_map.contains_key(&exact_key) {
+            return Some(exact_key);
+        }
+
+        // Look for template keys that would match after interpolation
+        // Common template patterns: {{ avocado.target }}, {{ config.* }}
+        for key in ext_map.keys() {
+            if let Some(key_str) = key.as_str() {
+                // Check if this is a template key
+                if key_str.contains("{{") && key_str.contains("}}") {
+                    // Try to match by replacing common template patterns
+                    // with regex-like patterns
+
+                    // Handle {{ avocado.target }} - this is the most common case
+                    // The key might be "avocado-bsp-{{ avocado.target }}"
+                    // and we're looking for "avocado-bsp-raspberrypi4"
+                    if key_str.contains("{{ avocado.target }}")
+                        || key_str.contains("{{avocado.target}}")
+                    {
+                        // Extract the prefix and suffix around the template
+                        let parts: Vec<&str> = if key_str.contains("{{ avocado.target }}") {
+                            key_str.split("{{ avocado.target }}").collect()
+                        } else {
+                            key_str.split("{{avocado.target}}").collect()
+                        };
+
+                        if parts.len() == 2 {
+                            let prefix = parts[0];
+                            let suffix = parts[1];
+
+                            // Check if the interpolated name matches the pattern
+                            if interpolated_name.starts_with(prefix)
+                                && interpolated_name.ends_with(suffix)
+                            {
+                                // Verify the middle part (the target) is reasonable
+                                let middle_len =
+                                    interpolated_name.len() - prefix.len() - suffix.len();
+                                if middle_len > 0 {
+                                    return Some(key.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Ensure the provision section exists in the config.
     fn ensure_provision_section(config: &mut serde_yaml::Value) {
         if let Some(main_map) = config.as_mapping_mut() {
@@ -1236,6 +1583,50 @@ impl Config {
                 );
             }
         }
+    }
+
+    /// Get possible base extension names by stripping common target suffixes.
+    ///
+    /// For an extension like "avocado-bsp-raspberrypi4", this returns:
+    /// - "avocado-bsp" (common pattern for BSP packages)
+    /// - Names with common target suffixes stripped
+    fn get_base_extension_names(ext_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+
+        // Common target suffixes to try stripping
+        let target_suffixes = [
+            "-raspberrypi4",
+            "-raspberrypi5",
+            "-rpi4",
+            "-rpi5",
+            "-jetson-orin-nano",
+            "-jetson-orin-nx",
+            "-jetson",
+            "-x86_64",
+            "-aarch64",
+        ];
+
+        for suffix in &target_suffixes {
+            if ext_name.ends_with(suffix) {
+                let base = &ext_name[..ext_name.len() - suffix.len()];
+                if !base.is_empty() && !names.contains(&base.to_string()) {
+                    names.push(base.to_string());
+                }
+            }
+        }
+
+        // Also try splitting on last dash as a generic approach
+        // e.g., "my-ext-target" -> "my-ext"
+        if let Some(last_dash) = ext_name.rfind('-') {
+            if last_dash > 0 {
+                let base = &ext_name[..last_dash];
+                if !names.contains(&base.to_string()) {
+                    names.push(base.to_string());
+                }
+            }
+        }
+
+        names
     }
 
     /// Deep-merge an extension section from external config into main config.
@@ -1398,6 +1789,21 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
+    /// Merge a target-specific override into a base config value
+    /// This filters out other target sections from the base and merges the override
+    pub fn merge_target_override(
+        &self,
+        base: serde_yaml::Value,
+        target_override: serde_yaml::Value,
+        _current_target: &str,
+    ) -> serde_yaml::Value {
+        // Filter out target-specific subsections from base before merging
+        let supported_targets = self.get_supported_targets().unwrap_or_default();
+        let filtered_base = self.filter_target_subsections(base, &supported_targets);
+        // Merge the target override into the filtered base
+        self.merge_values(filtered_base, target_override)
+    }
+
     /// Get merged runtime configuration for a specific runtime and target
     #[allow(dead_code)] // Future API for command integration
     pub fn get_merged_runtime_config(
