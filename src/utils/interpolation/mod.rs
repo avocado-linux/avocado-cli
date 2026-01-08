@@ -27,14 +27,21 @@
 //! - Navigates the YAML tree using dot notation
 //! - Returns an error if path doesn't exist (fatal)
 //! - Converts non-string values to strings
+//! - References are scoped to the current config being interpolated
 //!
 //! ## [`avocado`] - Computed Internal Values
 //! ```yaml
 //! target_pkg: "pkg-{{ avocado.target }}"
+//! distro_image: "sdk:{{ avocado.distro.channel }}"
+//! version_ref: "{{ avocado.distro.version }}"
 //! ```
-//! - Provides access to computed values like target architecture
+//! - Provides access to computed values from the main config
+//! - `avocado.target` - Target architecture (CLI > env > config precedence)
+//! - `avocado.distro.version` - Distro version from the main config
+//! - `avocado.distro.channel` - Distro channel from the main config
 //! - Leaves template as-is if value unavailable
 //! - Never produces errors (CLI handles validation)
+//! - Ensures all configs use the same distro values from the main config
 //!
 //! # Features
 //!
@@ -51,6 +58,9 @@ use std::collections::HashSet;
 pub mod avocado;
 pub mod config;
 pub mod env;
+
+// Re-export AvocadoContext for convenience
+pub use avocado::AvocadoContext;
 
 const MAX_ITERATIONS: usize = 100;
 
@@ -102,6 +112,47 @@ pub fn interpolate_name(input: &str, target: &str) -> String {
 /// assert_eq!(config.get("derived").unwrap().as_str().unwrap(), "value");
 /// ```
 pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> Result<()> {
+    // Create a context with just the target for backward compatibility
+    let context = AvocadoContext::from_main_config(yaml_value, cli_target);
+    interpolate_config_with_context(yaml_value, &context)
+}
+
+/// Interpolate configuration values using a pre-built avocado context.
+///
+/// This is the preferred method when interpolating multiple configs that should
+/// share the same avocado context (e.g., main config + extension configs).
+///
+/// # Arguments
+/// * `yaml_value` - The YAML value to interpolate (modified in place)
+/// * `context` - The avocado context with pre-resolved values from the main config
+///
+/// # Returns
+/// Result indicating success or error if config references cannot be resolved
+///
+/// # Examples
+/// ```
+/// # use avocado_cli::utils::interpolation::{interpolate_config_with_context, AvocadoContext};
+/// let main_config = serde_yaml::from_str(r#"
+/// distro:
+///   version: "1.0.0"
+///   channel: "stable"
+/// "#).unwrap();
+///
+/// // Create context from main config
+/// let context = AvocadoContext::from_main_config(&main_config, Some("x86_64"));
+///
+/// // Use context to interpolate an extension config
+/// let mut ext_config = serde_yaml::from_str(r#"
+/// image: "sdk:{{ avocado.distro.channel }}"
+/// "#).unwrap();
+///
+/// interpolate_config_with_context(&mut ext_config, &context).unwrap();
+/// assert_eq!(ext_config.get("image").unwrap().as_str().unwrap(), "sdk:stable");
+/// ```
+pub fn interpolate_config_with_context(
+    yaml_value: &mut Value,
+    context: &AvocadoContext,
+) -> Result<()> {
     let mut iteration = 0;
     let mut changed = true;
     let mut previous_states: Vec<String> = Vec::new();
@@ -128,7 +179,7 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
         let mut resolving_stack = HashSet::new();
         // Start with empty path at root level
         let path: Vec<String> = Vec::new();
-        changed = interpolate_value(yaml_value, &root, cli_target, &mut resolving_stack, &path)?;
+        changed = interpolate_value(yaml_value, &root, context, &mut resolving_stack, &path)?;
         iteration += 1;
     }
 
@@ -171,7 +222,7 @@ fn format_yaml_path(path: &[String], location: &YamlLocation) -> String {
 /// # Arguments
 /// * `value` - The current value to interpolate
 /// * `root` - The root YAML value for config references
-/// * `cli_target` - Optional CLI target value
+/// * `context` - The avocado context
 /// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
 /// * `path` - The current YAML path for error messages
 ///
@@ -180,7 +231,7 @@ fn format_yaml_path(path: &[String], location: &YamlLocation) -> String {
 fn interpolate_value(
     value: &mut Value,
     root: &Value,
-    cli_target: Option<&str>,
+    context: &AvocadoContext,
     resolving_stack: &mut HashSet<String>,
     path: &[String],
 ) -> Result<bool> {
@@ -190,7 +241,7 @@ fn interpolate_value(
         Value::String(s) => {
             let location = YamlLocation::Value;
             if let Some(new_value) =
-                interpolate_string(s, root, cli_target, resolving_stack, path, &location)?
+                interpolate_string(s, root, context, resolving_stack, path, &location)?
             {
                 *s = new_value;
                 changed = true;
@@ -207,7 +258,7 @@ fn interpolate_value(
                     if let Some(new_key) = interpolate_string(
                         key_str,
                         root,
-                        cli_target,
+                        context,
                         resolving_stack,
                         path,
                         &location,
@@ -232,7 +283,7 @@ fn interpolate_value(
                 };
                 let mut child_path = path.to_vec();
                 child_path.push(key_str);
-                if interpolate_value(v, root, cli_target, resolving_stack, &child_path)? {
+                if interpolate_value(v, root, context, resolving_stack, &child_path)? {
                     changed = true;
                 }
             }
@@ -241,7 +292,7 @@ fn interpolate_value(
             for (idx, item) in seq.iter_mut().enumerate() {
                 let mut child_path = path.to_vec();
                 child_path.push(format!("[{idx}]"));
-                if interpolate_value(item, root, cli_target, resolving_stack, &child_path)? {
+                if interpolate_value(item, root, context, resolving_stack, &child_path)? {
                     changed = true;
                 }
             }
@@ -259,7 +310,7 @@ fn interpolate_value(
 /// # Arguments
 /// * `input` - The input string that may contain templates
 /// * `root` - The root YAML value for config references
-/// * `cli_target` - Optional CLI target value
+/// * `context` - The avocado context
 /// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
 /// * `path` - The current YAML path for error messages
 /// * `location` - Whether this is a key or value
@@ -269,7 +320,7 @@ fn interpolate_value(
 fn interpolate_string(
     input: &str,
     root: &Value,
-    cli_target: Option<&str>,
+    context: &AvocadoContext,
     resolving_stack: &mut HashSet<String>,
     path: &[String],
     location: &YamlLocation,
@@ -289,7 +340,7 @@ fn interpolate_string(
         let full_match = capture.get(0).unwrap().as_str();
         let template = capture.get(1).unwrap().as_str().trim();
 
-        match resolve_template(template, root, cli_target, resolving_stack) {
+        match resolve_template(template, root, context, resolving_stack) {
             Ok(Some(replacement)) => {
                 result = result.replace(full_match, &replacement);
                 any_replaced = true;
@@ -317,7 +368,7 @@ fn interpolate_string(
 /// # Arguments
 /// * `template` - The template expression (e.g., "env.VAR" or "config.key")
 /// * `root` - The root YAML value for config references
-/// * `cli_target` - Optional CLI target value
+/// * `context` - The avocado context
 /// * `resolving_stack` - Set of templates currently being resolved (for cycle detection)
 ///
 /// # Returns
@@ -325,7 +376,7 @@ fn interpolate_string(
 fn resolve_template(
     template: &str,
     root: &Value,
-    cli_target: Option<&str>,
+    context: &AvocadoContext,
     resolving_stack: &mut HashSet<String>,
 ) -> Result<Option<String>> {
     // Check for circular reference
@@ -351,9 +402,9 @@ fn resolve_template(
         anyhow::bail!("Invalid template syntax: empty template");
     }
 
-    let context = parts[0];
+    let context_name = parts[0];
 
-    let result = match context {
+    let result = match context_name {
         "env" => {
             if parts.len() < 2 {
                 anyhow::bail!("Invalid env template: {template}");
@@ -372,12 +423,13 @@ fn resolve_template(
             if parts.len() < 2 {
                 anyhow::bail!("Invalid avocado template: {template}");
             }
-            let key = parts[1];
-            avocado::resolve(key, root, cli_target)
+            // Pass the full path (excluding "avocado" prefix)
+            let path = &parts[1..];
+            avocado::resolve(path, root, Some(context))
         }
         _ => {
             anyhow::bail!(
-                "Unknown template context: {context}. Expected 'env', 'config', or 'avocado'"
+                "Unknown template context: {context_name}. Expected 'env', 'config', or 'avocado'"
             );
         }
     };
@@ -913,6 +965,125 @@ mapping:
         assert_eq!(
             mapping.get("myprefix-key").unwrap().as_str().unwrap(),
             "value"
+        );
+    }
+
+    #[test]
+    fn test_avocado_distro_version_interpolation() {
+        // Create main config with distro values
+        let main_config = parse_yaml(
+            r#"
+distro:
+  version: "1.0.0"
+  channel: "apollo-edge"
+"#,
+        );
+
+        // Create context from main config
+        let context = AvocadoContext::from_main_config(&main_config, Some("x86_64"));
+
+        // Test interpolating an extension config
+        let mut ext_config = parse_yaml(
+            r#"
+packages:
+  avocado-runtime: "{{ avocado.distro.version }}"
+  avocado-sdk: "{{ avocado.distro.channel }}"
+"#,
+        );
+
+        interpolate_config_with_context(&mut ext_config, &context).unwrap();
+
+        let packages = ext_config.get("packages").unwrap();
+        assert_eq!(
+            packages.get("avocado-runtime").unwrap().as_str().unwrap(),
+            "1.0.0"
+        );
+        assert_eq!(
+            packages.get("avocado-sdk").unwrap().as_str().unwrap(),
+            "apollo-edge"
+        );
+    }
+
+    #[test]
+    fn test_avocado_distro_in_same_config() {
+        // When interpolating main config itself, avocado.distro should work
+        let mut config = parse_yaml(
+            r#"
+distro:
+  version: "1.0.0"
+  channel: "apollo-edge"
+sdk:
+  image: "docker.io/sdk:{{ avocado.distro.channel }}"
+  packages:
+    runtime: "{{ avocado.distro.version }}"
+"#,
+        );
+
+        interpolate_config(&mut config, None).unwrap();
+
+        let sdk = config.get("sdk").unwrap();
+        assert_eq!(
+            sdk.get("image").unwrap().as_str().unwrap(),
+            "docker.io/sdk:apollo-edge"
+        );
+
+        let packages = sdk.get("packages").unwrap();
+        assert_eq!(packages.get("runtime").unwrap().as_str().unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn test_avocado_distro_unavailable() {
+        // When distro values are not set, template should be left as-is
+        let mut config = parse_yaml(
+            r#"
+reference: "{{ avocado.distro.version }}"
+"#,
+        );
+
+        // No distro in config, so it should remain unresolved
+        interpolate_config(&mut config, None).unwrap();
+
+        assert_eq!(
+            config.get("reference").unwrap().as_str().unwrap(),
+            "{{ avocado.distro.version }}"
+        );
+    }
+
+    #[test]
+    fn test_extension_uses_main_config_distro() {
+        // Main config has distro values
+        let main_config = parse_yaml(
+            r#"
+distro:
+  version: "2.0.0"
+  channel: "stable"
+"#,
+        );
+
+        let context = AvocadoContext::from_main_config(&main_config, Some("aarch64"));
+
+        // Extension config has its OWN distro values, but avocado.distro should use main config
+        let mut ext_config = parse_yaml(
+            r#"
+distro:
+  version: "1.0.0"
+  channel: "ext-channel"
+avocado_version: "{{ avocado.distro.version }}"
+config_version: "{{ config.distro.version }}"
+"#,
+        );
+
+        interpolate_config_with_context(&mut ext_config, &context).unwrap();
+
+        // avocado.distro should use main config values
+        assert_eq!(
+            ext_config.get("avocado_version").unwrap().as_str().unwrap(),
+            "2.0.0"
+        );
+        // config.distro should use extension's own values
+        assert_eq!(
+            ext_config.get("config_version").unwrap().as_str().unwrap(),
+            "1.0.0"
         );
     }
 }
