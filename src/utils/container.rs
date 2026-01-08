@@ -306,15 +306,30 @@ impl SdkContainer {
 
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
+        // For non-detached runs, ensure we have a container name for Ctrl-C handling
+        // Generate a unique name if one wasn't provided
+        let effective_container_name = if !config.detach && config.container_name.is_none() {
+            Some(format!("avocado-run-{}", uuid::Uuid::new_v4()))
+        } else {
+            config.container_name.clone()
+        };
+
+        // Create a modified config with the container name
+        let effective_config = RunConfig {
+            container_name: effective_container_name.clone(),
+            ..config
+        };
+
         // Build container command with volume state
         let container_cmd =
-            self.build_container_command(&config, &bash_cmd, &env_vars, &volume_state)?;
+            self.build_container_command(&effective_config, &bash_cmd, &env_vars, &volume_state)?;
 
         // Execute the command
         self.execute_container_command(
             &container_cmd,
-            config.detach,
-            config.verbose || self.verbose,
+            effective_config.detach,
+            effective_config.verbose || self.verbose,
+            effective_container_name.as_deref(),
         )
         .await
     }
@@ -973,6 +988,7 @@ impl SdkContainer {
         container_cmd: &[String],
         detach: bool,
         verbose: bool,
+        container_name: Option<&str>,
     ) -> Result<bool> {
         if verbose {
             print_info(
@@ -988,10 +1004,9 @@ impl SdkContainer {
             );
         }
 
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
-
         if detach {
+            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            cmd.args(&container_cmd[1..]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = cmd
                 .output()
@@ -1014,13 +1029,70 @@ impl SdkContainer {
                 Ok(false)
             }
         } else {
-            // In non-detached mode, we need to capture output to ensure stderr is visible
+            // In non-detached mode, inherit stdio and wait for completion
+            // We use spawn + select to handle Ctrl-C properly
+            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            cmd.args(&container_cmd[1..]);
             cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-            let status = cmd
-                .status()
-                .await
-                .with_context(|| "Failed to execute container command")?;
-            Ok(status.success())
+
+            let mut child = cmd
+                .spawn()
+                .with_context(|| "Failed to spawn container command")?;
+
+            // Wait for either the process to complete or Ctrl-C
+            tokio::select! {
+                status = child.wait() => {
+                    let status = status.with_context(|| "Failed to wait for container command")?;
+                    Ok(status.success())
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    // Received Ctrl-C, need to stop the container
+                    if let Some(name) = container_name {
+                        // Stop the container gracefully (gives processes time to cleanup)
+                        let stop_result = AsyncCommand::new(&self.container_tool)
+                            .args(["stop", "-t", "2", name])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status()
+                            .await;
+
+                        if verbose {
+                            match stop_result {
+                                Ok(status) if status.success() => {
+                                    print_info("Container stopped", OutputLevel::Normal);
+                                }
+                                _ => {
+                                    // If stop fails, try kill
+                                    let _ = AsyncCommand::new(&self.container_tool)
+                                        .args(["kill", name])
+                                        .stdout(Stdio::null())
+                                        .stderr(Stdio::null())
+                                        .status()
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // In non-verbose mode, still try to stop/kill
+                            if stop_result.is_err() || !stop_result.unwrap().success() {
+                                let _ = AsyncCommand::new(&self.container_tool)
+                                    .args(["kill", name])
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status()
+                                    .await;
+                            }
+                        }
+                    } else {
+                        // No container name, just try to kill the child process
+                        let _ = child.kill().await;
+                    }
+
+                    // Wait for child to actually exit after stopping
+                    let _ = child.wait().await;
+
+                    Err(anyhow::anyhow!("Interrupted by user"))
+                }
+            }
         }
     }
 
@@ -1159,6 +1231,17 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
         let mut script = format!(
             r#"
 set -e
+
+# Set up signal handlers to forward signals to all child processes
+# This ensures that when the container receives SIGTERM/SIGINT,
+# the compile script also gets terminated immediately
+cleanup() {{
+    # Kill all child processes
+    pkill -P $$ 2>/dev/null || true
+    exit $1
+}}
+trap 'cleanup 143' TERM
+trap 'cleanup 130' INT
 
 # Remote execution mode - NFS volumes mounted
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Remote execution mode - using NFS-mounted volumes"; fi
@@ -1342,6 +1425,17 @@ fi
         let mut script = format!(
             r#"
 set -e
+
+# Set up signal handlers to forward signals to all child processes
+# This ensures that when the container receives SIGTERM/SIGINT,
+# the compile script also gets terminated immediately
+cleanup() {{
+    # Kill all child processes
+    pkill -P $$ 2>/dev/null || true
+    exit $1
+}}
+trap 'cleanup 143' TERM
+trap 'cleanup 130' INT
 
 # Remount source directory with permission translation via bindfs
 # This maps host UID/GID to root inside the container for seamless file access

@@ -30,6 +30,7 @@ tokio = { version = "1.0", features = [
     "rt-multi-thread",
     "process",
     "io-util",
+    "signal",
 ] }
 thiserror = "2.0"
 directories = "6.0"
