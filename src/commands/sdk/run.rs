@@ -166,8 +166,7 @@ impl SdkRunCommand {
         if self.verbose {
             print_info(
                 &format!(
-                    "Starting signing service with key '{}' using {} checksums",
-                    signing_key_name, checksum_str
+                    "Starting signing service with key '{signing_key_name}' using {checksum_str} checksums"
                 ),
                 OutputLevel::Verbose,
             );

@@ -99,7 +99,7 @@ impl PruneCommand {
                     active_count += 1;
                     if self.verbose {
                         print_info(
-                            &format!("Volume '{}' is active, skipping", volume_name),
+                            &format!("Volume '{volume_name}' is active, skipping"),
                             OutputLevel::Normal,
                         );
                     }
@@ -109,12 +109,12 @@ impl PruneCommand {
 
                     if self.dry_run {
                         print_warning(
-                            &format!("[DRY RUN] Would remove '{}': {}", volume_name, reason),
+                            &format!("[DRY RUN] Would remove '{volume_name}': {reason}"),
                             OutputLevel::Normal,
                         );
                     } else {
                         print_info(
-                            &format!("Removing '{}': {}", volume_name, reason),
+                            &format!("Removing '{volume_name}': {reason}"),
                             OutputLevel::Normal,
                         );
 
@@ -122,14 +122,14 @@ impl PruneCommand {
                             Ok(()) => {
                                 removed_count += 1;
                                 print_success(
-                                    &format!("Removed volume '{}'", volume_name),
+                                    &format!("Removed volume '{volume_name}'"),
                                     OutputLevel::Normal,
                                 );
                             }
                             Err(e) => {
                                 failed_count += 1;
                                 print_error(
-                                    &format!("Failed to remove '{}': {}", volume_name, e),
+                                    &format!("Failed to remove '{volume_name}': {e}"),
                                     OutputLevel::Normal,
                                 );
                             }
@@ -144,18 +144,16 @@ impl PruneCommand {
         if self.dry_run {
             print_info(
                 &format!(
-                    "Dry run complete: {} active, {} would be removed",
-                    active_count, abandoned_count
+                    "Dry run complete: {active_count} active, {abandoned_count} would be removed"
                 ),
                 OutputLevel::Normal,
             );
         } else {
             let mut summary = format!(
-                "Prune complete: {} active, {} removed",
-                active_count, removed_count
+                "Prune complete: {active_count} active, {removed_count} removed"
             );
             if failed_count > 0 {
-                summary.push_str(&format!(", {} failed", failed_count));
+                summary.push_str(&format!(", {failed_count} failed"));
             }
             print_success(&summary, OutputLevel::Normal);
         }
@@ -173,7 +171,7 @@ impl PruneCommand {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to list volumes: {}", stderr);
+            anyhow::bail!("Failed to list volumes: {stderr}");
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -232,8 +230,7 @@ impl PruneCommand {
         let source_dir = Path::new(source_path);
         if !source_dir.exists() {
             return Ok(VolumeStatus::Abandoned(format!(
-                "source directory '{}' does not exist",
-                source_path
+                "source directory '{source_path}' does not exist"
             )));
         }
 
@@ -241,8 +238,7 @@ impl PruneCommand {
         let state_file = source_dir.join(".avocado-state");
         if !state_file.exists() {
             return Ok(VolumeStatus::Abandoned(format!(
-                "no .avocado-state file in '{}'",
-                source_path
+                "no .avocado-state file in '{source_path}'"
             )));
         }
 
@@ -259,12 +255,10 @@ impl PruneCommand {
                 }
             }
             Ok(None) => Ok(VolumeStatus::Abandoned(format!(
-                "could not read .avocado-state in '{}'",
-                source_path
+                "could not read .avocado-state in '{source_path}'"
             ))),
             Err(e) => Ok(VolumeStatus::Abandoned(format!(
-                "error reading .avocado-state: {}",
-                e
+                "error reading .avocado-state: {e}"
             ))),
         }
     }
@@ -308,7 +302,7 @@ impl PruneCommand {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to inspect volume {}: {}", volume_name, stderr);
+            anyhow::bail!("Failed to inspect volume {volume_name}: {stderr}");
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -328,7 +322,7 @@ impl PruneCommand {
                 "ps",
                 "-a",
                 "--filter",
-                &format!("volume={}", volume_name),
+                &format!("volume={volume_name}"),
                 "--format",
                 "{{.ID}}",
             ])
@@ -394,7 +388,7 @@ impl PruneCommand {
                 .args(["rm", "-f", container_id])
                 .output()
                 .await
-                .with_context(|| format!("Failed to remove container {}", container_id))?;
+                .with_context(|| format!("Failed to remove container {container_id}"))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

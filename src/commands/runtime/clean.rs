@@ -279,8 +279,7 @@ mod tests {
             let path = stamp.relative_path();
             assert!(
                 path.starts_with("runtime/dev/"),
-                "Stamp {} should be under runtime/dev/",
-                path
+                "Stamp {path} should be under runtime/dev/"
             );
         }
 

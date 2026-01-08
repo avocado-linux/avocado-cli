@@ -95,11 +95,11 @@ impl RuntimeProvisionCommand {
             let remote_host = RemoteHost::parse(runs_on)?;
             let ssh = SshClient::new(remote_host).with_verbose(self.config.verbose);
             let arch = ssh.get_architecture().await.with_context(|| {
-                format!("Failed to detect architecture of remote host '{}'", runs_on)
+                format!("Failed to detect architecture of remote host '{runs_on}'")
             })?;
             if self.config.verbose {
                 print_info(
-                    &format!("Remote host architecture: {}", arch),
+                    &format!("Remote host architecture: {arch}"),
                     OutputLevel::Normal,
                 );
             }
@@ -480,8 +480,7 @@ impl RuntimeProvisionCommand {
         if self.config.verbose {
             print_info(
                 &format!(
-                    "Starting signing service with key '{}' using {} checksums",
-                    signing_key_name, checksum_str
+                    "Starting signing service with key '{signing_key_name}' using {checksum_str} checksums"
                 ),
                 OutputLevel::Verbose,
             );
@@ -595,8 +594,7 @@ avocado-provision-{} {}
 
         // Ensure parent directory exists and copy file to container
         let copy_script = format!(
-            "mkdir -p \"$(dirname '{}')\" && cp '/opt/src/{}' '{}'",
-            container_state_path, state_file_path, container_state_path
+            "mkdir -p \"$(dirname '{container_state_path}')\" && cp '/opt/src/{state_file_path}' '{container_state_path}'"
         );
 
         let mut copy_cmd = vec![
@@ -670,8 +668,7 @@ avocado-provision-{} {}
         if self.config.verbose {
             print_info(
                 &format!(
-                    "Checking for state file at {} in container",
-                    container_state_path
+                    "Checking for state file at {container_state_path} in container"
                 ),
                 OutputLevel::Verbose,
             );
@@ -688,7 +685,7 @@ avocado-provision-{} {}
         let volume_state = volume_manager.get_or_create_volume(src_dir).await?;
 
         // Check if the state file exists in the container
-        let check_script = format!("test -f '{}'", container_state_path);
+        let check_script = format!("test -f '{container_state_path}'");
 
         let mut check_cmd = vec![
             container_tool.to_string(),
@@ -746,8 +743,7 @@ avocado-provision-{} {}
         // Copy from container to host src_dir
         // Note: File ownership is automatically handled by bindfs permission translation
         let copy_script = format!(
-            "cp '{}' '/opt/src/{}'",
-            container_state_path, state_file_path
+            "cp '{container_state_path}' '/opt/src/{state_file_path}'"
         );
 
         // Use shared SdkContainer for running the command

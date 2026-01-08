@@ -37,7 +37,7 @@ mod common;
 fn get_test_host() -> String {
     std::env::var("RUNS_ON_TEST_HOST").unwrap_or_else(|_| {
         let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
-        format!("{}@localhost", user)
+        format!("{user}@localhost")
     })
 }
 
@@ -440,7 +440,7 @@ fn test_localhost_ssh_connectivity() {
     );
 
     let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(stdout.trim() == "ok", "Expected 'ok', got: {}", stdout);
+    assert!(stdout.trim() == "ok", "Expected 'ok', got: {stdout}");
 }
 
 #[test]
@@ -467,8 +467,7 @@ fn test_localhost_cli_version_check() {
     let version_output = String::from_utf8_lossy(&result.stdout);
     assert!(
         version_output.contains("avocado"),
-        "Version output should contain 'avocado': {}",
-        version_output
+        "Version output should contain 'avocado': {version_output}"
     );
 
     // Extract version number
@@ -480,8 +479,7 @@ fn test_localhost_cli_version_check() {
     // Should be a valid semver-like version
     assert!(
         version.contains('.'),
-        "Version should contain a dot: {}",
-        version
+        "Version should contain a dot: {version}"
     );
 }
 
@@ -588,11 +586,11 @@ fn test_localhost_write_file_via_ssh() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         // Connection closed errors are often transient - skip rather than fail
         if stderr.contains("Connection closed") || stderr.contains("connection reset") {
-            eprintln!("Skipping due to transient SSH error: {}", stderr);
+            eprintln!("Skipping due to transient SSH error: {stderr}");
             fs::remove_dir_all(&temp_dir).ok();
             return;
         }
-        panic!("Failed to write file via SSH: {}", stderr);
+        panic!("Failed to write file via SSH: {stderr}");
     }
 
     // Small delay to ensure file system sync
@@ -864,8 +862,7 @@ fn test_localhost_signing_socket_tunnel() {
 
     assert!(
         check.status.success(),
-        "Remote socket should exist at {}",
-        remote_socket_path
+        "Remote socket should exist at {remote_socket_path}"
     );
 }
 
@@ -1132,17 +1129,16 @@ mod docker_volume_tests {
             "docker volume create \
              --driver local \
              --opt type=nfs \
-             --opt o=addr={},rw,nfsvers=4,port={} \
-             --opt device=:{} \
-             {}",
-            nfs_host, nfs_port, export_path, volume_name
+             --opt o=addr={nfs_host},rw,nfsvers=4,port={nfs_port} \
+             --opt device=:{export_path} \
+             {volume_name}"
         );
 
         assert!(command.contains("--driver local"));
         assert!(command.contains("type=nfs"));
-        assert!(command.contains(&format!("addr={}", nfs_host)));
-        assert!(command.contains(&format!("port={}", nfs_port)));
-        assert!(command.contains(&format!("device=:{}", export_path)));
+        assert!(command.contains(&format!("addr={nfs_host}")));
+        assert!(command.contains(&format!("port={nfs_port}")));
+        assert!(command.contains(&format!("device=:{export_path}")));
         assert!(command.contains(volume_name));
     }
 
@@ -1150,7 +1146,7 @@ mod docker_volume_tests {
     fn test_nfs_volume_remove_command_format() {
         let volume_name = "avocado-state-def456";
 
-        let command = format!("docker volume rm -f {}", volume_name);
+        let command = format!("docker volume rm -f {volume_name}");
 
         assert!(command.contains("volume rm"));
         assert!(command.contains("-f"));
@@ -1174,20 +1170,19 @@ mod container_command_tests {
         env_vars: &HashMap<String, String>,
     ) -> String {
         let mut cmd = format!(
-            "{} run --rm \
-             -v {}:/opt/src:rw \
-             -v {}:/opt/_avocado:rw \
+            "{container_tool} run --rm \
+             -v {src_volume}:/opt/src:rw \
+             -v {state_volume}:/opt/_avocado:rw \
              --device /dev/fuse \
              --cap-add SYS_ADMIN \
-             --security-opt label=disable",
-            container_tool, src_volume, state_volume
+             --security-opt label=disable"
         );
 
         for (key, value) in env_vars {
-            cmd.push_str(&format!(" -e {}={}", key, value));
+            cmd.push_str(&format!(" -e {key}={value}"));
         }
 
-        cmd.push_str(&format!(" {} bash -c '{}'", image, command));
+        cmd.push_str(&format!(" {image} bash -c '{command}'"));
         cmd
     }
 

@@ -51,7 +51,7 @@ impl SwtpmInstance {
                 "--ctrl",
                 &format!("type=tcp,port={}", port + 1),
                 "--server",
-                &format!("type=tcp,port={}", port),
+                &format!("type=tcp,port={port}"),
                 "--flags",
                 "not-need-init",
             ])
@@ -65,11 +65,11 @@ impl SwtpmInstance {
         // Set environment variables for TPM communication
         env::set_var(
             "TPM2TOOLS_TCTI",
-            format!("swtpm:host=127.0.0.1,port={}", port),
+            format!("swtpm:host=127.0.0.1,port={port}"),
         );
         env::set_var(
             "TPM2_PKCS11_TCTI",
-            format!("swtpm:host=127.0.0.1,port={}", port),
+            format!("swtpm:host=127.0.0.1,port={port}"),
         );
 
         let instance = SwtpmInstance {
@@ -327,8 +327,8 @@ fn test_tpm_key_generation() {
     assert_eq!(algo_str, "ecdsa-p256", "Algorithm should be ecdsa-p256");
 
     println!("Generated TPM key:");
-    println!("  KeyID: {}", keyid);
-    println!("  Algorithm: {}", algo_str);
+    println!("  KeyID: {keyid}");
+    println!("  Algorithm: {algo_str}");
     println!("  Public key size: {} bytes", public_key_bytes.len());
 }
 
@@ -436,14 +436,14 @@ fn test_end_to_end_tpm_workflow() {
     let (public_key_bytes, keyid, algo_str) =
         generate_pkcs11_keypair(&session, label, &algorithm).expect("Failed to generate keypair");
 
-    println!("Step 1: Generated key with ID: {}", keyid);
+    println!("Step 1: Generated key with ID: {keyid}");
     assert_eq!(algo_str, "ecdsa-p256");
 
     // Step 3: Find the key we just created
     let (found_pubkey, found_keyid, _found_algo, _priv_label) =
         find_existing_key(&session, label).expect("Failed to find existing key");
 
-    println!("Step 2: Found existing key: {}", found_keyid);
+    println!("Step 2: Found existing key: {found_keyid}");
     assert_eq!(keyid, found_keyid);
     assert_eq!(public_key_bytes.len(), found_pubkey.len());
 
@@ -457,7 +457,7 @@ fn test_end_to_end_tpm_workflow() {
         .expect("Failed to get token info");
     let uri = build_pkcs11_uri(token_info.label(), label);
 
-    println!("Step 3: Built URI: {}", uri);
+    println!("Step 3: Built URI: {uri}");
     assert!(uri.starts_with("pkcs11:"));
 
     // Step 5: Sign some data
@@ -530,14 +530,14 @@ fn test_tpm_key_registration_and_removal() {
         generate_pkcs11_keypair(&session, "test-key-label", &KeyAlgorithm::EccP256)
             .expect("Failed to generate keypair in TPM");
 
-    println!("Generated TPM key with ID: {}", keyid);
+    println!("Generated TPM key with ID: {keyid}");
 
     // Step 2: Register the key using the create command
     create_cmd
         .execute()
         .expect("Failed to register TPM key with avocado");
 
-    println!("Registered key '{}' with avocado", key_name);
+    println!("Registered key '{key_name}' with avocado");
 
     // Step 3: Verify key is in registry
     let registry = KeysRegistry::load().expect("Failed to load registry");
@@ -584,7 +584,7 @@ fn test_tpm_key_registration_and_removal() {
         .execute()
         .expect("Failed to register second TPM key");
 
-    println!("Generated and registered second key with ID: {}", keyid2);
+    println!("Generated and registered second key with ID: {keyid2}");
 
     // Remove by key ID
     let remove_cmd2 = SigningKeysRemoveCommand::new(keyid2.clone(), false);

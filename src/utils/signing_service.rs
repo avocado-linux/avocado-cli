@@ -172,7 +172,7 @@ async fn run_service(
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, config).await {
                                 print_error(
-                                    &format!("Error handling signing request: {}", e),
+                                    &format!("Error handling signing request: {e}"),
                                     OutputLevel::Normal,
                                 );
                             }
@@ -180,7 +180,7 @@ async fn run_service(
                     }
                     Err(e) => {
                         print_error(
-                            &format!("Failed to accept connection: {}", e),
+                            &format!("Failed to accept connection: {e}"),
                             OutputLevel::Normal,
                         );
                     }
@@ -209,7 +209,7 @@ async fn handle_connection(stream: UnixStream, config: SigningServiceConfig) -> 
     let request: SignRequest = match timeout(SIGNING_TIMEOUT, reader.read_line(&mut line)).await {
         Ok(Ok(_)) => serde_json::from_str(&line).context("Failed to parse signing request JSON")?,
         Ok(Err(e)) => {
-            return Err(anyhow::anyhow!("Failed to read request: {}", e));
+            return Err(anyhow::anyhow!("Failed to read request: {e}"));
         }
         Err(_) => {
             return Err(anyhow::anyhow!("Timeout reading signing request"));
@@ -276,7 +276,7 @@ fn process_signing_request(request: SignRequest, config: &SigningServiceConfig) 
             response_type: "sign_response".to_string(),
             success: false,
             signature: None,
-            error: Some(format!("{:#}", e)),
+            error: Some(format!("{e:#}")),
         },
     }
 }
@@ -595,7 +595,7 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(file_content);
         let file_hash = hasher.finalize();
-        let file_hash_hex: String = file_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let file_hash_hex: String = file_hash.iter().map(|b| format!("{b:02x}")).collect();
 
         // Note: In actual use, the request would be sent to the signing service
         // Here we're just validating the data format and verification process
@@ -608,7 +608,7 @@ mod tests {
             "version": "1",
             "checksum_algorithm": "sha256",
             "checksum": file_hash_hex,
-            "signature": signature.as_ref().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            "signature": signature.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "key_name": "test-key",
             "keyid": "test-keyid",
         });
@@ -676,8 +676,7 @@ mod tests {
             response_type: "sign_response".to_string(),
             success: true,
             signature: Some(format!(
-                r#"{{"version":"1","signature":"{}"}}"#,
-                test_signature_hex
+                r#"{{"version":"1","signature":"{test_signature_hex}"}}"#
             )),
             error: None,
         };

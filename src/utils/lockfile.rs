@@ -76,20 +76,20 @@ impl SysrootType {
                 // The database is at standard location, so --root is sufficient
                 rpm_etcconfigdir: None,
                 rpm_configdir: None,
-                root_path: Some(format!("$AVOCADO_EXT_SYSROOTS/{}", name)),
+                root_path: Some(format!("$AVOCADO_EXT_SYSROOTS/{name}")),
             },
             SysrootType::VersionedExtension(name) => RpmQueryConfig {
                 // Versioned extensions use ext-rpm-config which puts database at custom location
                 // We need to set RPM_CONFIGDIR to find the database correctly
                 rpm_etcconfigdir: None,
                 rpm_configdir: Some("$AVOCADO_SDK_PREFIX/ext-rpm-config".to_string()),
-                root_path: Some(format!("$AVOCADO_EXT_SYSROOTS/{}", name)),
+                root_path: Some(format!("$AVOCADO_EXT_SYSROOTS/{name}")),
             },
             SysrootType::Runtime(name) => RpmQueryConfig {
                 // Runtime: same approach as rootfs - unset config and use --root
                 rpm_etcconfigdir: None,
                 rpm_configdir: None,
-                root_path: Some(format!("$AVOCADO_PREFIX/runtimes/{}", name)),
+                root_path: Some(format!("$AVOCADO_PREFIX/runtimes/{name}")),
             },
         }
     }
@@ -127,10 +127,10 @@ impl RpmQueryConfig {
             env_setup.push_str("unset RPM_ETCCONFIGDIR RPM_CONFIGDIR; ");
 
             if let Some(ref etcconfigdir) = self.rpm_etcconfigdir {
-                env_setup.push_str(&format!("export RPM_ETCCONFIGDIR=\"{}\"; ", etcconfigdir));
+                env_setup.push_str(&format!("export RPM_ETCCONFIGDIR=\"{etcconfigdir}\"; "));
             }
             if let Some(ref configdir) = self.rpm_configdir {
-                env_setup.push_str(&format!("export RPM_CONFIGDIR=\"{}\"; ", configdir));
+                env_setup.push_str(&format!("export RPM_CONFIGDIR=\"{configdir}\"; "));
             }
 
             format!(
@@ -143,10 +143,10 @@ impl RpmQueryConfig {
             // For SDK native queries (no --root), set the custom RPM config paths
             let mut cmd = String::new();
             if let Some(ref etcconfigdir) = self.rpm_etcconfigdir {
-                cmd.push_str(&format!("RPM_ETCCONFIGDIR=\"{}\" ", etcconfigdir));
+                cmd.push_str(&format!("RPM_ETCCONFIGDIR=\"{etcconfigdir}\" "));
             }
             if let Some(ref configdir) = self.rpm_configdir {
-                cmd.push_str(&format!("RPM_CONFIGDIR=\"{}\" ", configdir));
+                cmd.push_str(&format!("RPM_CONFIGDIR=\"{configdir}\" "));
             }
             cmd.push_str(&format!(
                 "rpm -q --qf '%{{NAME}} %{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' {} || true",
@@ -349,7 +349,7 @@ impl LockFile {
             .with_context(|| "Failed to serialize lock file using JCS")?;
 
         // Add a newline at the end for better git diffs
-        let content_with_newline = format!("{}\n", content);
+        let content_with_newline = format!("{content}\n");
 
         fs::write(&path, content_with_newline)
             .with_context(|| format!("Failed to write lock file: {}", path.display()))?;
@@ -604,13 +604,13 @@ pub fn build_package_spec_with_lock(
     // First, check if we have a locked version for this target
     if let Some(locked_version) = lock_file.get_locked_version(target, sysroot, package_name) {
         // Use the full locked version (NEVRA format)
-        format!("{}-{}", package_name, locked_version)
+        format!("{package_name}-{locked_version}")
     } else if config_version == "*" {
         // No lock and config says latest - just use package name
         package_name.to_string()
     } else {
         // No lock but config specifies a version
-        format!("{}-{}", package_name, config_version)
+        format!("{package_name}-{config_version}")
     }
 }
 

@@ -131,13 +131,13 @@ enum YamlLocation {
 fn format_yaml_path(path: &[String], location: &YamlLocation) -> String {
     if path.is_empty() {
         match location {
-            YamlLocation::Key(key) => format!("key \"{}\"", key),
+            YamlLocation::Key(key) => format!("key \"{key}\""),
             YamlLocation::Value => "root value".to_string(),
         }
     } else {
         let path_str = path.join(".");
         match location {
-            YamlLocation::Key(key) => format!("{}.\"{}\" (key)", path_str, key),
+            YamlLocation::Key(key) => format!("{path_str}.\"{key}\" (key)"),
             YamlLocation::Value => path_str,
         }
     }
@@ -205,7 +205,7 @@ fn interpolate_value(
             for (k, v) in map.iter_mut() {
                 let key_str = match k {
                     Value::String(s) => s.clone(),
-                    _ => format!("{:?}", k),
+                    _ => format!("{k:?}"),
                 };
                 let mut child_path = path.to_vec();
                 child_path.push(key_str);
@@ -217,7 +217,7 @@ fn interpolate_value(
         Value::Sequence(seq) => {
             for (idx, item) in seq.iter_mut().enumerate() {
                 let mut child_path = path.to_vec();
-                child_path.push(format!("[{}]", idx));
+                child_path.push(format!("[{idx}]"));
                 if interpolate_value(item, root, cli_target, resolving_stack, &child_path)? {
                     changed = true;
                 }
@@ -276,8 +276,7 @@ fn interpolate_string(
                 // Add context about where in the YAML this template was found
                 let yaml_location = format_yaml_path(path, location);
                 return Err(e.context(format!(
-                    "in template '{{{{ {} }}}}' at {}",
-                    template, yaml_location
+                    "in template '{{{{ {template} }}}}' at {yaml_location}"
                 )));
             }
         }
@@ -470,13 +469,11 @@ reference: "{{ config.nonexistent.path }}"
         // Should include both the location and the "not found" message
         assert!(
             full_error.contains("not found"),
-            "Expected 'not found' in error, got: {}",
-            full_error
+            "Expected 'not found' in error, got: {full_error}"
         );
         assert!(
             full_error.contains("reference"),
-            "Expected 'reference' location in error, got: {}",
-            full_error
+            "Expected 'reference' location in error, got: {full_error}"
         );
     }
 
@@ -776,8 +773,7 @@ key: "{{ unknown.value }}"
         let full_error = error_chain_string(&err);
         assert!(
             full_error.contains("Unknown template context"),
-            "Expected 'Unknown template context' in error, got: {}",
-            full_error
+            "Expected 'Unknown template context' in error, got: {full_error}"
         );
     }
 

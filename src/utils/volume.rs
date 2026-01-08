@@ -209,7 +209,7 @@ impl VolumeManager {
                     .args(["rm", "-f", container_id])
                     .output()
                     .await
-                    .with_context(|| format!("Failed to remove container {}", container_id))?;
+                    .with_context(|| format!("Failed to remove container {container_id}"))?;
 
                 if self.verbose && output.status.success() {
                     print_info(
@@ -236,7 +236,7 @@ impl VolumeManager {
                 "ps",
                 "-a",
                 "--filter",
-                &format!("volume={}", volume_name),
+                &format!("volume={volume_name}"),
                 "--format",
                 "{{.ID}}",
             ])

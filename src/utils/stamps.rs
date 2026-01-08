@@ -467,29 +467,29 @@ impl StampRequirement {
     pub fn fix_command_with_remote(&self, runs_on: Option<&str>) -> String {
         match (&self.component, &self.component_name, &self.command) {
             (StampComponent::Sdk, _, StampCommand::Install) => match runs_on {
-                Some(remote) => format!("avocado sdk install --runs-on {}", remote),
+                Some(remote) => format!("avocado sdk install --runs-on {remote}"),
                 None => "avocado sdk install".to_string(),
             },
             (StampComponent::Extension, Some(name), StampCommand::Install) => {
-                format!("avocado ext install -e {}", name)
+                format!("avocado ext install -e {name}")
             }
             (StampComponent::Extension, Some(name), StampCommand::Build) => {
-                format!("avocado ext build -e {}", name)
+                format!("avocado ext build -e {name}")
             }
             (StampComponent::Extension, Some(name), StampCommand::Image) => {
-                format!("avocado ext image -e {}", name)
+                format!("avocado ext image -e {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Install) => {
-                format!("avocado runtime install -r {}", name)
+                format!("avocado runtime install -r {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Build) => {
-                format!("avocado runtime build -r {}", name)
+                format!("avocado runtime build -r {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Sign) => {
-                format!("avocado runtime sign -r {}", name)
+                format!("avocado runtime sign -r {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Provision) => {
-                format!("avocado runtime provision -r {}", name)
+                format!("avocado runtime provision -r {name}")
             }
             _ => format!("avocado {} {}", self.component, self.command),
         }
@@ -628,7 +628,7 @@ impl fmt::Display for StampValidationError {
         fixes.dedup();
 
         for fix in fixes {
-            writeln!(f, "  {}", fix)?;
+            writeln!(f, "  {fix}")?;
         }
 
         Ok(())
@@ -640,7 +640,7 @@ pub fn compute_hash(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     let result = hasher.finalize();
-    format!("sha256:{:x}", result)
+    format!("sha256:{result:x}")
 }
 
 /// Compute hash of a YAML value (for config sections)
@@ -696,14 +696,14 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
     if let Some(ext) = config.get("ext").and_then(|e| e.get(ext_name)) {
         if let Some(deps) = ext.get("dependencies") {
             hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{}.dependencies", ext_name)),
+                serde_yaml::Value::String(format!("ext.{ext_name}.dependencies")),
                 deps.clone(),
             );
         }
         // Also include types as they affect build
         if let Some(types) = ext.get("types") {
             hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{}.types", ext_name)),
+                serde_yaml::Value::String(format!("ext.{ext_name}.types")),
                 types.clone(),
             );
         }
@@ -724,7 +724,7 @@ pub fn compute_runtime_input_hash(
     // Include the merged dependencies section
     if let Some(deps) = merged_runtime.get("dependencies") {
         hash_data.insert(
-            serde_yaml::Value::String(format!("runtime.{}.dependencies", runtime_name)),
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.dependencies")),
             deps.clone(),
         );
     }
@@ -732,7 +732,7 @@ pub fn compute_runtime_input_hash(
     // Include target if specified
     if let Some(target) = merged_runtime.get("target") {
         hash_data.insert(
-            serde_yaml::Value::String(format!("runtime.{}.target", runtime_name)),
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.target")),
             target.clone(),
         );
     }
@@ -1674,17 +1674,16 @@ mod tests {
     fn test_parse_batch_stamps_output() {
         let arch = get_local_arch();
         let output = format!(
-            r#"sdk/{}/install.stamp:::{{"version":"1.0.0","command":"install","component":"sdk"}}
+            r#"sdk/{arch}/install.stamp:::{{"version":"1.0.0","command":"install","component":"sdk"}}
 ext/my-ext/install.stamp:::{{"version":"1.0.0","command":"install","component":"ext"}}
-ext/my-ext/build.stamp:::null"#,
-            arch
+ext/my-ext/build.stamp:::null"#
         );
 
         let result = parse_batch_stamps_output(&output);
 
         assert_eq!(result.len(), 3);
         assert!(result
-            .get(&format!("sdk/{}/install.stamp", arch))
+            .get(&format!("sdk/{arch}/install.stamp"))
             .unwrap()
             .is_some());
         assert!(result.get("ext/my-ext/install.stamp").unwrap().is_some());
@@ -2052,7 +2051,7 @@ runtime/my-runtime/build.stamp:::null"#,
         let json = serde_json::to_string(&stamp).unwrap();
 
         let requirements = vec![StampRequirement::ext_install("my-ext")];
-        let output = format!("ext/my-ext/install.stamp:::{}", json);
+        let output = format!("ext/my-ext/install.stamp:::{json}");
 
         // With changed inputs, stamp should be stale
         let result = validate_stamps_batch(&requirements, &output, Some(&changed_inputs));
@@ -2156,7 +2155,7 @@ runtime/my-runtime/build.stamp:::null"#,
         assert_eq!(req.host_arch, Some(local_arch.to_string()));
         assert_eq!(
             req.relative_path(),
-            format!("sdk/{}/install.stamp", local_arch)
+            format!("sdk/{local_arch}/install.stamp")
         );
     }
 

@@ -22,8 +22,7 @@ impl SigningKeysRemoveCommand {
     /// Prompt user for confirmation (returns true if user confirms)
     fn confirm_deletion(key_name: &str, key_type: &str) -> Result<bool> {
         println!(
-            "⚠️  WARNING: This will PERMANENTLY delete the {} key '{}' from the hardware device.",
-            key_type, key_name
+            "⚠️  WARNING: This will PERMANENTLY delete the {key_type} key '{key_name}' from the hardware device."
         );
         print!("This action cannot be undone. Continue? [y/N]: ");
         io::stdout().flush()?;
@@ -78,14 +77,14 @@ impl SigningKeysRemoveCommand {
 
             match delete_key_files(&entry.keyid) {
                 Ok(()) => {
-                    println!("Removed signing key '{}'", key_name);
+                    println!("Removed signing key '{key_name}'");
                     println!("  Key ID:  {}", entry.keyid);
                     println!("  Deleted key files from disk");
                 }
                 Err(e) => {
                     // Key was removed from registry, but file deletion failed
-                    println!("Removed signing key '{}' from registry", key_name);
-                    println!("  Warning: Failed to delete key files: {}", e);
+                    println!("Removed signing key '{key_name}' from registry");
+                    println!("  Warning: Failed to delete key files: {e}");
                 }
             }
         } else {
@@ -103,15 +102,15 @@ impl SigningKeysRemoveCommand {
                 // Attempt to delete from hardware
                 match delete_pkcs11_key(&entry.uri) {
                     Ok(()) => {
-                        println!("Removed signing key '{}'", key_name);
+                        println!("Removed signing key '{key_name}'");
                         println!("  Key ID: {}", entry.keyid);
                         println!("  ✓ Deleted from registry");
                         println!("  ✓ Deleted from hardware device");
                     }
                     Err(e) => {
-                        println!("Removed signing key '{}' from registry", key_name);
+                        println!("Removed signing key '{key_name}' from registry");
                         println!("  Key ID: {}", entry.keyid);
-                        println!("  ⚠️  Warning: Failed to delete from hardware: {}", e);
+                        println!("  ⚠️  Warning: Failed to delete from hardware: {e}");
                         println!(
                             "  You may need to delete it manually using device-specific tools."
                         );
@@ -119,7 +118,7 @@ impl SigningKeysRemoveCommand {
                 }
             } else {
                 // Just remove from registry
-                println!("Removed signing key '{}'", key_name);
+                println!("Removed signing key '{key_name}'");
                 println!("  Key ID: {}", entry.keyid);
                 println!("  Note: PKCS#11 key reference removed (hardware key unchanged)");
                 println!("  Tip: Use --delete to permanently delete the hardware key");

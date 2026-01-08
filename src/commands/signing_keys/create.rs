@@ -99,14 +99,13 @@ impl SigningKeysCreateCommand {
                 keyid,
                 pkcs11_uri,
                 algorithm,
-                format!("{}/PKCS#11", device_type),
+                format!("{device_type}/PKCS#11"),
             )
         } else if let Some(pkcs11_uri) = &self.uri {
             // Manual PKCS#11 URI registration (existing flow)
             if !is_pkcs11_uri(pkcs11_uri) {
                 anyhow::bail!(
-                    "Invalid URI: '{}'. Expected a pkcs11: URI (e.g., 'pkcs11:token=YubiKey;object=signing-key')",
-                    pkcs11_uri
+                    "Invalid URI: '{pkcs11_uri}'. Expected a pkcs11: URI (e.g., 'pkcs11:token=YubiKey;object=signing-key')"
                 );
             }
 
@@ -136,7 +135,7 @@ impl SigningKeysCreateCommand {
 
         // Check if name already exists
         if registry.get_key(&name).is_some() {
-            anyhow::bail!("A key with name '{}' already exists", name);
+            anyhow::bail!("A key with name '{name}' already exists");
         }
 
         // Create the key entry
@@ -153,16 +152,16 @@ impl SigningKeysCreateCommand {
 
         // Print success message
         println!("Created signing key:");
-        println!("  Name:      {}", name);
-        println!("  Key ID:    {}", keyid);
-        println!("  Algorithm: {}", algorithm);
-        println!("  Type:      {}", key_type);
+        println!("  Name:      {name}");
+        println!("  Key ID:    {keyid}");
+        println!("  Algorithm: {algorithm}");
+        println!("  Type:      {key_type}");
 
         if key_type == "file" {
             let keys_dir = get_signing_keys_dir()?;
             println!("  Location:  {}", keys_dir.display());
         } else {
-            println!("  URI:       {}", uri);
+            println!("  URI:       {uri}");
         }
 
         Ok(())
@@ -185,7 +184,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{:02x}", b);
+            let _ = write!(acc, "{b:02x}");
             acc
         })
 }

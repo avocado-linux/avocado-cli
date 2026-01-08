@@ -172,13 +172,11 @@ reference: "{{ config.nonexistent.path }}"
     // Should contain both the location and the "not found" message
     assert!(
         full_error.contains("not found"),
-        "Expected 'not found' in error, got: {}",
-        full_error
+        "Expected 'not found' in error, got: {full_error}"
     );
     assert!(
         full_error.contains("reference"),
-        "Expected 'reference' location in error, got: {}",
-        full_error
+        "Expected 'reference' location in error, got: {full_error}"
     );
 }
 

@@ -157,7 +157,7 @@ impl SdkInstallCommand {
         if let Some(ref mut context) = runs_on_context {
             if let Err(e) = context.teardown().await {
                 print_error(
-                    &format!("Warning: Failed to cleanup remote resources: {}", e),
+                    &format!("Warning: Failed to cleanup remote resources: {e}"),
                     OutputLevel::Normal,
                 );
             }
@@ -199,8 +199,7 @@ impl SdkInstallCommand {
         if self.verbose {
             print_info(
                 &format!(
-                    "Using host architecture '{}' for SDK package tracking.",
-                    host_arch
+                    "Using host architecture '{host_arch}' for SDK package tracking."
                 ),
                 OutputLevel::Normal,
             );
@@ -401,12 +400,12 @@ MACROS_EOF
 
         // Install avocado-sdk-{target} with version from distro.version
         print_info(
-            &format!("Installing SDK for target '{}'.", target),
+            &format!("Installing SDK for target '{target}'."),
             OutputLevel::Normal,
         );
 
         // Build package name and spec with lock file support
-        let sdk_target_pkg_name = format!("avocado-sdk-{}", target);
+        let sdk_target_pkg_name = format!("avocado-sdk-{target}");
         let sdk_target_config_version = config
             .get_distro_version()
             .map(|s| s.as_str())
@@ -428,9 +427,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     $DNF_SDK_HOST_REPO_CONF \
     -y \
     install \
-    {}
-"#,
-            sdk_target_pkg
+    {sdk_target_pkg}
+"#
         );
 
         let run_config = RunConfig {
@@ -457,15 +455,14 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 
         if sdk_target_success {
             print_success(
-                &format!("Installed SDK for target '{}'.", target),
+                &format!("Installed SDK for target '{target}'."),
                 OutputLevel::Normal,
             );
             // Add to list for later query (after environment is fully set up)
             all_sdk_package_names.push(sdk_target_pkg_name);
         } else {
             return Err(anyhow::anyhow!(
-                "Failed to install SDK for target '{}'.",
-                target
+                "Failed to install SDK for target '{target}'."
             ));
         }
 
@@ -527,9 +524,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     $DNF_SDK_COMBINED_REPO_CONF \
     -y \
     install \
-    {}
-"#,
-            bootstrap_pkg
+    {bootstrap_pkg}
+"#
         );
 
         let run_config = RunConfig {
@@ -751,9 +747,8 @@ $DNF_SDK_HOST \
             r#"
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
-    {} {} --installroot $AVOCADO_PREFIX/rootfs install {}
-"#,
-            dnf_args_str, yes, rootfs_pkg
+    {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/rootfs install {rootfs_pkg}
+"#
         );
 
         let run_config = RunConfig {

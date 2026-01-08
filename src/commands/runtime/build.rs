@@ -130,7 +130,7 @@ impl RuntimeBuildCommand {
         if let Some(ref mut context) = runs_on_context {
             if let Err(e) = context.teardown().await {
                 print_error(
-                    &format!("Warning: Failed to cleanup remote resources: {}", e),
+                    &format!("Warning: Failed to cleanup remote resources: {e}"),
                     OutputLevel::Normal,
                 );
             }

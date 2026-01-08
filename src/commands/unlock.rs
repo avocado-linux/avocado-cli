@@ -87,14 +87,14 @@ impl UnlockCommand {
             // Unlock everything for the target
             if self.verbose {
                 print_info(
-                    &format!("Unlocking all entries for target '{}'", target),
+                    &format!("Unlocking all entries for target '{target}'"),
                     OutputLevel::Normal,
                 );
             }
             lock_file.clear_all(&target);
             unlocked_something = true;
             print_success(
-                &format!("Unlocked all entries for target '{}'.", target),
+                &format!("Unlocked all entries for target '{target}'."),
                 OutputLevel::Normal,
             );
         } else {
@@ -103,8 +103,7 @@ impl UnlockCommand {
                 if self.verbose {
                     print_info(
                         &format!(
-                            "Unlocking SDK, rootfs, and target-sysroot for target '{}'",
-                            target
+                            "Unlocking SDK, rootfs, and target-sysroot for target '{target}'"
                         ),
                         OutputLevel::Normal,
                     );
@@ -115,8 +114,7 @@ impl UnlockCommand {
                 unlocked_something = true;
                 print_success(
                     &format!(
-                        "Unlocked SDK, rootfs, and target-sysroot for target '{}'.",
-                        target
+                        "Unlocked SDK, rootfs, and target-sysroot for target '{target}'."
                     ),
                     OutputLevel::Normal,
                 );
@@ -126,14 +124,14 @@ impl UnlockCommand {
             if let Some(ref ext_name) = self.extension {
                 if self.verbose {
                     print_info(
-                        &format!("Unlocking extension '{}' for target '{}'", ext_name, target),
+                        &format!("Unlocking extension '{ext_name}' for target '{target}'"),
                         OutputLevel::Normal,
                     );
                 }
                 lock_file.clear_extension(&target, ext_name);
                 unlocked_something = true;
                 print_success(
-                    &format!("Unlocked extension '{}' for target '{}'.", ext_name, target),
+                    &format!("Unlocked extension '{ext_name}' for target '{target}'."),
                     OutputLevel::Normal,
                 );
             }
@@ -143,8 +141,7 @@ impl UnlockCommand {
                 if self.verbose {
                     print_info(
                         &format!(
-                            "Unlocking runtime '{}' for target '{}'",
-                            runtime_name, target
+                            "Unlocking runtime '{runtime_name}' for target '{target}'"
                         ),
                         OutputLevel::Normal,
                     );
@@ -153,8 +150,7 @@ impl UnlockCommand {
                 unlocked_something = true;
                 print_success(
                     &format!(
-                        "Unlocked runtime '{}' for target '{}'.",
-                        runtime_name, target
+                        "Unlocked runtime '{runtime_name}' for target '{target}'."
                     ),
                     OutputLevel::Normal,
                 );

@@ -51,10 +51,10 @@ impl SigningKeysListCommand {
                 "unknown".to_string()
             };
 
-            println!("  {}", name);
+            println!("  {name}");
             println!("    Key ID:    {}", entry.keyid);
             println!("    Algorithm: {}", entry.algorithm);
-            println!("    Type:      {}", key_type);
+            println!("    Type:      {key_type}");
             println!(
                 "    Created:   {}",
                 entry.created_at.format("%Y-%m-%d %H:%M:%S UTC")

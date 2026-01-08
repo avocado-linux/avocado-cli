@@ -66,8 +66,7 @@ impl FromStr for ChecksumAlgorithm {
             "sha256" | "sha-256" => Ok(ChecksumAlgorithm::Sha256),
             "blake3" => Ok(ChecksumAlgorithm::Blake3),
             _ => anyhow::bail!(
-                "Unsupported checksum algorithm '{}'. Supported: sha256, blake3",
-                s
+                "Unsupported checksum algorithm '{s}'. Supported: sha256, blake3"
             ),
         }
     }
@@ -151,8 +150,7 @@ pub fn sign_file(
     // Load signing key (only file:// URIs supported for now)
     let signing_key = load_signing_key(keyid).with_context(|| {
         format!(
-            "Failed to load signing key '{}' (keyid: {})",
-            key_name, keyid
+            "Failed to load signing key '{key_name}' (keyid: {keyid})"
         )
     })?;
 
@@ -270,15 +268,14 @@ pub fn validate_signing_key_for_use(key_name: &str, keyid: &str) -> Result<()> {
     let entries = get_key_entries(&[keyid.to_string()])?;
     let (_registry_name, entry) = entries
         .first()
-        .ok_or_else(|| anyhow::anyhow!("Key with ID '{}' not found in global registry", keyid))?;
+        .ok_or_else(|| anyhow::anyhow!("Key with ID '{keyid}' not found in global registry"))?;
 
     // Validate based on key type
     if is_file_uri(&entry.uri) {
         // Verify the key file exists and can be loaded
         load_signing_key(keyid).with_context(|| {
             format!(
-                "Failed to load signing key '{}' (keyid: {}). The key may be missing or corrupted.",
-                key_name, keyid
+                "Failed to load signing key '{key_name}' (keyid: {keyid}). The key may be missing or corrupted."
             )
         })?;
     } else if is_pkcs11_uri(&entry.uri) {
@@ -314,15 +311,14 @@ pub fn sign_hash_manifest(
     let entries = get_key_entries(&[keyid.to_string()])?;
     let (_registry_name, entry) = entries
         .first()
-        .ok_or_else(|| anyhow::anyhow!("Key with ID '{}' not found in global registry", keyid))?;
+        .ok_or_else(|| anyhow::anyhow!("Key with ID '{keyid}' not found in global registry"))?;
 
     // Determine signing method based on URI type
     let sign_fn: SignFn = if is_file_uri(&entry.uri) {
         // File-based signing
         let signing_key = load_signing_key(keyid).with_context(|| {
             format!(
-                "Failed to load signing key '{}' (keyid: {})",
-                key_name, keyid
+                "Failed to load signing key '{key_name}' (keyid: {keyid})"
             )
         })?;
         Box::new(move |hash: &[u8]| {
@@ -436,7 +432,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{:02x}", b);
+            let _ = write!(acc, "{b:02x}");
             acc
         })
 }
@@ -446,7 +442,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&hex[i..i + 2], 16)
-                .with_context(|| format!("Invalid hex string at position {}", i))
+                .with_context(|| format!("Invalid hex string at position {i}"))
         })
         .collect()
 }

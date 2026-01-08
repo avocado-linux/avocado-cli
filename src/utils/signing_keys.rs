@@ -77,7 +77,7 @@ impl KeysRegistry {
     /// Add a new key entry to the registry
     pub fn add_key(&mut self, name: String, entry: KeyEntry) -> Result<()> {
         if self.keys.contains_key(&name) {
-            anyhow::bail!("A key with name '{}' already exists", name);
+            anyhow::bail!("A key with name '{name}' already exists");
         }
         self.keys.insert(name, entry);
         Ok(())
@@ -87,7 +87,7 @@ impl KeysRegistry {
     pub fn remove_key(&mut self, name: &str) -> Result<KeyEntry> {
         self.keys
             .remove(name)
-            .ok_or_else(|| anyhow::anyhow!("No key found with name '{}'", name))
+            .ok_or_else(|| anyhow::anyhow!("No key found with name '{name}'"))
     }
 
     /// Get a key entry by name
@@ -258,7 +258,7 @@ pub fn validate_signing_keys(key_names: &[String]) -> Result<()> {
     } else {
         anyhow::bail!(
             "The following signing keys are referenced in the config but not found in the global registry: {}",
-            missing.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ")
+            missing.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ")
         )
     }
 }
@@ -302,7 +302,7 @@ pub fn get_key_entries(key_names: &[String]) -> Result<Vec<(String, KeyEntry)>> 
             "The following signing keys are not found in the global registry: {}",
             missing
                 .iter()
-                .map(|s| format!("'{}'", s))
+                .map(|s| format!("'{s}'"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -318,7 +318,7 @@ mod hex {
         bytes
             .iter()
             .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-                let _ = write!(acc, "{:02x}", b);
+                let _ = write!(acc, "{b:02x}");
                 acc
             })
     }
@@ -494,7 +494,7 @@ mod tests {
         let signature_hex: String = signature
             .as_ref()
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{b:02x}"))
             .collect();
 
         // Verify hex encoding

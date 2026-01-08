@@ -36,11 +36,11 @@ impl RemoteHost {
             let host = parts[1].to_string();
 
             if user.is_empty() {
-                anyhow::bail!("Username cannot be empty in '{}'", spec);
+                anyhow::bail!("Username cannot be empty in '{spec}'");
             }
 
             if host.is_empty() {
-                anyhow::bail!("Hostname cannot be empty in '{}'", spec);
+                anyhow::bail!("Hostname cannot be empty in '{spec}'");
             }
 
             Ok(Self {
@@ -254,8 +254,7 @@ impl SshClient {
         if self.verbose {
             print_info(
                 &format!(
-                    "Remote avocado version: {} (local: {})",
-                    remote_version, local_version
+                    "Remote avocado version: {remote_version} (local: {local_version})"
                 ),
                 OutputLevel::Normal,
             );
@@ -268,7 +267,7 @@ impl SshClient {
     pub async fn run_command(&self, command: &str) -> Result<String> {
         if self.verbose {
             print_info(
-                &format!("Running remote command: {}", command),
+                &format!("Running remote command: {command}"),
                 OutputLevel::Verbose,
             );
         }
@@ -280,7 +279,7 @@ impl SshClient {
             .args(&args)
             .output()
             .await
-            .with_context(|| format!("Failed to run command on remote: {}", command))?;
+            .with_context(|| format!("Failed to run command on remote: {command}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -301,7 +300,7 @@ impl SshClient {
     pub async fn run_command_interactive(&self, command: &str) -> Result<bool> {
         if self.verbose {
             print_info(
-                &format!("Running remote command (interactive): {}", command),
+                &format!("Running remote command (interactive): {command}"),
                 OutputLevel::Verbose,
             );
         }
@@ -332,7 +331,7 @@ impl SshClient {
             .stderr(Stdio::inherit())
             .status()
             .await
-            .with_context(|| format!("Failed to run command on remote: {}", command))?;
+            .with_context(|| format!("Failed to run command on remote: {command}"))?;
 
         Ok(status.success())
     }
@@ -386,7 +385,7 @@ impl SshClient {
 
         if self.verbose {
             print_info(
-                &format!("Remote architecture: {}", arch),
+                &format!("Remote architecture: {arch}"),
                 OutputLevel::Normal,
             );
         }
@@ -602,7 +601,7 @@ impl RemoteVolumeManager {
                 Ok(_) => {
                     if self.ssh.verbose {
                         print_info(
-                            &format!("Created NFS volume '{}' on remote", volume_name),
+                            &format!("Created NFS volume '{volume_name}' on remote"),
                             OutputLevel::Normal,
                         );
                     }
@@ -618,8 +617,7 @@ impl RemoteVolumeManager {
                         if self.ssh.verbose {
                             print_info(
                                 &format!(
-                                    "NFS volume creation attempt {}/{} failed, retrying in {}s...",
-                                    attempt, MAX_RETRIES, RETRY_DELAY_SECS
+                                    "NFS volume creation attempt {attempt}/{MAX_RETRIES} failed, retrying in {RETRY_DELAY_SECS}s..."
                                 ),
                                 OutputLevel::Normal,
                             );
@@ -650,7 +648,7 @@ impl RemoteVolumeManager {
 
         if self.ssh.verbose {
             print_info(
-                &format!("NFS volume '{}' health check passed", volume_name),
+                &format!("NFS volume '{volume_name}' health check passed"),
                 OutputLevel::Normal,
             );
         }
@@ -667,7 +665,7 @@ impl RemoteVolumeManager {
 
         if self.ssh.verbose {
             print_info(
-                &format!("Removed volume '{}' from remote", volume_name),
+                &format!("Removed volume '{volume_name}' from remote"),
                 OutputLevel::Normal,
             );
         }
@@ -708,17 +706,17 @@ impl RemoteVolumeManager {
 
         // Add volume mappings
         for (host_vol, container_path) in volumes {
-            docker_cmd.push_str(&format!(" -v {}:{}", host_vol, container_path));
+            docker_cmd.push_str(&format!(" -v {host_vol}:{container_path}"));
         }
 
         // Add environment variables
         for (key, value) in env_vars {
-            docker_cmd.push_str(&format!(" -e {}={}", key, value));
+            docker_cmd.push_str(&format!(" -e {key}={value}"));
         }
 
         // Add extra arguments
         for arg in extra_args {
-            docker_cmd.push_str(&format!(" {}", arg));
+            docker_cmd.push_str(&format!(" {arg}"));
         }
 
         // Add image and command
@@ -834,13 +832,13 @@ pub async fn get_local_ip_for_remote(remote_host: &str) -> Result<IpAddr> {
     use std::net::{SocketAddr, UdpSocket};
 
     // First, try to resolve the remote host
-    let remote_addrs: Vec<_> = tokio::net::lookup_host(format!("{}:22", remote_host))
+    let remote_addrs: Vec<_> = tokio::net::lookup_host(format!("{remote_host}:22"))
         .await
-        .with_context(|| format!("Failed to resolve remote host '{}'", remote_host))?
+        .with_context(|| format!("Failed to resolve remote host '{remote_host}'"))?
         .collect();
 
     if remote_addrs.is_empty() {
-        anyhow::bail!("Could not resolve remote host '{}'", remote_host);
+        anyhow::bail!("Could not resolve remote host '{remote_host}'");
     }
 
     // Try each resolved address, preferring IPv4
@@ -904,7 +902,7 @@ pub async fn get_local_ip_for_remote(remote_host: &str) -> Result<IpAddr> {
 
     // Return the last error we got
     Err(last_error
-        .map(|e| anyhow::anyhow!("Failed to determine route to remote host: {}", e))
+        .map(|e| anyhow::anyhow!("Failed to determine route to remote host: {e}"))
         .unwrap_or_else(|| anyhow::anyhow!("No valid addresses found for remote host")))
 }
 

@@ -121,7 +121,7 @@ impl RunsOnContext {
         print_info("Checking remote avocado version...", OutputLevel::Normal);
         let remote_version = ssh.check_cli_version().await?;
         print_success(
-            &format!("Remote avocado version: {}", remote_version),
+            &format!("Remote avocado version: {remote_version}"),
             OutputLevel::Normal,
         );
 
@@ -129,7 +129,7 @@ impl RunsOnContext {
         let port = match nfs_port {
             Some(p) => {
                 if !is_port_available(p) {
-                    anyhow::bail!("Specified NFS port {} is not available", p);
+                    anyhow::bail!("Specified NFS port {p} is not available");
                 }
                 p
             }
@@ -139,7 +139,7 @@ impl RunsOnContext {
 
         if verbose {
             print_info(
-                &format!("Using NFS port {} for remote execution", port),
+                &format!("Using NFS port {port} for remote execution"),
                 OutputLevel::Normal,
             );
         }
@@ -151,7 +151,7 @@ impl RunsOnContext {
 
         if verbose {
             print_info(
-                &format!("Local IP for NFS: {}", local_ip),
+                &format!("Local IP for NFS: {local_ip}"),
                 OutputLevel::Normal,
             );
         }
@@ -186,8 +186,7 @@ impl RunsOnContext {
                 .await
                 .with_context(|| {
                     format!(
-                        "Failed to get mountpoint for volume '{}'",
-                        local_volume_name
+                        "Failed to get mountpoint for volume '{local_volume_name}'"
                     )
                 })?;
 
@@ -229,14 +228,14 @@ impl RunsOnContext {
                 .context("Failed to start NFS server")?;
 
         print_success(
-            &format!("NFS server started on port {}", port),
+            &format!("NFS server started on port {port}"),
             OutputLevel::Normal,
         );
 
         // Generate unique session ID for volume names
         let session_id = Uuid::new_v4().to_string()[..8].to_string();
-        let src_volume_name = format!("avocado-src-{}", session_id);
-        let state_volume_name = format!("avocado-state-{}", session_id);
+        let src_volume_name = format!("avocado-src-{session_id}");
+        let state_volume_name = format!("avocado-state-{session_id}");
 
         // Create NFS-backed volumes on remote (use ControlMaster client)
         print_info(
@@ -252,8 +251,7 @@ impl RunsOnContext {
             .await
             .with_context(|| {
                 format!(
-                    "Failed to create NFS volume '{}' on remote",
-                    src_volume_name
+                    "Failed to create NFS volume '{src_volume_name}' on remote"
                 )
             })?;
 
@@ -263,8 +261,7 @@ impl RunsOnContext {
             .await
             .with_context(|| {
                 format!(
-                    "Failed to create NFS volume '{}' on remote",
-                    state_volume_name
+                    "Failed to create NFS volume '{state_volume_name}' on remote"
                 )
             })?;
 
@@ -367,8 +364,7 @@ impl RunsOnContext {
         // Escape the script content for shell
         let escaped_script = helper_script.replace("'", "'\\''");
         let create_script_cmd = format!(
-            "printf '%s' '{}' > {} && chmod +x {}",
-            escaped_script, remote_helper_path, remote_helper_path
+            "printf '%s' '{escaped_script}' > {remote_helper_path} && chmod +x {remote_helper_path}"
         );
 
         self.ssh
@@ -378,7 +374,7 @@ impl RunsOnContext {
 
         if self.verbose {
             print_info(
-                &format!("Created signing helper script at {}", remote_helper_path),
+                &format!("Created signing helper script at {remote_helper_path}"),
                 OutputLevel::Normal,
             );
         }
@@ -423,7 +419,7 @@ impl RunsOnContext {
 
         if self.verbose {
             print_info(
-                &format!("Running on remote: {}", docker_cmd),
+                &format!("Running on remote: {docker_cmd}"),
                 OutputLevel::Verbose,
             );
         }
@@ -456,7 +452,7 @@ impl RunsOnContext {
 
         if self.verbose {
             print_info(
-                &format!("Running on remote (capturing output): {}", docker_cmd),
+                &format!("Running on remote (capturing output): {docker_cmd}"),
                 OutputLevel::Verbose,
             );
         }
@@ -516,15 +512,14 @@ impl RunsOnContext {
             // Mount the helper script if it exists
             if let Some(ref helper_path) = self.remote_helper_script {
                 docker_cmd.push_str(&format!(
-                    " -v {}:/usr/local/bin/avocado-sign-request:ro",
-                    helper_path
+                    " -v {helper_path}:/usr/local/bin/avocado-sign-request:ro"
                 ));
             }
         }
 
         // Add extra Docker arguments
         for arg in extra_docker_args {
-            docker_cmd.push_str(&format!(" {}", arg));
+            docker_cmd.push_str(&format!(" {arg}"));
         }
 
         // Add image and command
@@ -577,7 +572,7 @@ impl RunsOnContext {
         if let Some(helper_path) = self.remote_helper_script.take() {
             let _ = self
                 .ssh
-                .run_command(&format!("rm -f {}", helper_path))
+                .run_command(&format!("rm -f {helper_path}"))
                 .await;
         }
 
@@ -595,24 +590,24 @@ impl RunsOnContext {
         if let Some(volume) = self.remote_src_volume.take() {
             if self.verbose {
                 print_info(
-                    &format!("Removing remote volume: {}", volume),
+                    &format!("Removing remote volume: {volume}"),
                     OutputLevel::Normal,
                 );
             }
             if let Err(e) = remote_vm.remove_volume(&volume).await {
-                cleanup_errors.push(format!("Failed to remove {}: {}", volume, e));
+                cleanup_errors.push(format!("Failed to remove {volume}: {e}"));
             }
         }
 
         if let Some(volume) = self.remote_state_volume.take() {
             if self.verbose {
                 print_info(
-                    &format!("Removing remote volume: {}", volume),
+                    &format!("Removing remote volume: {volume}"),
                     OutputLevel::Normal,
                 );
             }
             if let Err(e) = remote_vm.remove_volume(&volume).await {
-                cleanup_errors.push(format!("Failed to remove {}: {}", volume, e));
+                cleanup_errors.push(format!("Failed to remove {volume}: {e}"));
             }
         }
 
@@ -622,7 +617,7 @@ impl RunsOnContext {
         }
         if let Some(server) = self.nfs_server.take() {
             if let Err(e) = server.stop().await {
-                cleanup_errors.push(format!("Failed to stop NFS server: {}", e));
+                cleanup_errors.push(format!("Failed to stop NFS server: {e}"));
             }
         }
 
@@ -632,14 +627,14 @@ impl RunsOnContext {
         }
         if let Some(mut master) = self.ssh_master.take() {
             if let Err(e) = master.stop().await {
-                cleanup_errors.push(format!("Failed to stop SSH ControlMaster: {}", e));
+                cleanup_errors.push(format!("Failed to stop SSH ControlMaster: {e}"));
             }
         }
 
         // Report any cleanup errors (but don't fail - cleanup is best-effort)
         if !cleanup_errors.is_empty() {
             for error in &cleanup_errors {
-                print_info(&format!("Warning: {}", error), OutputLevel::Normal);
+                print_info(&format!("Warning: {error}"), OutputLevel::Normal);
             }
         }
 

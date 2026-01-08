@@ -43,8 +43,7 @@ impl FromStr for DeviceType {
             "yubikey" | "yk" => Ok(DeviceType::Yubikey),
             "auto" => Ok(DeviceType::Auto),
             _ => anyhow::bail!(
-                "Unsupported device type '{}'. Supported: tpm, yubikey, auto",
-                s
+                "Unsupported device type '{s}'. Supported: tpm, yubikey, auto"
             ),
         }
     }
@@ -67,8 +66,7 @@ impl FromStr for Pkcs11AuthMethod {
             "prompt" => Ok(Pkcs11AuthMethod::Prompt),
             "env" => Ok(Pkcs11AuthMethod::EnvVar("AVOCADO_PKCS11_PIN".to_string())),
             _ => anyhow::bail!(
-                "Unsupported auth method '{}'. Supported: none, prompt, env",
-                s
+                "Unsupported auth method '{s}'. Supported: none, prompt, env"
             ),
         }
     }
@@ -190,7 +188,7 @@ fn get_library_search_paths() -> Vec<PathBuf> {
         if output.status.success() {
             let multiarch = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !multiarch.is_empty() {
-                paths.push(PathBuf::from(format!("/usr/lib/{}", multiarch)));
+                paths.push(PathBuf::from(format!("/usr/lib/{multiarch}")));
             }
         }
     }
@@ -243,8 +241,7 @@ pub fn get_device_auth(method: &Pkcs11AuthMethod) -> Result<String> {
         }
         Pkcs11AuthMethod::EnvVar(var_name) => env::var(var_name).with_context(|| {
             format!(
-                "Environment variable '{}' not set. Set it or use --auth prompt",
-                var_name
+                "Environment variable '{var_name}' not set. Set it or use --auth prompt"
             )
         }),
     }
@@ -288,7 +285,7 @@ pub fn discover_device_token(
                 "No PKCS#11 tokens found. Ensure the device is connected and initialized."
             }
         };
-        anyhow::bail!("{}", help_msg);
+        anyhow::bail!("{help_msg}");
     }
 
     // If a specific token label was provided, look for exact match
@@ -649,7 +646,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(acc, "{:02x}", b);
+            let _ = write!(acc, "{b:02x}");
             acc
         })
 }
@@ -743,8 +740,7 @@ pub fn delete_pkcs11_key(uri: &str) -> Result<()> {
 
     if objects.is_empty() {
         anyhow::bail!(
-            "Private key '{}' not found in hardware device",
-            object_label
+            "Private key '{object_label}' not found in hardware device"
         );
     }
 
@@ -791,7 +787,7 @@ pub fn sign_with_pkcs11_device(
         .context("Failed to find private key object")?;
 
     if objects.is_empty() {
-        anyhow::bail!("No private key found with label '{}'", object_label);
+        anyhow::bail!("No private key found with label '{object_label}'");
     }
 
     let private_key_handle = objects[0];

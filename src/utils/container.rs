@@ -221,7 +221,7 @@ impl SdkContainer {
         let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
 
         print_info(
-            &format!("Setting up remote execution on {}...", runs_on),
+            &format!("Setting up remote execution on {runs_on}..."),
             OutputLevel::Normal,
         );
 
@@ -348,7 +348,7 @@ impl SdkContainer {
         let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
 
         print_info(
-            &format!("Setting up remote execution on {}...", runs_on),
+            &format!("Setting up remote execution on {runs_on}..."),
             OutputLevel::Normal,
         );
 
@@ -380,7 +380,7 @@ impl SdkContainer {
         // Always cleanup, even on error
         if let Err(e) = context.teardown().await {
             print_error(
-                &format!("Warning: Failed to cleanup remote resources: {}", e),
+                &format!("Warning: Failed to cleanup remote resources: {e}"),
                 OutputLevel::Normal,
             );
         }
@@ -616,9 +616,9 @@ impl SdkContainer {
         // Pass host UID/GID for bindfs permission translation
         let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={}", host_uid));
+        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={}", host_gid));
+        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
 
         // Add signing-related environment variables
         if config.signing_socket_path.is_some() {
@@ -630,18 +630,18 @@ impl SdkContainer {
 
         if let Some(key_name) = &config.signing_key_name {
             container_cmd.push("-e".to_string());
-            container_cmd.push(format!("AVOCADO_SIGNING_KEY_NAME={}", key_name));
+            container_cmd.push(format!("AVOCADO_SIGNING_KEY_NAME={key_name}"));
         }
 
         if let Some(checksum_algo) = &config.signing_checksum_algorithm {
             container_cmd.push("-e".to_string());
-            container_cmd.push(format!("AVOCADO_SIGNING_CHECKSUM={}", checksum_algo));
+            container_cmd.push(format!("AVOCADO_SIGNING_CHECKSUM={checksum_algo}"));
         }
 
         // Add signing keys directory env var if mounted
         if let Some(keys_dir) = signing_keys_env {
             container_cmd.push("-e".to_string());
-            container_cmd.push(format!("AVOCADO_SIGNING_KEYS_DIR={}", keys_dir));
+            container_cmd.push(format!("AVOCADO_SIGNING_KEYS_DIR={keys_dir}"));
         }
 
         for (key, value) in env_vars {
@@ -818,8 +818,7 @@ impl SdkContainer {
         if self.verbose {
             print_info(
                 &format!(
-                    "Querying installed packages for lock file (sysroot: {:?}): {}",
-                    sysroot, query_command
+                    "Querying installed packages for lock file (sysroot: {sysroot:?}): {query_command}"
                 ),
                 OutputLevel::Normal,
             );
@@ -863,7 +862,7 @@ impl SdkContainer {
                         OutputLevel::Normal,
                     );
                     for (name, version) in &versions {
-                        print_info(&format!("  {} = {}", name, version), OutputLevel::Normal);
+                        print_info(&format!("  {name} = {version}"), OutputLevel::Normal);
                     }
                 }
                 // Warn if we expected packages but got none (likely a parse or query issue)
@@ -1142,12 +1141,12 @@ impl SdkContainer {
         // Pass host UID/GID for bindfs permission translation
         let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={}", host_uid));
+        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={}", host_gid));
+        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
         // Pass SDK image for error messages
         container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_SDK_IMAGE={}", container_image));
+        container_cmd.push(format!("AVOCADO_SDK_IMAGE={container_image}"));
 
         // Add the container image
         container_cmd.push(container_image.to_string());
@@ -1160,8 +1159,7 @@ impl SdkContainer {
         // If host UID is 0 (root), skip bindfs and use simple bind mount
         let full_command = if host_uid == 0 && host_gid == 0 {
             format!(
-                "mkdir -p /opt/src && mount --bind /mnt/src /opt/src && {}",
-                command
+                "mkdir -p /opt/src && mount --bind /mnt/src /opt/src && {command}"
             )
         } else {
             format!(
@@ -1175,8 +1173,7 @@ impl SdkContainer {
     echo ""
     exit 1
 fi
-mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src && {}"#,
-                command
+mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src && {command}"#
             )
         };
         container_cmd.push(full_command);
@@ -1652,7 +1649,7 @@ fi
         // Write signature files to temp directory with flattened names
         let mut file_mappings = Vec::new();
         for (idx, sig) in signatures.iter().enumerate() {
-            let temp_file_name = format!("sig_{}.json", idx);
+            let temp_file_name = format!("sig_{idx}.json");
             let temp_file_path = temp_dir.path().join(&temp_file_name);
             std::fs::write(&temp_file_path, &sig.content).with_context(|| {
                 format!(
@@ -1666,7 +1663,7 @@ fi
 
         // Create a temporary container with the volume mounted
         let container_name = format!("avocado-sig-writer-{}", uuid::Uuid::new_v4());
-        let volume_mount = format!("{}:/opt/_avocado:rw", volume_name);
+        let volume_mount = format!("{volume_name}:/opt/_avocado:rw");
 
         let create_cmd = [
             &self.container_tool,
@@ -1682,8 +1679,7 @@ fi
         if self.verbose {
             print_info(
                 &format!(
-                    "Creating temporary container for signature writing: {}",
-                    container_name
+                    "Creating temporary container for signature writing: {container_name}"
                 ),
                 OutputLevel::Verbose,
             );
@@ -1700,13 +1696,13 @@ fi
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to create temporary container: {}", stderr);
+            anyhow::bail!("Failed to create temporary container: {stderr}");
         }
 
         // Copy each signature file into the container
         for (temp_path, container_path) in &file_mappings {
             let temp_path_str = temp_path.display().to_string();
-            let container_dest = format!("{}:{}", container_name, container_path);
+            let container_dest = format!("{container_name}:{container_path}");
 
             let cp_cmd = [
                 &self.container_tool,
@@ -1717,7 +1713,7 @@ fi
 
             if self.verbose {
                 print_info(
-                    &format!("Copying signature to {}", container_path),
+                    &format!("Copying signature to {container_path}"),
                     OutputLevel::Verbose,
                 );
             }
@@ -1728,8 +1724,7 @@ fi
 
             let output = cmd.output().await.with_context(|| {
                 format!(
-                    "Failed to copy signature file to container: {}",
-                    container_path
+                    "Failed to copy signature file to container: {container_path}"
                 )
             })?;
 
@@ -1740,9 +1735,7 @@ fi
                 let _ = self.remove_container(&container_name).await;
 
                 anyhow::bail!(
-                    "Failed to copy signature file {}: {}",
-                    container_path,
-                    stderr
+                    "Failed to copy signature file {container_path}: {stderr}"
                 );
             }
         }
@@ -1787,8 +1780,7 @@ fi
             if self.verbose {
                 print_error(
                     &format!(
-                        "Warning: Failed to remove temporary container {}: {}",
-                        container_name, stderr
+                        "Warning: Failed to remove temporary container {container_name}: {stderr}"
                     ),
                     OutputLevel::Verbose,
                 );

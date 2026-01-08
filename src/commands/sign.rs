@@ -69,7 +69,7 @@ impl SignCommand {
     /// Sign a single runtime
     async fn sign_single_runtime(&self, runtime_name: &str, target: &str) -> Result<()> {
         print_info(
-            &format!("Signing runtime '{}' for target '{}'", runtime_name, target),
+            &format!("Signing runtime '{runtime_name}' for target '{target}'"),
             OutputLevel::Normal,
         );
 
@@ -85,7 +85,7 @@ impl SignCommand {
         sign_cmd
             .execute()
             .await
-            .with_context(|| format!("Failed to sign runtime '{}'", runtime_name))?;
+            .with_context(|| format!("Failed to sign runtime '{runtime_name}'"))?;
 
         Ok(())
     }
@@ -144,7 +144,7 @@ impl SignCommand {
         if !runtimes_with_unresolved_keys.is_empty() {
             let runtime_details: Vec<String> = runtimes_with_unresolved_keys
                 .iter()
-                .map(|(runtime, key)| format!("  - runtime '{}' references key '{}'", runtime, key))
+                .map(|(runtime, key)| format!("  - runtime '{runtime}' references key '{key}'"))
                 .collect();
 
             anyhow::bail!(
@@ -177,7 +177,7 @@ impl SignCommand {
         for runtime_name in &runtimes_to_sign {
             if self.verbose {
                 print_info(
-                    &format!("Signing runtime '{}'", runtime_name),
+                    &format!("Signing runtime '{runtime_name}'"),
                     OutputLevel::Normal,
                 );
             }
@@ -194,7 +194,7 @@ impl SignCommand {
             sign_cmd
                 .execute()
                 .await
-                .with_context(|| format!("Failed to sign runtime '{}'", runtime_name))?;
+                .with_context(|| format!("Failed to sign runtime '{runtime_name}'"))?;
         }
 
         print_success(

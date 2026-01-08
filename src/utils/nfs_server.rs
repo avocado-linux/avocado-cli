@@ -407,7 +407,7 @@ impl NfsServer {
 
         for (host_path, container_path) in &volume_mounts {
             args.push("-v".to_string());
-            args.push(format!("{}:{}", host_path, container_path));
+            args.push(format!("{host_path}:{container_path}"));
             mounted_paths.insert(container_path.clone());
         }
 
@@ -417,7 +417,7 @@ impl NfsServer {
             // Skip if this path is already mounted (e.g., on Docker Desktop where we mount by volume name)
             if !mounted_paths.contains(&export_path) {
                 args.push("-v".to_string());
-                args.push(format!("{}:{}", export_path, export_path));
+                args.push(format!("{export_path}:{export_path}"));
                 mounted_paths.insert(export_path);
             }
         }
@@ -507,16 +507,14 @@ impl NfsServer {
                 .unwrap_or_default();
 
             anyhow::bail!(
-                "NFS server container failed to start. Logs:\n{}",
-                log_output
+                "NFS server container failed to start. Logs:\n{log_output}"
             );
         }
 
         if config.verbose {
             print_info(
                 &format!(
-                    "NFS server container '{}' started successfully",
-                    container_name
+                    "NFS server container '{container_name}' started successfully"
                 ),
                 OutputLevel::Normal,
             );
@@ -548,7 +546,7 @@ impl NfsServer {
         {
             if self.verbose {
                 print_info(
-                    &format!("Stopping NFS server container '{}'...", container_name),
+                    &format!("Stopping NFS server container '{container_name}'..."),
                     OutputLevel::Normal,
                 );
             }
@@ -650,7 +648,7 @@ impl NfsServerBuilder {
     /// Create a new builder with a specific port
     pub fn with_port(port: u16) -> Result<Self> {
         if !is_port_available(port) {
-            anyhow::bail!("Port {} is not available for NFS server", port);
+            anyhow::bail!("Port {port} is not available for NFS server");
         }
 
         Ok(Self {
@@ -711,20 +709,18 @@ pub async fn get_docker_volume_mountpoint(
         ])
         .output()
         .await
-        .with_context(|| format!("Failed to inspect Docker volume '{}'", volume_name))?;
+        .with_context(|| format!("Failed to inspect Docker volume '{volume_name}'"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "Failed to get mountpoint for volume '{}': {}",
-            volume_name,
-            stderr
+            "Failed to get mountpoint for volume '{volume_name}': {stderr}"
         );
     }
 
     let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if mountpoint.is_empty() {
-        anyhow::bail!("Docker volume '{}' has no mountpoint", volume_name);
+        anyhow::bail!("Docker volume '{volume_name}' has no mountpoint");
     }
 
     Ok(PathBuf::from(mountpoint))

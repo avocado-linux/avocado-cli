@@ -513,8 +513,8 @@ impl RuntimeSignCommand {
         let mut extension_patterns = Vec::new();
         for ext_name in required_extensions {
             // Match both with and without version: ext-name-*.raw or ext-name.raw
-            extension_patterns.push(format!("{}-*.raw", ext_name));
-            extension_patterns.push(format!("{}.raw", ext_name));
+            extension_patterns.push(format!("{ext_name}-*.raw"));
+            extension_patterns.push(format!("{ext_name}.raw"));
         }
 
         let pattern_checks = extension_patterns
@@ -528,10 +528,7 @@ impl RuntimeSignCommand {
             {checksum_cmd} "$file" | awk '{{print $1}}' > "$file.{checksum_ext}"
             echo "  Created: $file.{checksum_ext}"
         fi
-    done"#,
-                    pattern = pattern,
-                    checksum_ext = checksum_ext,
-                    checksum_cmd = checksum_cmd
+    done"#
                 )
             })
             .collect::<Vec<_>>()
@@ -592,13 +589,13 @@ echo "=== Checksum generation complete ==="
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Checksum generation failed: {}", stderr);
+            anyhow::bail!("Checksum generation failed: {stderr}");
         }
 
         if self.verbose {
             let stdout = String::from_utf8_lossy(&output.stdout);
             print_info(
-                &format!("Checksum generation output:\n{}", stdout),
+                &format!("Checksum generation output:\n{stdout}"),
                 OutputLevel::Verbose,
             );
         }
@@ -656,7 +653,7 @@ echo "=== Checksum generation complete ==="
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to create extract container: {}", stderr);
+            anyhow::bail!("Failed to create extract container: {stderr}");
         }
 
         // Extract checksum files using docker cp
@@ -670,14 +667,13 @@ echo "=== Checksum generation complete ==="
         for (source_dir, _) in &search_dirs {
             print_info(
                 &format!(
-                    "Attempting to copy checksums from: /opt/_avocado/{}",
-                    source_dir
+                    "Attempting to copy checksums from: /opt/_avocado/{source_dir}"
                 ),
                 OutputLevel::Normal,
             );
 
             // Copy the entire directory (without trailing slash to copy the dir itself)
-            let container_path = format!("{}:/opt/_avocado/{}", container_name, source_dir);
+            let container_path = format!("{container_name}:/opt/_avocado/{source_dir}");
             let dest_path = temp_dir.path().to_str().unwrap();
 
             let cp_cmd = ["docker", "cp", &container_path, dest_path];
@@ -703,8 +699,7 @@ echo "=== Checksum generation complete ==="
         // Read extracted checksum files from all subdirectories
         print_info(
             &format!(
-                "Looking for .{} files in extracted directories...",
-                file_ext
+                "Looking for .{file_ext} files in extracted directories..."
             ),
             OutputLevel::Normal,
         );
@@ -744,7 +739,7 @@ echo "=== Checksum generation complete ==="
                         );
 
                         print_info(
-                            &format!("    Found checksum: {}", image_name),
+                            &format!("    Found checksum: {image_name}"),
                             OutputLevel::Normal,
                         );
 
@@ -758,7 +753,7 @@ echo "=== Checksum generation complete ==="
 
                 if found_count == 0 {
                     print_info(
-                        &format!("    No .{} files found in this directory", file_ext),
+                        &format!("    No .{file_ext} files found in this directory"),
                         OutputLevel::Normal,
                     );
                 }

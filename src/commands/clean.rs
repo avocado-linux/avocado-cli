@@ -177,7 +177,7 @@ impl CleanCommand {
         // Clear all entries for the target
         if self.verbose {
             print_info(
-                &format!("Unlocking all entries for target '{}'", target),
+                &format!("Unlocking all entries for target '{target}'"),
                 OutputLevel::Normal,
             );
         }
@@ -189,7 +189,7 @@ impl CleanCommand {
             .with_context(|| "Failed to save lock file")?;
 
         print_success(
-            &format!("Unlocked all entries for target '{}'.", target),
+            &format!("Unlocked all entries for target '{target}'."),
             OutputLevel::Normal,
         );
 

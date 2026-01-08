@@ -1507,7 +1507,7 @@ echo "Set proper permissions on authentication files""#,
             // Use sdk_config_path which points to the config where sdk.compile sections are defined
             if self.verbose {
                 print_info(
-                    &format!("Using config path for SDK compile: {}", sdk_config_path),
+                    &format!("Using config path for SDK compile: {sdk_config_path}"),
                     OutputLevel::Normal,
                 );
             }
@@ -1522,8 +1522,7 @@ echo "Set proper permissions on authentication files""#,
 
             compile_command.execute().await.with_context(|| {
                 format!(
-                    "Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'. Config path: {}",
-                    sdk_config_path
+                    "Failed to compile SDK section '{compile_section}' for dependency '{dep_name}'. Config path: {sdk_config_path}"
                 )
             })?;
 

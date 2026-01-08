@@ -563,7 +563,7 @@ impl Config {
                         spec_map.get("ext").and_then(|v| v.as_str()),
                         spec_map.get("config").and_then(|v| v.as_str()),
                     ) {
-                        let key = format!("{}:{}", ext_name, config_path);
+                        let key = format!("{ext_name}:{config_path}");
                         if !visited.contains(&key) {
                             visited.insert(key);
                             refs.push((ext_name.to_string(), config_path.to_string()));
@@ -1303,7 +1303,7 @@ impl Config {
     pub fn get_provision_state_file(&self, profile_name: &str) -> String {
         self.get_provision_profile(profile_name)
             .and_then(|p| p.state_file.clone())
-            .unwrap_or_else(|| format!(".avocado/provision-{}.state", profile_name))
+            .unwrap_or_else(|| format!(".avocado/provision-{profile_name}.state"))
     }
 
     /// Get the resolved source directory path
@@ -1943,7 +1943,7 @@ impl Config {
             if flags_with_separate_values.contains(arg.as_str()) && i + 1 < args.len() {
                 // Flag with separate value: combine flag and value as key
                 let value = &args[i + 1];
-                let key = format!("{} {}", arg, value);
+                let key = format!("{arg} {value}");
                 parsed_args.push((key, vec![arg.clone(), value.clone()]));
                 i += 2;
             } else if arg.starts_with('-') && arg.contains('=') {
@@ -2629,8 +2629,7 @@ pub fn resolve_host_uid_gid(config: Option<&SdkConfig>) -> (u32, u32) {
     let gid = if let Ok(env_gid) = env::var("AVOCADO_HOST_GID") {
         env_gid.parse::<u32>().unwrap_or_else(|_| {
             eprintln!(
-                "Warning: Invalid AVOCADO_HOST_GID '{}', using fallback",
-                env_gid
+                "Warning: Invalid AVOCADO_HOST_GID '{env_gid}', using fallback"
             );
             fallback_gid
         })
