@@ -105,7 +105,7 @@ impl ExtBuildCommand {
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             // Resolve required stamps for extension build
             let required = resolve_required_stamps(
@@ -230,7 +230,7 @@ impl ExtBuildCommand {
 
         // Handle compile dependencies with install scripts before building the extension
         // Pass the ext_config_path so SDK compile sections are loaded from the correct config
-        self.handle_compile_dependencies(&config, &ext_config, &target, &ext_config_path)
+        self.handle_compile_dependencies(config, &ext_config, &target, &ext_config_path)
             .await?;
 
         // Get extension types from the types array (defaults to ["sysext", "confext"])
@@ -394,10 +394,10 @@ impl ExtBuildCommand {
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
         // Resolve target with proper precedence
-        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Initialize SDK container helper
-        let container_helper = SdkContainer::from_config(&self.config_path, &config)?;
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
 
         // Determine the extension source path for overlay resolution
         // For remote extensions, files are in $AVOCADO_PREFIX/includes/<ext-name>/
@@ -517,7 +517,7 @@ impl ExtBuildCommand {
             };
 
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
             container_helper.run_in_container(run_config).await?;
 
             if self.verbose {

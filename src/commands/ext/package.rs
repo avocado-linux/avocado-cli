@@ -173,12 +173,10 @@ impl ExtPackageCommand {
         // Also get the raw (unmerged) extension config to find all target-specific overlays
         // For remote extensions, use the parsed config; for local, read from file
         let raw_ext_config = match &extension_location {
-            ExtensionLocation::Remote { .. } => {
-                parsed
-                    .get("ext")
-                    .and_then(|ext| ext.get(&self.extension))
-                    .cloned()
-            }
+            ExtensionLocation::Remote { .. } => parsed
+                .get("ext")
+                .and_then(|ext| ext.get(&self.extension))
+                .cloned(),
             _ => self.get_raw_extension_config(&ext_config_path)?,
         };
 
@@ -208,7 +206,7 @@ impl ExtPackageCommand {
         let output_path = self
             .create_rpm_package_in_container(
                 &rpm_metadata,
-                &config,
+                config,
                 &target,
                 &ext_config_path,
                 &package_files,

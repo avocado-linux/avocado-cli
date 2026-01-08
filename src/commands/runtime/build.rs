@@ -103,11 +103,11 @@ impl RuntimeBuildCommand {
             .map(|s| s.to_string());
 
         // Resolve target architecture
-        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Initialize SDK container helper
         let container_helper =
-            SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
         // Create shared RunsOnContext if running on remote host
         let mut runs_on_context: Option<RunsOnContext> = if let Some(ref runs_on) = self.runs_on {
@@ -123,8 +123,8 @@ impl RuntimeBuildCommand {
         // Execute the build and ensure cleanup
         let result = self
             .execute_build_internal(
-                &config,
-                &parsed,
+                config,
+                parsed,
                 container_image,
                 &target_arch,
                 &merged_container_args,
@@ -379,38 +379,25 @@ impl RuntimeBuildCommand {
                 )
             })?;
 
-        let binding = serde_yaml::Mapping::new();
-        let runtime_deps = merged_runtime
-            .get("dependencies")
-            .and_then(|v| v.as_mapping())
-            .unwrap_or(&binding);
-
-        // Extract extension names and any type overrides from runtime dependencies
+        // Extract extension names from the `extensions` array
         let mut required_extensions = HashSet::new();
-        let mut extension_type_overrides: HashMap<String, Vec<String>> = HashMap::new();
+        let _extension_type_overrides: HashMap<String, Vec<String>> = HashMap::new();
 
-        // First, collect direct runtime dependencies
-        for (_dep_name, dep_spec) in runtime_deps {
-            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                required_extensions.insert(ext_name.to_string());
-
-                // Check if the runtime dependency specifies custom types
-                if let Some(types) = dep_spec.get("types").and_then(|v| v.as_sequence()) {
-                    let type_strings: Vec<String> = types
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .collect();
-                    if !type_strings.is_empty() {
-                        extension_type_overrides.insert(ext_name.to_string(), type_strings);
-                    }
+        // Collect extensions from the new `extensions` array format
+        if let Some(extensions) = merged_runtime
+            .get("extensions")
+            .and_then(|e| e.as_sequence())
+        {
+            for ext in extensions {
+                if let Some(ext_name) = ext.as_str() {
+                    required_extensions.insert(ext_name.to_string());
                 }
             }
         }
 
         // Recursively discover all extension dependencies (including nested external extensions)
         let all_required_extensions =
-            self.find_all_extension_dependencies(&config, &required_extensions, target_arch)?;
+            self.find_all_extension_dependencies(config, &required_extensions, target_arch)?;
 
         // Build a map from extension name to versioned name from resolved_extensions
         // Format of resolved_extensions items: "ext_name-version" (e.g., "my-ext-1.0.0")
@@ -648,11 +635,11 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
     /// Recursively collect all dependencies for a single extension
     fn collect_extension_dependencies(
         &self,
-        config: &crate::utils::config::Config,
+        _config: &crate::utils::config::Config,
         ext_name: &str,
         all_extensions: &mut HashSet<String>,
         visited: &mut HashSet<String>,
-        target_arch: &str,
+        _target_arch: &str,
     ) -> Result<()> {
         // Avoid infinite loops
         if visited.contains(ext_name) {
@@ -667,119 +654,26 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         let content = std::fs::read_to_string(&self.config_path)?;
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
-        // Check if this is a local extension
+        // Check if this is a local extension defined in the ext section
+        // Extension source configuration (repo, git, path) is now in the ext section
         if let Some(ext_config) = parsed
             .get("ext")
             .and_then(|e| e.as_mapping())
             .and_then(|table| table.get(ext_name))
         {
-            // This is a local extension - check its dependencies
-            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_mapping())
+            // This is a local extension - check if it has an extensions array for nested deps
+            if let Some(nested_extensions) =
+                ext_config.get("extensions").and_then(|e| e.as_sequence())
             {
-                for (_dep_name, dep_spec) in dependencies {
-                    if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                        // Check if this is an external extension dependency
-                        if let Some(external_config_path) =
-                            dep_spec.get("config").and_then(|v| v.as_str())
-                        {
-                            // This is an external extension - load its config and process recursively
-                            let external_extensions = config.load_external_extensions(
-                                &self.config_path,
-                                external_config_path,
-                            )?;
-
-                            // Add the external extension itself
-                            self.collect_extension_dependencies(
-                                config,
-                                nested_ext_name,
-                                all_extensions,
-                                visited,
-                                target_arch,
-                            )?;
-
-                            // Process its dependencies from the external config
-                            if let Some(ext_config) = external_extensions.get(nested_ext_name) {
-                                if let Some(nested_deps) =
-                                    ext_config.get("dependencies").and_then(|d| d.as_mapping())
-                                {
-                                    for (_nested_dep_name, nested_dep_spec) in nested_deps {
-                                        if let Some(nested_nested_ext_name) =
-                                            nested_dep_spec.get("ext").and_then(|v| v.as_str())
-                                        {
-                                            self.collect_extension_dependencies(
-                                                config,
-                                                nested_nested_ext_name,
-                                                all_extensions,
-                                                visited,
-                                                target_arch,
-                                            )?;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // This is a local extension dependency
-                            self.collect_extension_dependencies(
-                                config,
-                                nested_ext_name,
-                                all_extensions,
-                                visited,
-                                target_arch,
-                            )?;
-                        }
-                    }
-                }
-            }
-        } else {
-            // This might be an external extension - we need to find it in the runtime dependencies
-            // to get its config path, then process its dependencies
-            let merged_runtime = config
-                .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
-                .with_context(|| {
-                    format!(
-                        "Runtime '{}' not found or has no configuration for target '{}'",
-                        self.runtime_name, target_arch
-                    )
-                })?;
-
-            if let Some(runtime_deps) = merged_runtime
-                .get("dependencies")
-                .and_then(|v| v.as_mapping())
-            {
-                for (_dep_name, dep_spec) in runtime_deps {
-                    if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                        if dep_ext_name == ext_name {
-                            if let Some(external_config_path) =
-                                dep_spec.get("config").and_then(|v| v.as_str())
-                            {
-                                // Found the external extension - process its dependencies
-                                let external_extensions = config.load_external_extensions(
-                                    &self.config_path,
-                                    external_config_path,
-                                )?;
-
-                                if let Some(ext_config) = external_extensions.get(ext_name) {
-                                    if let Some(nested_deps) =
-                                        ext_config.get("dependencies").and_then(|d| d.as_mapping())
-                                    {
-                                        for (_nested_dep_name, nested_dep_spec) in nested_deps {
-                                            if let Some(nested_ext_name) =
-                                                nested_dep_spec.get("ext").and_then(|v| v.as_str())
-                                            {
-                                                self.collect_extension_dependencies(
-                                                    config,
-                                                    nested_ext_name,
-                                                    all_extensions,
-                                                    visited,
-                                                    target_arch,
-                                                )?;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
+                for nested_ext in nested_extensions {
+                    if let Some(nested_ext_name) = nested_ext.as_str() {
+                        self.collect_extension_dependencies(
+                            _config,
+                            nested_ext_name,
+                            all_extensions,
+                            visited,
+                            _target_arch,
+                        )?;
                     }
                 }
             }
@@ -807,29 +701,29 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         let merged_runtime =
             config.get_merged_runtime_config(runtime_name, target_arch, config_path)?;
 
-        let runtime_dep_table = merged_runtime
+        let mut extensions = Vec::new();
+
+        // Read extensions from the new `extensions` array format
+        let ext_list = merged_runtime
             .as_ref()
-            .and_then(|value| value.get("dependencies").and_then(|d| d.as_mapping()))
+            .and_then(|value| value.get("extensions").and_then(|e| e.as_sequence()))
             .or_else(|| {
                 parsed
                     .get("runtime")
                     .and_then(|r| r.get(runtime_name))
-                    .and_then(|runtime_value| runtime_value.get("dependencies"))
-                    .and_then(|d| d.as_mapping())
+                    .and_then(|runtime_value| runtime_value.get("extensions"))
+                    .and_then(|e| e.as_sequence())
             });
 
-        let mut extensions = Vec::new();
-
-        if let Some(deps) = runtime_dep_table {
-            for dep_spec in deps.values() {
-                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+        if let Some(ext_seq) = ext_list {
+            for ext in ext_seq {
+                if let Some(ext_name) = ext.as_str() {
                     let version = self
                         .resolve_extension_version(
                             parsed,
                             config,
                             config_path,
                             ext_name,
-                            dep_spec,
                             container_image,
                             target_arch,
                             container_args.clone(),
@@ -846,51 +740,22 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         Ok(extensions)
     }
 
-    /// Resolve the version for an extension dependency.
+    /// Resolve the version for an extension.
     ///
     /// Priority order:
-    /// 1. Explicit `vsn` field in the dependency spec (unless it's "*")
-    /// 2. Version from external config file (if `config` field is specified)
-    /// 3. Version from local `[ext]` section
-    /// 4. Query RPM database for installed version
+    /// 1. Version from local `[ext]` section
+    /// 2. Query RPM database for installed version (for repo-sourced extensions)
     #[allow(clippy::too_many_arguments)]
     async fn resolve_extension_version(
         &self,
         parsed: &serde_yaml::Value,
-        config: &crate::utils::config::Config,
-        config_path: &str,
+        _config: &crate::utils::config::Config,
+        _config_path: &str,
         ext_name: &str,
-        dep_spec: &serde_yaml::Value,
         container_image: &str,
         target_arch: &str,
         container_args: Option<Vec<String>>,
     ) -> Result<String> {
-        // If version is explicitly specified with vsn field, use it (unless it's a wildcard)
-        if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-            if version != "*" {
-                return Ok(version.to_string());
-            }
-            // If vsn is "*", fall through to query RPM for the actual installed version
-        }
-
-        // If external config is specified, try to get version from it
-        if let Some(external_config_path) = dep_spec.get("config").and_then(|v| v.as_str()) {
-            let external_extensions =
-                config.load_external_extensions(config_path, external_config_path)?;
-            if let Some(ext_config) = external_extensions.get(ext_name) {
-                if let Some(version) = ext_config.get("version").and_then(|v| v.as_str()) {
-                    if version != "*" {
-                        return Ok(version.to_string());
-                    }
-                    // If version is "*", fall through to query RPM
-                }
-            }
-            // External config but no version found or version is "*" - query RPM database
-            return self
-                .query_rpm_version(ext_name, container_image, target_arch, container_args)
-                .await;
-        }
-
         // Try to get version from local [ext] section
         if let Some(version) = parsed
             .get("ext")
@@ -1068,9 +933,8 @@ sdk:
 runtime:
   test-runtime:
     target: "x86_64"
-    dependencies:
-      test-dep:
-        ext: test-ext
+    extensions:
+      - test-ext
 
 ext:
   test-ext:
@@ -1102,7 +966,7 @@ ext:
     }
 
     #[test]
-    fn test_create_build_script_with_type_overrides() {
+    fn test_create_build_script_with_extension_types() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
 sdk:
@@ -1111,11 +975,8 @@ sdk:
 runtime:
   test-runtime:
     target: "x86_64"
-    dependencies:
-      test-dep:
-        ext: test-ext
-        types:
-          - sysext
+    extensions:
+      - test-ext
 
 ext:
   test-ext:
@@ -1150,7 +1011,7 @@ ext:
     }
 
     #[test]
-    fn test_create_build_script_no_type_override_uses_extension_defaults() {
+    fn test_create_build_script_uses_extension_defaults() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
 sdk:
@@ -1159,9 +1020,8 @@ sdk:
 runtime:
   test-runtime:
     target: "x86_64"
-    dependencies:
-      test-dep:
-        ext: test-ext
+    extensions:
+      - test-ext
 
 ext:
   test-ext:

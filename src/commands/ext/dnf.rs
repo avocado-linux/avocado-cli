@@ -56,15 +56,15 @@ impl ExtDnfCommand {
         let parsed = &composed.merged_value;
 
         let target = self.resolve_target_architecture(config)?;
-        let extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
-        let container_image = self.get_container_image(&config)?;
+        let extension_location = self.find_extension_in_dependency_tree(config, &target)?;
+        let container_image = self.get_container_image(config)?;
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
         self.execute_dnf_command(
-            &parsed,
+            parsed,
             &container_image,
             &target,
             repo_url.as_ref(),

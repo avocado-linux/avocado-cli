@@ -90,7 +90,7 @@ impl RuntimeProvisionCommand {
             .map(|s| s.to_string());
 
         // Resolve target architecture
-        let target_arch = resolve_target_required(self.config.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.config.target.as_deref(), config)?;
 
         // Detect remote host architecture if using --runs-on
         // This is needed to check if the SDK is installed for the remote's architecture
@@ -113,7 +113,7 @@ impl RuntimeProvisionCommand {
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.config.no_stamps {
-            let container_helper = SdkContainer::from_config(&self.config.config_path, &config)?
+            let container_helper = SdkContainer::from_config(&self.config.config_path, config)?
                 .verbose(self.config.verbose);
 
             // Provision requires runtime build stamp
@@ -180,8 +180,8 @@ impl RuntimeProvisionCommand {
         // For package repository extensions, we query the RPM database to get actual installed versions
         let resolved_extensions = self
             .collect_runtime_extensions(
-                &parsed,
-                &config,
+                parsed,
+                config,
                 &self.config.runtime_name,
                 target_arch.as_str(),
                 &self.config.config_path,
@@ -303,7 +303,7 @@ impl RuntimeProvisionCommand {
             };
 
         // Check if runtime has signing configured
-        let signing_config = self.setup_signing_service(&config).await?;
+        let signing_config = self.setup_signing_service(config).await?;
 
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
@@ -381,7 +381,7 @@ impl RuntimeProvisionCommand {
 
         // Write provision stamp (unless --no-stamps)
         if !self.config.no_stamps {
-            let container_helper = SdkContainer::from_config(&self.config.config_path, &config)?
+            let container_helper = SdkContainer::from_config(&self.config.config_path, config)?
                 .verbose(self.config.verbose);
 
             let inputs = StampInputs::new("provision".to_string());

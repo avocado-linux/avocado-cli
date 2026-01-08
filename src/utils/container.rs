@@ -2100,8 +2100,7 @@ mod tests {
         let arch_part = platform.strip_prefix("linux/").unwrap();
         assert!(
             valid_archs.contains(&arch_part) || !arch_part.is_empty(),
-            "Unexpected platform: {}",
-            platform
+            "Unexpected platform: {platform}"
         );
     }
 

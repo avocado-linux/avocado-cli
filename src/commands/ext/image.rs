@@ -81,7 +81,7 @@ impl ExtImageCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Get SDK configuration from interpolated config (needed for stamp validation)
         let container_image = config
@@ -91,7 +91,7 @@ impl ExtImageCommand {
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             // Resolve required stamps for extension image
             let required = resolve_required_stamps(
@@ -142,9 +142,7 @@ impl ExtImageCommand {
         // and may not find templated extension names like "avocado-bsp-{{ avocado.target }}"
         let extension_location = {
             // First check if extension exists in the composed config's ext section
-            let ext_in_composed = parsed
-                .get("ext")
-                .and_then(|e| e.get(&self.extension));
+            let ext_in_composed = parsed.get("ext").and_then(|e| e.get(&self.extension));
 
             if let Some(ext_config) = ext_in_composed {
                 // Check if it has a source: field (indicating remote extension)
@@ -173,7 +171,10 @@ impl ExtImageCommand {
                 config
                     .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+                        anyhow::anyhow!(
+                            "Extension '{}' not found in configuration.",
+                            self.extension
+                        )
                     })?
             }
         };
@@ -228,13 +229,10 @@ impl ExtImageCommand {
                 if self.verbose {
                     if let Some(all_ext) = parsed.get("ext") {
                         if let Some(ext_map) = all_ext.as_mapping() {
-                            let ext_names: Vec<_> = ext_map
-                                .keys()
-                                .filter_map(|k| k.as_str())
-                                .collect();
+                            let ext_names: Vec<_> =
+                                ext_map.keys().filter_map(|k| k.as_str()).collect();
                             eprintln!(
-                                "[DEBUG] Available extensions in composed config: {:?}",
-                                ext_names
+                                "[DEBUG] Available extensions in composed config: {ext_names:?}"
                             );
                         }
                     }
@@ -328,7 +326,7 @@ impl ExtImageCommand {
             .and_then(|runtime_config| runtime_config.get("target"))
             .and_then(|target| target.as_str())
             .map(|s| s.to_string());
-        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
@@ -370,7 +368,7 @@ impl ExtImageCommand {
 
             // Write extension image stamp (unless --no-stamps)
             if !self.no_stamps {
-                let inputs = compute_ext_input_hash(&parsed, &self.extension)?;
+                let inputs = compute_ext_input_hash(parsed, &self.extension)?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;
@@ -391,7 +389,7 @@ impl ExtImageCommand {
                 };
 
                 let container_helper =
-                    SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                    SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
                 container_helper.run_in_container(run_config).await?;
 
                 if self.verbose {

@@ -1014,30 +1014,13 @@ pub fn resolve_required_stamps_for_runtime_build_with_arch(
 
     let mut reqs = vec![sdk_install, StampRequirement::runtime_install(runtime_name)];
 
+    // All extensions now require install + build + image stamps
+    // Extension source configuration (repo, git, path) is defined in the ext section
     for ext_dep in ext_dependencies {
         let ext_name = ext_dep.name();
-
-        match ext_dep {
-            // Local extensions: require install + build + image stamps
-            RuntimeExtDep::Local(_) => {
-                reqs.push(StampRequirement::ext_install(ext_name));
-                reqs.push(StampRequirement::ext_build(ext_name));
-                reqs.push(StampRequirement::ext_image(ext_name));
-            }
-            // External extensions: require install + build + image stamps
-            RuntimeExtDep::External { .. } => {
-                reqs.push(StampRequirement::ext_install(ext_name));
-                reqs.push(StampRequirement::ext_build(ext_name));
-                reqs.push(StampRequirement::ext_image(ext_name));
-            }
-            // DEPRECATED: Versioned extensions with vsn: syntax
-            // This case should not be reached as vsn: syntax now errors early.
-            // Remote extensions are now handled through the ext section with source: field,
-            // and are treated as local extensions after being fetched.
-            RuntimeExtDep::Versioned { .. } => {
-                // Should not be reached - vsn: syntax errors during config parsing
-            }
-        }
+        reqs.push(StampRequirement::ext_install(ext_name));
+        reqs.push(StampRequirement::ext_build(ext_name));
+        reqs.push(StampRequirement::ext_image(ext_name));
     }
 
     reqs
@@ -1429,23 +1412,15 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_required_stamps_for_runtime_build_with_mixed_extensions() {
+    fn test_resolve_required_stamps_for_runtime_build_with_multiple_extensions() {
         use crate::utils::config::RuntimeExtDep;
 
-        // Test with mixed extension types:
-        // - local-ext: needs install + build + image stamps
-        // - external-ext: needs install + build + image stamps
-        // - versioned-ext: NO stamps (prebuilt package from repo)
+        // Test with multiple extensions:
+        // All extensions are now Local type - source config (repo, git, path) is in ext section
         let ext_deps = vec![
-            RuntimeExtDep::Local("local-ext".to_string()),
-            RuntimeExtDep::External {
-                name: "external-ext".to_string(),
-                config_path: "../external/avocado.yaml".to_string(),
-            },
-            RuntimeExtDep::Versioned {
-                name: "versioned-ext".to_string(),
-                version: "1.0.0".to_string(),
-            },
+            RuntimeExtDep::Local("app".to_string()),
+            RuntimeExtDep::Local("config-dev".to_string()),
+            RuntimeExtDep::Local("avocado-ext-dev".to_string()),
         ];
 
         let reqs = resolve_required_stamps_for_runtime_build("my-runtime", &ext_deps);
@@ -1453,108 +1428,35 @@ mod tests {
         // Should have:
         // - SDK install (1)
         // - Runtime install (1)
-        // - local-ext install + build + image (3)
-        // - external-ext install + build + image (3)
-        // - versioned-ext: NOTHING (prebuilt package from repo)
-        // Total: 8
-        assert_eq!(reqs.len(), 8);
+        // - app install + build + image (3)
+        // - config-dev install + build + image (3)
+        // - avocado-ext-dev install + build + image (3)
+        // Total: 11
+        assert_eq!(reqs.len(), 11);
 
         // Verify SDK and runtime install are present
         assert!(reqs.contains(&StampRequirement::sdk_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("my-runtime")));
 
-        // Verify local extension has install, build, and image
-        assert!(reqs.contains(&StampRequirement::ext_install("local-ext")));
-        assert!(reqs.contains(&StampRequirement::ext_build("local-ext")));
-        assert!(reqs.contains(&StampRequirement::ext_image("local-ext")));
+        // Verify all extensions have install, build, and image
+        assert!(reqs.contains(&StampRequirement::ext_install("app")));
+        assert!(reqs.contains(&StampRequirement::ext_build("app")));
+        assert!(reqs.contains(&StampRequirement::ext_image("app")));
 
-        // Verify external extension has install, build, and image
-        assert!(reqs.contains(&StampRequirement::ext_install("external-ext")));
-        assert!(reqs.contains(&StampRequirement::ext_build("external-ext")));
-        assert!(reqs.contains(&StampRequirement::ext_image("external-ext")));
+        assert!(reqs.contains(&StampRequirement::ext_install("config-dev")));
+        assert!(reqs.contains(&StampRequirement::ext_build("config-dev")));
+        assert!(reqs.contains(&StampRequirement::ext_image("config-dev")));
 
-        // Verify versioned extension has NO stamps at all
-        // (they're prebuilt packages installed via DNF during runtime install)
-        assert!(!reqs.contains(&StampRequirement::ext_install("versioned-ext")));
-        assert!(!reqs.contains(&StampRequirement::ext_build("versioned-ext")));
-        assert!(!reqs.contains(&StampRequirement::ext_image("versioned-ext")));
+        assert!(reqs.contains(&StampRequirement::ext_install("avocado-ext-dev")));
+        assert!(reqs.contains(&StampRequirement::ext_build("avocado-ext-dev")));
+        assert!(reqs.contains(&StampRequirement::ext_image("avocado-ext-dev")));
     }
 
     #[test]
-    fn test_resolve_required_stamps_runtime_build_only_versioned_extensions() {
+    fn test_resolve_required_stamps_runtime_build_local_extensions() {
         use crate::utils::config::RuntimeExtDep;
 
-        // Runtime with ONLY versioned extensions (common for prebuilt extensions from package repo)
-        // Example: avocado-ext-dev, avocado-ext-sshd-dev
-        // Versioned extensions are prebuilt packages - NO stamps required
-        let ext_deps = vec![
-            RuntimeExtDep::Versioned {
-                name: "avocado-ext-dev".to_string(),
-                version: "0.1.0".to_string(),
-            },
-            RuntimeExtDep::Versioned {
-                name: "avocado-ext-sshd-dev".to_string(),
-                version: "0.1.0".to_string(),
-            },
-        ];
-
-        let reqs = resolve_required_stamps_for_runtime_build("dev", &ext_deps);
-
-        // Should ONLY have SDK install + runtime install (2 total)
-        // Versioned extensions don't add any stamp requirements
-        assert_eq!(reqs.len(), 2);
-        assert!(reqs.contains(&StampRequirement::sdk_install()));
-        assert!(reqs.contains(&StampRequirement::runtime_install("dev")));
-
-        // Verify NO extension stamps are required for versioned extensions
-        assert!(!reqs.contains(&StampRequirement::ext_install("avocado-ext-dev")));
-        assert!(!reqs.contains(&StampRequirement::ext_build("avocado-ext-dev")));
-        assert!(!reqs.contains(&StampRequirement::ext_image("avocado-ext-dev")));
-        assert!(!reqs.contains(&StampRequirement::ext_install("avocado-ext-sshd-dev")));
-        assert!(!reqs.contains(&StampRequirement::ext_build("avocado-ext-sshd-dev")));
-        assert!(!reqs.contains(&StampRequirement::ext_image("avocado-ext-sshd-dev")));
-    }
-
-    #[test]
-    fn test_resolve_required_stamps_runtime_build_only_external_extensions() {
-        use crate::utils::config::RuntimeExtDep;
-
-        // Runtime with ONLY external extensions (from external config files)
-        let ext_deps = vec![
-            RuntimeExtDep::External {
-                name: "avocado-ext-peridio".to_string(),
-                config_path: "avocado-ext-peridio/avocado.yml".to_string(),
-            },
-            RuntimeExtDep::External {
-                name: "custom-ext".to_string(),
-                config_path: "../custom/avocado.yaml".to_string(),
-            },
-        ];
-
-        let reqs = resolve_required_stamps_for_runtime_build("my-runtime", &ext_deps);
-
-        // Should have:
-        // - SDK install (1)
-        // - Runtime install (1)
-        // - avocado-ext-peridio install + build + image (3)
-        // - custom-ext install + build + image (3)
-        // Total: 8
-        assert_eq!(reqs.len(), 8);
-
-        // Verify external extensions require install, build, and image
-        assert!(reqs.contains(&StampRequirement::ext_install("avocado-ext-peridio")));
-        assert!(reqs.contains(&StampRequirement::ext_build("avocado-ext-peridio")));
-        assert!(reqs.contains(&StampRequirement::ext_image("avocado-ext-peridio")));
-        assert!(reqs.contains(&StampRequirement::ext_install("custom-ext")));
-        assert!(reqs.contains(&StampRequirement::ext_build("custom-ext")));
-        assert!(reqs.contains(&StampRequirement::ext_image("custom-ext")));
-    }
-
-    #[test]
-    fn test_resolve_required_stamps_runtime_build_only_local_extensions() {
-        use crate::utils::config::RuntimeExtDep;
-
-        // Runtime with ONLY local extensions (defined in main config)
+        // Runtime with extensions (all are now Local type)
         let ext_deps = vec![
             RuntimeExtDep::Local("app".to_string()),
             RuntimeExtDep::Local("config-dev".to_string()),
@@ -1633,20 +1535,25 @@ mod tests {
     fn test_runtime_ext_dep_name() {
         use crate::utils::config::RuntimeExtDep;
 
+        // Test the Local variant (the primary way to specify extensions)
         let local = RuntimeExtDep::Local("my-local-ext".to_string());
         assert_eq!(local.name(), "my-local-ext");
 
-        let external = RuntimeExtDep::External {
-            name: "my-external-ext".to_string(),
-            config_path: "path/to/config.yaml".to_string(),
-        };
-        assert_eq!(external.name(), "my-external-ext");
+        // Test deprecated variants for backward compatibility
+        #[allow(deprecated)]
+        {
+            let external = RuntimeExtDep::External {
+                name: "my-external-ext".to_string(),
+                config_path: "path/to/config.yaml".to_string(),
+            };
+            assert_eq!(external.name(), "my-external-ext");
 
-        let versioned = RuntimeExtDep::Versioned {
-            name: "my-versioned-ext".to_string(),
-            version: "1.2.3".to_string(),
-        };
-        assert_eq!(versioned.name(), "my-versioned-ext");
+            let versioned = RuntimeExtDep::Versioned {
+                name: "my-versioned-ext".to_string(),
+                version: "1.2.3".to_string(),
+            };
+            assert_eq!(versioned.name(), "my-versioned-ext");
+        }
     }
 
     #[test]

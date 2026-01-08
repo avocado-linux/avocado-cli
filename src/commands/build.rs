@@ -22,7 +22,10 @@ pub enum ExtensionDependency {
     /// Extension resolved via DNF with a version specification
     Versioned { name: String, version: String },
     /// Remote extension with source field (repo, git, or path)
-    Remote { name: String, source: ExtensionSource },
+    Remote {
+        name: String,
+        source: ExtensionSource,
+    },
 }
 
 /// Implementation of the 'build' command that runs all build subcommands.
@@ -436,72 +439,56 @@ impl BuildCommand {
         runtimes: &[String],
         target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
+        use crate::utils::interpolation::interpolate_name;
+
         let mut required_extensions = HashSet::new();
-        let mut visited = HashSet::new(); // For cycle detection
+        let _visited = HashSet::<String>::new(); // For cycle detection
 
         // If no runtimes are found for this target, don't build any extensions
         if runtimes.is_empty() {
             return Ok(vec![]);
         }
 
-        let _runtime_section = parsed.get("runtime").and_then(|r| r.as_mapping()).unwrap();
+        // Build a map of interpolated ext names to their source config
+        // This is needed because ext section keys may contain templates like {{ avocado.target }}
+        let mut ext_sources: std::collections::HashMap<String, Option<ExtensionSource>> =
+            std::collections::HashMap::new();
+        if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+            for (ext_key, ext_config) in ext_section {
+                if let Some(raw_name) = ext_key.as_str() {
+                    // Interpolate the extension name with the target
+                    let interpolated_name = interpolate_name(raw_name, target);
+                    // Use parse_extension_source which properly deserializes the source field
+                    let source = Config::parse_extension_source(&interpolated_name, ext_config)
+                        .ok()
+                        .flatten();
+                    ext_sources.insert(interpolated_name, source);
+                }
+            }
+        }
 
         for runtime_name in runtimes {
             // Get merged runtime config for this target
             let merged_runtime =
                 config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
             if let Some(merged_value) = merged_runtime {
-                if let Some(dependencies) = merged_value
-                    .get("dependencies")
-                    .and_then(|d| d.as_mapping())
+                // Read extensions from the new `extensions` array format
+                if let Some(extensions) =
+                    merged_value.get("extensions").and_then(|e| e.as_sequence())
                 {
-                    for (_dep_name, dep_spec) in dependencies {
-                        // Check for extension dependency
-                        if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                            // Check if this is a versioned extension (has vsn field)
-                            if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-                                let ext_dep = ExtensionDependency::Versioned {
+                    for ext in extensions {
+                        if let Some(ext_name) = ext.as_str() {
+                            // Check if this extension has a source: field (remote extension)
+                            if let Some(Some(source)) = ext_sources.get(ext_name) {
+                                // Remote extension with source field
+                                required_extensions.insert(ExtensionDependency::Remote {
                                     name: ext_name.to_string(),
-                                    version: version.to_string(),
-                                };
-                                required_extensions.insert(ext_dep);
-                            }
-                            // Check if this is an external extension (has config field)
-                            else if let Some(external_config) =
-                                dep_spec.get("config").and_then(|v| v.as_str())
-                            {
-                                let ext_dep = ExtensionDependency::External {
-                                    name: ext_name.to_string(),
-                                    config_path: external_config.to_string(),
-                                };
-                                required_extensions.insert(ext_dep.clone());
-
-                                // Recursively find nested external extension dependencies
-                                self.find_nested_external_extensions(
-                                    config,
-                                    &ext_dep,
-                                    &mut required_extensions,
-                                    &mut visited,
-                                )?;
+                                    source: source.clone(),
+                                });
                             } else {
-                                // Check if this extension has a source: field (remote extension)
-                                let ext_source = parsed
-                                    .get("ext")
-                                    .and_then(|e| e.get(ext_name))
-                                    .and_then(|ext| ext.get("source"))
-                                    .and_then(|s| ExtensionSource::from_yaml(s));
-
-                                if let Some(source) = ext_source {
-                                    // Remote extension with source field
-                                    required_extensions.insert(ExtensionDependency::Remote {
-                                        name: ext_name.to_string(),
-                                        source,
-                                    });
-                                } else {
-                                    // Local extension
-                                    required_extensions
-                                        .insert(ExtensionDependency::Local(ext_name.to_string()));
-                                }
+                                // Local extension (defined in ext section without source, or not in ext section)
+                                required_extensions
+                                    .insert(ExtensionDependency::Local(ext_name.to_string()));
                             }
                         }
                     }
@@ -526,123 +513,6 @@ impl BuildCommand {
             name_a.cmp(name_b)
         });
         Ok(extensions)
-    }
-
-    /// Recursively find nested external extension dependencies
-    fn find_nested_external_extensions(
-        &self,
-        config: &Config,
-        ext_dep: &ExtensionDependency,
-        required_extensions: &mut HashSet<ExtensionDependency>,
-        visited: &mut HashSet<String>,
-    ) -> Result<()> {
-        let (ext_name, ext_config_path) = match ext_dep {
-            ExtensionDependency::External { name, config_path } => (name, config_path),
-            ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
-            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
-            ExtensionDependency::Remote { .. } => return Ok(()), // Remote extensions are handled separately
-        };
-
-        // Cycle detection: check if we've already processed this extension
-        let ext_key = format!("{ext_name}:{ext_config_path}");
-        if visited.contains(&ext_key) {
-            if self.verbose {
-                print_info(
-                    &format!("Skipping already processed extension '{ext_name}' to avoid cycles"),
-                    OutputLevel::Normal,
-                );
-            }
-            return Ok(());
-        }
-        visited.insert(ext_key);
-
-        // Load the external extension configuration
-        let resolved_external_config_path =
-            config.resolve_path_relative_to_src_dir(&self.config_path, ext_config_path);
-        let external_extensions =
-            config.load_external_extensions(&self.config_path, ext_config_path)?;
-
-        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
-            )
-        })?;
-
-        // Load the nested config file to get its src_dir setting
-        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
-            .with_context(|| {
-                format!(
-                    "Failed to read nested config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
-            .with_context(|| {
-                format!(
-                    "Failed to parse nested config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-
-        // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
-
-        // Check if this external extension has dependencies
-        if let Some(dependencies) = extension_config
-            .get("dependencies")
-            .and_then(|d| d.as_mapping())
-        {
-            for (_dep_name, dep_spec) in dependencies {
-                // Check for nested extension dependency
-                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                    // Check if this is a nested external extension (has config field)
-                    if let Some(nested_external_config) =
-                        dep_spec.get("config").and_then(|v| v.as_str())
-                    {
-                        // Resolve the nested config path relative to the nested config's src_dir
-                        let nested_config_path = nested_config_obj
-                            .resolve_path_relative_to_src_dir(
-                                &resolved_external_config_path,
-                                nested_external_config,
-                            );
-
-                        let nested_ext_dep = ExtensionDependency::External {
-                            name: nested_ext_name.to_string(),
-                            config_path: nested_config_path.to_string_lossy().to_string(),
-                        };
-
-                        // Add the nested extension to required extensions
-                        required_extensions.insert(nested_ext_dep.clone());
-
-                        if self.verbose {
-                            print_info(
-                                &format!("Found nested external extension '{nested_ext_name}' required by '{ext_name}' at '{}'", nested_config_path.display()),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Recursively process the nested extension
-                        self.find_nested_external_extensions(
-                            config,
-                            &nested_ext_dep,
-                            required_extensions,
-                            visited,
-                        )?;
-                    } else {
-                        // This is a local extension dependency within the external config
-                        // We don't need to process it further as it will be handled during build
-                        if self.verbose {
-                            print_info(
-                                &format!("Found local extension dependency '{nested_ext_name}' in external extension '{ext_name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Build an external extension using its own config file

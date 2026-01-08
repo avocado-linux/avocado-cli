@@ -61,7 +61,7 @@ impl RuntimeDnfCommand {
         let repo_release = config.get_sdk_repo_release();
 
         self.execute_dnf_command(
-            &parsed,
+            parsed,
             &container_image,
             &target,
             repo_url.as_ref(),

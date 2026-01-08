@@ -90,9 +90,9 @@ impl SdkCompileCommand {
             let container_image = config
                 .get_sdk_image()
                 .context("No SDK container image specified in configuration")?;
-            let target = resolve_target_required(self.target.as_deref(), &config)?;
+            let target = resolve_target_required(self.target.as_deref(), config)?;
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             let requirements = vec![StampRequirement::sdk_install()];
 
@@ -154,7 +154,7 @@ impl SdkCompileCommand {
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Get compile sections from config
-        let compile_sections = self.get_compile_sections_from_config(&config);
+        let compile_sections = self.get_compile_sections_from_config(config);
 
         if compile_sections.is_empty() {
             // If specific sections were requested but none found, this is an error
@@ -221,7 +221,7 @@ impl SdkCompileCommand {
         let repo_release = config.get_sdk_repo_release();
 
         // Resolve target with proper precedence
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         let mut overall_success = true;
 
@@ -235,7 +235,7 @@ impl SdkCompileCommand {
             );
 
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             let compile_command = format!(
                 r#"if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,

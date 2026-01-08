@@ -159,8 +159,8 @@ impl RuntimeInstallCommand {
         // Execute installation and ensure cleanup
         let result = self
             .execute_install_internal(
-                &parsed,
-                &config,
+                parsed,
+                config,
                 &runtimes_to_install,
                 &container_helper,
                 container_image,
@@ -397,7 +397,9 @@ impl RuntimeInstallCommand {
         let sysroot = SysrootType::Runtime(runtime.to_string());
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
-            // Build list of packages to install (excluding extension references)
+            // Build list of packages to install
+            // Note: Extensions are now listed in the separate `extensions` array,
+            // so dependencies should only contain package references.
             let mut packages = Vec::new();
             let mut package_names = Vec::new();
             for (package_name_val, version_spec) in deps_map {
@@ -406,32 +408,6 @@ impl RuntimeInstallCommand {
                     Some(name) => name,
                     None => continue, // Skip if package name is not a string
                 };
-
-                // Skip extension dependencies (identified by 'ext' key)
-                // Note: Extension dependencies are handled by the main install command,
-                // not by individual runtime install
-                if let serde_yaml::Value::Mapping(spec_map) = version_spec {
-                    if spec_map.contains_key(serde_yaml::Value::String("ext".to_string())) {
-                        if self.verbose {
-                            let dep_type = if spec_map
-                                .contains_key(serde_yaml::Value::String("vsn".to_string()))
-                            {
-                                "versioned extension"
-                            } else if spec_map
-                                .contains_key(serde_yaml::Value::String("config".to_string()))
-                            {
-                                "external extension"
-                            } else {
-                                "local extension"
-                            };
-                            print_debug(
-                                &format!("Skipping {dep_type} dependency '{package_name}' (handled by main install command)"),
-                                OutputLevel::Normal,
-                            );
-                        }
-                        continue;
-                    }
-                }
 
                 let config_version = if let Some(version) = version_spec.as_str() {
                     version.to_string()

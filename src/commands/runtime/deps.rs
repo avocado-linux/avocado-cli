@@ -65,50 +65,31 @@ impl RuntimeDepsCommand {
             .get(runtime_name)
             .with_context(|| format!("Runtime '{runtime_name}' not found"))?;
 
-        let runtime_deps = runtime_spec
-            .get("dependencies")
-            .and_then(|v| v.as_mapping());
-
         let mut dependencies = Vec::new();
 
-        if let Some(deps_table) = runtime_deps {
+        // New way: Read extensions from the `extensions` array
+        if let Some(extensions) = runtime_spec.get("extensions").and_then(|e| e.as_sequence()) {
+            for ext in extensions {
+                if let Some(ext_name) = ext.as_str() {
+                    dependencies.push(self.resolve_extension_dependency(parsed, ext_name));
+                }
+            }
+        }
+
+        // Read package dependencies from the `dependencies` section
+        if let Some(deps_table) = runtime_spec
+            .get("dependencies")
+            .and_then(|v| v.as_mapping())
+        {
             for (dep_name_val, dep_spec) in deps_table {
                 if let Some(dep_name) = dep_name_val.as_str() {
-                    if let Some(dependency) = self.resolve_dependency(parsed, dep_name, dep_spec) {
-                        dependencies.push(dependency);
-                    }
+                    dependencies.push(self.resolve_package_dependency(dep_name, dep_spec));
                 }
             }
         }
 
         self.sort_dependencies(&mut dependencies);
         Ok(dependencies)
-    }
-
-    fn resolve_dependency(
-        &self,
-        parsed: &serde_yaml::Value,
-        dep_name: &str,
-        dep_spec: &serde_yaml::Value,
-    ) -> Option<(String, String, String)> {
-        // Try to resolve as extension reference first
-        if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-            // Check if this is a versioned extension (has vsn field)
-            if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-                return Some(("ext".to_string(), ext_name.to_string(), version.to_string()));
-            }
-            // Check if this is an external extension (has config field)
-            else if dep_spec.get("config").is_some() {
-                // For external extensions, we don't have a local version, so use "*"
-                return Some(("ext".to_string(), ext_name.to_string(), "*".to_string()));
-            } else {
-                // Local extension - resolve from local config
-                return Some(self.resolve_extension_dependency(parsed, ext_name));
-            }
-        }
-
-        // Otherwise treat as package dependency
-        Some(self.resolve_package_dependency(dep_name, dep_spec))
     }
 
     fn resolve_extension_dependency(
@@ -132,12 +113,18 @@ impl RuntimeDepsCommand {
         dep_name: &str,
         dep_spec: &serde_yaml::Value,
     ) -> (String, String, String) {
-        let version = dep_spec
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("*");
+        // Version can be a string directly or in a mapping with 'version' key
+        let version = if let Some(v) = dep_spec.as_str() {
+            v.to_string()
+        } else {
+            dep_spec
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("*")
+                .to_string()
+        };
 
-        ("pkg".to_string(), dep_name.to_string(), version.to_string())
+        ("pkg".to_string(), dep_name.to_string(), version)
     }
 
     fn sort_dependencies(&self, dependencies: &mut [(String, String, String)]) {
@@ -169,11 +156,10 @@ sdk:
 runtime:
   test-runtime:
     target: "x86_64"
+    extensions:
+      - my-extension
     dependencies:
-      gcc:
-        version: "11.0"
-      app-ext:
-        ext: my-extension
+      gcc: "11.0"
 
 ext:
   my-extension:
