@@ -988,10 +988,9 @@ impl SdkContainer {
             );
         }
 
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
-
         if detach {
+            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            cmd.args(&container_cmd[1..]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = cmd
                 .output()
@@ -1014,12 +1013,17 @@ impl SdkContainer {
                 Ok(false)
             }
         } else {
-            // In non-detached mode, we need to capture output to ensure stderr is visible
+            // In non-detached mode, inherit stdio and wait for completion
+            // Signal handling is done via traps in the entrypoint script
+            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            cmd.args(&container_cmd[1..]);
             cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
             let status = cmd
                 .status()
                 .await
                 .with_context(|| "Failed to execute container command")?;
+
             Ok(status.success())
         }
     }
@@ -1159,6 +1163,17 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
         let mut script = format!(
             r#"
 set -e
+
+# Set up signal handlers to forward signals to all child processes
+# This ensures that when the container receives SIGTERM/SIGINT,
+# the compile script also gets terminated immediately
+cleanup() {{
+    # Kill all child processes
+    pkill -P $$ 2>/dev/null || true
+    exit $1
+}}
+trap 'cleanup 143' TERM
+trap 'cleanup 130' INT
 
 # Remote execution mode - NFS volumes mounted
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Remote execution mode - using NFS-mounted volumes"; fi
@@ -1342,6 +1357,17 @@ fi
         let mut script = format!(
             r#"
 set -e
+
+# Set up signal handlers to forward signals to all child processes
+# This ensures that when the container receives SIGTERM/SIGINT,
+# the compile script also gets terminated immediately
+cleanup() {{
+    # Kill all child processes
+    pkill -P $$ 2>/dev/null || true
+    exit $1
+}}
+trap 'cleanup 143' TERM
+trap 'cleanup 130' INT
 
 # Remount source directory with permission translation via bindfs
 # This maps host UID/GID to root inside the container for seamless file access
