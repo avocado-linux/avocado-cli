@@ -73,15 +73,16 @@ impl SdkCompileCommand {
 
     /// Execute the sdk compile command
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration
+        // Load composed configuration (includes remote extension compile sections)
         if self.verbose {
             print_info(
                 &format!("Loading SDK compile config from: {}", self.config_path),
                 OutputLevel::Normal,
             );
         }
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
 
         // Validate stamps before proceeding (unless --no-stamps)
         // SDK compile requires SDK to be installed

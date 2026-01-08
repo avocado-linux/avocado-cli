@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -45,14 +45,16 @@ impl RuntimeDnfCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .context("Failed to load composed config")?;
+        let config = &composed.config;
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let parsed = &composed.merged_value;
 
-        self.validate_runtime_exists(&parsed)?;
-        let container_image = self.get_container_image(&config)?;
-        let target = self.resolve_target_architecture(&config)?;
+        self.validate_runtime_exists(parsed)?;
+        let container_image = self.get_container_image(config)?;
+        let target = self.resolve_target_architecture(config)?;
 
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();

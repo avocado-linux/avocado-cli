@@ -1,7 +1,7 @@
 // Allow deprecated variants for backward compatibility during migration
 #![allow(deprecated)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -48,12 +48,14 @@ impl ExtDnfCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .context("Failed to load composed config")?;
+        let config = &composed.config;
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let parsed = &composed.merged_value;
 
-        let target = self.resolve_target_architecture(&config)?;
+        let target = self.resolve_target_architecture(config)?;
         let extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
         let container_image = self.get_container_image(&config)?;
 

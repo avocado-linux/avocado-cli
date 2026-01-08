@@ -70,10 +70,11 @@ impl RuntimeInstallCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration and parse raw TOML
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());

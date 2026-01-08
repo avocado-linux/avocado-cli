@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use crate::utils::signing_service::{generate_helper_script, SigningService, SigningServiceConfig};
 use crate::utils::{
-    config::load_config,
+    config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     remote::{RemoteHost, SshClient},
@@ -57,10 +57,11 @@ impl RuntimeProvisionCommand {
     }
 
     pub async fn execute(&mut self) -> Result<()> {
-        // Load configuration
-        let config = load_config(&self.config.config_path)?;
-        let content = std::fs::read_to_string(&self.config.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load composed configuration (includes remote extension configs with provision profiles)
+        let composed =
+            Config::load_composed(&self.config.config_path, self.config.target.as_deref())?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Get SDK configuration from interpolated config
         let container_image = config
@@ -587,8 +588,10 @@ avocado-provision-{} {}
             );
         }
 
-        // Load configuration to get container image
-        let config = load_config(&self.config.config_path)?;
+        // Load composed configuration to get container image
+        let composed =
+            Config::load_composed(&self.config.config_path, self.config.target.as_deref())?;
+        let config = &composed.config;
         let container_image = config
             .get_sdk_image()
             .context("No SDK container image specified in configuration")?;
@@ -677,8 +680,10 @@ avocado-provision-{} {}
             );
         }
 
-        // Load configuration to get container image
-        let config = load_config(&self.config.config_path)?;
+        // Load composed configuration to get container image
+        let composed =
+            Config::load_composed(&self.config.config_path, self.config.target.as_deref())?;
+        let config = &composed.config;
         let container_image = config
             .get_sdk_image()
             .context("No SDK container image specified in configuration")?;

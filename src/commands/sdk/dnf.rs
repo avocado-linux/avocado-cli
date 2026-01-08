@@ -62,9 +62,10 @@ impl SdkDnfCommand {
             ));
         }
 
-        // Load the configuration
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
 
         // Get the SDK image from configuration
         let container_image = config.get_sdk_image().ok_or_else(|| {
@@ -79,7 +80,7 @@ impl SdkDnfCommand {
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Resolve target with proper precedence
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         let container_helper = SdkContainer::new();
 

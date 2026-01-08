@@ -290,35 +290,12 @@ impl ExtInstallCommand {
                 );
             }
 
-            // Get the config path where this extension is actually defined
-            let ext_config_path = match ext_location {
-                ExtensionLocation::Local { config_path, .. } => config_path.clone(),
-                ExtensionLocation::External { config_path, .. } => {
-                    // Resolve relative path against main config directory
-                    let main_config_dir = std::path::Path::new(&self.config_path)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    main_config_dir
-                        .join(config_path)
-                        .to_string_lossy()
-                        .to_string()
-                }
-                ExtensionLocation::Remote { name, .. } => {
-                    // Remote extensions are installed to $AVOCADO_PREFIX/includes/<name>/
-                    let ext_install_path =
-                        config.get_extension_install_path(&self.config_path, name, target);
-                    ext_install_path
-                        .join("avocado.yaml")
-                        .to_string_lossy()
-                        .to_string()
-                }
-            };
-
             if !self
                 .install_single_extension(
                     config,
+                    parsed,
                     ext_name,
-                    &ext_config_path,
+                    ext_location,
                     container_helper,
                     container_image,
                     target,
@@ -383,8 +360,9 @@ impl ExtInstallCommand {
     async fn install_single_extension(
         &self,
         config: &Config,
+        parsed: &serde_yaml::Value,
         extension: &str,
-        ext_config_path: &str,
+        ext_location: &ExtensionLocation,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
@@ -453,9 +431,23 @@ impl ExtInstallCommand {
             }
         }
 
-        // Get merged extension configuration from the correct config file
-        // This properly handles both local and external extensions
-        let ext_config = config.get_merged_ext_config(extension, target, ext_config_path)?;
+        // Get extension configuration from the composed/merged config
+        // For remote extensions, this comes from the merged remote extension config
+        // For local extensions, this comes from the main config's ext section
+        let ext_config = match ext_location {
+            ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => {
+                // Use the already-merged config from `parsed` which contains remote extension configs
+                parsed
+                    .get("ext")
+                    .and_then(|ext| ext.get(extension))
+                    .cloned()
+            }
+            #[allow(deprecated)]
+            ExtensionLocation::External { config_path, .. } => {
+                // For deprecated external configs, read from the file
+                config.get_merged_ext_config(extension, target, config_path)?
+            }
+        };
 
         // Install dependencies if they exist
         let dependencies = ext_config.as_ref().and_then(|ec| ec.get("dependencies"));

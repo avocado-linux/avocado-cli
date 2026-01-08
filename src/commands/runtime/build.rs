@@ -1,5 +1,5 @@
 use crate::utils::{
-    config::load_config,
+    config::Config,
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -68,10 +68,11 @@ impl RuntimeBuildCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
-        let config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load composed configuration (includes remote extension configs)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Merge container args from config and CLI with environment variable expansion
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
@@ -366,7 +367,9 @@ impl RuntimeBuildCommand {
         resolved_extensions: &[String],
     ) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
-        let config = crate::utils::config::Config::load(&self.config_path)?;
+        // Use load_composed to include remote extension configs
+        let composed = Config::load_composed(&self.config_path, Some(target_arch))?;
+        let config = &composed.config;
         let merged_runtime = config
             .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
             .with_context(|| {

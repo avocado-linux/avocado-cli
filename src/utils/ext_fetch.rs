@@ -92,6 +92,7 @@ impl ExtensionFetcher {
                 version,
                 package,
                 repo_name,
+                ..  // include field not needed for fetching
             } => {
                 self.fetch_from_repo(
                     ext_name,
@@ -106,6 +107,7 @@ impl ExtensionFetcher {
                 url,
                 git_ref,
                 sparse_checkout,
+                ..  // include field not needed for fetching
             } => {
                 self.fetch_from_git(
                     ext_name,
@@ -116,7 +118,7 @@ impl ExtensionFetcher {
                 )
                 .await?;
             }
-            ExtensionSource::Path { path } => {
+            ExtensionSource::Path { path, .. } => {
                 self.fetch_from_path(ext_name, path, &ext_install_path)
                     .await?;
             }

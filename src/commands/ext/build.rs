@@ -83,10 +83,11 @@ impl ExtBuildCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let _parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load composed configuration (includes remote extension configs with compile sections)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
+        let _parsed = &composed.merged_value;
 
         // Merge container args from config and CLI (similar to SDK commands)
         let processed_container_args =
@@ -94,7 +95,7 @@ impl ExtBuildCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Get SDK configuration from interpolated config
         let container_image = config

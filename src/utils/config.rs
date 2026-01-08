@@ -137,6 +137,12 @@ pub enum ExtensionSource {
         /// Optional custom repository name
         #[serde(skip_serializing_if = "Option::is_none")]
         repo_name: Option<String>,
+        /// Optional list of config sections to include from the remote extension.
+        /// Supports dot-separated paths (e.g., "provision.tegraflash") and wildcards (e.g., "provision.*").
+        /// The extension's own `ext.<name>` section is always included.
+        /// Referenced `sdk.compile.*` sections are auto-included based on compile dependencies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include: Option<Vec<String>>,
     },
     /// Extension from a git repository
     Git {
@@ -148,12 +154,68 @@ pub enum ExtensionSource {
         /// Optional sparse checkout paths
         #[serde(skip_serializing_if = "Option::is_none")]
         sparse_checkout: Option<Vec<String>>,
+        /// Optional list of config sections to include from the remote extension.
+        /// Supports dot-separated paths (e.g., "provision.tegraflash") and wildcards (e.g., "provision.*").
+        /// The extension's own `ext.<name>` section is always included.
+        /// Referenced `sdk.compile.*` sections are auto-included based on compile dependencies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include: Option<Vec<String>>,
     },
     /// Extension from a local filesystem path
     Path {
         /// Path to the extension directory (relative to config or absolute)
         path: String,
+        /// Optional list of config sections to include from the remote extension.
+        /// Supports dot-separated paths (e.g., "provision.tegraflash") and wildcards (e.g., "provision.*").
+        /// The extension's own `ext.<name>` section is always included.
+        /// Referenced `sdk.compile.*` sections are auto-included based on compile dependencies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include: Option<Vec<String>>,
     },
+}
+
+impl ExtensionSource {
+    /// Get the include patterns for this extension source.
+    /// Returns an empty slice if no include patterns are specified.
+    pub fn get_include_patterns(&self) -> &[String] {
+        match self {
+            ExtensionSource::Repo { include, .. } => {
+                include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
+            }
+            ExtensionSource::Git { include, .. } => {
+                include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
+            }
+            ExtensionSource::Path { include, .. } => {
+                include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
+            }
+        }
+    }
+
+    /// Check if a config path matches any of the include patterns.
+    ///
+    /// Supports:
+    /// - Exact matches: "provision.tegraflash" matches "provision.tegraflash"
+    /// - Wildcard suffix: "provision.*" matches "provision.tegraflash", "provision.usb", etc.
+    ///
+    /// Returns true if the path matches at least one include pattern.
+    pub fn matches_include_pattern(config_path: &str, patterns: &[String]) -> bool {
+        for pattern in patterns {
+            if pattern.ends_with(".*") {
+                // Wildcard pattern: check if config_path starts with the prefix
+                let prefix = &pattern[..pattern.len() - 2]; // Remove ".*"
+                if config_path.starts_with(prefix)
+                    && (config_path.len() == prefix.len()
+                        || config_path.chars().nth(prefix.len()) == Some('.'))
+                {
+                    return true;
+                }
+            } else if config_path == pattern {
+                // Exact match
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Represents an extension dependency for a runtime with type information
@@ -644,8 +706,24 @@ impl Config {
                 &external_content,
             )?;
 
+            // For external configs (deprecated `config: path` syntax), use permissive include patterns
+            // to maintain backward compatibility - merge all sections
+            let legacy_include_patterns = vec![
+                "provision.*".to_string(),
+                "sdk.dependencies.*".to_string(),
+                "sdk.compile.*".to_string(),
+            ];
+            let auto_include_compile =
+                Self::find_compile_dependencies_in_ext(&external_config, ext_name);
+
             // Merge external config into main config
-            Self::merge_external_config(&mut main_config, &external_config, ext_name);
+            Self::merge_external_config(
+                &mut main_config,
+                &external_config,
+                ext_name,
+                &legacy_include_patterns,
+                &auto_include_compile,
+            );
 
             // Record this extension's source (the external config path)
             let resolved_path_str = resolved_path.to_string_lossy().to_string();
@@ -731,40 +809,63 @@ impl Config {
             return Ok(extension_sources);
         }
 
-        // Get extensions directory from volume or fallback path
-        let extensions_dir =
-            temp_config.get_extensions_dir(&config_path.to_string_lossy(), &resolved_target);
+        // Get src_dir for loading volume state
+        let config_path_str = config_path.to_string_lossy();
+        let src_dir = temp_config
+            .get_resolved_src_dir(config_path_str.as_ref())
+            .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
-        // For each remote extension, check if it's installed and merge its config
-        for (ext_name, _source) in remote_extensions {
-            let ext_install_path = extensions_dir.join(&ext_name);
+        // Try to load volume state for container-based config reading
+        let volume_state = crate::utils::volume::VolumeState::load_from_dir(&src_dir)
+            .ok()
+            .flatten();
 
-            // Try to find the extension's config file
-            let ext_config_path = if ext_install_path.join("avocado.yaml").exists() {
-                ext_install_path.join("avocado.yaml")
-            } else if ext_install_path.join("avocado.yml").exists() {
-                ext_install_path.join("avocado.yml")
-            } else if ext_install_path.join("avocado.toml").exists() {
-                ext_install_path.join("avocado.toml")
-            } else {
-                // Extension not installed yet, skip
-                continue;
+        // For each remote extension, try to read its config via container
+        for (ext_name, source) in remote_extensions {
+            // Try to read extension config via container command
+            let ext_content = match &volume_state {
+                Some(vs) => {
+                    match Self::read_extension_config_via_container(vs, &resolved_target, &ext_name)
+                    {
+                        Ok(content) => content,
+                        Err(_) => {
+                            // Extension not installed yet or config not found, skip
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    // No volume state - try fallback to local path (for development)
+                    let fallback_dir = src_dir
+                        .join(".avocado")
+                        .join(&resolved_target)
+                        .join("includes")
+                        .join(&ext_name);
+                    let config_path_local = fallback_dir.join("avocado.yaml");
+                    if config_path_local.exists() {
+                        match fs::read_to_string(&config_path_local) {
+                            Ok(content) => content,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
             };
 
-            // Load the remote extension's config
-            let ext_content = fs::read_to_string(&ext_config_path).with_context(|| {
-                format!(
-                    "Failed to read remote extension config: {}",
-                    ext_config_path.display()
-                )
-            })?;
-            let ext_config = Self::parse_config_value(
-                ext_config_path.to_str().unwrap_or(&ext_name),
-                &ext_content,
-            )?;
+            // Use a .yaml extension so parse_config_value knows to parse as YAML
+            let ext_config_path = format!("{ext_name}/avocado.yaml");
+            let ext_config = match Self::parse_config_value(&ext_config_path, &ext_content) {
+                Ok(cfg) => cfg,
+                Err(_) => {
+                    // Failed to parse config, skip this extension
+                    continue;
+                }
+            };
 
-            // Record this extension's source config path
-            let ext_config_path_str = ext_config_path.to_string_lossy().to_string();
+            // Record this extension's source (container path for reference)
+            let ext_config_path_str =
+                format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml");
             extension_sources.insert(ext_name.clone(), ext_config_path_str.clone());
 
             // Also record any extensions defined within this remote extension's config
@@ -777,11 +878,83 @@ impl Config {
                 }
             }
 
-            // Merge the remote extension config
-            Self::merge_external_config(main_config, &ext_config, &ext_name);
+            // Get include patterns from the extension source
+            let include_patterns = source.get_include_patterns();
+
+            // Find compile dependencies to auto-include from the extension's own section
+            let auto_include_compile =
+                Self::find_compile_dependencies_in_ext(&ext_config, &ext_name);
+
+            // Merge the remote extension config with include patterns
+            Self::merge_external_config(
+                main_config,
+                &ext_config,
+                &ext_name,
+                include_patterns,
+                &auto_include_compile,
+            );
         }
 
         Ok(extension_sources)
+    }
+
+    /// Read a remote extension's config file by running a container command.
+    ///
+    /// This runs a lightweight container to cat the extension's avocado.yaml from
+    /// the Docker volume, avoiding permission issues with direct host access.
+    fn read_extension_config_via_container(
+        volume_state: &crate::utils::volume::VolumeState,
+        target: &str,
+        ext_name: &str,
+    ) -> Result<String> {
+        // The extension config path inside the container
+        let container_config_path =
+            format!("/opt/_avocado/{target}/includes/{ext_name}/avocado.yaml");
+
+        // Run a minimal container to cat the config file
+        // We use busybox as a lightweight image, but fall back to alpine if needed
+        let images_to_try = [
+            "busybox:latest",
+            "alpine:latest",
+            "docker.io/library/busybox:latest",
+        ];
+
+        for image in &images_to_try {
+            let output = std::process::Command::new(&volume_state.container_tool)
+                .args([
+                    "run",
+                    "--rm",
+                    "-v",
+                    &format!("{}:/opt/_avocado:ro", volume_state.volume_name),
+                    image,
+                    "cat",
+                    &container_config_path,
+                ])
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let content = String::from_utf8_lossy(&out.stdout).to_string();
+                    if content.is_empty() {
+                        anyhow::bail!("Extension config file is empty");
+                    }
+                    return Ok(content);
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    // If file not found, bail immediately (no point trying other images)
+                    if stderr.contains("No such file") || stderr.contains("not found") {
+                        anyhow::bail!("Extension config not found: {container_config_path}");
+                    }
+                    // Otherwise, continue to try next image
+                }
+                Err(_) => {
+                    // Continue to try next image
+                }
+            }
+        }
+
+        anyhow::bail!("Failed to read extension config via container for '{ext_name}'")
     }
 
     /// Discover all external config references in runtime and ext dependencies.
@@ -912,21 +1085,34 @@ impl Config {
 
     /// Merge an external config into the main config.
     ///
-    /// Merges:
-    /// - `ext.*` sections (external extensions added to main ext section)
-    /// - `sdk.dependencies` (merged, main takes precedence on conflicts)
-    /// - `sdk.compile` (merged, main takes precedence on conflicts)
+    /// Always merges:
+    /// - `ext.<ext_name>` section (the extension's own section)
     ///
-    /// Does NOT merge:
-    /// - `distro` (main config only)
-    /// - `default_target` (main config only)
-    /// - `supported_targets` (main config only)
+    /// Conditionally merges (based on include_patterns):
+    /// - `provision.<profile>` sections (if pattern matches)
+    /// - `sdk.dependencies.<dep>` (if pattern matches)
+    /// - `sdk.compile.<section>` (if pattern matches)
+    ///
+    /// Does NOT merge (main config only):
+    /// - `distro`
+    /// - `default_target`
+    /// - `supported_targets`
+    /// - `sdk.image`, `sdk.container_args`, etc. (base SDK settings)
+    ///
+    /// # Arguments
+    /// * `main_config` - The main config to merge into
+    /// * `external_config` - The external config to merge from
+    /// * `ext_name` - The name of the extension (its `ext.<name>` is always merged)
+    /// * `include_patterns` - Patterns for additional sections to include (e.g., "provision.*")
+    /// * `auto_include_compile` - List of sdk.compile section names to auto-include (from compile deps)
     fn merge_external_config(
         main_config: &mut serde_yaml::Value,
         external_config: &serde_yaml::Value,
-        _ext_name: &str,
+        ext_name: &str,
+        include_patterns: &[String],
+        auto_include_compile: &[String],
     ) {
-        // Merge ext sections
+        // Always merge the extension's own ext.<ext_name> section
         if let Some(external_ext) = external_config.get("ext").and_then(|e| e.as_mapping()) {
             let main_ext = main_config
                 .as_mapping_mut()
@@ -942,58 +1128,161 @@ impl Config {
                 .and_then(|e| e.as_mapping_mut());
 
             if let Some(main_ext_map) = main_ext {
-                for (ext_key, ext_value) in external_ext {
-                    // Only add if not already present in main config
-                    if !main_ext_map.contains_key(ext_key) {
-                        main_ext_map.insert(ext_key.clone(), ext_value.clone());
+                // Deep-merge the extension's own section (ext.<ext_name>)
+                // This handles the case where main config has a stub with just `source:`
+                // and the remote extension has the full definition with `dependencies:` etc.
+                let ext_key = serde_yaml::Value::String(ext_name.to_string());
+                if let Some(ext_value) = external_ext.get(&ext_key) {
+                    if let Some(existing_ext) = main_ext_map.get_mut(&ext_key) {
+                        // Deep-merge: add fields from remote that don't exist in main
+                        // Main config values take precedence on conflicts
+                        Self::deep_merge_ext_section(existing_ext, ext_value);
+                    } else {
+                        // Extension not in main config, just add it
+                        main_ext_map.insert(ext_key, ext_value.clone());
                     }
                 }
             }
         }
 
-        // Merge sdk.dependencies
+        // Merge provision sections based on include patterns
+        if let Some(external_provision) = external_config
+            .get("provision")
+            .and_then(|p| p.as_mapping())
+        {
+            for (profile_key, profile_value) in external_provision {
+                if let Some(profile_name) = profile_key.as_str() {
+                    let config_path = format!("provision.{profile_name}");
+                    if ExtensionSource::matches_include_pattern(&config_path, include_patterns) {
+                        Self::ensure_provision_section(main_config);
+                        if let Some(main_provision) = main_config
+                            .get_mut("provision")
+                            .and_then(|p| p.as_mapping_mut())
+                        {
+                            // Only add if not already present (main takes precedence)
+                            if !main_provision.contains_key(profile_key) {
+                                main_provision.insert(profile_key.clone(), profile_value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge sdk.dependencies based on include patterns
         if let Some(external_sdk_deps) = external_config
             .get("sdk")
             .and_then(|s| s.get("dependencies"))
             .and_then(|d| d.as_mapping())
         {
-            Self::ensure_sdk_dependencies_section(main_config);
-
-            if let Some(main_sdk_deps) = main_config
-                .get_mut("sdk")
-                .and_then(|s| s.get_mut("dependencies"))
-                .and_then(|d| d.as_mapping_mut())
-            {
-                for (dep_key, dep_value) in external_sdk_deps {
-                    // Only add if not already present (main takes precedence)
-                    if !main_sdk_deps.contains_key(dep_key) {
-                        main_sdk_deps.insert(dep_key.clone(), dep_value.clone());
+            for (dep_key, dep_value) in external_sdk_deps {
+                if let Some(dep_name) = dep_key.as_str() {
+                    let config_path = format!("sdk.dependencies.{dep_name}");
+                    if ExtensionSource::matches_include_pattern(&config_path, include_patterns) {
+                        Self::ensure_sdk_dependencies_section(main_config);
+                        if let Some(main_sdk_deps) = main_config
+                            .get_mut("sdk")
+                            .and_then(|s| s.get_mut("dependencies"))
+                            .and_then(|d| d.as_mapping_mut())
+                        {
+                            // Only add if not already present (main takes precedence)
+                            if !main_sdk_deps.contains_key(dep_key) {
+                                main_sdk_deps.insert(dep_key.clone(), dep_value.clone());
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Merge sdk.compile
+        // Merge sdk.compile based on include patterns OR auto_include_compile list
         if let Some(external_sdk_compile) = external_config
             .get("sdk")
             .and_then(|s| s.get("compile"))
             .and_then(|c| c.as_mapping())
         {
-            Self::ensure_sdk_compile_section(main_config);
+            for (compile_key, compile_value) in external_sdk_compile {
+                if let Some(compile_name) = compile_key.as_str() {
+                    let config_path = format!("sdk.compile.{compile_name}");
+                    let should_include =
+                        ExtensionSource::matches_include_pattern(&config_path, include_patterns)
+                            || auto_include_compile.contains(&compile_name.to_string());
 
-            if let Some(main_sdk_compile) = main_config
-                .get_mut("sdk")
-                .and_then(|s| s.get_mut("compile"))
-                .and_then(|c| c.as_mapping_mut())
-            {
-                for (compile_key, compile_value) in external_sdk_compile {
-                    // Only add if not already present (main takes precedence)
-                    if !main_sdk_compile.contains_key(compile_key) {
-                        main_sdk_compile.insert(compile_key.clone(), compile_value.clone());
+                    if should_include {
+                        Self::ensure_sdk_compile_section(main_config);
+                        if let Some(main_sdk_compile) = main_config
+                            .get_mut("sdk")
+                            .and_then(|s| s.get_mut("compile"))
+                            .and_then(|c| c.as_mapping_mut())
+                        {
+                            // Only add if not already present (main takes precedence)
+                            if !main_sdk_compile.contains_key(compile_key) {
+                                main_sdk_compile.insert(compile_key.clone(), compile_value.clone());
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Ensure the provision section exists in the config.
+    fn ensure_provision_section(config: &mut serde_yaml::Value) {
+        if let Some(main_map) = config.as_mapping_mut() {
+            if !main_map.contains_key(serde_yaml::Value::String("provision".to_string())) {
+                main_map.insert(
+                    serde_yaml::Value::String("provision".to_string()),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                );
+            }
+        }
+    }
+
+    /// Deep-merge an extension section from external config into main config.
+    ///
+    /// This handles the case where main config has a stub definition (with just `source:`)
+    /// and the remote extension has the full definition (with `dependencies:`, `version:`, etc.).
+    ///
+    /// Main config values take precedence on conflicts.
+    fn deep_merge_ext_section(main_ext: &mut serde_yaml::Value, external_ext: &serde_yaml::Value) {
+        // Only merge if both are mappings
+        if let (Some(main_map), Some(external_map)) =
+            (main_ext.as_mapping_mut(), external_ext.as_mapping())
+        {
+            for (key, external_value) in external_map {
+                if !main_map.contains_key(key) {
+                    // Key doesn't exist in main, add it from external
+                    main_map.insert(key.clone(), external_value.clone());
+                }
+                // If key exists in main, keep main's value (main takes precedence)
+            }
+        }
+    }
+
+    /// Find compile dependencies in an extension's dependencies section.
+    ///
+    /// Scans `ext.<ext_name>.dependencies` for entries with a `compile` key
+    /// and returns the list of compile section names that should be auto-included.
+    fn find_compile_dependencies_in_ext(
+        ext_config: &serde_yaml::Value,
+        ext_name: &str,
+    ) -> Vec<String> {
+        let mut compile_deps = Vec::new();
+
+        if let Some(ext_section) = ext_config
+            .get("ext")
+            .and_then(|e| e.get(ext_name))
+            .and_then(|e| e.get("dependencies"))
+            .and_then(|d| d.as_mapping())
+        {
+            for (_dep_name, dep_spec) in ext_section {
+                if let Some(compile_name) = dep_spec.get("compile").and_then(|c| c.as_str()) {
+                    compile_deps.push(compile_name.to_string());
+                }
+            }
+        }
+
+        compile_deps
     }
 
     /// Ensure the sdk.dependencies section exists in the config.
@@ -2015,10 +2304,20 @@ impl Config {
         let content = std::fs::read_to_string(config_path)?;
         let parsed = Self::parse_config_value(config_path, &content)?;
 
-        // First check if it's a local extension
+        // First check if it's defined in the ext section
         if let Some(ext_section) = parsed.get("ext") {
             if let Some(ext_map) = ext_section.as_mapping() {
-                if ext_map.contains_key(serde_yaml::Value::String(extension_name.to_string())) {
+                let ext_key = serde_yaml::Value::String(extension_name.to_string());
+                if let Some(ext_config) = ext_map.get(&ext_key) {
+                    // Check if this is a remote extension (has source: field)
+                    if let Some(source) = Self::parse_extension_source(extension_name, ext_config)?
+                    {
+                        return Ok(Some(ExtensionLocation::Remote {
+                            name: extension_name.to_string(),
+                            source,
+                        }));
+                    }
+                    // Otherwise it's a local extension
                     return Ok(Some(ExtensionLocation::Local {
                         name: extension_name.to_string(),
                         config_path: config_path.to_string(),
@@ -6258,7 +6557,8 @@ ext:
         let external_config: serde_yaml::Value =
             serde_yaml::from_str(external_config_content).unwrap();
 
-        Config::merge_external_config(&mut main_config, &external_config, "external-ext");
+        // Use empty include patterns - ext.<ext-name> is always merged
+        Config::merge_external_config(&mut main_config, &external_config, "external-ext", &[], &[]);
 
         // Check that both extensions are present
         let ext_section = main_config.get("ext").unwrap().as_mapping().unwrap();
@@ -6285,7 +6585,15 @@ sdk:
         let external_config: serde_yaml::Value =
             serde_yaml::from_str(external_config_content).unwrap();
 
-        Config::merge_external_config(&mut main_config, &external_config, "test-ext");
+        // Include sdk.dependencies.* to merge SDK dependencies
+        let include_patterns = vec!["sdk.dependencies.*".to_string()];
+        Config::merge_external_config(
+            &mut main_config,
+            &external_config,
+            "test-ext",
+            &include_patterns,
+            &[],
+        );
 
         let sdk_deps = main_config
             .get("sdk")
@@ -6332,7 +6640,15 @@ distro:
         let external_config: serde_yaml::Value =
             serde_yaml::from_str(external_config_content).unwrap();
 
-        Config::merge_external_config(&mut main_config, &external_config, "test-ext");
+        // Distro is never merged regardless of include patterns
+        let include_patterns = vec!["distro.*".to_string()]; // Even with this, distro won't be merged
+        Config::merge_external_config(
+            &mut main_config,
+            &external_config,
+            "test-ext",
+            &include_patterns,
+            &[],
+        );
 
         // Distro should remain unchanged from main config
         let distro = main_config.get("distro").unwrap();
@@ -6427,5 +6743,306 @@ sdk:
             .unwrap();
         assert!(sdk_deps.contains_key(serde_yaml::Value::String("main-sdk-dep".to_string())));
         assert!(sdk_deps.contains_key(serde_yaml::Value::String("external-sdk-dep".to_string())));
+    }
+
+    #[test]
+    fn test_extension_source_get_include_patterns() {
+        // Test Repo variant with include patterns
+        let source = ExtensionSource::Repo {
+            version: "*".to_string(),
+            package: None,
+            repo_name: None,
+            include: Some(vec![
+                "provision.tegraflash".to_string(),
+                "sdk.compile.*".to_string(),
+            ]),
+        };
+        let patterns = source.get_include_patterns();
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0], "provision.tegraflash");
+        assert_eq!(patterns[1], "sdk.compile.*");
+
+        // Test Repo variant without include patterns
+        let source_no_include = ExtensionSource::Repo {
+            version: "*".to_string(),
+            package: None,
+            repo_name: None,
+            include: None,
+        };
+        assert!(source_no_include.get_include_patterns().is_empty());
+
+        // Test Git variant with include patterns
+        let git_source = ExtensionSource::Git {
+            url: "https://example.com/repo.git".to_string(),
+            git_ref: Some("main".to_string()),
+            sparse_checkout: None,
+            include: Some(vec!["provision.*".to_string()]),
+        };
+        assert_eq!(git_source.get_include_patterns().len(), 1);
+
+        // Test Path variant with include patterns
+        let path_source = ExtensionSource::Path {
+            path: "./external".to_string(),
+            include: Some(vec!["sdk.dependencies.*".to_string()]),
+        };
+        assert_eq!(path_source.get_include_patterns().len(), 1);
+    }
+
+    #[test]
+    fn test_matches_include_pattern_exact() {
+        let patterns = vec![
+            "provision.tegraflash".to_string(),
+            "sdk.compile.nvidia-l4t".to_string(),
+        ];
+
+        // Exact matches should return true
+        assert!(ExtensionSource::matches_include_pattern(
+            "provision.tegraflash",
+            &patterns
+        ));
+        assert!(ExtensionSource::matches_include_pattern(
+            "sdk.compile.nvidia-l4t",
+            &patterns
+        ));
+
+        // Non-matches should return false
+        assert!(!ExtensionSource::matches_include_pattern(
+            "provision.usb",
+            &patterns
+        ));
+        assert!(!ExtensionSource::matches_include_pattern(
+            "sdk.compile.other",
+            &patterns
+        ));
+        assert!(!ExtensionSource::matches_include_pattern(
+            "provision",
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn test_matches_include_pattern_wildcard() {
+        let patterns = vec!["provision.*".to_string(), "sdk.compile.*".to_string()];
+
+        // Wildcard matches should work
+        assert!(ExtensionSource::matches_include_pattern(
+            "provision.tegraflash",
+            &patterns
+        ));
+        assert!(ExtensionSource::matches_include_pattern(
+            "provision.usb",
+            &patterns
+        ));
+        assert!(ExtensionSource::matches_include_pattern(
+            "sdk.compile.nvidia-l4t",
+            &patterns
+        ));
+        assert!(ExtensionSource::matches_include_pattern(
+            "sdk.compile.custom-lib",
+            &patterns
+        ));
+
+        // Non-matches should return false
+        assert!(!ExtensionSource::matches_include_pattern(
+            "sdk.dependencies.package1",
+            &patterns
+        ));
+        assert!(!ExtensionSource::matches_include_pattern(
+            "runtime.prod",
+            &patterns
+        ));
+
+        // Partial prefix matches without proper dot separator should not match
+        assert!(!ExtensionSource::matches_include_pattern(
+            "provisionExtra",
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn test_matches_include_pattern_empty() {
+        let empty_patterns: Vec<String> = vec![];
+
+        // Empty patterns should never match
+        assert!(!ExtensionSource::matches_include_pattern(
+            "provision.tegraflash",
+            &empty_patterns
+        ));
+        assert!(!ExtensionSource::matches_include_pattern(
+            "anything",
+            &empty_patterns
+        ));
+    }
+
+    #[test]
+    fn test_merge_external_config_with_include_patterns() {
+        let main_config_content = r#"
+ext:
+  local-ext:
+    types:
+      - sysext
+provision:
+  existing-profile:
+    script: provision.sh
+"#;
+        let external_config_content = r#"
+ext:
+  remote-ext:
+    types:
+      - sysext
+    dependencies:
+      some-dep: "*"
+provision:
+  tegraflash:
+    script: flash.sh
+  usb:
+    script: usb-provision.sh
+sdk:
+  dependencies:
+    external-dep: "*"
+  compile:
+    nvidia-l4t:
+      compile: build.sh
+"#;
+
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(main_config_content).unwrap();
+        let external_config: serde_yaml::Value =
+            serde_yaml::from_str(external_config_content).unwrap();
+
+        // Only include provision.tegraflash (not provision.usb)
+        let include_patterns = vec!["provision.tegraflash".to_string()];
+        Config::merge_external_config(
+            &mut main_config,
+            &external_config,
+            "remote-ext",
+            &include_patterns,
+            &[],
+        );
+
+        // Check that ext.remote-ext was merged (always happens)
+        let ext_section = main_config.get("ext").unwrap().as_mapping().unwrap();
+        assert!(ext_section.contains_key(serde_yaml::Value::String("remote-ext".to_string())));
+
+        // Check that provision.tegraflash was included
+        let provision = main_config.get("provision").unwrap().as_mapping().unwrap();
+        assert!(provision.contains_key(serde_yaml::Value::String("tegraflash".to_string())));
+        assert!(provision.contains_key(serde_yaml::Value::String("existing-profile".to_string())));
+
+        // Check that provision.usb was NOT included (not in patterns)
+        assert!(!provision.contains_key(serde_yaml::Value::String("usb".to_string())));
+
+        // Check that sdk.dependencies was NOT merged (not in patterns)
+        assert!(main_config.get("sdk").is_none());
+    }
+
+    #[test]
+    fn test_merge_external_config_auto_include_compile() {
+        let main_config_content = r#"
+ext:
+  local-ext:
+    types:
+      - sysext
+"#;
+        let external_config_content = r#"
+ext:
+  remote-ext:
+    types:
+      - sysext
+    dependencies:
+      nvidia-l4t:
+        compile: nvidia-l4t
+sdk:
+  compile:
+    nvidia-l4t:
+      compile: build-nvidia.sh
+    other-lib:
+      compile: build-other.sh
+"#;
+
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(main_config_content).unwrap();
+        let external_config: serde_yaml::Value =
+            serde_yaml::from_str(external_config_content).unwrap();
+
+        // Use auto_include_compile to include nvidia-l4t
+        let auto_include = vec!["nvidia-l4t".to_string()];
+        Config::merge_external_config(
+            &mut main_config,
+            &external_config,
+            "remote-ext",
+            &[],           // No explicit include patterns
+            &auto_include, // Auto-include nvidia-l4t compile section
+        );
+
+        // Check that sdk.compile.nvidia-l4t was included
+        let sdk_compile = main_config
+            .get("sdk")
+            .unwrap()
+            .get("compile")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert!(sdk_compile.contains_key(serde_yaml::Value::String("nvidia-l4t".to_string())));
+
+        // Check that sdk.compile.other-lib was NOT included
+        assert!(!sdk_compile.contains_key(serde_yaml::Value::String("other-lib".to_string())));
+    }
+
+    #[test]
+    fn test_find_compile_dependencies_in_ext() {
+        let ext_config_content = r#"
+ext:
+  my-extension:
+    dependencies:
+      nvidia-l4t:
+        compile: nvidia-l4t
+      some-package:
+        version: "1.0"
+      custom-lib:
+        compile: custom-compile-section
+"#;
+        let ext_config: serde_yaml::Value = serde_yaml::from_str(ext_config_content).unwrap();
+
+        let compile_deps = Config::find_compile_dependencies_in_ext(&ext_config, "my-extension");
+
+        assert_eq!(compile_deps.len(), 2);
+        assert!(compile_deps.contains(&"nvidia-l4t".to_string()));
+        assert!(compile_deps.contains(&"custom-compile-section".to_string()));
+    }
+
+    #[test]
+    fn test_extension_source_include_serialization() {
+        let source = ExtensionSource::Repo {
+            version: "*".to_string(),
+            package: None,
+            repo_name: None,
+            include: Some(vec![
+                "provision.tegraflash".to_string(),
+                "sdk.compile.*".to_string(),
+            ]),
+        };
+
+        let serialized = serde_yaml::to_string(&source).unwrap();
+        assert!(serialized.contains("include:"));
+        assert!(serialized.contains("provision.tegraflash"));
+        assert!(serialized.contains("sdk.compile.*"));
+
+        // Test deserialization
+        let yaml_content = r#"
+type: repo
+version: "*"
+include:
+  - provision.tegraflash
+  - sdk.compile.*
+"#;
+        let deserialized: ExtensionSource = serde_yaml::from_str(yaml_content).unwrap();
+        match deserialized {
+            ExtensionSource::Repo { include, .. } => {
+                assert!(include.is_some());
+                let patterns = include.unwrap();
+                assert_eq!(patterns.len(), 2);
+                assert_eq!(patterns[0], "provision.tegraflash");
+            }
+            _ => panic!("Expected Repo variant"),
+        }
     }
 }

@@ -50,8 +50,12 @@ impl ProvisionCommand {
 
     /// Execute the provision command by calling runtime provision
     pub async fn execute(&self) -> Result<()> {
-        // Load config to access provision profiles
-        let config = crate::utils::config::Config::load(&self.config.config_path)?;
+        // Load composed config to access provision profiles (including from remote extensions)
+        let composed = crate::utils::config::Config::load_composed(
+            &self.config.config_path,
+            self.config.target.as_deref(),
+        )?;
+        let config = &composed.config;
 
         // Get state file path from provision profile if available
         let state_file = self

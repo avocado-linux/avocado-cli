@@ -116,7 +116,8 @@ impl InstallCommand {
             .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
 
         let config = &composed.config;
-        let parsed = &composed.merged_value;
+        // parsed from initial load is not used after sdk install reloads config
+        let _parsed = &composed.merged_value;
 
         print_info(
             "Starting comprehensive install process...",
@@ -152,6 +153,18 @@ impl InstallCommand {
             .execute()
             .await
             .with_context(|| "Failed to install SDK dependencies")?;
+
+        // Reload composed config after SDK install to pick up newly fetched remote extensions
+        // SDK install includes ext fetch which downloads remote extensions to $AVOCADO_PREFIX/includes/
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| {
+                format!(
+                    "Failed to reload composed config from {} after SDK install",
+                    self.config_path
+                )
+            })?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // 2. Install extension dependencies
         print_info(
