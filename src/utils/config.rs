@@ -1844,10 +1844,7 @@ impl Config {
                 // Deserialize the source block into ExtensionSource
                 let source: ExtensionSource = serde_yaml::from_value(source_value.clone())
                     .with_context(|| {
-                        format!(
-                            "Failed to parse source configuration for extension '{}'",
-                            ext_name
-                        )
+                        format!("Failed to parse source configuration for extension '{ext_name}'")
                     })?;
                 Ok(Some(source))
             }

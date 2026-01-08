@@ -108,8 +108,7 @@ impl ExtFetchCommand {
         if extensions_to_fetch.is_empty() {
             if let Some(ref ext_name) = self.extension {
                 return Err(anyhow::anyhow!(
-                    "Extension '{}' not found in configuration or is not a remote extension",
-                    ext_name
+                    "Extension '{ext_name}' not found in configuration or is not a remote extension"
                 ));
             }
             return Ok(());

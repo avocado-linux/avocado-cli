@@ -168,6 +168,8 @@ impl UnlockCommand {
 mod tests {
     use super::*;
     use crate::utils::lockfile::SysrootType;
+    use serial_test::serial;
+    use std::env;
     use std::fs;
     use tempfile::TempDir;
 
@@ -223,7 +225,9 @@ runtime:
     }
 
     #[test]
+    #[serial]
     fn test_unlock_all() {
+        env::remove_var("AVOCADO_TARGET");
         let temp_dir = TempDir::new().unwrap();
         let config_path = create_test_config(&temp_dir);
         create_test_lock_file(&temp_dir);
@@ -244,7 +248,9 @@ runtime:
     }
 
     #[test]
+    #[serial]
     fn test_unlock_sdk() {
+        env::remove_var("AVOCADO_TARGET");
         let temp_dir = TempDir::new().unwrap();
         let config_path = create_test_config(&temp_dir);
         create_test_lock_file(&temp_dir);
@@ -290,7 +296,9 @@ runtime:
     }
 
     #[test]
+    #[serial]
     fn test_unlock_extension() {
+        env::remove_var("AVOCADO_TARGET");
         let temp_dir = TempDir::new().unwrap();
         let config_path = create_test_config(&temp_dir);
         create_test_lock_file(&temp_dir);
@@ -325,7 +333,9 @@ runtime:
     }
 
     #[test]
+    #[serial]
     fn test_unlock_runtime() {
+        env::remove_var("AVOCADO_TARGET");
         let temp_dir = TempDir::new().unwrap();
         let config_path = create_test_config(&temp_dir);
         create_test_lock_file(&temp_dir);

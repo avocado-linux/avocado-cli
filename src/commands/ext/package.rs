@@ -158,7 +158,7 @@ impl ExtPackageCommand {
                 OutputLevel::Normal,
             );
             print_info(
-                &format!("Package files: {:?}", package_files),
+                &format!("Package files: {package_files:?}"),
                 OutputLevel::Normal,
             );
         }
@@ -480,7 +480,7 @@ impl ExtPackageCommand {
         let container_src_dir = if ext_src_dir.starts_with('/') {
             ext_src_dir.clone()
         } else {
-            format!("/opt/src/{}", ext_src_dir)
+            format!("/opt/src/{ext_src_dir}")
         };
 
         // Create the RPM filename

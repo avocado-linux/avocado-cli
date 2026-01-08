@@ -67,8 +67,7 @@ pub fn sdk_arch_to_platform(sdk_arch: &str) -> Result<String> {
         "aarch64" | "arm64" => Ok("linux/arm64".to_string()),
         "x86-64" | "x86_64" | "amd64" => Ok("linux/amd64".to_string()),
         _ => Err(anyhow::anyhow!(
-            "Unsupported SDK architecture: '{}'. Supported values: aarch64, x86-64",
-            sdk_arch
+            "Unsupported SDK architecture: '{sdk_arch}'. Supported values: aarch64, x86-64"
         )),
     }
 }
@@ -84,7 +83,7 @@ pub fn get_host_platform() -> String {
         // Fallback for other architectures
         "arm" => "linux/arm/v7".to_string(),
         "riscv64" => "linux/riscv64".to_string(),
-        _ => format!("linux/{}", arch),
+        _ => format!("linux/{arch}"),
     }
 }
 
