@@ -667,9 +667,7 @@ avocado-provision-{} {}
     ) -> Result<()> {
         if self.config.verbose {
             print_info(
-                &format!(
-                    "Checking for state file at {container_state_path} in container"
-                ),
+                &format!("Checking for state file at {container_state_path} in container"),
                 OutputLevel::Verbose,
             );
         }
@@ -742,9 +740,7 @@ avocado-provision-{} {}
 
         // Copy from container to host src_dir
         // Note: File ownership is automatically handled by bindfs permission translation
-        let copy_script = format!(
-            "cp '{container_state_path}' '/opt/src/{state_file_path}'"
-        );
+        let copy_script = format!("cp '{container_state_path}' '/opt/src/{state_file_path}'");
 
         // Use shared SdkContainer for running the command
         let container_helper = SdkContainer::new()

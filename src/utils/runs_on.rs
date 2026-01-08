@@ -185,9 +185,7 @@ impl RunsOnContext {
             let volume_mountpoint = get_docker_volume_mountpoint(container_tool, local_volume_name)
                 .await
                 .with_context(|| {
-                    format!(
-                        "Failed to get mountpoint for volume '{local_volume_name}'"
-                    )
+                    format!("Failed to get mountpoint for volume '{local_volume_name}'")
                 })?;
 
             if verbose {
@@ -250,9 +248,7 @@ impl RunsOnContext {
             .create_nfs_volume(&src_volume_name, &local_ip.to_string(), port, "/src")
             .await
             .with_context(|| {
-                format!(
-                    "Failed to create NFS volume '{src_volume_name}' on remote"
-                )
+                format!("Failed to create NFS volume '{src_volume_name}' on remote")
             })?;
 
         // Create state volume
@@ -260,9 +256,7 @@ impl RunsOnContext {
             .create_nfs_volume(&state_volume_name, &local_ip.to_string(), port, "/state")
             .await
             .with_context(|| {
-                format!(
-                    "Failed to create NFS volume '{state_volume_name}' on remote"
-                )
+                format!("Failed to create NFS volume '{state_volume_name}' on remote")
             })?;
 
         print_success("Remote NFS volumes ready.", OutputLevel::Normal);
@@ -570,10 +564,7 @@ impl RunsOnContext {
         // Remove remote helper script
         #[cfg(unix)]
         if let Some(helper_path) = self.remote_helper_script.take() {
-            let _ = self
-                .ssh
-                .run_command(&format!("rm -f {helper_path}"))
-                .await;
+            let _ = self.ssh.run_command(&format!("rm -f {helper_path}")).await;
         }
 
         // Remove remote volumes - use the existing SSH client which has ControlMaster

@@ -666,9 +666,7 @@ echo "=== Checksum generation complete ==="
 
         for (source_dir, _) in &search_dirs {
             print_info(
-                &format!(
-                    "Attempting to copy checksums from: /opt/_avocado/{source_dir}"
-                ),
+                &format!("Attempting to copy checksums from: /opt/_avocado/{source_dir}"),
                 OutputLevel::Normal,
             );
 
@@ -698,9 +696,7 @@ echo "=== Checksum generation complete ==="
 
         // Read extracted checksum files from all subdirectories
         print_info(
-            &format!(
-                "Looking for .{file_ext} files in extracted directories..."
-            ),
+            &format!("Looking for .{file_ext} files in extracted directories..."),
             OutputLevel::Normal,
         );
 

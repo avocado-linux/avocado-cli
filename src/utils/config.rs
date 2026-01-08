@@ -2628,9 +2628,7 @@ pub fn resolve_host_uid_gid(config: Option<&SdkConfig>) -> (u32, u32) {
     // Resolve GID: env var > config > libc
     let gid = if let Ok(env_gid) = env::var("AVOCADO_HOST_GID") {
         env_gid.parse::<u32>().unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: Invalid AVOCADO_HOST_GID '{env_gid}', using fallback"
-            );
+            eprintln!("Warning: Invalid AVOCADO_HOST_GID '{env_gid}', using fallback");
             fallback_gid
         })
     } else if let Some(cfg) = config {

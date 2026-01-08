@@ -1158,9 +1158,7 @@ impl SdkContainer {
         // Prepend bindfs check and setup to the command
         // If host UID is 0 (root), skip bindfs and use simple bind mount
         let full_command = if host_uid == 0 && host_gid == 0 {
-            format!(
-                "mkdir -p /opt/src && mount --bind /mnt/src /opt/src && {command}"
-            )
+            format!("mkdir -p /opt/src && mount --bind /mnt/src /opt/src && {command}")
         } else {
             format!(
                 r#"if ! command -v bindfs >/dev/null 2>&1; then
@@ -1678,9 +1676,7 @@ fi
 
         if self.verbose {
             print_info(
-                &format!(
-                    "Creating temporary container for signature writing: {container_name}"
-                ),
+                &format!("Creating temporary container for signature writing: {container_name}"),
                 OutputLevel::Verbose,
             );
         }
@@ -1723,9 +1719,7 @@ fi
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
             let output = cmd.output().await.with_context(|| {
-                format!(
-                    "Failed to copy signature file to container: {container_path}"
-                )
+                format!("Failed to copy signature file to container: {container_path}")
             })?;
 
             if !output.status.success() {
@@ -1734,9 +1728,7 @@ fi
                 // Clean up container before returning error
                 let _ = self.remove_container(&container_name).await;
 
-                anyhow::bail!(
-                    "Failed to copy signature file {container_path}: {stderr}"
-                );
+                anyhow::bail!("Failed to copy signature file {container_path}: {stderr}");
             }
         }
 

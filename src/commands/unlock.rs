@@ -102,9 +102,7 @@ impl UnlockCommand {
             if self.sdk {
                 if self.verbose {
                     print_info(
-                        &format!(
-                            "Unlocking SDK, rootfs, and target-sysroot for target '{target}'"
-                        ),
+                        &format!("Unlocking SDK, rootfs, and target-sysroot for target '{target}'"),
                         OutputLevel::Normal,
                     );
                 }
@@ -113,9 +111,7 @@ impl UnlockCommand {
                 lock_file.clear_target_sysroot(&target);
                 unlocked_something = true;
                 print_success(
-                    &format!(
-                        "Unlocked SDK, rootfs, and target-sysroot for target '{target}'."
-                    ),
+                    &format!("Unlocked SDK, rootfs, and target-sysroot for target '{target}'."),
                     OutputLevel::Normal,
                 );
             }
@@ -140,18 +136,14 @@ impl UnlockCommand {
             if let Some(ref runtime_name) = self.runtime {
                 if self.verbose {
                     print_info(
-                        &format!(
-                            "Unlocking runtime '{runtime_name}' for target '{target}'"
-                        ),
+                        &format!("Unlocking runtime '{runtime_name}' for target '{target}'"),
                         OutputLevel::Normal,
                     );
                 }
                 lock_file.clear_runtime(&target, runtime_name);
                 unlocked_something = true;
                 print_success(
-                    &format!(
-                        "Unlocked runtime '{runtime_name}' for target '{target}'."
-                    ),
+                    &format!("Unlocked runtime '{runtime_name}' for target '{target}'."),
                     OutputLevel::Normal,
                 );
             }

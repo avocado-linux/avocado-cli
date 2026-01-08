@@ -65,9 +65,7 @@ impl FromStr for ChecksumAlgorithm {
         match s.to_lowercase().as_str() {
             "sha256" | "sha-256" => Ok(ChecksumAlgorithm::Sha256),
             "blake3" => Ok(ChecksumAlgorithm::Blake3),
-            _ => anyhow::bail!(
-                "Unsupported checksum algorithm '{s}'. Supported: sha256, blake3"
-            ),
+            _ => anyhow::bail!("Unsupported checksum algorithm '{s}'. Supported: sha256, blake3"),
         }
     }
 }
@@ -148,11 +146,8 @@ pub fn sign_file(
     let hash = compute_file_hash(file_path, checksum_algorithm)?;
 
     // Load signing key (only file:// URIs supported for now)
-    let signing_key = load_signing_key(keyid).with_context(|| {
-        format!(
-            "Failed to load signing key '{key_name}' (keyid: {keyid})"
-        )
-    })?;
+    let signing_key = load_signing_key(keyid)
+        .with_context(|| format!("Failed to load signing key '{key_name}' (keyid: {keyid})"))?;
 
     // Sign the hash
     let signature: Signature = signing_key.sign(&hash, None);
@@ -316,11 +311,8 @@ pub fn sign_hash_manifest(
     // Determine signing method based on URI type
     let sign_fn: SignFn = if is_file_uri(&entry.uri) {
         // File-based signing
-        let signing_key = load_signing_key(keyid).with_context(|| {
-            format!(
-                "Failed to load signing key '{key_name}' (keyid: {keyid})"
-            )
-        })?;
+        let signing_key = load_signing_key(keyid)
+            .with_context(|| format!("Failed to load signing key '{key_name}' (keyid: {keyid})"))?;
         Box::new(move |hash: &[u8]| {
             let signature: Signature = signing_key.sign(hash, None);
             Ok(signature.as_ref().to_vec())

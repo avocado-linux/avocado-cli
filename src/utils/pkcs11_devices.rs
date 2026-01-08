@@ -42,9 +42,7 @@ impl FromStr for DeviceType {
             "tpm" => Ok(DeviceType::Tpm),
             "yubikey" | "yk" => Ok(DeviceType::Yubikey),
             "auto" => Ok(DeviceType::Auto),
-            _ => anyhow::bail!(
-                "Unsupported device type '{s}'. Supported: tpm, yubikey, auto"
-            ),
+            _ => anyhow::bail!("Unsupported device type '{s}'. Supported: tpm, yubikey, auto"),
         }
     }
 }
@@ -65,9 +63,7 @@ impl FromStr for Pkcs11AuthMethod {
             "none" => Ok(Pkcs11AuthMethod::None),
             "prompt" => Ok(Pkcs11AuthMethod::Prompt),
             "env" => Ok(Pkcs11AuthMethod::EnvVar("AVOCADO_PKCS11_PIN".to_string())),
-            _ => anyhow::bail!(
-                "Unsupported auth method '{s}'. Supported: none, prompt, env"
-            ),
+            _ => anyhow::bail!("Unsupported auth method '{s}'. Supported: none, prompt, env"),
         }
     }
 }
@@ -240,9 +236,7 @@ pub fn get_device_auth(method: &Pkcs11AuthMethod) -> Result<String> {
             Ok(pin)
         }
         Pkcs11AuthMethod::EnvVar(var_name) => env::var(var_name).with_context(|| {
-            format!(
-                "Environment variable '{var_name}' not set. Set it or use --auth prompt"
-            )
+            format!("Environment variable '{var_name}' not set. Set it or use --auth prompt")
         }),
     }
 }
@@ -739,9 +733,7 @@ pub fn delete_pkcs11_key(uri: &str) -> Result<()> {
         .context("Failed to find objects")?;
 
     if objects.is_empty() {
-        anyhow::bail!(
-            "Private key '{object_label}' not found in hardware device"
-        );
+        anyhow::bail!("Private key '{object_label}' not found in hardware device");
     }
 
     let private_key_handle = objects[0];

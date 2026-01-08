@@ -506,16 +506,12 @@ impl NfsServer {
                 .map(|l| String::from_utf8_lossy(&l.stderr).to_string())
                 .unwrap_or_default();
 
-            anyhow::bail!(
-                "NFS server container failed to start. Logs:\n{log_output}"
-            );
+            anyhow::bail!("NFS server container failed to start. Logs:\n{log_output}");
         }
 
         if config.verbose {
             print_info(
-                &format!(
-                    "NFS server container '{container_name}' started successfully"
-                ),
+                &format!("NFS server container '{container_name}' started successfully"),
                 OutputLevel::Normal,
             );
         }
@@ -713,9 +709,7 @@ pub async fn get_docker_volume_mountpoint(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to get mountpoint for volume '{volume_name}': {stderr}"
-        );
+        anyhow::bail!("Failed to get mountpoint for volume '{volume_name}': {stderr}");
     }
 
     let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();

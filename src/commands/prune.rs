@@ -149,9 +149,8 @@ impl PruneCommand {
                 OutputLevel::Normal,
             );
         } else {
-            let mut summary = format!(
-                "Prune complete: {active_count} active, {removed_count} removed"
-            );
+            let mut summary =
+                format!("Prune complete: {active_count} active, {removed_count} removed");
             if failed_count > 0 {
                 summary.push_str(&format!(", {failed_count} failed"));
             }

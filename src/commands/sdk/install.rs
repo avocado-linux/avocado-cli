@@ -198,9 +198,7 @@ impl SdkInstallCommand {
 
         if self.verbose {
             print_info(
-                &format!(
-                    "Using host architecture '{host_arch}' for SDK package tracking."
-                ),
+                &format!("Using host architecture '{host_arch}' for SDK package tracking."),
                 OutputLevel::Normal,
             );
         }

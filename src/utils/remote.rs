@@ -253,9 +253,7 @@ impl SshClient {
 
         if self.verbose {
             print_info(
-                &format!(
-                    "Remote avocado version: {remote_version} (local: {local_version})"
-                ),
+                &format!("Remote avocado version: {remote_version} (local: {local_version})"),
                 OutputLevel::Normal,
             );
         }
@@ -384,10 +382,7 @@ impl SshClient {
         let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if self.verbose {
-            print_info(
-                &format!("Remote architecture: {arch}"),
-                OutputLevel::Normal,
-            );
+            print_info(&format!("Remote architecture: {arch}"), OutputLevel::Normal);
         }
 
         Ok(arch)
