@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub struct HitlServerCommand {
-    /// Path to the avocado.toml configuration file
+    /// Path to the avocado.yaml configuration file
     #[arg(short, long, default_value = "avocado.yaml")]
     pub config_path: String,
 

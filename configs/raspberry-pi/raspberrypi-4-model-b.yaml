@@ -4,32 +4,37 @@ supported_targets:
 distro:
   channel: apollo-edge
   version: 0.1.0
-runtime:
+runtimes:
   dev:
-    dependencies:
+    extensions:
+      - avocado-ext-dev
+      - avocado-ext-sshd-dev
+      - avocado-bsp-{{ avocado.target }}
+      - config
+      - app
+    packages:
       avocado-img-bootfiles: '*'
       avocado-img-rootfs: '*'
       avocado-img-initramfs: '*'
-      avocado-ext-dev:
-        ext: avocado-ext-dev
-        vsn: '*'
-      avocado-ext-sshd-dev:
-        ext: avocado-ext-sshd-dev
-        vsn: '*'
-      avocado-bsp:
-        ext: avocado-bsp-{{ avocado.target }}
-        vsn: "*"
-      config:
-        ext: config
-      app:
-        ext: app
-ext:
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: '*'
+  avocado-ext-sshd-dev:
+    source:
+      type: package
+      version: '*'
+  avocado-bsp-{{ avocado.target }}:
+    source:
+      type: package
+      version: '*'
   app:
     types:
     - sysext
     - confext
     version: 0.1.0
-    dependencies: {}
+    packages: {}
   config:
     types:
     - confext
@@ -39,13 +44,13 @@ ext:
         password: ''
 sdk:
   image: docker.io/avocadolinux/sdk:{{ config.distro.channel }}
-  dependencies:
+  packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
     nativesdk-avocado-ext-dev: "*"
   raspberrypi4:
     container_args:
     - --network=host
-provision:
+provision_profiles:
   img:
     container_args:
     - -v

@@ -235,9 +235,9 @@ mod tests {
             supported_targets: None,
             src_dir: None,
             distro: None,
-            runtime: None,
+            runtimes: None,
             sdk: None,
-            provision: None,
+            provision_profiles: None,
             signing_keys: None,
         }
     }
@@ -249,9 +249,9 @@ mod tests {
             supported_targets: Some(SupportedTargets::List(targets)),
             src_dir: None,
             distro: None,
-            runtime: None,
+            runtimes: None,
             sdk: None,
-            provision: None,
+            provision_profiles: None,
             signing_keys: None,
         }
     }
@@ -263,9 +263,9 @@ mod tests {
             supported_targets: Some(SupportedTargets::All("*".to_string())),
             src_dir: None,
             distro: None,
-            runtime: None,
+            runtimes: None,
             sdk: None,
-            provision: None,
+            provision_profiles: None,
             signing_keys: None,
         }
     }

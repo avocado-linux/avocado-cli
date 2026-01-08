@@ -139,7 +139,7 @@ impl ExtInstallCommand {
             }
         } else {
             // No extension specified - install all local extensions
-            match parsed.get("ext") {
+            match parsed.get("extensions") {
                 Some(ext_section) => match ext_section.as_mapping() {
                     Some(table) => table
                         .keys()
@@ -189,7 +189,7 @@ impl ExtInstallCommand {
 
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|runtime| runtime.as_mapping())
             .and_then(|runtime_table| {
                 if runtime_table.len() == 1 {
@@ -438,7 +438,7 @@ impl ExtInstallCommand {
             ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 parsed
-                    .get("ext")
+                    .get("extensions")
                     .and_then(|ext| ext.get(extension))
                     .cloned()
             }
@@ -450,7 +450,7 @@ impl ExtInstallCommand {
         };
 
         // Install dependencies if they exist
-        let dependencies = ext_config.as_ref().and_then(|ec| ec.get("dependencies"));
+        let dependencies = ext_config.as_ref().and_then(|ec| ec.get("packages"));
 
         let sysroot = SysrootType::Extension(extension.to_string());
 
@@ -498,7 +498,8 @@ impl ExtInstallCommand {
 
                         // Check for extension dependency
                         // Format: { ext: "extension-name" } or { ext: "name", config: "path" } or { ext: "name", vsn: "version" }
-                        if let Some(ext_name) = spec_map.get("ext").and_then(|v| v.as_str()) {
+                        if let Some(ext_name) = spec_map.get("extensions").and_then(|v| v.as_str())
+                        {
                             // Check if this is a versioned extension (has vsn field)
                             if let Some(version) = spec_map.get("vsn").and_then(|v| v.as_str()) {
                                 extension_dependencies

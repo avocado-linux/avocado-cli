@@ -1,5 +1,5 @@
 src_dir: .
-ext:
+extensions:
   nested-extension:
     types:
     - sysext

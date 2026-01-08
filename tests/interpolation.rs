@@ -25,7 +25,7 @@ fn test_env_var_interpolation() {
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
     // Verify that runtime dev dependencies include interpolated env var
-    let runtime = config.runtime.as_ref().unwrap();
+    let runtime = config.runtimes.as_ref().unwrap();
     let dev = runtime.get("dev").unwrap();
 
     if let Some(deps) = &dev.dependencies {
@@ -53,7 +53,7 @@ fn test_missing_env_var_warning() {
     // Should succeed but replace with empty string
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
-    let runtime = config.runtime.as_ref().unwrap();
+    let runtime = config.runtimes.as_ref().unwrap();
     let dev = runtime.get("dev").unwrap();
 
     if let Some(deps) = &dev.dependencies {
@@ -102,7 +102,7 @@ fn test_avocado_target_from_env() {
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
-    let runtime = config.runtime.as_ref().unwrap();
+    let runtime = config.runtimes.as_ref().unwrap();
     let dev = runtime.get("dev").unwrap();
 
     assert_eq!(dev.target.as_ref().unwrap(), "aarch64-unknown-linux-gnu");
@@ -118,7 +118,7 @@ fn test_avocado_target_from_config() {
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
-    let runtime = config.runtime.as_ref().unwrap();
+    let runtime = config.runtimes.as_ref().unwrap();
     let dev = runtime.get("dev").unwrap();
 
     // Should use default_target from config
@@ -132,7 +132,7 @@ fn test_avocado_target_unavailable() {
 
     // Create a test config without default_target
     let test_yaml = r#"
-runtime:
+runtimes:
   dev:
     target: "{{ avocado.target }}"
 "#;
@@ -141,7 +141,7 @@ runtime:
     avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
 
     // Should leave template as-is
-    let runtime = parsed.get("runtime").unwrap();
+    let runtime = parsed.get("runtimes").unwrap();
     let dev = runtime.get("dev").unwrap();
     let target = dev.get("target").unwrap().as_str().unwrap();
 
@@ -189,7 +189,7 @@ fn test_multiple_interpolation_types() {
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
-    let runtime = config.runtime.as_ref().unwrap();
+    let runtime = config.runtimes.as_ref().unwrap();
     let dev = runtime.get("dev").unwrap();
 
     if let Some(deps) = &dev.dependencies {
@@ -224,7 +224,7 @@ fn test_combined_interpolation() {
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();
 
-    let runtime = config.runtime.as_ref().unwrap();
+    let runtime = config.runtimes.as_ref().unwrap();
     let prod = runtime.get("prod").unwrap();
 
     if let Some(deps) = &prod.dependencies {
@@ -276,7 +276,7 @@ fn test_config_distro_interpolation_in_sdk() {
     );
 
     // SDK dependencies should use config.distro.version interpolation
-    let deps = sdk.dependencies.as_ref().unwrap();
+    let deps = sdk.packages.as_ref().unwrap();
     let toolchain_version = deps.get("avocado-sdk-toolchain").unwrap();
     assert_eq!(toolchain_version.as_str().unwrap(), "0.1.0");
 }

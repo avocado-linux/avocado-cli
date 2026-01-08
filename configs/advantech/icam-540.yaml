@@ -5,32 +5,35 @@ src_dir: ../../
 distro:
   channel: apollo-edge
   version: 0.1.0
-runtime:
+runtimes:
   dev:
-    dependencies:
+    extensions:
+      - avocado-ext-dev
+      - avocado-bsp-{{ avocado.target }}
+      - config
+      - app
+    packages:
       avocado-img-bootfiles: '*'
       avocado-img-rootfs: '*'
       avocado-img-initramfs: '*'
-      avocado-ext-dev:
-        ext: avocado-ext-dev
-        vsn: "*"
-      avocado-bsp:
-          ext: avocado-bsp-{{ avocado.target }}
-          vsn: "*"
-      config:
-        ext: config
-      app:
-        ext: app
     icam-540:
-      dependencies:
+      packages:
         avocado-img-tegraflash: '*'
-ext:
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: '*'
+  avocado-bsp-{{ avocado.target }}:
+    source:
+      type: package
+      version: '*'
   app:
     types:
     - sysext
     - confext
     version: 0.1.0
-    dependencies:
+    packages:
       i2c-tools: '*'
       pylon: '*'
       pylon-dev: '*'
@@ -58,11 +61,11 @@ ext:
         password: ''
 sdk:
   image: docker.io/avocadolinux/sdk:{{ config.distro.channel }}
-  dependencies:
+  packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
     nativesdk-avocado-ext-dev: "*"
   icam-540:
-    dependencies:
+    packages:
       nativesdk-util-linux-mount: '*'
     container_args:
     - --network=host
@@ -71,7 +74,7 @@ sdk:
     - -v
     - /sys:/sys:ro
     - --privileged
-provision:
+provision_profiles:
   tegraflash:
     container_args:
     - -v

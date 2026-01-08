@@ -199,7 +199,9 @@ impl ExtBuildCommand {
             ExtensionLocation::Remote { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 // Then apply target-specific overrides manually
-                let ext_section = parsed.get("ext").and_then(|ext| ext.get(&self.extension));
+                let ext_section = parsed
+                    .get("extensions")
+                    .and_then(|ext| ext.get(&self.extension));
                 if let Some(ext_val) = ext_section {
                     let base_ext = ext_val.clone();
                     // Check for target-specific override within this extension
@@ -1508,7 +1510,7 @@ echo "Set proper permissions on authentication files""#,
         sdk_config_path: &str,
     ) -> Result<()> {
         // Get dependencies from extension configuration
-        let dependencies = ext_config.get("dependencies").and_then(|v| v.as_mapping());
+        let dependencies = ext_config.get("packages").and_then(|v| v.as_mapping());
 
         let Some(deps_table) = dependencies else {
             return Ok(());
@@ -3407,11 +3409,11 @@ mod tests {
     fn test_handle_compile_dependencies_parsing() {
         // Test that the new compile dependency syntax is properly parsed
         let config_content = r#"
-ext:
+extensions:
   my-extension:
     types:
       - sysext
-    dependencies:
+    packages:
       my-app:
         compile: my-app
         install: ext-install.sh
@@ -3429,19 +3431,19 @@ sdk:
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let ext_config = parsed
-            .get(serde_yaml::Value::String("ext".to_string()))
+            .get(serde_yaml::Value::String("extensions".to_string()))
             .unwrap()
             .get(serde_yaml::Value::String("my-extension".to_string()))
             .unwrap();
-        let dependencies = ext_config
-            .get(serde_yaml::Value::String("dependencies".to_string()))
+        let packages = ext_config
+            .get(serde_yaml::Value::String("packages".to_string()))
             .unwrap()
             .as_mapping()
             .unwrap();
 
         // Check that we can identify compile dependencies with install scripts
         let mut compile_install_deps = Vec::new();
-        for (dep_name, dep_spec) in dependencies {
+        for (dep_name, dep_spec) in packages {
             if let serde_yaml::Value::Mapping(spec_map) = dep_spec {
                 if let (
                     Some(serde_yaml::Value::String(compile_section)),

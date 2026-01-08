@@ -68,7 +68,7 @@ impl RuntimeDeployCommand {
 
         // Get runtime configuration
         let runtime_config = parsed
-            .get("runtime")
+            .get("runtimes")
             .context("No runtime configuration found")?;
 
         // Check if runtime exists

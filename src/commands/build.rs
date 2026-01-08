@@ -370,7 +370,7 @@ impl BuildCommand {
         target: &str,
     ) -> Result<Vec<String>> {
         let runtime_section = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
@@ -453,7 +453,7 @@ impl BuildCommand {
         // This is needed because ext section keys may contain templates like {{ avocado.target }}
         let mut ext_sources: std::collections::HashMap<String, Option<ExtensionSource>> =
             std::collections::HashMap::new();
-        if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+        if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_key, ext_config) in ext_section {
                 if let Some(raw_name) = ext_key.as_str() {
                     // Interpolate the extension name with the target
@@ -849,7 +849,9 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         );
 
         // Check if this is a local extension or needs to be found in external configs
-        let ext_config = parsed.get("ext").and_then(|ext| ext.get(extension_name));
+        let ext_config = parsed
+            .get("extensions")
+            .and_then(|ext| ext.get(extension_name));
 
         let extension_dep = if ext_config.is_some() {
             // Local extension
@@ -998,7 +1000,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
 
         // Verify the runtime exists and is configured for this target
         let runtime_section = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
@@ -1210,13 +1212,10 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         let mut visited = HashSet::new();
 
         // Check runtime dependencies for extensions
-        if let Some(dependencies) = runtime_config
-            .get("dependencies")
-            .and_then(|d| d.as_mapping())
-        {
+        if let Some(dependencies) = runtime_config.get("packages").and_then(|d| d.as_mapping()) {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for extension dependency
-                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                if let Some(ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
                     // Check if this is a versioned extension (has vsn field)
                     if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
                         let ext_dep = ExtensionDependency::Versioned {
@@ -1293,7 +1292,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
 
         // Get all extensions from runtime dependencies (this will recursively traverse)
         let runtime_section = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 
@@ -1308,13 +1307,13 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             let merged_runtime =
                 config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
             if let Some(merged_value) = merged_runtime {
-                if let Some(dependencies) = merged_value
-                    .get("dependencies")
-                    .and_then(|d| d.as_mapping())
+                if let Some(dependencies) =
+                    merged_value.get("packages").and_then(|d| d.as_mapping())
                 {
                     for (_dep_name, dep_spec) in dependencies {
                         // Check for extension dependency
-                        if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                        if let Some(ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str())
+                        {
                             // Check if this is a versioned extension (has vsn field)
                             if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
                                 let ext_dep = ExtensionDependency::Versioned {
@@ -1447,12 +1446,12 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
 
         // Check if this external extension has dependencies
         if let Some(dependencies) = extension_config
-            .get("dependencies")
+            .get("packages")
             .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for nested extension dependency
-                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                if let Some(nested_ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
                     // Check if this is a nested external extension (has config field)
                     if let Some(nested_external_config) =
                         dep_spec.get("config").and_then(|v| v.as_str())
@@ -1552,13 +1551,17 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         visited.insert(ext_key);
 
         // Get the local extension configuration
-        if let Some(ext_config) = parsed_config.get("ext").and_then(|ext| ext.get(ext_name)) {
+        if let Some(ext_config) = parsed_config
+            .get("extensions")
+            .and_then(|ext| ext.get(ext_name))
+        {
             // Check if this local extension has dependencies
-            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_mapping())
-            {
+            if let Some(dependencies) = ext_config.get("packages").and_then(|d| d.as_mapping()) {
                 for (_dep_name, dep_spec) in dependencies {
                     // Check for extension dependency
-                    if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    if let Some(nested_ext_name) =
+                        dep_spec.get("extensions").and_then(|v| v.as_str())
+                    {
                         // Check if this is an external extension (has config field)
                         if let Some(external_config) =
                             dep_spec.get("config").and_then(|v| v.as_str())

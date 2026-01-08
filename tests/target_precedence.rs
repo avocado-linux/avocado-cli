@@ -16,14 +16,18 @@ fn test_target_precedence_order() {
     env::remove_var("AVOCADO_TARGET");
 
     let config_content = r#"
-default_target = "config-target"
-supported_targets = ["cli-target", "env-target", "config-target"]
+default_target: "config-target"
+supported_targets:
+  - cli-target
+  - env-target
+  - config-target
 
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.dev]
-target = "qemux86-64"
+runtimes:
+  dev:
+    target: "qemux86-64"
 "#;
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -85,11 +89,12 @@ target = "qemux86-64"
 #[serial]
 fn test_target_error_when_none_specified() {
     let config_content = r#"
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.dev]
-target = "qemux86-64"
+runtimes:
+  dev:
+    target: "qemux86-64"
 "#;
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -124,13 +129,15 @@ fn test_avocado_target_environment_variable() {
     env::remove_var("AVOCADO_TARGET");
 
     let config_content = r#"
-supported_targets = ["test-env-target"]
+supported_targets:
+  - test-env-target
 
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.dev]
-target = "qemux86-64"
+runtimes:
+  dev:
+    target: "qemux86-64"
 "#;
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -206,17 +213,21 @@ fn test_all_commands_accept_target_flag() {
 
     // Test that major commands accept --target flag without error
     let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["test", "qemux86-64"]
+default_target: "qemux86-64"
+supported_targets:
+  - test
+  - qemux86-64
 
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.default]
-target = "x86_64-unknown-linux-gnu"
+runtimes:
+  default:
+    target: "x86_64-unknown-linux-gnu"
 
-[ext.test-ext]
-sysext = true
+extensions:
+  test-ext:
+    sysext: true
 "#;
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -274,14 +285,16 @@ fn test_sdk_target_validation_supported() {
     env::remove_var("AVOCADO_TARGET");
 
     let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64"]
+default_target: "qemux86-64"
+supported_targets:
+  - qemux86-64
 
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.dev]
-target = "qemux86-64"
+runtimes:
+  dev:
+    target: "qemux86-64"
 "#;
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -313,14 +326,16 @@ fn test_sdk_target_validation_unsupported() {
     env::remove_var("AVOCADO_TARGET");
 
     let config_content = r#"
-default_target = "unsupported-target"
-supported_targets = ["qemux86-64"]
+default_target: "unsupported-target"
+supported_targets:
+  - qemux86-64
 
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.dev]
-target = "qemux86-64"
+runtimes:
+  dev:
+    target: "qemux86-64"
 "#;
 
     let mut config_file = NamedTempFile::new().unwrap();

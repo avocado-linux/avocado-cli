@@ -8,7 +8,7 @@ signing_keys:
   - my-production-key: abc123def456abc123def456abc123def456abc123def456abc123def456abc1
   - backup-key: 789012fedcba789012fedcba789012fedcba789012fedcba789012fedcba7890
 
-runtime:
+runtimes:
   default:
     target: x86_64-unknown-linux-gnu
   dev:

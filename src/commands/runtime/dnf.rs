@@ -72,7 +72,7 @@ impl RuntimeDnfCommand {
     }
 
     fn validate_runtime_exists(&self, parsed: &serde_yaml::Value) -> Result<()> {
-        let runtime_section = parsed.get("runtime").ok_or_else(|| {
+        let runtime_section = parsed.get("runtimes").ok_or_else(|| {
             print_error(
                 &format!("Runtime '{}' not found in configuration.", self.runtime),
                 OutputLevel::Normal,

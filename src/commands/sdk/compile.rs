@@ -349,16 +349,17 @@ mod tests {
         let cmd = SdkCompileCommand::new("test.yaml".to_string(), false, vec![], None, None, None);
 
         let config_content = r#"
-[sdk]
-image = "test-image"
-
-[sdk.compile.app]
-compile = "build.sh"
-dependencies = { gcc = "*" }
-
-[sdk.compile.library]
-compile = "lib_build.sh"
-dependencies = { make = "*" }
+sdk:
+  image: "test-image"
+  compile:
+    app:
+      compile: "build.sh"
+      packages:
+        gcc: "*"
+    library:
+      compile: "lib_build.sh"
+      packages:
+        make: "*"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         write!(temp_file, "{config_content}").unwrap();
@@ -417,7 +418,7 @@ dependencies = { gcc = "*" }
 
         let section_config = crate::utils::config::CompileConfig {
             compile: Some("my_script.sh".to_string()),
-            dependencies: Some(deps),
+            packages: Some(deps),
         };
 
         let script = cmd.find_compile_script_in_section(&section_config);
@@ -426,7 +427,7 @@ dependencies = { gcc = "*" }
         // Test section with no compile script
         let section_config_no_script = crate::utils::config::CompileConfig {
             compile: None,
-            dependencies: None,
+            packages: None,
         };
 
         let script = cmd.find_compile_script_in_section(&section_config_no_script);

@@ -300,7 +300,7 @@ impl ExtCheckoutCommand {
 
         // Get target from runtime configuration
         let target = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|runtime| runtime.as_mapping())
             .and_then(|runtime_table| {
                 if runtime_table.len() == 1 {

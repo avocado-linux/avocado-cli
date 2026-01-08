@@ -178,10 +178,10 @@ mod tests {
 default_target: "qemux86-64"
 sdk:
   image: "test-image"
-ext:
+extensions:
   my-app:
     version: "1.0.0"
-runtime:
+runtimes:
   dev:
     target: "qemux86-64"
 "#;

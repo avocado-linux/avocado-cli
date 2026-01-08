@@ -15,29 +15,29 @@ nested:
 
 reference_nested: "{{ config.nested.value }}"
 
-runtime:
+runtimes:
   dev:
     # Test avocado.target interpolation
     target: "{{ avocado.target }}"
-    dependencies:
+    packages:
       # Test multiple interpolation types
       base-pkg: "{{ config.base_image }}"
       target-pkg: "avocado-os-{{ avocado.target }}"
       env-pkg: "{{ env.TEST_PKG_ENV_VAR_INTERP }}"
 
   prod:
-    dependencies:
+    packages:
       # Test combined interpolation
       combined: "{{ config.base_image }}-{{ avocado.target }}"
 
 sdk:
   # Test distro interpolation via config context
   image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
-  dependencies:
+  packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
     nativesdk-avocado-ext-dev: "*"
 
-ext:
+extensions:
   test-ext:
     types:
       - sysext

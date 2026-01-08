@@ -16,31 +16,39 @@ distro:
 ## Runtimes
 ##
 
-runtime:
+runtimes:
   dev:
-    dependencies:
+    extensions:
+      - avocado-ext-dev
+      - avocado-ext-sshd-dev
+      - avocado-bsp-{{ avocado.target }}
+      - config
+      - app
+    packages:
       avocado-img-bootfiles: "*"
       avocado-img-rootfs: "*"
       avocado-img-initramfs: "*"
-      avocado-ext-dev:
-        ext: avocado-ext-dev
-        vsn: "*"
-      avocado-ext-sshd-dev:
-        ext: avocado-ext-sshd-dev
-        vsn: "*"
-      avocado-bsp:
-        ext: avocado-bsp-{{ avocado.target }}
-        vsn: "*"
-      config:
-        ext: config
-      app:
-        ext: app
 
 ##
 ## Extensions
 ##
 
-ext:
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: "*"
+
+  avocado-ext-sshd-dev:
+    source:
+      type: package
+      version: "*"
+
+  avocado-bsp-{{ avocado.target }}:
+    source:
+      type: package
+      version: "*"
+
   # Generated default app extension
   # Use or modify this to install dependencies and or include sdk compiled code
   app:
@@ -50,7 +58,7 @@ ext:
     version: "0.1.0"
 
   # Install application dependencies
-    # dependencies:
+    # packages:
 #curl = "*"
 #iperf3 = "*"
 
@@ -74,7 +82,7 @@ ext:
 sdk:
   image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
 
-  dependencies:
+  packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
     nativesdk-avocado-ext-dev: "*"
 
@@ -89,7 +97,7 @@ sdk:
 # When provisioning using usb or sd provisioning profiles, set extra sdk
 # container arguments to allow access to these devices
 
-provision:
+provision_profiles:
   usb:
     container_args:
       - -v

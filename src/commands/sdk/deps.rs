@@ -209,7 +209,7 @@ impl SdkDepsCommand {
         }
 
         // Try extension reference
-        if let Some(serde_yaml::Value::String(ext_name)) = table.get("ext") {
+        if let Some(serde_yaml::Value::String(ext_name)) = table.get("extensions") {
             let version = self.get_extension_version(config, ext_name);
             return vec![("ext".to_string(), ext_name.clone(), version)];
         }
@@ -240,7 +240,7 @@ impl SdkDepsCommand {
             .as_ref()
             .and_then(|sdk| sdk.compile.as_ref())
             .and_then(|compile| compile.get(compile_name))
-            .and_then(|compile_config| compile_config.dependencies.as_ref());
+            .and_then(|compile_config| compile_config.packages.as_ref());
 
         let Some(deps) = compile_deps else {
             return Vec::new();
@@ -287,11 +287,10 @@ mod tests {
 
         // Create a minimal config for testing
         let config_content = r#"
-[sdk]
-image = "test-image"
-
-[sdk.dependencies]
-cmake = "*"
+sdk:
+  image: "test-image"
+  packages:
+    cmake: "*"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         write!(temp_file, "{config_content}").unwrap();
@@ -342,12 +341,12 @@ cmake = "*"
         let config_content = r#"
 sdk:
   image: "test-image"
-  dependencies:
+  packages:
     cmake: "*"
     gcc: "11.0.0"
   compile:
     app:
-      dependencies:
+      packages:
         make: "4.3"
 "#;
         let mut temp_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
@@ -384,16 +383,16 @@ sdk:
         let config_content = r#"
 sdk:
   image: "test-image"
-  dependencies:
+  packages:
     cmake: "*"
 
-ext:
+extensions:
   avocado-dev:
     types:
       - sysext
       - confext
     sdk:
-      dependencies:
+      packages:
         nativesdk-avocado-hitl: "*"
 
   avocado-dev1:
@@ -401,7 +400,7 @@ ext:
       - sysext
       - confext
     sdk:
-      dependencies:
+      packages:
         nativesdk-avocado-hitl: "*"
 "#;
         let mut temp_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();

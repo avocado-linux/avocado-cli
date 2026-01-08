@@ -230,7 +230,7 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
         /// Provision profile to use
-        #[arg(long = "provision-profile")]
+        #[arg(long = "profile")]
         provision_profile: Option<String>,
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
@@ -580,7 +580,7 @@ enum RuntimeCommands {
         #[arg(short, long)]
         target: Option<String>,
         /// Provision profile to use
-        #[arg(long = "provision-profile")]
+        #[arg(long = "profile")]
         provision_profile: Option<String>,
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]

@@ -141,7 +141,9 @@ impl ExtPackageCommand {
             ExtensionLocation::Remote { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 // Then apply target-specific overrides manually
-                let ext_section = parsed.get("ext").and_then(|ext| ext.get(&self.extension));
+                let ext_section = parsed
+                    .get("extensions")
+                    .and_then(|ext| ext.get(&self.extension));
                 if let Some(ext_val) = ext_section {
                     let base_ext = ext_val.clone();
                     // Check for target-specific override within this extension
@@ -174,7 +176,7 @@ impl ExtPackageCommand {
         // For remote extensions, use the parsed config; for local, read from file
         let raw_ext_config = match &extension_location {
             ExtensionLocation::Remote { .. } => parsed
-                .get("ext")
+                .get("extensions")
                 .and_then(|ext| ext.get(&self.extension))
                 .cloned(),
             _ => self.get_raw_extension_config(&ext_config_path)?,
@@ -239,7 +241,7 @@ impl ExtPackageCommand {
             .with_context(|| format!("Failed to parse config file: {ext_config_path}"))?;
 
         // Get the ext section
-        let ext_section = parsed.get("ext");
+        let ext_section = parsed.get("extensions");
         if ext_section.is_none() {
             return Ok(None);
         }
@@ -270,7 +272,7 @@ impl ExtPackageCommand {
     ///
     /// If `package_files` is specified in the extension config, use those patterns.
     /// Otherwise, default to:
-    /// - The avocado config file (avocado.yaml, avocado.yml, or avocado.toml)
+    /// - The avocado config file (avocado.yaml or avocado.yml)
     /// - All overlay directories (base level and target-specific)
     ///
     /// # Arguments
@@ -552,8 +554,8 @@ if [ ! -d "$EXT_SRC_DIR" ]; then
 fi
 
 # Check for avocado config file
-if [ ! -f "$EXT_SRC_DIR/avocado.yaml" ] && [ ! -f "$EXT_SRC_DIR/avocado.yml" ] && [ ! -f "$EXT_SRC_DIR/avocado.toml" ]; then
-    echo "No avocado.yaml/yml/toml found in $EXT_SRC_DIR"
+if [ ! -f "$EXT_SRC_DIR/avocado.yaml" ] && [ ! -f "$EXT_SRC_DIR/avocado.yml" ]; then
+    echo "No avocado.yaml/yml found in $EXT_SRC_DIR"
     exit 1
 fi
 

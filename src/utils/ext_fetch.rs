@@ -88,7 +88,7 @@ impl ExtensionFetcher {
         let ext_install_path = install_dir.join(ext_name);
 
         match source {
-            ExtensionSource::Repo {
+            ExtensionSource::Package {
                 version,
                 package,
                 repo_name,
@@ -396,9 +396,7 @@ echo "Successfully copied extension '{ext_name}' from {resolved_source_str} to {
         let ext_path = install_dir.join(ext_name);
         // Check if the directory exists and has an avocado config file
         ext_path.exists()
-            && (ext_path.join("avocado.yaml").exists()
-                || ext_path.join("avocado.yml").exists()
-                || ext_path.join("avocado.toml").exists())
+            && (ext_path.join("avocado.yaml").exists() || ext_path.join("avocado.yml").exists())
     }
 }
 

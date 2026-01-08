@@ -1,11 +1,11 @@
 src_dir: .
-ext:
+extensions:
   external-extension:
     types:
     - sysext
     packages:
     - curl
-    dependencies:
+    packages:
       nested-dep:
         ext: nested-extension
         config: nested-config.yaml

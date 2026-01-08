@@ -96,7 +96,7 @@ impl SignCommand {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         let runtime_section = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|r| r.as_mapping())
             .ok_or_else(|| anyhow::anyhow!("No runtime configuration found"))?;
 

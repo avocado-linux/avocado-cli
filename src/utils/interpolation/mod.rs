@@ -723,9 +723,9 @@ key: "{{   env.TRIMMED   }}"
         let mut config = parse_yaml(
             r#"
 default_target: "x86_64"
-runtime:
+runtimes:
   dev:
-    dependencies:
+    packages:
       pkg1: "{{ env.PKG_VERSION }}"
       pkg2: "{{ config.default_target }}"
     array:
@@ -736,9 +736,9 @@ runtime:
 
         interpolate_config(&mut config, None).unwrap();
 
-        let runtime = config.get("runtime").unwrap();
+        let runtime = config.get("runtimes").unwrap();
         let dev = runtime.get("dev").unwrap();
-        let deps = dev.get("dependencies").unwrap();
+        let deps = dev.get("packages").unwrap();
 
         assert_eq!(deps.get("pkg1").unwrap().as_str().unwrap(), "1.2.3");
         assert_eq!(deps.get("pkg2").unwrap().as_str().unwrap(), "x86_64");
@@ -809,7 +809,7 @@ distro:
   version: 0.1.0
 sdk:
   image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
-  dependencies:
+  packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
 "#,
         );
@@ -822,7 +822,7 @@ sdk:
             "docker.io/avocadolinux/sdk:apollo-edge"
         );
 
-        let deps = sdk.get("dependencies").unwrap();
+        let deps = sdk.get("packages").unwrap();
         assert_eq!(
             deps.get("avocado-sdk-toolchain").unwrap().as_str().unwrap(),
             "0.1.0"
@@ -837,7 +837,7 @@ sdk:
             r#"
 default_target: qemux86-64
 sdk:
-  dependencies:
+  packages:
     packagegroup-rust-cross-canadian-{{ avocado.target }}: "*"
     regular-package: "1.0.0"
 "#,
@@ -846,7 +846,7 @@ sdk:
         interpolate_config(&mut config, Some("qemux86-64")).unwrap();
 
         let sdk = config.get("sdk").unwrap();
-        let deps = sdk.get("dependencies").unwrap();
+        let deps = sdk.get("packages").unwrap();
 
         // The key should be interpolated with the target
         assert!(deps
@@ -879,14 +879,14 @@ sdk:
 
         let mut config = parse_yaml(
             r#"
-dependencies:
+packages:
   package-{{ env.MY_SUFFIX }}: "1.0.0"
 "#,
         );
 
         interpolate_config(&mut config, None).unwrap();
 
-        let deps = config.get("dependencies").unwrap();
+        let deps = config.get("packages").unwrap();
         assert!(deps.get("package-custom").is_some());
         assert_eq!(
             deps.get("package-custom").unwrap().as_str().unwrap(),

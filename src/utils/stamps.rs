@@ -660,7 +660,7 @@ pub fn compute_sdk_input_hash(config: &serde_yaml::Value) -> Result<StampInputs>
 
     // Include sdk.dependencies
     if let Some(sdk) = config.get("sdk") {
-        if let Some(deps) = sdk.get("dependencies") {
+        if let Some(deps) = sdk.get("packages") {
             hash_data.insert(
                 serde_yaml::Value::String("sdk.dependencies".to_string()),
                 deps.clone(),
@@ -696,8 +696,8 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
     let mut hash_data = serde_yaml::Mapping::new();
 
     // Include ext.<name>.dependencies
-    if let Some(ext) = config.get("ext").and_then(|e| e.get(ext_name)) {
-        if let Some(deps) = ext.get("dependencies") {
+    if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
+        if let Some(deps) = ext.get("packages") {
             hash_data.insert(
                 serde_yaml::Value::String(format!("ext.{ext_name}.dependencies")),
                 deps.clone(),
@@ -725,7 +725,7 @@ pub fn compute_runtime_input_hash(
     let mut hash_data = serde_yaml::Mapping::new();
 
     // Include the merged dependencies section
-    if let Some(deps) = merged_runtime.get("dependencies") {
+    if let Some(deps) = merged_runtime.get("packages") {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.dependencies")),
             deps.clone(),
@@ -1538,22 +1538,6 @@ mod tests {
         // Test the Local variant (the primary way to specify extensions)
         let local = RuntimeExtDep::Local("my-local-ext".to_string());
         assert_eq!(local.name(), "my-local-ext");
-
-        // Test deprecated variants for backward compatibility
-        #[allow(deprecated)]
-        {
-            let external = RuntimeExtDep::External {
-                name: "my-external-ext".to_string(),
-                config_path: "path/to/config.yaml".to_string(),
-            };
-            assert_eq!(external.name(), "my-external-ext");
-
-            let versioned = RuntimeExtDep::Versioned {
-                name: "my-versioned-ext".to_string(),
-                version: "1.2.3".to_string(),
-            };
-            assert_eq!(versioned.name(), "my-versioned-ext");
-        }
     }
 
     #[test]

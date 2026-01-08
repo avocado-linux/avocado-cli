@@ -142,7 +142,9 @@ impl ExtImageCommand {
         // and may not find templated extension names like "avocado-bsp-{{ avocado.target }}"
         let extension_location = {
             // First check if extension exists in the composed config's ext section
-            let ext_in_composed = parsed.get("ext").and_then(|e| e.get(&self.extension));
+            let ext_in_composed = parsed
+                .get("extensions")
+                .and_then(|e| e.get(&self.extension));
 
             if let Some(ext_config) = ext_in_composed {
                 // Check if it has a source: field (indicating remote extension)
@@ -224,10 +226,12 @@ impl ExtImageCommand {
             ExtensionLocation::Remote { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 // Then apply target-specific overrides manually
-                let ext_section = parsed.get("ext").and_then(|ext| ext.get(&self.extension));
+                let ext_section = parsed
+                    .get("extensions")
+                    .and_then(|ext| ext.get(&self.extension));
 
                 if self.verbose {
-                    if let Some(all_ext) = parsed.get("ext") {
+                    if let Some(all_ext) = parsed.get("extensions") {
                         if let Some(ext_map) = all_ext.as_mapping() {
                             let ext_names: Vec<_> =
                                 ext_map.keys().filter_map(|k| k.as_str()).collect();
@@ -314,7 +318,7 @@ impl ExtImageCommand {
 
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed
-            .get("runtime")
+            .get("runtimes")
             .and_then(|runtime| runtime.as_mapping())
             .and_then(|runtime_table| {
                 if runtime_table.len() == 1 {

@@ -278,16 +278,16 @@ impl InitCommand {
     /// Checks if a target is supported in the given TOML content.
     ///
     /// # Arguments
-    /// * `toml_content` - The content of the avocado.yaml file
+    /// * `yaml_content` - The content of the avocado.yaml file
     /// * `target` - The target to check for
     ///
     /// # Returns
     /// * `Ok(true)` if the target is supported or if supported_targets contains "*"
     /// * `Ok(false)` if the target is not supported
-    /// * `Err` if the TOML cannot be parsed or doesn't have supported_targets
-    fn is_target_supported(toml_content: &str, target: &str) -> Result<bool> {
-        let config: toml::Value =
-            toml::from_str(toml_content).with_context(|| "Failed to parse avocado.yaml")?;
+    /// * `Err` if the YAML cannot be parsed or doesn't have supported_targets
+    fn is_target_supported(yaml_content: &str, target: &str) -> Result<bool> {
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(yaml_content).with_context(|| "Failed to parse avocado.yaml")?;
 
         let supported_targets_value = config.get("supported_targets").ok_or_else(|| {
             anyhow::anyhow!("Reference avocado.yaml missing 'supported_targets' field")
@@ -299,7 +299,7 @@ impl InitCommand {
         }
 
         // Handle supported_targets as an array
-        if let Some(array) = supported_targets_value.as_array() {
+        if let Some(array) = supported_targets_value.as_sequence() {
             // Check if "*" is in supported_targets (means all targets supported)
             let has_wildcard = array.iter().any(|v| v.as_str() == Some("*"));
 
@@ -319,38 +319,38 @@ impl InitCommand {
     /// Updates the default_target in the avocado.yaml file.
     ///
     /// # Arguments
-    /// * `toml_path` - Path to the avocado.yaml file
+    /// * `yaml_path` - Path to the avocado.yaml file
     /// * `new_target` - The new target to set as default
     ///
     /// # Returns
     /// * `Ok(())` if successful
     /// * `Err` if the file cannot be read, parsed, or written
-    fn update_default_target(toml_path: &Path, new_target: &str) -> Result<()> {
-        let content = fs::read_to_string(toml_path)
-            .with_context(|| format!("Failed to read '{}'", toml_path.display()))?;
+    fn update_default_target(yaml_path: &Path, new_target: &str) -> Result<()> {
+        let content = fs::read_to_string(yaml_path)
+            .with_context(|| format!("Failed to read '{}'", yaml_path.display()))?;
 
-        // Parse as toml::Value to preserve structure
-        let mut config: toml::Value =
-            toml::from_str(&content).with_context(|| "Failed to parse avocado.yaml")?;
+        // Parse as serde_yaml::Value to preserve structure
+        let mut config: serde_yaml::Value =
+            serde_yaml::from_str(&content).with_context(|| "Failed to parse avocado.yaml")?;
 
         // Update the default_target field
-        if let Some(table) = config.as_table_mut() {
-            table.insert(
-                "default_target".to_string(),
-                toml::Value::String(new_target.to_string()),
+        if let Some(mapping) = config.as_mapping_mut() {
+            mapping.insert(
+                serde_yaml::Value::String("default_target".to_string()),
+                serde_yaml::Value::String(new_target.to_string()),
             );
         } else {
-            anyhow::bail!("avocado.yaml is not a valid TOML table");
+            anyhow::bail!("avocado.yaml is not a valid YAML mapping");
         }
 
         // Write back to file
-        let updated_content = toml::to_string_pretty(&config)
-            .with_context(|| "Failed to serialize updated config")?;
+        let updated_content =
+            serde_yaml::to_string(&config).with_context(|| "Failed to serialize updated config")?;
 
-        fs::write(toml_path, updated_content).with_context(|| {
+        fs::write(yaml_path, updated_content).with_context(|| {
             format!(
                 "Failed to write updated config to '{}'",
-                toml_path.display()
+                yaml_path.display()
             )
         })?;
 
@@ -913,19 +913,18 @@ mod tests {
         assert!(content.contains("distro:"));
         assert!(content.contains("channel: apollo-edge"));
         assert!(content.contains("version: 0.1.0"));
-        assert!(content.contains("runtime:"));
+        assert!(content.contains("runtimes:"));
         assert!(content.contains("dev:"));
-        assert!(content.contains("dependencies:"));
-        assert!(content.contains("avocado-img-bootfiles: \"*\""));
-        assert!(content.contains("avocado-img-rootfs: \"*\""));
-        assert!(content.contains("avocado-img-initramfs: \"*\""));
+        assert!(content.contains("packages:"));
+        assert!(content.contains("avocado-img-bootfiles:"));
+        assert!(content.contains("avocado-img-rootfs:"));
+        assert!(content.contains("avocado-img-initramfs:"));
         assert!(content.contains("avocado-ext-dev:"));
-        assert!(content.contains("ext: avocado-ext-dev"));
-        assert!(content.contains("vsn: \"*\""));
+        assert!(content.contains("type: package"));
         assert!(
             content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.channel }}\"")
         );
-        assert!(content.contains("ext:"));
+        assert!(content.contains("extensions:"));
         assert!(content.contains("app:"));
         assert!(content.contains("- sysext"));
         assert!(content.contains("- confext"));

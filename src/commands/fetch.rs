@@ -163,7 +163,7 @@ impl FetchCommand {
 
         // Check if extension exists in configuration
         if config_toml
-            .get("ext")
+            .get("extensions")
             .and_then(|ext| ext.get(extension))
             .is_none()
         {
@@ -267,7 +267,7 @@ $DNF_SDK_HOST \
 
         // Check if runtime exists in configuration
         if config_toml
-            .get("runtime")
+            .get("runtimes")
             .and_then(|rt| rt.get(runtime))
             .is_none()
         {
@@ -378,7 +378,10 @@ $DNF_SDK_HOST \
         self.fetch_sdk_target_metadata(container_config).await?;
 
         // 4. Fetch all extension metadata (including nested external extensions)
-        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_mapping()) {
+        if let Some(extensions) = config_toml
+            .get("extensions")
+            .and_then(|ext| ext.as_mapping())
+        {
             for extension_name_val in extensions.keys() {
                 if let Some(extension_name) = extension_name_val.as_str() {
                     if let Err(e) = self
@@ -419,7 +422,7 @@ $DNF_SDK_HOST \
         }
 
         // 5. Fetch all runtime metadata
-        if let Some(runtimes) = config_toml.get("runtime").and_then(|rt| rt.as_mapping()) {
+        if let Some(runtimes) = config_toml.get("runtimes").and_then(|rt| rt.as_mapping()) {
             for runtime_name_val in runtimes.keys() {
                 if let Some(runtime_name) = runtime_name_val.as_str() {
                     if let Err(e) = self
@@ -706,11 +709,14 @@ $DNF_SDK_HOST \
         let mut visited = HashSet::new();
 
         // Find external extensions from main config
-        if let Some(extensions) = config_toml.get("ext").and_then(|ext| ext.as_mapping()) {
+        if let Some(extensions) = config_toml
+            .get("extensions")
+            .and_then(|ext| ext.as_mapping())
+        {
             for (ext_name_val, ext_config) in extensions {
                 if let Some(ext_name) = ext_name_val.as_str() {
                     if let Some(dependencies) =
-                        ext_config.get("dependencies").and_then(|d| d.as_mapping())
+                        ext_config.get("packages").and_then(|d| d.as_mapping())
                     {
                         for (_dep_name, dep_spec) in dependencies {
                             // Check for external extension dependency
@@ -800,12 +806,12 @@ $DNF_SDK_HOST \
 
         // Check if this external extension has dependencies
         if let Some(dependencies) = extension_config
-            .get("dependencies")
+            .get("packages")
             .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for nested extension dependency
-                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                if let Some(nested_ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
                     // Check if this is a nested external extension (has config field)
                     if let Some(nested_external_config) =
                         dep_spec.get("config").and_then(|v| v.as_str())

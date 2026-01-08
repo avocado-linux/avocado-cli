@@ -70,7 +70,7 @@ impl RuntimeProvisionCommand {
 
         // Get runtime configuration
         let runtime_config = parsed
-            .get("runtime")
+            .get("runtimes")
             .context("No runtime configuration found")?;
 
         // Check if runtime exists
@@ -458,7 +458,7 @@ impl RuntimeProvisionCommand {
 
         // Get checksum algorithm (defaults to sha256)
         let checksum_str = config
-            .runtime
+            .runtimes
             .as_ref()
             .and_then(|r| r.get(&self.config.runtime_name))
             .and_then(|rc| rc.signing.as_ref())
@@ -793,12 +793,12 @@ avocado-provision-{} {}
 
         let runtime_dep_table = merged_runtime
             .as_ref()
-            .and_then(|value| value.get("dependencies").and_then(|d| d.as_mapping()))
+            .and_then(|value| value.get("packages").and_then(|d| d.as_mapping()))
             .or_else(|| {
                 parsed
-                    .get("runtime")
+                    .get("runtimes")
                     .and_then(|r| r.get(runtime_name))
-                    .and_then(|runtime_value| runtime_value.get("dependencies"))
+                    .and_then(|runtime_value| runtime_value.get("packages"))
                     .and_then(|d| d.as_mapping())
             });
 
@@ -806,7 +806,7 @@ avocado-provision-{} {}
 
         if let Some(deps) = runtime_dep_table {
             for dep_spec in deps.values() {
-                if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                if let Some(ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
                     let version = self
                         .resolve_extension_version(
                             parsed,
@@ -868,7 +868,7 @@ avocado-provision-{} {}
 
         // Try to get version from local [ext] section
         if let Some(version) = parsed
-            .get("ext")
+            .get("extensions")
             .and_then(|ext_section| ext_section.as_mapping())
             .and_then(|ext_table| ext_table.get(ext_name))
             .and_then(|ext_config| ext_config.get("version"))
@@ -1010,70 +1010,8 @@ mod tests {
         assert!(script.contains("Running SDK lifecycle hook 'avocado-provision'"));
     }
 
-    #[tokio::test]
-    async fn test_collect_runtime_extensions() {
-        use std::fs;
-        use tempfile::TempDir;
-
-        let config_content = r#"
-sdk:
-  image: "docker.io/avocado/sdk:latest"
-
-runtime:
-  test-runtime:
-    dependencies:
-      ext_one:
-        ext: alpha-ext
-        vsn: "1.0.0"
-      ext_two:
-        ext: beta-ext
-        vsn: "2.0.0"
-        "#;
-
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("avocado.yaml");
-        fs::write(&config_path, config_content).unwrap();
-
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
-        let config = crate::utils::config::Config::load(&config_path).unwrap();
-
-        let provision_config = RuntimeProvisionConfig {
-            runtime_name: "test-runtime".to_string(),
-            config_path: config_path.to_str().unwrap().to_string(),
-            verbose: false,
-            force: false,
-            target: Some("x86_64".to_string()),
-            provision_profile: None,
-            env_vars: None,
-            out: None,
-            container_args: None,
-            dnf_args: None,
-            state_file: None,
-            no_stamps: false,
-            runs_on: None,
-            nfs_port: None,
-            sdk_arch: None,
-        };
-
-        let command = RuntimeProvisionCommand::new(provision_config);
-
-        let extensions = command
-            .collect_runtime_extensions(
-                &parsed,
-                &config,
-                "test-runtime",
-                "x86_64",
-                config_path.to_str().unwrap(),
-                "docker.io/avocado/sdk:latest",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            extensions,
-            vec!["alpha-ext-1.0.0".to_string(), "beta-ext-2.0.0".to_string()]
-        );
-    }
+    // NOTE: test_collect_runtime_extensions was removed as it tested the deprecated
+    // ext:/vsn: format inside runtime packages. The new format uses an extensions array.
 
     #[test]
     fn test_new_with_container_args() {

@@ -84,7 +84,7 @@ impl RuntimeInstallCommand {
         let repo_release = config.get_sdk_repo_release();
 
         // Check if runtime section exists
-        let runtime_section = match parsed.get("runtime") {
+        let runtime_section = match parsed.get("runtimes") {
             Some(runtime) => runtime,
             None => {
                 if self.runtime.is_some() {
@@ -392,7 +392,7 @@ impl RuntimeInstallCommand {
             config.get_merged_runtime_config(runtime, &target_arch, &self.config_path)?;
         let dependencies = merged_runtime
             .as_ref()
-            .and_then(|merged| merged.get("dependencies"));
+            .and_then(|merged| merged.get("packages"));
 
         let sysroot = SysrootType::Runtime(runtime.to_string());
 
@@ -653,7 +653,7 @@ sdk:
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   other-runtime:
     target: "x86_64"
 "#;
@@ -678,10 +678,10 @@ runtime:
     async fn test_execute_no_sdk_config() {
         let temp_dir = TempDir::new().unwrap();
         let config_content = r#"
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
-    dependencies:
+    packages:
       gcc: "11.0"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
@@ -712,10 +712,10 @@ runtime:
 sdk:
   # Missing image field
 
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
-    dependencies:
+    packages:
       gcc: "11.0"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);

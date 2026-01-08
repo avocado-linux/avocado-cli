@@ -126,7 +126,7 @@ impl RuntimeSignCommand {
 
         // Verify runtime exists
         let runtime_config = parsed
-            .get("runtime")
+            .get("runtimes")
             .context("No runtime configuration found")?;
 
         runtime_config.get(&self.runtime_name).with_context(|| {
@@ -145,13 +145,13 @@ impl RuntimeSignCommand {
 
         let binding = serde_yaml::Mapping::new();
         let runtime_deps = merged_runtime
-            .get("dependencies")
+            .get("packages")
             .and_then(|v| v.as_mapping())
             .unwrap_or(&binding);
 
         let mut required_extensions = HashSet::new();
         for (_dep_name, dep_spec) in runtime_deps {
-            if let Some(ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+            if let Some(ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
                 required_extensions.insert(ext_name.to_string());
             }
         }
@@ -253,15 +253,16 @@ impl RuntimeSignCommand {
 
         // Check if this is a local extension
         if let Some(ext_config) = parsed
-            .get("ext")
+            .get("extensions")
             .and_then(|e| e.as_mapping())
             .and_then(|table| table.get(ext_name))
         {
             // This is a local extension - check its dependencies
-            if let Some(dependencies) = ext_config.get("dependencies").and_then(|d| d.as_mapping())
-            {
+            if let Some(dependencies) = ext_config.get("packages").and_then(|d| d.as_mapping()) {
                 for (_dep_name, dep_spec) in dependencies {
-                    if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    if let Some(nested_ext_name) =
+                        dep_spec.get("extensions").and_then(|v| v.as_str())
+                    {
                         // Check if this is an external extension dependency
                         if let Some(external_config_path) =
                             dep_spec.get("config").and_then(|v| v.as_str())
@@ -284,11 +285,12 @@ impl RuntimeSignCommand {
                             // Process its dependencies from the external config
                             if let Some(ext_config) = external_extensions.get(nested_ext_name) {
                                 if let Some(nested_deps) =
-                                    ext_config.get("dependencies").and_then(|d| d.as_mapping())
+                                    ext_config.get("packages").and_then(|d| d.as_mapping())
                                 {
                                     for (_nested_dep_name, nested_dep_spec) in nested_deps {
-                                        if let Some(nested_nested_ext_name) =
-                                            nested_dep_spec.get("ext").and_then(|v| v.as_str())
+                                        if let Some(nested_nested_ext_name) = nested_dep_spec
+                                            .get("extensions")
+                                            .and_then(|v| v.as_str())
                                         {
                                             self.collect_extension_dependencies(
                                                 config,
@@ -326,12 +328,11 @@ impl RuntimeSignCommand {
                     )
                 })?;
 
-            if let Some(runtime_deps) = merged_runtime
-                .get("dependencies")
-                .and_then(|v| v.as_mapping())
+            if let Some(runtime_deps) = merged_runtime.get("packages").and_then(|v| v.as_mapping())
             {
                 for (_dep_name, dep_spec) in runtime_deps {
-                    if let Some(dep_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
+                    if let Some(dep_ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str())
+                    {
                         if dep_ext_name == ext_name {
                             if let Some(external_config_path) =
                                 dep_spec.get("config").and_then(|v| v.as_str())
@@ -344,11 +345,12 @@ impl RuntimeSignCommand {
 
                                 if let Some(ext_config) = external_extensions.get(ext_name) {
                                     if let Some(nested_deps) =
-                                        ext_config.get("dependencies").and_then(|d| d.as_mapping())
+                                        ext_config.get("packages").and_then(|d| d.as_mapping())
                                     {
                                         for (_nested_dep_name, nested_dep_spec) in nested_deps {
-                                            if let Some(nested_ext_name) =
-                                                nested_dep_spec.get("ext").and_then(|v| v.as_str())
+                                            if let Some(nested_ext_name) = nested_dep_spec
+                                                .get("extensions")
+                                                .and_then(|v| v.as_str())
                                             {
                                                 self.collect_extension_dependencies(
                                                     config,
@@ -412,7 +414,7 @@ impl RuntimeSignCommand {
 
         // Get checksum algorithm (defaults to sha256)
         let checksum_str = config
-            .runtime
+            .runtimes
             .as_ref()
             .and_then(|r| r.get(&self.runtime_name))
             .and_then(|rc| rc.signing.as_ref())

@@ -36,7 +36,7 @@ impl RuntimeDepsCommand {
 
     fn validate_runtime_exists(&self, parsed: &serde_yaml::Value) -> Result<()> {
         let runtime_config = parsed
-            .get("runtime")
+            .get("runtimes")
             .context("No runtime configuration found")?;
 
         runtime_config.get(&self.runtime_name).with_context(|| {
@@ -58,7 +58,7 @@ impl RuntimeDepsCommand {
         runtime_name: &str,
     ) -> Result<Vec<(String, String, String)>> {
         let runtime_config = parsed
-            .get("runtime")
+            .get("runtimes")
             .context("No runtime configuration found")?;
 
         let runtime_spec = runtime_config
@@ -77,10 +77,7 @@ impl RuntimeDepsCommand {
         }
 
         // Read package dependencies from the `dependencies` section
-        if let Some(deps_table) = runtime_spec
-            .get("dependencies")
-            .and_then(|v| v.as_mapping())
-        {
+        if let Some(deps_table) = runtime_spec.get("packages").and_then(|v| v.as_mapping()) {
             for (dep_name_val, dep_spec) in deps_table {
                 if let Some(dep_name) = dep_name_val.as_str() {
                     dependencies.push(self.resolve_package_dependency(dep_name, dep_spec));
@@ -98,7 +95,7 @@ impl RuntimeDepsCommand {
         ext_name: &str,
     ) -> (String, String, String) {
         let version = parsed
-            .get("ext")
+            .get("extensions")
             .and_then(|ext_config| ext_config.as_mapping())
             .and_then(|ext_table| ext_table.get(ext_name))
             .and_then(|ext_spec| ext_spec.get("version"))
@@ -153,15 +150,15 @@ mod tests {
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
     extensions:
       - my-extension
-    dependencies:
+    packages:
       gcc: "11.0"
 
-ext:
+extensions:
   my-extension:
     version: "2.0.0"
     types:

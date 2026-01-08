@@ -1,26 +1,11 @@
 //! Configuration utilities for Avocado CLI.
 
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-// =============================================================================
-// DEPRECATION NOTE: TOML Support (Pre-1.0.0)
-// =============================================================================
-// TOML configuration file support is DEPRECATED and maintained only for
-// backward compatibility and migration purposes. The default format is now YAML.
-//
-// TOML support will be removed before the 1.0.0 release.
-//
-// Migration: When a legacy avocado.toml file is detected, it will be
-// automatically converted to avocado.yaml format.
-// =============================================================================
 
 /// Custom deserializer module for container_args
 mod container_args_deserializer {
@@ -113,10 +98,10 @@ pub enum ExtensionLocation {
     /// Extension defined in the main config file
     Local { name: String, config_path: String },
     /// DEPRECATED: Extension from an external config file
-    /// Use source: path in the ext section instead
+    /// Use source: path in the extensions section instead
     #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
     External { name: String, config_path: String },
-    /// Remote extension fetched from a source (repo, git, or path)
+    /// Remote extension fetched from a source (package, git, or path)
     Remote {
         name: String,
         source: ExtensionSource,
@@ -128,7 +113,8 @@ pub enum ExtensionLocation {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ExtensionSource {
     /// Extension from the avocado package repository
-    Repo {
+    #[serde(alias = "repo")]
+    Package {
         /// Version to fetch (e.g., "0.1.0" or "*")
         version: String,
         /// Optional RPM package name (defaults to extension name if not specified)
@@ -138,7 +124,7 @@ pub enum ExtensionSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         repo_name: Option<String>,
         /// Optional list of config sections to include from the remote extension.
-        /// Supports dot-separated paths (e.g., "provision.tegraflash") and wildcards (e.g., "provision.*").
+        /// Supports dot-separated paths (e.g., "provision_profiles.tegraflash") and wildcards (e.g., "provision_profiles.*").
         /// The extension's own `ext.<name>` section is always included.
         /// Referenced `sdk.compile.*` sections are auto-included based on compile dependencies.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,7 +141,7 @@ pub enum ExtensionSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         sparse_checkout: Option<Vec<String>>,
         /// Optional list of config sections to include from the remote extension.
-        /// Supports dot-separated paths (e.g., "provision.tegraflash") and wildcards (e.g., "provision.*").
+        /// Supports dot-separated paths (e.g., "provision_profiles.tegraflash") and wildcards (e.g., "provision_profiles.*").
         /// The extension's own `ext.<name>` section is always included.
         /// Referenced `sdk.compile.*` sections are auto-included based on compile dependencies.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,7 +152,7 @@ pub enum ExtensionSource {
         /// Path to the extension directory (relative to config or absolute)
         path: String,
         /// Optional list of config sections to include from the remote extension.
-        /// Supports dot-separated paths (e.g., "provision.tegraflash") and wildcards (e.g., "provision.*").
+        /// Supports dot-separated paths (e.g., "provision_profiles.tegraflash") and wildcards (e.g., "provision_profiles.*").
         /// The extension's own `ext.<name>` section is always included.
         /// Referenced `sdk.compile.*` sections are auto-included based on compile dependencies.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,7 +165,7 @@ impl ExtensionSource {
     /// Returns an empty slice if no include patterns are specified.
     pub fn get_include_patterns(&self) -> &[String] {
         match self {
-            ExtensionSource::Repo { include, .. } => {
+            ExtensionSource::Package { include, .. } => {
                 include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
             }
             ExtensionSource::Git { include, .. } => {
@@ -194,8 +180,8 @@ impl ExtensionSource {
     /// Check if a config path matches any of the include patterns.
     ///
     /// Supports:
-    /// - Exact matches: "provision.tegraflash" matches "provision.tegraflash"
-    /// - Wildcard suffix: "provision.*" matches "provision.tegraflash", "provision.usb", etc.
+    /// - Exact matches: "provision_profiles.tegraflash" matches "provision_profiles.tegraflash"
+    /// - Wildcard suffix: "provision_profiles.*" matches "provision_profiles.tegraflash", "provision_profiles.usb", etc.
     ///
     /// Returns true if the path matches at least one include pattern.
     pub fn matches_include_pattern(config_path: &str, patterns: &[String]) -> bool {
@@ -216,7 +202,6 @@ impl ExtensionSource {
         }
         false
     }
-
 }
 
 /// Represents an extension dependency for a runtime with type information
@@ -225,24 +210,13 @@ impl ExtensionSource {
 pub enum RuntimeExtDep {
     /// Extension defined in the config (local or fetched remote)
     Local(String),
-    /// DEPRECATED: Extension from an external config file
-    /// Use source: path in the ext section instead
-    #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
-    External { name: String, config_path: String },
-    /// DEPRECATED: Prebuilt extension from package repo
-    /// Use source: repo in the ext section instead
-    #[deprecated(since = "0.23.0", note = "Use Local with source: repo instead")]
-    Versioned { name: String, version: String },
 }
 
 impl RuntimeExtDep {
     /// Get the extension name
-    #[allow(deprecated)]
     pub fn name(&self) -> &str {
         match self {
             RuntimeExtDep::Local(name) => name,
-            RuntimeExtDep::External { name, .. } => name,
-            RuntimeExtDep::Versioned { name, .. } => name,
         }
     }
 }
@@ -252,7 +226,7 @@ impl RuntimeExtDep {
 /// This struct provides a unified view where:
 /// - `distro`, `default_target`, `supported_targets` come from the main config only
 /// - `ext` sections are merged from both main and external configs
-/// - `sdk.dependencies` and `sdk.compile` are merged from both main and external configs
+/// - `sdk.packages` and `sdk.compile` are merged from both main and external configs
 ///
 /// Interpolation is applied after merging, so external configs can reference
 /// `{{ config.distro.version }}` and resolve to the main config's values.
@@ -395,7 +369,8 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SdkConfig {
     pub image: Option<String>,
-    pub dependencies: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(alias = "dependencies")]
+    pub packages: Option<HashMap<String, serde_yaml::Value>>,
     pub compile: Option<HashMap<String, CompileConfig>>,
     pub repo_url: Option<String>,
     pub repo_release: Option<String>,
@@ -412,7 +387,8 @@ pub struct SdkConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompileConfig {
     pub compile: Option<String>,
-    pub dependencies: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(alias = "dependencies")]
+    pub packages: Option<HashMap<String, serde_yaml::Value>>,
 }
 
 /// Provision profile configuration
@@ -478,9 +454,11 @@ pub struct Config {
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
     pub distro: Option<DistroConfig>,
-    pub runtime: Option<HashMap<String, RuntimeConfig>>,
+    #[serde(alias = "runtime")]
+    pub runtimes: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
-    pub provision: Option<HashMap<String, ProvisionProfileConfig>>,
+    #[serde(alias = "provision")]
+    pub provision_profiles: Option<HashMap<String, ProvisionProfileConfig>>,
     /// Signing keys mapping friendly names to key IDs
     /// Acts as a local bridge between the config and the global signing keys registry
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
@@ -496,7 +474,7 @@ impl Config {
     /// - For named sections: [section_type.name] + [section_type.name.<target>]
     ///
     /// # Arguments
-    /// * `section_path` - The base section path (e.g., "sdk", "runtime.prod", "ext.avocado-dev")
+    /// * `section_path` - The base section path (e.g., "sdk", "runtimes.prod", "extensions.avocado-dev")
     /// * `target` - The target architecture
     /// * `config_path` - Path to the configuration file for raw TOML access
     ///
@@ -547,19 +525,10 @@ impl Config {
         }
     }
 
-    /// Parse a config file content into a YAML value (supports both YAML and TOML)
+    /// Parse a config file content into a YAML value
     fn parse_config_value(path: &str, content: &str) -> Result<serde_yaml::Value> {
-        let is_yaml = path.ends_with(".yaml") || path.ends_with(".yml");
-
-        if is_yaml {
-            serde_yaml::from_str(content)
-                .with_context(|| format!("Failed to parse config file: {path}"))
-        } else {
-            // DEPRECATED: Parse TOML and convert to YAML value
-            let toml_val: toml::Value = toml::from_str(content)
-                .with_context(|| format!("Failed to parse config file: {path}"))?;
-            Self::toml_to_yaml(&toml_val)
-        }
+        serde_yaml::from_str(content)
+            .with_context(|| format!("Failed to parse config file: {path}"))
     }
 
     /// Parse config content and apply interpolation with the given target.
@@ -588,7 +557,7 @@ impl Config {
     /// 2. Discovers installed remote extensions in avocado-extensions/ and merges their configs
     /// 3. Discovers all external config references in runtime and ext dependencies
     /// 4. Loads each external config (raw)
-    /// 5. Merges external `ext.*`, `sdk.dependencies`, and `sdk.compile` sections
+    /// 5. Merges external `extensions.*`, `sdk.packages`, and `sdk.compile` sections
     /// 6. Applies interpolation to the composed model
     ///
     /// The `distro`, `default_target`, and `supported_targets` sections come from the main config only,
@@ -610,7 +579,7 @@ impl Config {
         let mut main_config = Self::parse_config_value(&config_path_str, &content)?;
 
         // Record extensions from the main config
-        if let Some(ext_section) = main_config.get("ext").and_then(|e| e.as_mapping()) {
+        if let Some(ext_section) = main_config.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_key, _) in ext_section {
                 if let Some(ext_name) = ext_key.as_str() {
                     extension_sources.insert(ext_name.to_string(), config_path_str.clone());
@@ -654,8 +623,8 @@ impl Config {
             // For external configs (deprecated `config: path` syntax), use permissive include patterns
             // to maintain backward compatibility - merge all sections
             let legacy_include_patterns = vec![
-                "provision.*".to_string(),
-                "sdk.dependencies.*".to_string(),
+                "provision_profiles.*".to_string(),
+                "sdk.packages.*".to_string(),
                 "sdk.compile.*".to_string(),
             ];
             let auto_include_compile =
@@ -675,8 +644,9 @@ impl Config {
             extension_sources.insert(ext_name.clone(), resolved_path_str.clone());
 
             // Also record any extensions defined within this external config
-            if let Some(nested_ext_section) =
-                external_config.get("ext").and_then(|e| e.as_mapping())
+            if let Some(nested_ext_section) = external_config
+                .get("extensions")
+                .and_then(|e| e.as_mapping())
             {
                 for (nested_ext_key, _) in nested_ext_section {
                     if let Some(nested_ext_name) = nested_ext_key.as_str() {
@@ -725,9 +695,9 @@ impl Config {
                 supported_targets: None,
                 src_dir: None,
                 distro: None,
-                runtime: None,
+                runtimes: None,
                 sdk: None,
-                provision: None,
+                provision_profiles: None,
                 signing_keys: None,
             });
 
@@ -876,7 +846,9 @@ impl Config {
                     if verbose {
                         eprintln!("[DEBUG] Successfully parsed config for '{ext_name}'");
                         // Show what extensions are defined in this remote config
-                        if let Some(ext_section) = cfg.get("ext").and_then(|e| e.as_mapping()) {
+                        if let Some(ext_section) =
+                            cfg.get("extensions").and_then(|e| e.as_mapping())
+                        {
                             let ext_names: Vec<_> =
                                 ext_section.keys().filter_map(|k| k.as_str()).collect();
                             eprintln!("[DEBUG]   Remote config defines extensions: {ext_names:?}");
@@ -915,7 +887,9 @@ impl Config {
             extension_sources.insert(ext_name.clone(), ext_config_path_str.clone());
 
             // Also record any extensions defined within this remote extension's config
-            if let Some(nested_ext_section) = ext_config.get("ext").and_then(|e| e.as_mapping()) {
+            if let Some(nested_ext_section) =
+                ext_config.get("extensions").and_then(|e| e.as_mapping())
+            {
                 for (nested_ext_key, _) in nested_ext_section {
                     if let Some(nested_ext_name) = nested_ext_key.as_str() {
                         extension_sources
@@ -948,7 +922,8 @@ impl Config {
 
             if verbose {
                 // Show what the main config's ext section looks like after merge
-                if let Some(main_ext) = main_config.get("ext").and_then(|e| e.get(&ext_name)) {
+                if let Some(main_ext) = main_config.get("extensions").and_then(|e| e.get(&ext_name))
+                {
                     eprintln!(
                         "[DEBUG] After merge, main config ext.{}:\n{}",
                         ext_name,
@@ -1033,7 +1008,7 @@ impl Config {
         let mut visited = std::collections::HashSet::new();
 
         // Scan runtime dependencies
-        if let Some(runtime_section) = config.get("runtime").and_then(|r| r.as_mapping()) {
+        if let Some(runtime_section) = config.get("runtimes").and_then(|r| r.as_mapping()) {
             for (_runtime_name, runtime_config) in runtime_section {
                 Self::collect_external_refs_from_dependencies(
                     runtime_config,
@@ -1047,7 +1022,7 @@ impl Config {
                         // Skip known non-target keys
                         if let Some(key_str) = key.as_str() {
                             if ![
-                                "dependencies",
+                                "packages",
                                 "target",
                                 "stone_include_paths",
                                 "stone_manifest",
@@ -1069,7 +1044,7 @@ impl Config {
         }
 
         // Scan ext dependencies
-        if let Some(ext_section) = config.get("ext").and_then(|e| e.as_mapping()) {
+        if let Some(ext_section) = config.get("extensions").and_then(|e| e.as_mapping()) {
             for (_ext_name, ext_config) in ext_section {
                 Self::collect_external_refs_from_dependencies(ext_config, &mut refs, &mut visited);
 
@@ -1088,7 +1063,6 @@ impl Config {
                                 "vendor",
                                 "types",
                                 "packages",
-                                "dependencies",
                                 "sdk",
                                 "enable_services",
                                 "on_merge",
@@ -1125,14 +1099,14 @@ impl Config {
         refs: &mut Vec<(String, String)>,
         visited: &mut std::collections::HashSet<String>,
     ) {
-        let dependencies = section.get("dependencies").and_then(|d| d.as_mapping());
+        let dependencies = section.get("packages").and_then(|d| d.as_mapping());
 
         if let Some(deps_map) = dependencies {
             for (_dep_name, dep_spec) in deps_map {
                 if let Some(spec_map) = dep_spec.as_mapping() {
                     // Check for external extension reference
                     if let (Some(ext_name), Some(config_path)) = (
-                        spec_map.get("ext").and_then(|v| v.as_str()),
+                        spec_map.get("extensions").and_then(|v| v.as_str()),
                         spec_map.get("config").and_then(|v| v.as_str()),
                     ) {
                         let key = format!("{ext_name}:{config_path}");
@@ -1153,7 +1127,7 @@ impl Config {
     ///
     /// Conditionally merges (based on include_patterns):
     /// - `provision.<profile>` sections (if pattern matches)
-    /// - `sdk.dependencies.<dep>` (if pattern matches)
+    /// - `sdk.packages.<dep>` (if pattern matches)
     /// - `sdk.compile.<section>` (if pattern matches)
     ///
     /// Does NOT merge (main config only):
@@ -1166,7 +1140,7 @@ impl Config {
     /// * `main_config` - The main config to merge into
     /// * `external_config` - The external config to merge from
     /// * `ext_name` - The name of the extension (its `ext.<name>` is always merged)
-    /// * `include_patterns` - Patterns for additional sections to include (e.g., "provision.*")
+    /// * `include_patterns` - Patterns for additional sections to include (e.g., "provision_profiles.*")
     /// * `auto_include_compile` - List of sdk.compile section names to auto-include (from compile deps)
     fn merge_external_config(
         main_config: &mut serde_yaml::Value,
@@ -1175,18 +1149,21 @@ impl Config {
         include_patterns: &[String],
         auto_include_compile: &[String],
     ) {
-        // Always merge the extension's own ext.<ext_name> section
-        if let Some(external_ext) = external_config.get("ext").and_then(|e| e.as_mapping()) {
+        // Always merge the extension's own extensions.<ext_name> section
+        if let Some(external_ext) = external_config
+            .get("extensions")
+            .and_then(|e| e.as_mapping())
+        {
             let main_ext = main_config
                 .as_mapping_mut()
                 .and_then(|m| {
-                    if !m.contains_key(serde_yaml::Value::String("ext".to_string())) {
+                    if !m.contains_key(serde_yaml::Value::String("extensions".to_string())) {
                         m.insert(
-                            serde_yaml::Value::String("ext".to_string()),
+                            serde_yaml::Value::String("extensions".to_string()),
                             serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
                         );
                     }
-                    m.get_mut(serde_yaml::Value::String("ext".to_string()))
+                    m.get_mut(serde_yaml::Value::String("extensions".to_string()))
                 })
                 .and_then(|e| e.as_mapping_mut());
 
@@ -1246,16 +1223,16 @@ impl Config {
 
         // Merge provision sections based on include patterns
         if let Some(external_provision) = external_config
-            .get("provision")
+            .get("provision_profiles")
             .and_then(|p| p.as_mapping())
         {
             for (profile_key, profile_value) in external_provision {
                 if let Some(profile_name) = profile_key.as_str() {
-                    let config_path = format!("provision.{profile_name}");
+                    let config_path = format!("provision_profiles.{profile_name}");
                     if ExtensionSource::matches_include_pattern(&config_path, include_patterns) {
                         Self::ensure_provision_section(main_config);
                         if let Some(main_provision) = main_config
-                            .get_mut("provision")
+                            .get_mut("provision_profiles")
                             .and_then(|p| p.as_mapping_mut())
                         {
                             // Only add if not already present (main takes precedence)
@@ -1268,20 +1245,20 @@ impl Config {
             }
         }
 
-        // Merge sdk.dependencies based on include patterns
+        // Merge sdk.packages based on include patterns
         if let Some(external_sdk_deps) = external_config
             .get("sdk")
-            .and_then(|s| s.get("dependencies"))
+            .and_then(|s| s.get("packages"))
             .and_then(|d| d.as_mapping())
         {
             for (dep_key, dep_value) in external_sdk_deps {
                 if let Some(dep_name) = dep_key.as_str() {
-                    let config_path = format!("sdk.dependencies.{dep_name}");
+                    let config_path = format!("sdk.packages.{dep_name}");
                     if ExtensionSource::matches_include_pattern(&config_path, include_patterns) {
-                        Self::ensure_sdk_dependencies_section(main_config);
+                        Self::ensure_sdk_packages_section(main_config);
                         if let Some(main_sdk_deps) = main_config
                             .get_mut("sdk")
-                            .and_then(|s| s.get_mut("dependencies"))
+                            .and_then(|s| s.get_mut("packages"))
                             .and_then(|d| d.as_mapping_mut())
                         {
                             // Only add if not already present (main takes precedence)
@@ -1391,9 +1368,9 @@ impl Config {
     /// Ensure the provision section exists in the config.
     fn ensure_provision_section(config: &mut serde_yaml::Value) {
         if let Some(main_map) = config.as_mapping_mut() {
-            if !main_map.contains_key(serde_yaml::Value::String("provision".to_string())) {
+            if !main_map.contains_key(serde_yaml::Value::String("provision_profiles".to_string())) {
                 main_map.insert(
-                    serde_yaml::Value::String("provision".to_string()),
+                    serde_yaml::Value::String("provision_profiles".to_string()),
                     serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
                 );
             }
@@ -1475,9 +1452,9 @@ impl Config {
         let mut compile_deps = Vec::new();
 
         if let Some(ext_section) = ext_config
-            .get("ext")
+            .get("extensions")
             .and_then(|e| e.get(ext_name))
-            .and_then(|e| e.get("dependencies"))
+            .and_then(|e| e.get("packages"))
             .and_then(|d| d.as_mapping())
         {
             for (_dep_name, dep_spec) in ext_section {
@@ -1490,8 +1467,8 @@ impl Config {
         compile_deps
     }
 
-    /// Ensure the sdk.dependencies section exists in the config.
-    fn ensure_sdk_dependencies_section(config: &mut serde_yaml::Value) {
+    /// Ensure the sdk.packages section exists in the config.
+    fn ensure_sdk_packages_section(config: &mut serde_yaml::Value) {
         if let Some(main_map) = config.as_mapping_mut() {
             // Ensure sdk section exists
             if !main_map.contains_key(serde_yaml::Value::String("sdk".to_string())) {
@@ -1501,13 +1478,12 @@ impl Config {
                 );
             }
 
-            // Ensure sdk.dependencies section exists
+            // Ensure sdk.packages section exists
             if let Some(sdk) = main_map.get_mut(serde_yaml::Value::String("sdk".to_string())) {
                 if let Some(sdk_map) = sdk.as_mapping_mut() {
-                    if !sdk_map.contains_key(serde_yaml::Value::String("dependencies".to_string()))
-                    {
+                    if !sdk_map.contains_key(serde_yaml::Value::String("packages".to_string())) {
                         sdk_map.insert(
-                            serde_yaml::Value::String("dependencies".to_string()),
+                            serde_yaml::Value::String("packages".to_string()),
                             serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
                         );
                     }
@@ -1626,7 +1602,7 @@ impl Config {
         target: &str,
         config_path: &str,
     ) -> Result<Option<serde_yaml::Value>> {
-        let section_path = format!("runtime.{runtime_name}");
+        let section_path = format!("runtimes.{runtime_name}");
         self.get_merged_section(&section_path, target, config_path)
     }
 
@@ -1638,7 +1614,7 @@ impl Config {
         target: &str,
         config_path: &str,
     ) -> Result<Option<serde_yaml::Value>> {
-        let section_path = format!("provision.{profile_name}");
+        let section_path = format!("provision_profiles.{profile_name}");
         self.get_merged_section(&section_path, target, config_path)
     }
 
@@ -1649,7 +1625,7 @@ impl Config {
         target: &str,
         config_path: &str,
     ) -> Result<Option<serde_yaml::Value>> {
-        let section_path = format!("ext.{ext_name}");
+        let section_path = format!("extensions.{ext_name}");
         self.get_merged_section(&section_path, target, config_path)
     }
 
@@ -1666,7 +1642,7 @@ impl Config {
     ///     extensions:
     ///       - avocado-ext-dev
     ///       - avocado-ext-sshd-dev
-    ///     dependencies:
+    ///     packages:
     ///       avocado-runtime: '0.1.0'
     /// ```
     pub fn get_runtime_extension_dependencies_detailed(
@@ -1701,9 +1677,9 @@ impl Config {
         Ok(ext_deps)
     }
 
-    /// Get merged section for nested paths (e.g., "ext.name.dependencies", "runtime.name.dependencies")
+    /// Get merged section for nested paths (e.g., "extensions.name.packages", "runtimes.name.packages")
     /// For target-specific overrides, the target is inserted between base_path and nested_path:
-    /// Base: [ext.name.dependencies] + Target: [ext.name.<target>.dependencies]
+    /// Base: [extensions.name.packages] + Target: [extensions.name.<target>.packages]
     #[allow(dead_code)] // Future API for command integration
     pub fn get_merged_nested_section(
         &self,
@@ -1745,91 +1721,14 @@ impl Config {
         let path = config_path.as_ref();
 
         if !path.exists() {
-            // If a YAML file is requested but doesn't exist, check for a TOML version
-            let is_yaml_request = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e == "yaml" || e == "yml")
-                .unwrap_or(false);
-
-            if is_yaml_request {
-                // Try to find a corresponding TOML file
-                let toml_path = path.with_extension("toml");
-                if toml_path.exists() {
-                    println!(
-                        "⚠ Found legacy TOML config file: {}. Migrating to YAML format...",
-                        toml_path.display()
-                    );
-
-                    // Migrate TOML to YAML
-                    let migrated_path = Self::migrate_toml_to_yaml(&toml_path)?;
-
-                    // Load the migrated YAML file
-                    let content = fs::read_to_string(&migrated_path).with_context(|| {
-                        format!(
-                            "Failed to read migrated config file: {}",
-                            migrated_path.display()
-                        )
-                    })?;
-
-                    return Self::load_from_yaml_str(&content).with_context(|| {
-                        format!(
-                            "Failed to parse migrated YAML config file: {}",
-                            migrated_path.display()
-                        )
-                    });
-                }
-            }
-
             return Err(ConfigError::FileNotFound(path.display().to_string()).into());
         }
 
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        // Determine format based on file extension
-        let is_yaml = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e == "yaml" || e == "yml")
-            .unwrap_or(false);
-
-        if is_yaml {
-            Self::load_from_yaml_str(&content)
-                .with_context(|| format!("Failed to parse YAML config file: {}", path.display()))
-        } else {
-            // TOML file detected - migrate to YAML
-            println!(
-                "⚠ Found legacy TOML config file: {}. Migrating to YAML...",
-                path.display()
-            );
-
-            // Parse TOML, convert to YAML, and save
-            #[allow(deprecated)]
-            let config = Self::load_from_toml_str(&content)
-                .with_context(|| format!("Failed to parse TOML config file: {}", path.display()))?;
-
-            // Convert to YAML value for saving
-            let toml_val: toml::Value =
-                toml::from_str(&content).with_context(|| "Failed to parse TOML for conversion")?;
-            let yaml_val = Self::toml_to_yaml(&toml_val)?;
-
-            // Save as YAML in the same directory
-            let yaml_path = path.with_extension("yaml");
-            if !yaml_path.exists() {
-                let yaml_content = serde_yaml::to_string(&yaml_val)?;
-                fs::write(&yaml_path, yaml_content).with_context(|| {
-                    format!(
-                        "Failed to write migrated YAML config to {}",
-                        yaml_path.display()
-                    )
-                })?;
-                println!("✓ Migrated to {}", yaml_path.display());
-                println!("  Note: The old TOML file has been preserved. You can remove it after verifying the migration.");
-            }
-
-            Ok(config)
-        }
+        Self::load_from_yaml_str(&content)
+            .with_context(|| format!("Failed to parse YAML config file: {}", path.display()))
     }
 
     /// Load configuration from a YAML string
@@ -1849,85 +1748,12 @@ impl Config {
         Ok(config)
     }
 
-    /// Load configuration from a string (auto-detects YAML or TOML format)
-    /// Used primarily in tests for flexible parsing
+    /// Load configuration from a YAML string
+    /// Used primarily in tests
     #[allow(dead_code)]
     pub fn load_from_str(content: &str) -> Result<Self> {
-        // Try YAML first (preferred format)
-        if let Ok(config) = serde_yaml::from_str::<Config>(content) {
-            return Ok(config);
-        }
-
-        // Fall back to TOML for test compatibility
-        #[allow(deprecated)]
-        {
-            Self::load_from_toml_str(content)
-        }
-    }
-
-    // =============================================================================
-    // DEPRECATED: TOML Support Functions (Pre-1.0.0)
-    // =============================================================================
-    // The following functions support legacy TOML configuration files.
-    // These will be removed before the 1.0.0 release.
-    // =============================================================================
-
-    /// DEPRECATED: Load configuration from a TOML string
-    #[allow(dead_code)] // Kept for backward compatibility until 1.0.0
-    #[deprecated(
-        note = "TOML format is deprecated. Use YAML format instead. Will be removed before 1.0.0"
-    )]
-    pub fn load_from_toml_str(content: &str) -> Result<Self> {
-        let config: Config =
-            toml::from_str(content).with_context(|| "Failed to parse TOML configuration")?;
-
-        Ok(config)
-    }
-
-    /// Convert TOML value to YAML value
-    fn toml_to_yaml(toml_val: &toml::Value) -> Result<serde_yaml::Value> {
-        let json_str = serde_json::to_string(toml_val)?;
-        let yaml_val = serde_json::from_str(&json_str)?;
-        Ok(yaml_val)
-    }
-
-    /// Migrate a TOML config file to YAML format
-    /// Reads an avocado.toml file, converts it to YAML, and saves as avocado.yaml
-    #[allow(dead_code)] // Public API for manual migration, kept until 1.0.0
-    pub fn migrate_toml_to_yaml<P: AsRef<Path>>(toml_path: P) -> Result<PathBuf> {
-        let toml_path = toml_path.as_ref();
-
-        // Read the TOML file
-        let toml_content = fs::read_to_string(toml_path)
-            .with_context(|| format!("Failed to read TOML config file: {}", toml_path.display()))?;
-
-        // Parse as TOML
-        let toml_val: toml::Value =
-            toml::from_str(&toml_content).with_context(|| "Failed to parse TOML configuration")?;
-
-        // Convert to YAML
-        let yaml_val = Self::toml_to_yaml(&toml_val)?;
-
-        // Serialize to YAML string
-        let yaml_content =
-            serde_yaml::to_string(&yaml_val).with_context(|| "Failed to serialize to YAML")?;
-
-        // Determine output path
-        let yaml_path = toml_path.with_file_name("avocado.yaml");
-
-        // Write YAML file
-        fs::write(&yaml_path, yaml_content).with_context(|| {
-            format!("Failed to write YAML config file: {}", yaml_path.display())
-        })?;
-
-        println!(
-            "✓ Migrated {} to {}",
-            toml_path.display(),
-            yaml_path.display()
-        );
-        println!("  Note: The old TOML file has been preserved. You can remove it after verifying the migration.");
-
-        Ok(yaml_path)
+        serde_yaml::from_str::<Config>(content)
+            .with_context(|| "Failed to parse YAML configuration")
     }
 
     /// Get the SDK image from configuration
@@ -1937,7 +1763,7 @@ impl Config {
 
     /// Get SDK dependencies
     pub fn get_sdk_dependencies(&self) -> Option<&HashMap<String, serde_yaml::Value>> {
-        self.sdk.as_ref()?.dependencies.as_ref()
+        self.sdk.as_ref()?.packages.as_ref()
     }
 
     /// Get SDK dependencies with target interpolation.
@@ -1971,7 +1797,7 @@ impl Config {
         // Extract SDK dependencies from the interpolated config
         let sdk_deps = parsed
             .get("sdk")
-            .and_then(|sdk| sdk.get("dependencies"))
+            .and_then(|sdk| sdk.get("packages"))
             .and_then(|deps| deps.as_mapping())
             .map(|mapping| {
                 mapping
@@ -2085,7 +1911,7 @@ impl Config {
     /// None if the runtime doesn't exist or has no signing section.
     #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_signing_key_name(&self, runtime_name: &str) -> Option<String> {
-        let runtime_config = self.runtime.as_ref()?.get(runtime_name)?;
+        let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
         Some(runtime_config.signing.as_ref()?.key.clone())
     }
 
@@ -2098,7 +1924,7 @@ impl Config {
     /// Returns the resolved key ID.
     #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_signing_key(&self, runtime_name: &str) -> Option<String> {
-        let runtime_config = self.runtime.as_ref()?.get(runtime_name)?;
+        let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
         let signing_key_name = &runtime_config.signing.as_ref()?.key;
 
         // First, check the local signing_keys mapping
@@ -2121,7 +1947,7 @@ impl Config {
 
     /// Get provision profile configuration
     pub fn get_provision_profile(&self, profile_name: &str) -> Option<&ProvisionProfileConfig> {
-        self.provision.as_ref()?.get(profile_name)
+        self.provision_profiles.as_ref()?.get(profile_name)
     }
 
     /// Get container args from provision profile
@@ -2312,7 +2138,7 @@ impl Config {
         let mut external_extensions = HashMap::new();
 
         // Find all ext.* sections in the external config
-        if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+        if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_name_key, ext_config) in ext_section {
                 if let Some(ext_name) = ext_name_key.as_str() {
                     external_extensions.insert(ext_name.to_string(), ext_config.clone());
@@ -2376,7 +2202,7 @@ impl Config {
 
         let mut remote_extensions = Vec::new();
 
-        if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+        if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_name_key, ext_config) in ext_section {
                 if let Some(raw_ext_name) = ext_name_key.as_str() {
                     // Interpolate extension name if target is provided
@@ -2491,11 +2317,10 @@ impl Config {
         target: &str,
     ) -> bool {
         let install_path = self.get_extension_install_path(config_path, ext_name, target);
-        // Check if the directory exists and contains an avocado.yaml or avocado.toml
+        // Check if the directory exists and contains an avocado.yaml
         install_path.exists()
             && (install_path.join("avocado.yaml").exists()
-                || install_path.join("avocado.yml").exists()
-                || install_path.join("avocado.toml").exists())
+                || install_path.join("avocado.yml").exists())
     }
 
     /// Find an extension in the full dependency tree (local and external)
@@ -2514,7 +2339,7 @@ impl Config {
 
         // First check if it's defined in the ext section
         // Need to iterate and interpolate keys since they may contain templates like {{ avocado.target }}
-        if let Some(ext_section) = parsed.get("ext") {
+        if let Some(ext_section) = parsed.get("extensions") {
             if let Some(ext_map) = ext_section.as_mapping() {
                 for (ext_key, ext_config) in ext_map {
                     if let Some(raw_name) = ext_key.as_str() {
@@ -2542,7 +2367,7 @@ impl Config {
         }
 
         // If not found in ext section, search through runtime extensions array
-        let runtime_section = parsed.get("runtime").and_then(|r| r.as_mapping());
+        let runtime_section = parsed.get("runtimes").and_then(|r| r.as_mapping());
 
         if let Some(runtime_section) = runtime_section {
             for (runtime_name_key, _) in runtime_section {
@@ -2559,7 +2384,7 @@ impl Config {
                                 if let Some(ext_name) = ext.as_str() {
                                     if ext_name == extension_name {
                                         // Found in extensions array - now find its definition in ext section
-                                        if let Some(ext_section) = parsed.get("ext") {
+                                        if let Some(ext_section) = parsed.get("extensions") {
                                             if let Some(ext_map) = ext_section.as_mapping() {
                                                 for (ext_key, ext_config) in ext_map {
                                                     if let Some(raw_name) = ext_key.as_str() {
@@ -2604,7 +2429,6 @@ impl Config {
 
         Ok(None)
     }
-
 
     /// Expand environment variables in a string
     pub fn expand_env_vars(input: &str) -> String {
@@ -2811,7 +2635,7 @@ impl Config {
         if let Some(sdk) = &self.sdk {
             if let Some(compile) = &sdk.compile {
                 for (section_name, compile_config) in compile {
-                    if let Some(dependencies) = &compile_config.dependencies {
+                    if let Some(dependencies) = &compile_config.packages {
                         compile_deps.insert(section_name.clone(), dependencies);
                     }
                 }
@@ -2882,7 +2706,7 @@ impl Config {
         let mut visited = std::collections::HashSet::new();
 
         // Process local extensions in the current config
-        if let Some(ext_section) = parsed.get("ext") {
+        if let Some(ext_section) = parsed.get("extensions") {
             if let Some(ext_table) = ext_section.as_mapping() {
                 for (ext_name_val, ext_config) in ext_table {
                     if let Some(ext_name) = ext_name_val.as_str() {
@@ -2890,10 +2714,10 @@ impl Config {
                             // Extract SDK dependencies for this extension (base and target-specific)
                             let mut merged_deps = HashMap::new();
 
-                            // First, collect base SDK dependencies from [ext.<ext_name>.sdk.dependencies]
+                            // First, collect base SDK dependencies from [extensions.<ext_name>.sdk.packages]
                             if let Some(sdk_section) = ext_config_table.get("sdk") {
                                 if let Some(sdk_table) = sdk_section.as_mapping() {
-                                    if let Some(dependencies) = sdk_table.get("dependencies") {
+                                    if let Some(dependencies) = sdk_table.get("packages") {
                                         if let Some(deps_table) = dependencies.as_mapping() {
                                             for (k, v) in deps_table.iter() {
                                                 if let Some(key_str) = k.as_str() {
@@ -2906,14 +2730,14 @@ impl Config {
                                 }
                             }
 
-                            // Then, if we have a target, collect target-specific dependencies from [ext.<ext_name>.<target>.sdk.dependencies]
+                            // Then, if we have a target, collect target-specific dependencies from [extensions.<ext_name>.<target>.sdk.packages]
                             if let Some(target) = target {
                                 if let Some(target_section) = ext_config_table.get(target) {
                                     if let Some(target_table) = target_section.as_mapping() {
                                         if let Some(sdk_section) = target_table.get("sdk") {
                                             if let Some(sdk_table) = sdk_section.as_mapping() {
                                                 if let Some(dependencies) =
-                                                    sdk_table.get("dependencies")
+                                                    sdk_table.get("packages")
                                                 {
                                                     if let Some(deps_table) =
                                                         dependencies.as_mapping()
@@ -2942,7 +2766,7 @@ impl Config {
 
                             // If we have a config path, traverse external extension dependencies
                             if let Some(config_path) = config_path {
-                                if let Some(dependencies) = ext_config_table.get("dependencies") {
+                                if let Some(dependencies) = ext_config_table.get("packages") {
                                     if let Some(deps_table) = dependencies.as_mapping() {
                                         self.collect_external_extension_sdk_dependencies_with_target(
                                             config_path,
@@ -2962,12 +2786,12 @@ impl Config {
 
         // Also process extensions referenced in runtime dependencies
         if let Some(config_path) = config_path {
-            if let Some(runtime_section) = parsed.get("runtime") {
+            if let Some(runtime_section) = parsed.get("runtimes") {
                 if let Some(runtime_table) = runtime_section.as_mapping() {
                     for (_runtime_name, runtime_config) in runtime_table {
                         if let Some(runtime_config_table) = runtime_config.as_mapping() {
                             // Check base runtime dependencies
-                            if let Some(dependencies) = runtime_config_table.get("dependencies") {
+                            if let Some(dependencies) = runtime_config_table.get("packages") {
                                 if let Some(deps_table) = dependencies.as_mapping() {
                                     self.collect_external_extension_sdk_dependencies_with_target(
                                         config_path,
@@ -2983,8 +2807,7 @@ impl Config {
                             if let Some(target) = target {
                                 if let Some(target_section) = runtime_config_table.get(target) {
                                     if let Some(target_table) = target_section.as_mapping() {
-                                        if let Some(dependencies) = target_table.get("dependencies")
-                                        {
+                                        if let Some(dependencies) = target_table.get("packages") {
                                             if let Some(deps_table) = dependencies.as_mapping() {
                                                 self.collect_external_extension_sdk_dependencies_with_target(
                                                     config_path,
@@ -3019,7 +2842,7 @@ impl Config {
         for (_dep_name, dep_spec) in dependencies {
             if let Some(dep_spec_table) = dep_spec.as_mapping() {
                 // Check for external extension dependency
-                if let Some(ext_name) = dep_spec_table.get("ext").and_then(|v| v.as_str()) {
+                if let Some(ext_name) = dep_spec_table.get("extensions").and_then(|v| v.as_str()) {
                     if let Some(external_config) =
                         dep_spec_table.get("config").and_then(|v| v.as_str())
                     {
@@ -3053,7 +2876,9 @@ impl Config {
                                             )
                                         {
                                             // Only process the specific extension that's being referenced
-                                            if let Some(ext_section) = external_parsed.get("ext") {
+                                            if let Some(ext_section) =
+                                                external_parsed.get("extensions")
+                                            {
                                                 if let Some(ext_table) = ext_section.as_mapping() {
                                                     if let Some(external_ext_config) =
                                                         ext_table.get(ext_name)
@@ -3064,7 +2889,7 @@ impl Config {
                                                             // Extract SDK dependencies for this specific external extension (base and target-specific)
                                                             let mut merged_deps = HashMap::new();
 
-                                                            // First, collect base SDK dependencies from [ext.<ext_name>.sdk.dependencies]
+                                                            // First, collect base SDK dependencies from [extensions.<ext_name>.sdk.packages]
                                                             if let Some(sdk_section) =
                                                                 external_ext_config_table.get("sdk")
                                                             {
@@ -3072,8 +2897,7 @@ impl Config {
                                                                     sdk_section.as_mapping()
                                                                 {
                                                                     if let Some(dependencies) =
-                                                                        sdk_table
-                                                                            .get("dependencies")
+                                                                        sdk_table.get("packages")
                                                                     {
                                                                         if let Some(deps_table) =
                                                                             dependencies
@@ -3097,7 +2921,7 @@ impl Config {
                                                                 }
                                                             }
 
-                                                            // Then, if we have a target, collect target-specific dependencies from [ext.<ext_name>.<target>.sdk.dependencies]
+                                                            // Then, if we have a target, collect target-specific dependencies from [extensions.<ext_name>.<target>.sdk.packages]
                                                             if let Some(target) = target {
                                                                 if let Some(target_section) =
                                                                     external_ext_config_table
@@ -3116,9 +2940,8 @@ impl Config {
                                                                                 if let Some(
                                                                                     dependencies,
                                                                                 ) = sdk_table
-                                                                                    .get(
-                                                                                    "dependencies",
-                                                                                ) {
+                                                                                    .get("packages")
+                                                                                {
                                                                                     if let Some(deps_table) = dependencies.as_mapping() {
                                                                                         // Target-specific dependencies override base dependencies
                                                                                         for (k, v) in deps_table.iter() {
@@ -3145,7 +2968,7 @@ impl Config {
                                                             // Recursively process dependencies of this specific external extension
                                                             if let Some(nested_dependencies) =
                                                                 external_ext_config_table
-                                                                    .get("dependencies")
+                                                                    .get("packages")
                                                             {
                                                                 if let Some(nested_deps_table) =
                                                                     nested_dependencies.as_mapping()
@@ -3186,7 +3009,7 @@ impl Config {
     /// Get target from configuration
     /// Returns the target if there's exactly one runtime configuration
     pub fn get_target(&self) -> Option<String> {
-        let runtime = self.runtime.as_ref()?;
+        let runtime = self.runtimes.as_ref()?;
 
         // Find all runtime configurations (nested dictionaries)
         let runtime_configs: Vec<&RuntimeConfig> = runtime.values().collect();
@@ -3282,7 +3105,7 @@ impl Config {
 
     /// Get merged SDK dependencies for a specific target.
     ///
-    /// This merges [sdk.dependencies] with [sdk.<target>.dependencies],
+    /// This merges [sdk.packages] with [sdk.<target>.packages],
     /// where target-specific dependencies override base dependencies.
     ///
     /// # Arguments
@@ -3306,7 +3129,7 @@ impl Config {
 
         // First, add base SDK dependencies
         if let Some(sdk_section) = parsed.get("sdk") {
-            if let Some(deps) = sdk_section.get("dependencies") {
+            if let Some(deps) = sdk_section.get("packages") {
                 if let Some(deps_table) = deps.as_mapping() {
                     for (key, value) in deps_table {
                         if let Some(key_str) = key.as_str() {
@@ -3318,7 +3141,7 @@ impl Config {
 
             // Then, add/override with target-specific dependencies
             if let Some(target_section) = sdk_section.get(target) {
-                if let Some(target_deps) = target_section.get("dependencies") {
+                if let Some(target_deps) = target_section.get("packages") {
                     if let Some(target_deps_table) = target_deps.as_mapping() {
                         for (key, value) in target_deps_table {
                             if let Some(key_str) = key.as_str() {
@@ -3379,18 +3202,18 @@ fn merge_sdk_configs(mut base: SdkConfig, target: SdkConfig) -> SdkConfig {
         base.host_gid = target.host_gid;
     }
 
-    // For dependencies and compile, merge the HashMaps
-    if let Some(target_deps) = target.dependencies {
-        match base.dependencies {
+    // For packages and compile, merge the HashMaps
+    if let Some(target_deps) = target.packages {
+        match base.packages {
             Some(ref mut base_deps) => {
-                // Merge target dependencies into base dependencies
+                // Merge target packages into base packages
                 for (key, value) in target_deps {
                     base_deps.insert(key, value);
                 }
             }
             None => {
-                // No base dependencies, use target dependencies
-                base.dependencies = Some(target_deps);
+                // No base packages, use target packages
+                base.packages = Some(target_deps);
             }
         }
     }
@@ -3479,20 +3302,20 @@ mod tests {
     #[test]
     fn test_load_valid_config() {
         let config_content = r#"
-[runtime.default]
-target = "qemux86-64"
+runtimes:
+  default:
+    target: qemux86-64
+    packages:
+      nativesdk-avocado-images: "*"
 
-[runtime.default.dependencies]
-nativesdk-avocado-images = "*"
-
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-
-[sdk.dependencies]
-cmake = "*"
-
-[sdk.compile.app]
-dependencies = { gcc = "*" }
+sdk:
+  image: docker.io/avocadolinux/sdk:apollo-edge
+  packages:
+    cmake: "*"
+  compile:
+    app:
+      packages:
+        gcc: "*"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -3518,10 +3341,10 @@ dependencies = { gcc = "*" }
     #[test]
     fn test_src_dir_absolute_path() {
         let config_content = r#"
-src_dir = "/absolute/path/to/source"
+src_dir: "/absolute/path/to/source"
 
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -3540,10 +3363,10 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
     #[test]
     fn test_src_dir_relative_path() {
         let config_content = r#"
-src_dir = "../../"
+src_dir: "../../"
 
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -3568,8 +3391,8 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
     #[test]
     fn test_src_dir_not_configured() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -3587,13 +3410,13 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
 sdk:
   image: "docker.io/avocadolinux/sdk:apollo-edge"
 
-ext:
+extensions:
   avocado-dev:
     types:
       - sysext
       - confext
     sdk:
-      dependencies:
+      packages:
         nativesdk-avocado-hitl: "*"
         nativesdk-something-else: "1.2.3"
 
@@ -3601,7 +3424,7 @@ ext:
     types:
       - sysext
     sdk:
-      dependencies:
+      packages:
         nativesdk-tool: "*"
 "#;
 
@@ -3645,18 +3468,18 @@ ext:
 sdk:
   image: "docker.io/avocadolinux/sdk:apollo-edge"
 
-ext:
+extensions:
   avocado-dev:
     types:
       - sysext
       - confext
     sdk:
-      dependencies:
+      packages:
         nativesdk-avocado-hitl: "*"
         nativesdk-base-tool: "1.0.0"
     qemux86-64:
       sdk:
-        dependencies:
+        packages:
           nativesdk-avocado-hitl: "2.0.0"
           nativesdk-target-specific: "*"
 
@@ -3664,11 +3487,11 @@ ext:
     types:
       - sysext
     sdk:
-      dependencies:
+      packages:
         nativesdk-tool: "*"
     qemuarm64:
       sdk:
-        dependencies:
+        packages:
           nativesdk-arm-tool: "*"
 "#;
 
@@ -3787,19 +3610,19 @@ ext:
 sdk:
   image: "docker.io/avocadolinux/sdk:apollo-edge"
 
-runtime:
+runtimes:
   dev:
-    dependencies:
+    packages:
       avocado-ext-dev:
         ext: avocado-ext-dev
         config: "extensions/dev/avocado.yaml"
     raspberrypi4:
-      dependencies:
+      packages:
         avocado-bsp-raspberrypi4:
           ext: avocado-bsp-raspberrypi4
           config: "bsp/raspberrypi4/avocado.yaml"
 
-ext:
+extensions:
   config:
     types:
       - confext
@@ -3842,9 +3665,9 @@ ext:
     #[test]
     fn test_sdk_container_args() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--network=$USER-avocado", "--privileged"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--network=$USER-avocado", "--privileged"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3861,11 +3684,12 @@ container_args = ["--network=$USER-avocado", "--privileged"]
     #[test]
     fn test_default_target_field() {
         let config_content = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 
-[runtime.dev]
-target = "qemux86-64"
-image = "avocadolinux/runtime:apollo-edge"
+runtimes:
+  dev:
+    target: "qemux86-64"
+    image: "avocadolinux/runtime:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3878,9 +3702,10 @@ image = "avocadolinux/runtime:apollo-edge"
     #[test]
     fn test_no_default_target_field() {
         let config_content = r#"
-[runtime.dev]
-target = "qemux86-64"
-image = "avocadolinux/runtime:apollo-edge"
+runtimes:
+  dev:
+    target: "qemux86-64"
+    image: "avocadolinux/runtime:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3893,11 +3718,12 @@ image = "avocadolinux/runtime:apollo-edge"
     #[test]
     fn test_empty_default_target_field() {
         let config_content = r#"
-default_target = ""
+default_target: ""
 
-[runtime.dev]
-target = "qemux86-64"
-image = "avocadolinux/runtime:apollo-edge"
+runtimes:
+  dev:
+    target: "qemux86-64"
+    image: "avocadolinux/runtime:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3910,9 +3736,9 @@ image = "avocadolinux/runtime:apollo-edge"
     #[test]
     fn test_merge_sdk_container_args() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--network=host", "--privileged"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--network=host", "--privileged"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3933,9 +3759,9 @@ container_args = ["--network=host", "--privileged"]
     #[test]
     fn test_merge_sdk_container_args_config_only() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--network=host"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--network=host"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3952,8 +3778,8 @@ container_args = ["--network=host"]
     #[test]
     fn test_merge_sdk_container_args_cli_only() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3971,8 +3797,8 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
     #[test]
     fn test_merge_sdk_container_args_none() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -3987,9 +3813,9 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
     fn test_get_sdk_repo_url_env_override() {
         // Test environment variable override for SDK repo URL
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-repo_url = "https://config.example.com"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  repo_url: "https://config.example.com"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4012,9 +3838,9 @@ repo_url = "https://config.example.com"
     fn test_get_sdk_repo_release_env_override() {
         // Test environment variable override for SDK repo release
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-repo_release = "config-release"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  repo_release: "config-release"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4037,8 +3863,8 @@ repo_release = "config-release"
     fn test_get_sdk_repo_url_env_only() {
         // Test environment variable when no config value exists
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4094,9 +3920,9 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
         std::env::set_var("TEST_USER", "myuser");
 
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--network=$TEST_USER-avocado", "--privileged"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--network=$TEST_USER-avocado", "--privileged"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4147,11 +3973,11 @@ container_args = ["--network=$TEST_USER-avocado", "--privileged"]
     #[test]
     fn test_provision_profile_config() {
         let config_content = r#"
-[provision.usb]
-container_args = ["-v", "/dev/usb:/dev/usb", "-v", "/sys:/sys:ro"]
-
-[provision.development]
-container_args = ["--privileged", "--network=host"]
+provision_profiles:
+  usb:
+    container_args: ["-v", "/dev/usb:/dev/usb", "-v", "/sys:/sys:ro"]
+  development:
+    container_args: ["--privileged", "--network=host"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4178,8 +4004,9 @@ container_args = ["--privileged", "--network=host"]
     #[test]
     fn test_merge_provision_container_args() {
         let config_content = r#"
-[provision.usb]
-container_args = ["-v", "/dev/usb:/dev/usb", "--privileged"]
+provision_profiles:
+  usb:
+    container_args: ["-v", "/dev/usb:/dev/usb", "--privileged"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4201,8 +4028,9 @@ container_args = ["-v", "/dev/usb:/dev/usb", "--privileged"]
     #[test]
     fn test_merge_provision_container_args_profile_only() {
         let config_content = r#"
-[provision.test]
-container_args = ["--network=host"]
+provision_profiles:
+  test:
+    container_args: ["--network=host"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4219,8 +4047,8 @@ container_args = ["--network=host"]
     #[test]
     fn test_merge_provision_container_args_cli_only() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4238,8 +4066,8 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
     #[test]
     fn test_merge_provision_container_args_none() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4254,12 +4082,13 @@ image = "docker.io/avocadolinux/sdk:apollo-edge"
     fn test_merge_provision_container_args_with_sdk_defaults() {
         // Test that SDK container_args are included as base defaults
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--privileged", "--network=host"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--privileged", "--network=host"]
 
-[provision.usb]
-container_args = ["-v", "/dev:/dev"]
+provision_profiles:
+  usb:
+    container_args: ["-v", "/dev:/dev"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4283,9 +4112,9 @@ container_args = ["-v", "/dev:/dev"]
     fn test_merge_provision_container_args_sdk_defaults_only() {
         // Test that SDK container_args are used when no provision profile or CLI args
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--privileged", "-v", "/dev:/dev"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--privileged", "-v", "/dev:/dev"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4304,12 +4133,13 @@ container_args = ["--privileged", "-v", "/dev:/dev"]
     fn test_merge_provision_container_args_deduplication() {
         // Test that duplicate args are removed (keeping the last occurrence)
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:apollo-edge"
-container_args = ["--privileged", "--network=host", "-v", "/dev:/dev"]
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+  container_args: ["--privileged", "--network=host", "-v", "/dev:/dev"]
 
-[provision.tegraflash]
-container_args = ["--privileged", "--network=host", "-v", "/dev:/dev", "-v", "/sys:/sys"]
+provision_profiles:
+  tegraflash:
+    container_args: ["--privileged", "--network=host", "-v", "/dev:/dev", "-v", "/sys:/sys"]
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4342,7 +4172,7 @@ container_args = ["--privileged", "--network=host", "-v", "/dev:/dev", "-v", "/s
     fn test_provision_state_file_default() {
         // Test that state_file defaults to .avocado/provision-{profile}.state when not configured
         let config_content = r#"
-provision:
+provision_profiles:
   usb:
     container_args:
       - --privileged
@@ -4363,7 +4193,7 @@ provision:
     fn test_provision_state_file_custom() {
         // Test that custom state_file is used when configured
         let config_content = r#"
-provision:
+provision_profiles:
   production:
     container_args:
       - --privileged
@@ -4387,23 +4217,20 @@ provision:
     fn test_merged_sdk_config() {
         // Create a temporary config file for testing merging
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64"]
 
-[sdk]
-image = "base-image"
-repo_url = "http://base-repo"
-repo_release = "base-release"
-
-[sdk.dependencies]
-base-package = "*"
-
-[sdk.qemux86-64]
-image = "target-specific-image"
-repo_url = "http://target-repo"
-
-[sdk.qemux86-64.dependencies]
-target-package = "*"
+sdk:
+  image: "base-image"
+  repo_url: "http://base-repo"
+  repo_release: "base-release"
+  packages:
+    base-package: "*"
+  qemux86-64:
+    image: "target-specific-image"
+    repo_url: "http://target-repo"
+    packages:
+      target-package: "*"
 "#;
 
         let temp_file = tempfile::NamedTempFile::new().unwrap();
@@ -4426,13 +4253,12 @@ target-package = "*"
     fn test_merged_sdk_config_with_container_args() {
         // Test that target-specific container_args are properly merged
         let config_content = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 
-[sdk]
-image = "base-image"
-
-[sdk.qemux86-64]
-container_args = ["--net=host", "--privileged"]
+sdk:
+  image: "base-image"
+  qemux86-64:
+    container_args: ["--net=host", "--privileged"]
 "#;
 
         let temp_file = tempfile::NamedTempFile::new().unwrap();
@@ -4457,16 +4283,17 @@ container_args = ["--net=host", "--privileged"]
     fn test_merged_sdk_dependencies() {
         // Create a temporary config file for testing dependency merging
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64"]
 
-[sdk.dependencies]
-base-package = "*"
-shared-package = "1.0"
-
-[sdk.qemux86-64.dependencies]
-target-package = "*"
-shared-package = "2.0"
+sdk:
+  packages:
+    base-package: "*"
+    shared-package: "1.0"
+  qemux86-64:
+    packages:
+      target-package: "*"
+      shared-package: "2.0"
 "#;
 
         let temp_file = tempfile::NamedTempFile::new().unwrap();
@@ -4493,12 +4320,12 @@ shared-package = "2.0"
     fn test_merged_sdk_config_no_target_section() {
         // Test merging when there's no target-specific section
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64"]
 
-[sdk]
-image = "base-image"
-repo_url = "http://base-repo"
+sdk:
+  image: "base-image"
+  repo_url: "http://base-repo"
 "#;
 
         let temp_file = tempfile::NamedTempFile::new().unwrap();
@@ -4517,32 +4344,31 @@ repo_url = "http://base-repo"
     #[test]
     fn test_hierarchical_section_merging() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
-[sdk]
-image = "base-image"
-repo_url = "base-repo"
+sdk:
+  image: "base-image"
+  repo_url: "base-repo"
+  qemuarm64:
+    image: "arm64-image"
 
-[sdk.qemuarm64]
-image = "arm64-image"
+provision_profiles:
+  usb:
+    container_args: ["--network=host"]
+    qemuarm64:
+      container_args: ["--privileged"]
 
-[provision.usb]
-container_args = ["--network=host"]
-
-[provision.usb.qemuarm64]
-container_args = ["--privileged"]
-
-[runtime.prod]
-some_setting = "base-value"
-
-[runtime.prod.qemuarm64]
-some_setting = "arm64-value"
-additional_setting = "arm64-only"
+runtimes:
+  prod:
+    some_setting: "base-value"
+    qemuarm64:
+      some_setting: "arm64-value"
+      additional_setting: "arm64-only"
 "#;
 
         // Write test config to a temp file
-        let temp_file = std::env::temp_dir().join("hierarchical_test.toml");
+        let temp_file = std::env::temp_dir().join("hierarchical_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -4653,27 +4479,29 @@ additional_setting = "arm64-only"
     #[test]
     fn test_nested_section_merging() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
-[ext.avocado-dev.dependencies]
-base-dep = "*"
-shared-dep = "1.0"
-
-[ext.avocado-dev.qemuarm64.dependencies]
-arm64-dep = "*"
-shared-dep = "2.0"
-
-[ext.avocado-dev.users.root]
-password = ""
-shell = "/bin/bash"
-
-[ext.avocado-dev.qemuarm64.users.root]
-password = "arm64-password"
+extensions:
+  avocado-dev:
+    packages:
+      base-dep: "*"
+      shared-dep: "1.0"
+    users:
+      root:
+        password: ""
+        shell: "/bin/bash"
+    qemuarm64:
+      packages:
+        arm64-dep: "*"
+        shared-dep: "2.0"
+      users:
+        root:
+          password: "arm64-password"
 "#;
 
         // Write test config to a temp file
-        let temp_file = std::env::temp_dir().join("nested_test.toml");
+        let temp_file = std::env::temp_dir().join("nested_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -4681,7 +4509,12 @@ password = "arm64-password"
 
         // Test nested dependencies merging
         let deps_x86 = config
-            .get_merged_nested_section("ext.avocado-dev", "dependencies", "qemux86-64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "packages",
+                "qemux86-64",
+                config_path,
+            )
             .unwrap();
         assert!(deps_x86.is_some());
         let deps_x86_value = deps_x86.unwrap();
@@ -4697,7 +4530,12 @@ password = "arm64-password"
         assert!(deps_x86_table.get("arm64-dep").is_none());
 
         let deps_arm64 = config
-            .get_merged_nested_section("ext.avocado-dev", "dependencies", "qemuarm64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "packages",
+                "qemuarm64",
+                config_path,
+            )
             .unwrap();
         assert!(deps_arm64.is_some());
         let deps_arm64_value = deps_arm64.unwrap();
@@ -4721,7 +4559,12 @@ password = "arm64-password"
 
         // Test nested users merging
         let users_x86 = config
-            .get_merged_nested_section("ext.avocado-dev", "users.root", "qemux86-64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "users.root",
+                "qemux86-64",
+                config_path,
+            )
             .unwrap();
         assert!(users_x86.is_some());
         let users_x86_value = users_x86.unwrap();
@@ -4736,7 +4579,12 @@ password = "arm64-password"
         );
 
         let users_arm64 = config
-            .get_merged_nested_section("ext.avocado-dev", "users.root", "qemuarm64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "users.root",
+                "qemuarm64",
+                config_path,
+            )
             .unwrap();
         assert!(users_arm64.is_some());
         let users_arm64_value = users_arm64.unwrap();
@@ -4757,15 +4605,19 @@ password = "arm64-password"
     #[test]
     fn test_target_only_sections() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
 # No base section, only target-specific
-[runtime.special.qemuarm64]
-special_setting = "arm64-only"
+runtimes:
+  special:
+    qemuarm64:
+      special_setting: "arm64-only"
 
-[ext.arm-only.qemuarm64]
-types = ["sysext"]
+extensions:
+  arm-only:
+    qemuarm64:
+      types: ["sysext"]
 "#;
 
         let temp_file = std::env::temp_dir().join("target_only_test.toml");
@@ -4817,11 +4669,11 @@ types = ["sysext"]
     #[test]
     fn test_supported_targets_all_format() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = "*"
+default_target: "qemux86-64"
+supported_targets: "*"
 
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4837,11 +4689,11 @@ image = "test-image"
     #[test]
     fn test_supported_targets_list_format() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64", "raspberrypi4"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64", "raspberrypi4"]
 
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4863,11 +4715,11 @@ image = "test-image"
     #[test]
     fn test_supported_targets_empty_list() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = []
+default_target: "qemux86-64"
+supported_targets: []
 
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4882,10 +4734,10 @@ image = "test-image"
     #[test]
     fn test_supported_targets_missing() {
         let config_content = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 
-[sdk]
-image = "test-image"
+sdk:
+  image: "test-image"
 "#;
 
         let config = Config::load_from_str(config_content).unwrap();
@@ -4898,44 +4750,39 @@ image = "test-image"
     #[test]
     fn test_comprehensive_sdk_section() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
-[sdk]
-image = "base-sdk-image"
-repo_url = "http://base-repo.com"
-repo_release = "main"
-container_args = ["--network=host", "--privileged"]
-
-[sdk.dependencies]
-cmake = "*"
-gcc = ">=9.0"
-build-essential = "*"
-
-[sdk.compile.app]
-compile = "make"
-
-[sdk.compile.app.dependencies]
-libfoo = "*"
-libbar = "1.2.3"
-
-[sdk.qemuarm64]
-image = "arm64-sdk-image"
-repo_url = "http://arm64-repo.com"
-container_args = ["--cap-add=SYS_ADMIN"]
-
-[sdk.qemuarm64.dependencies]
-gcc-aarch64-linux-gnu = "*"
-qemu-user-static = "*"
-
-[sdk.qemuarm64.compile.app]
-compile = "cross-make"
-
-[sdk.qemuarm64.compile.app.dependencies]
-libfoo-dev-arm64 = "*"
+sdk:
+  image: "base-sdk-image"
+  repo_url: "http://base-repo.com"
+  repo_release: "main"
+  container_args: ["--network=host", "--privileged"]
+  packages:
+    cmake: "*"
+    gcc: ">=9.0"
+    build-essential: "*"
+  compile:
+    app:
+      compile: "make"
+      packages:
+        libfoo: "*"
+        libbar: "1.2.3"
+  qemuarm64:
+    image: "arm64-sdk-image"
+    repo_url: "http://arm64-repo.com"
+    container_args: ["--cap-add=SYS_ADMIN"]
+    packages:
+      gcc-aarch64-linux-gnu: "*"
+      qemu-user-static: "*"
+    compile:
+      app:
+        compile: "cross-make"
+        packages:
+          libfoo-dev-arm64: "*"
 "#;
 
-        let temp_file = std::env::temp_dir().join("comprehensive_sdk_test.toml");
+        let temp_file = std::env::temp_dir().join("comprehensive_sdk_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -4953,8 +4800,8 @@ libfoo-dev-arm64 = "*"
         assert_eq!(merged_x86.repo_release, Some("main".to_string()));
         assert_eq!(merged_x86.container_args.as_ref().unwrap().len(), 2);
 
-        // Test dependencies for base
-        let deps_x86 = merged_x86.dependencies.unwrap();
+        // Test packages for base
+        let deps_x86 = merged_x86.packages.unwrap();
         assert!(deps_x86.contains_key("cmake"));
         assert!(deps_x86.contains_key("gcc"));
         assert!(deps_x86.contains_key("build-essential"));
@@ -4971,8 +4818,8 @@ libfoo-dev-arm64 = "*"
         assert_eq!(merged_arm64.repo_release, Some("main".to_string())); // Inherited
         assert_eq!(merged_arm64.container_args.as_ref().unwrap().len(), 1); // Overridden
 
-        // Test merged dependencies
-        let deps_arm64 = merged_arm64.dependencies.unwrap();
+        // Test merged packages
+        let deps_arm64 = merged_arm64.packages.unwrap();
         assert!(deps_arm64.contains_key("cmake")); // From base
         assert!(deps_arm64.contains_key("gcc")); // From base
         assert!(deps_arm64.contains_key("gcc-aarch64-linux-gnu")); // Target-specific
@@ -4996,13 +4843,14 @@ libfoo-dev-arm64 = "*"
     fn test_has_compile_sections() {
         // Test with compile sections defined
         let config_with_compile = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 
-[sdk.compile.app]
-compile = "make"
-
-[sdk.compile.app.dependencies]
-libfoo = "*"
+sdk:
+  compile:
+    app:
+      compile: "make"
+      packages:
+        libfoo: "*"
 "#;
 
         let config = Config::load_from_str(config_with_compile).unwrap();
@@ -5010,10 +4858,12 @@ libfoo = "*"
 
         // Test with compile sections but no dependencies
         let config_no_deps = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 
-[sdk.compile.app]
-compile = "make"
+sdk:
+  compile:
+    app:
+      compile: "make"
 "#;
 
         let config = Config::load_from_str(config_no_deps).unwrap();
@@ -5021,10 +4871,10 @@ compile = "make"
 
         // Test with no compile sections
         let config_no_compile = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 
-[sdk]
-image = "my-sdk-image"
+sdk:
+  image: "my-sdk-image"
 "#;
 
         let config = Config::load_from_str(config_no_compile).unwrap();
@@ -5032,7 +4882,7 @@ image = "my-sdk-image"
 
         // Test with empty config (minimal)
         let config_minimal = r#"
-default_target = "qemux86-64"
+default_target: "qemux86-64"
 "#;
 
         let config = Config::load_from_str(config_minimal).unwrap();
@@ -5042,44 +4892,38 @@ default_target = "qemux86-64"
     #[test]
     fn test_comprehensive_runtime_section() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
-[runtime.production]
-target = "qemux86-64"
-image_version = "v1.0.0"
-boot_timeout = 30
-
-[runtime.production.dependencies]
-avocado-img-bootfiles = "*"
-avocado-img-rootfs = "*"
-base-system = ">=2.0"
-
-[runtime.production.qemuarm64]
-target = "qemuarm64"
-image_version = "v1.0.0-arm64"
-memory = "2G"
-
-[runtime.production.qemuarm64.dependencies]
-avocado-img-bootfiles-arm64 = "*"
-arm64-specific-pkg = "*"
-
-[runtime.development]
-target = "qemux86-64"
-debug_mode = true
-
-[runtime.development.dependencies]
-debug-tools = "*"
-gdb = "*"
-
-[runtime.development.qemuarm64]
-cross_debug = true
-
-[runtime.development.qemuarm64.dependencies]
-gdb-multiarch = "*"
+runtimes:
+  production:
+    target: "qemux86-64"
+    image_version: "v1.0.0"
+    boot_timeout: 30
+    packages:
+      avocado-img-bootfiles: "*"
+      avocado-img-rootfs: "*"
+      base-system: ">=2.0"
+    qemuarm64:
+      target: "qemuarm64"
+      image_version: "v1.0.0-arm64"
+      memory: "2G"
+      packages:
+        avocado-img-bootfiles-arm64: "*"
+        arm64-specific-pkg: "*"
+  development:
+    target: "qemux86-64"
+    debug_mode: true
+    packages:
+      debug-tools: "*"
+      gdb: "*"
+    qemuarm64:
+      cross_debug: true
+      packages:
+        gdb-multiarch: "*"
 "#;
 
-        let temp_file = std::env::temp_dir().join("comprehensive_runtime_test.toml");
+        let temp_file = std::env::temp_dir().join("comprehensive_runtime_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -5172,28 +5016,26 @@ gdb-multiarch = "*"
     #[test]
     fn test_comprehensive_provision_section() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
-[provision.usb]
-container_args = ["--privileged", "-v", "/dev:/dev"]
-timeout = 300
-retry_count = 3
-
-[provision.usb.qemuarm64]
-container_args = ["--cap-add=SYS_ADMIN", "-v", "/dev:/dev:ro"]
-emulation_mode = true
-
-[provision.network]
-container_args = ["--network=host"]
-protocol = "ssh"
-
-[provision.network.qemuarm64]
-protocol = "serial"
-baud_rate = 115200
+provision_profiles:
+  usb:
+    container_args: ["--privileged", "-v", "/dev:/dev"]
+    timeout: 300
+    retry_count: 3
+    qemuarm64:
+      container_args: ["--cap-add=SYS_ADMIN", "-v", "/dev:/dev:ro"]
+      emulation_mode: true
+  network:
+    container_args: ["--network=host"]
+    protocol: "ssh"
+    qemuarm64:
+      protocol: "serial"
+      baud_rate: 115200
 "#;
 
-        let temp_file = std::env::temp_dir().join("comprehensive_provision_test.toml");
+        let temp_file = std::env::temp_dir().join("comprehensive_provision_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -5275,63 +5117,58 @@ baud_rate = 115200
     #[test]
     fn test_comprehensive_ext_section() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
-[ext.avocado-dev]
-version = "1.0.0"
-types = ["sysext", "confext"]
-scopes = ["system"]
-overlay = "overlays/avocado-dev"
-enable_services = ["sshd.socket"]
-modprobe = ["nfs", "overlay"]
-
-[ext.avocado-dev.dependencies]
-openssh = "*"
-nfs-utils = "*"
-debug-tools = ">=1.0"
-
-[ext.avocado-dev.sdk.dependencies]
-nativesdk-openssh = "*"
-nativesdk-gdb = "*"
-
-[ext.avocado-dev.users.root]
-password = ""
-shell = "/bin/bash"
-home = "/root"
-
-[ext.avocado-dev.users.developer]
-password = "dev123"
-groups = ["wheel", "docker"]
-home = "/home/developer"
-
-[ext.avocado-dev.groups.docker]
-gid = 999
-
-[ext.avocado-dev.qemuarm64]
-version = "1.0.0-arm64"
-overlay = "overlays/avocado-dev-arm64"
-
-[ext.avocado-dev.qemuarm64.dependencies]
-gdb-multiarch = "*"
-arm64-debug-tools = "*"
-
-[ext.avocado-dev.qemuarm64.sdk.dependencies]
-nativesdk-gdb-cross-aarch64 = "*"
-
-[ext.avocado-dev.qemuarm64.users.root]
-password = "arm64-root"
-
-[ext.peridio]
-version = "2.0.0"
-types = ["confext"]
-enable_services = ["peridiod.service"]
-
-[ext.peridio.qemuarm64]
-enable_services = ["peridiod.service", "peridio-agent.service"]
+extensions:
+  avocado-dev:
+    version: "1.0.0"
+    types: ["sysext", "confext"]
+    scopes: ["system"]
+    overlay: "overlays/avocado-dev"
+    enable_services: ["sshd.socket"]
+    modprobe: ["nfs", "overlay"]
+    packages:
+      openssh: "*"
+      nfs-utils: "*"
+      debug-tools: ">=1.0"
+    sdk:
+      packages:
+        nativesdk-openssh: "*"
+        nativesdk-gdb: "*"
+    users:
+      root:
+        password: ""
+        shell: "/bin/bash"
+        home: "/root"
+      developer:
+        password: "dev123"
+        groups: ["wheel", "docker"]
+        home: "/home/developer"
+    groups:
+      docker:
+        gid: 999
+    qemuarm64:
+      version: "1.0.0-arm64"
+      overlay: "overlays/avocado-dev-arm64"
+      packages:
+        gdb-multiarch: "*"
+        arm64-debug-tools: "*"
+      sdk:
+        packages:
+          nativesdk-gdb-cross-aarch64: "*"
+      users:
+        root:
+          password: "arm64-root"
+  peridio:
+    version: "2.0.0"
+    types: ["confext"]
+    enable_services: ["peridiod.service"]
+    qemuarm64:
+      enable_services: ["peridiod.service", "peridio-agent.service"]
 "#;
 
-        let temp_file = std::env::temp_dir().join("comprehensive_ext_test.toml");
+        let temp_file = std::env::temp_dir().join("comprehensive_ext_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -5375,7 +5212,12 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
 
         // Test nested dependencies merging
         let deps_x86 = config
-            .get_merged_nested_section("ext.avocado-dev", "dependencies", "qemux86-64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "packages",
+                "qemux86-64",
+                config_path,
+            )
             .unwrap();
         assert!(deps_x86.is_some());
         let deps_x86_value = deps_x86.unwrap();
@@ -5385,7 +5227,12 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         assert!(!deps_x86_table.contains_key("gdb-multiarch"));
 
         let deps_arm64 = config
-            .get_merged_nested_section("ext.avocado-dev", "dependencies", "qemuarm64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "packages",
+                "qemuarm64",
+                config_path,
+            )
             .unwrap();
         assert!(deps_arm64.is_some());
         let deps_arm64_value = deps_arm64.unwrap();
@@ -5397,8 +5244,8 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         // Test SDK dependencies merging
         let sdk_deps_x86 = config
             .get_merged_nested_section(
-                "ext.avocado-dev",
-                "sdk.dependencies",
+                "extensions.avocado-dev",
+                "sdk.packages",
                 "qemux86-64",
                 config_path,
             )
@@ -5412,8 +5259,8 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
 
         let sdk_deps_arm64 = config
             .get_merged_nested_section(
-                "ext.avocado-dev",
-                "sdk.dependencies",
+                "extensions.avocado-dev",
+                "sdk.packages",
                 "qemuarm64",
                 config_path,
             )
@@ -5426,7 +5273,12 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
 
         // Test users merging
         let users_root_x86 = config
-            .get_merged_nested_section("ext.avocado-dev", "users.root", "qemux86-64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "users.root",
+                "qemux86-64",
+                config_path,
+            )
             .unwrap();
         assert!(users_root_x86.is_some());
         let users_root_x86_value = users_root_x86.unwrap();
@@ -5445,7 +5297,12 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
         );
 
         let users_root_arm64 = config
-            .get_merged_nested_section("ext.avocado-dev", "users.root", "qemuarm64", config_path)
+            .get_merged_nested_section(
+                "extensions.avocado-dev",
+                "users.root",
+                "qemuarm64",
+                config_path,
+            )
             .unwrap();
         assert!(users_root_arm64.is_some());
         let users_root_arm64_value = users_root_arm64.unwrap();
@@ -5502,11 +5359,11 @@ enable_services = ["peridiod.service", "peridio-agent.service"]
     fn test_invalid_config_handling() {
         // Test invalid supported_targets format
         let invalid_supported_targets = r#"
-default_target = "qemux86-64"
-supported_targets = 123  # Invalid - not string or array
+default_target: "qemux86-64"
+supported_targets: 123  # Invalid - not string or array
 
-[sdk]
-image = "test"
+sdk:
+  image: "test"
 "#;
 
         let result = Config::load_from_str(invalid_supported_targets);
@@ -5514,12 +5371,12 @@ image = "test"
 
         // Test missing required fields
         let missing_sdk_image = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64"]
 
-[sdk]
+sdk:
 # Missing image field
-repo_url = "http://example.com"
+  repo_url: "http://example.com"
 "#;
 
         let config = Config::load_from_str(missing_sdk_image).unwrap();
@@ -5531,32 +5388,40 @@ repo_url = "http://example.com"
         assert!(result.default_target.is_none());
         assert!(result.supported_targets.is_none());
         assert!(result.sdk.is_none());
-        assert!(result.runtime.is_none());
-        assert!(result.provision.is_none());
+        assert!(result.runtimes.is_none());
+        assert!(result.provision_profiles.is_none());
     }
 
     #[test]
     fn test_complex_nested_overrides() {
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64", "raspberrypi4"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64", "raspberrypi4"]
 
 # Complex nested structure with target-specific overrides
-[ext.complex.level1.level2.level3]
-base_value = "original"
-shared_value = "base"
-
-[ext.complex.qemuarm64.level1.level2.level3]
-override_value = "arm64-specific"
-shared_value = "arm64-override"
-nested_override = "arm64-nested"
-
-[ext.complex.raspberrypi4.level1.level2.level3]
-rpi_specific = true
-shared_value = "rpi-override"
+extensions:
+  complex:
+    level1:
+      level2:
+        level3:
+          base_value: "original"
+          shared_value: "base"
+    qemuarm64:
+      level1:
+        level2:
+          level3:
+            override_value: "arm64-specific"
+            shared_value: "arm64-override"
+            nested_override: "arm64-nested"
+    raspberrypi4:
+      level1:
+        level2:
+          level3:
+            rpi_specific: true
+            shared_value: "rpi-override"
 "#;
 
-        let temp_file = std::env::temp_dir().join("complex_nested_test.toml");
+        let temp_file = std::env::temp_dir().join("complex_nested_test.yaml");
         std::fs::write(&temp_file, config_content).unwrap();
         let config_path = temp_file.to_str().unwrap();
 
@@ -5565,7 +5430,7 @@ shared_value = "rpi-override"
         // Test x86-64 (base only)
         let x86_nested = config
             .get_merged_nested_section(
-                "ext.complex",
+                "extensions.complex",
                 "level1.level2.level3",
                 "qemux86-64",
                 config_path,
@@ -5588,7 +5453,7 @@ shared_value = "rpi-override"
         // Test ARM64 (has target-specific override)
         let arm64_nested = config
             .get_merged_nested_section(
-                "ext.complex",
+                "extensions.complex",
                 "level1.level2.level3",
                 "qemuarm64",
                 config_path,
@@ -5621,7 +5486,7 @@ shared_value = "rpi-override"
         // Test RaspberryPi4 (different target-specific override)
         let rpi_nested = config
             .get_merged_nested_section(
-                "ext.complex",
+                "extensions.complex",
                 "level1.level2.level3",
                 "raspberrypi4",
                 config_path,
@@ -5650,18 +5515,23 @@ shared_value = "rpi-override"
     fn test_edge_cases_and_error_conditions() {
         // Test configuration with only target-specific sections
         let target_only_config = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "qemuarm64"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "qemuarm64"]
 
 # Only target-specific sections, no base
-[sdk.qemuarm64]
-image = "arm64-only-sdk"
+sdk:
+  qemuarm64:
+    image: "arm64-only-sdk"
 
-[runtime.special.qemuarm64]
-special_mode = true
+runtimes:
+  special:
+    qemuarm64:
+      special_mode: true
 
-[ext.arm-only.qemuarm64]
-types = ["sysext"]
+extensions:
+  arm-only:
+    qemuarm64:
+      types: ["sysext"]
 "#;
 
         let temp_file = std::env::temp_dir().join("target_only_edge_test.toml");
@@ -5720,29 +5590,30 @@ types = ["sysext"]
     fn test_nested_target_config_merging() {
         // Create a temporary config file with nested target-specific configuration
         let config_content = r#"
-default_target = "qemux86-64"
-supported_targets = ["qemux86-64", "reterminal-dm"]
+default_target: "qemux86-64"
+supported_targets: ["qemux86-64", "reterminal-dm"]
 
-[sdk]
-image = "ghcr.io/avocado-framework/avocado-sdk:latest"
+sdk:
+  image: "ghcr.io/avocado-framework/avocado-sdk:latest"
 
-[runtime.default]
-target = "x86_64-unknown-linux-gnu"
+runtimes:
+  default:
+    target: "x86_64-unknown-linux-gnu"
 
-[ext.avocado-ext-webkit]
-version = "1.0.0"
-release = "r0"
-vendor = "Avocado Linux <info@avocadolinux.org>"
-summary = "WPE WebKit browser and display utilities"
-description = "WPE WebKit browser and display utilities"
-license = "Apache-2.0"
-url = "https://github.com/avocadolinux/avocado-ext"
-types = ["sysext", "confext"]
-enable_services = ["cog.service"]
-on_merge = ["systemctl restart --no-block cog.service"]
-
-[ext.avocado-ext-webkit.reterminal-dm]
-overlay = "extensions/webkit/overlays/reterminal-dm"
+extensions:
+  avocado-ext-webkit:
+    version: "1.0.0"
+    release: "r0"
+    vendor: "Avocado Linux <info@avocadolinux.org>"
+    summary: "WPE WebKit browser and display utilities"
+    description: "WPE WebKit browser and display utilities"
+    license: "Apache-2.0"
+    url: "https://github.com/avocadolinux/avocado-ext"
+    types: ["sysext", "confext"]
+    enable_services: ["cog.service"]
+    on_merge: ["systemctl restart --no-block cog.service"]
+    reterminal-dm:
+      overlay: "extensions/webkit/overlays/reterminal-dm"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5827,12 +5698,13 @@ overlay = "extensions/webkit/overlays/reterminal-dm"
     #[test]
     fn test_stone_include_paths_basic() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
-stone_include_paths = ["stone-qemux86-64"]
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    stone_include_paths: ["stone-qemux86-64"]
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5851,12 +5723,13 @@ stone_include_paths = ["stone-qemux86-64"]
     #[test]
     fn test_stone_include_paths_multiple() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
-stone_include_paths = ["stone-a", "stone-b", "stone-c"]
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    stone_include_paths: ["stone-a", "stone-b", "stone-c"]
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5875,11 +5748,12 @@ stone_include_paths = ["stone-a", "stone-b", "stone-c"]
     #[test]
     fn test_stone_include_paths_not_configured() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
+runtimes:
+  test-runtime:
+    target: "x86_64"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5896,15 +5770,15 @@ target = "x86_64"
     #[test]
     fn test_stone_include_paths_target_specific_override() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
-stone_include_paths = ["stone-default"]
-
-[runtime.test-runtime.aarch64]
-stone_include_paths = ["stone-aarch64"]
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    stone_include_paths: ["stone-default"]
+    aarch64:
+      stone_include_paths: ["stone-aarch64"]
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5931,14 +5805,14 @@ stone_include_paths = ["stone-aarch64"]
     fn test_stone_include_paths_user_example() {
         // Test the exact example from the user's request
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.dev]
-stone_include_paths = ["stone-common"]
-
-[runtime.dev.qemux86-64]
-stone_include_paths = ["stone-qemux86-64"]
+runtimes:
+  dev:
+    stone_include_paths: ["stone-common"]
+    qemux86-64:
+      stone_include_paths: ["stone-qemux86-64"]
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5971,12 +5845,13 @@ stone_include_paths = ["stone-qemux86-64"]
     #[test]
     fn test_stone_include_paths_empty_array() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
-stone_include_paths = []
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    stone_include_paths: []
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -5994,12 +5869,13 @@ stone_include_paths = []
     #[test]
     fn test_stone_manifest_basic() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
-stone_manifest = "stone-manifest.json"
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    stone_manifest: "stone-manifest.json"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -6017,11 +5893,12 @@ stone_manifest = "stone-manifest.json"
     #[test]
     fn test_stone_manifest_not_configured() {
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.test-runtime]
-target = "x86_64"
+runtimes:
+  test-runtime:
+    target: "x86_64"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -6039,14 +5916,14 @@ target = "x86_64"
     fn test_stone_manifest_target_specific_override() {
         // Test the exact example from the user's request
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.dev]
-stone_manifest = "stone-common.json"
-
-[runtime.dev.qemux86-64]
-stone_manifest = "stone-qemux86-64.json"
+runtimes:
+  dev:
+    stone_manifest: "stone-common.json"
+    qemux86-64:
+      stone_manifest: "stone-qemux86-64.json"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -6083,14 +5960,14 @@ stone_manifest = "stone-qemux86-64.json"
     fn test_stone_manifest_only_target_specific() {
         // Test when stone_manifest is only defined in target-specific section
         let config_content = r#"
-[sdk]
-image = "docker.io/avocadolinux/sdk:latest"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
 
-[runtime.dev]
-target = "x86_64"
-
-[runtime.dev.qemux86-64]
-stone_manifest = "stone-qemux86-64.json"
+runtimes:
+  dev:
+    target: "x86_64"
+    qemux86-64:
+      stone_manifest: "stone-qemux86-64.json"
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -6207,7 +6084,7 @@ sdk:
     fn test_container_args_provision_as_string() {
         // Test that provision profile container_args also supports string format
         let config_content = r#"
-provision:
+provision_profiles:
   usb:
     container_args: "-v /dev:/dev -v /sys:/sys:ro --privileged"
 "#;
@@ -6308,7 +6185,7 @@ signing_keys:
   - my-production-key: {production_keyid}
   - backup-key: {backup_keyid}
 
-runtime:
+runtimes:
   dev:
     signing:
       key: my-production-key
@@ -6363,21 +6240,21 @@ runtime:
         assert_eq!(runtime_key, Some(production_keyid.to_string()));
 
         // Test runtime signing config
-        let runtime = config.runtime.as_ref().unwrap().get("dev").unwrap();
+        let runtime = config.runtimes.as_ref().unwrap().get("dev").unwrap();
         assert!(runtime.signing.is_some());
         let signing = runtime.signing.as_ref().unwrap();
         assert_eq!(signing.key, "my-production-key");
         assert_eq!(signing.checksum_algorithm, "sha256");
 
         // Test production runtime with blake3
-        let production = config.runtime.as_ref().unwrap().get("production").unwrap();
+        let production = config.runtimes.as_ref().unwrap().get("production").unwrap();
         assert!(production.signing.is_some());
         let prod_signing = production.signing.as_ref().unwrap();
         assert_eq!(prod_signing.key, "backup-key");
         assert_eq!(prod_signing.checksum_algorithm, "blake3");
 
         // Test staging runtime with default checksum_algorithm
-        let staging = config.runtime.as_ref().unwrap().get("staging").unwrap();
+        let staging = config.runtimes.as_ref().unwrap().get("staging").unwrap();
         assert!(staging.signing.is_some());
         let staging_signing = staging.signing.as_ref().unwrap();
         assert_eq!(staging_signing.key, "my-production-key");
@@ -6413,7 +6290,7 @@ default_target: qemux86-64
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:latest
 
-runtime:
+runtimes:
   dev:
     signing:
       key: my-key
@@ -6421,7 +6298,7 @@ runtime:
     signing:
       key: production-key
   no-signing:
-    dependencies:
+    packages:
       some-package: '*'
 "#;
 
@@ -6465,7 +6342,7 @@ sdk:
 signing_keys:
   - existing-key: {keyid}
 
-runtime:
+runtimes:
   dev:
     signing:
       key: missing-key
@@ -6499,45 +6376,52 @@ runtime:
 
     #[test]
     fn test_discover_external_config_refs_from_runtime() {
+        // New format: external config refs are defined in extensions section with source: path
         let config_content = r#"
-runtime:
+runtimes:
   prod:
     target: qemux86-64
-    dependencies:
-      peridio:
-        ext: avocado-ext-peridio
-        config: avocado-ext-peridio/avocado.yml
-      local-ext:
-        ext: local-extension
+    extensions:
+      - avocado-ext-peridio
+      - local-extension
+extensions:
+  avocado-ext-peridio:
+    source:
+      type: path
+      path: avocado-ext-peridio
+  local-extension:
+    version: "1.0.0"
 "#;
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let refs = Config::discover_external_config_refs(&parsed);
 
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].0, "avocado-ext-peridio");
-        assert_eq!(refs[0].1, "avocado-ext-peridio/avocado.yml");
+        // In the new format, source: path extensions are handled differently
+        // so this test verifies no deprecated refs are found
+        assert_eq!(refs.len(), 0);
     }
 
     #[test]
     fn test_discover_external_config_refs_from_ext() {
+        // New format: external config refs are no longer in packages, they use source: path
         let config_content = r#"
-ext:
+extensions:
   main-ext:
     types:
       - sysext
-    dependencies:
-      external-dep:
-        ext: external-extension
-        config: external/config.yaml
+    packages:
+      some-package: "*"
+  external-extension:
+    source:
+      type: path
+      path: external
 "#;
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let refs = Config::discover_external_config_refs(&parsed);
 
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].0, "external-extension");
-        assert_eq!(refs[0].1, "external/config.yaml");
+        // In the new format, source: path extensions are handled differently
+        assert_eq!(refs.len(), 0);
     }
 
     #[test]
@@ -6545,13 +6429,13 @@ ext:
         let main_config_content = r#"
 distro:
   version: "1.0.0"
-ext:
+extensions:
   local-ext:
     types:
       - sysext
 "#;
         let external_config_content = r#"
-ext:
+extensions:
   external-ext:
     types:
       - sysext
@@ -6566,7 +6450,7 @@ ext:
         Config::merge_external_config(&mut main_config, &external_config, "external-ext", &[], &[]);
 
         // Check that both extensions are present
-        let ext_section = main_config.get("ext").unwrap().as_mapping().unwrap();
+        let ext_section = main_config.get("extensions").unwrap().as_mapping().unwrap();
         assert!(ext_section.contains_key(serde_yaml::Value::String("local-ext".to_string())));
         assert!(ext_section.contains_key(serde_yaml::Value::String("external-ext".to_string())));
     }
@@ -6576,12 +6460,12 @@ ext:
         let main_config_content = r#"
 sdk:
   image: test-image
-  dependencies:
+  packages:
     main-package: "*"
 "#;
         let external_config_content = r#"
 sdk:
-  dependencies:
+  packages:
     external-package: "1.0.0"
     main-package: "2.0.0"  # Should not override main config
 "#;
@@ -6590,8 +6474,8 @@ sdk:
         let external_config: serde_yaml::Value =
             serde_yaml::from_str(external_config_content).unwrap();
 
-        // Include sdk.dependencies.* to merge SDK dependencies
-        let include_patterns = vec!["sdk.dependencies.*".to_string()];
+        // Include sdk.packages.* to merge SDK packages
+        let include_patterns = vec!["sdk.packages.*".to_string()];
         Config::merge_external_config(
             &mut main_config,
             &external_config,
@@ -6603,7 +6487,7 @@ sdk:
         let sdk_deps = main_config
             .get("sdk")
             .unwrap()
-            .get("dependencies")
+            .get("packages")
             .unwrap()
             .as_mapping()
             .unwrap();
@@ -6661,114 +6545,29 @@ distro:
         assert_eq!(distro.get("channel").unwrap().as_str(), Some("stable"));
     }
 
-    #[test]
-    fn test_load_composed_with_interpolation() {
-        use tempfile::TempDir;
-
-        // Create a temp directory for our test configs
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create main config
-        let main_config_content = r#"
-distro:
-  version: "1.0.0"
-  channel: apollo-edge
-default_target: qemux86-64
-sdk:
-  image: "docker.io/test:{{ config.distro.channel }}"
-  dependencies:
-    main-sdk-dep: "*"
-runtime:
-  prod:
-    target: qemux86-64
-    dependencies:
-      peridio:
-        ext: test-ext
-        config: external/avocado.yml
-"#;
-        let main_config_path = temp_dir.path().join("avocado.yaml");
-        std::fs::write(&main_config_path, main_config_content).unwrap();
-
-        // Create external config directory and file
-        let external_dir = temp_dir.path().join("external");
-        std::fs::create_dir_all(&external_dir).unwrap();
-
-        let external_config_content = r#"
-ext:
-  test-ext:
-    version: "{{ config.distro.version }}"
-    types:
-      - sysext
-sdk:
-  dependencies:
-    external-sdk-dep: "*"
-"#;
-        let external_config_path = external_dir.join("avocado.yml");
-        std::fs::write(&external_config_path, external_config_content).unwrap();
-
-        // Load composed config
-        let composed = Config::load_composed(&main_config_path, Some("qemux86-64")).unwrap();
-
-        // Verify the SDK image was interpolated using main config's distro
-        assert_eq!(
-            composed
-                .config
-                .sdk
-                .as_ref()
-                .unwrap()
-                .image
-                .as_ref()
-                .unwrap(),
-            "docker.io/test:apollo-edge"
-        );
-
-        // Verify the external extension was merged
-        let ext_section = composed
-            .merged_value
-            .get("ext")
-            .unwrap()
-            .as_mapping()
-            .unwrap();
-        assert!(ext_section.contains_key(serde_yaml::Value::String("test-ext".to_string())));
-
-        // Verify the external extension's version was interpolated from main config's distro
-        let test_ext = ext_section
-            .get(serde_yaml::Value::String("test-ext".to_string()))
-            .unwrap();
-        assert_eq!(test_ext.get("version").unwrap().as_str(), Some("1.0.0"));
-
-        // Verify SDK dependencies were merged
-        let sdk_deps = composed
-            .merged_value
-            .get("sdk")
-            .unwrap()
-            .get("dependencies")
-            .unwrap()
-            .as_mapping()
-            .unwrap();
-        assert!(sdk_deps.contains_key(serde_yaml::Value::String("main-sdk-dep".to_string())));
-        assert!(sdk_deps.contains_key(serde_yaml::Value::String("external-sdk-dep".to_string())));
-    }
+    // NOTE: test_load_composed_with_interpolation was removed as it tested the deprecated
+    // config: path syntax for external extension loading. The new format uses source: path
+    // in the extensions section and this functionality is handled by ext fetch.
 
     #[test]
     fn test_extension_source_get_include_patterns() {
         // Test Repo variant with include patterns
-        let source = ExtensionSource::Repo {
+        let source = ExtensionSource::Package {
             version: "*".to_string(),
             package: None,
             repo_name: None,
             include: Some(vec![
-                "provision.tegraflash".to_string(),
+                "provision_profiles.tegraflash".to_string(),
                 "sdk.compile.*".to_string(),
             ]),
         };
         let patterns = source.get_include_patterns();
         assert_eq!(patterns.len(), 2);
-        assert_eq!(patterns[0], "provision.tegraflash");
+        assert_eq!(patterns[0], "provision_profiles.tegraflash");
         assert_eq!(patterns[1], "sdk.compile.*");
 
         // Test Repo variant without include patterns
-        let source_no_include = ExtensionSource::Repo {
+        let source_no_include = ExtensionSource::Package {
             version: "*".to_string(),
             package: None,
             repo_name: None,
@@ -6781,14 +6580,14 @@ sdk:
             url: "https://example.com/repo.git".to_string(),
             git_ref: Some("main".to_string()),
             sparse_checkout: None,
-            include: Some(vec!["provision.*".to_string()]),
+            include: Some(vec!["provision_profiles.*".to_string()]),
         };
         assert_eq!(git_source.get_include_patterns().len(), 1);
 
         // Test Path variant with include patterns
         let path_source = ExtensionSource::Path {
             path: "./external".to_string(),
-            include: Some(vec!["sdk.dependencies.*".to_string()]),
+            include: Some(vec!["sdk.packages.*".to_string()]),
         };
         assert_eq!(path_source.get_include_patterns().len(), 1);
     }
@@ -6796,13 +6595,13 @@ sdk:
     #[test]
     fn test_matches_include_pattern_exact() {
         let patterns = vec![
-            "provision.tegraflash".to_string(),
+            "provision_profiles.tegraflash".to_string(),
             "sdk.compile.nvidia-l4t".to_string(),
         ];
 
         // Exact matches should return true
         assert!(ExtensionSource::matches_include_pattern(
-            "provision.tegraflash",
+            "provision_profiles.tegraflash",
             &patterns
         ));
         assert!(ExtensionSource::matches_include_pattern(
@@ -6812,7 +6611,7 @@ sdk:
 
         // Non-matches should return false
         assert!(!ExtensionSource::matches_include_pattern(
-            "provision.usb",
+            "provision_profiles.usb",
             &patterns
         ));
         assert!(!ExtensionSource::matches_include_pattern(
@@ -6827,15 +6626,18 @@ sdk:
 
     #[test]
     fn test_matches_include_pattern_wildcard() {
-        let patterns = vec!["provision.*".to_string(), "sdk.compile.*".to_string()];
+        let patterns = vec![
+            "provision_profiles.*".to_string(),
+            "sdk.compile.*".to_string(),
+        ];
 
         // Wildcard matches should work
         assert!(ExtensionSource::matches_include_pattern(
-            "provision.tegraflash",
+            "provision_profiles.tegraflash",
             &patterns
         ));
         assert!(ExtensionSource::matches_include_pattern(
-            "provision.usb",
+            "provision_profiles.usb",
             &patterns
         ));
         assert!(ExtensionSource::matches_include_pattern(
@@ -6849,11 +6651,11 @@ sdk:
 
         // Non-matches should return false
         assert!(!ExtensionSource::matches_include_pattern(
-            "sdk.dependencies.package1",
+            "sdk.packages.package1",
             &patterns
         ));
         assert!(!ExtensionSource::matches_include_pattern(
-            "runtime.prod",
+            "runtimes.prod",
             &patterns
         ));
 
@@ -6870,7 +6672,7 @@ sdk:
 
         // Empty patterns should never match
         assert!(!ExtensionSource::matches_include_pattern(
-            "provision.tegraflash",
+            "provision_profiles.tegraflash",
             &empty_patterns
         ));
         assert!(!ExtensionSource::matches_include_pattern(
@@ -6882,28 +6684,28 @@ sdk:
     #[test]
     fn test_merge_external_config_with_include_patterns() {
         let main_config_content = r#"
-ext:
+extensions:
   local-ext:
     types:
       - sysext
-provision:
+provision_profiles:
   existing-profile:
     script: provision.sh
 "#;
         let external_config_content = r#"
-ext:
+extensions:
   remote-ext:
     types:
       - sysext
-    dependencies:
+    packages:
       some-dep: "*"
-provision:
+provision_profiles:
   tegraflash:
     script: flash.sh
   usb:
     script: usb-provision.sh
 sdk:
-  dependencies:
+  packages:
     external-dep: "*"
   compile:
     nvidia-l4t:
@@ -6914,8 +6716,8 @@ sdk:
         let external_config: serde_yaml::Value =
             serde_yaml::from_str(external_config_content).unwrap();
 
-        // Only include provision.tegraflash (not provision.usb)
-        let include_patterns = vec!["provision.tegraflash".to_string()];
+        // Only include provision_profiles.tegraflash (not provision_profiles.usb)
+        let include_patterns = vec!["provision_profiles.tegraflash".to_string()];
         Config::merge_external_config(
             &mut main_config,
             &external_config,
@@ -6925,35 +6727,39 @@ sdk:
         );
 
         // Check that ext.remote-ext was merged (always happens)
-        let ext_section = main_config.get("ext").unwrap().as_mapping().unwrap();
+        let ext_section = main_config.get("extensions").unwrap().as_mapping().unwrap();
         assert!(ext_section.contains_key(serde_yaml::Value::String("remote-ext".to_string())));
 
-        // Check that provision.tegraflash was included
-        let provision = main_config.get("provision").unwrap().as_mapping().unwrap();
+        // Check that provision_profiles.tegraflash was included
+        let provision = main_config
+            .get("provision_profiles")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
         assert!(provision.contains_key(serde_yaml::Value::String("tegraflash".to_string())));
         assert!(provision.contains_key(serde_yaml::Value::String("existing-profile".to_string())));
 
         // Check that provision.usb was NOT included (not in patterns)
         assert!(!provision.contains_key(serde_yaml::Value::String("usb".to_string())));
 
-        // Check that sdk.dependencies was NOT merged (not in patterns)
+        // Check that sdk.packages was NOT merged (not in patterns)
         assert!(main_config.get("sdk").is_none());
     }
 
     #[test]
     fn test_merge_external_config_auto_include_compile() {
         let main_config_content = r#"
-ext:
+extensions:
   local-ext:
     types:
       - sysext
 "#;
         let external_config_content = r#"
-ext:
+extensions:
   remote-ext:
     types:
       - sysext
-    dependencies:
+    packages:
       nvidia-l4t:
         compile: nvidia-l4t
 sdk:
@@ -6995,9 +6801,9 @@ sdk:
     #[test]
     fn test_find_compile_dependencies_in_ext() {
         let ext_config_content = r#"
-ext:
+extensions:
   my-extension:
-    dependencies:
+    packages:
       nvidia-l4t:
         compile: nvidia-l4t
       some-package:
@@ -7016,19 +6822,19 @@ ext:
 
     #[test]
     fn test_extension_source_include_serialization() {
-        let source = ExtensionSource::Repo {
+        let source = ExtensionSource::Package {
             version: "*".to_string(),
             package: None,
             repo_name: None,
             include: Some(vec![
-                "provision.tegraflash".to_string(),
+                "provision_profiles.tegraflash".to_string(),
                 "sdk.compile.*".to_string(),
             ]),
         };
 
         let serialized = serde_yaml::to_string(&source).unwrap();
         assert!(serialized.contains("include:"));
-        assert!(serialized.contains("provision.tegraflash"));
+        assert!(serialized.contains("provision_profiles.tegraflash"));
         assert!(serialized.contains("sdk.compile.*"));
 
         // Test deserialization
@@ -7036,16 +6842,16 @@ ext:
 type: repo
 version: "*"
 include:
-  - provision.tegraflash
+  - provision_profiles.tegraflash
   - sdk.compile.*
 "#;
         let deserialized: ExtensionSource = serde_yaml::from_str(yaml_content).unwrap();
         match deserialized {
-            ExtensionSource::Repo { include, .. } => {
+            ExtensionSource::Package { include, .. } => {
                 assert!(include.is_some());
                 let patterns = include.unwrap();
                 assert_eq!(patterns.len(), 2);
-                assert_eq!(patterns[0], "provision.tegraflash");
+                assert_eq!(patterns[0], "provision_profiles.tegraflash");
             }
             _ => panic!("Expected Repo variant"),
         }

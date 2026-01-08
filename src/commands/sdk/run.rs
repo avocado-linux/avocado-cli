@@ -147,7 +147,7 @@ impl SdkRunCommand {
 
         // Get checksum algorithm (defaults to sha256)
         let checksum_str = config
-            .runtime
+            .runtimes
             .as_ref()
             .and_then(|r| r.get(runtime_name))
             .and_then(|rc| rc.signing.as_ref())

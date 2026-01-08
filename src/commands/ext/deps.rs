@@ -68,7 +68,7 @@ impl ExtDepsCommand {
             }
             None => {
                 // For listing all extensions, still use local extensions only
-                let ext_section = parsed.get("ext");
+                let ext_section = parsed.get("extensions");
                 match ext_section {
                     Some(ext) => {
                         let ext_table = ext
@@ -165,7 +165,7 @@ impl ExtDepsCommand {
         }
 
         // Try extension reference
-        if let Some(serde_yaml::Value::String(ext_name)) = spec_map.get("ext") {
+        if let Some(serde_yaml::Value::String(ext_name)) = spec_map.get("extensions") {
             // Check if this is a versioned extension (has vsn field)
             if let Some(serde_yaml::Value::String(version)) = spec_map.get("vsn") {
                 return vec![("ext".to_string(), ext_name.clone(), version.clone())];
@@ -206,7 +206,7 @@ impl ExtDepsCommand {
         ext_name: &str,
     ) -> Vec<(String, String, String)> {
         let version = config
-            .get("ext")
+            .get("extensions")
             .and_then(|ext_section| ext_section.get(ext_name))
             .and_then(|ext_config| ext_config.get("version"))
             .and_then(|v| v.as_str())
@@ -224,7 +224,7 @@ impl ExtDepsCommand {
             .get("sdk")
             .and_then(|sdk| sdk.get("compile"))
             .and_then(|compile| compile.get(compile_name))
-            .and_then(|compile_config| compile_config.get("dependencies"))
+            .and_then(|compile_config| compile_config.get("packages"))
             .and_then(|deps| deps.as_mapping());
 
         let Some(deps_table) = compile_deps else {
@@ -264,9 +264,9 @@ impl ExtDepsCommand {
         extension: &str,
     ) -> Vec<(String, String, String)> {
         let dependencies = config
-            .get("ext")
+            .get("extensions")
             .and_then(|ext_section| ext_section.get(extension))
-            .and_then(|ext_config| ext_config.get("dependencies"))
+            .and_then(|ext_config| ext_config.get("packages"))
             .and_then(|deps| deps.as_mapping());
 
         let Some(deps_table) = dependencies else {
@@ -314,11 +314,11 @@ mod tests {
     #[test]
     fn test_resolve_compile_dependency_with_install() {
         let config_content = r#"
-ext:
+extensions:
   my-extension:
     types:
       - sysext
-    dependencies:
+    packages:
       my-app:
         compile: my-app
         install: ext-install.sh
@@ -373,7 +373,7 @@ sdk:
     #[test]
     fn test_resolve_regular_dependencies() {
         let config_content = r#"
-ext:
+extensions:
   test-ext:
     types:
       - sysext

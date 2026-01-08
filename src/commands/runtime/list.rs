@@ -20,7 +20,7 @@ impl RuntimeListCommand {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
 
         // Check if runtime section exists
-        if let Some(runtime_config) = parsed.get("runtime").and_then(|v| v.as_mapping()) {
+        if let Some(runtime_config) = parsed.get("runtimes").and_then(|v| v.as_mapping()) {
             // List all runtime names
             let mut runtimes: Vec<String> = runtime_config
                 .keys()
@@ -69,7 +69,7 @@ mod tests {
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   app:
     target: "x86_64"
   server:

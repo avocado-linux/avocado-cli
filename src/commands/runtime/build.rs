@@ -88,7 +88,7 @@ impl RuntimeBuildCommand {
 
         // Get runtime configuration
         let runtime_config = parsed
-            .get("runtime")
+            .get("runtimes")
             .context("No runtime configuration found")?;
 
         // Check if runtime exists
@@ -427,7 +427,7 @@ impl RuntimeBuildCommand {
         let mut processed_extensions = HashSet::new();
 
         // Process local extensions defined in [ext.*] sections
-        if let Some(ext_config) = parsed.get("ext").and_then(|v| v.as_mapping()) {
+        if let Some(ext_config) = parsed.get("extensions").and_then(|v| v.as_mapping()) {
             for (ext_name_val, ext_data) in ext_config {
                 if let Some(ext_name) = ext_name_val.as_str() {
                     // Only process extensions that are required by this runtime
@@ -657,7 +657,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
         // Check if this is a local extension defined in the ext section
         // Extension source configuration (repo, git, path) is now in the ext section
         if let Some(ext_config) = parsed
-            .get("ext")
+            .get("extensions")
             .and_then(|e| e.as_mapping())
             .and_then(|table| table.get(ext_name))
         {
@@ -709,7 +709,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
             .and_then(|value| value.get("extensions").and_then(|e| e.as_sequence()))
             .or_else(|| {
                 parsed
-                    .get("runtime")
+                    .get("runtimes")
                     .and_then(|r| r.get(runtime_name))
                     .and_then(|runtime_value| runtime_value.get("extensions"))
                     .and_then(|e| e.as_sequence())
@@ -758,7 +758,7 @@ avocado-build-$TARGET_ARCH $RUNTIME_NAME
     ) -> Result<String> {
         // Try to get version from local [ext] section
         if let Some(version) = parsed
-            .get("ext")
+            .get("extensions")
             .and_then(|ext_section| ext_section.as_mapping())
             .and_then(|ext_table| ext_table.get(ext_name))
             .and_then(|ext_config| ext_config.get("version"))
@@ -892,10 +892,10 @@ mod tests {
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
-    dependencies:
+    packages:
       test-dep:
         ext: test-ext
 "#;
@@ -930,13 +930,13 @@ runtime:
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
     extensions:
       - test-ext
 
-ext:
+extensions:
   test-ext:
     version: "1.0.0"
     types:
@@ -972,13 +972,13 @@ ext:
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
     extensions:
       - test-ext
 
-ext:
+extensions:
   test-ext:
     version: "1.0.0"
     types:
@@ -1017,13 +1017,13 @@ ext:
 sdk:
   image: "test-image"
 
-runtime:
+runtimes:
   test-runtime:
     target: "x86_64"
     extensions:
       - test-ext
 
-ext:
+extensions:
   test-ext:
     version: "1.0.0"
     types:

@@ -5,11 +5,11 @@ distro:
 sdk:
   image: ghcr.io/avocado-framework/avocado-sdk:v1.0.0
   version: 1.0.0
-runtime:
+runtimes:
   default:
     target: aarch64-unknown-linux-gnu
     board: raspberry-pi-4
-ext:
+extensions:
   web-server:
     types:
     - sysext

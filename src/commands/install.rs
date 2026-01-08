@@ -20,16 +20,15 @@ use crate::utils::{
 
 /// Represents an extension dependency
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // Deprecated variants kept for backward compatibility
 pub enum ExtensionDependency {
     /// Extension defined in the config (local or fetched remote)
     Local(String),
     /// DEPRECATED: Extension from an external config file
-    /// Use source: path in the ext section instead
-    #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
+    /// Use source: path in the extensions section instead
     External { name: String, config_path: String },
     /// DEPRECATED: Extension resolved via DNF with a version specification
-    /// Use source: repo in the ext section instead
-    #[deprecated(since = "0.23.0", note = "Use Local with source: repo instead")]
+    /// Use source: package in the extensions section instead
     Versioned { name: String, version: String },
 }
 
@@ -225,10 +224,10 @@ impl InstallCommand {
                         return Err(anyhow::anyhow!(
                             "Deprecated 'vsn:' syntax found for extension '{name}' version '{version}'.\n\n\
                             The 'vsn:' syntax for versioned extensions is no longer supported.\n\n\
-                            To use remote extensions, define them in the 'ext' section with a 'source' field:\n\n\
-                            ext:\n  {name}:\n    source:\n      type: repo\n      version: \"{version}\"\n\n\
-                            Then reference the extension in runtime dependencies simply by name:\n\n\
-                            runtime:\n  your-runtime:\n    dependencies:\n      {name}: ext\n\n\
+                            To use remote extensions, define them in the 'extensions' section with a 'source' field:\n\n\
+                            extensions:\n  {name}:\n    source:\n      type: package\n      version: \"{version}\"\n\n\
+                            Then reference the extension in runtimes packages simply by name:\n\n\
+                            runtimes:\n  your-runtime:\n    packages:\n      {name}: ext\n\n\
                             Remote extensions are automatically fetched during 'avocado sdk install' or\n\
                             can be manually fetched with 'avocado ext fetch'."
                         ));
@@ -304,7 +303,6 @@ impl InstallCommand {
         use std::collections::HashSet;
 
         let mut required_extensions = HashSet::new();
-        let mut visited = HashSet::new(); // For cycle detection
 
         let config = &composed.config;
         let parsed = &composed.merged_value;
@@ -321,7 +319,7 @@ impl InstallCommand {
                 );
             }
             // If no runtimes match this target, install all local extensions
-            if let Some(ext_section) = parsed.get("ext").and_then(|e| e.as_mapping()) {
+            if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
                 for ext_name_val in ext_section.keys() {
                     if let Some(ext_name) = ext_name_val.as_str() {
                         required_extensions
@@ -331,56 +329,22 @@ impl InstallCommand {
             }
         } else {
             // Only install extensions needed by the target-relevant runtimes
-            if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_mapping()) {
+            if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
                 for runtime_name in &target_runtimes {
                     if let Some(_runtime_config) = runtime_section.get(runtime_name) {
                         // Check both base dependencies and target-specific dependencies
                         let merged_runtime =
                             config.get_merged_runtime_config(runtime_name, target, config_path)?;
                         if let Some(merged_value) = merged_runtime {
-                            if let Some(dependencies) = merged_value
-                                .get("dependencies")
-                                .and_then(|d| d.as_mapping())
+                            // NEW FORMAT: Extensions are listed directly under runtimes.<name>.extensions
+                            if let Some(extensions_list) =
+                                merged_value.get("extensions").and_then(|e| e.as_sequence())
                             {
-                                for (_dep_name, dep_spec) in dependencies {
-                                    // Check for extension dependency
-                                    if let Some(ext_name) =
-                                        dep_spec.get("ext").and_then(|v| v.as_str())
-                                    {
-                                        // Check if this is a versioned extension (has vsn field)
-                                        if let Some(version) =
-                                            dep_spec.get("vsn").and_then(|v| v.as_str())
-                                        {
-                                            let ext_dep = ExtensionDependency::Versioned {
-                                                name: ext_name.to_string(),
-                                                version: version.to_string(),
-                                            };
-                                            required_extensions.insert(ext_dep);
-                                        }
-                                        // Check if this is an external extension (has config field)
-                                        else if let Some(external_config) =
-                                            dep_spec.get("config").and_then(|v| v.as_str())
-                                        {
-                                            let ext_dep = ExtensionDependency::External {
-                                                name: ext_name.to_string(),
-                                                config_path: external_config.to_string(),
-                                            };
-                                            required_extensions.insert(ext_dep.clone());
-
-                                            // Recursively find nested external extension dependencies
-                                            self.find_nested_external_extensions(
-                                                config,
-                                                config_path,
-                                                &ext_dep,
-                                                &mut required_extensions,
-                                                &mut visited,
-                                            )?;
-                                        } else {
-                                            // Local extension
-                                            required_extensions.insert(ExtensionDependency::Local(
-                                                ext_name.to_string(),
-                                            ));
-                                        }
+                                for ext_val in extensions_list {
+                                    if let Some(ext_name) = ext_val.as_str() {
+                                        required_extensions.insert(ExtensionDependency::Local(
+                                            ext_name.to_string(),
+                                        ));
                                     }
                                 }
                             }
@@ -407,124 +371,6 @@ impl InstallCommand {
         Ok(extensions)
     }
 
-    /// Recursively find nested external extension dependencies
-    fn find_nested_external_extensions(
-        &self,
-        config: &Config,
-        base_config_path: &str,
-        ext_dep: &ExtensionDependency,
-        required_extensions: &mut std::collections::HashSet<ExtensionDependency>,
-        visited: &mut std::collections::HashSet<String>,
-    ) -> Result<()> {
-        let (ext_name, ext_config_path) = match ext_dep {
-            ExtensionDependency::External { name, config_path } => (name, config_path),
-            ExtensionDependency::Local(_) => return Ok(()), // Local extensions don't have nested external deps
-            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
-        };
-
-        // Cycle detection: check if we've already processed this extension
-        let ext_key = format!("{ext_name}:{ext_config_path}");
-        if visited.contains(&ext_key) {
-            if self.verbose {
-                print_info(
-                    &format!("Skipping already processed extension '{ext_name}' to avoid cycles"),
-                    OutputLevel::Normal,
-                );
-            }
-            return Ok(());
-        }
-        visited.insert(ext_key);
-
-        // Load the external extension configuration
-        let resolved_external_config_path =
-            config.resolve_path_relative_to_src_dir(base_config_path, ext_config_path);
-        let external_extensions =
-            config.load_external_extensions(base_config_path, ext_config_path)?;
-
-        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
-            )
-        })?;
-
-        // Load the nested config file to get its src_dir setting
-        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
-            .with_context(|| {
-                format!(
-                    "Failed to read nested config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
-            .with_context(|| {
-                format!(
-                    "Failed to parse nested config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-
-        // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
-
-        // Check if this external extension has dependencies
-        if let Some(dependencies) = extension_config
-            .get("dependencies")
-            .and_then(|d| d.as_mapping())
-        {
-            for (_dep_name, dep_spec) in dependencies {
-                // Check for nested extension dependency
-                if let Some(nested_ext_name) = dep_spec.get("ext").and_then(|v| v.as_str()) {
-                    // Check if this is a nested external extension (has config field)
-                    if let Some(nested_external_config) =
-                        dep_spec.get("config").and_then(|v| v.as_str())
-                    {
-                        // Resolve the nested config path relative to the nested config's src_dir
-                        let nested_config_path = nested_config_obj
-                            .resolve_path_relative_to_src_dir(
-                                &resolved_external_config_path,
-                                nested_external_config,
-                            );
-
-                        let nested_ext_dep = ExtensionDependency::External {
-                            name: nested_ext_name.to_string(),
-                            config_path: nested_config_path.to_string_lossy().to_string(),
-                        };
-
-                        // Add the nested extension to required extensions
-                        required_extensions.insert(nested_ext_dep.clone());
-
-                        if self.verbose {
-                            print_info(
-                                &format!("Found nested external extension '{nested_ext_name}' required by '{ext_name}' at '{}'", nested_config_path.display()),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Recursively process the nested extension
-                        self.find_nested_external_extensions(
-                            config,
-                            base_config_path,
-                            &nested_ext_dep,
-                            required_extensions,
-                            visited,
-                        )?;
-                    } else {
-                        // This is a local extension dependency within the external config
-                        // We don't need to process it further as it will be handled during installation
-                        if self.verbose {
-                            print_info(
-                                &format!("Found local extension dependency '{nested_ext_name}' in external extension '{ext_name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Find runtimes that are relevant for the specified target
     fn find_target_relevant_runtimes(
         &self,
@@ -534,7 +380,7 @@ impl InstallCommand {
     ) -> Result<Vec<String>> {
         let mut relevant_runtimes = Vec::new();
 
-        if let Some(runtime_section) = parsed.get("runtime").and_then(|r| r.as_mapping()) {
+        if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
             for runtime_name_val in runtime_section.keys() {
                 if let Some(runtime_name) = runtime_name_val.as_str() {
                     // If a specific runtime is requested, only check that one
@@ -703,7 +549,7 @@ impl InstallCommand {
         // Process the extension's dependencies (packages, not extension or compile dependencies)
         let sysroot = SysrootType::Extension(extension_name.to_string());
 
-        if let Some(serde_yaml::Value::Mapping(deps_map)) = extension_config.get("dependencies") {
+        if let Some(serde_yaml::Value::Mapping(deps_map)) = extension_config.get("packages") {
             if !deps_map.is_empty() {
                 let mut packages = Vec::new();
                 let mut package_names = Vec::new();
@@ -719,7 +565,7 @@ impl InstallCommand {
                     // Skip non-package dependencies (extension or compile dependencies)
                     if let serde_yaml::Value::Mapping(spec_map) = version_spec {
                         // Skip extension dependencies (they have "ext" field) - handled by recursive logic
-                        if spec_map.get("ext").is_some() {
+                        if spec_map.get("extensions").is_some() {
                             continue;
                         }
                         // Skip compile dependencies (they have "compile" field) - SDK-compiled, not from repo
@@ -1164,7 +1010,7 @@ $DNF_SDK_HOST \
         // Check if the external config has SDK dependencies
         let sdk_deps = external_config
             .get("sdk")
-            .and_then(|sdk| sdk.get("dependencies"))
+            .and_then(|sdk| sdk.get("packages"))
             .and_then(|deps| deps.as_mapping());
 
         let Some(sdk_deps_map) = sdk_deps else {

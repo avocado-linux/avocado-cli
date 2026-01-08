@@ -30,7 +30,7 @@ impl ExtListCommand {
 
     fn get_extensions(&self, parsed: &serde_yaml::Value) -> Vec<String> {
         parsed
-            .get("ext")
+            .get("extensions")
             .and_then(|ext_section| ext_section.as_mapping())
             .map(|table| {
                 table
