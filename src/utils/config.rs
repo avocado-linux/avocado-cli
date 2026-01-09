@@ -747,14 +747,94 @@ impl Config {
             );
         }
 
+        // Load extension path state for path-based extensions
+        let ext_path_state = crate::utils::ext_fetch::ExtensionPathState::load_from_dir(&src_dir)
+            .ok()
+            .flatten();
+
         // For each remote extension, try to read its config
         for (ext_name, source) in remote_extensions {
             // Try multiple methods to read the extension config:
+            // 0. Path-based extension: read directly from source path (for source: { type: path })
             // 1. Direct container path (when running inside a container)
             // 2. Via container command (when running on host)
             // 3. Local fallback path (for development)
 
             let ext_content = {
+                // Method 0: Check if this is a path-based extension (source: { type: path })
+                // For path-based extensions, read from the registered source path on the host
+                if let Some(ref state) = ext_path_state {
+                    if let Some(source_path) = state.path_mounts.get(&ext_name) {
+                        let config_path_yaml = source_path.join("avocado.yaml");
+                        let config_path_yml = source_path.join("avocado.yml");
+
+                        if verbose {
+                            eprintln!(
+                                "[DEBUG] Extension '{}' is path-based, checking: {}",
+                                ext_name,
+                                config_path_yaml.display()
+                            );
+                        }
+
+                        if config_path_yaml.exists() {
+                            match fs::read_to_string(&config_path_yaml) {
+                                Ok(content) => {
+                                    if verbose {
+                                        eprintln!(
+                                            "[DEBUG]   Read {} bytes from path-based source",
+                                            content.len()
+                                        );
+                                    }
+                                    content
+                                }
+                                Err(e) => {
+                                    if verbose {
+                                        eprintln!("[DEBUG]   Failed to read: {e}");
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else if config_path_yml.exists() {
+                            match fs::read_to_string(&config_path_yml) {
+                                Ok(content) => {
+                                    if verbose {
+                                        eprintln!(
+                                            "[DEBUG]   Read {} bytes from path-based source (.yml)",
+                                            content.len()
+                                        );
+                                    }
+                                    content
+                                }
+                                Err(e) => {
+                                    if verbose {
+                                        eprintln!("[DEBUG]   Failed to read: {e}");
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            if verbose {
+                                eprintln!(
+                                    "[DEBUG]   Path-based source path has no avocado.yaml/yml: {}",
+                                    source_path.display()
+                                );
+                            }
+                            continue;
+                        }
+                    } else {
+                        // Not a path-based extension, fall through to other methods
+                        "".to_string()
+                    }
+                } else {
+                    // No path state, fall through to other methods
+                    "".to_string()
+                }
+            };
+
+            // If we got content from path-based source, skip other methods
+            let ext_content = if !ext_content.is_empty() {
+                ext_content
+            } else {
                 // Method 1: Check if we're inside a container and can read directly
                 // The standard container path is /opt/_avocado/<target>/includes/<ext>/avocado.yaml
                 let container_direct_path =
@@ -881,9 +961,21 @@ impl Config {
                 }
             };
 
-            // Record this extension's source (container path for reference)
-            let ext_config_path_str =
-                format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml");
+            // Record this extension's source path
+            // For path-based extensions, use the actual host path
+            // For other remote extensions, use the container path
+            let ext_config_path_str = if let Some(ref state) = ext_path_state {
+                if let Some(source_path) = state.path_mounts.get(&ext_name) {
+                    source_path
+                        .join("avocado.yaml")
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml")
+                }
+            } else {
+                format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml")
+            };
             extension_sources.insert(ext_name.clone(), ext_config_path_str.clone());
 
             // Also record any extensions defined within this remote extension's config
@@ -899,7 +991,20 @@ impl Config {
             }
 
             // Get include patterns from the extension source
-            let include_patterns = source.get_include_patterns();
+            // For path-based extensions (type: path), use permissive patterns similar to legacy
+            // external configs to ensure sdk.compile sections are included
+            let include_patterns: Vec<String> = match &source {
+                ExtensionSource::Path { include, .. } => {
+                    if let Some(patterns) = include {
+                        patterns.clone()
+                    } else {
+                        // Default: include all sdk sections for path-based extensions
+                        vec!["sdk.packages.*".to_string(), "sdk.compile.*".to_string()]
+                    }
+                }
+                _ => source.get_include_patterns().to_vec(),
+            };
+            let include_patterns = include_patterns.as_slice();
 
             // Find compile dependencies to auto-include from the extension's own section
             let auto_include_compile =

@@ -3,14 +3,92 @@
 //! This module provides functionality to fetch extensions from various sources:
 //! - Package repository (avocado extension repo)
 //! - Git repositories (with optional sparse checkout)
-//! - Local filesystem paths
+//! - Local filesystem paths (mounted via bindfs at runtime)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::utils::config::ExtensionSource;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, OutputLevel};
+
+/// State for extension path mounts stored in .avocado/ext-paths.json
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ExtensionPathState {
+    /// Map of extension name to host path for bindfs mounting
+    pub path_mounts: HashMap<String, PathBuf>,
+}
+
+impl ExtensionPathState {
+    /// Load extension path state from .avocado/ext-paths.json in the given directory
+    pub fn load_from_dir(dir_path: &Path) -> Result<Option<Self>> {
+        let state_file = dir_path.join(".avocado").join("ext-paths.json");
+
+        if !state_file.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&state_file).with_context(|| {
+            format!(
+                "Failed to read extension path state file: {}",
+                state_file.display()
+            )
+        })?;
+
+        let state: Self = serde_json::from_str(&content).with_context(|| {
+            format!(
+                "Failed to parse extension path state file: {}",
+                state_file.display()
+            )
+        })?;
+
+        Ok(Some(state))
+    }
+
+    /// Save extension path state to .avocado/ext-paths.json in the given directory
+    pub fn save_to_dir(&self, dir_path: &Path) -> Result<()> {
+        let state_dir = dir_path.join(".avocado");
+        fs::create_dir_all(&state_dir).with_context(|| {
+            format!(
+                "Failed to create .avocado directory: {}",
+                state_dir.display()
+            )
+        })?;
+
+        let state_file = state_dir.join("ext-paths.json");
+        let content = serde_json::to_string_pretty(self)
+            .with_context(|| "Failed to serialize extension path state".to_string())?;
+
+        fs::write(&state_file, content).with_context(|| {
+            format!(
+                "Failed to write extension path state file: {}",
+                state_file.display()
+            )
+        })?;
+
+        Ok(())
+    }
+
+    /// Add a path mount for an extension
+    pub fn add_path_mount(&mut self, ext_name: String, host_path: PathBuf) {
+        self.path_mounts.insert(ext_name, host_path);
+    }
+
+    /// Remove a path mount for an extension
+    #[allow(dead_code)]
+    pub fn remove_path_mount(&mut self, ext_name: &str) {
+        self.path_mounts.remove(ext_name);
+    }
+
+    /// Get the path mount for an extension
+    #[allow(dead_code)]
+    pub fn get_path_mount(&self, ext_name: &str) -> Option<&PathBuf> {
+        self.path_mounts.get(ext_name)
+    }
+}
 
 /// Extension fetcher for downloading and installing remote extensions
 pub struct ExtensionFetcher {
@@ -30,6 +108,8 @@ pub struct ExtensionFetcher {
     container_args: Option<Vec<String>>,
     /// SDK container architecture for cross-arch emulation
     sdk_arch: Option<String>,
+    /// Source directory for resolving relative extension paths
+    src_dir: Option<PathBuf>,
 }
 
 impl ExtensionFetcher {
@@ -49,6 +129,7 @@ impl ExtensionFetcher {
             repo_release: None,
             container_args: None,
             sdk_arch: None,
+            src_dir: None,
         }
     }
 
@@ -73,6 +154,12 @@ impl ExtensionFetcher {
     /// Set SDK container architecture for cross-arch emulation
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
+        self
+    }
+
+    /// Set source directory for resolving relative extension paths
+    pub fn with_src_dir(mut self, src_dir: Option<PathBuf>) -> Self {
+        self.src_dir = src_dir;
         self
     }
 
@@ -318,75 +405,98 @@ echo "Successfully fetched extension '{ext_name}' from git"
     }
 
     /// Fetch an extension from a local filesystem path
+    ///
+    /// Instead of copying files, this validates the path exists and stores the
+    /// mapping for bindfs mounting at container runtime. The extension source
+    /// will be mounted at `/mnt/ext/<ext_name>` and bindfs'd to
+    /// `$AVOCADO_PREFIX/includes/<ext_name>`.
     async fn fetch_from_path(
         &self,
         ext_name: &str,
         source_path: &str,
-        _install_path: &Path, // Host path - not used, we use container path instead
+        _install_path: &Path, // Host path - not used, we use bindfs mounting instead
     ) -> Result<()> {
         if self.verbose {
             print_info(
-                &format!("Fetching extension '{ext_name}' from path: {source_path}"),
+                &format!("Registering extension '{ext_name}' from path: {source_path}"),
                 OutputLevel::Normal,
             );
         }
 
-        // Resolve the source path relative to the config file
-        let config_dir = Path::new(&self.config_path)
-            .parent()
-            .unwrap_or(Path::new("."));
+        // Resolve the source path relative to src_dir (or config dir if src_dir not set)
         let resolved_source = if Path::new(source_path).is_absolute() {
             PathBuf::from(source_path)
         } else {
-            config_dir.join(source_path)
+            // Use src_dir if available, otherwise fall back to config directory
+            if let Some(ref src_dir) = self.src_dir {
+                src_dir.join(source_path)
+            } else {
+                let config_dir = Path::new(&self.config_path)
+                    .parent()
+                    .unwrap_or(Path::new("."));
+                config_dir.join(source_path)
+            }
         };
+
+        // Canonicalize the path to get the absolute path
+        let resolved_source = resolved_source.canonicalize().unwrap_or(resolved_source);
 
         if !resolved_source.exists() {
             return Err(anyhow::anyhow!(
-                "Extension source path does not exist: {}",
+                "Extension source path does not exist: {}\n\
+                 Path was resolved relative to: {}",
+                resolved_source.display(),
+                self.src_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "config directory".to_string())
+            ));
+        }
+
+        // Check that the path contains an avocado.yaml or avocado.yml file
+        let has_config = resolved_source.join("avocado.yaml").exists()
+            || resolved_source.join("avocado.yml").exists();
+        if !has_config {
+            return Err(anyhow::anyhow!(
+                "Extension source path does not contain an avocado.yaml or avocado.yml file: {}",
                 resolved_source.display()
             ));
         }
 
-        // Use container path $AVOCADO_PREFIX/includes/<ext_name>
-        let container_install_path = format!("$AVOCADO_PREFIX/includes/{ext_name}");
+        // Get the state directory (src_dir or config dir)
+        let state_dir = self.src_dir.clone().unwrap_or_else(|| {
+            Path::new(&self.config_path)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
 
-        // The source path needs to be accessible from inside the container
-        // Since the workspace is mounted at $AVOCADO_SRC_DIR, convert the path
-        let resolved_source_str = resolved_source.to_string_lossy();
+        // Load or create extension path state
+        let mut state = ExtensionPathState::load_from_dir(&state_dir)?.unwrap_or_default();
 
-        // Build copy command to run inside the container
-        let copy_cmd = format!(
-            r#"
-set -e
-rm -rf "{container_install_path}"
-mkdir -p "{container_install_path}"
-cp -r "{resolved_source_str}/." "{container_install_path}/"
-echo "Successfully copied extension '{ext_name}' from {resolved_source_str} to {container_install_path}"
-"#
-        );
+        // Add the path mount for this extension
+        state.add_path_mount(ext_name.to_string(), resolved_source.clone());
 
-        let container_helper = SdkContainer::new().verbose(self.verbose);
-        let run_config = RunConfig {
-            container_image: self.container_image.clone(),
-            target: self.target.clone(),
-            command: copy_cmd,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: self.repo_url.clone(),
-            repo_release: self.repo_release.clone(),
-            container_args: self.container_args.clone(),
-            sdk_arch: self.sdk_arch.clone(),
-            ..Default::default()
-        };
+        // Save the state
+        state.save_to_dir(&state_dir)?;
 
-        let success = container_helper.run_in_container(run_config).await?;
-        if !success {
-            return Err(anyhow::anyhow!(
-                "Failed to copy extension '{ext_name}' from path"
-            ));
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Registered extension '{ext_name}' for bindfs mounting from: {}",
+                    resolved_source.display()
+                ),
+                OutputLevel::Normal,
+            );
         }
+
+        print_info(
+            &format!(
+                "Extension '{ext_name}' will be mounted via bindfs at runtime from: {}",
+                resolved_source.display()
+            ),
+            OutputLevel::Normal,
+        );
 
         Ok(())
     }

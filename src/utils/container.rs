@@ -146,6 +146,9 @@ pub struct RunConfig {
     pub nfs_port: Option<u16>,
     /// SDK container architecture for cross-arch emulation (e.g., "aarch64", "x86-64")
     pub sdk_arch: Option<String>,
+    /// Extension source paths to mount via bindfs (extension name -> host path)
+    /// These are mounted at /mnt/ext/<ext_name> and bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
+    pub ext_path_mounts: Option<HashMap<String, PathBuf>>,
 }
 
 impl Default for RunConfig {
@@ -177,6 +180,7 @@ impl Default for RunConfig {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            ext_path_mounts: None,
         }
     }
 }
@@ -233,6 +237,44 @@ impl SdkContainer {
     pub fn from_config(config_path: &str, config: &crate::utils::config::Config) -> Result<Self> {
         let src_dir = config.get_resolved_src_dir(config_path);
         Ok(Self::new().with_src_dir(src_dir))
+    }
+
+    /// Load extension path mounts from the state file
+    ///
+    /// Returns a HashMap of extension name -> host path for extensions that use
+    /// `source: { type: path }` and were registered via `avocado ext fetch`.
+    ///
+    /// These paths should be added to `RunConfig.ext_path_mounts` so they get
+    /// mounted via bindfs at container runtime.
+    pub fn load_ext_path_mounts(&self) -> Option<HashMap<String, PathBuf>> {
+        use crate::utils::ext_fetch::ExtensionPathState;
+
+        let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
+
+        match ExtensionPathState::load_from_dir(src_dir) {
+            Ok(Some(state)) if !state.path_mounts.is_empty() => {
+                if self.verbose {
+                    print_info(
+                        &format!(
+                            "Loaded {} extension path mount(s) from state file",
+                            state.path_mounts.len()
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                Some(state.path_mounts)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                if self.verbose {
+                    print_info(
+                        &format!("Warning: Failed to load extension path state: {e}"),
+                        OutputLevel::Normal,
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Create a shared RunsOnContext for running multiple commands on a remote host
@@ -359,9 +401,17 @@ impl SdkContainer {
             config.container_name.clone()
         };
 
-        // Create a modified config with the container name
+        // Auto-populate ext_path_mounts from state file if not already set
+        let effective_ext_path_mounts = if config.ext_path_mounts.is_some() {
+            config.ext_path_mounts.clone()
+        } else {
+            self.load_ext_path_mounts()
+        };
+
+        // Create a modified config with the container name and ext_path_mounts
         let effective_config = RunConfig {
             container_name: effective_container_name.clone(),
+            ext_path_mounts: effective_ext_path_mounts,
             ..config
         };
 
@@ -662,6 +712,30 @@ impl SdkContainer {
                 None
             };
 
+        // Mount extension source paths for bindfs
+        // Each extension path is mounted at /mnt/ext/<ext_name> and will be bindfs'd
+        // to $AVOCADO_PREFIX/includes/<ext_name> in the entrypoint script
+        let mut ext_path_names: Vec<String> = Vec::new();
+        if let Some(ref ext_mounts) = config.ext_path_mounts {
+            for (ext_name, host_path) in ext_mounts {
+                container_cmd.push("-v".to_string());
+                container_cmd.push(format!("{}:/mnt/ext/{}:rw", host_path.display(), ext_name));
+                ext_path_names.push(ext_name.clone());
+
+                if self.verbose {
+                    print_info(
+                        &format!(
+                            "Mounting extension '{}' source: {} -> /mnt/ext/{}",
+                            ext_name,
+                            host_path.display(),
+                            ext_name
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
         // Note: Working directory is handled in the entrypoint script based on sysroot parameters
 
         // Add environment variables
@@ -701,6 +775,16 @@ impl SdkContainer {
         if let Some(keys_dir) = signing_keys_env {
             container_cmd.push("-e".to_string());
             container_cmd.push(format!("AVOCADO_SIGNING_KEYS_DIR={keys_dir}"));
+        }
+
+        // Add extension path mounts env var for entrypoint script
+        // This is a space-separated list of extension names that have bindfs mounts
+        if !ext_path_names.is_empty() {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(format!(
+                "AVOCADO_EXT_PATH_MOUNTS={}",
+                ext_path_names.join(" ")
+            ));
         }
 
         for (key, value) in env_vars {
@@ -786,11 +870,24 @@ impl SdkContainer {
 
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
+        // Auto-populate ext_path_mounts from state file if not already set
+        let effective_ext_path_mounts = if config.ext_path_mounts.is_some() {
+            config.ext_path_mounts.clone()
+        } else {
+            self.load_ext_path_mounts()
+        };
+
+        // Create effective config with ext_path_mounts
+        let effective_config = RunConfig {
+            ext_path_mounts: effective_ext_path_mounts,
+            ..config
+        };
+
         // Build container command with volume state
         let container_cmd =
-            self.build_container_command(&config, &bash_cmd, &env_vars, &volume_state)?;
+            self.build_container_command(&effective_config, &bash_cmd, &env_vars, &volume_state)?;
 
-        if config.verbose || self.verbose {
+        if effective_config.verbose || self.verbose {
             print_info(
                 &format!(
                     "Mounting source directory: {} -> /mnt/src (bindfs -> /opt/src)",
@@ -1340,6 +1437,35 @@ else
     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)"; fi
 fi
 
+# Mount extension source paths with bindfs (for path-based remote extensions)
+# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
+if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
+    # AVOCADO_PREFIX must be set before this - use the target from environment
+    EXT_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}/includes"
+    for ext_name in $AVOCADO_EXT_PATH_MOUNTS; do
+        mnt_path="/mnt/ext/$ext_name"
+        target_path="$EXT_PREFIX/$ext_name"
+
+        if [ -d "$mnt_path" ]; then
+            mkdir -p "$target_path"
+            if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
+                if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
+                    mount --bind "$mnt_path" "$target_path"
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)"; fi
+                else
+                    bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 "$mnt_path" "$target_path"
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping"; fi
+                fi
+            else
+                mount --bind "$mnt_path" "$target_path"
+                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)"; fi
+            fi
+        else
+            echo "[WARNING] Extension mount path not found: $mnt_path"
+        fi
+    done
+fi
+
 # Get repo url from environment or default to prod
 if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
     REPO_URL="$AVOCADO_SDK_REPO_URL"
@@ -1530,6 +1656,35 @@ else
     # Fallback: simple bind mount without permission translation
     mount --bind /mnt/src /opt/src
     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)"; fi
+fi
+
+# Mount extension source paths with bindfs (for path-based remote extensions)
+# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
+if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
+    # AVOCADO_PREFIX must be set before this - use the target from environment
+    EXT_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}/includes"
+    for ext_name in $AVOCADO_EXT_PATH_MOUNTS; do
+        mnt_path="/mnt/ext/$ext_name"
+        target_path="$EXT_PREFIX/$ext_name"
+
+        if [ -d "$mnt_path" ]; then
+            mkdir -p "$target_path"
+            if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
+                if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
+                    mount --bind "$mnt_path" "$target_path"
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)"; fi
+                else
+                    bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 "$mnt_path" "$target_path"
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping"; fi
+                fi
+            else
+                mount --bind "$mnt_path" "$target_path"
+                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)"; fi
+            fi
+        else
+            echo "[WARNING] Extension mount path not found: $mnt_path"
+        fi
+    done
 fi
 
 # Get repo url from environment or default to prod
@@ -1907,6 +2062,7 @@ mod tests {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            ext_path_mounts: None,
         };
 
         let result = container.build_container_command(&config, &command, &env_vars, &volume_state);

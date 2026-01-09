@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::utils::config::{Config, ExtensionSource};
 use crate::utils::ext_fetch::ExtensionFetcher;
-use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
 
 /// Command to fetch remote extensions
@@ -138,6 +138,9 @@ impl ExtFetchCommand {
             config.merge_sdk_container_args(None)
         };
 
+        // Get the resolved src_dir for resolving relative extension paths
+        let src_dir = config.get_resolved_src_dir(&self.config_path);
+
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
             target.clone(),
@@ -147,7 +150,8 @@ impl ExtFetchCommand {
         .with_repo_url(config.get_sdk_repo_url())
         .with_repo_release(config.get_sdk_repo_release())
         .with_container_args(effective_container_args)
-        .with_sdk_arch(self.sdk_arch.clone());
+        .with_sdk_arch(self.sdk_arch.clone())
+        .with_src_dir(src_dir);
 
         // Fetch each extension
         let mut fetched_count = 0;
@@ -183,11 +187,9 @@ impl ExtFetchCommand {
                     fetched_count += 1;
                 }
                 Err(e) => {
-                    print_warning(
-                        &format!("Failed to fetch extension '{ext_name}': {e}"),
-                        OutputLevel::Normal,
-                    );
-                    // Continue with other extensions instead of failing entirely
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch extension '{ext_name}': {e}"
+                    ));
                 }
             }
         }
