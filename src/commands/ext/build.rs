@@ -155,17 +155,18 @@ impl ExtBuildCommand {
             })?;
 
         // Get the config path where this extension is actually defined
+        // Note: For SDK compile operations, we need a path that's accessible from the host.
+        // For remote extensions, the sdk.compile sections are already merged into the main
+        // config via load_composed(), so we use the main config path for SDK compile.
+        // The ext_src_path (for overlay/scripts) is computed separately below.
         let ext_config_path = match &extension_location {
             ExtensionLocation::Local { config_path, .. } => config_path.clone(),
             ExtensionLocation::External { config_path, .. } => config_path.clone(),
-            ExtensionLocation::Remote { name, .. } => {
-                // Remote extensions are installed to $AVOCADO_PREFIX/includes/<name>/
-                let ext_install_path =
-                    config.get_extension_install_path(&self.config_path, name, &target);
-                ext_install_path
-                    .join("avocado.yaml")
-                    .to_string_lossy()
-                    .to_string()
+            ExtensionLocation::Remote { .. } => {
+                // For remote extensions, use the main config path because:
+                // 1. Remote extension sdk.compile sections are merged into main config via load_composed
+                // 2. The Docker volume path is not accessible from the host for SDK compile operations
+                self.config_path.clone()
             }
         };
 
@@ -230,10 +231,26 @@ impl ExtBuildCommand {
             anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
         })?;
 
+        // Determine the extension source path for compile/install scripts
+        // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext-name>/
+        // For local extensions, scripts are in /opt/src (the mounted src_dir)
+        let ext_script_workdir = match &extension_location {
+            ExtensionLocation::Remote { name, .. } => {
+                Some(format!("$AVOCADO_PREFIX/includes/{name}"))
+            }
+            ExtensionLocation::Local { .. } | ExtensionLocation::External { .. } => None,
+        };
+
         // Handle compile dependencies with install scripts before building the extension
         // Pass the ext_config_path so SDK compile sections are loaded from the correct config
-        self.handle_compile_dependencies(config, &ext_config, &target, &ext_config_path)
-            .await?;
+        self.handle_compile_dependencies(
+            config,
+            &ext_config,
+            &target,
+            &ext_config_path,
+            ext_script_workdir.as_deref(),
+        )
+        .await?;
 
         // Get extension types from the types array (defaults to ["sysext", "confext"])
         let ext_types = ext_config
@@ -1502,12 +1519,16 @@ echo "Set proper permissions on authentication files""#,
     ///
     /// `sdk_config_path` is the path to the config file that contains the sdk.compile sections.
     /// For external extensions, this should be the external config path, not the main config.
+    ///
+    /// `ext_script_workdir` is the optional working directory for compile/install scripts
+    /// (container path). For remote extensions, this is `$AVOCADO_PREFIX/includes/<ext>/`.
     async fn handle_compile_dependencies(
         &self,
         config: &Config,
         ext_config: &serde_yaml::Value,
         target: &str,
         sdk_config_path: &str,
+        ext_script_workdir: Option<&str>,
     ) -> Result<()> {
         // Get dependencies from extension configuration
         let dependencies = ext_config.get("packages").and_then(|v| v.as_mapping());
@@ -1577,6 +1598,12 @@ echo "Set proper permissions on authentication files""#,
                     &format!("Using config path for SDK compile: {sdk_config_path}"),
                     OutputLevel::Normal,
                 );
+                if let Some(workdir) = ext_script_workdir {
+                    print_info(
+                        &format!("Using script workdir: {workdir}"),
+                        OutputLevel::Normal,
+                    );
+                }
             }
             let compile_command = SdkCompileCommand::new(
                 sdk_config_path.to_string(),
@@ -1585,7 +1612,8 @@ echo "Set proper permissions on authentication files""#,
                 Some(target.to_string()),
                 self.container_args.clone(),
                 self.dnf_args.clone(),
-            );
+            )
+            .with_workdir(ext_script_workdir.map(|s| s.to_string()));
 
             compile_command.execute().await.with_context(|| {
                 format!(
@@ -1594,12 +1622,20 @@ echo "Set proper permissions on authentication files""#,
             })?;
 
             // Then, run the install script
-            // Note: install_script is already relative to /opt/src (the mounted src_dir in the container)
-            // so we don't need to prepend src_dir here - just use it directly like compile scripts do
-            let install_command = format!(
-                r#"if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
-                extension_name = self.extension
-            );
+            // For remote extensions, use ext_script_workdir to find the script
+            // For local extensions, scripts are relative to /opt/src (the mounted src_dir)
+            // Note: Use double quotes for workdir so $AVOCADO_PREFIX gets expanded by the shell
+            let install_command = if let Some(workdir) = ext_script_workdir {
+                format!(
+                    r#"cd "{workdir}" && if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
+                    extension_name = self.extension
+                )
+            } else {
+                format!(
+                    r#"if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
+                    extension_name = self.extension
+                )
+            };
 
             if self.verbose {
                 print_info(

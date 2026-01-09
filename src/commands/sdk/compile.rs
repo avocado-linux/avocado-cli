@@ -35,6 +35,10 @@ pub struct SdkCompileCommand {
     pub no_stamps: bool,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Working directory for compile scripts (container path).
+    /// If set, scripts are executed from this directory instead of /opt/src.
+    /// Used for remote extensions where scripts are in $AVOCADO_PREFIX/includes/<ext>/
+    pub workdir: Option<String>,
 }
 
 impl SdkCompileCommand {
@@ -56,7 +60,14 @@ impl SdkCompileCommand {
             dnf_args,
             no_stamps: false,
             sdk_arch: None,
+            workdir: None,
         }
+    }
+
+    /// Set the working directory for compile scripts (container path)
+    pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
+        self.workdir = workdir;
+        self
     }
 
     /// Set the no_stamps flag
@@ -237,10 +248,20 @@ impl SdkCompileCommand {
             let container_helper =
                 SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
-            let compile_command = format!(
-                r#"if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
-                section.script, section.script, section.script, section.script
-            );
+            // Build compile command with optional workdir prefix
+            // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext>/ instead of /opt/src
+            // Note: Use double quotes for workdir so $AVOCADO_PREFIX gets expanded by the shell
+            let compile_command = if let Some(ref workdir) = self.workdir {
+                format!(
+                    r#"cd "{workdir}" && if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
+                    section.script, section.script, section.script, section.script
+                )
+            } else {
+                format!(
+                    r#"if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
+                    section.script, section.script, section.script, section.script
+                )
+            };
 
             let config = RunConfig {
                 container_image: container_image.to_string(),
