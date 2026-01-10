@@ -1,5 +1,5 @@
 use crate::utils::{
-    config::load_config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
@@ -7,6 +7,7 @@ use crate::utils::{
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct RuntimeDeployCommand {
     runtime_name: String,
@@ -18,6 +19,8 @@ pub struct RuntimeDeployCommand {
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeDeployCommand {
@@ -40,6 +43,7 @@ impl RuntimeDeployCommand {
             dnf_args,
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -55,11 +59,24 @@ impl RuntimeDeployCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration
-        let config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(
+                &self.config_path,
+                self.target.as_deref(),
+            )?),
+        };
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Get SDK configuration from interpolated config
         let container_image = config
@@ -83,11 +100,11 @@ impl RuntimeDeployCommand {
             .map(|s| s.to_string());
 
         // Resolve target architecture
-        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Initialize SDK container helper
         let container_helper =
-            SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {

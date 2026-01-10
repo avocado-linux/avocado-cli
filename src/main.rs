@@ -1392,6 +1392,7 @@ async fn main() -> Result<()> {
                     port,
                     no_stamps: no_stamps || cli.no_stamps,
                     sdk_arch: cli.sdk_arch.clone(),
+                    composed_config: None,
                 };
                 hitl_cmd.execute().await?;
                 Ok(())

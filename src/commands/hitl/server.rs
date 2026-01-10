@@ -1,4 +1,4 @@
-use crate::utils::config::Config;
+use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{is_docker_desktop, RunConfig, SdkContainer};
 use crate::utils::nfs_server::{NfsExport, HITL_DEFAULT_PORT};
 use crate::utils::output::{print_debug, print_info, OutputLevel};
@@ -6,9 +6,10 @@ use crate::utils::stamps::{
     generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
 };
 use crate::utils::target::validate_and_log_target;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct HitlServerCommand {
@@ -46,15 +47,34 @@ pub struct HitlServerCommand {
     /// SDK container architecture for cross-arch emulation
     #[arg(skip)]
     pub sdk_arch: Option<String>,
+
+    /// Pre-composed configuration to avoid reloading
+    #[arg(skip)]
+    pub composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl HitlServerCommand {
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
         let container_helper = SdkContainer::new().verbose(self.verbose);
 
         // Use shared target resolution logic with early validation and logging
-        let target = validate_and_log_target(self.target.as_deref(), &config)?;
+        let target = validate_and_log_target(self.target.as_deref(), config)?;
 
         // Get SDK configuration
         let (container_image, repo_url, repo_release) = if let Some(sdk_config) = &config.sdk {
@@ -314,6 +334,7 @@ mod tests {
             port: None,
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -337,6 +358,7 @@ mod tests {
             port: Some(2049),
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -358,6 +380,7 @@ mod tests {
             port: Some(3049),
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -380,6 +403,7 @@ mod tests {
             port: Some(4049),
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         };
 
         let commands = cmd.generate_export_setup_commands();
@@ -429,6 +453,7 @@ mod tests {
             port: None,
             no_stamps: true,
             sdk_arch: None,
+            composed_config: None,
         };
 
         // With no_stamps, validation should be skipped
@@ -448,6 +473,7 @@ mod tests {
             port: None,
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         };
 
         // With no extensions, the stamp validation loop is skipped entirely

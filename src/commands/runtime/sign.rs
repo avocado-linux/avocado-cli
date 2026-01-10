@@ -3,7 +3,7 @@
 //! Signs runtime images (extension images) using configured signing keys.
 
 use crate::utils::{
-    config::load_config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     image_signing::{validate_signing_key_for_use, ChecksumAlgorithm},
     output::{print_info, print_success, print_warning, OutputLevel},
@@ -15,6 +15,7 @@ use crate::utils::{
 };
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Command to sign runtime images
 pub struct RuntimeSignCommand {
@@ -28,6 +29,8 @@ pub struct RuntimeSignCommand {
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeSignCommand {
@@ -48,6 +51,7 @@ impl RuntimeSignCommand {
             dnf_args,
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -63,14 +67,26 @@ impl RuntimeSignCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration
-        let config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(
+                &self.config_path,
+                self.target.as_deref(),
+            )?),
+        };
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         // Resolve target architecture
-        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
@@ -78,7 +94,7 @@ impl RuntimeSignCommand {
                 .get_sdk_image()
                 .context("No SDK container image specified in configuration")?;
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             // Sign requires runtime build stamp
             let required = resolve_required_stamps(
@@ -157,10 +173,10 @@ impl RuntimeSignCommand {
         }
 
         let all_required_extensions =
-            self.find_all_extension_dependencies(&config, &required_extensions, &target_arch)?;
+            self.find_all_extension_dependencies(config, &required_extensions, &target_arch)?;
 
         // Sign images
-        self.sign_runtime_images(&config, &target_arch, &all_required_extensions)
+        self.sign_runtime_images(config, &target_arch, &all_required_extensions)
             .await?;
 
         print_success(
@@ -174,7 +190,7 @@ impl RuntimeSignCommand {
                 .get_sdk_image()
                 .context("No SDK container image specified")?;
             let container_helper =
-                SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             let inputs = StampInputs::new("sign".to_string());
             let outputs = StampOutputs::default();

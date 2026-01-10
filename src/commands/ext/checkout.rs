@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::process::Command as AsyncCommand;
 
-use crate::utils::config::Config;
+use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::stamps::{
@@ -21,6 +22,8 @@ pub struct ExtCheckoutCommand {
     target: Option<String>,
     no_stamps: bool,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ExtCheckoutCommand {
@@ -43,6 +46,7 @@ impl ExtCheckoutCommand {
             target,
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -58,18 +62,34 @@ impl ExtCheckoutCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
         let cwd = std::env::current_dir().context("Failed to get current directory")?;
+
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .context("Failed to load config")?,
+            ),
+        };
+        let config = &composed.config;
 
         // Validate stamps before proceeding (unless --no-stamps)
         // Checkout requires extension to be installed
         if !self.no_stamps {
-            let config = Config::load(&self.config_path)?;
-            let target = resolve_target_required(self.target.as_deref(), &config)?;
+            let target = resolve_target_required(self.target.as_deref(), config)?;
 
             if let Some(container_image) = config.get_sdk_image() {
                 let container_helper =
-                    SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+                    SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
                 let requirements = vec![
                     StampRequirement::sdk_install(),

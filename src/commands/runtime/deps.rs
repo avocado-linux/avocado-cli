@@ -1,12 +1,15 @@
 use crate::utils::{
-    config::load_config,
+    config::{ComposedConfig, Config},
     output::{print_success, OutputLevel},
 };
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 pub struct RuntimeDepsCommand {
     config_path: String,
     runtime_name: String,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeDepsCommand {
@@ -14,16 +17,27 @@ impl RuntimeDepsCommand {
         Self {
             config_path,
             runtime_name,
+            composed_config: None,
         }
     }
 
-    pub fn execute(&self) -> Result<()> {
-        let _config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
 
-        self.validate_runtime_exists(&parsed)?;
-        let dependencies = self.list_runtime_dependencies(&parsed, &self.runtime_name)?;
+    pub fn execute(&self) -> Result<()> {
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(&self.config_path, None)?),
+        };
+        let parsed = &composed.merged_value;
+
+        self.validate_runtime_exists(parsed)?;
+        let dependencies = self.list_runtime_dependencies(parsed, &self.runtime_name)?;
 
         self.display_dependencies(&dependencies);
         print_success(

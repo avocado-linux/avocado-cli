@@ -5,9 +5,10 @@ use crate::utils::signing_service::{generate_helper_script, SigningService, Sign
 use anyhow::{Context, Result};
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     target::validate_and_log_target,
@@ -52,6 +53,8 @@ pub struct SdkRunCommand {
     /// Signing service handle (Unix only)
     #[cfg(unix)]
     signing_service: Option<SigningService>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl SdkRunCommand {
@@ -93,6 +96,7 @@ impl SdkRunCommand {
             sdk_arch: None,
             #[cfg(unix)]
             signing_service: None,
+            composed_config: None,
         }
     }
 
@@ -106,6 +110,13 @@ impl SdkRunCommand {
     /// Set SDK container architecture for cross-arch emulation
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
+        self
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
         self
     }
 
@@ -251,12 +262,18 @@ impl SdkRunCommand {
             ));
         }
 
-        // Load the configuration
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
 
         // Early target validation and logging - fail fast if target is unsupported
-        let target = validate_and_log_target(self.target.as_deref(), &config)?;
+        let target = validate_and_log_target(self.target.as_deref(), config)?;
 
         // Get merged SDK configuration for the target
         let merged_sdk_config = config.get_merged_sdk_config(&target, &self.config_path)?;
@@ -306,14 +323,14 @@ impl SdkRunCommand {
 
         // Setup signing service if a runtime is specified
         let signing_config = if let Some(runtime_name) = self.runtime.clone() {
-            self.setup_signing_service(&config, &runtime_name).await?
+            self.setup_signing_service(config, &runtime_name).await?
         } else {
             None
         };
 
         // Use the container helper to run the command
         let container_helper =
-            SdkContainer::from_config(&self.config_path, &config)?.verbose(self.verbose);
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
         // Create RunConfig - detach mode is now handled by the shared run_in_container
         let mut run_config = RunConfig {

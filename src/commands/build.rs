@@ -2,13 +2,14 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::commands::{
     ext::{ExtBuildCommand, ExtImageCommand},
     runtime::RuntimeBuildCommand,
 };
 use crate::utils::{
-    config::{Config, ExtensionSource},
+    config::{ComposedConfig, Config, ExtensionSource},
     output::{print_info, print_success, OutputLevel},
 };
 
@@ -52,6 +53,8 @@ pub struct BuildCommand {
     pub nfs_port: Option<u16>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl BuildCommand {
@@ -77,6 +80,7 @@ impl BuildCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -99,32 +103,40 @@ impl BuildCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     /// Execute the build command
     pub async fn execute(&self) -> Result<()> {
-        // Early target validation - load basic config first
-        let basic_config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
-        let target =
-            crate::utils::target::validate_and_log_target(self.target.as_deref(), &basic_config)?;
-
-        // Load the composed configuration (merges external configs, applies interpolation)
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
 
         let config = &composed.config;
         let parsed = &composed.merged_value;
+        let target = crate::utils::target::validate_and_log_target(self.target.as_deref(), config)?;
 
         // If a specific extension is requested, build only that extension
         if let Some(ref ext_name) = self.extension {
             return self
-                .build_single_extension(config, parsed, ext_name, &target)
+                .build_single_extension(&composed, ext_name, &target)
                 .await;
         }
 
         // If a specific runtime is requested, build only that runtime and its dependencies
         if let Some(ref runtime_name) = self.runtime {
             return self
-                .build_single_runtime(config, parsed, runtime_name, &target)
+                .build_single_runtime(&composed, runtime_name, &target)
                 .await;
         }
 
@@ -171,7 +183,8 @@ impl BuildCommand {
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(&composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build extension '{extension_name}'")
                         })?;
@@ -231,7 +244,8 @@ impl BuildCommand {
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(&composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build remote extension '{name}'")
                         })?;
@@ -264,7 +278,8 @@ impl BuildCommand {
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(&composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
                         })?;
@@ -313,7 +328,8 @@ impl BuildCommand {
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(&composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for remote extension '{name}'")
                         })?;
@@ -351,7 +367,8 @@ impl BuildCommand {
                 self.dnf_args.clone(),
             )
             .with_no_stamps(self.no_stamps)
-            .with_runs_on(self.runs_on.clone(), self.nfs_port);
+            .with_runs_on(self.runs_on.clone(), self.nfs_port)
+            .with_composed_config(Arc::clone(&composed));
             runtime_build_cmd
                 .execute()
                 .await
@@ -838,11 +855,13 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     /// Build a single extension without building runtimes
     async fn build_single_extension(
         &self,
-        config: &Config,
-        parsed: &serde_yaml::Value,
+        composed: &Arc<ComposedConfig>,
         extension_name: &str,
         target: &str,
     ) -> Result<()> {
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
+
         print_info(
             &format!("Building single extension '{extension_name}' for target '{target}'"),
             OutputLevel::Normal,
@@ -883,7 +902,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     self.dnf_args.clone(),
                 )
                 .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
                     .await
@@ -912,7 +932,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     self.dnf_args.clone(),
                 )
                 .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
                     .await
@@ -937,7 +958,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     self.dnf_args.clone(),
                 )
                 .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for extension '{ext_name}'")
                 })?;
@@ -971,7 +993,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     self.dnf_args.clone(),
                 )
                 .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for remote extension '{name}'")
                 })?;
@@ -988,11 +1011,13 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     /// Build a single runtime and its required extensions
     async fn build_single_runtime(
         &self,
-        config: &Config,
-        parsed: &serde_yaml::Value,
+        composed: &Arc<ComposedConfig>,
         runtime_name: &str,
         target: &str,
     ) -> Result<()> {
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
+
         print_info(
             &format!("Building single runtime '{runtime_name}' for target '{target}'"),
             OutputLevel::Normal,
@@ -1069,7 +1094,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build extension '{extension_name}'")
                         })?;
@@ -1084,7 +1110,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
                         })?;
@@ -1148,7 +1175,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build remote extension '{name}'")
                         })?;
@@ -1163,7 +1191,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for remote extension '{name}'")
                         })?;
@@ -1189,7 +1218,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             self.dnf_args.clone(),
         )
         .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_composed_config(Arc::clone(composed));
         runtime_build_cmd
             .execute()
             .await

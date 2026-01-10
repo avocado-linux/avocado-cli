@@ -2,9 +2,10 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     output::{print_success, OutputLevel},
 };
 
@@ -15,24 +16,43 @@ type DependencySections = HashMap<String, Vec<(String, String, String)>>;
 pub struct SdkDepsCommand {
     /// Path to configuration file
     pub config_path: String,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl SdkDepsCommand {
     /// Create a new SdkDepsCommand instance
     pub fn new(config_path: String) -> Self {
-        Self { config_path }
+        Self {
+            config_path,
+            composed_config: None,
+        }
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
     }
 
     /// Execute the sdk deps command
     pub fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, None)
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
 
         // Read the config file content for extension parsing
         let config_content = std::fs::read_to_string(&self.config_path)
             .with_context(|| format!("Failed to read config file {}", self.config_path))?;
 
-        let sections = self.list_packages_by_section(&config, &config_content)?;
+        let sections = self.list_packages_by_section(config, &config_content)?;
         let total_count = self.display_packages_by_section(&sections);
 
         print_success(

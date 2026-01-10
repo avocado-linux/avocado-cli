@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use crate::utils::signing_service::{generate_helper_script, SigningService, SigningServiceConfig};
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     remote::{RemoteHost, SshClient},
@@ -16,6 +16,7 @@ use crate::utils::{
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct RuntimeProvisionConfig {
     pub runtime_name: String,
@@ -45,6 +46,8 @@ pub struct RuntimeProvisionCommand {
     config: RuntimeProvisionConfig,
     #[cfg(unix)]
     signing_service: Option<SigningService>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeProvisionCommand {
@@ -53,13 +56,25 @@ impl RuntimeProvisionCommand {
             config,
             #[cfg(unix)]
             signing_service: None,
+            composed_config: None,
         }
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&mut self) -> Result<()> {
-        // Load composed configuration (includes remote extension configs with provision profiles)
-        let composed =
-            Config::load_composed(&self.config.config_path, self.config.target.as_deref())?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(
+                &self.config.config_path,
+                self.config.target.as_deref(),
+            )?),
+        };
         let config = &composed.config;
         let parsed = &composed.merged_value;
 
@@ -296,6 +311,7 @@ impl RuntimeProvisionCommand {
                     state_file_path,
                     container_state_path,
                     &target_arch,
+                    container_image,
                 )
                 .await?
             } else {
@@ -367,6 +383,7 @@ impl RuntimeProvisionCommand {
                 container_state_path,
                 &target_arch,
                 state_file_existed,
+                container_image,
             )
             .await?;
         }
@@ -560,6 +577,7 @@ avocado-provision-{} {}
         state_file_path: &str,
         container_state_path: &str,
         _target_arch: &str,
+        container_image: &str,
     ) -> Result<bool> {
         let host_state_file = src_dir.join(state_file_path);
 
@@ -587,14 +605,6 @@ avocado-provision-{} {}
                 OutputLevel::Verbose,
             );
         }
-
-        // Load composed configuration to get container image
-        let composed =
-            Config::load_composed(&self.config.config_path, self.config.target.as_deref())?;
-        let config = &composed.config;
-        let container_image = config
-            .get_sdk_image()
-            .context("No SDK container image specified in configuration")?;
 
         let container_tool = "docker";
         let volume_manager = VolumeManager::new(container_tool.to_string(), self.config.verbose);
@@ -672,6 +682,7 @@ avocado-provision-{} {}
         container_state_path: &str,
         _target_arch: &str,
         _original_existed: bool,
+        container_image: &str,
     ) -> Result<()> {
         if self.config.verbose {
             print_info(
@@ -679,14 +690,6 @@ avocado-provision-{} {}
                 OutputLevel::Verbose,
             );
         }
-
-        // Load composed configuration to get container image
-        let composed =
-            Config::load_composed(&self.config.config_path, self.config.target.as_deref())?;
-        let config = &composed.config;
-        let container_image = config
-            .get_sdk_image()
-            .context("No SDK container image specified in configuration")?;
 
         let container_tool = "docker";
         let volume_manager = VolumeManager::new(container_tool.to_string(), self.config.verbose);

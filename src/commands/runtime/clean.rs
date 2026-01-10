@@ -1,6 +1,7 @@
 use anyhow::Result;
+use std::sync::Arc;
 
-use crate::utils::config::{load_config, Config};
+use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -13,6 +14,8 @@ pub struct RuntimeCleanCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeCleanCommand {
@@ -32,6 +35,7 @@ impl RuntimeCleanCommand {
             container_args,
             dnf_args,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -41,14 +45,28 @@ impl RuntimeCleanCommand {
         self
     }
 
-    pub async fn execute(&self) -> Result<()> {
-        let config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
 
-        self.validate_runtime_exists(&parsed)?;
-        let container_image = self.get_container_image(&config)?;
-        let target = self.resolve_target_architecture(&config)?;
+    pub async fn execute(&self) -> Result<()> {
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(
+                &self.config_path,
+                self.target.as_deref(),
+            )?),
+        };
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
+
+        self.validate_runtime_exists(parsed)?;
+        let container_image = self.get_container_image(config)?;
+        let target = self.resolve_target_architecture(config)?;
 
         self.clean_runtime(&container_image, &target).await
     }

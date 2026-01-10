@@ -1,9 +1,10 @@
 //! SDK clean command implementation.
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
@@ -36,6 +37,8 @@ pub struct SdkCleanCommand {
     pub dnf_args: Option<Vec<String>>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl SdkCleanCommand {
@@ -56,6 +59,7 @@ impl SdkCleanCommand {
             container_args,
             dnf_args,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -65,11 +69,23 @@ impl SdkCleanCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     /// Execute the sdk clean command
     pub async fn execute(&self) -> Result<()> {
-        // Load composed configuration to get sdk.compile sections
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
         let config = &composed.config;
 
         // Merge container args from config with CLI args

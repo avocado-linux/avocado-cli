@@ -1,23 +1,39 @@
 use anyhow::Result;
+use std::sync::Arc;
 
-use crate::utils::config::load_config;
+use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::output::{print_success, OutputLevel};
 
 pub struct ExtListCommand {
     config_path: String,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ExtListCommand {
     pub fn new(config_path: String) -> Self {
-        Self { config_path }
+        Self {
+            config_path,
+            composed_config: None,
+        }
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
     }
 
     pub fn execute(&self) -> Result<()> {
-        let _config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(&self.config_path, None)?),
+        };
+        let parsed = &composed.merged_value;
 
-        let extensions = self.get_extensions(&parsed);
+        let extensions = self.get_extensions(parsed);
         self.display_extensions(&extensions);
 
         print_success(

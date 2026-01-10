@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::utils::config::Config;
+use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -25,6 +26,8 @@ pub struct UnlockCommand {
     runtime: Option<String>,
     /// Unlock SDK (includes rootfs, target-sysroot, and all SDK arches)
     sdk: bool,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl UnlockCommand {
@@ -44,17 +47,31 @@ impl UnlockCommand {
             extension,
             runtime,
             sdk,
+            composed_config: None,
         }
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
     }
 
     /// Execute the unlock command
     pub fn execute(&self) -> Result<()> {
-        // Load configuration
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
 
         // Resolve target
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Get src_dir from config
         let src_dir = config

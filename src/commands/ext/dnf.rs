@@ -2,8 +2,9 @@
 #![allow(deprecated)]
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
-use crate::utils::config::{Config, ExtensionLocation};
+use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -17,6 +18,8 @@ pub struct ExtDnfCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ExtDnfCommand {
@@ -38,6 +41,7 @@ impl ExtDnfCommand {
             container_args,
             dnf_args,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -47,10 +51,22 @@ impl ExtDnfCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load composed configuration (includes remote extension configs)
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .context("Failed to load composed config")?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .context("Failed to load composed config")?,
+            ),
+        };
         let config = &composed.config;
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
         let parsed = &composed.merged_value;

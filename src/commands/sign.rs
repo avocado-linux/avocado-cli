@@ -4,10 +4,11 @@
 //! It signs all runtimes with signing configuration, or a specific runtime with `-r`.
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 use crate::commands::runtime::RuntimeSignCommand;
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     output::{print_info, print_success, OutputLevel},
 };
 
@@ -25,6 +26,8 @@ pub struct SignCommand {
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
     pub dnf_args: Option<Vec<String>>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl SignCommand {
@@ -44,30 +47,50 @@ impl SignCommand {
             target,
             container_args,
             dnf_args,
+            composed_config: None,
         }
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
     }
 
     /// Execute the sign command
     pub async fn execute(&self) -> Result<()> {
-        // Load the configuration
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
 
         // Early target validation and logging - fail fast if target is unsupported
-        let target =
-            crate::utils::target::validate_and_log_target(self.target.as_deref(), &config)?;
+        let target = crate::utils::target::validate_and_log_target(self.target.as_deref(), config)?;
 
         // If a specific runtime is requested, sign only that runtime
         if let Some(ref runtime_name) = self.runtime {
-            return self.sign_single_runtime(runtime_name, &target).await;
+            return self
+                .sign_single_runtime(runtime_name, &target, Arc::clone(&composed))
+                .await;
         }
 
         // Otherwise, sign all runtimes that have signing configuration
-        self.sign_all_runtimes(&config, &target).await
+        self.sign_all_runtimes(&composed, &target).await
     }
 
     /// Sign a single runtime
-    async fn sign_single_runtime(&self, runtime_name: &str, target: &str) -> Result<()> {
+    async fn sign_single_runtime(
+        &self,
+        runtime_name: &str,
+        target: &str,
+        composed: Arc<ComposedConfig>,
+    ) -> Result<()> {
         print_info(
             &format!("Signing runtime '{runtime_name}' for target '{target}'"),
             OutputLevel::Normal,
@@ -80,7 +103,8 @@ impl SignCommand {
             Some(target.to_string()),
             self.container_args.clone(),
             self.dnf_args.clone(),
-        );
+        )
+        .with_composed_config(composed);
 
         sign_cmd
             .execute()
@@ -91,9 +115,9 @@ impl SignCommand {
     }
 
     /// Sign all runtimes that have signing configuration
-    async fn sign_all_runtimes(&self, config: &Config, target: &str) -> Result<()> {
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    async fn sign_all_runtimes(&self, composed: &Arc<ComposedConfig>, target: &str) -> Result<()> {
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
         let runtime_section = parsed
             .get("runtimes")
@@ -189,7 +213,8 @@ impl SignCommand {
                 Some(target.to_string()),
                 self.container_args.clone(),
                 self.dnf_args.clone(),
-            );
+            )
+            .with_composed_config(Arc::clone(composed));
 
             sign_cmd
                 .execute()

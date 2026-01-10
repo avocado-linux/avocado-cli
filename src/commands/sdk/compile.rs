@@ -1,9 +1,10 @@
 //! SDK compile command implementation.
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
@@ -39,6 +40,8 @@ pub struct SdkCompileCommand {
     /// If set, scripts are executed from this directory instead of /opt/src.
     /// Used for remote extensions where scripts are in $AVOCADO_PREFIX/includes/<ext>/
     pub workdir: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl SdkCompileCommand {
@@ -61,6 +64,7 @@ impl SdkCompileCommand {
             no_stamps: false,
             sdk_arch: None,
             workdir: None,
+            composed_config: None,
         }
     }
 
@@ -82,17 +86,30 @@ impl SdkCompileCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     /// Execute the sdk compile command
     pub async fn execute(&self) -> Result<()> {
-        // Load composed configuration (includes remote extension compile sections)
+        // Use provided config or load fresh
         if self.verbose {
             print_info(
                 &format!("Loading SDK compile config from: {}", self.config_path),
                 OutputLevel::Normal,
             );
         }
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
         let config = &composed.config;
 
         // Validate stamps before proceeding (unless --no-stamps)

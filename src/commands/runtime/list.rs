@@ -1,23 +1,38 @@
 use crate::utils::{
-    config::load_config,
+    config::{ComposedConfig, Config},
     output::{print_success, OutputLevel},
 };
 use anyhow::Result;
+use std::sync::Arc;
 
 pub struct RuntimeListCommand {
     config_path: String,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeListCommand {
     pub fn new(config_path: String) -> Self {
-        Self { config_path }
+        Self {
+            config_path,
+            composed_config: None,
+        }
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
     }
 
     pub fn execute(&self) -> Result<()> {
-        // Load configuration and parse raw TOML
-        let _config = load_config(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(&self.config_path, None)?),
+        };
+        let parsed = &composed.merged_value;
 
         // Check if runtime section exists
         if let Some(runtime_config) = parsed.get("runtimes").and_then(|v| v.as_mapping()) {

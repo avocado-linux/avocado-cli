@@ -1,5 +1,5 @@
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -11,6 +11,7 @@ use crate::utils::{
 };
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub struct RuntimeBuildCommand {
     runtime_name: String,
@@ -23,6 +24,8 @@ pub struct RuntimeBuildCommand {
     runs_on: Option<String>,
     nfs_port: Option<u16>,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeBuildCommand {
@@ -45,6 +48,7 @@ impl RuntimeBuildCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -67,10 +71,22 @@ impl RuntimeBuildCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load composed configuration (includes remote extension configs)
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
         let config = &composed.config;
         let parsed = &composed.merged_value;
 
@@ -230,7 +246,8 @@ impl RuntimeBuildCommand {
             .await?;
 
         // Build var image
-        let build_script = self.create_build_script(parsed, target_arch, &resolved_extensions)?;
+        let build_script =
+            self.create_build_script(config, parsed, target_arch, &resolved_extensions)?;
 
         if self.verbose {
             print_info(
@@ -362,14 +379,12 @@ impl RuntimeBuildCommand {
 
     fn create_build_script(
         &self,
+        config: &Config,
         parsed: &serde_yaml::Value,
         target_arch: &str,
         resolved_extensions: &[String],
     ) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
-        // Use load_composed to include remote extension configs
-        let composed = Config::load_composed(&self.config_path, Some(target_arch))?;
-        let config = &composed.config;
         let merged_runtime = config
             .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
             .with_context(|| {
@@ -911,9 +926,10 @@ runtimes:
         );
 
         // Pass empty resolved_extensions since no extensions are defined with versions
+        let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions: Vec<String> = vec![];
         let script = cmd
-            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
 
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
@@ -953,9 +969,10 @@ extensions:
             None,
         );
 
+        let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
 
         assert!(script.contains("test-ext-1.0.0.raw"));
@@ -996,9 +1013,10 @@ extensions:
             None,
         );
 
+        let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
 
         // Extension should be copied from output/extensions to runtime-specific directory
@@ -1040,9 +1058,10 @@ extensions:
             None,
         );
 
+        let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&parsed, "x86_64", &resolved_extensions)
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
 
         // Extension should be copied from output/extensions to runtime-specific directory

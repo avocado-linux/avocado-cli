@@ -3,11 +3,12 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::process::Command as AsyncCommand;
 
 use crate::commands::install::ExtensionDependency;
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
     target::resolve_target_required,
@@ -33,6 +34,8 @@ pub struct FetchCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl FetchCommand {
@@ -54,6 +57,7 @@ impl FetchCommand {
             container_args,
             dnf_args,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -63,14 +67,27 @@ impl FetchCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let config_toml: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
+        let config_toml = &composed.merged_value;
 
         // Resolve target architecture
-        let target_arch = resolve_target_required(self.target.as_deref(), &config)?;
+        let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Get container configuration from interpolated config
         let container_image = config
@@ -110,7 +127,7 @@ impl FetchCommand {
                     repo_release: repo_release.as_ref(),
                     container_args: &merged_container_args,
                 };
-                self.fetch_extension_metadata(&config_toml, extension, &container_config)
+                self.fetch_extension_metadata(config_toml, extension, &container_config)
                     .await?;
             }
             (None, Some(runtime)) => {
@@ -123,7 +140,7 @@ impl FetchCommand {
                     repo_release: repo_release.as_ref(),
                     container_args: &merged_container_args,
                 };
-                self.fetch_runtime_metadata(&config_toml, runtime, &container_config)
+                self.fetch_runtime_metadata(config_toml, runtime, &container_config)
                     .await?;
             }
             (None, None) => {
@@ -136,7 +153,7 @@ impl FetchCommand {
                     repo_release: repo_release.as_ref(),
                     container_args: &merged_container_args,
                 };
-                self.fetch_all_metadata(&config_toml, &container_config)
+                self.fetch_all_metadata(config_toml, &container_config)
                     .await?;
             }
             (Some(_), Some(_)) => {

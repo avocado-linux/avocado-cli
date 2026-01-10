@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::commands::{
     ext::ExtInstallCommand, runtime::RuntimeInstallCommand, sdk::SdkInstallCommand,
@@ -56,6 +57,8 @@ pub struct InstallCommand {
     pub nfs_port: Option<u16>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl InstallCommand {
@@ -81,6 +84,7 @@ impl InstallCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -103,20 +107,29 @@ impl InstallCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     /// Execute the install command
     pub async fn execute(&self) -> Result<()> {
-        // Early target validation - load basic config first to validate target
-        let basic_config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
-        let _target = validate_and_log_target(self.target.as_deref(), &basic_config)?;
-
-        // Load the composed configuration (merges external configs, applies interpolation)
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
 
         let config = &composed.config;
         // parsed from initial load is not used after sdk install reloads config
         let _parsed = &composed.merged_value;
+        let _target = validate_and_log_target(self.target.as_deref(), config)?;
 
         print_info(
             "Starting comprehensive install process...",
@@ -147,7 +160,8 @@ impl InstallCommand {
             self.dnf_args.clone(),
         )
         .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_composed_config(Arc::clone(&composed));
         sdk_install_cmd
             .execute()
             .await
@@ -155,13 +169,16 @@ impl InstallCommand {
 
         // Reload composed config after SDK install to pick up newly fetched remote extensions
         // SDK install includes ext fetch which downloads remote extensions to $AVOCADO_PREFIX/includes/
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| {
-                format!(
-                    "Failed to reload composed config from {} after SDK install",
-                    self.config_path
-                )
-            })?;
+        let composed = Arc::new(
+            Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                || {
+                    format!(
+                        "Failed to reload composed config from {} after SDK install",
+                        self.config_path
+                    )
+                },
+            )?,
+        );
         let config = &composed.config;
         let parsed = &composed.merged_value;
 
@@ -195,7 +212,8 @@ impl InstallCommand {
                             self.dnf_args.clone(),
                         )
                         .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_composed_config(Arc::clone(&composed));
                         ext_install_cmd.execute().await.with_context(|| {
                             format!(
                                 "Failed to install extension dependencies for '{extension_name}'"
@@ -280,7 +298,8 @@ impl InstallCommand {
                     self.dnf_args.clone(),
                 )
                 .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port);
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_composed_config(Arc::clone(&composed));
                 runtime_install_cmd.execute().await.with_context(|| {
                     format!("Failed to install runtime dependencies for '{runtime_name}'")
                 })?;

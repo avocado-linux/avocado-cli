@@ -4,8 +4,9 @@
 //! and installs them to `$AVOCADO_PREFIX/includes/<ext_name>/`.
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
-use crate::utils::config::{Config, ExtensionSource};
+use crate::utils::config::{ComposedConfig, Config, ExtensionSource};
 use crate::utils::ext_fetch::ExtensionFetcher;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -30,6 +31,8 @@ pub struct ExtFetchCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ExtFetchCommand {
@@ -52,6 +55,7 @@ impl ExtFetchCommand {
             sdk_arch: None,
             runs_on: None,
             nfs_port: None,
+            composed_config: None,
         }
     }
 
@@ -68,14 +72,27 @@ impl ExtFetchCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     /// Execute the fetch command
     pub async fn execute(&self) -> Result<()> {
-        // Load configuration
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .with_context(|| format!("Failed to load config from {}", self.config_path))?,
+            ),
+        };
+        let config = &composed.config;
 
         // Resolve target
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Get container image
         let container_image = config

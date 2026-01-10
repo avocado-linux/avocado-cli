@@ -3,9 +3,10 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::utils::{
-    config::Config,
+    config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
@@ -39,6 +40,8 @@ pub struct SdkInstallCommand {
     pub nfs_port: Option<u16>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl SdkInstallCommand {
@@ -62,6 +65,7 @@ impl SdkInstallCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -84,19 +88,26 @@ impl SdkInstallCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     /// Execute the sdk install command
     pub async fn execute(&self) -> Result<()> {
-        // Early target validation - load basic config first
-        let basic_config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
-        let target = validate_and_log_target(self.target.as_deref(), &basic_config)?;
-
-        // Load initial composed configuration (without remote extensions yet)
-        // Remote extensions will be fetched after SDK bootstrap when repos are available
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
 
         let config = &composed.config;
+        let target = validate_and_log_target(self.target.as_deref(), config)?;
 
         // Merge container args from config with CLI args
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());

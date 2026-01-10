@@ -3,8 +3,9 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use crate::utils::config::{Config, ExtensionLocation};
+use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::output::{print_error, print_info, OutputLevel};
 use crate::utils::target::resolve_target_required;
 
@@ -12,6 +13,8 @@ pub struct ExtDepsCommand {
     config_path: String,
     extension: Option<String>,
     target: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ExtDepsCommand {
@@ -20,18 +23,33 @@ impl ExtDepsCommand {
             config_path,
             extension,
             target,
+            composed_config: None,
         }
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(Config::load_composed(
+                &self.config_path,
+                self.target.as_deref(),
+            )?),
+        };
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
-        let extensions_to_process = self.get_extensions_to_process(&config, &parsed, &target)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
+        let extensions_to_process = self.get_extensions_to_process(config, parsed, &target)?;
 
-        self.display_dependencies(&parsed, &extensions_to_process);
+        self.display_dependencies(parsed, &extensions_to_process);
         Ok(())
     }
 
@@ -339,6 +357,7 @@ sdk:
             config_path: "test.yaml".to_string(),
             extension: Some("my-extension".to_string()),
             target: None,
+            composed_config: None,
         };
 
         // Test new syntax with install script
@@ -384,6 +403,7 @@ extensions:
             config_path: "test.yaml".to_string(),
             extension: Some("test-ext".to_string()),
             target: None,
+            composed_config: None,
         };
 
         // Test version dependency

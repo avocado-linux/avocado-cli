@@ -1,9 +1,11 @@
 //! Provision command implementation that acts as a shortcut to runtime provision.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::commands::runtime::RuntimeProvisionCommand;
+use crate::utils::config::{ComposedConfig, Config};
 
 /// Configuration for provision command
 pub struct ProvisionConfig {
@@ -40,21 +42,38 @@ pub struct ProvisionConfig {
 /// Implementation of the 'provision' command that calls through to runtime provision.
 pub struct ProvisionCommand {
     config: ProvisionConfig,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ProvisionCommand {
     /// Create a new ProvisionCommand instance
     pub fn new(config: ProvisionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            composed_config: None,
+        }
+    }
+
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
     }
 
     /// Execute the provision command by calling runtime provision
     pub async fn execute(&self) -> Result<()> {
-        // Load composed config to access provision profiles (including from remote extensions)
-        let composed = crate::utils::config::Config::load_composed(
-            &self.config.config_path,
-            self.config.target.as_deref(),
-        )?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config.config_path, self.config.target.as_deref())
+                    .with_context(|| {
+                        format!("Failed to load config from {}", self.config.config_path)
+                    })?,
+            ),
+        };
         let config = &composed.config;
 
         // Get state file path from provision profile if available
@@ -84,7 +103,8 @@ impl ProvisionCommand {
                 nfs_port: self.config.nfs_port,
                 sdk_arch: self.config.sdk_arch.clone(),
             },
-        );
+        )
+        .with_composed_config(composed);
 
         runtime_provision_cmd.execute().await
     }

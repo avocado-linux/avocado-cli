@@ -2,11 +2,12 @@
 #![allow(deprecated)]
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 use std::fs;
 use std::path::PathBuf;
 
-use crate::utils::config::{Config, ExtensionLocation};
+use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::SdkContainer;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 // Note: Stamp imports removed - we no longer validate build stamps for packaging
@@ -28,6 +29,8 @@ pub struct ExtPackageCommand {
     #[allow(dead_code)]
     pub no_stamps: bool,
     pub sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ExtPackageCommand {
@@ -50,6 +53,7 @@ impl ExtPackageCommand {
             dnf_args,
             no_stamps: false,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -65,10 +69,23 @@ impl ExtPackageCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    #[allow(dead_code)]
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load composed configuration (includes remote extension configs)
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
         let config = &composed.config;
         let parsed = &composed.merged_value;
 

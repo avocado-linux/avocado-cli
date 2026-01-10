@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::utils::config::Config;
+use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
@@ -23,6 +24,8 @@ pub struct RuntimeInstallCommand {
     runs_on: Option<String>,
     nfs_port: Option<u16>,
     sdk_arch: Option<String>,
+    /// Pre-composed configuration to avoid reloading
+    composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl RuntimeInstallCommand {
@@ -47,6 +50,7 @@ impl RuntimeInstallCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            composed_config: None,
         }
     }
 
@@ -69,10 +73,22 @@ impl RuntimeInstallCommand {
         self
     }
 
+    /// Set pre-composed configuration to avoid reloading
+    pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
+        self.composed_config = Some(config);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
-        // Load composed configuration (includes remote extension configs)
-        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
-            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        // Use provided config or load fresh
+        let composed = match &self.composed_config {
+            Some(cc) => Arc::clone(cc),
+            None => Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
+                    || format!("Failed to load composed config from {}", self.config_path),
+                )?,
+            ),
+        };
         let config = &composed.config;
         let parsed = &composed.merged_value;
 
