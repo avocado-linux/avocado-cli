@@ -6,6 +6,9 @@ use anyhow::{Context, Result};
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::stamps::{
+    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
+};
 use crate::utils::target::resolve_target_required;
 
 pub struct ExtCleanCommand {
@@ -173,14 +176,6 @@ impl ExtCleanCommand {
             return Ok(());
         }
 
-        print_info(
-            &format!(
-                "Executing {} clean script(s) for compile dependencies",
-                clean_scripts.len()
-            ),
-            OutputLevel::Normal,
-        );
-
         // Get SDK configuration for container setup
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
@@ -188,6 +183,44 @@ impl ExtCleanCommand {
 
         // Initialize SDK container helper
         let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+
+        // Validate SDK is installed before running clean scripts
+        let requirements = vec![StampRequirement::sdk_install()];
+        let batch_script = generate_batch_read_stamps_script(&requirements);
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: batch_script,
+            verbose: false,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.clone(),
+            repo_release: repo_release.clone(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        };
+
+        let output = container_helper
+            .run_in_container_with_output(run_config)
+            .await?;
+
+        let validation =
+            validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+
+        if !validation.is_satisfied() {
+            let error = validation.into_error("Cannot run clean scripts for compile dependencies");
+            return Err(error.into());
+        }
+
+        print_info(
+            &format!(
+                "Executing {} clean script(s) for compile dependencies",
+                clean_scripts.len()
+            ),
+            OutputLevel::Normal,
+        );
 
         // Execute each clean script
         for (section_name, clean_script) in clean_scripts {
