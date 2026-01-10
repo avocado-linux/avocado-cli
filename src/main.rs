@@ -493,6 +493,7 @@ enum SdkCommands {
         dnf_args: Option<Vec<String>>,
     },
     /// Remove the SDK directory
+    /// Clean the SDK or run clean scripts for specific compile sections
     Clean {
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
@@ -503,6 +504,8 @@ enum SdkCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Specific compile sections to clean (runs their clean scripts)
+        sections: Vec<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -1514,12 +1517,14 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                sections,
                 container_args,
                 dnf_args,
             } => {
                 let clean_cmd = SdkCleanCommand::new(
                     config,
                     verbose,
+                    sections,
                     target.or(cli.target),
                     container_args,
                     dnf_args,

@@ -1,7 +1,7 @@
 // Allow deprecated variants for backward compatibility during migration
 #![allow(deprecated)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::utils::config::{Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -45,15 +45,235 @@ impl ExtCleanCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let _parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        // Load composed configuration (includes remote extension configs with compile sections)
+        let composed = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load composed config from {}", self.config_path))?;
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
 
-        let target = resolve_target_required(self.target.as_deref(), &config)?;
-        let _extension_location = self.find_extension_in_dependency_tree(&config, &target)?;
-        let container_image = self.get_container_image(&config)?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
+        let extension_location = self.find_extension_in_dependency_tree(config, &target)?;
+        let container_image = self.get_container_image(config)?;
+
+        // Get extension configuration from the composed/merged config
+        let ext_config = self.get_extension_config(config, parsed, &extension_location, &target)?;
+
+        // Determine the extension source path for clean scripts
+        // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext-name>/
+        // For local extensions, scripts are in /opt/src (the mounted src_dir)
+        let ext_script_workdir = match &extension_location {
+            ExtensionLocation::Remote { name, .. } => {
+                Some(format!("$AVOCADO_PREFIX/includes/{name}"))
+            }
+            ExtensionLocation::Local { .. } | ExtensionLocation::External { .. } => None,
+        };
+
+        // Execute clean scripts for compile dependencies BEFORE cleaning the extension
+        // This allows clean scripts to access build artifacts if needed
+        self.execute_compile_clean_scripts(
+            config,
+            &ext_config,
+            &container_image,
+            &target,
+            ext_script_workdir.as_deref(),
+        )
+        .await?;
 
         self.clean_extension(&container_image, &target).await
+    }
+
+    /// Get extension configuration from the composed/merged config
+    fn get_extension_config(
+        &self,
+        config: &Config,
+        parsed: &serde_yaml::Value,
+        extension_location: &ExtensionLocation,
+        target: &str,
+    ) -> Result<serde_yaml::Value> {
+        match extension_location {
+            ExtensionLocation::Remote { .. } => {
+                // Use the already-merged config from `parsed` which contains remote extension configs
+                let ext_section = parsed
+                    .get("extensions")
+                    .and_then(|ext| ext.get(&self.extension));
+                if let Some(ext_val) = ext_section {
+                    let base_ext = ext_val.clone();
+                    // Check for target-specific override within this extension
+                    let target_override = ext_val.get(target).cloned();
+                    if let Some(override_val) = target_override {
+                        Ok(config.merge_target_override(base_ext, override_val, target))
+                    } else {
+                        Ok(base_ext)
+                    }
+                } else {
+                    Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
+                }
+            }
+            ExtensionLocation::Local { config_path, .. } => config
+                .get_merged_ext_config(&self.extension, target, config_path)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+                }),
+            #[allow(deprecated)]
+            ExtensionLocation::External { config_path, .. } => config
+                .get_merged_ext_config(&self.extension, target, config_path)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+                }),
+        }
+    }
+
+    /// Execute clean scripts for compile dependencies
+    async fn execute_compile_clean_scripts(
+        &self,
+        config: &Config,
+        ext_config: &serde_yaml::Value,
+        container_image: &str,
+        target: &str,
+        ext_script_workdir: Option<&str>,
+    ) -> Result<()> {
+        // Get dependencies from extension configuration
+        let dependencies = ext_config.get("packages").and_then(|v| v.as_mapping());
+
+        let Some(deps_table) = dependencies else {
+            return Ok(());
+        };
+
+        // Find compile dependencies that may have clean scripts
+        let mut compile_sections_to_clean = Vec::new();
+
+        for (dep_name_val, dep_spec) in deps_table {
+            if let Some(dep_name) = dep_name_val.as_str() {
+                if let serde_yaml::Value::Mapping(spec_map) = dep_spec {
+                    // Check for compile dependency: { compile = "section-name", ... }
+                    if let Some(serde_yaml::Value::String(compile_section)) =
+                        spec_map.get("compile")
+                    {
+                        compile_sections_to_clean
+                            .push((dep_name.to_string(), compile_section.clone()));
+                    }
+                }
+            }
+        }
+
+        if compile_sections_to_clean.is_empty() {
+            return Ok(());
+        }
+
+        // Get clean scripts from SDK compile sections
+        let clean_scripts = self.get_clean_scripts_for_sections(config, &compile_sections_to_clean);
+
+        if clean_scripts.is_empty() {
+            if self.verbose {
+                print_info(
+                    "No clean scripts defined for compile dependencies",
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        }
+
+        print_info(
+            &format!(
+                "Executing {} clean script(s) for compile dependencies",
+                clean_scripts.len()
+            ),
+            OutputLevel::Normal,
+        );
+
+        // Get SDK configuration for container setup
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+
+        // Initialize SDK container helper
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+
+        // Execute each clean script
+        for (section_name, clean_script) in clean_scripts {
+            print_info(
+                &format!(
+                    "Running clean script for compile section '{section_name}': {clean_script}"
+                ),
+                OutputLevel::Normal,
+            );
+
+            // Build clean command with optional workdir prefix
+            // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext>/ instead of /opt/src
+            let clean_command = if let Some(workdir) = ext_script_workdir {
+                format!(
+                    r#"cd "{workdir}" && if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                )
+            } else {
+                format!(
+                    r#"if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                )
+            };
+
+            if self.verbose {
+                print_info(
+                    &format!("Running command: {clean_command}"),
+                    OutputLevel::Normal,
+                );
+            }
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: clean_command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            };
+
+            let success = container_helper.run_in_container(run_config).await?;
+
+            if success {
+                print_success(
+                    &format!("Completed clean script for section '{section_name}'."),
+                    OutputLevel::Normal,
+                );
+            } else {
+                print_error(
+                    &format!("Failed to run clean script for section '{section_name}'."),
+                    OutputLevel::Normal,
+                );
+                return Err(anyhow::anyhow!(
+                    "Clean script failed for section '{section_name}'"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get clean scripts for the specified compile sections
+    fn get_clean_scripts_for_sections(
+        &self,
+        config: &Config,
+        compile_sections: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let mut clean_scripts = Vec::new();
+
+        if let Some(sdk) = &config.sdk {
+            if let Some(compile) = &sdk.compile {
+                for (_dep_name, section_name) in compile_sections {
+                    if let Some(section_config) = compile.get(section_name) {
+                        if let Some(clean_script) = &section_config.clean {
+                            clean_scripts.push((section_name.clone(), clean_script.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        clean_scripts
     }
 
     fn find_extension_in_dependency_tree(
@@ -311,5 +531,171 @@ mod tests {
             "Should clean output files"
         );
         assert!(script.contains(".stamps/ext"), "Should clean stamps");
+    }
+
+    #[test]
+    fn test_get_clean_scripts_for_sections_with_clean_script() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let config_content = r#"
+sdk:
+  image: "test-image"
+  compile:
+    my-library:
+      compile: "build.sh"
+      clean: "clean.sh"
+      packages:
+        gcc: "*"
+    other-library:
+      compile: "build-other.sh"
+      packages:
+        make: "*"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+        let config = Config::load(temp_file.path()).unwrap();
+
+        let cmd = ExtCleanCommand::new(
+            "test-ext".to_string(),
+            temp_file.path().to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        // Test with compile sections - one has clean script, one doesn't
+        let compile_sections = vec![
+            ("dep1".to_string(), "my-library".to_string()),
+            ("dep2".to_string(), "other-library".to_string()),
+        ];
+
+        let clean_scripts = cmd.get_clean_scripts_for_sections(&config, &compile_sections);
+
+        // Only my-library has a clean script
+        assert_eq!(clean_scripts.len(), 1);
+        assert_eq!(clean_scripts[0].0, "my-library");
+        assert_eq!(clean_scripts[0].1, "clean.sh");
+    }
+
+    #[test]
+    fn test_get_clean_scripts_for_sections_no_clean_scripts() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let config_content = r#"
+sdk:
+  image: "test-image"
+  compile:
+    my-library:
+      compile: "build.sh"
+      packages:
+        gcc: "*"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+        let config = Config::load(temp_file.path()).unwrap();
+
+        let cmd = ExtCleanCommand::new(
+            "test-ext".to_string(),
+            temp_file.path().to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let compile_sections = vec![("dep1".to_string(), "my-library".to_string())];
+
+        let clean_scripts = cmd.get_clean_scripts_for_sections(&config, &compile_sections);
+
+        // No clean script defined
+        assert!(clean_scripts.is_empty());
+    }
+
+    #[test]
+    fn test_get_clean_scripts_for_nonexistent_section() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let config_content = r#"
+sdk:
+  image: "test-image"
+  compile:
+    my-library:
+      compile: "build.sh"
+      clean: "clean.sh"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+        let config = Config::load(temp_file.path()).unwrap();
+
+        let cmd = ExtCleanCommand::new(
+            "test-ext".to_string(),
+            temp_file.path().to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        // Reference a section that doesn't exist
+        let compile_sections = vec![("dep1".to_string(), "nonexistent-library".to_string())];
+
+        let clean_scripts = cmd.get_clean_scripts_for_sections(&config, &compile_sections);
+
+        // No clean script found for nonexistent section
+        assert!(clean_scripts.is_empty());
+    }
+
+    #[test]
+    fn test_get_clean_scripts_multiple_sections_with_clean() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let config_content = r#"
+sdk:
+  image: "test-image"
+  compile:
+    lib-a:
+      compile: "build-a.sh"
+      clean: "clean-a.sh"
+    lib-b:
+      compile: "build-b.sh"
+      clean: "clean-b.sh"
+    lib-c:
+      compile: "build-c.sh"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+        let config = Config::load(temp_file.path()).unwrap();
+
+        let cmd = ExtCleanCommand::new(
+            "test-ext".to_string(),
+            temp_file.path().to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let compile_sections = vec![
+            ("dep-a".to_string(), "lib-a".to_string()),
+            ("dep-b".to_string(), "lib-b".to_string()),
+            ("dep-c".to_string(), "lib-c".to_string()),
+        ];
+
+        let clean_scripts = cmd.get_clean_scripts_for_sections(&config, &compile_sections);
+
+        // lib-a and lib-b have clean scripts, lib-c doesn't
+        assert_eq!(clean_scripts.len(), 2);
+
+        let section_names: Vec<&str> = clean_scripts
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert!(section_names.contains(&"lib-a"));
+        assert!(section_names.contains(&"lib-b"));
     }
 }

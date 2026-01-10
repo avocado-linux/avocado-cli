@@ -387,6 +387,8 @@ pub struct SdkConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompileConfig {
     pub compile: Option<String>,
+    /// Path to clean script relative to src_dir, executed during `ext clean`
+    pub clean: Option<String>,
     #[serde(alias = "dependencies")]
     pub packages: Option<HashMap<String, serde_yaml::Value>>,
 }

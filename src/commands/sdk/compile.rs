@@ -439,6 +439,7 @@ dependencies = { gcc = "*" }
 
         let section_config = crate::utils::config::CompileConfig {
             compile: Some("my_script.sh".to_string()),
+            clean: None,
             packages: Some(deps),
         };
 
@@ -448,6 +449,7 @@ dependencies = { gcc = "*" }
         // Test section with no compile script
         let section_config_no_script = crate::utils::config::CompileConfig {
             compile: None,
+            clean: None,
             packages: None,
         };
 
