@@ -263,11 +263,13 @@ fi
                         )
                     })?;
             } else {
+                // Default behavior: automatically stop VS Code explorer containers
+                // (these are safe to stop), but fail if other containers are using the volume
                 volume_manager
-                    .remove_volume(&volume_state.volume_name)
+                    .remove_volume_with_explorer_cleanup(&volume_state.volume_name)
                     .await
                     .with_context(|| {
-                        format!("Failed to remove volume: {}", volume_state.volume_name)
+                        format!("Failed to remove volume: {}. If other containers are using this volume, try using --force to remove them.", volume_state.volume_name)
                     })?;
             }
 

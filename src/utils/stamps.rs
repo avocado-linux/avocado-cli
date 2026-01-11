@@ -621,11 +621,29 @@ impl fmt::Display for StampValidationError {
 
         // Collect unique fix commands, using runs_on hint for SDK install commands
         let runs_on_ref = self.runs_on.as_deref();
+        let local_arch = get_local_arch();
+
         let mut fixes: Vec<String> = self
             .missing
             .iter()
             .chain(self.stale.iter().map(|(req, _)| req))
-            .map(|req| req.fix_command_with_remote(runs_on_ref))
+            .flat_map(|req| {
+                // For SDK install stamps with a different architecture than local,
+                // offer both --runs-on and --sdk-arch alternatives
+                if req.component == StampComponent::Sdk
+                    && req.command == StampCommand::Install
+                    && req.host_arch.as_deref() != Some(local_arch)
+                {
+                    if let Some(arch) = &req.host_arch {
+                        let mut cmds = vec![format!("avocado sdk install --sdk-arch {arch}")];
+                        if let Some(remote) = runs_on_ref {
+                            cmds.push(format!("avocado sdk install --runs-on {remote}"));
+                        }
+                        return cmds;
+                    }
+                }
+                vec![req.fix_command_with_remote(runs_on_ref)]
+            })
             .collect();
         fixes.sort();
         fixes.dedup();
@@ -967,16 +985,19 @@ pub fn resolve_required_stamps_for_arch(
             reqs
         }
 
-        // Sign requires runtime build
+        // Sign requires SDK install + runtime build
+        // SDK install is needed because signing runs in the SDK container
         (StampCommand::Sign, StampComponent::Runtime) => {
             let runtime_name = component_name.expect("Runtime name required");
-            vec![StampRequirement::runtime_build(runtime_name)]
+            vec![sdk_install(), StampRequirement::runtime_build(runtime_name)]
         }
 
-        // Provision requires runtime build
+        // Provision requires SDK install + runtime build
+        // SDK install is needed because provisioning runs in the SDK container
+        // When using --runs-on, this ensures the SDK is installed for the remote's arch
         (StampCommand::Provision, StampComponent::Runtime) => {
             let runtime_name = component_name.expect("Runtime name required");
-            vec![StampRequirement::runtime_build(runtime_name)]
+            vec![sdk_install(), StampRequirement::runtime_build(runtime_name)]
         }
 
         // Other combinations have no requirements
@@ -1279,28 +1300,30 @@ mod tests {
 
     #[test]
     fn test_resolve_required_stamps_sign() {
-        // Sign requires runtime build
+        // Sign requires SDK install + runtime build
         let reqs = resolve_required_stamps(
             StampCommand::Sign,
             StampComponent::Runtime,
             Some("my-runtime"),
             &[],
         );
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0], StampRequirement::runtime_build("my-runtime"));
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0], StampRequirement::sdk_install());
+        assert_eq!(reqs[1], StampRequirement::runtime_build("my-runtime"));
     }
 
     #[test]
     fn test_resolve_required_stamps_provision() {
-        // Provision requires runtime build
+        // Provision requires SDK install + runtime build
         let reqs = resolve_required_stamps(
             StampCommand::Provision,
             StampComponent::Runtime,
             Some("my-runtime"),
             &[],
         );
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0], StampRequirement::runtime_build("my-runtime"));
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0], StampRequirement::sdk_install());
+        assert_eq!(reqs[1], StampRequirement::runtime_build("my-runtime"));
     }
 
     #[test]
@@ -2113,25 +2136,46 @@ runtime/my-runtime/build.stamp:::null"#,
     }
 
     #[test]
-    fn test_validation_error_includes_runs_on_hint() {
+    fn test_validation_error_includes_sdk_arch_hint_for_different_arch() {
         let mut result = StampValidationResult::new();
-        result.add_missing(StampRequirement::sdk_install_for_arch("aarch64"));
+        // Use an architecture different from local to trigger --sdk-arch suggestion
+        let different_arch = if get_local_arch() == "aarch64" {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        result.add_missing(StampRequirement::sdk_install_for_arch(different_arch));
 
-        // Without runs_on, fix should be regular install
+        // Without runs_on, fix should suggest --sdk-arch for different architecture
         let error = result.into_error("Cannot provision");
         let msg = error.to_string();
-        assert!(msg.contains("avocado sdk install"));
-        assert!(!msg.contains("--runs-on"));
+        assert!(
+            msg.contains(&format!("avocado sdk install --sdk-arch {different_arch}")),
+            "Expected --sdk-arch suggestion in: {msg}"
+        );
     }
 
     #[test]
-    fn test_validation_error_with_runs_on_includes_remote_in_fix() {
+    fn test_validation_error_with_runs_on_includes_both_alternatives() {
         let mut result = StampValidationResult::new();
-        result.add_missing(StampRequirement::sdk_install_for_arch("aarch64"));
+        // Use an architecture different from local to trigger both suggestions
+        let different_arch = if get_local_arch() == "aarch64" {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        result.add_missing(StampRequirement::sdk_install_for_arch(different_arch));
 
-        // With runs_on, fix should include the remote
+        // With runs_on, fix should include BOTH --sdk-arch and --runs-on alternatives
         let error = result.into_error_with_runs_on("Cannot provision", Some("user@remote"));
         let msg = error.to_string();
-        assert!(msg.contains("avocado sdk install --runs-on user@remote"));
+        assert!(
+            msg.contains(&format!("avocado sdk install --sdk-arch {different_arch}")),
+            "Expected --sdk-arch suggestion in: {msg}"
+        );
+        assert!(
+            msg.contains("avocado sdk install --runs-on user@remote"),
+            "Expected --runs-on suggestion in: {msg}"
+        );
     }
 }

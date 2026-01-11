@@ -161,6 +161,7 @@ impl InstallCommand {
         )
         .with_no_stamps(self.no_stamps)
         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_sdk_arch(self.sdk_arch.clone())
         .with_composed_config(Arc::clone(&composed));
         sdk_install_cmd
             .execute()
@@ -213,6 +214,7 @@ impl InstallCommand {
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(&composed));
                         ext_install_cmd.execute().await.with_context(|| {
                             format!(
@@ -299,6 +301,7 @@ impl InstallCommand {
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(&composed));
                 runtime_install_cmd.execute().await.with_context(|| {
                     format!("Failed to install runtime dependencies for '{runtime_name}'")
@@ -700,6 +703,7 @@ $DNF_SDK_HOST \
                                     repo_release,
                                     merged_container_args,
                                     None, // TODO: Add runs_on_context support to install.rs
+                                    self.sdk_arch.as_ref(),
                                 )
                                 .await?;
 
@@ -949,6 +953,7 @@ $DNF_SDK_HOST \
                 repo_release,
                 merged_container_args,
                 None, // TODO: Add runs_on_context support to install.rs
+                self.sdk_arch.as_ref(),
             )
             .await?;
 
@@ -1173,6 +1178,7 @@ $DNF_SDK_HOST \
                     repo_release,
                     merged_container_args,
                     None, // TODO: Add runs_on_context support to install.rs
+                    self.sdk_arch.as_ref(),
                 )
                 .await?;
 

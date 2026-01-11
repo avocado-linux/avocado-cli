@@ -258,6 +258,126 @@ impl VolumeManager {
 
         Ok(containers)
     }
+
+    /// Name prefix for VS Code extension explorer containers
+    const EXPLORER_CONTAINER_PREFIX: &'static str = "avocado-explorer-";
+
+    /// Get list of VS Code extension explorer containers using a specific volume.
+    /// These containers are created by the avocado-devtools VS Code extension
+    /// to browse volume contents and can be safely stopped automatically.
+    pub async fn get_explorer_containers_using_volume(
+        &self,
+        volume_name: &str,
+    ) -> Result<Vec<String>> {
+        // Find containers that:
+        // 1. Use the specified volume
+        // 2. Have a name matching the explorer pattern (avocado-explorer-*)
+        let output = AsyncCommand::new(&self.container_tool)
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("volume={volume_name}"),
+                "--filter",
+                &format!("name={}", Self::EXPLORER_CONTAINER_PREFIX),
+                "--format",
+                "{{.ID}}\t{{.Names}}",
+            ])
+            .output()
+            .await
+            .with_context(|| "Failed to list explorer containers")?;
+
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let containers: Vec<String> = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 2 {
+                    let id = parts[0];
+                    let name = parts[1];
+                    // Double-check the name starts with our prefix
+                    if name.starts_with(Self::EXPLORER_CONTAINER_PREFIX) {
+                        return Some(id.to_string());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        Ok(containers)
+    }
+
+    /// Stop and remove VS Code extension explorer containers using a specific volume.
+    /// Returns the number of containers that were stopped.
+    pub async fn stop_explorer_containers(&self, volume_name: &str) -> Result<usize> {
+        let containers = self
+            .get_explorer_containers_using_volume(volume_name)
+            .await?;
+
+        if containers.is_empty() {
+            return Ok(0);
+        }
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Found {} VS Code explorer container(s) using volume, stopping...",
+                    containers.len()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        for container_id in &containers {
+            // Stop the container gracefully with short timeout
+            let _ = AsyncCommand::new(&self.container_tool)
+                .args(["stop", "-t", "1", container_id])
+                .output()
+                .await;
+
+            // Remove the container
+            let output = AsyncCommand::new(&self.container_tool)
+                .args(["rm", "-f", container_id])
+                .output()
+                .await
+                .with_context(|| format!("Failed to remove explorer container {container_id}"))?;
+
+            if self.verbose && output.status.success() {
+                print_info(
+                    &format!(
+                        "Stopped explorer container: {}",
+                        &container_id[..12.min(container_id.len())]
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        Ok(containers.len())
+    }
+
+    /// Remove a docker volume, automatically stopping any VS Code explorer containers first.
+    /// Unlike force_remove_volume, this only stops known safe containers (explorer containers)
+    /// and will still fail if other containers are using the volume.
+    pub async fn remove_volume_with_explorer_cleanup(&self, volume_name: &str) -> Result<()> {
+        // First, stop any VS Code explorer containers that might be using this volume
+        let stopped = self.stop_explorer_containers(volume_name).await?;
+
+        if stopped > 0 && self.verbose {
+            print_info(
+                &format!("Stopped {stopped} VS Code explorer container(s) before volume removal"),
+                OutputLevel::Normal,
+            );
+        }
+
+        // Now try to remove the volume
+        self.remove_volume(volume_name).await
+    }
 }
 
 /// Information about a docker volume

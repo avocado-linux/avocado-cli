@@ -675,6 +675,7 @@ $DNF_SDK_HOST \
                             repo_release.cloned(),
                             merged_container_args.clone(),
                             runs_on_context,
+                            self.sdk_arch.as_ref(),
                         )
                         .await?;
 

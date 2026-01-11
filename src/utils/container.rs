@@ -72,6 +72,23 @@ pub fn sdk_arch_to_platform(sdk_arch: &str) -> Result<String> {
     }
 }
 
+/// Normalize SDK arch specification to standard architecture name.
+///
+/// # Arguments
+/// * `sdk_arch` - Architecture string (e.g., "aarch64", "x86-64", "arm64", "amd64")
+///
+/// # Returns
+/// Normalized architecture name (e.g., "aarch64", "x86_64")
+pub fn normalize_sdk_arch(sdk_arch: &str) -> Result<String> {
+    match sdk_arch.to_lowercase().as_str() {
+        "aarch64" | "arm64" => Ok("aarch64".to_string()),
+        "x86-64" | "x86_64" | "amd64" => Ok("x86_64".to_string()),
+        _ => Err(anyhow::anyhow!(
+            "Unsupported SDK architecture: '{sdk_arch}'. Supported values: aarch64, x86-64"
+        )),
+    }
+}
+
 /// Get the host's native platform in Docker format (e.g., "linux/amd64" or "linux/arm64").
 /// This is used to explicitly request the native platform variant from multi-arch images,
 /// ensuring Docker keeps both variants cached when switching between native and emulated runs.
@@ -949,6 +966,7 @@ impl SdkContainer {
     /// * `repo_release` - Optional repository release
     /// * `container_args` - Optional additional container arguments
     /// * `runs_on_context` - Optional remote execution context for --runs-on support
+    /// * `sdk_arch` - Optional SDK architecture for cross-arch emulation
     ///
     /// # Returns
     /// A HashMap of package name to version string (NEVRA format without name prefix)
@@ -963,6 +981,7 @@ impl SdkContainer {
         repo_release: Option<String>,
         container_args: Option<Vec<String>>,
         runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
+        sdk_arch: Option<&String>,
     ) -> Result<std::collections::HashMap<String, String>> {
         if packages.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -993,6 +1012,7 @@ impl SdkContainer {
             repo_url,
             repo_release,
             container_args,
+            sdk_arch: sdk_arch.cloned(),
             ..Default::default()
         };
 
@@ -2240,6 +2260,52 @@ mod tests {
     #[test]
     fn test_sdk_arch_to_platform_unsupported() {
         let result = sdk_arch_to_platform("riscv64");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported SDK architecture"));
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_aarch64() {
+        let result = normalize_sdk_arch("aarch64").unwrap();
+        assert_eq!(result, "aarch64");
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_arm64() {
+        let result = normalize_sdk_arch("arm64").unwrap();
+        assert_eq!(result, "aarch64");
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_x86_64() {
+        let result = normalize_sdk_arch("x86-64").unwrap();
+        assert_eq!(result, "x86_64");
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_x86_64_underscore() {
+        let result = normalize_sdk_arch("x86_64").unwrap();
+        assert_eq!(result, "x86_64");
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_amd64() {
+        let result = normalize_sdk_arch("amd64").unwrap();
+        assert_eq!(result, "x86_64");
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_case_insensitive() {
+        let result = normalize_sdk_arch("AARCH64").unwrap();
+        assert_eq!(result, "aarch64");
+    }
+
+    #[test]
+    fn test_normalize_sdk_arch_unsupported() {
+        let result = normalize_sdk_arch("riscv64");
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

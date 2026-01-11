@@ -184,6 +184,7 @@ impl BuildCommand {
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(&composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build extension '{extension_name}'")
@@ -245,6 +246,7 @@ impl BuildCommand {
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(&composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build remote extension '{name}'")
@@ -279,6 +281,7 @@ impl BuildCommand {
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(&composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
@@ -329,6 +332,7 @@ impl BuildCommand {
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(&composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for remote extension '{name}'")
@@ -368,6 +372,7 @@ impl BuildCommand {
             )
             .with_no_stamps(self.no_stamps)
             .with_runs_on(self.runs_on.clone(), self.nfs_port)
+            .with_sdk_arch(self.sdk_arch.clone())
             .with_composed_config(Arc::clone(&composed));
             runtime_build_cmd
                 .execute()
@@ -579,7 +584,8 @@ impl BuildCommand {
             self.dnf_args.clone(),
         )
         .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_sdk_arch(self.sdk_arch.clone());
 
         // Execute the extension build using the external config
         match ext_build_cmd.execute().await {
@@ -641,7 +647,8 @@ impl BuildCommand {
             self.dnf_args.clone(),
         )
         .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port);
+        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_sdk_arch(self.sdk_arch.clone());
 
         // Execute the image creation
         ext_image_cmd.execute().await.with_context(|| {
@@ -903,6 +910,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
@@ -933,6 +941,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
@@ -959,6 +968,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for extension '{ext_name}'")
@@ -994,6 +1004,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for remote extension '{name}'")
@@ -1095,6 +1106,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build extension '{extension_name}'")
@@ -1111,6 +1123,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
@@ -1176,6 +1189,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(composed));
                         ext_build_cmd.execute().await.with_context(|| {
                             format!("Failed to build remote extension '{name}'")
@@ -1192,6 +1206,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         )
                         .with_no_stamps(self.no_stamps)
                         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                        .with_sdk_arch(self.sdk_arch.clone())
                         .with_composed_config(Arc::clone(composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for remote extension '{name}'")
@@ -1219,6 +1234,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         )
         .with_no_stamps(self.no_stamps)
         .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_sdk_arch(self.sdk_arch.clone())
         .with_composed_config(Arc::clone(composed));
         runtime_build_cmd
             .execute()

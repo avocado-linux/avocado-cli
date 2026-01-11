@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::{RunConfig, SdkContainer},
+    container::{normalize_sdk_arch, RunConfig, SdkContainer},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -238,8 +238,11 @@ impl SdkInstallCommand {
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<()> {
         // Determine host architecture for SDK package tracking
-        // For remote execution, query the remote host; for local, use local arch
-        let host_arch = if let Some(context) = runs_on_context {
+        // Priority: sdk_arch (for cross-arch emulation) > runs_on remote arch > local arch
+        let host_arch = if let Some(ref arch) = self.sdk_arch {
+            // Convert sdk_arch to normalized architecture name (e.g., "aarch64", "x86_64")
+            normalize_sdk_arch(arch)?
+        } else if let Some(context) = runs_on_context {
             context
                 .get_host_arch()
                 .await
@@ -807,6 +810,7 @@ $DNF_SDK_HOST \
                     repo_release.map(|s| s.to_string()),
                     merged_container_args.cloned(),
                     runs_on_context,
+                    self.sdk_arch.as_ref(),
                 )
                 .await?;
 
@@ -895,6 +899,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     repo_release.map(|s| s.to_string()),
                     merged_container_args.cloned(),
                     runs_on_context,
+                    self.sdk_arch.as_ref(),
                 )
                 .await?;
 
@@ -1028,6 +1033,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         repo_release.map(|s| s.to_string()),
                         merged_container_args.cloned(),
                         runs_on_context,
+                        self.sdk_arch.as_ref(),
                     )
                     .await?;
 
