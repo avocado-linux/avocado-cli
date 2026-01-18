@@ -145,6 +145,8 @@ impl ExtBuildCommand {
                 container_args: processed_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 
@@ -548,6 +550,8 @@ impl ExtBuildCommand {
                 container_args: processed_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 
@@ -620,6 +624,8 @@ impl ExtBuildCommand {
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -688,6 +694,8 @@ impl ExtBuildCommand {
             container_args: processed_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -1681,6 +1689,8 @@ echo "Set proper permissions on authentication files""#,
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
                 ..Default::default()
             };
 

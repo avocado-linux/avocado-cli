@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::include_str;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -24,6 +27,22 @@ struct GitHubContent {
     size: Option<u64>,
     /// The git URL - for submodules this points to the submodule repo's tree
     git_url: Option<String>,
+}
+
+/// GitHub Git Trees API response structure
+#[derive(serde::Deserialize, Debug)]
+struct GitHubTree {
+    tree: Vec<GitHubTreeEntry>,
+}
+
+/// Individual entry in a Git tree
+#[derive(serde::Deserialize, Debug)]
+struct GitHubTreeEntry {
+    path: String,
+    /// The file mode (e.g., "100644" for regular file, "100755" for executable)
+    mode: String,
+    #[serde(rename = "type")]
+    entry_type: String,
 }
 
 /// Command to initialize a new Avocado project with configuration files.
@@ -183,16 +202,87 @@ impl InitCommand {
         Ok(response.status().is_success())
     }
 
+    /// Fetches file modes from the Git Trees API for a directory.
+    ///
+    /// # Arguments
+    /// * `repo_owner` - The repository owner
+    /// * `repo_name` - The repository name
+    /// * `git_ref` - The git ref (branch/commit) to fetch from
+    /// * `path` - The path within the repository (empty for root)
+    ///
+    /// # Returns
+    /// * `Ok(HashMap<String, String>)` mapping file paths to their modes
+    /// * `Err` if there was an error fetching the tree
+    async fn fetch_file_modes(
+        repo_owner: &str,
+        repo_name: &str,
+        git_ref: &str,
+        path: &str,
+    ) -> Result<HashMap<String, String>> {
+        let url = format!(
+            "{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/git/trees/{git_ref}?recursive=1"
+        );
+
+        let client = reqwest::Client::builder()
+            .user_agent("avocado-cli")
+            .build()?;
+
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch tree from {url}"))?;
+
+        if !response.status().is_success() {
+            // Return empty map if we can't fetch the tree - files will just not have execute bits
+            return Ok(HashMap::new());
+        }
+
+        let tree: GitHubTree = response
+            .json()
+            .await
+            .with_context(|| "Failed to parse GitHub tree API response")?;
+
+        let mut modes = HashMap::new();
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path)
+        };
+
+        for entry in tree.tree {
+            if entry.entry_type == "blob" {
+                // Store mode relative to the requested path
+                if path.is_empty() {
+                    modes.insert(entry.path, entry.mode);
+                } else if entry.path.starts_with(&prefix) {
+                    let relative_path = entry.path.strip_prefix(&prefix).unwrap_or(&entry.path);
+                    modes.insert(relative_path.to_string(), entry.mode);
+                } else if entry.path == path {
+                    // Handle case where path points to a single file
+                    modes.insert(entry.path.clone(), entry.mode);
+                }
+            }
+        }
+
+        Ok(modes)
+    }
+
     /// Downloads a file from GitHub and saves it to the specified path.
     ///
     /// # Arguments
     /// * `download_url` - The URL to download the file from
     /// * `dest_path` - The destination path to save the file
+    /// * `is_executable` - Whether the file should have execute permissions
     ///
     /// # Returns
     /// * `Ok(())` if successful
     /// * `Err` if there was an error downloading or saving the file
-    async fn download_file(download_url: &str, dest_path: &Path) -> Result<()> {
+    async fn download_file(
+        download_url: &str,
+        dest_path: &Path,
+        is_executable: bool,
+    ) -> Result<()> {
         let client = reqwest::Client::builder()
             .user_agent("avocado-cli")
             .build()?;
@@ -218,8 +308,24 @@ impl InitCommand {
                 .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
         }
 
-        fs::write(dest_path, content)
+        fs::write(dest_path, &content)
             .with_context(|| format!("Failed to write file '{}'", dest_path.display()))?;
+
+        // Set executable permissions on Unix if the file should be executable
+        #[cfg(unix)]
+        if is_executable {
+            let mut perms = fs::metadata(dest_path)
+                .with_context(|| format!("Failed to get metadata for '{}'", dest_path.display()))?
+                .permissions();
+            // Add execute bits for owner, group, and others (respecting existing read bits)
+            let mode = perms.mode();
+            // Set execute bit for each read bit that's set (e.g., 0o644 -> 0o755)
+            let new_mode = mode | ((mode & 0o444) >> 2);
+            perms.set_mode(new_mode);
+            fs::set_permissions(dest_path, perms).with_context(|| {
+                format!("Failed to set permissions for '{}'", dest_path.display())
+            })?;
+        }
 
         Ok(())
     }
@@ -366,6 +472,7 @@ impl InitCommand {
     /// * `repo_owner` - The repository owner
     /// * `repo_name` - The repository name
     /// * `git_ref` - The git ref (branch/commit) to fetch from
+    /// * `file_modes` - Optional map of file paths to their git modes
     ///
     /// # Returns
     /// * `Ok(())` if successful
@@ -377,6 +484,7 @@ impl InitCommand {
         repo_owner: &'a str,
         repo_name: &'a str,
         git_ref: &'a str,
+        file_modes: &'a HashMap<String, String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let url = format!(
@@ -453,7 +561,13 @@ impl InitCommand {
                         "file" => {
                             if let Some(ref download_url) = item.download_url {
                                 println!("  Downloading {relative_path}...");
-                                Self::download_file(download_url, &local_path).await?;
+                                // Check if this file should be executable based on its mode
+                                let is_executable = file_modes
+                                    .get(&item.path)
+                                    .map(|mode| mode == "100755")
+                                    .unwrap_or(false);
+                                Self::download_file(download_url, &local_path, is_executable)
+                                    .await?;
                             }
                         }
                         "dir" => {
@@ -469,6 +583,7 @@ impl InitCommand {
                                 repo_owner,
                                 repo_name,
                                 git_ref,
+                                file_modes,
                             )
                             .await?;
                         }
@@ -593,6 +708,9 @@ impl InitCommand {
         local_path: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            // Fetch file modes for the submodule
+            let file_modes = Self::fetch_file_modes(repo_owner, repo_name, git_ref, path).await?;
+
             let url = if path.is_empty() {
                 format!("{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/contents?ref={git_ref}")
             } else {
@@ -660,7 +778,14 @@ impl InitCommand {
                     match item.item_type.as_str() {
                         "file" => {
                             if let Some(ref download_url) = item.download_url {
-                                Self::download_file(download_url, &item_local_path).await?;
+                                // Check if this file should be executable
+                                let is_executable = file_modes
+                                    .get(&item.path)
+                                    .or_else(|| file_modes.get(item_name))
+                                    .map(|mode| mode == "100755")
+                                    .unwrap_or(false);
+                                Self::download_file(download_url, &item_local_path, is_executable)
+                                    .await?;
                             }
                         }
                         "dir" => {
@@ -813,6 +938,16 @@ impl InitCommand {
                 println!("✓ Target '{target}' is supported by reference '{ref_name}'.");
             }
 
+            // Fetch file modes for the reference directory to preserve execute permissions
+            let reference_path = format!("{REFERENCES_PATH}/{ref_name}");
+            let file_modes = Self::fetch_file_modes(
+                self.get_repo_owner(),
+                self.get_repo_name(),
+                self.get_git_ref(),
+                &reference_path,
+            )
+            .await?;
+
             // Download all contents from the reference
             println!("Downloading reference contents...");
             Self::download_reference_contents(
@@ -822,6 +957,7 @@ impl InitCommand {
                 self.get_repo_owner(),
                 self.get_repo_name(),
                 self.get_git_ref(),
+                &file_modes,
             )
             .await?;
 

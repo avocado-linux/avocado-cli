@@ -609,7 +609,15 @@ impl SdkContainer {
         // Always add platform flag to ensure Docker uses the correct image variant.
         // This prevents Docker from caching only one variant when switching between
         // native and cross-arch emulated runs.
-        let platform = get_container_platform(config.sdk_arch.as_deref())?;
+        // When --sdk-arch is not provided but --runs-on is, default to the remote's architecture
+        let platform = if let Some(sdk_arch) = config.sdk_arch.as_deref() {
+            // User explicitly provided --sdk-arch, use that
+            get_container_platform(Some(sdk_arch))?
+        } else {
+            // No --sdk-arch provided, use the remote host's architecture
+            let remote_arch = context.get_host_arch().await?;
+            sdk_arch_to_platform(&remote_arch)?
+        };
         extra_args.push("--platform".to_string());
         extra_args.push(platform);
 

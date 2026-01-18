@@ -1043,6 +1043,7 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone());
                 build_cmd.execute().await?;
                 Ok(())
@@ -1243,6 +1244,7 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone());
                 build_cmd.execute().await?;
                 Ok(())
