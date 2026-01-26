@@ -103,12 +103,9 @@ impl RuntimeInstallCommand {
         let runtime_section = match parsed.get("runtimes") {
             Some(runtime) => runtime,
             None => {
-                if self.runtime.is_some() {
+                if let Some(runtime) = &self.runtime {
                     print_error(
-                        &format!(
-                            "Runtime '{}' not found in configuration.",
-                            self.runtime.as_ref().unwrap()
-                        ),
+                        &format!("Runtime '{}' not found in configuration.", runtime),
                         OutputLevel::Normal,
                     );
                     return Ok(());
