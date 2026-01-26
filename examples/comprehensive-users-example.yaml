@@ -6,7 +6,6 @@ sdk:
   image: docker.io/avocadolinux/sdk:{{ config.distro.channel }}
   dependencies:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
-    nativesdk-avocado-ext-dev: "*"
 
 runtime:
   default:

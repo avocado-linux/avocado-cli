@@ -35,7 +35,6 @@ sdk:
   image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
   packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
-    nativesdk-avocado-ext-dev: "*"
 
 extensions:
   test-ext:

@@ -930,7 +930,6 @@ mod tests {
         assert!(content.contains("- confext"));
         assert!(content.contains("config:"));
         assert!(content.contains("avocado-sdk-toolchain: \"{{ config.distro.version }}\""));
-        assert!(content.contains("nativesdk-avocado-ext-dev: \"*\""));
     }
 
     #[tokio::test]

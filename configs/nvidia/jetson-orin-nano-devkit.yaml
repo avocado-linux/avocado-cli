@@ -39,7 +39,6 @@ sdk:
   image: docker.io/avocadolinux/sdk:{{ config.distro.channel }}
   packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
-    nativesdk-avocado-ext-dev: "*"
   jetson-orin-nano-devkit:
     container_args:
     - --network=host

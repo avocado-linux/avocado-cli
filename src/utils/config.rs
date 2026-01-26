@@ -3413,7 +3413,7 @@ runtimes:
   default:
     target: qemux86-64
     packages:
-      nativesdk-avocado-images: "*"
+      example-package: "*"
 
 sdk:
   image: docker.io/avocadolinux/sdk:apollo-edge
@@ -3524,7 +3524,7 @@ extensions:
       - confext
     sdk:
       packages:
-        nativesdk-avocado-hitl: "*"
+        nativesdk-example-tool: "*"
         nativesdk-something-else: "1.2.3"
 
   another-ext:
@@ -3547,7 +3547,7 @@ extensions:
         assert_eq!(avocado_dev_deps.len(), 2);
         assert_eq!(
             avocado_dev_deps
-                .get("nativesdk-avocado-hitl")
+                .get("nativesdk-example-tool")
                 .unwrap()
                 .as_str(),
             Some("*")
@@ -3582,12 +3582,12 @@ extensions:
       - confext
     sdk:
       packages:
-        nativesdk-avocado-hitl: "*"
+        nativesdk-example-tool: "*"
         nativesdk-base-tool: "1.0.0"
     qemux86-64:
       sdk:
         packages:
-          nativesdk-avocado-hitl: "2.0.0"
+          nativesdk-example-tool: "2.0.0"
           nativesdk-target-specific: "*"
 
   another-ext:
@@ -3615,7 +3615,7 @@ extensions:
         assert_eq!(avocado_dev_base.len(), 2);
         assert_eq!(
             avocado_dev_base
-                .get("nativesdk-avocado-hitl")
+                .get("nativesdk-example-tool")
                 .unwrap()
                 .as_str(),
             Some("*")
@@ -3645,7 +3645,7 @@ extensions:
         // Target-specific dependency should override base
         assert_eq!(
             avocado_dev_x86
-                .get("nativesdk-avocado-hitl")
+                .get("nativesdk-example-tool")
                 .unwrap()
                 .as_str(),
             Some("2.0.0")
@@ -3688,7 +3688,7 @@ extensions:
         assert_eq!(avocado_dev_arm.len(), 2);
         assert_eq!(
             avocado_dev_arm
-                .get("nativesdk-avocado-hitl")
+                .get("nativesdk-example-tool")
                 .unwrap()
                 .as_str(),
             Some("*")

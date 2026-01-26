@@ -413,7 +413,7 @@ extensions:
       - confext
     sdk:
       packages:
-        nativesdk-avocado-hitl: "*"
+        nativesdk-example-tool: "*"
 
   avocado-dev1:
     types:
@@ -421,7 +421,7 @@ extensions:
       - confext
     sdk:
       packages:
-        nativesdk-avocado-hitl: "*"
+        nativesdk-example-tool: "*"
 "#;
         let mut temp_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         write!(temp_file, "{config_content}").unwrap();
@@ -448,7 +448,7 @@ extensions:
         assert_eq!(ext1_packages.len(), 1);
         let ext1_package_names: Vec<&String> =
             ext1_packages.iter().map(|(_, name, _)| name).collect();
-        assert!(ext1_package_names.contains(&&"nativesdk-avocado-hitl".to_string()));
+        assert!(ext1_package_names.contains(&&"nativesdk-example-tool".to_string()));
 
         // Check second extension
         let ext2_packages = sections
@@ -457,6 +457,6 @@ extensions:
         assert_eq!(ext2_packages.len(), 1);
         let ext2_package_names: Vec<&String> =
             ext2_packages.iter().map(|(_, name, _)| name).collect();
-        assert!(ext2_package_names.contains(&&"nativesdk-avocado-hitl".to_string()));
+        assert!(ext2_package_names.contains(&&"nativesdk-example-tool".to_string()));
     }
 }

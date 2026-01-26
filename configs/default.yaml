@@ -84,7 +84,6 @@ sdk:
 
   packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
-    nativesdk-avocado-ext-dev: "*"
 
   {target}:
     container_args:
