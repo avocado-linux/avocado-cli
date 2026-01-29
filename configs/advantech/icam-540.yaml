@@ -17,8 +17,7 @@ runtimes:
       avocado-img-rootfs: '*'
       avocado-img-initramfs: '*'
     icam-540:
-      packages:
-        avocado-img-tegraflash: '*'
+      packages: {}
 extensions:
   avocado-ext-dev:
     source:
@@ -66,6 +65,7 @@ sdk:
   icam-540:
     packages:
       nativesdk-util-linux-mount: '*'
+      nativesdk-tegraflash-tools: '*'
     container_args:
     - --network=host
     - -v

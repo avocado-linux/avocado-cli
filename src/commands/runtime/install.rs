@@ -901,9 +901,8 @@ avocado-img-bootfiles = "*"
 avocado-img-rootfs = "*"
 avocado-img-initramfs = "*"
 
-# Target-specific dependencies
+# Target-specific dependencies (now empty - tegraflash handled separately)
 [runtime.dev.jetson-orin-nano-devkit.dependencies]
-avocado-img-tegraflash = "*"
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 

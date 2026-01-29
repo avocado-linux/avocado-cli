@@ -15,8 +15,7 @@ runtimes:
       avocado-img-rootfs: '*'
       avocado-img-initramfs: '*'
     jetson-orin-nano-devkit:
-      packages:
-        avocado-img-tegraflash: '*'
+      packages: {}
 extensions:
   avocado-bsp-{{ avocado.target }}:
     source:
@@ -49,6 +48,7 @@ sdk:
     - --privileged
     packages:
       nativesdk-util-linux-mount: '*'
+      nativesdk-tegraflash-tools: '*'
 provision_profiles:
   tegraflash:
     container_args:
