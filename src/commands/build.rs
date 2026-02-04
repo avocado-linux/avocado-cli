@@ -1071,7 +1071,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             "Step 1/4: Analyzing runtime dependencies",
             OutputLevel::Normal,
         );
-        let required_extensions = self.find_extensions_for_runtime(config, &runtime_config)?;
+        let required_extensions =
+            self.find_extensions_for_runtime(config, parsed, &runtime_config, target)?;
 
         // Note: SDK compile sections are now compiled on-demand when extensions are built
         // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
@@ -1252,12 +1253,66 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     fn find_extensions_for_runtime(
         &self,
         config: &Config,
+        parsed: &serde_yaml::Value,
         runtime_config: &serde_yaml::Value,
+        target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
+        use crate::utils::interpolation::interpolate_name;
+
         let mut required_extensions = HashSet::new();
         let mut visited = HashSet::new();
 
-        // Check runtime dependencies for extensions
+        // Build a map of interpolated ext names to their source config
+        // This is needed because ext section keys may contain templates like {{ avocado.target }}
+        let mut ext_sources: std::collections::HashMap<String, Option<ExtensionSource>> =
+            std::collections::HashMap::new();
+        if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
+            for (ext_key, ext_config) in ext_section {
+                if let Some(raw_name) = ext_key.as_str() {
+                    // Interpolate the extension name with the target
+                    let interpolated_name = interpolate_name(raw_name, target);
+                    // Use parse_extension_source which properly deserializes the source field
+                    let source = Config::parse_extension_source(&interpolated_name, ext_config)
+                        .ok()
+                        .flatten();
+                    ext_sources.insert(interpolated_name, source);
+                }
+            }
+        }
+
+        // Check extensions from the new `extensions` array format
+        if let Some(extensions) = runtime_config
+            .get("extensions")
+            .and_then(|e| e.as_sequence())
+        {
+            for ext in extensions {
+                if let Some(ext_name) = ext.as_str() {
+                    // Check if this extension has a source: field (remote extension)
+                    if let Some(Some(source)) = ext_sources.get(ext_name) {
+                        // Remote extension with source field
+                        required_extensions.insert(ExtensionDependency::Remote {
+                            name: ext_name.to_string(),
+                            source: source.clone(),
+                        });
+                    } else {
+                        // Local extension (defined in ext section without source, or not in ext section)
+                        required_extensions
+                            .insert(ExtensionDependency::Local(ext_name.to_string()));
+
+                        // Also check local extension dependencies
+                        self.find_local_extension_dependencies(
+                            config,
+                            parsed,
+                            ext_name,
+                            &mut required_extensions,
+                            &mut visited,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Check runtime dependencies for extensions (old packages format for backwards compatibility)
         if let Some(dependencies) = runtime_config.get("packages").and_then(|d| d.as_mapping()) {
             for (_dep_name, dep_spec) in dependencies {
                 // Check for extension dependency
