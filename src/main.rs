@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 
 mod commands;
 mod utils;
+
+use utils::config::Config;
 
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
@@ -711,6 +713,23 @@ enum RuntimeCommands {
     },
 }
 
+/// Validate that a runtime exists in the configuration if provided.
+/// This provides early validation with a helpful error message before command execution.
+fn validate_runtime_if_provided(config_path: &str, runtime: Option<&String>) -> Result<()> {
+    if let Some(runtime_name) = runtime {
+        Config::validate_runtime_exists(config_path, runtime_name)
+            .with_context(|| format!("Invalid runtime specified: '{runtime_name}'"))?;
+    }
+    Ok(())
+}
+
+/// Validate that a runtime exists in the configuration (for required runtime arguments).
+/// This provides early validation with a helpful error message before command execution.
+fn validate_runtime_required(config_path: &str, runtime: &str) -> Result<()> {
+    Config::validate_runtime_exists(config_path, runtime)
+        .with_context(|| format!("Invalid runtime specified: '{runtime}'"))
+}
+
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
 fn parse_env_vars(env_args: Option<&Vec<String>>) -> Option<HashMap<String, String>> {
     env_args.map(|args| {
@@ -800,6 +819,9 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            // Validate runtime exists if provided
+            validate_runtime_if_provided(&config, runtime.as_ref())?;
+
             let install_cmd = InstallCommand::new(
                 config,
                 verbose,
@@ -824,6 +846,9 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            // Validate runtime exists if provided
+            validate_runtime_if_provided(&config, runtime.as_ref())?;
+
             let build_cmd = BuildCommand::new(
                 config,
                 verbose,
@@ -848,6 +873,9 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            // Validate runtime exists if provided
+            validate_runtime_if_provided(&config, runtime.as_ref())?;
+
             let fetch_cmd = FetchCommand::new(
                 config,
                 verbose,
@@ -878,6 +906,9 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            // Validate runtime exists (required argument)
+            validate_runtime_required(&config, &runtime)?;
+
             let provision_cmd =
                 ProvisionCommand::new(crate::commands::provision::ProvisionConfig {
                     runtime,
@@ -907,6 +938,9 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            // Validate runtime exists (required argument)
+            validate_runtime_required(&config, &runtime)?;
+
             let deploy_cmd = RuntimeDeployCommand::new(
                 runtime,
                 config,
@@ -962,6 +996,9 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            // Validate runtime exists if provided
+            validate_runtime_if_provided(&config, runtime.as_ref())?;
+
             let sign_cmd = SignCommand::new(
                 config,
                 verbose,
@@ -990,6 +1027,9 @@ async fn main() -> Result<()> {
             runtime,
             sdk,
         } => {
+            // Validate runtime exists if provided
+            validate_runtime_if_provided(&config, runtime.as_ref())?;
+
             let unlock_cmd = UnlockCommand::new(
                 config,
                 verbose,
@@ -1011,6 +1051,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists if provided
+                validate_runtime_if_provided(&config, runtime.as_ref())?;
+
                 let install_cmd = RuntimeInstallCommand::new(
                     runtime,
                     config,
@@ -1034,6 +1077,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let build_cmd = RuntimeBuildCommand::new(
                     runtime,
                     config,
@@ -1060,6 +1106,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let mut provision_cmd = RuntimeProvisionCommand::new(
                     crate::commands::runtime::provision::RuntimeProvisionConfig {
                         runtime_name: runtime,
@@ -1092,6 +1141,9 @@ async fn main() -> Result<()> {
                 runtime,
                 target: _,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let deps_cmd = RuntimeDepsCommand::new(config, runtime);
                 deps_cmd.execute()?;
                 Ok(())
@@ -1105,6 +1157,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let dnf_cmd = RuntimeDnfCommand::new(
                     config,
                     runtime,
@@ -1126,6 +1181,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let clean_cmd = RuntimeCleanCommand::new(
                     runtime,
                     config,
@@ -1147,6 +1205,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let deploy_cmd = RuntimeDeployCommand::new(
                     runtime,
                     config,
@@ -1169,6 +1230,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                // Validate runtime exists (required argument)
+                validate_runtime_required(&config, &runtime)?;
+
                 let sign_cmd = RuntimeSignCommand::new(
                     runtime,
                     config,
@@ -1439,6 +1503,9 @@ async fn main() -> Result<()> {
                 dnf_args,
                 no_bootstrap,
             } => {
+                // Validate runtime exists if provided
+                validate_runtime_if_provided(&config, runtime.as_ref())?;
+
                 let cmd = if command.is_empty() {
                     None
                 } else {

@@ -1713,6 +1713,51 @@ impl Config {
         self.get_merged_section(&section_path, target, config_path)
     }
 
+    /// Get all runtime names defined in the configuration
+    ///
+    /// Returns a sorted list of runtime names from the `runtimes` section.
+    pub fn get_runtime_names(config_path: &str) -> Result<Vec<String>> {
+        let content = fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read config file: {config_path}"))?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {config_path}"))?;
+
+        let mut runtimes: Vec<String> = parsed
+            .get("runtimes")
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        runtimes.sort();
+        Ok(runtimes)
+    }
+
+    /// Validate that a runtime exists in the configuration
+    ///
+    /// Returns an error if the runtime does not exist, with a helpful message
+    /// listing available runtimes.
+    pub fn validate_runtime_exists(config_path: &str, runtime_name: &str) -> Result<()> {
+        let runtimes = Self::get_runtime_names(config_path)?;
+
+        if runtimes.contains(&runtime_name.to_string()) {
+            Ok(())
+        } else {
+            let available = if runtimes.is_empty() {
+                "No runtimes are defined in the configuration.".to_string()
+            } else {
+                format!("Available runtimes: {}", runtimes.join(", "))
+            };
+            Err(anyhow::anyhow!(
+                "Runtime '{}' not found in configuration. {}",
+                runtime_name,
+                available
+            ))
+        }
+    }
+
     /// Get merged provision configuration for a specific profile and target
     #[allow(dead_code)] // Future API for command integration
     pub fn get_merged_provision_config(
@@ -6962,5 +7007,111 @@ include:
             }
             _ => panic!("Expected Repo variant"),
         }
+    }
+
+    #[test]
+    fn test_get_runtime_names() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  production:
+    target: "aarch64"
+  development:
+    target: "x86_64"
+  staging:
+    target: "aarch64"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let runtimes = Config::get_runtime_names(temp_file.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(runtimes.len(), 3);
+        // Should be sorted alphabetically
+        assert_eq!(runtimes[0], "development");
+        assert_eq!(runtimes[1], "production");
+        assert_eq!(runtimes[2], "staging");
+    }
+
+    #[test]
+    fn test_get_runtime_names_empty() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let runtimes = Config::get_runtime_names(temp_file.path().to_str().unwrap()).unwrap();
+
+        assert!(runtimes.is_empty());
+    }
+
+    #[test]
+    fn test_validate_runtime_exists_success() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  production:
+    target: "aarch64"
+  development:
+    target: "x86_64"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        // Valid runtime should succeed
+        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "production");
+        assert!(result.is_ok());
+
+        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "development");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_runtime_exists_failure() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  production:
+    target: "aarch64"
+  development:
+    target: "x86_64"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        // Non-existent runtime should fail with helpful error message
+        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "nonexistent");
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("nonexistent"));
+        assert!(error_msg.contains("not found"));
+        assert!(error_msg.contains("development"));
+        assert!(error_msg.contains("production"));
+    }
+
+    #[test]
+    fn test_validate_runtime_exists_no_runtimes() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        // Should fail with message about no runtimes defined
+        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "any");
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("No runtimes are defined"));
     }
 }
