@@ -362,6 +362,8 @@ impl ExtImageCommand {
             OutputLevel::Normal,
         );
 
+        let source_date_epoch = config.source_date_epoch.unwrap_or(0);
+
         let result = self
             .create_image(
                 &container_helper,
@@ -372,6 +374,7 @@ impl ExtImageCommand {
                 repo_url.as_ref(),
                 repo_release.as_ref(),
                 &merged_container_args,
+                source_date_epoch,
             )
             .await?;
 
@@ -441,9 +444,10 @@ impl ExtImageCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
+        source_date_epoch: u64,
     ) -> Result<bool> {
         // Create the build script
-        let build_script = self.create_build_script(ext_version, extension_type);
+        let build_script = self.create_build_script(ext_version, extension_type, source_date_epoch);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -470,7 +474,12 @@ impl ExtImageCommand {
         Ok(result)
     }
 
-    fn create_build_script(&self, ext_version: &str, _extension_type: &str) -> String {
+    fn create_build_script(
+        &self,
+        ext_version: &str,
+        _extension_type: &str,
+        source_date_epoch: u64,
+    ) -> String {
         format!(
             r#"
 set -e
@@ -493,16 +502,22 @@ if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
     exit 1
 fi
 
+# Ensure reproducible timestamps
+export SOURCE_DATE_EPOCH={source_date_epoch}
+
 # Create squashfs image
 mksquashfs \
   "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
   "$OUTPUT_FILE" \
   -noappend \
-  -no-xattrs
+  -no-xattrs \
+  -reproducible
 
 echo "Created extension image: $OUTPUT_FILE"
 "#,
-            self.extension, ext_version
+            self.extension,
+            ext_version,
+            source_date_epoch = source_date_epoch
         )
     }
 
@@ -535,5 +550,96 @@ echo "Created extension image: $OUTPUT_FILE"
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cmd(extension: &str) -> ExtImageCommand {
+        ExtImageCommand::new(
+            extension.to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_create_build_script_contains_reproducible_flags() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0);
+
+        assert!(
+            script.contains("-reproducible"),
+            "script should include -reproducible flag"
+        );
+        assert!(
+            script.contains("-noappend"),
+            "script should include -noappend flag"
+        );
+        assert!(
+            script.contains("-no-xattrs"),
+            "script should include -no-xattrs flag"
+        );
+        assert!(
+            script.contains("mksquashfs"),
+            "script should invoke mksquashfs"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_source_date_epoch_default() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0);
+
+        assert!(
+            script.contains("export SOURCE_DATE_EPOCH=0"),
+            "script should set SOURCE_DATE_EPOCH=0 when default is used"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_source_date_epoch_custom() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 1700000000);
+
+        assert!(
+            script.contains("export SOURCE_DATE_EPOCH=1700000000"),
+            "script should set SOURCE_DATE_EPOCH to the custom value"
+        );
+        assert!(
+            !script.contains("SOURCE_DATE_EPOCH=0"),
+            "script should not contain the default value when a custom one is set"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_extension_name_and_version() {
+        let cmd = make_cmd("test-extension");
+        let script = cmd.create_build_script("2.3.4", "sysext", 0);
+
+        assert!(
+            script.contains("EXT_NAME=\"test-extension\""),
+            "script should contain the extension name"
+        );
+        assert!(
+            script.contains("EXT_VERSION=\"2.3.4\""),
+            "script should contain the extension version"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_output_path() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0);
+
+        assert!(
+            script.contains("OUTPUT_FILE=\"$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw\""),
+            "script should set the output file with .raw extension"
+        );
     }
 }

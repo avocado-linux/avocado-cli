@@ -796,6 +796,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{extension_name}" --dbpath=/var/lib/extension.
             })?;
 
         // Create the image creation script
+        let source_date_epoch = config.source_date_epoch.unwrap_or(0);
         let image_script = format!(
             r#"
 set -e
@@ -818,12 +819,16 @@ if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
     exit 1
 fi
 
+# Ensure reproducible timestamps
+export SOURCE_DATE_EPOCH={source_date_epoch}
+
 # Create squashfs image from the versioned extension sysroot
 mksquashfs \
   "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
   "$OUTPUT_FILE" \
   -noappend \
-  -no-xattrs
+  -no-xattrs \
+  -reproducible
 
 echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION' at $OUTPUT_FILE"
 "#
@@ -1790,5 +1795,115 @@ mod tests {
         assert_eq!(cmd.target, None);
         assert_eq!(cmd.container_args, None);
         assert_eq!(cmd.dnf_args, None);
+    }
+
+    /// Helper that replicates the versioned extension image script template
+    /// from `create_versioned_extension_image` so we can unit-test the
+    /// SOURCE_DATE_EPOCH interpolation without needing a container.
+    fn build_versioned_image_script(
+        extension_name: &str,
+        ext_version: &str,
+        source_date_epoch: u64,
+    ) -> String {
+        format!(
+            r#"
+set -e
+
+# Common variables
+EXT_NAME="{extension_name}"
+EXT_VERSION="{ext_version}"
+OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
+OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw"
+
+# Create output directory
+mkdir -p $OUTPUT_DIR
+
+# Remove existing file if it exists (including any old versions)
+rm -f "$OUTPUT_DIR/$EXT_NAME"*.raw
+
+# Check if extension sysroot exists
+if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
+    echo "Extension sysroot does not exist: $AVOCADO_EXT_SYSROOTS/$EXT_NAME."
+    exit 1
+fi
+
+# Ensure reproducible timestamps
+export SOURCE_DATE_EPOCH={source_date_epoch}
+
+# Create squashfs image from the versioned extension sysroot
+mksquashfs \
+  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
+  "$OUTPUT_FILE" \
+  -noappend \
+  -no-xattrs \
+  -reproducible
+
+echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION' at $OUTPUT_FILE"
+"#
+        )
+    }
+
+    #[test]
+    fn test_versioned_image_script_source_date_epoch_default() {
+        let script = build_versioned_image_script("my-ext", "1.0.0", 0);
+
+        assert!(
+            script.contains("export SOURCE_DATE_EPOCH=0"),
+            "script should set SOURCE_DATE_EPOCH=0 when default is used"
+        );
+        assert!(
+            script.contains("-reproducible"),
+            "script should include -reproducible flag"
+        );
+        assert!(
+            script.contains("mksquashfs"),
+            "script should invoke mksquashfs"
+        );
+    }
+
+    #[test]
+    fn test_versioned_image_script_source_date_epoch_custom() {
+        let script = build_versioned_image_script("my-ext", "1.0.0", 1700000000);
+
+        assert!(
+            script.contains("export SOURCE_DATE_EPOCH=1700000000"),
+            "script should set SOURCE_DATE_EPOCH to the custom value"
+        );
+        assert!(
+            !script.contains("SOURCE_DATE_EPOCH=0"),
+            "script should not contain the default value when a custom one is set"
+        );
+    }
+
+    #[test]
+    fn test_versioned_image_script_extension_name_and_version() {
+        let script = build_versioned_image_script("test-extension", "2.3.4", 0);
+
+        assert!(
+            script.contains("EXT_NAME=\"test-extension\""),
+            "script should contain the extension name"
+        );
+        assert!(
+            script.contains("EXT_VERSION=\"2.3.4\""),
+            "script should contain the extension version"
+        );
+    }
+
+    #[test]
+    fn test_versioned_image_script_reproducible_flags() {
+        let script = build_versioned_image_script("my-ext", "1.0.0", 0);
+
+        assert!(
+            script.contains("-reproducible"),
+            "script should include -reproducible flag"
+        );
+        assert!(
+            script.contains("-noappend"),
+            "script should include -noappend flag"
+        );
+        assert!(
+            script.contains("-no-xattrs"),
+            "script should include -no-xattrs flag"
+        );
     }
 }

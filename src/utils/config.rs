@@ -452,6 +452,7 @@ pub enum SupportedTargets {
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    pub source_date_epoch: Option<u64>,
     pub default_target: Option<String>,
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
@@ -693,6 +694,7 @@ impl Config {
         // First deserialize just to get src_dir and default_target
         let temp_config: Config =
             serde_yaml::from_value(main_config.clone()).unwrap_or_else(|_| Config {
+                source_date_epoch: None,
                 default_target: None,
                 supported_targets: None,
                 src_dir: None,
@@ -1751,9 +1753,7 @@ impl Config {
                 format!("Available runtimes: {}", runtimes.join(", "))
             };
             Err(anyhow::anyhow!(
-                "Runtime '{}' not found in configuration. {}",
-                runtime_name,
-                available
+                "Runtime '{runtime_name}' not found in configuration. {available}"
             ))
         }
     }
@@ -7065,10 +7065,12 @@ runtimes:
         write!(temp_file, "{config_content}").unwrap();
 
         // Valid runtime should succeed
-        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "production");
+        let result =
+            Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "production");
         assert!(result.is_ok());
 
-        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "development");
+        let result =
+            Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "development");
         assert!(result.is_ok());
     }
 
@@ -7088,7 +7090,8 @@ runtimes:
         write!(temp_file, "{config_content}").unwrap();
 
         // Non-existent runtime should fail with helpful error message
-        let result = Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "nonexistent");
+        let result =
+            Config::validate_runtime_exists(temp_file.path().to_str().unwrap(), "nonexistent");
         assert!(result.is_err());
 
         let error_msg = result.unwrap_err().to_string();
@@ -7113,5 +7116,53 @@ sdk:
 
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("No runtimes are defined"));
+    }
+
+    #[test]
+    fn test_source_date_epoch_set() {
+        let config_content = r#"
+source_date_epoch: 1700000000
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        assert_eq!(config.source_date_epoch, Some(1700000000));
+    }
+
+    #[test]
+    fn test_source_date_epoch_zero() {
+        let config_content = r#"
+source_date_epoch: 0
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        assert_eq!(config.source_date_epoch, Some(0));
+    }
+
+    #[test]
+    fn test_source_date_epoch_unset_defaults_to_none() {
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        assert_eq!(config.source_date_epoch, None);
+        // When consumed, unwrap_or(0) should yield 0
+        assert_eq!(config.source_date_epoch.unwrap_or(0), 0);
     }
 }

@@ -247,7 +247,7 @@ impl InitCommand {
         let prefix = if path.is_empty() {
             String::new()
         } else {
-            format!("{}/", path)
+            format!("{path}/")
         };
 
         for entry in tree.tree {

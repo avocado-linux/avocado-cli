@@ -105,7 +105,7 @@ impl RuntimeInstallCommand {
             None => {
                 if let Some(runtime) = &self.runtime {
                     print_error(
-                        &format!("Runtime '{}' not found in configuration.", runtime),
+                        &format!("Runtime '{runtime}' not found in configuration."),
                         OutputLevel::Normal,
                     );
                     return Ok(());
