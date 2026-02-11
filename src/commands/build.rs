@@ -1662,7 +1662,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             .and_then(|ext| ext.get(ext_name))
         {
             // Check if this local extension has dependencies
-            if let Some(dependencies) = ext_config.get("packages").and_then(|d| d.as_mapping()) {
+            let packages_value = ext_config.get("packages");
+            if let Some(dependencies) = packages_value.and_then(|d| d.as_mapping()) {
                 for (_dep_name, dep_spec) in dependencies {
                     // Check for extension dependency
                     if let Some(nested_ext_name) =
@@ -1701,6 +1702,24 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                             )?;
                         }
                     }
+                }
+            } else if let Some(deps_value) = packages_value {
+                // packages field exists but is not a YAML mapping — detect common syntax mistakes
+                if !deps_value.is_null() {
+                    let value_str = serde_yaml::to_string(deps_value)
+                        .unwrap_or_else(|_| format!("{deps_value:?}"));
+                    let hint = if value_str.contains('=') {
+                        "\n\nIt looks like '=' was used instead of ':'. YAML uses ':' for key-value pairs.\n\
+                         Example:\n  packages:\n    curl: \"*\"\n    iperf3: \"*\""
+                    } else {
+                        "\n\nExpected a YAML mapping (key: value pairs).\n\
+                         Example:\n  packages:\n    curl: \"*\"\n    iperf3: \"*\""
+                    };
+                    return Err(anyhow::anyhow!(
+                        "Invalid 'packages' format in extension '{ext_name}': \
+                         expected a mapping but got: {}{hint}",
+                        value_str.trim()
+                    ));
                 }
             }
         }

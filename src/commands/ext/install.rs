@@ -697,6 +697,24 @@ $DNF_SDK_HOST \
                     OutputLevel::Normal,
                 );
             }
+        } else if let Some(deps_value) = dependencies {
+            // packages field exists but is not a YAML mapping — detect common syntax mistakes
+            if !deps_value.is_null() {
+                let value_str =
+                    serde_yaml::to_string(deps_value).unwrap_or_else(|_| format!("{deps_value:?}"));
+                let hint = if value_str.contains('=') {
+                    "\n\nIt looks like '=' was used instead of ':'. YAML uses ':' for key-value pairs.\n\
+                     Example:\n  packages:\n    curl: \"*\"\n    iperf3: \"*\""
+                } else {
+                    "\n\nExpected a YAML mapping (key: value pairs).\n\
+                     Example:\n  packages:\n    curl: \"*\"\n    iperf3: \"*\""
+                };
+                return Err(anyhow::anyhow!(
+                    "Invalid 'packages' format in extension '{extension}': \
+                     expected a mapping but got: {}{hint}",
+                    value_str.trim()
+                ));
+            }
         } else if self.verbose {
             print_debug(
                 &format!("No dependencies defined for extension '{extension}'."),

@@ -150,30 +150,11 @@ impl InitCommand {
     /// # Returns
     /// * The configuration template content as a string
     fn load_config_template(target: &str) -> String {
-        // Try to load YAML config first, fall back to default with target substitution
-        let yaml_content = match target {
-            "reterminal" => Some(include_str!("../../configs/seeed/reterminal.yaml")),
-            "reterminal-dm" => Some(include_str!("../../configs/seeed/reterminal-dm.yaml")),
-            "jetson-orin-nano-devkit" => Some(include_str!(
-                "../../configs/nvidia/jetson-orin-nano-devkit.yaml"
-            )),
-            "raspberrypi4" => Some(include_str!(
-                "../../configs/raspberry-pi/raspberrypi-4-model-b.yaml"
-            )),
-            "raspberrypi5" => Some(include_str!(
-                "../../configs/raspberry-pi/raspberrypi-5.yaml"
-            )),
-            "icam-540" => Some(include_str!("../../configs/advantech/icam-540.yaml")),
-            _ => None,
-        };
-
-        if let Some(content) = yaml_content {
-            content.to_string()
-        } else {
-            // Use default YAML template and substitute the target
-            let default_template = include_str!("../../configs/default.yaml");
-            default_template.replace("{target}", target)
-        }
+        // All targets start from the default config template.
+        // To add target-specific config additions in the future, create a YAML file at
+        // configs/additions/<target>.yaml and add an include_str! match arm here.
+        let default_template = include_str!("../../configs/default.yaml");
+        default_template.replace("{target}", target)
     }
 
     /// Checks if a reference exists in the repository.
@@ -1052,9 +1033,7 @@ mod tests {
         assert!(content.contains("runtimes:"));
         assert!(content.contains("dev:"));
         assert!(content.contains("packages:"));
-        assert!(content.contains("avocado-img-bootfiles:"));
-        assert!(content.contains("avocado-img-rootfs:"));
-        assert!(content.contains("avocado-img-initramfs:"));
+        assert!(content.contains("avocado-runtime:"));
         assert!(content.contains("avocado-ext-dev:"));
         assert!(content.contains("type: package"));
         assert!(
@@ -1220,45 +1199,18 @@ mod tests {
         let default_template =
             include_str!("../../configs/default.yaml").replace("{target}", "test-target");
         validate_ext_versions(&default_template, "default.yaml");
-
-        // Test reterminal
-        let reterminal = include_str!("../../configs/seeed/reterminal.yaml");
-        validate_ext_versions(reterminal, "reterminal.yaml");
-
-        // Test reterminal-dm
-        let reterminal_dm = include_str!("../../configs/seeed/reterminal-dm.yaml");
-        validate_ext_versions(reterminal_dm, "reterminal-dm.yaml");
-
-        // Test jetson-orin-nano-devkit
-        let jetson = include_str!("../../configs/nvidia/jetson-orin-nano-devkit.yaml");
-        validate_ext_versions(jetson, "jetson-orin-nano-devkit.yaml");
-
-        // Test raspberrypi4
-        let rpi4 = include_str!("../../configs/raspberry-pi/raspberrypi-4-model-b.yaml");
-        validate_ext_versions(rpi4, "raspberrypi-4-model-b.yaml");
-
-        // Test raspberrypi5
-        let rpi5 = include_str!("../../configs/raspberry-pi/raspberrypi-5.yaml");
-        validate_ext_versions(rpi5, "raspberrypi-5.yaml");
-
-        // Test icam-540
-        let icam = include_str!("../../configs/advantech/icam-540.yaml");
-        validate_ext_versions(icam, "icam-540.yaml");
     }
 
     #[tokio::test]
     async fn test_generated_configs_have_ext_versions() {
-        // Test that configs generated for all supported targets have versions
+        // Test that configs generated for various targets have versions.
+        // All targets use the default template with target substitution.
         let targets = vec![
             "qemux86-64",
             "qemuarm64",
-            "reterminal",
-            "reterminal-dm",
-            "jetson-orin-nano-devkit",
             "raspberrypi4",
-            "raspberrypi5",
-            "icam-540",
-            "custom-target", // This uses the default template
+            "jetson-orin-nano-devkit",
+            "custom-target",
         ];
 
         for target in targets {

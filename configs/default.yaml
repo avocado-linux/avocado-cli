@@ -25,9 +25,7 @@ runtimes:
       - config
       - app
     packages:
-      avocado-img-bootfiles: "*"
-      avocado-img-rootfs: "*"
-      avocado-img-initramfs: "*"
+      avocado-runtime: "{{ avocado.distro.version }}"
 
 ##
 ## Extensions
@@ -57,14 +55,14 @@ extensions:
       - confext
     version: "0.1.0"
 
-  # Install application dependencies
-    # packages:
-#curl = "*"
-#iperf3 = "*"
+    # Install additional application dependencies
+    #packages:
+      #curl: "*"
+      #iperf3: "*"
 
-# Generated default config extension
-# Use or modify this to configure "real" user accounts (passwd, shadow, group)
-# or configure other system services
+  # Generated default config extension
+  # Use or modify this to configure "real" user accounts (passwd, shadow, group)
+  # or configure other system services
   config:
     types:
       - confext
@@ -82,34 +80,11 @@ extensions:
 sdk:
   image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
 
+  container_args:
+    - --privileged
+    - --network=host
+    - -v /dev:/dev
+    - -v /sys:/sys
+
   packages:
     avocado-sdk-toolchain: "{{ config.distro.version }}"
-
-  {target}:
-    container_args:
-      - --network=host
-
-##
-## Provisioning
-##
-
-# When provisioning using usb or sd provisioning profiles, set extra sdk
-# container arguments to allow access to these devices
-
-provision_profiles:
-  usb:
-    container_args:
-      - -v
-      - /dev:/dev
-      - -v
-      - /sys:/sys:ro
-      - --privileged
-
-  sd:
-    container_args:
-      - -v
-      - /dev:/dev
-      - -v
-      - /sys:/sys:ro
-      - --privileged
-
