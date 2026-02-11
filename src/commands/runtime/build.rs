@@ -1,3 +1,4 @@
+use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
@@ -231,6 +232,99 @@ impl RuntimeBuildCommand {
             OutputLevel::Normal,
         );
 
+        // Check for kernel configuration in the merged runtime config
+        let merged_runtime =
+            config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?;
+        let kernel_config = merged_runtime
+            .as_ref()
+            .and_then(|v| Config::get_kernel_config_from_runtime(v).ok().flatten());
+
+        // Handle kernel cross-compilation if kernel.compile is configured
+        if let Some(ref kc) = kernel_config {
+            if let (Some(ref compile_section), Some(ref install_script)) =
+                (&kc.compile, &kc.install)
+            {
+                print_info(
+                    &format!(
+                        "Compiling kernel via sdk.compile.{compile_section} for runtime '{}'",
+                        self.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+
+                // Step 1: Run the SDK compile section
+                let compile_command = SdkCompileCommand::new(
+                    self.config_path.clone(),
+                    self.verbose,
+                    vec![compile_section.clone()],
+                    Some(target_arch.to_string()),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_sdk_arch(self.sdk_arch.clone());
+
+                compile_command.execute().await.with_context(|| {
+                    format!(
+                        "Failed to compile kernel SDK section '{compile_section}' for runtime '{}'",
+                        self.runtime_name
+                    )
+                })?;
+
+                // Step 2: Run the kernel install script in the SDK container
+                // The install script copies kernel artifacts to $AVOCADO_RUNTIME_BUILD_DIR
+                let runtime_build_dir = format!(
+                    "/opt/_avocado/{}/runtimes/{}",
+                    target_arch, self.runtime_name
+                );
+                let install_cmd = format!(
+                    r#"mkdir -p "{runtime_build_dir}" && if [ -f '{install_script}' ]; then echo 'Running kernel install script: {install_script}'; export AVOCADO_RUNTIME_BUILD_DIR="{runtime_build_dir}"; bash '{install_script}'; else echo 'Kernel install script {install_script} not found.'; ls -la; exit 1; fi"#
+                );
+
+                if self.verbose {
+                    print_info(
+                        &format!("Running kernel install script: {install_script}"),
+                        OutputLevel::Normal,
+                    );
+                }
+
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target_arch.to_string(),
+                    command: install_cmd,
+                    verbose: self.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    ..Default::default()
+                };
+
+                let install_result =
+                    run_container_command(container_helper, run_config, runs_on_context)
+                        .await
+                        .context("Failed to run kernel install script")?;
+
+                if !install_result {
+                    return Err(anyhow::anyhow!(
+                        "Kernel install script '{}' failed for runtime '{}'",
+                        install_script,
+                        self.runtime_name
+                    ));
+                }
+
+                print_success(
+                    &format!(
+                        "Kernel compiled and installed for runtime '{}'",
+                        self.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
         // Collect extensions with versions for AVOCADO_EXT_LIST
         // This ensures the build scripts know exactly which extension versions to use
         let resolved_extensions = self
@@ -301,6 +395,16 @@ impl RuntimeBuildCommand {
         // Set AVOCADO_DISTRO_VERSION if configured
         if let Some(distro_version) = config.get_distro_version() {
             env_vars.insert("AVOCADO_DISTRO_VERSION".to_string(), distro_version.clone());
+        }
+
+        // Set kernel-related environment variables for the avocado-build hook
+        if let Some(ref kc) = kernel_config {
+            if kc.compile.is_some() {
+                env_vars.insert("AVOCADO_KERNEL_SOURCE".to_string(), "compile".to_string());
+            } else if let Some(ref package) = kc.package {
+                env_vars.insert("AVOCADO_KERNEL_SOURCE".to_string(), "package".to_string());
+                env_vars.insert("AVOCADO_KERNEL_PACKAGE".to_string(), package.clone());
+            }
         }
 
         let env_vars = if env_vars.is_empty() {
@@ -1071,5 +1175,91 @@ extensions:
         // Should NOT include symlinks to systemd directories (runtime will handle this)
         assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $SYSEXT"));
         assert!(!script.contains("ln -sf /var/lib/avocado/extensions/test-ext-1.0.0.raw $CONFEXT"));
+    }
+
+    #[test]
+    fn test_kernel_config_parsed_from_runtime() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    kernel:
+      package: kernel-image
+      version: "*"
+    packages:
+      avocado-img-rootfs: "*"
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let runtime_val = parsed
+            .get("runtimes")
+            .and_then(|r| r.get("test-runtime"))
+            .unwrap();
+
+        let kernel_config =
+            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
+        assert!(kernel_config.is_some());
+        let kc = kernel_config.unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("*"));
+        assert!(kc.compile.is_none());
+    }
+
+    #[test]
+    fn test_kernel_config_compile_mode_from_runtime() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+  compile:
+    kernel-build:
+      compile: kernel-compile.sh
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    kernel:
+      compile: kernel-build
+      install: kernel-install.sh
+    packages:
+      avocado-img-rootfs: "*"
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let runtime_val = parsed
+            .get("runtimes")
+            .and_then(|r| r.get("test-runtime"))
+            .unwrap();
+
+        let kernel_config =
+            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
+        assert!(kernel_config.is_some());
+        let kc = kernel_config.unwrap();
+        assert!(kc.package.is_none());
+        assert_eq!(kc.compile.as_deref(), Some("kernel-build"));
+        assert_eq!(kc.install.as_deref(), Some("kernel-install.sh"));
+    }
+
+    #[test]
+    fn test_kernel_config_absent_from_runtime() {
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    packages:
+      avocado-img-rootfs: "*"
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let runtime_val = parsed
+            .get("runtimes")
+            .and_then(|r| r.get("test-runtime"))
+            .unwrap();
+
+        let kernel_config =
+            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
+        assert!(kernel_config.is_none());
     }
 }

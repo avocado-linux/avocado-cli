@@ -445,6 +445,31 @@ impl RuntimeInstallCommand {
                 package_names.push(package_name.to_string());
             }
 
+            // Add kernel package if specified in the runtime kernel config
+            if let Some(ref merged_val) = merged_runtime {
+                if let Ok(Some(kernel_config)) = Config::get_kernel_config_from_runtime(merged_val)
+                {
+                    if let Some(ref kernel_package) = kernel_config.package {
+                        let kernel_version = kernel_config.version.as_deref().unwrap_or("*");
+                        let package_spec = build_package_spec_with_lock(
+                            lock_file,
+                            &target_arch,
+                            &sysroot,
+                            kernel_package,
+                            kernel_version,
+                        );
+                        print_info(
+                            &format!(
+                                "Adding kernel package '{kernel_package}' (version: {kernel_version}) for runtime '{runtime}'"
+                            ),
+                            OutputLevel::Normal,
+                        );
+                        packages.push(package_spec);
+                        package_names.push(kernel_package.to_string());
+                    }
+                }
+            }
+
             if !packages.is_empty() {
                 print_info(
                     &format!(

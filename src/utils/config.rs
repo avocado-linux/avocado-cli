@@ -336,6 +336,8 @@ pub enum ConfigError {
     #[error("Failed to parse configuration: {0}")]
     #[allow(dead_code)]
     ParseError(String),
+    #[error("Validation error: {0}")]
+    ValidationError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }
@@ -354,6 +356,47 @@ fn default_checksum_algorithm() -> String {
     "sha256".to_string()
 }
 
+/// Kernel configuration for a runtime.
+///
+/// Two mutually exclusive modes:
+/// - `package` (+`version`): kernel installed from an RPM package during `runtime install`
+/// - `compile` (+`install`): kernel cross-compiled via `sdk.compile.<section>` during `runtime build`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KernelConfig {
+    /// Package name for kernel (e.g., "kernel-image"). Mutually exclusive with `compile`.
+    pub package: Option<String>,
+    /// Package version spec (e.g., "*"). Only used with `package`.
+    pub version: Option<String>,
+    /// SDK compile section name (references `sdk.compile.<section>`). Mutually exclusive with `package`.
+    pub compile: Option<String>,
+    /// Install script path (copies kernel artifacts to runtime build dir). Required when `compile` is set.
+    pub install: Option<String>,
+}
+
+impl KernelConfig {
+    /// Validate that the kernel config is well-formed:
+    /// - `package` and `compile` are mutually exclusive
+    /// - `compile` requires `install`
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.package.is_some() && self.compile.is_some() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: 'package' and 'compile' are mutually exclusive".to_string(),
+            ));
+        }
+        if self.compile.is_some() && self.install.is_none() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: 'compile' requires 'install' to be set".to_string(),
+            ));
+        }
+        if self.package.is_none() && self.compile.is_none() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: either 'package' or 'compile' must be set".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Runtime configuration section
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -363,6 +406,9 @@ pub struct RuntimeConfig {
     pub stone_manifest: Option<String>,
     /// Signing configuration for this runtime
     pub signing: Option<SigningConfig>,
+    /// Optional kernel configuration. When omitted, the avocado-runtime meta-package
+    /// handles kernel provisioning via avocado-img-bootfiles (legacy behavior).
+    pub kernel: Option<KernelConfig>,
 }
 
 /// SDK configuration section
@@ -1713,6 +1759,26 @@ impl Config {
     ) -> Result<Option<serde_yaml::Value>> {
         let section_path = format!("runtimes.{runtime_name}");
         self.get_merged_section(&section_path, target, config_path)
+    }
+
+    /// Extract and validate the kernel configuration from a merged runtime config value.
+    ///
+    /// Returns `None` if no kernel section is present (legacy behavior applies).
+    /// Returns an error if the kernel section is present but invalid.
+    pub fn get_kernel_config_from_runtime(
+        merged_runtime: &serde_yaml::Value,
+    ) -> Result<Option<KernelConfig>> {
+        match merged_runtime.get("kernel") {
+            Some(kernel_val) if !kernel_val.is_null() => {
+                let kernel_config: KernelConfig = serde_yaml::from_value(kernel_val.clone())
+                    .context("Failed to parse kernel configuration")?;
+                kernel_config
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(Some(kernel_config))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Get all runtime names defined in the configuration
@@ -7164,5 +7230,166 @@ sdk:
         assert_eq!(config.source_date_epoch, None);
         // When consumed, unwrap_or(0) should yield 0
         assert_eq!(config.source_date_epoch.unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn test_kernel_config_validate_package_mode() {
+        let kc = KernelConfig {
+            package: Some("kernel-image".to_string()),
+            version: Some("*".to_string()),
+            compile: None,
+            install: None,
+        };
+        assert!(kc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_kernel_config_validate_compile_mode() {
+        let kc = KernelConfig {
+            package: None,
+            version: None,
+            compile: Some("kernel-build".to_string()),
+            install: Some("kernel-install.sh".to_string()),
+        };
+        assert!(kc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_kernel_config_validate_mutually_exclusive() {
+        let kc = KernelConfig {
+            package: Some("kernel-image".to_string()),
+            version: Some("*".to_string()),
+            compile: Some("kernel-build".to_string()),
+            install: Some("kernel-install.sh".to_string()),
+        };
+        assert!(kc.validate().is_err());
+    }
+
+    #[test]
+    fn test_kernel_config_validate_compile_requires_install() {
+        let kc = KernelConfig {
+            package: None,
+            version: None,
+            compile: Some("kernel-build".to_string()),
+            install: None,
+        };
+        let err = kc.validate().unwrap_err();
+        assert!(err.to_string().contains("'compile' requires 'install'"));
+    }
+
+    #[test]
+    fn test_kernel_config_validate_neither_set() {
+        let kc = KernelConfig {
+            package: None,
+            version: None,
+            compile: None,
+            install: None,
+        };
+        let err = kc.validate().unwrap_err();
+        assert!(err.to_string().contains("either 'package' or 'compile'"));
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_package() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kernel:
+  package: kernel-image
+  version: "*"
+packages:
+  avocado-img-rootfs: "*"
+"#,
+        )
+        .unwrap();
+
+        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        assert!(result.is_some());
+        let kc = result.unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("*"));
+        assert!(kc.compile.is_none());
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_compile() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kernel:
+  compile: kernel-build
+  install: kernel-install.sh
+"#,
+        )
+        .unwrap();
+
+        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        assert!(result.is_some());
+        let kc = result.unwrap();
+        assert!(kc.package.is_none());
+        assert_eq!(kc.compile.as_deref(), Some("kernel-build"));
+        assert_eq!(kc.install.as_deref(), Some("kernel-install.sh"));
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_absent() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-img-rootfs: "*"
+"#,
+        )
+        .unwrap();
+
+        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_kernel_config_deserialization_in_runtime() {
+        let config_content = r#"
+runtimes:
+  dev:
+    target: qemux86-64
+    kernel:
+      package: kernel-image
+      version: "*"
+    packages:
+      avocado-img-rootfs: "*"
+
+sdk:
+  image: docker.io/avocadolinux/sdk:apollo-edge
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let runtimes = config.runtimes.unwrap();
+        let dev = runtimes.get("dev").unwrap();
+        assert!(dev.kernel.is_some());
+        let kc = dev.kernel.as_ref().unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn test_kernel_config_absent_in_runtime_deserialization() {
+        let config_content = r#"
+runtimes:
+  dev:
+    target: qemux86-64
+    packages:
+      avocado-img-rootfs: "*"
+
+sdk:
+  image: docker.io/avocadolinux/sdk:apollo-edge
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let runtimes = config.runtimes.unwrap();
+        let dev = runtimes.get("dev").unwrap();
+        assert!(dev.kernel.is_none());
     }
 }

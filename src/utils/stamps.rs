@@ -735,7 +735,7 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
 }
 
 /// Compute input hash for runtime install
-/// Includes: runtime.<name>.dependencies (merged with target)
+/// Includes: runtime.<name>.dependencies (merged with target), kernel config
 pub fn compute_runtime_input_hash(
     merged_runtime: &serde_yaml::Value,
     runtime_name: &str,
@@ -755,6 +755,14 @@ pub fn compute_runtime_input_hash(
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.target")),
             target.clone(),
+        );
+    }
+
+    // Include kernel config if specified (changes to kernel config should trigger rebuild)
+    if let Some(kernel) = merged_runtime.get("kernel") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
+            kernel.clone(),
         );
     }
 
@@ -2177,5 +2185,66 @@ runtime/my-runtime/build.stamp:::null"#,
             msg.contains("avocado sdk install --runs-on user@remote"),
             "Expected --runs-on suggestion in: {msg}"
         );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_includes_kernel() {
+        let without_kernel: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-img-rootfs: "*"
+target: "x86_64"
+"#,
+        )
+        .unwrap();
+
+        let with_kernel: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-img-rootfs: "*"
+target: "x86_64"
+kernel:
+  package: kernel-image
+  version: "*"
+"#,
+        )
+        .unwrap();
+
+        let hash_without = compute_runtime_input_hash(&without_kernel, "dev").unwrap();
+        let hash_with = compute_runtime_input_hash(&with_kernel, "dev").unwrap();
+
+        // Hashes should differ when kernel config is added
+        assert_ne!(hash_without.config_hash, hash_with.config_hash);
+    }
+
+    #[test]
+    fn test_runtime_input_hash_kernel_change_triggers_rebuild() {
+        let kernel_package: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-img-rootfs: "*"
+kernel:
+  package: kernel-image
+  version: "*"
+"#,
+        )
+        .unwrap();
+
+        let kernel_compile: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-img-rootfs: "*"
+kernel:
+  compile: kernel-build
+  install: kernel-install.sh
+"#,
+        )
+        .unwrap();
+
+        let hash_package = compute_runtime_input_hash(&kernel_package, "dev").unwrap();
+        let hash_compile = compute_runtime_input_hash(&kernel_compile, "dev").unwrap();
+
+        // Switching kernel mode should produce a different hash
+        assert_ne!(hash_package.config_hash, hash_compile.config_hash);
     }
 }
