@@ -127,9 +127,7 @@ fn compute_key_id(public_key: &PublicKey) -> String {
 /// Produce the canonical JSON for an ed25519 public key (sorted keys, no whitespace).
 fn canonical_key_json(public_key: &PublicKey) -> String {
     let public_hex = hex_encode(public_key.as_ref());
-    format!(
-        r#"{{"keytype":"ed25519","keyval":{{"public":"{public_hex}"}},"scheme":"ed25519"}}"#
-    )
+    format!(r#"{{"keytype":"ed25519","keyval":{{"public":"{public_hex}"}},"scheme":"ed25519"}}"#)
 }
 
 /// Generate the TUF root.json content as a JSON string.
@@ -332,7 +330,9 @@ mod tests {
             tough::schema::RoleType::Snapshot,
             tough::schema::RoleType::Timestamp,
         ] {
-            let role_keys = root.roles.get(role_type)
+            let role_keys = root
+                .roles
+                .get(role_type)
                 .unwrap_or_else(|| panic!("Missing role: {role_type:?}"));
             assert_eq!(role_keys.threshold.get(), 1);
             assert_eq!(role_keys.keyids.len(), 1);
