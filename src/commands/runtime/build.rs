@@ -656,6 +656,102 @@ fi"#
             symlink_commands.join("\n")
         };
 
+        // Generate the runtime manifest JSON statically in Rust
+        let build_id = uuid::Uuid::new_v4().to_string();
+        let built_at =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let distro_version = config
+            .get_distro_version()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let ext_json_entries: Vec<String> = resolved_extensions
+            .iter()
+            .map(|versioned_name| {
+                // Parse "ext-name-1.0.0" into (name, version)
+                let (name, version) =
+                    if let Some(idx) = versioned_name.rfind('-') {
+                        let (n, v_with_dash) = versioned_name.split_at(idx);
+                        let v = &v_with_dash[1..];
+                        if v.chars()
+                            .next()
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(false)
+                        {
+                            (n.to_string(), v.to_string())
+                        } else {
+                            (versioned_name.clone(), "0.0.0".to_string())
+                        }
+                    } else {
+                        (versioned_name.clone(), "0.0.0".to_string())
+                    };
+                format!(
+                    r#"    {{
+      "name": "{name}",
+      "version": "{version}",
+      "filename": "{versioned_name}.raw"
+    }}"#
+                )
+            })
+            .collect();
+        let extensions_json = ext_json_entries.join(",\n");
+
+        let manifest_json = format!(
+            r#"{{
+  "manifest_version": 1,
+  "id": "{build_id}",
+  "built_at": "{built_at}",
+  "runtime": {{
+    "name": "{}",
+    "version": "{distro_version}"
+  }},
+  "extensions": [
+{extensions_json}
+  ]
+}}"#,
+            self.runtime_name
+        );
+
+        let manifest_section = format!(
+            r#"
+# Generate Avocado Runtime Manifest
+MANIFEST_DIR="$VAR_DIR/lib/avocado/runtimes/{build_id}"
+mkdir -p "$MANIFEST_DIR"
+
+cat > "$MANIFEST_DIR/manifest.json" <<'MANIFEST_EOF'
+{manifest_json}
+MANIFEST_EOF
+
+ln -sfn "runtimes/{build_id}" "$VAR_DIR/lib/avocado/active"
+echo "Created runtime manifest: runtimes/{build_id}/manifest.json"
+echo "Set active runtime -> runtimes/{build_id}""#
+        );
+
+        // Generate update authority (root.json) for verified updates
+        let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
+        let project_dir = std::path::Path::new(&self.config_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let (sk, pk) = crate::utils::update_signing::resolve_signing_key(
+            signing_key_name.as_deref(),
+            project_dir,
+        )?;
+        let root_json_content = crate::utils::update_signing::generate_root_json(&sk, &pk)?;
+
+        let update_authority_section = format!(
+            r#"
+# Provision update authority (trust anchor for verified updates)
+mkdir -p "$VAR_DIR/lib/avocado/metadata"
+
+cat > "$VAR_DIR/lib/avocado/metadata/root.json" <<'ROOT_EOF'
+{root_json_content}
+ROOT_EOF
+
+cp "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1.root.json"
+echo "Provisioned update authority: metadata/root.json""#
+        );
+
         let script = format!(
             r#"
 # Set common variables
@@ -679,6 +775,7 @@ fi
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
 mkdir -p "$VAR_DIR/lib/avocado/os-releases/$VERSION_ID"
+mkdir -p "$VAR_DIR/lib/avocado/runtimes"
 
 OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
@@ -707,21 +804,25 @@ for ext in "$VAR_DIR/lib/avocado/extensions/"*.raw; do
         echo "Created symlink: os-releases/$VERSION_ID/$ext_filename -> extensions/$ext_filename"
     fi
 done
+{}
+{}
 
 # Potential future SDK target hook.
 # echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
 # avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME
 
-# Create btrfs image with extensions and os-releases subvolumes
+# Create btrfs image with extensions, os-releases, runtimes, and metadata subvolumes
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado/extensions \
     --subvol rw:lib/avocado/os-releases \
+    --subvol rw:lib/avocado/runtimes \
+    --subvol rw:lib/avocado/metadata \
     -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
 avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
-            self.runtime_name, target_arch, copy_section, symlink_section
+            self.runtime_name, target_arch, copy_section, symlink_section, manifest_section, update_authority_section
         );
 
         Ok(script)
@@ -1261,5 +1362,130 @@ runtimes:
         let kernel_config =
             crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
         assert!(kernel_config.is_none());
+    }
+
+    #[test]
+    fn test_create_build_script_generates_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+distro:
+  version: "0.1.0"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - test-ext
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .unwrap();
+
+        // Manifest should be written
+        assert!(script.contains("manifest.json"));
+        assert!(script.contains("\"manifest_version\": 1"));
+        assert!(script.contains("\"name\": \"test-runtime\""));
+        assert!(script.contains("\"version\": \"0.1.0\""));
+        assert!(script.contains("\"name\": \"test-ext\""));
+        assert!(script.contains("\"filename\": \"test-ext-1.0.0.raw\""));
+
+        // Active symlink should be created
+        assert!(script.contains("ln -sfn \"runtimes/"));
+        assert!(script.contains("$VAR_DIR/lib/avocado/active"));
+
+        // Runtimes subvolume should be included in btrfs
+        assert!(script.contains("--subvol rw:lib/avocado/runtimes"));
+    }
+
+    #[test]
+    fn test_create_build_script_manifest_no_extensions() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+distro:
+  version: "2.0.0"
+
+runtimes:
+  empty-runtime:
+    target: "x86_64"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "empty-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let resolved_extensions: Vec<String> = vec![];
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .unwrap();
+
+        assert!(script.contains("\"name\": \"empty-runtime\""));
+        assert!(script.contains("\"version\": \"2.0.0\""));
+        assert!(script.contains("\"extensions\": ["));
+        assert!(script.contains("ln -sfn \"runtimes/"));
+    }
+
+    #[test]
+    fn test_create_build_script_manifest_has_uuid() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  dev:
+    target: "x86_64"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &[])
+            .unwrap();
+
+        // The manifest should contain an "id" field with a UUID-like value (contains hyphens)
+        assert!(script.contains("\"id\": \""));
+        // The manifest should contain a "built_at" timestamp
+        assert!(script.contains("\"built_at\": \""));
     }
 }

@@ -777,7 +777,7 @@ impl Config {
         // Get src_dir for loading volume state
         let config_path_str = config_path.to_string_lossy();
         let src_dir = temp_config
-            .get_resolved_src_dir(config_path_str.as_ref())
+            .get_resolved_src_dir::<&str>(config_path_str.as_ref())
             .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
         // Try to load volume state for container-based config reading
