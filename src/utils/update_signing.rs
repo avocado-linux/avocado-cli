@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(root.roles.len(), 4);
 
         // Verify key type
-        for (_, key) in &root.keys {
+        for key in root.keys.values() {
             assert!(matches!(key, tough::schema::key::Key::Ed25519 { .. }));
         }
 

@@ -358,9 +358,15 @@ RUNTIME_NAME="{runtime_name}"
 VAR_STAGING="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"
 IMAGES_DIR="$VAR_STAGING/lib/avocado/images"
 
-# Find the active manifest
-MANIFEST_FILE=$(find "$VAR_STAGING/lib/avocado/runtimes" -name manifest.json -type f 2>/dev/null | head -n 1)
-if [ -z "$MANIFEST_FILE" ]; then
+# Find the active manifest (prefer active symlink over find)
+ACTIVE_LINK="$VAR_STAGING/lib/avocado/active"
+if [ -L "$ACTIVE_LINK" ]; then
+    MANIFEST_FILE="$VAR_STAGING/lib/avocado/$(readlink "$ACTIVE_LINK")/manifest.json"
+fi
+if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
+    MANIFEST_FILE=$(find "$VAR_STAGING/lib/avocado/runtimes" -name manifest.json -type f 2>/dev/null | head -n 1)
+fi
+if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
     echo "ERROR: No manifest.json found in $VAR_STAGING/lib/avocado/runtimes/" >&2
     exit 1
 fi
@@ -442,9 +448,15 @@ cp "$STAGING_DIR/timestamp.json" "$REPO_DIR/metadata/timestamp.json"
 cp "$VAR_STAGING/lib/avocado/metadata/root.json" "$REPO_DIR/metadata/root.json"
 cp "$VAR_STAGING/lib/avocado/metadata/1.root.json" "$REPO_DIR/metadata/1.root.json"
 
-# Link manifest.json into targets/
-MANIFEST_FILE=$(find "$VAR_STAGING/lib/avocado/runtimes" -name manifest.json -type f | head -n 1)
-if [ -n "$MANIFEST_FILE" ]; then
+# Link manifest.json into targets/ (prefer active symlink over find)
+ACTIVE_LINK="$VAR_STAGING/lib/avocado/active"
+if [ -L "$ACTIVE_LINK" ]; then
+    MANIFEST_FILE="$VAR_STAGING/lib/avocado/$(readlink "$ACTIVE_LINK")/manifest.json"
+fi
+if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
+    MANIFEST_FILE=$(find "$VAR_STAGING/lib/avocado/runtimes" -name manifest.json -type f 2>/dev/null | head -n 1)
+fi
+if [ -n "$MANIFEST_FILE" ] && [ -f "$MANIFEST_FILE" ]; then
     cp "$MANIFEST_FILE" "$REPO_DIR/targets/manifest.json"
 fi
 
@@ -503,7 +515,8 @@ REPO_URL="http://${{HOST_IP}}:${{PORT}}"
 echo "Serving TUF repository at $REPO_URL"
 echo "Connecting to $SSH_DEST via SSH..."
 
-# SSH into device and trigger update
+# SSH into device and trigger update (disable set -e to capture exit code)
+set +e
 ssh -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=10 \
@@ -513,6 +526,7 @@ ssh -o StrictHostKeyChecking=no \
     "avocadoctl runtime update --url $REPO_URL"
 
 UPDATE_EXIT=$?
+set -e
 
 if [ $UPDATE_EXIT -eq 0 ]; then
     echo "Device update completed successfully."

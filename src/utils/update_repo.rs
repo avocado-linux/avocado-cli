@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub const AVOCADO_IMAGE_NAMESPACE: Uuid = uuid::uuid!("7488fa35-6390-425b-bbbf-b156cfe1eed2");
 
 /// Derive a deterministic UUIDv5 image identifier from an image's SHA-256 hex digest.
+#[cfg(test)]
 pub fn compute_image_id(sha256_hex: &str) -> String {
     Uuid::new_v5(&AVOCADO_IMAGE_NAMESPACE, sha256_hex.as_bytes()).to_string()
 }
