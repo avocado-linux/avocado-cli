@@ -523,7 +523,7 @@ ssh -o StrictHostKeyChecking=no \
     -o LogLevel=ERROR \
     $SSH_PORT_ARGS \
     "$SSH_DEST" \
-    "avocadoctl runtime update --url $REPO_URL"
+    "avocadoctl runtime add --url $REPO_URL"
 
 UPDATE_EXIT=$?
 set -e
@@ -666,7 +666,7 @@ mod tests {
         assert!(script.contains("DEVICE_HOST=\"device.local\""));
         assert!(script.contains("SSH_PORT_ARGS=\"\""));
         assert!(script.contains("python3 -m http.server"));
-        assert!(script.contains("avocadoctl runtime update --url"));
+        assert!(script.contains("avocadoctl runtime add --url"));
         assert!(script.contains("ssh -o StrictHostKeyChecking=no"));
     }
 
