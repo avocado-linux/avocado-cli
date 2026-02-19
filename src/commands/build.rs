@@ -825,7 +825,7 @@ export SOURCE_DATE_EPOCH={source_date_epoch}
 # Create erofs image from the versioned extension sysroot
 mkfs.erofs \
   -T "$SOURCE_DATE_EPOCH" \
-  -U clear \
+  -U 00000000-0000-0000-0000-000000000000 \
   -x -1 \
   --all-root \
   "$OUTPUT_FILE" \
@@ -1853,7 +1853,7 @@ export SOURCE_DATE_EPOCH={source_date_epoch}
 # Create erofs image from the versioned extension sysroot
 mkfs.erofs \
   -T "$SOURCE_DATE_EPOCH" \
-  -U clear \
+  -U 00000000-0000-0000-0000-000000000000 \
   -x -1 \
   --all-root \
   "$OUTPUT_FILE" \
@@ -1919,8 +1919,8 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             "script should invoke mkfs.erofs"
         );
         assert!(
-            script.contains("-U clear"),
-            "script should include -U clear flag"
+            script.contains("-U 00000000-0000-0000-0000-000000000000"),
+            "script should include nil UUID flag"
         );
         assert!(
             script.contains("-x -1"),
