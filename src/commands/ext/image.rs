@@ -505,13 +505,14 @@ fi
 # Ensure reproducible timestamps
 export SOURCE_DATE_EPOCH={source_date_epoch}
 
-# Create squashfs image
-mksquashfs \
-  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
+# Create erofs image
+mkfs.erofs \
+  -T "$SOURCE_DATE_EPOCH" \
+  -U clear \
+  -x -1 \
+  --all-root \
   "$OUTPUT_FILE" \
-  -noappend \
-  -no-xattrs \
-  -reproducible
+  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME"
 
 echo "Created extension image: $OUTPUT_FILE"
 "#,
@@ -574,20 +575,20 @@ mod tests {
         let script = cmd.create_build_script("1.0.0", "sysext", 0);
 
         assert!(
-            script.contains("-reproducible"),
-            "script should include -reproducible flag"
+            script.contains("mkfs.erofs"),
+            "script should invoke mkfs.erofs"
         );
         assert!(
-            script.contains("-noappend"),
-            "script should include -noappend flag"
+            script.contains("-U clear"),
+            "script should include -U clear flag"
         );
         assert!(
-            script.contains("-no-xattrs"),
-            "script should include -no-xattrs flag"
+            script.contains("-x -1"),
+            "script should include -x -1 flag to disable xattr inlining"
         );
         assert!(
-            script.contains("mksquashfs"),
-            "script should invoke mksquashfs"
+            script.contains("--all-root"),
+            "script should include --all-root flag"
         );
     }
 
@@ -599,6 +600,10 @@ mod tests {
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=0"),
             "script should set SOURCE_DATE_EPOCH=0 when default is used"
+        );
+        assert!(
+            script.contains("-T \"$SOURCE_DATE_EPOCH\""),
+            "script should pass SOURCE_DATE_EPOCH to mkfs.erofs via -T"
         );
     }
 

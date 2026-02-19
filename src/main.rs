@@ -261,7 +261,7 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
-        /// Device IP address or hostname to deploy to
+        /// Device to deploy to as [user@]host[:port] (e.g. root@192.168.1.100:2222)
         #[arg(short = 'd', long = "device", required = true)]
         device: String,
         /// Additional arguments to pass to the container runtime
@@ -680,7 +680,7 @@ enum RuntimeCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
-        /// Device IP address or hostname to deploy to
+        /// Device to deploy to as [user@]host[:port] (e.g. root@192.168.1.100:2222)
         #[arg(short = 'd', long = "device", required = true)]
         device: String,
         /// Additional arguments to pass to the container runtime

@@ -656,76 +656,111 @@ fi"#
             symlink_commands.join("\n")
         };
 
-        // Generate the runtime manifest JSON statically in Rust
+        // Generate build ID and timestamp for the manifest
         let build_id = uuid::Uuid::new_v4().to_string();
-        let built_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let built_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let distro_version = config
             .get_distro_version()
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let ext_json_entries: Vec<String> = resolved_extensions
+        // Build "name:version" pairs for dynamic manifest generation.
+        // The shell script will compute SHA-256 + UUIDv5 image IDs at build time.
+        let ext_info_pairs: Vec<String> = resolved_extensions
             .iter()
             .map(|versioned_name| {
-                // Parse "ext-name-1.0.0" into (name, version)
-                let (name, version) =
-                    if let Some(idx) = versioned_name.rfind('-') {
-                        let (n, v_with_dash) = versioned_name.split_at(idx);
-                        let v = &v_with_dash[1..];
-                        if v.chars()
-                            .next()
-                            .map(|c| c.is_ascii_digit())
-                            .unwrap_or(false)
-                        {
-                            (n.to_string(), v.to_string())
-                        } else {
-                            (versioned_name.clone(), "0.0.0".to_string())
-                        }
+                let (name, version) = if let Some(idx) = versioned_name.rfind('-') {
+                    let (n, v_with_dash) = versioned_name.split_at(idx);
+                    let v = &v_with_dash[1..];
+                    if v.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
+                        (n.to_string(), v.to_string())
                     } else {
                         (versioned_name.clone(), "0.0.0".to_string())
-                    };
-                format!(
-                    r#"    {{
-      "name": "{name}",
-      "version": "{version}",
-      "filename": "{versioned_name}.raw"
-    }}"#
-                )
+                    }
+                } else {
+                    (versioned_name.clone(), "0.0.0".to_string())
+                };
+                format!("{name}:{version}")
             })
             .collect();
-        let extensions_json = ext_json_entries.join(",\n");
+        let ext_info_str = ext_info_pairs.join(" ");
 
-        let manifest_json = format!(
-            r#"{{
-  "manifest_version": 1,
-  "id": "{build_id}",
-  "built_at": "{built_at}",
-  "runtime": {{
-    "name": "{}",
-    "version": "{distro_version}"
-  }},
-  "extensions": [
-{extensions_json}
-  ]
-}}"#,
-            self.runtime_name
-        );
+        let namespace_uuid = crate::utils::update_repo::AVOCADO_IMAGE_NAMESPACE.to_string();
 
         let manifest_section = format!(
             r#"
-# Generate Avocado Runtime Manifest
-MANIFEST_DIR="$VAR_DIR/lib/avocado/runtimes/{build_id}"
+# Generate Avocado Runtime Manifest with content-addressable image IDs
+IMAGES_DIR="$VAR_DIR/lib/avocado/images"
+mkdir -p "$IMAGES_DIR"
+BUILD_ID="{build_id}"
+BUILT_AT="{built_at}"
+DISTRO_VERSION="{distro_version}"
+MANIFEST_DIR="$VAR_DIR/lib/avocado/runtimes/$BUILD_ID"
 mkdir -p "$MANIFEST_DIR"
 
-cat > "$MANIFEST_DIR/manifest.json" <<'MANIFEST_EOF'
-{manifest_json}
-MANIFEST_EOF
+export AVOCADO_NS_UUID="{namespace_uuid}"
+export AVOCADO_RT_EXT_DIR="$RUNTIME_EXT_DIR"
+export AVOCADO_IMAGES_DIR="$IMAGES_DIR"
+export AVOCADO_MANIFEST_PATH="$MANIFEST_DIR/manifest.json"
+export AVOCADO_BUILD_ID="$BUILD_ID"
+export AVOCADO_BUILT_AT="$BUILT_AT"
+export AVOCADO_RUNTIME_NAME="{runtime_name}"
+export AVOCADO_DISTRO_VERSION="$DISTRO_VERSION"
+export AVOCADO_EXT_PAIRS="{ext_info_str}"
 
-ln -sfn "runtimes/{build_id}" "$VAR_DIR/lib/avocado/active"
-echo "Created runtime manifest: runtimes/{build_id}/manifest.json"
-echo "Set active runtime -> runtimes/{build_id}""#
+echo "Computing content-addressable image IDs..."
+python3 << 'PYEOF'
+import json, hashlib, uuid, os, shutil
+
+namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
+runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
+images_dir = os.environ["AVOCADO_IMAGES_DIR"]
+manifest_path = os.environ["AVOCADO_MANIFEST_PATH"]
+build_id = os.environ["AVOCADO_BUILD_ID"]
+built_at = os.environ["AVOCADO_BUILT_AT"]
+runtime_name = os.environ["AVOCADO_RUNTIME_NAME"]
+distro_version = os.environ["AVOCADO_DISTRO_VERSION"]
+ext_pairs_str = os.environ.get("AVOCADO_EXT_PAIRS", "")
+
+ext_pairs = ext_pairs_str.split() if ext_pairs_str else []
+
+extensions = []
+for pair in ext_pairs:
+    name, version = pair.split(":", 1)
+    raw_file = os.path.join(runtime_ext_dir, name + "-" + version + ".raw")
+    if not os.path.isfile(raw_file):
+        print("WARNING: Extension image not found: " + raw_file)
+        continue
+    with open(raw_file, "rb") as f:
+        sha256 = hashlib.sha256(f.read()).hexdigest()
+    image_id = str(uuid.uuid5(namespace, sha256))
+    dest = os.path.join(images_dir, image_id + ".raw")
+    shutil.copy2(raw_file, dest)
+    print("  Image: " + name + "-" + version + ".raw -> " + image_id + ".raw")
+    extensions.append(dict(name=name, version=version, image_id=image_id))
+
+manifest = dict(
+    manifest_version=2,
+    id=build_id,
+    built_at=built_at,
+    runtime=dict(name=runtime_name, version=distro_version),
+    extensions=extensions,
+)
+
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+print("Created runtime manifest with " + str(len(extensions)) + " extension(s)")
+PYEOF
+
+ln -sfn "runtimes/$BUILD_ID" "$VAR_DIR/lib/avocado/active"
+echo "Created runtime manifest: runtimes/$BUILD_ID/manifest.json"
+echo "Set active runtime -> runtimes/$BUILD_ID""#,
+            runtime_name = self.runtime_name,
         );
 
         // Generate update authority (root.json) for verified updates
@@ -774,6 +809,7 @@ fi
 
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/extensions"
+mkdir -p "$VAR_DIR/lib/avocado/images"
 mkdir -p "$VAR_DIR/lib/avocado/os-releases/$VERSION_ID"
 mkdir -p "$VAR_DIR/lib/avocado/runtimes"
 
@@ -811,9 +847,10 @@ done
 # echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
 # avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME
 
-# Create btrfs image with extensions, os-releases, runtimes, and metadata subvolumes
+# Create btrfs image with extensions, images, os-releases, runtimes, and metadata subvolumes
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado/extensions \
+    --subvol rw:lib/avocado/images \
     --subvol rw:lib/avocado/os-releases \
     --subvol rw:lib/avocado/runtimes \
     --subvol rw:lib/avocado/metadata \
@@ -822,7 +859,12 @@ mkfs.btrfs -r "$VAR_DIR" \
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
 avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
-            self.runtime_name, target_arch, copy_section, symlink_section, manifest_section, update_authority_section
+            self.runtime_name,
+            target_arch,
+            copy_section,
+            symlink_section,
+            manifest_section,
+            update_authority_section
         );
 
         Ok(script)
@@ -1403,19 +1445,19 @@ extensions:
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
 
-        // Manifest should be written
+        // Manifest should be generated dynamically via Python
         assert!(script.contains("manifest.json"));
-        assert!(script.contains("\"manifest_version\": 1"));
-        assert!(script.contains("\"name\": \"test-runtime\""));
-        assert!(script.contains("\"version\": \"0.1.0\""));
-        assert!(script.contains("\"name\": \"test-ext\""));
-        assert!(script.contains("\"filename\": \"test-ext-1.0.0.raw\""));
+        assert!(script.contains("manifest_version=2"));
+        assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
+        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0\""));
+        assert!(script.contains("AVOCADO_NS_UUID="));
 
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
         assert!(script.contains("$VAR_DIR/lib/avocado/active"));
 
-        // Runtimes subvolume should be included in btrfs
+        // Images subvolume should be included in btrfs
+        assert!(script.contains("--subvol rw:lib/avocado/images"));
         assert!(script.contains("--subvol rw:lib/avocado/runtimes"));
     }
 
@@ -1450,9 +1492,9 @@ runtimes:
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
 
-        assert!(script.contains("\"name\": \"empty-runtime\""));
-        assert!(script.contains("\"version\": \"2.0.0\""));
-        assert!(script.contains("\"extensions\": ["));
+        assert!(script.contains("AVOCADO_RUNTIME_NAME=\"empty-runtime\""));
+        assert!(script.contains("AVOCADO_DISTRO_VERSION=\"$DISTRO_VERSION\""));
+        assert!(script.contains("AVOCADO_EXT_PAIRS=\"\""));
         assert!(script.contains("ln -sfn \"runtimes/"));
     }
 
@@ -1483,9 +1525,9 @@ runtimes:
             .create_build_script(&config, &parsed, "x86_64", &[])
             .unwrap();
 
-        // The manifest should contain an "id" field with a UUID-like value (contains hyphens)
-        assert!(script.contains("\"id\": \""));
-        // The manifest should contain a "built_at" timestamp
-        assert!(script.contains("\"built_at\": \""));
+        // The manifest section should set BUILD_ID with a UUID
+        assert!(script.contains("BUILD_ID=\""));
+        // The manifest section should set BUILT_AT with a timestamp
+        assert!(script.contains("BUILT_AT=\""));
     }
 }
