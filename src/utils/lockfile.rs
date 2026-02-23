@@ -526,6 +526,48 @@ impl LockFile {
         }
     }
 
+    /// Get the set of package names previously locked for a target and sysroot.
+    /// Returns an empty set if no packages are recorded.
+    pub fn get_locked_package_names(
+        &self,
+        target: &str,
+        sysroot: &SysrootType,
+    ) -> std::collections::HashSet<String> {
+        self.get_sysroot_versions(target, sysroot)
+            .map(|versions| versions.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove specific package entries from a sysroot's lock data.
+    /// Used during sync to remove only the packages that were removed from the config
+    /// while preserving version pinning for packages that remain.
+    pub fn remove_packages_from_sysroot(
+        &mut self,
+        target: &str,
+        sysroot: &SysrootType,
+        packages_to_remove: &[String],
+    ) {
+        let Some(target_locks) = self.targets.get_mut(target) else {
+            return;
+        };
+
+        let pkg_map = match sysroot {
+            SysrootType::Sdk(arch) => target_locks.sdk.get_mut(arch),
+            SysrootType::Rootfs => Some(&mut target_locks.rootfs),
+            SysrootType::TargetSysroot => Some(&mut target_locks.target_sysroot),
+            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
+                target_locks.extensions.get_mut(name)
+            }
+            SysrootType::Runtime(name) => target_locks.runtimes.get_mut(name),
+        };
+
+        if let Some(packages) = pkg_map {
+            for pkg in packages_to_remove {
+                packages.remove(pkg);
+            }
+        }
+    }
+
     /// Clear all entries for a target (SDK, rootfs, target-sysroot, extensions, runtimes)
     pub fn clear_all(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
@@ -1428,5 +1470,179 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             ),
             Some(&"2.0.0-r0".to_string())
         );
+    }
+
+    #[test]
+    fn test_get_locked_package_names_empty() {
+        let lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+        let names = lock.get_locked_package_names("qemux86-64", &sysroot);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_get_locked_package_names_returns_keys() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+        let mut versions = HashMap::new();
+        versions.insert("curl".to_string(), "8.0.0-r0".to_string());
+        versions.insert("iperf3".to_string(), "3.14-r0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &sysroot, versions);
+
+        let names = lock.get_locked_package_names("qemux86-64", &sysroot);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("curl"));
+        assert!(names.contains("iperf3"));
+    }
+
+    #[test]
+    fn test_get_locked_package_names_different_sysroot_isolated() {
+        let mut lock = LockFile::new();
+        let ext_a = SysrootType::Extension("ext-a".to_string());
+        let ext_b = SysrootType::Extension("ext-b".to_string());
+
+        let mut versions_a = HashMap::new();
+        versions_a.insert("curl".to_string(), "8.0.0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &ext_a, versions_a);
+
+        let mut versions_b = HashMap::new();
+        versions_b.insert("nginx".to_string(), "1.0.0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &ext_b, versions_b);
+
+        let names_a = lock.get_locked_package_names("qemux86-64", &ext_a);
+        assert_eq!(names_a.len(), 1);
+        assert!(names_a.contains("curl"));
+        assert!(!names_a.contains("nginx"));
+    }
+
+    #[test]
+    fn test_remove_packages_from_sysroot_selective() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+        let mut versions = HashMap::new();
+        versions.insert("curl".to_string(), "8.0.0-r0".to_string());
+        versions.insert("iperf3".to_string(), "3.14-r0".to_string());
+        versions.insert("wget".to_string(), "1.21-r0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &sysroot, versions);
+
+        // Remove only iperf3 -- curl and wget should remain with their versions
+        lock.remove_packages_from_sysroot("qemux86-64", &sysroot, &["iperf3".to_string()]);
+
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "curl"),
+            Some(&"8.0.0-r0".to_string())
+        );
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "iperf3"),
+            None
+        );
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "wget"),
+            Some(&"1.21-r0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_remove_packages_from_sysroot_nonexistent_target() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+
+        // Should not panic when target doesn't exist
+        lock.remove_packages_from_sysroot("nonexistent", &sysroot, &["curl".to_string()]);
+    }
+
+    #[test]
+    fn test_remove_packages_from_runtime_sysroot() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Runtime("dev".to_string());
+        let mut versions = HashMap::new();
+        versions.insert("avocado-runtime".to_string(), "0.1.0".to_string());
+        versions.insert("kernel-tools".to_string(), "6.1.0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &sysroot, versions);
+
+        lock.remove_packages_from_sysroot("qemux86-64", &sysroot, &["kernel-tools".to_string()]);
+
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "avocado-runtime"),
+            Some(&"0.1.0".to_string())
+        );
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "kernel-tools"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_removal_detection_scenario() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+
+        // Simulate initial install: curl + iperf3
+        let mut initial_versions = HashMap::new();
+        initial_versions.insert("curl".to_string(), "8.0.0-r0".to_string());
+        initial_versions.insert("iperf3".to_string(), "3.14-r0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &sysroot, initial_versions);
+
+        // Simulate user removing iperf3 from config
+        let current_config_packages: std::collections::HashSet<String> =
+            ["curl".to_string()].into_iter().collect();
+        let locked_names = lock.get_locked_package_names("qemux86-64", &sysroot);
+
+        let removed: Vec<String> = locked_names
+            .difference(&current_config_packages)
+            .cloned()
+            .collect();
+
+        assert_eq!(removed, vec!["iperf3".to_string()]);
+
+        // Remove stale entries preserving curl's version pin
+        lock.remove_packages_from_sysroot("qemux86-64", &sysroot, &removed);
+
+        // curl version is preserved
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "curl"),
+            Some(&"8.0.0-r0".to_string())
+        );
+        // iperf3 is gone
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &sysroot, "iperf3"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_no_removal_when_packages_only_added() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+
+        // Initial: just curl
+        let mut initial = HashMap::new();
+        initial.insert("curl".to_string(), "8.0.0-r0".to_string());
+        lock.update_sysroot_versions("qemux86-64", &sysroot, initial);
+
+        // Config now has curl + iperf3 (addition only)
+        let config_packages: std::collections::HashSet<String> =
+            ["curl".to_string(), "iperf3".to_string()]
+                .into_iter()
+                .collect();
+        let locked_names = lock.get_locked_package_names("qemux86-64", &sysroot);
+
+        let removed: Vec<String> = locked_names.difference(&config_packages).cloned().collect();
+
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn test_no_removal_when_lock_is_empty() {
+        let lock = LockFile::new();
+        let sysroot = SysrootType::Extension("app".to_string());
+
+        let config_packages: std::collections::HashSet<String> =
+            ["curl".to_string()].into_iter().collect();
+        let locked_names = lock.get_locked_package_names("qemux86-64", &sysroot);
+
+        let removed: Vec<String> = locked_names.difference(&config_packages).cloned().collect();
+
+        assert!(removed.is_empty());
     }
 }

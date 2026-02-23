@@ -1313,3 +1313,251 @@ mod tests {
         assert_ne!(versioned, versioned_wildcard);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Imperative add / remove commands
+// ---------------------------------------------------------------------------
+
+use crate::utils::config_edit::PackageScope;
+use crate::utils::output::{print_error, OutputLevel as OL};
+
+/// `avocado install <packages> -e <ext>` -- add packages to config + install
+pub struct PackageAddCommand {
+    pub packages: Vec<String>,
+    pub extension: Option<String>,
+    pub runtime: Option<String>,
+    #[allow(dead_code)] // validated in main.rs scope routing
+    pub sdk: bool,
+    pub config_path: String,
+    pub verbose: bool,
+    pub force: bool,
+    pub no_save: bool,
+    pub target: Option<String>,
+    pub container_args: Option<Vec<String>>,
+    pub dnf_args: Option<Vec<String>>,
+    pub no_stamps: bool,
+    pub runs_on: Option<String>,
+    pub nfs_port: Option<u16>,
+    pub sdk_arch: Option<String>,
+}
+
+impl PackageAddCommand {
+    pub async fn execute(&self) -> Result<()> {
+        let scope = self.resolve_scope();
+        let config_path = std::path::Path::new(&self.config_path);
+
+        // 1. Write packages to avocado.yaml (unless --no-save)
+        if !self.no_save {
+            let added =
+                crate::utils::config_edit::add_packages(config_path, &scope, &self.packages)?;
+            if added.is_empty() {
+                print_info(
+                    &format!(
+                        "All specified packages already present in {}.",
+                        scope_label(&scope)
+                    ),
+                    OL::Normal,
+                );
+            } else {
+                print_success(
+                    &format!(
+                        "Added {} package(s) to {}: {}",
+                        added.len(),
+                        scope_label(&scope),
+                        added.join(", ")
+                    ),
+                    OL::Normal,
+                );
+            }
+        }
+
+        // 2. Run the scoped install to actually install the packages
+        self.run_scoped_install(&scope).await
+    }
+
+    fn resolve_scope(&self) -> PackageScope {
+        if let Some(ref ext) = self.extension {
+            PackageScope::Extension(ext.clone())
+        } else if let Some(ref rt) = self.runtime {
+            PackageScope::Runtime(rt.clone())
+        } else {
+            PackageScope::Sdk
+        }
+    }
+
+    async fn run_scoped_install(&self, scope: &PackageScope) -> Result<()> {
+        match scope {
+            PackageScope::Extension(name) => {
+                let cmd = ExtInstallCommand::new(
+                    Some(name.clone()),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone());
+                cmd.execute().await
+            }
+            PackageScope::Runtime(name) => {
+                let cmd = RuntimeInstallCommand::new(
+                    Some(name.clone()),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone());
+                cmd.execute().await
+            }
+            PackageScope::Sdk => {
+                let cmd = SdkInstallCommand::new(
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone());
+                cmd.execute().await
+            }
+        }
+    }
+}
+
+/// `avocado uninstall <packages> -e <ext>` -- remove from config + sync sysroot
+pub struct PackageRemoveCommand {
+    pub packages: Vec<String>,
+    pub extension: Option<String>,
+    pub runtime: Option<String>,
+    #[allow(dead_code)] // validated in main.rs scope routing
+    pub sdk: bool,
+    pub config_path: String,
+    pub verbose: bool,
+    pub force: bool,
+    pub target: Option<String>,
+    pub container_args: Option<Vec<String>>,
+    pub dnf_args: Option<Vec<String>>,
+    pub no_stamps: bool,
+    pub runs_on: Option<String>,
+    pub nfs_port: Option<u16>,
+    pub sdk_arch: Option<String>,
+}
+
+impl PackageRemoveCommand {
+    pub async fn execute(&self) -> Result<()> {
+        let scope = self.resolve_scope();
+        let config_path = std::path::Path::new(&self.config_path);
+
+        // 1. Remove packages from avocado.yaml
+        let removed =
+            crate::utils::config_edit::remove_packages(config_path, &scope, &self.packages)?;
+
+        if removed.is_empty() {
+            print_error(
+                &format!(
+                    "None of the specified packages found in {}.",
+                    scope_label(&scope)
+                ),
+                OL::Normal,
+            );
+            return Ok(());
+        }
+
+        print_success(
+            &format!(
+                "Removed {} package(s) from {}: {}",
+                removed.len(),
+                scope_label(&scope),
+                removed.join(", ")
+            ),
+            OL::Normal,
+        );
+
+        // 2. Re-run install to sync the sysroot (the sync-aware install will detect
+        //    the removals via lock file comparison and clean+reinstall automatically)
+        print_info(
+            &format!("Syncing {} sysroot...", scope_label(&scope)),
+            OL::Normal,
+        );
+
+        self.run_scoped_install(&scope).await
+    }
+
+    fn resolve_scope(&self) -> PackageScope {
+        if let Some(ref ext) = self.extension {
+            PackageScope::Extension(ext.clone())
+        } else if let Some(ref rt) = self.runtime {
+            PackageScope::Runtime(rt.clone())
+        } else {
+            PackageScope::Sdk
+        }
+    }
+
+    async fn run_scoped_install(&self, scope: &PackageScope) -> Result<()> {
+        match scope {
+            PackageScope::Extension(name) => {
+                let cmd = ExtInstallCommand::new(
+                    Some(name.clone()),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone());
+                cmd.execute().await
+            }
+            PackageScope::Runtime(name) => {
+                let cmd = RuntimeInstallCommand::new(
+                    Some(name.clone()),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone());
+                cmd.execute().await
+            }
+            PackageScope::Sdk => {
+                let cmd = SdkInstallCommand::new(
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.force,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone());
+                cmd.execute().await
+            }
+        }
+    }
+}
+
+fn scope_label(scope: &PackageScope) -> String {
+    match scope {
+        PackageScope::Extension(name) => format!("extension '{name}'"),
+        PackageScope::Runtime(name) => format!("runtime '{name}'"),
+        PackageScope::Sdk => "SDK".to_string(),
+    }
+}

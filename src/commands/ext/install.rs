@@ -2,6 +2,7 @@
 #![allow(deprecated)]
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -372,6 +373,76 @@ impl ExtInstallCommand {
         Ok(())
     }
 
+    /// Compare the config's current package list with the lock file's previously installed
+    /// packages to detect removals. Returns true if the sysroot needs to be cleaned and
+    /// reinstalled from scratch.
+    ///
+    /// When packages are removed from the config, DNF install alone cannot remove them from
+    /// the sysroot. We must clean the sysroot and reinstall to bring it in sync with the config.
+    /// Only the removed packages' lock entries are cleared, preserving version pinning for
+    /// packages that remain in the config.
+    fn detect_package_removals(
+        &self,
+        parsed: &serde_yaml::Value,
+        extension: &str,
+        ext_location: &ExtensionLocation,
+        config: &Config,
+        target: &str,
+        lock_file: &mut LockFile,
+    ) -> bool {
+        let sysroot = SysrootType::Extension(extension.to_string());
+        let locked_names = lock_file.get_locked_package_names(target, &sysroot);
+
+        if locked_names.is_empty() {
+            return false;
+        }
+
+        // Gather current config package names for this extension
+        let ext_config = match ext_location {
+            ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => parsed
+                .get("extensions")
+                .and_then(|ext| ext.get(extension))
+                .cloned(),
+            #[allow(deprecated)]
+            ExtensionLocation::External { config_path, .. } => config
+                .get_merged_ext_config(extension, target, config_path)
+                .ok()
+                .flatten(),
+        };
+
+        let config_names: HashSet<String> = ext_config
+            .as_ref()
+            .and_then(|ec| ec.get("packages"))
+            .and_then(|deps| deps.as_mapping())
+            .map(|deps_map| {
+                deps_map
+                    .keys()
+                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let removed: Vec<String> = locked_names.difference(&config_names).cloned().collect();
+
+        if removed.is_empty() {
+            return false;
+        }
+
+        print_info(
+            &format!(
+                "Packages removed from extension '{}': {}. Cleaning sysroot for fresh install.",
+                extension,
+                removed.join(", ")
+            ),
+            OutputLevel::Normal,
+        );
+
+        // Remove only the stale entries, preserving version pins for remaining packages
+        lock_file.remove_packages_from_sysroot(target, &sysroot, &removed);
+
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn install_single_extension(
         &self,
@@ -390,44 +461,76 @@ impl ExtInstallCommand {
         src_dir: &Path,
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<bool> {
-        // Create the commands to check and set up the directory structure
+        let sysroot = SysrootType::Extension(extension.to_string());
+
+        // Detect package removals: compare current config packages with lock file.
+        // If packages were removed, we must clean the sysroot and reinstall from scratch
+        // because DNF install is additive-only and cannot remove packages.
+        let needs_clean_reinstall = self.detect_package_removals(
+            parsed,
+            extension,
+            ext_location,
+            config,
+            target,
+            lock_file,
+        );
+
+        if needs_clean_reinstall {
+            // Clean the sysroot so it will be recreated fresh below
+            let clean_command = format!(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}""#);
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: clean_command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            };
+            // Best-effort clean -- if sysroot doesn't exist, this is a no-op
+            let _ = run_container_command(container_helper, run_config, runs_on_context).await;
+        }
+
+        // Check if the sysroot exists (it may have just been cleaned above, or never created)
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
         let setup_command = format!(
             "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
         );
 
-        // First check if the sysroot already exists
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.to_string(),
             command: check_command,
             verbose: self.verbose,
-            source_environment: false, // don't source environment
+            source_environment: false,
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
-            // runs_on handled by shared context
             ..Default::default()
         };
         let sysroot_exists =
             run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if !sysroot_exists {
-            // Create the sysroot
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target.to_string(),
                 command: setup_command,
                 verbose: self.verbose,
-                source_environment: false, // don't source environment
+                source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
-                // runs_on handled by shared context
                 ..Default::default()
             };
             let success =
@@ -467,8 +570,6 @@ impl ExtInstallCommand {
 
         // Install dependencies if they exist
         let dependencies = ext_config.as_ref().and_then(|ec| ec.get("packages"));
-
-        let sysroot = SysrootType::Extension(extension.to_string());
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install and handle extension dependencies
