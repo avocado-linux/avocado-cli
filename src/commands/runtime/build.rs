@@ -688,7 +688,7 @@ for pair in ext_pairs:
     extensions.append(dict(name=name, version=version, image_id=image_id))
 
 manifest = dict(
-    manifest_version=2,
+    manifest_version=1,
     id=build_id,
     built_at=built_at,
     runtime=dict(name=runtime_name, version=distro_version),
@@ -1354,7 +1354,7 @@ extensions:
 
         // Manifest should be generated dynamically via Python
         assert!(script.contains("manifest.json"));
-        assert!(script.contains("manifest_version=2"));
+        assert!(script.contains("manifest_version=1"));
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
