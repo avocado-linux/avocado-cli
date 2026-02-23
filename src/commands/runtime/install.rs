@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -313,6 +314,68 @@ impl RuntimeInstallCommand {
         Ok(())
     }
 
+    /// Compare the config's current package list with the lock file's previously installed
+    /// packages to detect removals for a runtime sysroot.
+    fn detect_runtime_package_removals(
+        &self,
+        config: &Config,
+        runtime: &str,
+        target_arch: &str,
+        lock_file: &mut LockFile,
+    ) -> bool {
+        let sysroot = SysrootType::Runtime(runtime.to_string());
+        let locked_names = lock_file.get_locked_package_names(target_arch, &sysroot);
+
+        if locked_names.is_empty() {
+            return false;
+        }
+
+        let merged_runtime = config
+            .get_merged_runtime_config(runtime, target_arch, &self.config_path)
+            .ok()
+            .flatten();
+
+        let mut config_names: HashSet<String> = merged_runtime
+            .as_ref()
+            .and_then(|merged| merged.get("packages"))
+            .and_then(|deps| deps.as_mapping())
+            .map(|deps_map| {
+                deps_map
+                    .keys()
+                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Also include kernel package if specified
+        if let Some(ref merged_val) = merged_runtime {
+            if let Ok(Some(kernel_config)) = Config::get_kernel_config_from_runtime(merged_val) {
+                if let Some(ref kernel_package) = kernel_config.package {
+                    config_names.insert(kernel_package.clone());
+                }
+            }
+        }
+
+        let removed: Vec<String> = locked_names.difference(&config_names).cloned().collect();
+
+        if removed.is_empty() {
+            return false;
+        }
+
+        print_info(
+            &format!(
+                "Packages removed from runtime '{}': {}. Cleaning installroot for fresh install.",
+                runtime,
+                removed.join(", ")
+            ),
+            OutputLevel::Normal,
+        );
+
+        lock_file.remove_packages_from_sysroot(target_arch, &sysroot, &removed);
+
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn install_single_runtime(
         &self,
@@ -340,26 +403,52 @@ impl RuntimeInstallCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
-        // Create the commands to check and set up the runtime installroot
+        let sysroot = SysrootType::Runtime(runtime.to_string());
+
+        // Detect package removals: if packages were removed from the config since the last
+        // install, clean the installroot so DNF reinstalls from a clean state.
+        let needs_clean_reinstall =
+            self.detect_runtime_package_removals(config, runtime, &target_arch, lock_file);
+
         let installroot_path = format!("$AVOCADO_PREFIX/runtimes/{runtime}");
+
+        if needs_clean_reinstall {
+            let clean_command = format!(r#"rm -rf "{installroot_path}""#);
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target_arch.clone(),
+                command: clean_command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            };
+            let _ = run_container_command(container_helper, run_config, runs_on_context).await;
+        }
+
+        // Check if the installroot exists (may have been cleaned above or never created)
         let check_command = format!("[ -d {installroot_path} ]");
         let setup_command = format!(
             "mkdir -p {installroot_path}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm {installroot_path}/var/lib"
         );
 
-        // First check if the installroot already exists
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.clone(),
             command: check_command,
             verbose: self.verbose,
-            source_environment: false, // don't source environment
+            source_environment: false,
             interactive: false,
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
-            // runs_on handled by shared context
             sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
@@ -367,19 +456,17 @@ impl RuntimeInstallCommand {
             run_container_command(container_helper, run_config, runs_on_context).await?;
 
         if !installroot_exists {
-            // Create the installroot
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target_arch.clone(),
                 command: setup_command,
                 verbose: self.verbose,
-                source_environment: false, // don't source environment
+                source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
-                // runs_on handled by shared context
                 sdk_arch: self.sdk_arch.clone(),
                 ..Default::default()
             };
@@ -406,8 +493,6 @@ impl RuntimeInstallCommand {
         let dependencies = merged_runtime
             .as_ref()
             .and_then(|merged| merged.get("packages"));
-
-        let sysroot = SysrootType::Runtime(runtime.to_string());
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
             // Build list of packages to install

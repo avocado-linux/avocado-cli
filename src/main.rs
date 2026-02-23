@@ -136,8 +136,16 @@ enum Commands {
         #[arg(long)]
         unlock: bool,
     },
-    /// Install all components (SDK, extensions, and runtime dependencies)
+    /// Install all components, or add specific packages to an extension/runtime/SDK
+    ///
+    /// Without packages: syncs all sysroots with avocado.yaml (installs missing, removes extraneous).
+    /// With packages: adds them to the specified scope and writes to avocado.yaml.
     Install {
+        /// Packages to install (when provided, adds to config and installs into the specified scope)
+        packages: Vec<String>,
+        /// Extension to install packages into (required when adding packages)
+        #[arg(short = 'e', long = "extension")]
+        extension: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -147,9 +155,48 @@ enum Commands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
-        /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
+        /// Runtime name to install packages into (or sync when no packages given)
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
+        /// Install packages into the SDK
+        #[arg(long)]
+        sdk: bool,
+        /// Skip writing packages to avocado.yaml
+        #[arg(long)]
+        no_save: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Remove packages from an extension, runtime, or SDK and update avocado.yaml
+    Uninstall {
+        /// Packages to remove
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Extension to remove packages from
+        #[arg(short = 'e', long = "extension")]
+        extension: Option<String>,
+        /// Runtime to remove packages from
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
+        /// Remove packages from the SDK
+        #[arg(long)]
+        sdk: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -811,30 +858,117 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Install {
+            packages,
+            extension,
             config,
             verbose,
             force,
             runtime,
+            sdk,
+            no_save,
             target,
             container_args,
             dnf_args,
         } => {
-            // Validate runtime exists if provided
-            validate_runtime_if_provided(&config, runtime.as_ref())?;
+            if packages.is_empty() {
+                // No packages specified: sync all from config (original behavior)
+                validate_runtime_if_provided(&config, runtime.as_ref())?;
 
-            let install_cmd = InstallCommand::new(
-                config,
+                let install_cmd = InstallCommand::new(
+                    config,
+                    verbose,
+                    force,
+                    runtime,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_no_stamps(cli.no_stamps)
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone());
+                install_cmd.execute().await?;
+            } else {
+                // Packages specified: add to config and install into specified scope
+                use commands::install::PackageAddCommand;
+                let scope_count = extension.is_some() as u8 + runtime.is_some() as u8 + sdk as u8;
+                if scope_count == 0 {
+                    anyhow::bail!(
+                        "When installing packages, specify a scope: \
+                         -e/--extension <name>, -r/--runtime <name>, or --sdk"
+                    );
+                }
+                if scope_count > 1 {
+                    anyhow::bail!(
+                        "Specify only one scope: \
+                         -e/--extension, -r/--runtime, or --sdk"
+                    );
+                }
+
+                let add_cmd = PackageAddCommand {
+                    packages,
+                    extension,
+                    runtime,
+                    sdk,
+                    config_path: config,
+                    verbose,
+                    force,
+                    no_save,
+                    target: target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                    no_stamps: cli.no_stamps,
+                    runs_on: cli.runs_on.clone(),
+                    nfs_port: cli.nfs_port,
+                    sdk_arch: cli.sdk_arch.clone(),
+                };
+                add_cmd.execute().await?;
+            }
+            Ok(())
+        }
+        Commands::Uninstall {
+            packages,
+            extension,
+            runtime,
+            sdk,
+            config,
+            verbose,
+            force,
+            target,
+            container_args,
+            dnf_args,
+        } => {
+            use commands::install::PackageRemoveCommand;
+            let scope_count = extension.is_some() as u8 + runtime.is_some() as u8 + sdk as u8;
+            if scope_count == 0 {
+                anyhow::bail!(
+                    "When uninstalling packages, specify a scope: \
+                     -e/--extension <name>, -r/--runtime <name>, or --sdk"
+                );
+            }
+            if scope_count > 1 {
+                anyhow::bail!(
+                    "Specify only one scope: \
+                     -e/--extension, -r/--runtime, or --sdk"
+                );
+            }
+
+            let remove_cmd = PackageRemoveCommand {
+                packages,
+                extension,
+                runtime,
+                sdk,
+                config_path: config,
                 verbose,
                 force,
-                runtime,
-                target.or(cli.target.clone()),
+                target: target.or(cli.target.clone()),
                 container_args,
                 dnf_args,
-            )
-            .with_no_stamps(cli.no_stamps)
-            .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-            .with_sdk_arch(cli.sdk_arch.clone());
-            install_cmd.execute().await?;
+                no_stamps: cli.no_stamps,
+                runs_on: cli.runs_on.clone(),
+                nfs_port: cli.nfs_port,
+                sdk_arch: cli.sdk_arch.clone(),
+            };
+            remove_cmd.execute().await?;
             Ok(())
         }
         Commands::Build {

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_edit;
 pub mod container;
 pub mod ext_fetch;
 pub mod image_signing;
