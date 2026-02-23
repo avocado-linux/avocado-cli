@@ -497,10 +497,13 @@ else
     # loopback -- not the host -- so we must resolve a real non-loopback IP.
     case "$DEVICE_HOST" in
         127.*|localhost|::1)
-            HOST_IP=$(hostname -I 2>/dev/null | awk '{{print $1}}')
+            HOST_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{{print $2}}' | cut -d/ -f1 | head -n 1)
             ;;
         *)
-            HOST_IP=$(ip route get "$DEVICE_HOST" 2>/dev/null | grep -oP 'src \K[^ ]+' || hostname -I | awk '{{print $1}}')
+            HOST_IP=$(ip route get "$DEVICE_HOST" 2>/dev/null | awk '{{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}}' | head -n 1)
+            if [ -z "$HOST_IP" ]; then
+                HOST_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{{print $2}}' | cut -d/ -f1 | head -n 1)
+            fi
             ;;
     esac
 fi
@@ -690,9 +693,9 @@ mod tests {
         assert!(script.contains("$SSH_PORT_ARGS"));
         assert!(script.contains("\"$SSH_DEST\""));
 
-        // Loopback device host should use hostname -I instead of ip route get
+        // Loopback device host should use ip addr instead of ip route get
         assert!(script.contains("127.*|localhost"));
-        assert!(script.contains("hostname -I"));
+        assert!(script.contains("ip -4 addr show scope global"));
     }
 
     #[test]
