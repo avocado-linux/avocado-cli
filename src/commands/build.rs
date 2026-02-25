@@ -13,15 +13,11 @@ use crate::utils::{
     output::{print_info, print_success, OutputLevel},
 };
 
-/// Represents an extension dependency that can be either local, external, remote, or version-based
+/// Represents an extension dependency that can be either local or remote
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionDependency {
     /// Extension defined in the main config file
     Local(String),
-    /// Extension defined in an external config file (deprecated)
-    External { name: String, config_path: String },
-    /// Extension resolved via DNF with a version specification
-    Versioned { name: String, version: String },
     /// Remote extension with source field (repo, git, or path)
     Remote {
         name: String,
@@ -190,43 +186,6 @@ impl BuildCommand {
                             format!("Failed to build extension '{extension_name}'")
                         })?;
                     }
-                    ExtensionDependency::External {
-                        name,
-                        config_path: ext_config_path,
-                    } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Building external extension '{name}' from config '{ext_config_path}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Build external extension using its own config
-                        self.build_external_extension(config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
-                            format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
-                        })?;
-
-                        // Create images for external extension
-                        self.create_external_extension_images(config, &self.config_path, name, ext_config_path, &target).await.with_context(|| {
-                            format!("Failed to create images for external extension '{name}' from config '{ext_config_path}'")
-                        })?;
-
-                        // Copy external extension images to output directory so runtime build can find them
-                        self.copy_external_extension_images(config, name, &target)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to copy images for external extension '{name}'")
-                            })?;
-                    }
-                    ExtensionDependency::Versioned { name, version } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Skipping build for versioned extension '{name}' version '{version}' (installed via DNF)"),
-                                OutputLevel::Normal,
-                            );
-                        }
-                        // Versioned extensions are installed via DNF and don't need building
-                    }
                     ExtensionDependency::Remote { name, source: _ } => {
                         if self.verbose {
                             print_info(
@@ -285,32 +244,6 @@ impl BuildCommand {
                         .with_composed_config(Arc::clone(&composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
-                        })?;
-                    }
-                    ExtensionDependency::External {
-                        name,
-                        config_path: _ext_config_path,
-                    } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Skipping image creation for external extension '{name}' - already handled by ExtBuildCommand"),
-                                OutputLevel::Normal,
-                            );
-                        }
-                        // External extensions already have their images created by ExtBuildCommand::execute()
-                        // No additional image creation needed
-                    }
-                    ExtensionDependency::Versioned { name, version } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Creating image for versioned extension '{name}' version '{version}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Create image for versioned extension from its sysroot
-                        self.create_versioned_extension_image(name, &target).await.with_context(|| {
-                            format!("Failed to create image for versioned extension '{name}' version '{version}'")
                         })?;
                     }
                     ExtensionDependency::Remote { name, source: _ } => {
@@ -522,349 +455,16 @@ impl BuildCommand {
         extensions.sort_by(|a, b| {
             let name_a = match a {
                 ExtensionDependency::Local(name) => name,
-                ExtensionDependency::External { name, .. } => name,
-                ExtensionDependency::Versioned { name, .. } => name,
                 ExtensionDependency::Remote { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
-                ExtensionDependency::External { name, .. } => name,
-                ExtensionDependency::Versioned { name, .. } => name,
                 ExtensionDependency::Remote { name, .. } => name,
             };
             name_a.cmp(name_b)
         });
         Ok(extensions)
     }
-
-    /// Build an external extension using its own config file
-    async fn build_external_extension(
-        &self,
-        config: &Config,
-        base_config_path: &str,
-        extension_name: &str,
-        external_config_path: &str,
-        target: &str,
-    ) -> Result<()> {
-        // Load the external extension configuration
-        let external_extensions =
-            config.load_external_extensions(base_config_path, external_config_path)?;
-
-        let _extension_config = external_extensions.get(extension_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Extension '{extension_name}' not found in external config file '{external_config_path}'"
-            )
-        })?;
-
-        // Load the external config as a TOML value to process the extension
-        let resolved_external_config_path =
-            config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
-        let external_config_content = std::fs::read_to_string(&resolved_external_config_path)
-            .with_context(|| {
-                format!(
-                    "Failed to read external config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-        let _external_config_toml: serde_yaml::Value =
-            serde_yaml::from_str(&external_config_content).with_context(|| {
-                format!(
-                    "Failed to parse external config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-
-        // Create a temporary ExtBuildCommand to build the external extension
-        let ext_build_cmd = crate::commands::ext::build::ExtBuildCommand::new(
-            extension_name.to_string(),
-            resolved_external_config_path.to_string_lossy().to_string(),
-            self.verbose,
-            Some(target.to_string()),
-            self.container_args.clone(),
-            self.dnf_args.clone(),
-        )
-        .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-        .with_sdk_arch(self.sdk_arch.clone());
-
-        // Execute the extension build using the external config
-        match ext_build_cmd.execute().await {
-            Ok(_) => {
-                print_info(
-                    &format!("Successfully built external extension '{extension_name}' from '{external_config_path}'."),
-                    OutputLevel::Normal,
-                );
-                Ok(())
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "Failed to build external extension '{extension_name}' from '{external_config_path}': {e}"
-            )),
-        }
-    }
-
-    /// Create images for external extension using ExtImageCommand
-    async fn create_external_extension_images(
-        &self,
-        config: &Config,
-        base_config_path: &str,
-        extension_name: &str,
-        external_config_path: &str,
-        target: &str,
-    ) -> Result<()> {
-        // Load the external extension configuration to get the types
-        let external_extensions =
-            config.load_external_extensions(base_config_path, external_config_path)?;
-
-        let extension_config = external_extensions.get(extension_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Extension '{extension_name}' not found in external config file '{external_config_path}'"
-            )
-        })?;
-
-        // Get extension types from the external config (defaults to ["sysext", "confext"])
-        let types = extension_config
-            .get("types")
-            .and_then(|t| t.as_sequence())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_else(|| vec!["sysext".to_string(), "confext".to_string()]);
-
-        // Resolve the external config path for ExtImageCommand
-        let resolved_external_config_path =
-            config.resolve_path_relative_to_src_dir(base_config_path, external_config_path);
-
-        // Create ExtImageCommand for the external extension
-        let ext_image_cmd = crate::commands::ext::image::ExtImageCommand::new(
-            extension_name.to_string(),
-            resolved_external_config_path.to_string_lossy().to_string(),
-            self.verbose,
-            Some(target.to_string()),
-            self.container_args.clone(),
-            self.dnf_args.clone(),
-        )
-        .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-        .with_sdk_arch(self.sdk_arch.clone());
-
-        // Execute the image creation
-        ext_image_cmd.execute().await.with_context(|| {
-            format!("Failed to create images for external extension '{extension_name}'")
-        })?;
-
-        print_info(
-            &format!("Successfully created images for external extension '{extension_name}' (types: {}).", types.join(", ")),
-            OutputLevel::Normal,
-        );
-
-        Ok(())
-    }
-
-    /// Copy external extension images from their sysroot to the output directory
-    async fn copy_external_extension_images(
-        &self,
-        config: &Config,
-        extension_name: &str,
-        target: &str,
-    ) -> Result<()> {
-        // Get SDK configuration for container setup
-        let container_image = config.get_sdk_image().ok_or_else(|| {
-            anyhow::anyhow!("No container image specified in config under 'sdk.image'")
-        })?;
-
-        let repo_url = config.get_sdk_repo_url();
-        let repo_release = config.get_sdk_repo_release();
-        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
-
-        let container_helper =
-            crate::utils::container::SdkContainer::from_config(&self.config_path, config)?
-                .verbose(self.verbose);
-
-        // The images are already created in the correct location by ExtImageCommand
-        // We just need to verify they exist
-        let copy_command = format!(
-            r#"
-# Verify external extension images are in the output directory
-echo "Verifying images for external extension {extension_name}:"
-ls -la $AVOCADO_PREFIX/output/extensions/{extension_name}*.raw 2>/dev/null || {{
-    echo "ERROR: No images found for external extension {extension_name} in output directory"
-    exit 1
-}}
-
-echo "External extension {extension_name} images are ready in output directory"
-"#
-        );
-
-        let run_config = crate::utils::container::RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: copy_command,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url,
-            repo_release,
-            container_args: merged_container_args,
-            dnf_args: self.dnf_args.clone(),
-            ..Default::default()
-        };
-
-        let success = container_helper.run_in_container(run_config).await?;
-
-        if success {
-            print_info(
-                &format!("Successfully verified images for external extension '{extension_name}' in output directory."),
-                OutputLevel::Normal,
-            );
-        } else {
-            return Err(anyhow::anyhow!(
-                "Failed to verify images for external extension '{extension_name}'"
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Create image for a versioned extension from its sysroot
-    async fn create_versioned_extension_image(
-        &self,
-        extension_name: &str,
-        target: &str,
-    ) -> Result<()> {
-        print_info(
-            &format!("Creating image for versioned extension '{extension_name}'."),
-            OutputLevel::Normal,
-        );
-
-        // Load configuration
-        let config = Config::load(&self.config_path)?;
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let _parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
-
-        // Merge container args from config and CLI
-        let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
-
-        // Get repo_url and repo_release from config
-        let repo_url = config.get_sdk_repo_url();
-        let repo_release = config.get_sdk_repo_release();
-
-        // Get SDK configuration from interpolated config
-        let container_image = config
-            .get_sdk_image()
-            .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
-
-        // Initialize SDK container helper
-        let container_helper = crate::utils::container::SdkContainer::new();
-
-        // Query RPM version for the extension from the RPM database
-        // Use the same RPM configuration that was used during installation
-        let version_query_script = format!(
-            r#"
-set -e
-# Query RPM version for extension from RPM database using the same config as installation
-RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
-RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-rpm --root="$AVOCADO_EXT_SYSROOTS/{extension_name}" --dbpath=/var/lib/extension.d/rpm -q {extension_name} --queryformat '%{{VERSION}}'
-"#
-        );
-
-        let version_query_config = crate::utils::container::RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: version_query_script,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            ..Default::default()
-        };
-
-        let ext_version = container_helper
-            .run_in_container_with_output(version_query_config)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to query RPM version for extension '{extension_name}'. The RPM database should contain this package. \
-                    This may indicate the extension was not properly installed via packages, or the RPM database is corrupted."
-                )
-            })?;
-
-        // Create the image creation script
-        let source_date_epoch = config.source_date_epoch.unwrap_or(0);
-        let image_script = format!(
-            r#"
-set -e
-
-# Common variables
-EXT_NAME="{extension_name}"
-EXT_VERSION="{ext_version}"
-OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
-OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw"
-
-# Create output directory
-mkdir -p $OUTPUT_DIR
-
-# Remove existing file if it exists (including any old versions)
-rm -f "$OUTPUT_DIR/$EXT_NAME"*.raw
-
-# Check if extension sysroot exists
-if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
-    echo "Extension sysroot does not exist: $AVOCADO_EXT_SYSROOTS/$EXT_NAME."
-    exit 1
-fi
-
-# Ensure reproducible timestamps
-export SOURCE_DATE_EPOCH={source_date_epoch}
-
-# Create erofs image from the versioned extension sysroot
-mkfs.erofs \
-  -T "$SOURCE_DATE_EPOCH" \
-  -U 00000000-0000-0000-0000-000000000000 \
-  -x -1 \
-  --all-root \
-  "$OUTPUT_FILE" \
-  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME"
-
-echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION' at $OUTPUT_FILE"
-"#
-        );
-
-        let run_config = crate::utils::container::RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: image_script,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url,
-            repo_release,
-            container_args: merged_container_args,
-            dnf_args: self.dnf_args.clone(),
-            ..Default::default()
-        };
-
-        let success = container_helper.run_in_container(run_config).await?;
-
-        if success {
-            print_info(
-                &format!("Successfully created image for versioned extension '{extension_name}'."),
-                OutputLevel::Normal,
-            );
-        } else {
-            return Err(anyhow::anyhow!(
-                "Failed to create image for versioned extension '{extension_name}'"
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Build a single extension without building runtimes
     async fn build_single_extension(
         &self,
@@ -923,19 +523,6 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     .await
                     .with_context(|| format!("Failed to build extension '{ext_name}'"))?;
             }
-            ExtensionDependency::External {
-                name,
-                config_path: ext_config_path,
-            } => {
-                self.build_external_extension(config, &self.config_path, name, ext_config_path, target).await.with_context(|| {
-                    format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
-                })?;
-            }
-            ExtensionDependency::Versioned { name, version } => {
-                return Err(anyhow::anyhow!(
-                    "Cannot build individual versioned extension '{name}' version '{version}'. Versioned extensions are installed via DNF."
-                ));
-            }
             ExtensionDependency::Remote { name, source: _ } => {
                 let ext_build_cmd = ExtBuildCommand::new(
                     name.clone(),
@@ -979,25 +566,6 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for extension '{ext_name}'")
                 })?;
-            }
-            ExtensionDependency::External {
-                name,
-                config_path: ext_config_path,
-            } => {
-                self.create_external_extension_images(config, &self.config_path, name, ext_config_path, target).await.with_context(|| {
-                    format!("Failed to create images for external extension '{name}' from config '{ext_config_path}'")
-                })?;
-
-                self.copy_external_extension_images(config, name, target)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to copy images for external extension '{name}'")
-                    })?;
-            }
-            ExtensionDependency::Versioned { name, version } => {
-                return Err(anyhow::anyhow!(
-                    "Cannot create image for individual versioned extension '{name}' version '{version}'. Versioned extensions are installed via DNF."
-                ));
             }
             ExtensionDependency::Remote { name, source: _ } => {
                 let ext_image_cmd = ExtImageCommand::new(
@@ -1134,47 +702,6 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         .with_composed_config(Arc::clone(composed));
                         ext_image_cmd.execute().await.with_context(|| {
                             format!("Failed to create image for extension '{extension_name}'")
-                        })?;
-                    }
-                    ExtensionDependency::External {
-                        name,
-                        config_path: ext_config_path,
-                    } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Building external extension '{name}' from config '{ext_config_path}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Build external extension
-                        self.build_external_extension(config, &self.config_path, name, ext_config_path, target).await.with_context(|| {
-                            format!("Failed to build external extension '{name}' from config '{ext_config_path}'")
-                        })?;
-
-                        // Create images for external extension
-                        self.create_external_extension_images(config, &self.config_path, name, ext_config_path, target).await.with_context(|| {
-                            format!("Failed to create images for external extension '{name}' from config '{ext_config_path}'")
-                        })?;
-
-                        // Copy external extension images
-                        self.copy_external_extension_images(config, name, target)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to copy images for external extension '{name}'")
-                            })?;
-                    }
-                    ExtensionDependency::Versioned { name, version } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Skipping build for versioned extension '{name}' version '{version}' (installed via DNF)"),
-                                OutputLevel::Normal,
-                            );
-                        }
-                        // Versioned extensions are installed via DNF and don't need building
-                        // But they do need images created from their sysroots
-                        self.create_versioned_extension_image(name, target).await.with_context(|| {
-                            format!("Failed to create image for versioned extension '{name}' version '{version}'")
                         })?;
                     }
                     ExtensionDependency::Remote { name, source: _ } => {
@@ -1323,45 +850,17 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
             for (_dep_name, dep_spec) in dependencies {
                 // Check for extension dependency
                 if let Some(ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
-                    // Check if this is a versioned extension (has vsn field)
-                    if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-                        let ext_dep = ExtensionDependency::Versioned {
-                            name: ext_name.to_string(),
-                            version: version.to_string(),
-                        };
-                        required_extensions.insert(ext_dep);
-                    }
-                    // Check if this is an external extension (has config field)
-                    else if let Some(external_config) =
-                        dep_spec.get("config").and_then(|v| v.as_str())
-                    {
-                        let ext_dep = ExtensionDependency::External {
-                            name: ext_name.to_string(),
-                            config_path: external_config.to_string(),
-                        };
-                        required_extensions.insert(ext_dep.clone());
+                    // Local extension
+                    required_extensions.insert(ExtensionDependency::Local(ext_name.to_string()));
 
-                        // Recursively find nested external extension dependencies
-                        self.find_all_nested_extensions(
-                            config,
-                            &ext_dep,
-                            &mut required_extensions,
-                            &mut visited,
-                        )?;
-                    } else {
-                        // Local extension
-                        required_extensions
-                            .insert(ExtensionDependency::Local(ext_name.to_string()));
-
-                        // Also check local extension dependencies
-                        self.find_local_extension_dependencies(
-                            config,
-                            &serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
-                            ext_name,
-                            &mut required_extensions,
-                            &mut visited,
-                        )?;
-                    }
+                    // Also check local extension dependencies
+                    self.find_local_extension_dependencies(
+                        config,
+                        &serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
+                        ext_name,
+                        &mut required_extensions,
+                        &mut visited,
+                    )?;
                 }
             }
         }
@@ -1370,14 +869,10 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         extensions.sort_by(|a, b| {
             let name_a = match a {
                 ExtensionDependency::Local(name) => name,
-                ExtensionDependency::External { name, .. } => name,
-                ExtensionDependency::Versioned { name, .. } => name,
                 ExtensionDependency::Remote { name, .. } => name,
             };
             let name_b = match b {
                 ExtensionDependency::Local(name) => name,
-                ExtensionDependency::External { name, .. } => name,
-                ExtensionDependency::Versioned { name, .. } => name,
                 ExtensionDependency::Remote { name, .. } => name,
             };
             name_a.cmp(name_b)
@@ -1385,7 +880,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         Ok(extensions)
     }
 
-    /// Find an external extension by searching through the full dependency tree
+    /// Find an extension by searching through the full dependency tree
     fn find_external_extension(
         &self,
         config: &Config,
@@ -1421,45 +916,17 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                         // Check for extension dependency
                         if let Some(ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str())
                         {
-                            // Check if this is a versioned extension (has vsn field)
-                            if let Some(version) = dep_spec.get("vsn").and_then(|v| v.as_str()) {
-                                let ext_dep = ExtensionDependency::Versioned {
-                                    name: ext_name.to_string(),
-                                    version: version.to_string(),
-                                };
-                                all_extensions.insert(ext_dep);
-                            }
-                            // Check if this is an external extension (has config field)
-                            else if let Some(external_config) =
-                                dep_spec.get("config").and_then(|v| v.as_str())
-                            {
-                                let ext_dep = ExtensionDependency::External {
-                                    name: ext_name.to_string(),
-                                    config_path: external_config.to_string(),
-                                };
-                                all_extensions.insert(ext_dep.clone());
+                            // Local extension
+                            all_extensions.insert(ExtensionDependency::Local(ext_name.to_string()));
 
-                                // Recursively find nested external extension dependencies
-                                self.find_all_nested_extensions(
-                                    config,
-                                    &ext_dep,
-                                    &mut all_extensions,
-                                    &mut visited,
-                                )?;
-                            } else {
-                                // Local extension
-                                all_extensions
-                                    .insert(ExtensionDependency::Local(ext_name.to_string()));
-
-                                // Also check local extension dependencies
-                                self.find_local_extension_dependencies(
-                                    config,
-                                    parsed,
-                                    ext_name,
-                                    &mut all_extensions,
-                                    &mut visited,
-                                )?;
-                            }
+                            // Also check local extension dependencies
+                            self.find_local_extension_dependencies(
+                                config,
+                                parsed,
+                                ext_name,
+                                &mut all_extensions,
+                                &mut visited,
+                            )?;
                         }
                     }
                 }
@@ -1470,8 +937,6 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         for ext_dep in all_extensions {
             let found_name = match &ext_dep {
                 ExtensionDependency::Local(name) => name,
-                ExtensionDependency::External { name, .. } => name,
-                ExtensionDependency::Versioned { name, .. } => name,
                 ExtensionDependency::Remote { name, .. } => name,
             };
 
@@ -1481,144 +946,6 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
         }
 
         Ok(None)
-    }
-
-    /// Recursively find all nested extensions (enhanced version of find_nested_external_extensions)
-    fn find_all_nested_extensions(
-        &self,
-        config: &Config,
-        ext_dep: &ExtensionDependency,
-        all_extensions: &mut HashSet<ExtensionDependency>,
-        visited: &mut HashSet<String>,
-    ) -> Result<()> {
-        let (ext_name, ext_config_path) = match ext_dep {
-            ExtensionDependency::External { name, config_path } => (name, config_path),
-            ExtensionDependency::Local(name) => {
-                // For local extensions, we need to check their dependencies too
-                return self.find_local_extension_dependencies(
-                    config,
-                    &serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?,
-                    name,
-                    all_extensions,
-                    visited,
-                );
-            }
-            ExtensionDependency::Versioned { .. } => return Ok(()), // Versioned extensions don't have nested deps
-            ExtensionDependency::Remote { .. } => return Ok(()), // Remote extensions are handled separately
-        };
-
-        // Cycle detection: check if we've already processed this extension
-        let ext_key = format!("{ext_name}:{ext_config_path}");
-        if visited.contains(&ext_key) {
-            if self.verbose {
-                print_info(
-                    &format!("Skipping already processed extension '{ext_name}' to avoid cycles"),
-                    OutputLevel::Normal,
-                );
-            }
-            return Ok(());
-        }
-        visited.insert(ext_key);
-
-        // Load the external extension configuration
-        let resolved_external_config_path =
-            config.resolve_path_relative_to_src_dir(&self.config_path, ext_config_path);
-        let external_extensions =
-            config.load_external_extensions(&self.config_path, ext_config_path)?;
-
-        let extension_config = external_extensions.get(ext_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Extension '{ext_name}' not found in external config file '{ext_config_path}'"
-            )
-        })?;
-
-        // Load the nested config file to get its src_dir setting
-        let nested_config_content = std::fs::read_to_string(&resolved_external_config_path)
-            .with_context(|| {
-                format!(
-                    "Failed to read nested config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-        let nested_config: serde_yaml::Value = serde_yaml::from_str(&nested_config_content)
-            .with_context(|| {
-                format!(
-                    "Failed to parse nested config file: {}",
-                    resolved_external_config_path.display()
-                )
-            })?;
-
-        // Create a temporary Config object for the nested config to handle its src_dir
-        let nested_config_obj = serde_yaml::from_value::<Config>(nested_config.clone())?;
-
-        // Check if this external extension has dependencies
-        if let Some(dependencies) = extension_config
-            .get("packages")
-            .and_then(|d| d.as_mapping())
-        {
-            for (_dep_name, dep_spec) in dependencies {
-                // Check for nested extension dependency
-                if let Some(nested_ext_name) = dep_spec.get("extensions").and_then(|v| v.as_str()) {
-                    // Check if this is a nested external extension (has config field)
-                    if let Some(nested_external_config) =
-                        dep_spec.get("config").and_then(|v| v.as_str())
-                    {
-                        // Resolve the nested config path relative to the nested config's src_dir
-                        let nested_config_path = nested_config_obj
-                            .resolve_path_relative_to_src_dir(
-                                &resolved_external_config_path,
-                                nested_external_config,
-                            );
-
-                        let nested_ext_dep = ExtensionDependency::External {
-                            name: nested_ext_name.to_string(),
-                            config_path: nested_config_path.to_string_lossy().to_string(),
-                        };
-
-                        // Add the nested extension to all extensions
-                        all_extensions.insert(nested_ext_dep.clone());
-
-                        if self.verbose {
-                            print_info(
-                                &format!("Found nested external extension '{nested_ext_name}' required by '{ext_name}' at '{}'", nested_config_path.display()),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Recursively process the nested extension
-                        self.find_all_nested_extensions(
-                            config,
-                            &nested_ext_dep,
-                            all_extensions,
-                            visited,
-                        )?;
-                    } else {
-                        // This is a local extension dependency within the external config
-                        all_extensions
-                            .insert(ExtensionDependency::Local(nested_ext_name.to_string()));
-
-                        if self.verbose {
-                            print_info(
-                                &format!("Found local extension dependency '{nested_ext_name}' in external extension '{ext_name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
-
-                        // Check dependencies of this local extension in the external config
-                        self.find_local_extension_dependencies_in_config(
-                            config,
-                            &nested_config,
-                            nested_ext_name,
-                            &resolved_external_config_path,
-                            all_extensions,
-                            visited,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Find dependencies of local extensions
@@ -1641,6 +968,7 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
     }
 
     /// Find dependencies of local extensions in a specific config
+    #[allow(clippy::only_used_in_recursion)]
     fn find_local_extension_dependencies_in_config(
         &self,
         config: &Config,
@@ -1670,38 +998,19 @@ echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION
                     if let Some(nested_ext_name) =
                         dep_spec.get("extensions").and_then(|v| v.as_str())
                     {
-                        // Check if this is an external extension (has config field)
-                        if let Some(external_config) =
-                            dep_spec.get("config").and_then(|v| v.as_str())
-                        {
-                            let ext_dep = ExtensionDependency::External {
-                                name: nested_ext_name.to_string(),
-                                config_path: external_config.to_string(),
-                            };
-                            all_extensions.insert(ext_dep.clone());
+                        // Local extension dependency
+                        all_extensions
+                            .insert(ExtensionDependency::Local(nested_ext_name.to_string()));
 
-                            // Recursively find nested external extension dependencies
-                            self.find_all_nested_extensions(
-                                config,
-                                &ext_dep,
-                                all_extensions,
-                                visited,
-                            )?;
-                        } else {
-                            // Local extension dependency
-                            all_extensions
-                                .insert(ExtensionDependency::Local(nested_ext_name.to_string()));
-
-                            // Recursively check this local extension's dependencies
-                            self.find_local_extension_dependencies_in_config(
-                                config,
-                                parsed_config,
-                                nested_ext_name,
-                                config_path,
-                                all_extensions,
-                                visited,
-                            )?;
-                        }
+                        // Recursively check this local extension's dependencies
+                        self.find_local_extension_dependencies_in_config(
+                            config,
+                            parsed_config,
+                            nested_ext_name,
+                            config_path,
+                            all_extensions,
+                            visited,
+                        )?;
                     }
                 }
             } else if let Some(deps_value) = packages_value {
@@ -1815,120 +1124,5 @@ mod tests {
         assert_eq!(cmd.target, None);
         assert_eq!(cmd.container_args, None);
         assert_eq!(cmd.dnf_args, None);
-    }
-
-    /// Helper that replicates the versioned extension image script template
-    /// from `create_versioned_extension_image` so we can unit-test the
-    /// SOURCE_DATE_EPOCH interpolation without needing a container.
-    fn build_versioned_image_script(
-        extension_name: &str,
-        ext_version: &str,
-        source_date_epoch: u64,
-    ) -> String {
-        format!(
-            r#"
-set -e
-
-# Common variables
-EXT_NAME="{extension_name}"
-EXT_VERSION="{ext_version}"
-OUTPUT_DIR="$AVOCADO_PREFIX/output/extensions"
-OUTPUT_FILE="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw"
-
-# Create output directory
-mkdir -p $OUTPUT_DIR
-
-# Remove existing file if it exists (including any old versions)
-rm -f "$OUTPUT_DIR/$EXT_NAME"*.raw
-
-# Check if extension sysroot exists
-if [ ! -d "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" ]; then
-    echo "Extension sysroot does not exist: $AVOCADO_EXT_SYSROOTS/$EXT_NAME."
-    exit 1
-fi
-
-# Ensure reproducible timestamps
-export SOURCE_DATE_EPOCH={source_date_epoch}
-
-# Create erofs image from the versioned extension sysroot
-mkfs.erofs \
-  -T "$SOURCE_DATE_EPOCH" \
-  -U 00000000-0000-0000-0000-000000000000 \
-  -x -1 \
-  --all-root \
-  "$OUTPUT_FILE" \
-  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME"
-
-echo "Successfully created image for versioned extension '$EXT_NAME-$EXT_VERSION' at $OUTPUT_FILE"
-"#
-        )
-    }
-
-    #[test]
-    fn test_versioned_image_script_source_date_epoch_default() {
-        let script = build_versioned_image_script("my-ext", "1.0.0", 0);
-
-        assert!(
-            script.contains("export SOURCE_DATE_EPOCH=0"),
-            "script should set SOURCE_DATE_EPOCH=0 when default is used"
-        );
-        assert!(
-            script.contains("-T \"$SOURCE_DATE_EPOCH\""),
-            "script should pass SOURCE_DATE_EPOCH to mkfs.erofs via -T"
-        );
-        assert!(
-            script.contains("mkfs.erofs"),
-            "script should invoke mkfs.erofs"
-        );
-    }
-
-    #[test]
-    fn test_versioned_image_script_source_date_epoch_custom() {
-        let script = build_versioned_image_script("my-ext", "1.0.0", 1700000000);
-
-        assert!(
-            script.contains("export SOURCE_DATE_EPOCH=1700000000"),
-            "script should set SOURCE_DATE_EPOCH to the custom value"
-        );
-        assert!(
-            !script.contains("SOURCE_DATE_EPOCH=0"),
-            "script should not contain the default value when a custom one is set"
-        );
-    }
-
-    #[test]
-    fn test_versioned_image_script_extension_name_and_version() {
-        let script = build_versioned_image_script("test-extension", "2.3.4", 0);
-
-        assert!(
-            script.contains("EXT_NAME=\"test-extension\""),
-            "script should contain the extension name"
-        );
-        assert!(
-            script.contains("EXT_VERSION=\"2.3.4\""),
-            "script should contain the extension version"
-        );
-    }
-
-    #[test]
-    fn test_versioned_image_script_reproducible_flags() {
-        let script = build_versioned_image_script("my-ext", "1.0.0", 0);
-
-        assert!(
-            script.contains("mkfs.erofs"),
-            "script should invoke mkfs.erofs"
-        );
-        assert!(
-            script.contains("-U 00000000-0000-0000-0000-000000000000"),
-            "script should include nil UUID flag"
-        );
-        assert!(
-            script.contains("-x -1"),
-            "script should include -x -1 flag to disable xattr inlining"
-        );
-        assert!(
-            script.contains("--all-root"),
-            "script should include --all-root flag"
-        );
     }
 }

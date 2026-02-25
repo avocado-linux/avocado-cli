@@ -3,9 +3,6 @@
 //! This module provides functionality to track and pin package versions
 //! across different sysroots to ensure reproducible builds.
 
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,8 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Current lock file format version
-/// Version 2: SDK packages are now keyed by host architecture (sdk/{arch}) instead of just "sdk"
-const LOCKFILE_VERSION: u32 = 2;
+/// Version 3: Extensions now use ExtensionLock with optional source metadata and packages
+const LOCKFILE_VERSION: u32 = 3;
 
 /// Lock file name
 const LOCKFILE_NAME: &str = "lock.json";
@@ -34,16 +31,9 @@ pub enum SysrootType {
     Rootfs,
     /// Target sysroot ($AVOCADO_PREFIX/sdk/target-sysroot)
     TargetSysroot,
-    /// Local/external extension sysroot ($AVOCADO_EXT_SYSROOTS/{name})
+    /// Extension sysroot ($AVOCADO_EXT_SYSROOTS/{name})
     /// Uses ext-rpm-config-scripts for RPM database
     Extension(String),
-    /// DEPRECATED: Versioned extension sysroot
-    /// The vsn: syntax is no longer supported. Remote extensions are now defined
-    /// in the ext section with source: field and are treated as local extensions
-    /// after being fetched to $AVOCADO_PREFIX/includes/<ext_name>/.
-    #[deprecated(since = "0.23.0", note = "Use Extension variant for all extensions")]
-    #[allow(dead_code)]
-    VersionedExtension(String),
     /// Runtime sysroot ($AVOCADO_PREFIX/runtimes/{name})
     Runtime(String),
 }
@@ -79,17 +69,10 @@ impl SysrootType {
                 root_path: Some("$AVOCADO_PREFIX/sdk/target-sysroot".to_string()),
             },
             SysrootType::Extension(name) => RpmQueryConfig {
-                // Local/external extensions use ext-rpm-config-scripts
+                // Extensions use ext-rpm-config-scripts
                 // The database is at standard location, so --root is sufficient
                 rpm_etcconfigdir: None,
                 rpm_configdir: None,
-                root_path: Some(format!("$AVOCADO_EXT_SYSROOTS/{name}")),
-            },
-            SysrootType::VersionedExtension(name) => RpmQueryConfig {
-                // Versioned extensions use ext-rpm-config which puts database at custom location
-                // We need to set RPM_CONFIGDIR to find the database correctly
-                rpm_etcconfigdir: None,
-                rpm_configdir: Some("$AVOCADO_SDK_PREFIX/ext-rpm-config".to_string()),
                 root_path: Some(format!("$AVOCADO_EXT_SYSROOTS/{name}")),
             },
             SysrootType::Runtime(name) => RpmQueryConfig {
@@ -168,8 +151,44 @@ impl RpmQueryConfig {
 pub type PackageVersions = HashMap<String, String>;
 
 /// Nested package versions map: sub_key -> package_name -> version
-/// Used for SDK (keyed by host arch), extensions (keyed by name), runtimes (keyed by name)
+/// Used for SDK (keyed by host arch) and runtimes (keyed by name)
 pub type NestedPackageVersions = HashMap<String, PackageVersions>;
+
+/// Source metadata for a fetched extension in the lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionSourceLock {
+    /// Source type (e.g., "package")
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// RPM package name (may differ from extension name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Actual installed version
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Lock data for a single extension — unifies sysroot packages and source metadata
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtensionLock {
+    /// Source metadata (only present for remote/fetched extensions)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ExtensionSourceLock>,
+    /// Packages installed in this extension's sysroot
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub packages: PackageVersions,
+}
+
+impl ExtensionLock {
+    pub fn is_empty(&self) -> bool {
+        self.source.is_none() && self.packages.is_empty()
+    }
+}
+
+/// Helper for serde skip_serializing_if on extensions map
+fn extensions_are_empty(extensions: &HashMap<String, ExtensionLock>) -> bool {
+    extensions.is_empty() || extensions.values().all(|e| e.is_empty())
+}
 
 /// Lock data for a single target
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -192,9 +211,9 @@ pub struct TargetLocks {
     )]
     pub target_sysroot: PackageVersions,
 
-    /// Extension packages keyed by extension name
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub extensions: NestedPackageVersions,
+    /// Extension data keyed by extension name (source metadata + sysroot packages)
+    #[serde(default, skip_serializing_if = "extensions_are_empty")]
+    pub extensions: HashMap<String, ExtensionLock>,
 
     /// Runtime packages keyed by runtime name
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -233,8 +252,8 @@ impl LockFile {
     /// Load lock file from disk, or return a new one if it doesn't exist
     ///
     /// This function also handles migration from older lock file versions:
-    /// - Version 1 -> 2: SDK packages now nested under arch key, extensions/runtimes
-    ///   restructured. Old format is migrated automatically.
+    /// - Version 1 -> 3: SDK packages nested under arch key, extensions use ExtensionLock
+    /// - Version 2 -> 3: Extensions migrated from flat packages to ExtensionLock structure
     pub fn load(src_dir: &Path) -> Result<Self> {
         let path = Self::get_path(src_dir);
 
@@ -245,7 +264,7 @@ impl LockFile {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
 
-        // First, try to parse as v2 format
+        // First, try to parse as current (v3) format
         if let Ok(lock_file) = serde_json::from_str::<LockFile>(&content) {
             if lock_file.version >= LOCKFILE_VERSION {
                 if lock_file.version > LOCKFILE_VERSION {
@@ -259,35 +278,29 @@ impl LockFile {
             }
         }
 
-        // Try to parse as v1 format and migrate
-        let v1_lock: serde_json::Value = serde_json::from_str(&content)
+        // Try to parse as older format and migrate
+        let old_lock: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
 
-        let version = v1_lock.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let version = old_lock.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
-        if version == 1 {
-            return Ok(Self::migrate_v1_to_v2(&v1_lock));
+        match version {
+            1 => Ok(Self::migrate_v1_to_v3(&old_lock)),
+            2 => Ok(Self::migrate_v2_to_v3(&old_lock)),
+            _ => anyhow::bail!("Unable to parse lock file format"),
         }
-
-        // Unknown format
-        anyhow::bail!("Unable to parse lock file format");
     }
 
-    /// Migrate lock file from version 1 to version 2
+    /// Migrate lock file from version 1 to version 3
     ///
     /// Version 1 stored:
     /// - SDK packages under flat "sdk" key
     /// - Extensions under "extensions/{name}"
     /// - Runtimes under "runtimes/{name}"
     ///
-    /// Version 2 stores:
-    /// - SDK packages under nested sdk -> {arch} -> packages
-    /// - Extensions under nested extensions -> {name} -> packages
-    /// - Runtimes under nested runtimes -> {name} -> packages
-    ///
     /// Since we can't know what architecture the v1 SDK packages were installed for,
     /// we discard them. Users will need to re-run `avocado sdk install`.
-    fn migrate_v1_to_v2(v1_lock: &serde_json::Value) -> LockFile {
+    fn migrate_v1_to_v3(v1_lock: &serde_json::Value) -> LockFile {
         let mut lock_file = LockFile::new();
 
         if let Some(targets) = v1_lock.get("targets").and_then(|t| t.as_object()) {
@@ -314,9 +327,13 @@ impl LockFile {
                                 }
                                 _ if key.starts_with("extensions/") => {
                                     if let Some(name) = key.strip_prefix("extensions/") {
-                                        target_locks
-                                            .extensions
-                                            .insert(name.to_string(), pkg_versions);
+                                        target_locks.extensions.insert(
+                                            name.to_string(),
+                                            ExtensionLock {
+                                                source: None,
+                                                packages: pkg_versions,
+                                            },
+                                        );
                                     }
                                 }
                                 _ if key.starts_with("runtimes/") => {
@@ -329,6 +346,123 @@ impl LockFile {
                                 _ => {
                                     // Unknown key, ignore
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        lock_file
+    }
+
+    /// Migrate lock file from version 2 to version 3
+    ///
+    /// Version 2 stored extensions as flat package maps: extensions -> {name} -> {pkg: ver}
+    /// Version 3 wraps them in ExtensionLock: extensions -> {name} -> {packages: {pkg: ver}}
+    ///
+    /// Also migrates any "fetched-extensions" entries into the unified extensions structure
+    /// with source metadata.
+    fn migrate_v2_to_v3(v2_lock: &serde_json::Value) -> LockFile {
+        let mut lock_file = LockFile::new();
+
+        if let Some(targets) = v2_lock.get("targets").and_then(|t| t.as_object()) {
+            for (target_name, target_data) in targets {
+                let target_locks = lock_file.targets.entry(target_name.clone()).or_default();
+
+                if let Some(target_map) = target_data.as_object() {
+                    // Migrate SDK (already nested by arch in v2)
+                    if let Some(sdk) = target_map.get("sdk").and_then(|v| v.as_object()) {
+                        for (arch, packages) in sdk {
+                            if let Some(pkg_map) = packages.as_object() {
+                                let pkg_versions: PackageVersions = pkg_map
+                                    .iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect();
+                                target_locks.sdk.insert(arch.clone(), pkg_versions);
+                            }
+                        }
+                    }
+
+                    // Migrate rootfs
+                    if let Some(rootfs) = target_map.get("rootfs").and_then(|v| v.as_object()) {
+                        target_locks.rootfs = rootfs
+                            .iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect();
+                    }
+
+                    // Migrate target-sysroot
+                    if let Some(ts) = target_map.get("target-sysroot").and_then(|v| v.as_object())
+                    {
+                        target_locks.target_sysroot = ts
+                            .iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect();
+                    }
+
+                    // Migrate extensions: v2 has flat {name: {pkg: ver}}
+                    if let Some(exts) =
+                        target_map.get("extensions").and_then(|v| v.as_object())
+                    {
+                        for (name, packages) in exts {
+                            if let Some(pkg_map) = packages.as_object() {
+                                let pkg_versions: PackageVersions = pkg_map
+                                    .iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect();
+                                let ext_lock = target_locks
+                                    .extensions
+                                    .entry(name.clone())
+                                    .or_default();
+                                ext_lock.packages = pkg_versions;
+                            }
+                        }
+                    }
+
+                    // Migrate fetched-extensions into unified extensions with source metadata
+                    if let Some(fetched) =
+                        target_map.get("fetched-extensions").and_then(|v| v.as_object())
+                    {
+                        for (name, packages) in fetched {
+                            if let Some(pkg_map) = packages.as_object() {
+                                // In v2, fetched-extensions stored {ext_name: {pkg_name: version}}
+                                // The package name and version represent the fetched RPM
+                                let ext_lock = target_locks
+                                    .extensions
+                                    .entry(name.clone())
+                                    .or_default();
+                                // Convert the single package entry to source metadata
+                                if let Some((pkg_name, version)) = pkg_map.iter().next() {
+                                    if let Some(ver_str) = version.as_str() {
+                                        ext_lock.source = Some(ExtensionSourceLock {
+                                            source_type: "package".to_string(),
+                                            package: Some(pkg_name.clone()),
+                                            version: Some(ver_str.to_string()),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Migrate runtimes (already nested by name in v2)
+                    if let Some(runtimes) =
+                        target_map.get("runtimes").and_then(|v| v.as_object())
+                    {
+                        for (name, packages) in runtimes {
+                            if let Some(pkg_map) = packages.as_object() {
+                                let pkg_versions: PackageVersions = pkg_map
+                                    .iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect();
+                                target_locks.runtimes.insert(name.clone(), pkg_versions);
                             }
                         }
                     }
@@ -380,10 +514,10 @@ impl LockFile {
                 .and_then(|pkgs| pkgs.get(package)),
             SysrootType::Rootfs => target_locks.rootfs.get(package),
             SysrootType::TargetSysroot => target_locks.target_sysroot.get(package),
-            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => target_locks
+            SysrootType::Extension(name) => target_locks
                 .extensions
                 .get(name)
-                .and_then(|pkgs| pkgs.get(package)),
+                .and_then(|ext| ext.packages.get(package)),
             SysrootType::Runtime(name) => target_locks
                 .runtimes
                 .get(name)
@@ -406,8 +540,8 @@ impl LockFile {
             SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
             SysrootType::Rootfs => &mut target_locks.rootfs,
             SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
-            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
-                target_locks.extensions.entry(name.clone()).or_default()
+            SysrootType::Extension(name) => {
+                &mut target_locks.extensions.entry(name.clone()).or_default().packages
             }
             SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
         };
@@ -428,8 +562,8 @@ impl LockFile {
             SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
             SysrootType::Rootfs => &mut target_locks.rootfs,
             SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
-            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
-                target_locks.extensions.entry(name.clone()).or_default()
+            SysrootType::Extension(name) => {
+                &mut target_locks.extensions.entry(name.clone()).or_default().packages
             }
             SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
         };
@@ -453,8 +587,8 @@ impl LockFile {
             SysrootType::Sdk(arch) => target_locks.sdk.get(arch),
             SysrootType::Rootfs => Some(&target_locks.rootfs),
             SysrootType::TargetSysroot => Some(&target_locks.target_sysroot),
-            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
-                target_locks.extensions.get(name)
+            SysrootType::Extension(name) => {
+                target_locks.extensions.get(name).map(|ext| &ext.packages)
             }
             SysrootType::Runtime(name) => target_locks.runtimes.get(name),
         };
@@ -470,7 +604,7 @@ impl LockFile {
                 target_locks.sdk.is_empty()
                     && target_locks.rootfs.is_empty()
                     && target_locks.target_sysroot.is_empty()
-                    && target_locks.extensions.is_empty()
+                    && extensions_are_empty(&target_locks.extensions)
                     && target_locks.runtimes.is_empty()
             })
     }
@@ -555,15 +689,53 @@ impl LockFile {
             SysrootType::Sdk(arch) => target_locks.sdk.get_mut(arch),
             SysrootType::Rootfs => Some(&mut target_locks.rootfs),
             SysrootType::TargetSysroot => Some(&mut target_locks.target_sysroot),
-            SysrootType::Extension(name) | SysrootType::VersionedExtension(name) => {
-                target_locks.extensions.get_mut(name)
-            }
+            SysrootType::Extension(name) => target_locks
+                .extensions
+                .get_mut(name)
+                .map(|ext| &mut ext.packages),
             SysrootType::Runtime(name) => target_locks.runtimes.get_mut(name),
         };
 
         if let Some(packages) = pkg_map {
             for pkg in packages_to_remove {
                 packages.remove(pkg);
+            }
+        }
+    }
+
+    /// Get the source metadata for a fetched extension
+    pub fn get_extension_source(
+        &self,
+        target: &str,
+        ext_name: &str,
+    ) -> Option<&ExtensionSourceLock> {
+        self.targets
+            .get(target)
+            .and_then(|tl| tl.extensions.get(ext_name))
+            .and_then(|ext| ext.source.as_ref())
+    }
+
+    /// Set the source metadata for a fetched extension
+    pub fn set_extension_source(
+        &mut self,
+        target: &str,
+        ext_name: &str,
+        source: ExtensionSourceLock,
+    ) {
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+        let ext_lock = target_locks
+            .extensions
+            .entry(ext_name.to_string())
+            .or_default();
+        ext_lock.source = Some(source);
+    }
+
+    /// Clear the source metadata for a fetched extension (preserves sysroot packages)
+    #[allow(dead_code)]
+    pub fn clear_extension_source(&mut self, target: &str, ext_name: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            if let Some(ext_lock) = target_locks.extensions.get_mut(ext_name) {
+                ext_lock.source = None;
             }
         }
     }
@@ -1201,26 +1373,13 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             Some("$AVOCADO_PREFIX/rootfs".to_string())
         );
 
-        // Test Extension config - local/external extensions don't need RPM_CONFIGDIR
+        // Test Extension config - extensions don't need RPM_CONFIGDIR
         let ext_config = SysrootType::Extension("my-ext".to_string()).get_rpm_query_config();
         assert!(ext_config.rpm_etcconfigdir.is_none());
         assert!(ext_config.rpm_configdir.is_none());
         assert_eq!(
             ext_config.root_path,
             Some("$AVOCADO_EXT_SYSROOTS/my-ext".to_string())
-        );
-
-        // Test VersionedExtension config - needs RPM_CONFIGDIR for ext-rpm-config database location
-        let versioned_ext_config =
-            SysrootType::VersionedExtension("my-versioned-ext".to_string()).get_rpm_query_config();
-        assert!(versioned_ext_config.rpm_etcconfigdir.is_none());
-        assert_eq!(
-            versioned_ext_config.rpm_configdir,
-            Some("$AVOCADO_SDK_PREFIX/ext-rpm-config".to_string())
-        );
-        assert_eq!(
-            versioned_ext_config.root_path,
-            Some("$AVOCADO_EXT_SYSROOTS/my-versioned-ext".to_string())
         );
 
         // Test Runtime config - same as rootfs, no custom config needed
@@ -1258,13 +1417,15 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 
         let json = serde_json::to_string_pretty(&lock).unwrap();
 
-        // Verify JSON structure - SDK is nested under arch, extensions under name
+        // Verify JSON structure - SDK is nested under arch, extensions use ExtensionLock
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["version"], 2);
+        assert_eq!(parsed["version"], 3);
         // SDK packages nested under sdk -> {arch} -> {package}
         assert!(parsed["targets"]["qemux86-64"]["sdk"]["x86_64"]["curl"].is_string());
-        // Extensions nested under extensions -> {name} -> {package}
-        assert!(parsed["targets"]["qemux86-64"]["extensions"]["app"]["libfoo"].is_string());
+        // Extensions nested under extensions -> {name} -> packages -> {package}
+        assert!(
+            parsed["targets"]["qemux86-64"]["extensions"]["app"]["packages"]["libfoo"].is_string()
+        );
         assert!(parsed["targets"]["qemuarm64"]["sdk"]["aarch64"]["curl"].is_string());
     }
 
@@ -1404,7 +1565,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     }
 
     #[test]
-    fn test_migrate_v1_to_v2() {
+    fn test_migrate_v1_to_v3() {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
@@ -1422,8 +1583,8 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         // Load the lock file - should trigger migration
         let lock = LockFile::load(src_dir).unwrap();
 
-        // Version should be updated to 2
-        assert_eq!(lock.version, 2);
+        // Version should be updated to 3
+        assert_eq!(lock.version, 3);
 
         // Old "sdk" entries should be removed (we can't determine their host arch)
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
@@ -1451,7 +1612,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             Some(&"0.1.0-r0.0.avocado_jetson_orin_nano_devkit".to_string())
         );
 
-        // Extensions should be migrated from "extensions/name" to nested structure
+        // Extensions should be migrated from "extensions/name" to ExtensionLock
         assert_eq!(
             lock.get_locked_version(
                 "jetson-orin-nano-devkit",
@@ -1460,6 +1621,10 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             ),
             Some(&"1.0.0-r0".to_string())
         );
+        // No source metadata for v1 extensions
+        assert!(lock
+            .get_extension_source("jetson-orin-nano-devkit", "my-app")
+            .is_none());
 
         // Runtimes should be migrated from "runtimes/name" to nested structure
         assert_eq!(
@@ -1470,6 +1635,135 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             ),
             Some(&"2.0.0-r0".to_string())
         );
+    }
+
+    #[test]
+    fn test_migrate_v2_to_v3() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path();
+
+        // Create a v2 lock file with both extensions and fetched-extensions
+        let v2_content = r#"{"targets":{"qemux86-64":{"extensions":{"my-app":{"curl":"8.0.0-r0","libfoo":"1.0.0-r0"}},"fetched-extensions":{"remote-ext":{"avocado-ext-remote":"1.0.0-1.el9.x86_64"}},"rootfs":{"base":"1.0.0-r0"},"sdk":{"x86_64":{"toolchain":"1.0.0-r0"}}}},"version":2}
+"#;
+
+        let lock_path = LockFile::get_path(src_dir);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, v2_content).unwrap();
+
+        // Load the lock file - should trigger v2->v3 migration
+        let lock = LockFile::load(src_dir).unwrap();
+
+        // Version should be updated to 3
+        assert_eq!(lock.version, 3);
+
+        // SDK should be preserved
+        assert_eq!(
+            lock.get_locked_version(
+                "qemux86-64",
+                &SysrootType::Sdk("x86_64".to_string()),
+                "toolchain"
+            ),
+            Some(&"1.0.0-r0".to_string())
+        );
+
+        // Rootfs preserved
+        assert_eq!(
+            lock.get_locked_version("qemux86-64", &SysrootType::Rootfs, "base"),
+            Some(&"1.0.0-r0".to_string())
+        );
+
+        // Regular extensions should be migrated with packages
+        assert_eq!(
+            lock.get_locked_version(
+                "qemux86-64",
+                &SysrootType::Extension("my-app".to_string()),
+                "curl"
+            ),
+            Some(&"8.0.0-r0".to_string())
+        );
+        assert_eq!(
+            lock.get_locked_version(
+                "qemux86-64",
+                &SysrootType::Extension("my-app".to_string()),
+                "libfoo"
+            ),
+            Some(&"1.0.0-r0".to_string())
+        );
+
+        // Fetched extension should have source metadata
+        let source = lock
+            .get_extension_source("qemux86-64", "remote-ext")
+            .expect("should have source metadata");
+        assert_eq!(source.source_type, "package");
+        assert_eq!(source.package.as_deref(), Some("avocado-ext-remote"));
+        assert_eq!(source.version.as_deref(), Some("1.0.0-1.el9.x86_64"));
+    }
+
+    #[test]
+    fn test_extension_source_get_set() {
+        let mut lock = LockFile::new();
+        let target = "qemux86-64";
+        let ext_name = "remote-ext";
+
+        // Initially no source
+        assert!(lock.get_extension_source(target, ext_name).is_none());
+
+        // Set source
+        lock.set_extension_source(
+            target,
+            ext_name,
+            ExtensionSourceLock {
+                source_type: "package".to_string(),
+                package: Some("avocado-ext-remote".to_string()),
+                version: Some("1.0.0-1.el9.x86_64".to_string()),
+            },
+        );
+
+        let source = lock.get_extension_source(target, ext_name).unwrap();
+        assert_eq!(source.source_type, "package");
+        assert_eq!(source.package.as_deref(), Some("avocado-ext-remote"));
+        assert_eq!(source.version.as_deref(), Some("1.0.0-1.el9.x86_64"));
+
+        // Clear source (preserves packages)
+        lock.set_locked_version(
+            target,
+            &SysrootType::Extension(ext_name.to_string()),
+            "some-pkg",
+            "1.0.0",
+        );
+        lock.clear_extension_source(target, ext_name);
+        assert!(lock.get_extension_source(target, ext_name).is_none());
+        // Package should still be there
+        assert_eq!(
+            lock.get_locked_version(
+                target,
+                &SysrootType::Extension(ext_name.to_string()),
+                "some-pkg"
+            ),
+            Some(&"1.0.0".to_string())
+        );
+
+        // clear_extension removes everything (source + packages)
+        lock.set_extension_source(
+            target,
+            ext_name,
+            ExtensionSourceLock {
+                source_type: "package".to_string(),
+                package: None,
+                version: None,
+            },
+        );
+        lock.clear_extension(target, ext_name);
+        assert!(lock.get_extension_source(target, ext_name).is_none());
+        assert!(lock
+            .get_locked_version(
+                target,
+                &SysrootType::Extension(ext_name.to_string()),
+                "some-pkg"
+            )
+            .is_none());
     }
 
     #[test]

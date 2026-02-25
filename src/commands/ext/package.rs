@@ -1,6 +1,3 @@
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -116,7 +113,6 @@ impl ExtPackageCommand {
         // Get the config path where this extension is actually defined
         let ext_config_path = match &extension_location {
             ExtensionLocation::Local { config_path, .. } => config_path.clone(),
-            ExtensionLocation::External { config_path, .. } => config_path.clone(),
             ExtensionLocation::Remote { name, .. } => {
                 // Remote extensions are installed to $AVOCADO_PREFIX/includes/<name>/
                 let ext_install_path =
@@ -133,12 +129,6 @@ impl ExtPackageCommand {
                 ExtensionLocation::Local { name, config_path } => {
                     print_info(
                         &format!("Found local extension '{name}' in config '{config_path}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-                ExtensionLocation::External { name, config_path } => {
-                    print_info(
-                        &format!("Found external extension '{name}' in config '{config_path}'"),
                         OutputLevel::Normal,
                     );
                 }
@@ -177,11 +167,6 @@ impl ExtPackageCommand {
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
-            }
-            #[allow(deprecated)]
-            ExtensionLocation::External { config_path, .. } => {
-                // For deprecated external configs, read from the file
                 config.get_merged_ext_config(&self.extension, &target, config_path)?
             }
         }

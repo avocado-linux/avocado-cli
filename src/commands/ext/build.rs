@@ -1,6 +1,3 @@
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -179,7 +176,6 @@ impl ExtBuildCommand {
         // The ext_src_path (for overlay/scripts) is computed separately below.
         let ext_config_path = match &extension_location {
             ExtensionLocation::Local { config_path, .. } => config_path.clone(),
-            ExtensionLocation::External { config_path, .. } => config_path.clone(),
             ExtensionLocation::Remote { .. } => {
                 // For remote extensions, use the main config path because:
                 // 1. Remote extension sdk.compile sections are merged into main config via load_composed
@@ -193,12 +189,6 @@ impl ExtBuildCommand {
                 ExtensionLocation::Local { name, config_path } => {
                     print_info(
                         &format!("Found local extension '{name}' in config '{config_path}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-                ExtensionLocation::External { name, config_path } => {
-                    print_info(
-                        &format!("Found external extension '{name}' in config '{config_path}'"),
                         OutputLevel::Normal,
                     );
                 }
@@ -239,11 +229,6 @@ impl ExtBuildCommand {
                 // For local extensions, read from the file with proper target merging
                 config.get_merged_ext_config(&self.extension, &target, config_path)?
             }
-            #[allow(deprecated)]
-            ExtensionLocation::External { config_path, .. } => {
-                // For deprecated external configs, read from the file
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
-            }
         }
         .ok_or_else(|| {
             anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
@@ -256,7 +241,7 @@ impl ExtBuildCommand {
             ExtensionLocation::Remote { name, .. } => {
                 Some(format!("$AVOCADO_PREFIX/includes/{name}"))
             }
-            ExtensionLocation::Local { .. } | ExtensionLocation::External { .. } => None,
+            ExtensionLocation::Local { .. } => None,
         };
 
         // Handle compile dependencies with install scripts before building the extension
@@ -443,9 +428,7 @@ impl ExtBuildCommand {
             ExtensionLocation::Remote { name, .. } => {
                 format!("$AVOCADO_PREFIX/includes/{name}")
             }
-            ExtensionLocation::Local { .. } | ExtensionLocation::External { .. } => {
-                "/opt/src".to_string()
-            }
+            ExtensionLocation::Local { .. } => "/opt/src".to_string(),
         };
 
         // Build extensions based on configuration

@@ -1,6 +1,3 @@
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -112,14 +109,6 @@ impl ExtDnfCommand {
                                 OutputLevel::Normal,
                             );
                         }
-                        ExtensionLocation::External { name, config_path } => {
-                            print_info(
-                                &format!(
-                                    "Found external extension '{name}' in config '{config_path}'"
-                                ),
-                                OutputLevel::Normal,
-                            );
-                        }
                         ExtensionLocation::Remote { name, source } => {
                             print_info(
                                 &format!("Found remote extension '{name}' with source: {source:?}"),
@@ -207,7 +196,6 @@ impl ExtDnfCommand {
     ) -> Result<()> {
         let extension_name = match extension_location {
             ExtensionLocation::Local { name, .. } => name,
-            ExtensionLocation::External { name, .. } => name,
             ExtensionLocation::Remote { name, .. } => name,
         };
         let check_cmd = format!("test -d $AVOCADO_EXT_SYSROOTS/{extension_name}");
@@ -258,7 +246,6 @@ impl ExtDnfCommand {
     ) -> Result<()> {
         let extension_name = match extension_location {
             ExtensionLocation::Local { name, .. } => name,
-            ExtensionLocation::External { name, .. } => name,
             ExtensionLocation::Remote { name, .. } => name,
         };
         let setup_cmd = format!(
@@ -345,7 +332,6 @@ impl ExtDnfCommand {
     fn build_dnf_command(&self, extension_location: &ExtensionLocation) -> String {
         let extension_name = match extension_location {
             ExtensionLocation::Local { name, .. } => name,
-            ExtensionLocation::External { name, .. } => name,
             ExtensionLocation::Remote { name, .. } => name,
         };
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension_name}");
