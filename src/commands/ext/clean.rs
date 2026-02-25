@@ -1,6 +1,3 @@
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -85,7 +82,7 @@ impl ExtCleanCommand {
             ExtensionLocation::Remote { name, .. } => {
                 Some(format!("$AVOCADO_PREFIX/includes/{name}"))
             }
-            ExtensionLocation::Local { .. } | ExtensionLocation::External { .. } => None,
+            ExtensionLocation::Local { .. } => None,
         };
 
         // Execute clean scripts for compile dependencies BEFORE cleaning the extension
@@ -130,12 +127,6 @@ impl ExtCleanCommand {
                 }
             }
             ExtensionLocation::Local { config_path, .. } => config
-                .get_merged_ext_config(&self.extension, target, config_path)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-                }),
-            #[allow(deprecated)]
-            ExtensionLocation::External { config_path, .. } => config
                 .get_merged_ext_config(&self.extension, target, config_path)?
                 .ok_or_else(|| {
                     anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
@@ -343,14 +334,6 @@ impl ExtCleanCommand {
                             print_info(
                                 &format!(
                                     "Found local extension '{name}' in config '{config_path}'"
-                                ),
-                                OutputLevel::Normal,
-                            );
-                        }
-                        ExtensionLocation::External { name, config_path } => {
-                            print_info(
-                                &format!(
-                                    "Found external extension '{name}' in config '{config_path}'"
                                 ),
                                 OutputLevel::Normal,
                             );

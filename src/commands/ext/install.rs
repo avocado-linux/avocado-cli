@@ -1,6 +1,3 @@
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -106,80 +103,71 @@ impl ExtInstallCommand {
         let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Determine which extensions to install (with their locations)
-        let extensions_to_install: Vec<(String, ExtensionLocation)> = if let Some(extension_name) =
-            &self.extension
-        {
-            // Single extension specified - use comprehensive lookup
-            match config.find_extension_in_dependency_tree(
-                &self.config_path,
-                extension_name,
-                &target,
-            )? {
-                Some(location) => {
-                    if self.verbose {
-                        match &location {
-                            ExtensionLocation::Local { name, config_path } => {
-                                print_info(
-                                    &format!(
+        let extensions_to_install: Vec<(String, ExtensionLocation)> =
+            if let Some(extension_name) = &self.extension {
+                // Single extension specified - use comprehensive lookup
+                match config.find_extension_in_dependency_tree(
+                    &self.config_path,
+                    extension_name,
+                    &target,
+                )? {
+                    Some(location) => {
+                        if self.verbose {
+                            match &location {
+                                ExtensionLocation::Local { name, config_path } => {
+                                    print_info(
+                                        &format!(
                                         "Found local extension '{name}' in config '{config_path}'"
                                     ),
-                                    OutputLevel::Normal,
-                                );
-                            }
-                            ExtensionLocation::External { name, config_path } => {
-                                print_info(
-                                        &format!(
-                                            "Found external extension '{name}' in config '{config_path}'"
-                                        ),
                                         OutputLevel::Normal,
                                     );
-                            }
-                            ExtensionLocation::Remote { name, source } => {
-                                print_info(
-                                    &format!(
+                                }
+                                ExtensionLocation::Remote { name, source } => {
+                                    print_info(
+                                        &format!(
                                         "Found remote extension '{name}' with source: {source:?}"
                                     ),
-                                    OutputLevel::Normal,
-                                );
+                                        OutputLevel::Normal,
+                                    );
+                                }
                             }
                         }
+                        vec![(extension_name.clone(), location)]
                     }
-                    vec![(extension_name.clone(), location)]
+                    None => {
+                        print_error(
+                            &format!("Extension '{extension_name}' not found in configuration."),
+                            OutputLevel::Normal,
+                        );
+                        return Ok(());
+                    }
                 }
-                None => {
-                    print_error(
-                        &format!("Extension '{extension_name}' not found in configuration."),
-                        OutputLevel::Normal,
-                    );
-                    return Ok(());
-                }
-            }
-        } else {
-            // No extension specified - install all local extensions
-            match parsed.get("extensions") {
-                Some(ext_section) => match ext_section.as_mapping() {
-                    Some(table) => table
-                        .keys()
-                        .filter_map(|k| {
-                            k.as_str().map(|s| {
-                                (
-                                    s.to_string(),
-                                    ExtensionLocation::Local {
-                                        name: s.to_string(),
-                                        config_path: self.config_path.clone(),
-                                    },
-                                )
+            } else {
+                // No extension specified - install all local extensions
+                match parsed.get("extensions") {
+                    Some(ext_section) => match ext_section.as_mapping() {
+                        Some(table) => table
+                            .keys()
+                            .filter_map(|k| {
+                                k.as_str().map(|s| {
+                                    (
+                                        s.to_string(),
+                                        ExtensionLocation::Local {
+                                            name: s.to_string(),
+                                            config_path: self.config_path.clone(),
+                                        },
+                                    )
+                                })
                             })
-                        })
-                        .collect(),
-                    None => vec![],
-                },
-                None => {
-                    print_info("No extensions found in configuration.", OutputLevel::Normal);
-                    return Ok(());
+                            .collect(),
+                        None => vec![],
+                    },
+                    None => {
+                        print_info("No extensions found in configuration.", OutputLevel::Normal);
+                        return Ok(());
+                    }
                 }
-            }
-        };
+            };
 
         if extensions_to_install.is_empty() {
             print_info("No extensions found in configuration.", OutputLevel::Normal);
@@ -386,7 +374,7 @@ impl ExtInstallCommand {
         parsed: &serde_yaml::Value,
         extension: &str,
         ext_location: &ExtensionLocation,
-        config: &Config,
+        _config: &Config,
         target: &str,
         lock_file: &mut LockFile,
     ) -> bool {
@@ -403,11 +391,6 @@ impl ExtInstallCommand {
                 .get("extensions")
                 .and_then(|ext| ext.get(extension))
                 .cloned(),
-            #[allow(deprecated)]
-            ExtensionLocation::External { config_path, .. } => config
-                .get_merged_ext_config(extension, target, config_path)
-                .ok()
-                .flatten(),
         };
 
         let config_names: HashSet<String> = ext_config
@@ -560,11 +543,6 @@ impl ExtInstallCommand {
                     .get("extensions")
                     .and_then(|ext| ext.get(extension))
                     .cloned()
-            }
-            #[allow(deprecated)]
-            ExtensionLocation::External { config_path, .. } => {
-                // For deprecated external configs, read from the file
-                config.get_merged_ext_config(extension, target, config_path)?
             }
         };
 

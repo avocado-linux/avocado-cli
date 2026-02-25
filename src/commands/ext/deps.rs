@@ -1,12 +1,9 @@
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
-use crate::utils::output::{print_error, print_info, OutputLevel};
+use crate::utils::config::{ComposedConfig, Config};
+use crate::utils::output::{print_error, OutputLevel};
 use crate::utils::target::resolve_target_required;
 
 pub struct ExtDepsCommand {
@@ -67,17 +64,7 @@ impl ExtDepsCommand {
                     extension_name,
                     target,
                 )? {
-                    Some(location) => {
-                        if let ExtensionLocation::External { name, config_path } = &location {
-                            print_info(
-                                &format!(
-                                    "Found external extension '{name}' in config '{config_path}'"
-                                ),
-                                OutputLevel::Normal,
-                            );
-                        }
-                        Ok(vec![extension_name.clone()])
-                    }
+                    Some(_location) => Ok(vec![extension_name.clone()]),
                     None => {
                         self.print_extension_not_found(extension_name);
                         Err(anyhow::anyhow!("Extension not found"))

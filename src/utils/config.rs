@@ -93,14 +93,9 @@ mod container_args_deserializer {
 
 /// Represents the location of an extension
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum ExtensionLocation {
     /// Extension defined in the main config file
     Local { name: String, config_path: String },
-    /// DEPRECATED: Extension from an external config file
-    /// Use source: path in the extensions section instead
-    #[deprecated(since = "0.23.0", note = "Use Local with source: path instead")]
-    External { name: String, config_path: String },
     /// Remote extension fetched from a source (package, git, or path)
     Remote {
         name: String,

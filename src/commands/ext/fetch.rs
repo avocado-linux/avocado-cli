@@ -4,10 +4,12 @@
 //! and installs them to `$AVOCADO_PREFIX/includes/<ext_name>/`.
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionSource};
 use crate::utils::ext_fetch::ExtensionFetcher;
+use crate::utils::lockfile::{ExtensionSourceLock, LockFile};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
 
@@ -158,6 +160,17 @@ impl ExtFetchCommand {
         // Get the resolved src_dir for resolving relative extension paths
         let src_dir = config.get_resolved_src_dir(&self.config_path);
 
+        // Load lock file for version pinning
+        let lock_src_dir = src_dir.clone().unwrap_or_else(|| {
+            Path::new(&self.config_path)
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
+        let mut lock_file = LockFile::load(&lock_src_dir)
+            .with_context(|| "Failed to load lock file")?;
+        let mut lock_file_dirty = false;
+
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
             target.clone(),
@@ -187,12 +200,35 @@ impl ExtFetchCommand {
                 continue;
             }
 
+            // For package-type sources, use locked version if available
+            let effective_source = if let ExtensionSource::Package {
+                version,
+                package,
+                repo_name,
+                include,
+            } = source
+            {
+                let effective_version = lock_file
+                    .get_extension_source(&target, ext_name)
+                    .and_then(|s| s.version.as_deref())
+                    .unwrap_or(version.as_str())
+                    .to_string();
+                ExtensionSource::Package {
+                    version: effective_version,
+                    package: package.clone(),
+                    repo_name: repo_name.clone(),
+                    include: include.clone(),
+                }
+            } else {
+                source.clone()
+            };
+
             print_info(
                 &format!("Fetching extension '{ext_name}'..."),
                 OutputLevel::Normal,
             );
 
-            match fetcher.fetch(ext_name, source, &extensions_dir).await {
+            match fetcher.fetch(ext_name, &effective_source, &extensions_dir).await {
                 Ok(install_path) => {
                     print_success(
                         &format!(
@@ -201,6 +237,28 @@ impl ExtFetchCommand {
                         ),
                         OutputLevel::Normal,
                     );
+
+                    // Record source metadata in lock file for package-type extensions
+                    if let ExtensionSource::Package {
+                        version, package, ..
+                    } = &effective_source
+                    {
+                        let pkg_name = package
+                            .as_deref()
+                            .unwrap_or(ext_name)
+                            .to_string();
+                        lock_file.set_extension_source(
+                            &target,
+                            ext_name,
+                            ExtensionSourceLock {
+                                source_type: "package".to_string(),
+                                package: Some(pkg_name),
+                                version: Some(version.clone()),
+                            },
+                        );
+                        lock_file_dirty = true;
+                    }
+
                     fetched_count += 1;
                 }
                 Err(e) => {
@@ -209,6 +267,13 @@ impl ExtFetchCommand {
                     ));
                 }
             }
+        }
+
+        // Save lock file if we recorded any source metadata
+        if lock_file_dirty {
+            lock_file
+                .save(&lock_src_dir)
+                .with_context(|| "Failed to save lock file")?;
         }
 
         // Summary
