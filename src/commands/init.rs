@@ -544,7 +544,7 @@ impl InitCommand {
                                 println!("  Downloading {relative_path}...");
                                 // Check if this file should be executable based on its mode
                                 let is_executable = file_modes
-                                    .get(&item.path)
+                                    .get(relative_path)
                                     .map(|mode| mode == "100755")
                                     .unwrap_or(false);
                                 Self::download_file(download_url, &local_path, is_executable)
@@ -1384,5 +1384,57 @@ mod tests {
             "avocado-linux",
             "avocado-os"
         ));
+    }
+
+    #[test]
+    fn test_file_modes_lookup_uses_relative_path() {
+        // Simulate how fetch_file_modes stores keys when called with
+        // path = "references/rubicon". It strips the prefix, so keys are relative.
+        let mut file_modes = HashMap::new();
+        file_modes.insert(
+            "overlay/usr/lib/rubicon/rubicon-usb-gadget-setup".to_string(),
+            "100755".to_string(),
+        );
+        file_modes.insert("avocado.yaml".to_string(), "100644".to_string());
+
+        // Simulate how download_reference_contents processes an item.
+        // item.path from GitHub API includes the full path:
+        let item_path = "references/rubicon/overlay/usr/lib/rubicon/rubicon-usb-gadget-setup";
+        let reference_name = "rubicon";
+
+        // This is how relative_path is computed (lines 498-503):
+        let relative_path = item_path
+            .strip_prefix(&format!("{REFERENCES_PATH}/"))
+            .unwrap_or(item_path)
+            .strip_prefix(&format!("{reference_name}/"))
+            .unwrap_or(item_path);
+
+        // The fix: lookup with relative_path MUST find the executable mode
+        assert_eq!(
+            file_modes.get(relative_path).map(|m| m.as_str()),
+            Some("100755"),
+            "file_modes.get(relative_path) should find the entry"
+        );
+
+        // The old code used item.path directly - prove it was broken
+        assert_eq!(
+            file_modes.get(item_path).map(|m| m.as_str()),
+            None,
+            "file_modes.get(item.path) should NOT find the entry (this was the bug)"
+        );
+
+        // Also verify a non-executable file
+        let item_path_yaml = "references/rubicon/avocado.yaml";
+        let relative_path_yaml = item_path_yaml
+            .strip_prefix(&format!("{REFERENCES_PATH}/"))
+            .unwrap_or(item_path_yaml)
+            .strip_prefix(&format!("{reference_name}/"))
+            .unwrap_or(item_path_yaml);
+
+        let is_executable = file_modes
+            .get(relative_path_yaml)
+            .map(|mode| mode == "100755")
+            .unwrap_or(false);
+        assert!(!is_executable, "avocado.yaml should not be executable");
     }
 }
