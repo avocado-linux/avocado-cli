@@ -318,6 +318,23 @@ impl ExtImageCommand {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_else(|| vec!["sysext", "confext"]);
 
+        // Get filesystem type (defaults to "squashfs")
+        let filesystem = ext_config
+            .get("filesystem")
+            .and_then(|v| v.as_str())
+            .unwrap_or("squashfs");
+
+        match filesystem {
+            "squashfs" | "erofs" => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Extension '{}' has invalid filesystem type '{}'. Must be 'squashfs' or 'erofs'.",
+                    self.extension,
+                    other
+                ));
+            }
+        }
+
         // Use resolved target (from CLI/env) if available, otherwise fall back to config
         let _config_target = parsed
             .get("runtimes")
@@ -361,6 +378,7 @@ impl ExtImageCommand {
                 repo_release.as_ref(),
                 &merged_container_args,
                 source_date_epoch,
+                filesystem,
             )
             .await?;
 
@@ -431,9 +449,11 @@ impl ExtImageCommand {
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
         source_date_epoch: u64,
+        filesystem: &str,
     ) -> Result<bool> {
         // Create the build script
-        let build_script = self.create_build_script(ext_version, extension_type, source_date_epoch);
+        let build_script =
+            self.create_build_script(ext_version, extension_type, source_date_epoch, filesystem);
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -465,7 +485,28 @@ impl ExtImageCommand {
         ext_version: &str,
         _extension_type: &str,
         source_date_epoch: u64,
+        filesystem: &str,
     ) -> String {
+        let mkfs_command = match filesystem {
+            "erofs" => r#"# Create erofs image
+mkfs.erofs \
+  -T "$SOURCE_DATE_EPOCH" \
+  -U 00000000-0000-0000-0000-000000000000 \
+  -x -1 \
+  --all-root \
+  "$OUTPUT_FILE" \
+  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME""#
+                .to_string(),
+            _ => r#"# Create squashfs image
+mksquashfs \
+  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
+  "$OUTPUT_FILE" \
+  -noappend \
+  -no-xattrs \
+  -reproducible"#
+                .to_string(),
+        };
+
         format!(
             r#"
 set -e
@@ -491,20 +532,14 @@ fi
 # Ensure reproducible timestamps
 export SOURCE_DATE_EPOCH={source_date_epoch}
 
-# Create erofs image
-mkfs.erofs \
-  -T "$SOURCE_DATE_EPOCH" \
-  -U 00000000-0000-0000-0000-000000000000 \
-  -x -1 \
-  --all-root \
-  "$OUTPUT_FILE" \
-  "$AVOCADO_EXT_SYSROOTS/$EXT_NAME"
+{mkfs_command}
 
 echo "Created extension image: $OUTPUT_FILE"
 "#,
             self.extension,
             ext_version,
-            source_date_epoch = source_date_epoch
+            source_date_epoch = source_date_epoch,
+            mkfs_command = mkfs_command,
         )
     }
 
@@ -556,9 +591,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_build_script_contains_reproducible_flags() {
+    fn test_create_build_script_erofs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0);
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs");
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -579,9 +614,48 @@ mod tests {
     }
 
     #[test]
+    fn test_create_build_script_squashfs_contains_reproducible_flags() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs");
+
+        assert!(
+            script.contains("mksquashfs"),
+            "script should invoke mksquashfs"
+        );
+        assert!(
+            script.contains("-noappend"),
+            "script should include -noappend flag"
+        );
+        assert!(
+            script.contains("-no-xattrs"),
+            "script should include -no-xattrs flag"
+        );
+        assert!(
+            script.contains("-reproducible"),
+            "script should include -reproducible flag"
+        );
+        assert!(
+            !script.contains("mkfs.erofs"),
+            "script should not invoke mkfs.erofs"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_defaults_to_squashfs() {
+        let cmd = make_cmd("my-ext");
+        // Passing "squashfs" simulates the default behavior
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs");
+
+        assert!(
+            script.contains("mksquashfs"),
+            "default filesystem should use mksquashfs"
+        );
+    }
+
+    #[test]
     fn test_create_build_script_source_date_epoch_default() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0);
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs");
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=0"),
@@ -596,7 +670,7 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_custom() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 1700000000);
+        let script = cmd.create_build_script("1.0.0", "sysext", 1700000000, "erofs");
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=1700000000"),
@@ -611,7 +685,7 @@ mod tests {
     #[test]
     fn test_create_build_script_extension_name_and_version() {
         let cmd = make_cmd("test-extension");
-        let script = cmd.create_build_script("2.3.4", "sysext", 0);
+        let script = cmd.create_build_script("2.3.4", "sysext", 0, "squashfs");
 
         assert!(
             script.contains("EXT_NAME=\"test-extension\""),
@@ -626,7 +700,7 @@ mod tests {
     #[test]
     fn test_create_build_script_output_path() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0);
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs");
 
         assert!(
             script.contains("OUTPUT_FILE=\"$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw\""),
