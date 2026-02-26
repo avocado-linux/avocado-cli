@@ -167,8 +167,8 @@ impl ExtFetchCommand {
                 .unwrap_or(Path::new("."))
                 .to_path_buf()
         });
-        let mut lock_file = LockFile::load(&lock_src_dir)
-            .with_context(|| "Failed to load lock file")?;
+        let mut lock_file =
+            LockFile::load(&lock_src_dir).with_context(|| "Failed to load lock file")?;
         let mut lock_file_dirty = false;
 
         let fetcher = ExtensionFetcher::new(
@@ -228,7 +228,10 @@ impl ExtFetchCommand {
                 OutputLevel::Normal,
             );
 
-            match fetcher.fetch(ext_name, &effective_source, &extensions_dir).await {
+            match fetcher
+                .fetch(ext_name, &effective_source, &extensions_dir)
+                .await
+            {
                 Ok(install_path) => {
                     print_success(
                         &format!(
@@ -243,10 +246,7 @@ impl ExtFetchCommand {
                         version, package, ..
                     } = &effective_source
                     {
-                        let pkg_name = package
-                            .as_deref()
-                            .unwrap_or(ext_name)
-                            .to_string();
+                        let pkg_name = package.as_deref().unwrap_or(ext_name).to_string();
                         lock_file.set_extension_source(
                             &target,
                             ext_name,

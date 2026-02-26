@@ -47,6 +47,7 @@ pub enum StampCommand {
     Image,
     Sign,
     Provision,
+    CompileDeps,
 }
 
 impl fmt::Display for StampCommand {
@@ -57,6 +58,7 @@ impl fmt::Display for StampCommand {
             StampCommand::Image => write!(f, "image"),
             StampCommand::Sign => write!(f, "sign"),
             StampCommand::Provision => write!(f, "provision"),
+            StampCommand::CompileDeps => write!(f, "compile-deps"),
         }
     }
 }
@@ -174,6 +176,21 @@ impl Stamp {
     pub fn sdk_install(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
         Self::new(
             StampCommand::Install,
+            StampComponent::Sdk,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Create compile-deps install stamp
+    ///
+    /// Tracks the target-sysroot compile dependencies installation.
+    /// Stored under `sdk/{host_arch}/compile-deps.stamp`.
+    pub fn compile_deps_install(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::CompileDeps,
             StampComponent::Sdk,
             None,
             target.to_string(),
@@ -380,6 +397,21 @@ impl StampRequirement {
         }
     }
 
+    /// Compile-deps install requirement for the local host architecture
+    pub fn compile_deps_install() -> Self {
+        Self::compile_deps_install_for_arch(get_local_arch())
+    }
+
+    /// Compile-deps install requirement for a specific host architecture
+    pub fn compile_deps_install_for_arch(arch: &str) -> Self {
+        Self {
+            command: StampCommand::CompileDeps,
+            component: StampComponent::Sdk,
+            component_name: None,
+            host_arch: Some(arch.to_string()),
+        }
+    }
+
     /// Extension install requirement
     pub fn ext_install(name: &str) -> Self {
         Self::new(StampCommand::Install, StampComponent::Extension, Some(name))
@@ -469,7 +501,8 @@ impl StampRequirement {
     /// Suggested fix command with optional remote host for --runs-on
     pub fn fix_command_with_remote(&self, runs_on: Option<&str>) -> String {
         match (&self.component, &self.component_name, &self.command) {
-            (StampComponent::Sdk, _, StampCommand::Install) => match runs_on {
+            (StampComponent::Sdk, _, StampCommand::Install)
+            | (StampComponent::Sdk, _, StampCommand::CompileDeps) => match runs_on {
                 Some(remote) => format!("avocado sdk install --runs-on {remote}"),
                 None => "avocado sdk install".to_string(),
             },
@@ -710,6 +743,51 @@ pub fn compute_sdk_input_hash(config: &serde_yaml::Value) -> Result<StampInputs>
 
 /// Compute input hash for extension install
 /// Includes: ext.<name>.dependencies
+/// Compute input hash for compile-deps install
+///
+/// Includes the sorted set of active compile section names and their packages.
+/// When active runtimes change, the set of active compile sections changes,
+/// causing this hash to change and the stamp to become stale.
+pub fn compute_compile_deps_input_hash(
+    config: &serde_yaml::Value,
+    active_compile_sections: &[String],
+) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+
+    // Include sorted list of active compile section names
+    let sections_value = serde_yaml::Value::Sequence(
+        active_compile_sections
+            .iter()
+            .map(|s| serde_yaml::Value::String(s.clone()))
+            .collect(),
+    );
+    hash_data.insert(
+        serde_yaml::Value::String("active_compile_sections".to_string()),
+        sections_value,
+    );
+
+    // Include the packages from each active compile section
+    if let Some(sdk) = config.get("sdk") {
+        if let Some(compile) = sdk.get("compile") {
+            for section_name in active_compile_sections {
+                if let Some(section) = compile.get(section_name) {
+                    if let Some(packages) = section.get("packages") {
+                        hash_data.insert(
+                            serde_yaml::Value::String(format!(
+                                "sdk.compile.{section_name}.packages"
+                            )),
+                            packages.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
 pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -945,9 +1023,19 @@ pub fn resolve_required_stamps_for_arch(
         None => StampRequirement::sdk_install(),
     };
 
+    let compile_deps_install = || match host_arch {
+        Some(arch) => StampRequirement::compile_deps_install_for_arch(arch),
+        None => StampRequirement::compile_deps_install(),
+    };
+
     match (cmd, component) {
         // SDK install has no dependencies
         (StampCommand::Install, StampComponent::Sdk) => vec![],
+
+        // Compile-deps install requires SDK install
+        (StampCommand::CompileDeps, StampComponent::Sdk) => {
+            vec![sdk_install()]
+        }
 
         // Extension install requires SDK install
         (StampCommand::Install, StampComponent::Extension) => {
@@ -959,28 +1047,34 @@ pub fn resolve_required_stamps_for_arch(
             vec![sdk_install()]
         }
 
-        // Extension build requires SDK install + own extension install
+        // Extension build requires SDK install + compile-deps + own extension install
         (StampCommand::Build, StampComponent::Extension) => {
             let ext_name = component_name.expect("Extension name required");
-            vec![sdk_install(), StampRequirement::ext_install(ext_name)]
+            vec![
+                sdk_install(),
+                compile_deps_install(),
+                StampRequirement::ext_install(ext_name),
+            ]
         }
 
-        // Extension image requires SDK install + own extension install + own extension build
+        // Extension image requires SDK install + compile-deps + own extension install + own extension build
         (StampCommand::Image, StampComponent::Extension) => {
             let ext_name = component_name.expect("Extension name required");
             vec![
                 sdk_install(),
+                compile_deps_install(),
                 StampRequirement::ext_install(ext_name),
                 StampRequirement::ext_build(ext_name),
             ]
         }
 
-        // Runtime build requires SDK + own install + ALL extension deps (install AND build)
+        // Runtime build requires SDK + compile-deps + own install + ALL extension deps (install AND build)
         // Note: This doesn't distinguish versioned extensions - use resolve_required_stamps_detailed
         (StampCommand::Build, StampComponent::Runtime) => {
             let runtime_name = component_name.expect("Runtime name required");
             let mut reqs = vec![
                 sdk_install(),
+                compile_deps_install(),
                 StampRequirement::runtime_install(runtime_name),
             ];
 
@@ -1041,7 +1135,16 @@ pub fn resolve_required_stamps_for_runtime_build_with_arch(
         None => StampRequirement::sdk_install(),
     };
 
-    let mut reqs = vec![sdk_install, StampRequirement::runtime_install(runtime_name)];
+    let compile_deps_install = match host_arch {
+        Some(arch) => StampRequirement::compile_deps_install_for_arch(arch),
+        None => StampRequirement::compile_deps_install(),
+    };
+
+    let mut reqs = vec![
+        sdk_install,
+        compile_deps_install,
+        StampRequirement::runtime_install(runtime_name),
+    ];
 
     // All extensions now require install + build + image stamps
     // Extension source configuration (repo, git, path) is defined in the ext section
@@ -1260,16 +1363,17 @@ mod tests {
 
     #[test]
     fn test_resolve_required_stamps_ext_build() {
-        // Extension build requires SDK install + own extension install
+        // Extension build requires SDK install + compile-deps + own extension install
         let reqs = resolve_required_stamps(
             StampCommand::Build,
             StampComponent::Extension,
             Some("my-ext"),
             &[],
         );
-        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs.len(), 3);
         assert_eq!(reqs[0], StampRequirement::sdk_install());
-        assert_eq!(reqs[1], StampRequirement::ext_install("my-ext"));
+        assert_eq!(reqs[1], StampRequirement::compile_deps_install());
+        assert_eq!(reqs[2], StampRequirement::ext_install("my-ext"));
     }
 
     #[test]
@@ -1296,14 +1400,15 @@ mod tests {
             &ext_deps,
         );
 
-        // Should have: SDK install, runtime install, ext-a install, ext-a build, ext-b install, ext-b build
-        assert_eq!(reqs.len(), 6);
+        // Should have: SDK install, compile-deps, runtime install, ext-a install, ext-a build, ext-b install, ext-b build
+        assert_eq!(reqs.len(), 7);
         assert_eq!(reqs[0], StampRequirement::sdk_install());
-        assert_eq!(reqs[1], StampRequirement::runtime_install("my-runtime"));
-        assert_eq!(reqs[2], StampRequirement::ext_install("ext-a"));
-        assert_eq!(reqs[3], StampRequirement::ext_build("ext-a"));
-        assert_eq!(reqs[4], StampRequirement::ext_install("ext-b"));
-        assert_eq!(reqs[5], StampRequirement::ext_build("ext-b"));
+        assert_eq!(reqs[1], StampRequirement::compile_deps_install());
+        assert_eq!(reqs[2], StampRequirement::runtime_install("my-runtime"));
+        assert_eq!(reqs[3], StampRequirement::ext_install("ext-a"));
+        assert_eq!(reqs[4], StampRequirement::ext_build("ext-a"));
+        assert_eq!(reqs[5], StampRequirement::ext_install("ext-b"));
+        assert_eq!(reqs[6], StampRequirement::ext_build("ext-b"));
     }
 
     #[test]
@@ -1458,15 +1563,17 @@ mod tests {
 
         // Should have:
         // - SDK install (1)
+        // - compile-deps install (1)
         // - Runtime install (1)
         // - app install + build + image (3)
         // - config-dev install + build + image (3)
         // - avocado-ext-dev install + build + image (3)
-        // Total: 11
-        assert_eq!(reqs.len(), 11);
+        // Total: 12
+        assert_eq!(reqs.len(), 12);
 
-        // Verify SDK and runtime install are present
+        // Verify SDK, compile-deps, and runtime install are present
         assert!(reqs.contains(&StampRequirement::sdk_install()));
+        assert!(reqs.contains(&StampRequirement::compile_deps_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("my-runtime")));
 
         // Verify all extensions have install, build, and image
@@ -1497,11 +1604,12 @@ mod tests {
 
         // Should have:
         // - SDK install (1)
+        // - compile-deps install (1)
         // - Runtime install (1)
         // - app install + build + image (3)
         // - config-dev install + build + image (3)
-        // Total: 8
-        assert_eq!(reqs.len(), 8);
+        // Total: 9
+        assert_eq!(reqs.len(), 9);
 
         // Verify local extensions require install, build, and image
         assert!(reqs.contains(&StampRequirement::ext_install("app")));
@@ -1521,10 +1629,11 @@ mod tests {
             Some("my-ext"),
             &[],
         );
-        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs.len(), 4);
         assert_eq!(reqs[0], StampRequirement::sdk_install());
-        assert_eq!(reqs[1], StampRequirement::ext_install("my-ext"));
-        assert_eq!(reqs[2], StampRequirement::ext_build("my-ext"));
+        assert_eq!(reqs[1], StampRequirement::compile_deps_install());
+        assert_eq!(reqs[2], StampRequirement::ext_install("my-ext"));
+        assert_eq!(reqs[3], StampRequirement::ext_build("my-ext"));
     }
 
     #[test]
@@ -1556,9 +1665,10 @@ mod tests {
 
         let reqs = resolve_required_stamps_for_runtime_build("minimal-runtime", &ext_deps);
 
-        // Should ONLY have SDK install + runtime install
-        assert_eq!(reqs.len(), 2);
+        // Should have SDK install + compile-deps + runtime install
+        assert_eq!(reqs.len(), 3);
         assert!(reqs.contains(&StampRequirement::sdk_install()));
+        assert!(reqs.contains(&StampRequirement::compile_deps_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("minimal-runtime")));
     }
 
