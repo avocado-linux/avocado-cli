@@ -229,7 +229,7 @@ impl ExtFetchCommand {
             );
 
             match fetcher
-                .fetch(ext_name, &effective_source, &extensions_dir)
+                .fetch(ext_name, &effective_source, &extensions_dir, self.force)
                 .await
             {
                 Ok(install_path) => {
