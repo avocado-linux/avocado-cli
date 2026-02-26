@@ -171,6 +171,7 @@ impl ExtensionFetcher {
         ext_name: &str,
         source: &ExtensionSource,
         install_dir: &Path,
+        force: bool,
     ) -> Result<PathBuf> {
         let ext_install_path = install_dir.join(ext_name);
 
@@ -187,6 +188,7 @@ impl ExtensionFetcher {
                     package.as_deref(),
                     repo_name.as_deref(),
                     &ext_install_path,
+                    force,
                 )
                 .await?;
             }
@@ -215,6 +217,10 @@ impl ExtensionFetcher {
     }
 
     /// Fetch an extension from the avocado package repository
+    ///
+    /// Installs the extension package into a per-extension installroot at
+    /// `$AVOCADO_PREFIX/includes/<ext_name>` using DNF with `--installroot`.
+    /// This gives proper RPM tracking, clean upgrades, and version management.
     async fn fetch_from_repo(
         &self,
         ext_name: &str,
@@ -222,6 +228,7 @@ impl ExtensionFetcher {
         package: Option<&str>,
         repo_name: Option<&str>,
         _install_path: &Path, // Host path - not used, we use container path instead
+        force: bool,
     ) -> Result<()> {
         // Use explicit package name if provided, otherwise fall back to extension name
         let package_name = package.unwrap_or(ext_name);
@@ -242,54 +249,39 @@ impl ExtensionFetcher {
             format!("{package_name}-{version}")
         };
 
-        // Build the DNF command to download and extract the package
-        // We use --downloadonly and then extract the RPM contents
         let repo_arg = repo_name.map(|r| format!("--repo={r}")).unwrap_or_default();
 
-        // Use container path $AVOCADO_PREFIX/includes/<ext_name> instead of host path
-        // This ensures the directory is created inside the container with proper permissions
-        let container_install_path = format!("$AVOCADO_PREFIX/includes/{ext_name}");
+        // Use container path $AVOCADO_PREFIX/includes/<ext_name> as the installroot
+        let installroot = format!("$AVOCADO_PREFIX/includes/{ext_name}");
 
-        // The fetch script downloads the package and extracts it to the install path
-        // Use $DNF_SDK_HOST with $DNF_SDK_COMBINED_REPO_CONF to access target-specific repos
+        // Force mode: clean the installroot for a fresh install
+        let force_clean = if force {
+            format!(r#"rm -rf "{installroot}""#)
+        } else {
+            String::new()
+        };
+
+        // Install the extension package using DNF with --installroot
+        // Uses $DNF_SDK_COMBINED_REPO_CONF to access both SDK and target-specific repos
         let fetch_script = format!(
             r#"
 set -e
 
-# Create temp directory for download
-TMPDIR=$(mktemp -d)
+{force_clean}
 
-# Download the extension package using SDK DNF with combined repo config
-# This includes both SDK repos and target-specific repos (like $AVOCADO_TARGET-ext)
+# Install the extension package into the per-extension installroot
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_COMBINED_REPO_CONF \
     {repo_arg} \
-    --downloadonly \
-    --downloaddir="$TMPDIR" \
+    --installroot={installroot} \
     -y \
     install \
     {package_spec}
 
-# Find the downloaded RPM
-RPM_FILE=$(ls -1 "$TMPDIR"/*.rpm 2>/dev/null | head -1)
-if [ -z "$RPM_FILE" ]; then
-    echo "ERROR: Failed to download package '{package_spec}' for extension '{ext_name}'"
-    exit 1
-fi
-
-# Extract RPM contents to install path (using container path)
-# The package root / maps to the extension's src_dir
-mkdir -p "{container_install_path}"
-cd "{container_install_path}"
-rpm2cpio "$RPM_FILE" | cpio -idmv
-
-echo "Successfully fetched extension '{ext_name}' (package: {package_spec}) to {container_install_path}"
-
-# Cleanup
-rm -rf "$TMPDIR"
+echo "Successfully fetched extension '{ext_name}' (package: {package_spec}) to {installroot}"
 "#
         );
 
@@ -534,5 +526,51 @@ mod tests {
         let result =
             ExtensionFetcher::is_extension_installed(Path::new("/nonexistent"), "test-ext");
         assert!(!result);
+    }
+
+    #[test]
+    fn test_is_extension_installed_with_config() {
+        let tmp_dir = std::env::temp_dir().join("avocado_test_ext_installed");
+        let ext_dir = tmp_dir.join("my-ext");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&ext_dir).unwrap();
+
+        // Directory exists but no config file -> not installed
+        assert!(!ExtensionFetcher::is_extension_installed(
+            &tmp_dir, "my-ext"
+        ));
+
+        // Add avocado.yaml -> installed
+        std::fs::write(ext_dir.join("avocado.yaml"), "version: '1.0.0'").unwrap();
+        assert!(ExtensionFetcher::is_extension_installed(&tmp_dir, "my-ext"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_extension_path_state_roundtrip() {
+        let tmp_dir = std::env::temp_dir().join("avocado_test_path_state");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut state = ExtensionPathState::default();
+        state.add_path_mount("ext-a".to_string(), PathBuf::from("/path/to/ext-a"));
+        state.add_path_mount("ext-b".to_string(), PathBuf::from("/path/to/ext-b"));
+        state.save_to_dir(&tmp_dir).unwrap();
+
+        let loaded = ExtensionPathState::load_from_dir(&tmp_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.path_mounts.len(), 2);
+        assert_eq!(
+            loaded.path_mounts.get("ext-a").unwrap(),
+            &PathBuf::from("/path/to/ext-a")
+        );
+        assert_eq!(
+            loaded.path_mounts.get("ext-b").unwrap(),
+            &PathBuf::from("/path/to/ext-b")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
