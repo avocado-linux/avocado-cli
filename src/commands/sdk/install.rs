@@ -6,14 +6,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::utils::{
-    config::{ComposedConfig, Config},
+    config::{find_active_compile_sections, find_active_extensions, ComposedConfig, Config},
     container::{normalize_sdk_arch, RunConfig, SdkContainer},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
     stamps::{
-        compute_sdk_input_hash, generate_write_sdk_stamp_script_dynamic_arch,
-        generate_write_stamp_script, get_local_arch, Stamp, StampOutputs,
+        compute_compile_deps_input_hash, compute_sdk_input_hash,
+        generate_write_sdk_stamp_script_dynamic_arch, generate_write_stamp_script, get_local_arch,
+        Stamp, StampOutputs,
     },
     target::validate_and_log_target,
 };
@@ -117,6 +118,15 @@ impl SdkInstallCommand {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
         })?;
 
+        // Determine which extensions are active for this target based on runtime configuration
+        let active_extensions = find_active_extensions(
+            config,
+            &composed.merged_value,
+            &target,
+            &composed.config_path,
+            None,
+        )?;
+
         print_info("Installing SDK dependencies.", OutputLevel::Normal);
 
         // Get SDK dependencies from the composed config (already has external deps merged)
@@ -159,6 +169,7 @@ impl SdkInstallCommand {
                 &container_helper,
                 merged_container_args.as_ref(),
                 runs_on_context.as_ref(),
+                &active_extensions,
             )
             .await;
 
@@ -179,16 +190,24 @@ impl SdkInstallCommand {
     ///
     /// This discovers extensions with a `source` field and fetches them
     /// using the SDK environment where repos are already configured.
+    /// Only fetches extensions that are in the active_extensions set.
     async fn fetch_remote_extensions_in_sdk(
         &self,
         target: &str,
         merged_container_args: Option<&Vec<String>>,
+        active_extensions: &std::collections::HashSet<String>,
     ) -> Result<()> {
         use crate::commands::ext::ExtFetchCommand;
 
         // Discover remote extensions (with target interpolation for extension names)
-        let remote_extensions =
+        let all_remote_extensions =
             Config::discover_remote_extensions(&self.config_path, Some(target))?;
+
+        // Filter to only extensions referenced by active runtimes
+        let remote_extensions: Vec<_> = all_remote_extensions
+            .into_iter()
+            .filter(|(name, _)| active_extensions.contains(name))
+            .collect();
 
         if remote_extensions.is_empty() {
             return Ok(());
@@ -202,23 +221,25 @@ impl SdkInstallCommand {
             OutputLevel::Normal,
         );
 
-        // Use ExtFetchCommand to fetch extensions with SDK environment
-        let mut fetch_cmd = ExtFetchCommand::new(
-            self.config_path.clone(),
-            None, // Fetch all remote extensions
-            self.verbose,
-            false, // Don't force re-fetch
-            Some(target.to_string()),
-            merged_container_args.cloned(),
-        )
-        .with_sdk_arch(self.sdk_arch.clone());
+        // Fetch each active remote extension individually
+        for (ext_name, _source) in &remote_extensions {
+            let mut fetch_cmd = ExtFetchCommand::new(
+                self.config_path.clone(),
+                Some(ext_name.clone()),
+                self.verbose,
+                false, // Don't force re-fetch
+                Some(target.to_string()),
+                merged_container_args.cloned(),
+            )
+            .with_sdk_arch(self.sdk_arch.clone());
 
-        // Pass through the runs_on context for remote execution
-        if let Some(runs_on) = &self.runs_on {
-            fetch_cmd = fetch_cmd.with_runs_on(runs_on.clone(), self.nfs_port);
+            // Pass through the runs_on context for remote execution
+            if let Some(runs_on) = &self.runs_on {
+                fetch_cmd = fetch_cmd.with_runs_on(runs_on.clone(), self.nfs_port);
+            }
+
+            fetch_cmd.execute().await?;
         }
-
-        fetch_cmd.execute().await?;
 
         Ok(())
     }
@@ -236,6 +257,7 @@ impl SdkInstallCommand {
         container_helper: &SdkContainer,
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
+        initial_active_extensions: &std::collections::HashSet<String>,
     ) -> Result<()> {
         // Determine host architecture for SDK package tracking
         // Priority: sdk_arch (for cross-arch emulation) > runs_on remote arch > local arch
@@ -633,25 +655,43 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
         }
 
         // Fetch remote extensions now that SDK repos are available
-        // This uses the SDK environment with configured repos to download extension packages
-        self.fetch_remote_extensions_in_sdk(target, merged_container_args)
-            .await?;
+        // Only fetch extensions that are referenced by active runtimes
+        self.fetch_remote_extensions_in_sdk(
+            target,
+            merged_container_args,
+            initial_active_extensions,
+        )
+        .await?;
 
         // Reload composed config to include extension configs
         let composed = Config::load_composed(&self.config_path, Some(target))
             .with_context(|| "Failed to reload composed config after fetching extensions")?;
         let config = &composed.config;
 
-        // Re-compute extension SDK dependencies now that extension configs are available
+        // Re-compute active extensions after config reload (remote extension configs may be merged)
+        let active_extensions = find_active_extensions(
+            config,
+            &composed.merged_value,
+            target,
+            &self.config_path,
+            None,
+        )?;
+
+        // Re-compute extension SDK dependencies, filtered to only active extensions
         let config_content = serde_yaml::to_string(&composed.merged_value)
             .with_context(|| "Failed to serialize composed config")?;
-        let extension_sdk_dependencies = config
+        let all_extension_sdk_dependencies = config
             .get_extension_sdk_dependencies_with_config_path_and_target(
                 &config_content,
                 Some(&self.config_path),
                 Some(target),
             )
             .with_context(|| "Failed to parse extension SDK dependencies")?;
+        let extension_sdk_dependencies: HashMap<String, HashMap<String, serde_yaml::Value>> =
+            all_extension_sdk_dependencies
+                .into_iter()
+                .filter(|(ext_name, _)| active_extensions.contains(ext_name))
+                .collect();
 
         // After bootstrap, source environment-setup and configure SSL certs for subsequent commands
         if self.verbose {
@@ -918,24 +958,26 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             return Err(anyhow::anyhow!("Failed to install rootfs sysroot."));
         }
 
-        // Install target-sysroot if there are any sdk.compile sections defined
-        // (regardless of whether they have dependencies).
-        // This is needed for cross-compilation support.
-        // The composed config already has external extension compile sections merged in.
-        if config.has_compile_sections() {
-            // Aggregate all compile dependencies into a single list (with lock file support)
+        // Install target-sysroot if there are compile sections referenced by active extensions.
+        // Only install compile deps for extensions that are dependencies of active runtimes.
+        let active_compile_sections =
+            find_active_compile_sections(&composed.merged_value, &active_extensions);
+        if config.has_compile_sections() && !active_compile_sections.is_empty() {
+            // Aggregate compile dependencies only from active sections (with lock file support)
             let compile_dependencies = config.get_compile_dependencies();
             let mut all_compile_packages: Vec<String> = Vec::new();
             let mut all_compile_package_names: Vec<String> = Vec::new();
-            for dependencies in compile_dependencies.values() {
-                let packages = self.build_package_list_with_lock(
-                    dependencies,
-                    &lock_file,
-                    target,
-                    &SysrootType::TargetSysroot,
-                );
-                all_compile_packages.extend(packages);
-                all_compile_package_names.extend(self.extract_package_names(dependencies));
+            for section_name in &active_compile_sections {
+                if let Some(dependencies) = compile_dependencies.get(section_name) {
+                    let packages = self.build_package_list_with_lock(
+                        dependencies,
+                        &lock_file,
+                        target,
+                        &SysrootType::TargetSysroot,
+                    );
+                    all_compile_packages.extend(packages);
+                    all_compile_package_names.extend(self.extract_package_names(dependencies));
+                }
             }
 
             // Deduplicate packages
@@ -1056,6 +1098,67 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 return Err(anyhow::anyhow!(
                     "Failed to install target-sysroot with compile dependencies."
                 ));
+            }
+        }
+
+        // Write compile-deps stamp (unless --no-stamps)
+        // This tracks which compile dependencies are installed in the target-sysroot.
+        // When runtimes change, the active compile sections change, making this stamp stale.
+        if !self.no_stamps {
+            let compile_inputs =
+                compute_compile_deps_input_hash(&composed.merged_value, &active_compile_sections)?;
+
+            let stamp_script = if self.runs_on.is_some() {
+                // For remote execution, use dynamic arch detection
+                // Build the stamp JSON with a placeholder that gets replaced at runtime
+                let outputs = StampOutputs::default();
+                let stamp = Stamp::compile_deps_install("DYNAMIC_ARCH", compile_inputs, outputs);
+                let stamp_json = stamp.to_json()?;
+                // Replace the placeholder with dynamic arch detection
+                let stamp_json_escaped = stamp_json.replace('"', "\\\"");
+                format!(
+                    r#"
+HOST_ARCH=$(uname -m)
+STAMP_DIR="${{AVOCADO_PREFIX}}/.stamps/sdk/${{HOST_ARCH}}"
+mkdir -p "$STAMP_DIR"
+STAMP_JSON="{stamp_json_escaped}"
+STAMP_JSON=$(echo "$STAMP_JSON" | sed "s/DYNAMIC_ARCH/$HOST_ARCH/g")
+echo "$STAMP_JSON" > "$STAMP_DIR/compile-deps.stamp"
+echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
+"#
+                )
+            } else {
+                let outputs = StampOutputs::default();
+                let host_arch = get_local_arch();
+                let stamp = Stamp::compile_deps_install(host_arch, compile_inputs, outputs);
+                generate_write_stamp_script(&stamp)?
+            };
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                ..Default::default()
+            };
+
+            run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
+
+            if self.verbose {
+                print_info("Wrote compile-deps stamp.", OutputLevel::Normal);
             }
         }
 

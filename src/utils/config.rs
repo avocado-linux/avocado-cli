@@ -1595,7 +1595,7 @@ impl Config {
     ///
     /// Scans `ext.<ext_name>.dependencies` for entries with a `compile` key
     /// and returns the list of compile section names that should be auto-included.
-    fn find_compile_dependencies_in_ext(
+    pub fn find_compile_dependencies_in_ext(
         ext_config: &serde_yaml::Value,
         ext_name: &str,
     ) -> Vec<String> {
@@ -3504,6 +3504,136 @@ pub fn resolve_host_uid_gid(config: Option<&SdkConfig>) -> (u32, u32) {
 #[allow(dead_code)]
 pub fn load_config<P: AsRef<Path>>(config_path: P) -> Result<Config> {
     Config::load(config_path)
+}
+
+/// Find runtimes that are relevant for the specified target.
+///
+/// A runtime is relevant if:
+/// - It has a `target:` field matching the given target, OR
+/// - It has no `target:` field (matches all targets)
+///
+/// If `requested_runtime` is Some, only that runtime is considered.
+pub fn find_target_relevant_runtimes(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    target: &str,
+    config_path: &str,
+    requested_runtime: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut relevant_runtimes = Vec::new();
+
+    if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
+        for runtime_name_val in runtime_section.keys() {
+            if let Some(runtime_name) = runtime_name_val.as_str() {
+                // If a specific runtime is requested, only check that one
+                if let Some(requested) = requested_runtime {
+                    if runtime_name != requested {
+                        continue;
+                    }
+                }
+
+                // Check if this runtime is relevant for the target
+                let merged_runtime =
+                    config.get_merged_runtime_config(runtime_name, target, config_path)?;
+                if let Some(merged_value) = merged_runtime {
+                    if let Some(runtime_target) =
+                        merged_value.get("target").and_then(|t| t.as_str())
+                    {
+                        if runtime_target == target {
+                            relevant_runtimes.push(runtime_name.to_string());
+                        }
+                    } else {
+                        // No target specified - include for all targets
+                        relevant_runtimes.push(runtime_name.to_string());
+                    }
+                } else {
+                    // No merged config - check the base runtime config
+                    if let Some(runtime_config) = runtime_section.get(runtime_name_val) {
+                        if let Some(runtime_target) =
+                            runtime_config.get("target").and_then(|t| t.as_str())
+                        {
+                            if runtime_target == target {
+                                relevant_runtimes.push(runtime_name.to_string());
+                            }
+                        } else {
+                            relevant_runtimes.push(runtime_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(relevant_runtimes)
+}
+
+/// Find extensions that are active for the given target based on runtime configuration.
+///
+/// Returns the set of extension names that are referenced by runtimes matching the target.
+/// If no runtimes match the target, returns an empty set (nothing to install/build).
+pub fn find_active_extensions(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    target: &str,
+    config_path: &str,
+    requested_runtime: Option<&str>,
+) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    let mut active_extensions = HashSet::new();
+
+    let target_runtimes =
+        find_target_relevant_runtimes(config, parsed, target, config_path, requested_runtime)?;
+
+    if target_runtimes.is_empty() {
+        return Ok(active_extensions);
+    }
+
+    if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
+        for runtime_name in &target_runtimes {
+            if let Some(_runtime_config) = runtime_section.get(runtime_name.as_str()) {
+                let merged_runtime =
+                    config.get_merged_runtime_config(runtime_name, target, config_path)?;
+                if let Some(merged_value) = merged_runtime {
+                    if let Some(extensions_list) =
+                        merged_value.get("extensions").and_then(|e| e.as_sequence())
+                    {
+                        for ext_val in extensions_list {
+                            if let Some(ext_name) = ext_val.as_str() {
+                                active_extensions.insert(ext_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(active_extensions)
+}
+
+/// Find the set of sdk.compile section names that are referenced by active extensions.
+///
+/// This examines the `packages` section of each active extension for `compile:` references,
+/// returning only the compile section names that are actually needed.
+pub fn find_active_compile_sections(
+    parsed: &serde_yaml::Value,
+    active_extensions: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut active_sections = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for ext_name in active_extensions {
+        let compile_refs = Config::find_compile_dependencies_in_ext(parsed, ext_name);
+        for section_name in compile_refs {
+            if seen.insert(section_name.clone()) {
+                active_sections.push(section_name);
+            }
+        }
+    }
+
+    active_sections.sort();
+    active_sections
 }
 
 #[cfg(test)]

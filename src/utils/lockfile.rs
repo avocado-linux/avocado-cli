@@ -282,7 +282,10 @@ impl LockFile {
         let old_lock: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
 
-        let version = old_lock.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let version = old_lock
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
 
         match version {
             1 => Ok(Self::migrate_v1_to_v3(&old_lock)),
@@ -395,8 +398,7 @@ impl LockFile {
                     }
 
                     // Migrate target-sysroot
-                    if let Some(ts) = target_map.get("target-sysroot").and_then(|v| v.as_object())
-                    {
+                    if let Some(ts) = target_map.get("target-sysroot").and_then(|v| v.as_object()) {
                         target_locks.target_sysroot = ts
                             .iter()
                             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
@@ -404,9 +406,7 @@ impl LockFile {
                     }
 
                     // Migrate extensions: v2 has flat {name: {pkg: ver}}
-                    if let Some(exts) =
-                        target_map.get("extensions").and_then(|v| v.as_object())
-                    {
+                    if let Some(exts) = target_map.get("extensions").and_then(|v| v.as_object()) {
                         for (name, packages) in exts {
                             if let Some(pkg_map) = packages.as_object() {
                                 let pkg_versions: PackageVersions = pkg_map
@@ -415,27 +415,24 @@ impl LockFile {
                                         v.as_str().map(|s| (k.clone(), s.to_string()))
                                     })
                                     .collect();
-                                let ext_lock = target_locks
-                                    .extensions
-                                    .entry(name.clone())
-                                    .or_default();
+                                let ext_lock =
+                                    target_locks.extensions.entry(name.clone()).or_default();
                                 ext_lock.packages = pkg_versions;
                             }
                         }
                     }
 
                     // Migrate fetched-extensions into unified extensions with source metadata
-                    if let Some(fetched) =
-                        target_map.get("fetched-extensions").and_then(|v| v.as_object())
+                    if let Some(fetched) = target_map
+                        .get("fetched-extensions")
+                        .and_then(|v| v.as_object())
                     {
                         for (name, packages) in fetched {
                             if let Some(pkg_map) = packages.as_object() {
                                 // In v2, fetched-extensions stored {ext_name: {pkg_name: version}}
                                 // The package name and version represent the fetched RPM
-                                let ext_lock = target_locks
-                                    .extensions
-                                    .entry(name.clone())
-                                    .or_default();
+                                let ext_lock =
+                                    target_locks.extensions.entry(name.clone()).or_default();
                                 // Convert the single package entry to source metadata
                                 if let Some((pkg_name, version)) = pkg_map.iter().next() {
                                     if let Some(ver_str) = version.as_str() {
@@ -451,9 +448,7 @@ impl LockFile {
                     }
 
                     // Migrate runtimes (already nested by name in v2)
-                    if let Some(runtimes) =
-                        target_map.get("runtimes").and_then(|v| v.as_object())
-                    {
+                    if let Some(runtimes) = target_map.get("runtimes").and_then(|v| v.as_object()) {
                         for (name, packages) in runtimes {
                             if let Some(pkg_map) = packages.as_object() {
                                 let pkg_versions: PackageVersions = pkg_map
@@ -541,7 +536,11 @@ impl LockFile {
             SysrootType::Rootfs => &mut target_locks.rootfs,
             SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
             SysrootType::Extension(name) => {
-                &mut target_locks.extensions.entry(name.clone()).or_default().packages
+                &mut target_locks
+                    .extensions
+                    .entry(name.clone())
+                    .or_default()
+                    .packages
             }
             SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
         };
@@ -563,7 +562,11 @@ impl LockFile {
             SysrootType::Rootfs => &mut target_locks.rootfs,
             SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
             SysrootType::Extension(name) => {
-                &mut target_locks.extensions.entry(name.clone()).or_default().packages
+                &mut target_locks
+                    .extensions
+                    .entry(name.clone())
+                    .or_default()
+                    .packages
             }
             SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
         };

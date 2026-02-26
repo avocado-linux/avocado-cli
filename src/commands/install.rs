@@ -274,19 +274,12 @@ impl InstallCommand {
         if target_runtimes.is_empty() {
             if self.verbose {
                 print_info(
-                    &format!("No runtimes found for target '{target}'. Installing all extensions."),
+                    &format!("No runtimes found for target '{target}'. No extensions to install."),
                     OutputLevel::Normal,
                 );
             }
-            // If no runtimes match this target, install all local extensions
-            if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
-                for ext_name_val in ext_section.keys() {
-                    if let Some(ext_name) = ext_name_val.as_str() {
-                        required_extensions
-                            .insert(ExtensionDependency::Local(ext_name.to_string()));
-                    }
-                }
-            }
+            // No runtimes match this target - return empty list
+            // Users can explicitly install extensions via `avocado ext install -e <name>`
         } else {
             // Only install extensions needed by the target-relevant runtimes
             if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
