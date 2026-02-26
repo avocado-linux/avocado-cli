@@ -624,35 +624,9 @@ pub struct StampValidationError {
 
 impl std::error::Error for StampValidationError {}
 
-impl fmt::Display for StampValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Error: {} - dependencies not satisfied\n", self.context)?;
-
-        if !self.missing.is_empty() {
-            writeln!(f, "  Missing steps:")?;
-            for req in &self.missing {
-                writeln!(f, "    - {} ({})", req.description(), req.relative_path())?;
-            }
-            writeln!(f)?;
-        }
-
-        if !self.stale.is_empty() {
-            writeln!(f, "  Stale steps (config changed):")?;
-            for (req, reason) in &self.stale {
-                writeln!(
-                    f,
-                    "    - {} ({}: {})",
-                    req.description(),
-                    req.relative_path(),
-                    reason
-                )?;
-            }
-            writeln!(f)?;
-        }
-
-        writeln!(f, "To fix:")?;
-
-        // Collect unique fix commands, using runs_on hint for SDK install commands
+impl StampValidationError {
+    /// Collect unique fix commands, using runs_on hint for SDK install commands
+    fn fix_commands(&self) -> Vec<String> {
         let runs_on_ref = self.runs_on.as_deref();
         let local_arch = get_local_arch();
 
@@ -680,8 +654,81 @@ impl fmt::Display for StampValidationError {
             .collect();
         fixes.sort();
         fixes.dedup();
+        fixes
+    }
 
-        for fix in fixes {
+    /// Print the error with formatted [ERROR]/[INFO] tags matching CLI output style,
+    /// then exit with a non-zero status code.
+    pub fn print_and_exit(&self) -> ! {
+        use crate::utils::output::{print_error, print_info, print_warning, OutputLevel};
+
+        print_error(
+            &format!("{} - dependencies not satisfied", self.context),
+            OutputLevel::Normal,
+        );
+
+        if !self.missing.is_empty() {
+            print_info("Missing steps:", OutputLevel::Normal);
+            for req in &self.missing {
+                print_info(
+                    &format!("  - {} ({})", req.description(), req.relative_path()),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        if !self.stale.is_empty() {
+            print_warning("Stale steps (config changed):", OutputLevel::Normal);
+            for (req, reason) in &self.stale {
+                print_warning(
+                    &format!(
+                        "  - {} ({}: {})",
+                        req.description(),
+                        req.relative_path(),
+                        reason
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        print_info("To fix:", OutputLevel::Normal);
+        for fix in self.fix_commands() {
+            print_info(&format!("  {fix}"), OutputLevel::Normal);
+        }
+
+        std::process::exit(1);
+    }
+}
+
+impl fmt::Display for StampValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{} - dependencies not satisfied\n", self.context)?;
+
+        if !self.missing.is_empty() {
+            writeln!(f, "  Missing steps:")?;
+            for req in &self.missing {
+                writeln!(f, "    - {} ({})", req.description(), req.relative_path())?;
+            }
+            writeln!(f)?;
+        }
+
+        if !self.stale.is_empty() {
+            writeln!(f, "  Stale steps (config changed):")?;
+            for (req, reason) in &self.stale {
+                writeln!(
+                    f,
+                    "    - {} ({}: {})",
+                    req.description(),
+                    req.relative_path(),
+                    reason
+                )?;
+            }
+            writeln!(f)?;
+        }
+
+        writeln!(f, "To fix:")?;
+        for fix in self.fix_commands() {
             writeln!(f, "  {fix}")?;
         }
 

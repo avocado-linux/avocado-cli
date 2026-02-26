@@ -148,8 +148,9 @@ impl SdkCompileCommand {
                 validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
 
             if !validation.is_satisfied() {
-                let error = validation.into_error("Cannot run SDK compile");
-                return Err(error.into());
+                validation
+                    .into_error("Cannot run SDK compile")
+                    .print_and_exit();
             }
         }
 

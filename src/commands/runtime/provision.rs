@@ -177,11 +177,12 @@ impl RuntimeProvisionCommand {
 
             if !validation.is_satisfied() {
                 // Include the --runs-on target in error message for SDK install hints
-                let error = validation.into_error_with_runs_on(
-                    &format!("Cannot provision runtime '{}'", self.config.runtime_name),
-                    self.config.runs_on.as_deref(),
-                );
-                return Err(error.into());
+                validation
+                    .into_error_with_runs_on(
+                        &format!("Cannot provision runtime '{}'", self.config.runtime_name),
+                        self.config.runs_on.as_deref(),
+                    )
+                    .print_and_exit();
             }
         }
 

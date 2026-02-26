@@ -119,9 +119,9 @@ impl ExtCheckoutCommand {
                     validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
 
                 if !validation.is_satisfied() {
-                    let error = validation
-                        .into_error(&format!("Cannot checkout extension '{}'", self.extension));
-                    return Err(error.into());
+                    validation
+                        .into_error(&format!("Cannot checkout extension '{}'", self.extension))
+                        .print_and_exit();
                 }
             }
         }
