@@ -135,8 +135,9 @@ impl SdkCleanCommand {
                 validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
 
             if !validation.is_satisfied() {
-                let error = validation.into_error("Cannot run SDK clean scripts");
-                return Err(error.into());
+                validation
+                    .into_error("Cannot run SDK clean scripts")
+                    .print_and_exit();
             }
 
             let ctx = CleanContext {

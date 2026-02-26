@@ -133,8 +133,9 @@ impl HitlServerCommand {
                 validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
 
             if !validation.is_satisfied() {
-                let error = validation.into_error("Cannot start HITL server");
-                return Err(error.into());
+                validation
+                    .into_error("Cannot start HITL server")
+                    .print_and_exit();
             }
 
             if self.verbose {

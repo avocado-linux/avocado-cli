@@ -189,9 +189,9 @@ impl RuntimeDeployCommand {
                 validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
 
             if !validation.is_satisfied() {
-                let error = validation
-                    .into_error(&format!("Cannot deploy runtime '{}'", self.runtime_name));
-                return Err(error.into());
+                validation
+                    .into_error(&format!("Cannot deploy runtime '{}'", self.runtime_name))
+                    .print_and_exit();
             }
         }
 
