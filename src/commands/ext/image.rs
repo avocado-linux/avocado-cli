@@ -292,8 +292,9 @@ impl ExtImageCommand {
             );
         }
 
-        // Get extension version
-        let ext_version = ext_config
+        // Get extension version from the composed config (source of truth).
+        // For remote extensions, the version comes from the merged remote extension avocado.yaml.
+        let config_version = ext_config
             .get("version")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
@@ -302,14 +303,6 @@ impl ExtImageCommand {
                     self.extension
                 )
             })?;
-
-        // Validate semver format
-        Self::validate_semver(ext_version).with_context(|| {
-            format!(
-                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
-                self.extension, ext_version
-            )
-        })?;
 
         // Get extension types from the types array (defaults to ["sysext", "confext"])
         let ext_types = ext_config
@@ -354,6 +347,41 @@ impl ExtImageCommand {
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
 
+        // Resolve the extension version. Use the composed config value as the source of truth.
+        // For remote extensions, if the version contains wildcards (e.g., "2024.*" from
+        // {{ avocado.distro.version }}), resolve the actual installed version from RPM.
+        let ext_version = if config_version.contains('*') {
+            if matches!(extension_location, ExtensionLocation::Remote { .. }) {
+                self.query_extension_rpm_version(&container_helper, container_image, &target_arch)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Extension '{}' has wildcard version '{}' in composed config. \
+                         Failed to resolve actual version from RPM database. \
+                         Ensure the extension is installed (run 'avocado install' first).",
+                            self.extension, config_version
+                        )
+                    })?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Extension '{}' has invalid version '{}'. \
+                     Local extensions must specify a concrete semantic version (e.g., '1.0.0').",
+                    self.extension,
+                    config_version
+                ));
+            }
+        } else {
+            config_version.to_string()
+        };
+
+        // Validate semver format
+        Self::validate_semver(&ext_version).with_context(|| {
+            format!(
+                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
+                self.extension, ext_version
+            )
+        })?;
+
         // Create a single image for the extension
         // The runtime will decide whether to use it as sysext, confext, or both
         print_info(
@@ -372,7 +400,7 @@ impl ExtImageCommand {
                 &container_helper,
                 container_image,
                 &target_arch,
-                ext_version,
+                &ext_version,
                 &ext_types.join(","), // Pass types for potential future use
                 repo_url.as_ref(),
                 repo_release.as_ref(),
@@ -387,7 +415,7 @@ impl ExtImageCommand {
                 &format!(
                     "Successfully created image for extension '{}-{}' (types: {}).",
                     self.extension,
-                    ext_version,
+                    &ext_version,
                     ext_types.join(", ")
                 ),
                 OutputLevel::Normal,
@@ -541,6 +569,69 @@ echo "Created extension image: $OUTPUT_FILE"
             source_date_epoch = source_date_epoch,
             mkfs_command = mkfs_command,
         )
+    }
+
+    /// Query RPM database for the actual installed version of a remote extension.
+    ///
+    /// This is used as a fallback when the composed config version contains wildcards
+    /// (e.g., "2024.*" from {{ avocado.distro.version }}).
+    async fn query_extension_rpm_version(
+        &self,
+        container_helper: &SdkContainer,
+        container_image: &str,
+        target: &str,
+    ) -> Result<String> {
+        let version_query_script = format!(
+            r#"
+set -e
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
+RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
+rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm -q {ext_name} --queryformat '%{{VERSION}}'
+"#,
+            ext_name = self.extension
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: version_query_script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
+            ..Default::default()
+        };
+
+        match container_helper
+            .run_in_container_with_output(run_config)
+            .await
+        {
+            Ok(Some(version)) => {
+                let version = version.trim().to_string();
+                if self.verbose {
+                    print_info(
+                        &format!(
+                            "Resolved extension '{}' version '{}' from RPM database",
+                            self.extension, version
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                Ok(version)
+            }
+            Ok(None) => Err(anyhow::anyhow!(
+                "Failed to query version for extension '{}' from RPM database. \
+                 Extension may not be installed yet. Run 'avocado install' first.",
+                self.extension
+            )),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to query version for extension '{}' from RPM database: {e}",
+                self.extension
+            )),
+        }
     }
 
     /// Validate semantic versioning format (X.Y.Z where X, Y, Z are non-negative integers)
