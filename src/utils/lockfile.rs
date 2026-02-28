@@ -225,6 +225,9 @@ pub struct TargetLocks {
 pub struct LockFile {
     /// Lock file format version
     pub version: u32,
+    /// Distro release (feed year) at lock time — compatibility guard for feed year changes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distro_release: Option<String>,
     /// Package versions organized by target
     pub targets: HashMap<String, TargetLocks>,
 }
@@ -240,6 +243,7 @@ impl LockFile {
     pub fn new() -> Self {
         Self {
             version: LOCKFILE_VERSION,
+            distro_release: None,
             targets: HashMap::new(),
         }
     }
@@ -491,6 +495,23 @@ impl LockFile {
             .with_context(|| format!("Failed to write lock file: {}", path.display()))?;
 
         Ok(())
+    }
+
+    /// Check if the lock file's distro release matches the config's.
+    /// Warns if there's a mismatch (e.g., feed year changed from 2024 to 2026).
+    pub fn check_distro_release_compat(&self, config_release: Option<&str>) {
+        if let (Some(locked_release), Some(current_release)) =
+            (&self.distro_release, config_release)
+        {
+            if locked_release != current_release {
+                eprintln!(
+                    "[WARNING] Lock file was created with distro.release '{}' but config has '{}'. \
+                     This may indicate an incompatible feed year change. \
+                     Run 'avocado unlock' and reinstall to update.",
+                    locked_release, current_release
+                );
+            }
+        }
     }
 
     /// Get the locked version for a package in a specific target and sysroot

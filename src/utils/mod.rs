@@ -17,4 +17,5 @@ pub mod stamps;
 pub mod target;
 pub mod update_repo;
 pub mod update_signing;
+pub mod version;
 pub mod volume;

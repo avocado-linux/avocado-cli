@@ -278,6 +278,8 @@ impl ExtInstallCommand {
                     .to_path_buf()
             });
         let mut lock_file = LockFile::load(&src_dir).with_context(|| "Failed to load lock file")?;
+        lock_file.check_distro_release_compat(config.get_distro_release().as_deref());
+        lock_file.distro_release = config.get_distro_release();
 
         if self.verbose && !lock_file.is_empty() {
             print_info(

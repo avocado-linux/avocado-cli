@@ -414,35 +414,11 @@ impl ExtBuildCommand {
         // Initialize SDK container helper
         let container_helper = SdkContainer::from_config(&self.config_path, config)?;
 
-        // Resolve the extension version. Use the composed config value as the source of truth.
-        // For remote extensions, if the version contains wildcards (e.g., "2024.*" from
-        // {{ avocado.distro.version }}), resolve the actual installed version from RPM.
-        let ext_version = if config_version.contains('*') {
-            if matches!(extension_location, ExtensionLocation::Remote { .. }) {
-                self.query_extension_rpm_version(&container_helper, container_image, &target_arch)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Extension '{}' has wildcard version '{}' in composed config. \
-                         Failed to resolve actual version from RPM database. \
-                         Ensure the extension is installed (run 'avocado install' first).",
-                            self.extension, config_version
-                        )
-                    })?
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Extension '{}' has invalid version '{}'. \
-                     Local extensions must specify a concrete semantic version (e.g., '1.0.0').",
-                    self.extension,
-                    config_version
-                ));
-            }
-        } else {
-            config_version.to_string()
-        };
+        // Config is the source of truth for extension versions — no wildcard resolution.
+        let ext_version = config_version.to_string();
 
         // Validate semver format
-        Self::validate_semver(&ext_version).with_context(|| {
+        crate::utils::version::validate_semver(&ext_version).with_context(|| {
             format!(
                 "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
                 self.extension, ext_version
@@ -1717,100 +1693,6 @@ echo "Set proper permissions on authentication files""#,
                     "Failed to run install script '{install_script}' for compile dependency '{dep_name}'"
                 ));
             }
-        }
-
-        Ok(())
-    }
-
-    /// Query RPM database for the actual installed version of a remote extension.
-    ///
-    /// This is used as a fallback when the composed config version contains wildcards
-    /// (e.g., "2024.*" from {{ avocado.distro.version }}).
-    async fn query_extension_rpm_version(
-        &self,
-        container_helper: &SdkContainer,
-        container_image: &str,
-        target: &str,
-    ) -> Result<String> {
-        let version_query_script = format!(
-            r#"
-set -e
-RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config \
-RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
-rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm -q {ext_name} --queryformat '%{{VERSION}}'
-"#,
-            ext_name = self.extension
-        );
-
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: version_query_script,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            container_args: self.container_args.clone(),
-            sdk_arch: self.sdk_arch.clone(),
-            runs_on: self.runs_on.clone(),
-            nfs_port: self.nfs_port,
-            ..Default::default()
-        };
-
-        match container_helper
-            .run_in_container_with_output(run_config)
-            .await
-        {
-            Ok(Some(version)) => {
-                let version = version.trim().to_string();
-                if self.verbose {
-                    print_info(
-                        &format!(
-                            "Resolved extension '{}' version '{}' from RPM database",
-                            self.extension, version
-                        ),
-                        OutputLevel::Normal,
-                    );
-                }
-                Ok(version)
-            }
-            Ok(None) => Err(anyhow::anyhow!(
-                "Failed to query version for extension '{}' from RPM database. \
-                 Extension may not be installed yet. Run 'avocado install' first.",
-                self.extension
-            )),
-            Err(e) => Err(anyhow::anyhow!(
-                "Failed to query version for extension '{}' from RPM database: {e}",
-                self.extension
-            )),
-        }
-    }
-
-    /// Validate semantic versioning format (X.Y.Z where X, Y, Z are non-negative integers)
-    fn validate_semver(version: &str) -> Result<()> {
-        let parts: Vec<&str> = version.split('.').collect();
-
-        if parts.len() < 3 {
-            return Err(anyhow::anyhow!(
-                "Version must follow semantic versioning format with at least MAJOR.MINOR.PATCH components (e.g., '1.0.0', '2.1.3')"
-            ));
-        }
-
-        // Validate the first 3 components (MAJOR.MINOR.PATCH)
-        for (i, part) in parts.iter().take(3).enumerate() {
-            // Handle pre-release and build metadata (e.g., "1.0.0-alpha" or "1.0.0+build")
-            let component = part.split(&['-', '+'][..]).next().unwrap_or(part);
-
-            component.parse::<u32>().with_context(|| {
-                let component_name = match i {
-                    0 => "MAJOR",
-                    1 => "MINOR",
-                    2 => "PATCH",
-                    _ => "component",
-                };
-                format!(
-                    "{component_name} version component '{component}' must be a non-negative integer in semantic versioning format"
-                )
-            })?;
         }
 
         Ok(())

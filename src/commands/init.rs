@@ -1029,7 +1029,7 @@ mod tests {
         assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
         assert!(content.contains("distro:"));
         assert!(content.contains("channel: apollo-edge"));
-        assert!(content.contains("version: 0.1.0"));
+        assert!(content.contains("release: 0.1.0"));
         assert!(content.contains("runtimes:"));
         assert!(content.contains("dev:"));
         assert!(content.contains("packages:"));
@@ -1044,7 +1044,7 @@ mod tests {
         assert!(content.contains("- sysext"));
         assert!(content.contains("- confext"));
         assert!(content.contains("config:"));
-        assert!(content.contains("avocado-sdk-toolchain: \"{{ config.distro.version }}\""));
+        assert!(content.contains("avocado-sdk-toolchain: \"*\""));
     }
 
     #[tokio::test]

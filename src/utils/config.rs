@@ -449,7 +449,18 @@ pub struct ProvisionProfileConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DistroConfig {
     pub channel: Option<String>,
-    pub version: Option<String>,
+    #[serde(alias = "version")]
+    pub release: Option<String>,
+    #[serde(default)]
+    pub repo: Option<DistroRepoConfig>,
+}
+
+/// Repository configuration for package feeds
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DistroRepoConfig {
+    pub url: Option<String>,
+    /// Explicit releasever override. When not set, derived from distro.release/channel.
+    pub releasever: Option<String>,
 }
 
 /// Helper module for deserializing signing keys list
@@ -2022,33 +2033,87 @@ impl Config {
         Ok(sdk_deps)
     }
 
-    /// Get the SDK repo URL from environment variable or configuration
-    /// Priority: AVOCADO_SDK_REPO_URL environment variable > config file
-    pub fn get_sdk_repo_url(&self) -> Option<String> {
-        // First priority: Environment variable
-        if let Ok(env_url) = env::var("AVOCADO_SDK_REPO_URL") {
-            return Some(env_url);
+    /// Get the repo URL.
+    /// Priority: AVOCADO_REPO_URL > AVOCADO_SDK_REPO_URL (legacy) > distro.repo.url > sdk.repo_url (legacy)
+    pub fn get_repo_url(&self) -> Option<String> {
+        if let Ok(url) = env::var("AVOCADO_REPO_URL") {
+            return Some(url);
         }
-
-        // Second priority: Configuration file
+        if let Ok(url) = env::var("AVOCADO_SDK_REPO_URL") {
+            return Some(url);
+        }
+        if let Some(url) = self
+            .distro
+            .as_ref()
+            .and_then(|d| d.repo.as_ref())
+            .and_then(|r| r.url.as_ref())
+        {
+            return Some(url.clone());
+        }
+        // Legacy fallback: sdk.repo_url
         self.sdk.as_ref()?.repo_url.as_ref().cloned()
     }
 
-    /// Get the SDK repo release from environment variable or configuration
-    /// Priority: AVOCADO_SDK_REPO_RELEASE environment variable > config file
-    pub fn get_sdk_repo_release(&self) -> Option<String> {
-        // First priority: Environment variable
-        if let Ok(env_release) = env::var("AVOCADO_SDK_REPO_RELEASE") {
-            return Some(env_release);
+    /// Get the releasever for DNF --releasever.
+    /// Priority: AVOCADO_RELEASEVER > AVOCADO_SDK_REPO_RELEASE (legacy)
+    ///         > distro.repo.releasever > sdk.repo_release (legacy)
+    ///         > derived {release}/{channel}
+    pub fn get_releasever(&self) -> Option<String> {
+        if let Ok(rv) = env::var("AVOCADO_RELEASEVER") {
+            return Some(rv);
         }
-
-        // Second priority: Configuration file
-        self.sdk.as_ref()?.repo_release.as_ref().cloned()
+        if let Ok(rv) = env::var("AVOCADO_SDK_REPO_RELEASE") {
+            return Some(rv);
+        }
+        if let Some(rv) = self
+            .distro
+            .as_ref()
+            .and_then(|d| d.repo.as_ref())
+            .and_then(|r| r.releasever.as_ref())
+        {
+            return Some(rv.clone());
+        }
+        // Legacy fallback: sdk.repo_release
+        if let Some(rv) = self.sdk.as_ref().and_then(|s| s.repo_release.as_ref()) {
+            return Some(rv.clone());
+        }
+        // Derive from distro.release/distro.channel
+        let release = self.get_distro_release()?;
+        let channel = self.get_distro_channel()?;
+        Some(format!("{}/{}", release, channel))
     }
 
-    /// Get the distro version from configuration
-    pub fn get_distro_version(&self) -> Option<&String> {
-        self.distro.as_ref()?.version.as_ref()
+    /// Get distro release (feed year).
+    /// Priority: AVOCADO_DISTRO_RELEASE > distro.release (aliased from distro.version)
+    pub fn get_distro_release(&self) -> Option<String> {
+        if let Ok(release) = env::var("AVOCADO_DISTRO_RELEASE") {
+            return Some(release);
+        }
+        self.distro.as_ref()?.release.as_ref().cloned()
+    }
+
+    /// Get distro channel.
+    /// Priority: AVOCADO_DISTRO_CHANNEL > distro.channel
+    pub fn get_distro_channel(&self) -> Option<String> {
+        if let Ok(channel) = env::var("AVOCADO_DISTRO_CHANNEL") {
+            return Some(channel);
+        }
+        self.distro.as_ref()?.channel.as_ref().cloned()
+    }
+
+    /// Deprecated: use get_repo_url() instead
+    pub fn get_sdk_repo_url(&self) -> Option<String> {
+        self.get_repo_url()
+    }
+
+    /// Deprecated: use get_releasever() instead
+    pub fn get_sdk_repo_release(&self) -> Option<String> {
+        self.get_releasever()
+    }
+
+    /// Deprecated: use get_distro_release() instead
+    pub fn get_distro_version(&self) -> Option<String> {
+        self.get_distro_release()
     }
 
     /// Get the SDK container args from configuration

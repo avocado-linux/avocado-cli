@@ -4,7 +4,8 @@
 //!
 //! **Available values:**
 //! - `{{ avocado.target }}` - Resolved target architecture
-//! - `{{ avocado.distro.version }}` - Distro version from main config
+//! - `{{ avocado.distro.release }}` - Distro release (feed year) from main config
+//! - `{{ avocado.distro.version }}` - Alias for distro.release (backward compat)
 //! - `{{ avocado.distro.channel }}` - Distro channel from main config
 //!
 //! **Behavior:**
@@ -17,6 +18,26 @@ use anyhow::Result;
 use serde_yaml::Value;
 use std::env;
 
+/// Convert a YAML value to a string, handling numbers (e.g., `release: 2024` parsed as integer).
+fn yaml_value_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_u64() {
+                i.to_string()
+            } else if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(f) = n.as_f64() {
+                f.to_string()
+            } else {
+                n.to_string()
+            }
+        }
+        Value::Bool(b) => b.to_string(),
+        _ => format!("{v:?}"),
+    }
+}
+
 /// Context for avocado interpolation values.
 ///
 /// This struct holds values that are set by the main config and should be
@@ -27,8 +48,8 @@ use std::env;
 pub struct AvocadoContext {
     /// Target architecture (CLI > env > config precedence)
     pub target: Option<String>,
-    /// Distro version from the main config
-    pub distro_version: Option<String>,
+    /// Distro release (feed year) from the main config
+    pub distro_release: Option<String>,
     /// Distro channel from the main config
     pub distro_channel: Option<String>,
 }
@@ -47,7 +68,7 @@ impl AvocadoContext {
     pub fn with_target(target: Option<&str>) -> Self {
         Self {
             target: target.map(|s| s.to_string()),
-            distro_version: None,
+            distro_release: None,
             distro_channel: None,
         }
     }
@@ -65,11 +86,11 @@ impl AvocadoContext {
         let target = Self::resolve_target_value(root, cli_target);
 
         // Extract distro values from the main config
-        let (distro_version, distro_channel) = Self::extract_distro_values(root);
+        let (distro_release, distro_channel) = Self::extract_distro_values(root);
 
         Self {
             target,
-            distro_version,
+            distro_release,
             distro_channel,
         }
     }
@@ -96,24 +117,22 @@ impl AvocadoContext {
         None
     }
 
-    /// Extract distro version and channel from the config.
+    /// Extract distro release and channel from the config.
+    /// Reads `distro.release` with fallback to `distro.version` for backward compat.
     fn extract_distro_values(root: &Value) -> (Option<String>, Option<String>) {
         let distro = match root.get("distro") {
             Some(d) => d,
             None => return (None, None),
         };
 
-        let version = distro
-            .get("version")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let release = distro
+            .get("release")
+            .or_else(|| distro.get("version"))
+            .map(yaml_value_to_string);
 
-        let channel = distro
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let channel = distro.get("channel").map(yaml_value_to_string);
 
-        (version, channel)
+        (release, channel)
     }
 
     /// Create a context with all values explicitly provided.
@@ -122,17 +141,17 @@ impl AvocadoContext {
     ///
     /// # Arguments
     /// * `target` - The resolved target (CLI > env > config precedence should be applied by caller)
-    /// * `distro_version` - The distro version from the main config
+    /// * `distro_release` - The distro release from the main config
     /// * `distro_channel` - The distro channel from the main config
     #[allow(dead_code)]
     pub fn with_values(
         target: Option<String>,
-        distro_version: Option<String>,
+        distro_release: Option<String>,
         distro_channel: Option<String>,
     ) -> Self {
         Self {
             target,
-            distro_version,
+            distro_release,
             distro_channel,
         }
     }
@@ -141,7 +160,7 @@ impl AvocadoContext {
 /// Resolve an avocado computed value using path segments.
 ///
 /// # Arguments
-/// * `path` - The avocado path segments (e.g., ["target"] or ["distro", "version"])
+/// * `path` - The avocado path segments (e.g., ["target"] or ["distro", "release"])
 /// * `root` - The root YAML value for fallback lookups (used for target resolution)
 /// * `context` - Optional avocado context with pre-resolved values from main config
 ///
@@ -161,11 +180,11 @@ impl AvocadoContext {
 /// // With distro context
 /// let ctx = AvocadoContext {
 ///     target: None,
-///     distro_version: Some("1.0.0".to_string()),
-///     distro_channel: Some("stable".to_string()),
+///     distro_release: Some("2024".to_string()),
+///     distro_channel: Some("edge".to_string()),
 /// };
-/// let result = resolve(&["distro", "version"], &yaml, Some(&ctx)).unwrap();
-/// assert_eq!(result, Some("1.0.0".to_string()));
+/// let result = resolve(&["distro", "release"], &yaml, Some(&ctx)).unwrap();
+/// assert_eq!(result, Some("2024".to_string()));
 /// ```
 pub fn resolve(
     path: &[&str],
@@ -174,7 +193,7 @@ pub fn resolve(
 ) -> Result<Option<String>> {
     match path {
         ["target"] => resolve_target(root, context),
-        ["distro", "version"] => resolve_distro_version(context),
+        ["distro", "release"] | ["distro", "version"] => resolve_distro_release(context),
         ["distro", "channel"] => resolve_distro_channel(context),
         _ => {
             // Other avocado keys are not yet supported, but don't error
@@ -215,14 +234,15 @@ fn resolve_target(root: &Value, context: Option<&AvocadoContext>) -> Result<Opti
     Ok(None)
 }
 
-/// Resolve the distro version from the avocado context.
+/// Resolve the distro release from the avocado context.
 ///
 /// This value comes from the main config and is passed through the context,
-/// ensuring all configs use the same distro version.
-fn resolve_distro_version(context: Option<&AvocadoContext>) -> Result<Option<String>> {
+/// ensuring all configs use the same distro release.
+/// Handles both `avocado.distro.release` and `avocado.distro.version` (alias).
+fn resolve_distro_release(context: Option<&AvocadoContext>) -> Result<Option<String>> {
     if let Some(ctx) = context {
-        if let Some(ref version) = ctx.distro_version {
-            return Ok(Some(version.clone()));
+        if let Some(ref release) = ctx.distro_release {
+            return Ok(Some(release.clone()));
         }
     }
     // Not available - leave template as-is
@@ -299,15 +319,28 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_distro_version_from_context() {
+    fn test_resolve_distro_release_from_context() {
         let config = parse_yaml("{}");
         let ctx = AvocadoContext {
             target: None,
-            distro_version: Some("1.2.3".to_string()),
+            distro_release: Some("2024".to_string()),
             distro_channel: None,
         };
+        let result = resolve(&["distro", "release"], &config, Some(&ctx)).unwrap();
+        assert_eq!(result, Some("2024".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_distro_version_alias() {
+        let config = parse_yaml("{}");
+        let ctx = AvocadoContext {
+            target: None,
+            distro_release: Some("2024".to_string()),
+            distro_channel: None,
+        };
+        // "distro.version" should resolve to the same value as "distro.release"
         let result = resolve(&["distro", "version"], &config, Some(&ctx)).unwrap();
-        assert_eq!(result, Some("1.2.3".to_string()));
+        assert_eq!(result, Some("2024".to_string()));
     }
 
     #[test]
@@ -315,7 +348,7 @@ mod tests {
         let config = parse_yaml("{}");
         let ctx = AvocadoContext {
             target: None,
-            distro_version: None,
+            distro_release: None,
             distro_channel: Some("apollo-edge".to_string()),
         };
         let result = resolve(&["distro", "channel"], &config, Some(&ctx)).unwrap();
@@ -326,6 +359,9 @@ mod tests {
     fn test_resolve_distro_without_context() {
         let config = parse_yaml("{}");
         // Without context, distro values should return None
+        let result = resolve(&["distro", "release"], &config, None).unwrap();
+        assert_eq!(result, None);
+
         let result = resolve(&["distro", "version"], &config, None).unwrap();
         assert_eq!(result, None);
 
@@ -334,7 +370,24 @@ mod tests {
     }
 
     #[test]
-    fn test_avocado_context_from_main_config() {
+    fn test_avocado_context_from_main_config_with_release() {
+        let config = parse_yaml(
+            r#"
+default_target: x86_64-unknown-linux-gnu
+distro:
+  release: 2024
+  channel: edge
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target, Some("x86_64-unknown-linux-gnu".to_string()));
+        assert_eq!(ctx.distro_release, Some("2024".to_string()));
+        assert_eq!(ctx.distro_channel, Some("edge".to_string()));
+    }
+
+    #[test]
+    fn test_avocado_context_from_main_config_with_version_fallback() {
+        // Backward compat: "version" field should populate distro_release
         let config = parse_yaml(
             r#"
 default_target: x86_64-unknown-linux-gnu
@@ -345,7 +398,7 @@ distro:
         );
         let ctx = AvocadoContext::from_main_config(&config, None);
         assert_eq!(ctx.target, Some("x86_64-unknown-linux-gnu".to_string()));
-        assert_eq!(ctx.distro_version, Some("0.1.0".to_string()));
+        assert_eq!(ctx.distro_release, Some("0.1.0".to_string()));
         assert_eq!(ctx.distro_channel, Some("apollo-edge".to_string()));
     }
 
@@ -355,14 +408,14 @@ distro:
             r#"
 default_target: config-target
 distro:
-  version: 0.1.0
-  channel: apollo-edge
+  release: 2024
+  channel: edge
 "#,
         );
         let ctx = AvocadoContext::from_main_config(&config, Some("cli-target"));
         assert_eq!(ctx.target, Some("cli-target".to_string()));
-        assert_eq!(ctx.distro_version, Some("0.1.0".to_string()));
-        assert_eq!(ctx.distro_channel, Some("apollo-edge".to_string()));
+        assert_eq!(ctx.distro_release, Some("2024".to_string()));
+        assert_eq!(ctx.distro_channel, Some("edge".to_string()));
     }
 
     #[test]
@@ -370,7 +423,7 @@ distro:
         let config = parse_yaml("default_target: x86_64");
         let ctx = AvocadoContext::from_main_config(&config, None);
         assert_eq!(ctx.target, Some("x86_64".to_string()));
-        assert_eq!(ctx.distro_version, None);
+        assert_eq!(ctx.distro_release, None);
         assert_eq!(ctx.distro_channel, None);
     }
 }

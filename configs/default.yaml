@@ -10,7 +10,7 @@ supported_targets:
 
 distro:
   channel: apollo-edge
-  version: 0.1.0
+  release: 0.1.0
 
 ##
 ## Runtimes
@@ -25,7 +25,7 @@ runtimes:
       - config
       - app
     packages:
-      avocado-runtime: "{{ avocado.distro.version }}"
+      avocado-runtime: "*"
 
 ##
 ## Extensions
@@ -87,4 +87,4 @@ sdk:
     - -v /sys:/sys
 
   packages:
-    avocado-sdk-toolchain: "{{ config.distro.version }}"
+    avocado-sdk-toolchain: "*"

@@ -605,7 +605,6 @@ fi"#
 
         let distro_version = config
             .get_distro_version()
-            .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
         // Build "name:version" pairs for dynamic manifest generation.
