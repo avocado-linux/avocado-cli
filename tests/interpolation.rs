@@ -260,7 +260,7 @@ fn test_distro_config_loaded() {
     assert!(config.distro.is_some());
     let distro = config.distro.as_ref().unwrap();
     assert_eq!(distro.channel.as_ref().unwrap(), "apollo-edge");
-    assert_eq!(distro.version.as_ref().unwrap(), "0.1.0");
+    assert_eq!(distro.release.as_ref().unwrap(), "0.1.0");
 }
 
 #[test]

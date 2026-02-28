@@ -293,6 +293,8 @@ impl SdkInstallCommand {
                     .to_path_buf()
             });
         let mut lock_file = LockFile::load(&src_dir).with_context(|| "Failed to load lock file")?;
+        lock_file.check_distro_release_compat(config.get_distro_release().as_deref());
+        lock_file.distro_release = config.get_distro_release();
 
         if self.verbose && !lock_file.is_empty() {
             print_info(
@@ -489,10 +491,7 @@ MACROS_EOF
 
         // Build package name and spec with lock file support
         let sdk_target_pkg_name = format!("avocado-sdk-{target}");
-        let sdk_target_config_version = config
-            .get_distro_version()
-            .map(|s| s.as_str())
-            .unwrap_or("*");
+        let sdk_target_config_version = "*";
         let sdk_target_pkg = build_package_spec_with_lock(
             &lock_file,
             target,
@@ -590,14 +589,11 @@ $DNF_SDK_HOST \
         )
         .await?;
 
-        // Install avocado-sdk-bootstrap with version from distro.version
+        // Install avocado-sdk-bootstrap — repo scoping via --releasever, lock file pins exact version
         print_info("Installing SDK bootstrap.", OutputLevel::Normal);
 
         let bootstrap_pkg_name = "avocado-sdk-bootstrap";
-        let bootstrap_config_version = config
-            .get_distro_version()
-            .map(|s| s.as_str())
-            .unwrap_or("*");
+        let bootstrap_config_version = "*";
         let bootstrap_pkg = build_package_spec_with_lock(
             &lock_file,
             target,
@@ -870,14 +866,11 @@ $DNF_SDK_HOST \
             }
         }
 
-        // Install rootfs sysroot with version from distro.version
+        // Install rootfs sysroot — repo scoping via --releasever, lock file pins exact version
         print_info("Installing rootfs sysroot.", OutputLevel::Normal);
 
         let rootfs_base_pkg = "avocado-pkg-rootfs";
-        let rootfs_config_version = config
-            .get_distro_version()
-            .map(|s| s.as_str())
-            .unwrap_or("*");
+        let rootfs_config_version = "*";
         let rootfs_pkg = build_package_spec_with_lock(
             &lock_file,
             target,
@@ -1001,12 +994,9 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 String::new()
             };
 
-            // Build the target-sysroot package spec with version from distro.version (with lock)
+            // Build the target-sysroot package spec — repo scoping via --releasever, lock file pins exact version
             let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
-            let target_sysroot_config_version = config
-                .get_distro_version()
-                .map(|s| s.as_str())
-                .unwrap_or("*");
+            let target_sysroot_config_version = "*";
             let target_sysroot_pkg = build_package_spec_with_lock(
                 &lock_file,
                 target,
