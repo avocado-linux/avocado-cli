@@ -589,7 +589,7 @@ for pattern in $PACKAGE_FILES; do
             if [ "$parent_dir" != "." ]; then
                 mkdir -p "$STAGING_DIR/$parent_dir"
             fi
-            cp -rp "$file" "$STAGING_DIR/$file"
+            cp -r "$file" "$STAGING_DIR/$file"
             if [ -f "$file" ]; then
                 FILE_COUNT=$((FILE_COUNT + 1))
             elif [ -d "$file" ]; then
@@ -638,7 +638,7 @@ Group: {group}{url_line}
 mkdir -p %{{buildroot}}
 # Copy staged files to buildroot root
 # This allows installation to \$AVOCADO_PREFIX/includes/<ext_name>/
-cp -rp "$STAGING_DIR"/* %{{buildroot}}/
+cp -r "$STAGING_DIR"/* %{{buildroot}}/
 
 %clean
 # Skip clean section - not needed for our use case
