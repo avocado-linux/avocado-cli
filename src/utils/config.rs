@@ -548,6 +548,7 @@ pub enum SupportedTargets {
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    pub cli_requirement: Option<String>,
     pub source_date_epoch: Option<u64>,
     pub default_target: Option<String>,
     pub supported_targets: Option<SupportedTargets>,
@@ -565,6 +566,14 @@ pub struct Config {
 }
 
 impl Config {
+    /// Validate that the running CLI version satisfies the `cli_requirement` if set.
+    pub fn validate_cli_requirement(&self) -> Result<()> {
+        if let Some(ref requirement) = self.cli_requirement {
+            crate::utils::version::check_cli_requirement(requirement)?;
+        }
+        Ok(())
+    }
+
     /// Get merged configuration for any section type with target-specific overrides.
     ///
     /// This function implements the hierarchical merging pattern:
@@ -764,6 +773,8 @@ impl Config {
         let config: Config = serde_yaml::from_value(main_config.clone())
             .with_context(|| "Failed to deserialize composed configuration")?;
 
+        config.validate_cli_requirement()?;
+
         Ok(ComposedConfig {
             config,
             merged_value: main_config,
@@ -790,6 +801,7 @@ impl Config {
         // First deserialize just to get src_dir and default_target
         let temp_config: Config =
             serde_yaml::from_value(main_config.clone()).unwrap_or_else(|_| Config {
+                cli_requirement: None,
                 source_date_epoch: None,
                 default_target: None,
                 supported_targets: None,
@@ -2012,6 +2024,8 @@ impl Config {
         // Deserialize to Config struct
         let config: Config = serde_yaml::from_value(parsed)
             .with_context(|| "Failed to deserialize configuration after interpolation")?;
+
+        config.validate_cli_requirement()?;
 
         Ok(config)
     }
@@ -7625,5 +7639,54 @@ sdk:
         let runtimes = config.runtimes.unwrap();
         let dev = runtimes.get("dev").unwrap();
         assert!(dev.kernel.is_none());
+    }
+
+    #[test]
+    fn test_cli_requirement_field_optional() {
+        let config = Config::load_from_str("sdk:\n  image: test").unwrap();
+        assert!(config.cli_requirement.is_none());
+    }
+
+    #[test]
+    fn test_cli_requirement_field_parses() {
+        let config =
+            Config::load_from_str("cli_requirement: \">=0.1.0\"\nsdk:\n  image: test").unwrap();
+        assert_eq!(config.cli_requirement, Some(">=0.1.0".to_string()));
+    }
+
+    #[test]
+    fn test_validate_cli_requirement_none() {
+        let config = Config::load_from_str("sdk:\n  image: test").unwrap();
+        assert!(config.validate_cli_requirement().is_ok());
+    }
+
+    #[test]
+    fn test_validate_cli_requirement_satisfied() {
+        let config =
+            Config::load_from_str("cli_requirement: \">=0.0.1\"\nsdk:\n  image: test").unwrap();
+        assert!(config.validate_cli_requirement().is_ok());
+    }
+
+    #[test]
+    fn test_validate_cli_requirement_not_satisfied() {
+        let config =
+            Config::load_from_str("cli_requirement: \">=999.0.0\"\nsdk:\n  image: test").unwrap();
+        let result = config.validate_cli_requirement();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(">=999.0.0"));
+        assert!(msg.contains("update"));
+    }
+
+    #[test]
+    fn test_validate_cli_requirement_invalid_syntax() {
+        let config = Config::load_from_str(
+            "cli_requirement: \"not-valid\"\nsdk:\n  image: test",
+        )
+        .unwrap();
+        let result = config.validate_cli_requirement();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Invalid cli_requirement"));
     }
 }
