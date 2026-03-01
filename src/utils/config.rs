@@ -449,10 +449,54 @@ pub struct ProvisionProfileConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DistroConfig {
     pub channel: Option<String>,
-    #[serde(alias = "version")]
+    #[serde(
+        alias = "version",
+        default,
+        deserialize_with = "deserialize_string_or_int"
+    )]
     pub release: Option<String>,
     #[serde(default)]
     pub repo: Option<DistroRepoConfig>,
+}
+
+/// Deserialize a value that may be a string or integer into Option<String>
+fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrInt;
+
+    impl<'de> de::Visitor<'de> for StringOrInt {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or integer")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInt)
 }
 
 /// Repository configuration for package feeds
