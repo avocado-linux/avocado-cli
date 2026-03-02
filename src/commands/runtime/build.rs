@@ -216,9 +216,14 @@ impl RuntimeBuildCommand {
                 .run_in_container_with_output(run_config)
                 .await?;
 
-            // Validate all stamps from batch output
-            let validation =
-                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+            // Compute current inputs for staleness detection so that changes to
+            // extension packages (e.g. from path-based sources) are detected.
+            let current_inputs = compute_runtime_input_hash(parsed, &self.runtime_name).ok();
+            let validation = validate_stamps_batch(
+                &required,
+                output.as_deref().unwrap_or(""),
+                current_inputs.as_ref(),
+            );
 
             if !validation.is_satisfied() {
                 validation
@@ -550,14 +555,21 @@ impl RuntimeBuildCommand {
                         let ext_version = ext_data
                             .get("version")
                             .map(|v| {
-                                v.as_str()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| format!("{}", v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).unwrap_or(0)))
+                                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                                    format!(
+                                        "{}",
+                                        v.as_i64()
+                                            .or_else(|| v.as_f64().map(|f| f as i64))
+                                            .unwrap_or(0)
+                                    )
+                                })
                             })
-                            .ok_or_else(|| anyhow::anyhow!(
-                                "Extension '{ext_name}' is missing a 'version' field. \
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Extension '{ext_name}' is missing a 'version' field. \
                                  Check that the extension config was parsed and merged correctly."
-                            ))?;
+                                )
+                            })?;
 
                         copy_commands.push(format!(
                             r#"

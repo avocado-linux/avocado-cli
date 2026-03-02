@@ -152,9 +152,14 @@ impl ExtBuildCommand {
                 .run_in_container_with_output(run_config)
                 .await?;
 
-            // Validate all stamps from batch output
-            let validation =
-                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+            // Compute current inputs from composed config for staleness detection.
+            // This ensures that changes to path-based extension packages are detected.
+            let current_inputs = compute_ext_input_hash(parsed, &self.extension).ok();
+            let validation = validate_stamps_batch(
+                &required,
+                output.as_deref().unwrap_or(""),
+                current_inputs.as_ref(),
+            );
 
             if !validation.is_satisfied() {
                 validation
@@ -370,16 +375,23 @@ impl ExtBuildCommand {
         let config_version = ext_config
             .get("version")
             .map(|v| {
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}", v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).unwrap_or(0)))
+                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                    format!(
+                        "{}",
+                        v.as_i64()
+                            .or_else(|| v.as_f64().map(|f| f as i64))
+                            .unwrap_or(0)
+                    )
+                })
             })
-            .ok_or_else(|| anyhow::anyhow!(
-                "Extension '{}' is missing a 'version' field. \
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Extension '{}' is missing a 'version' field. \
                  Remote extensions must define 'version' in their avocado.yaml. \
                  Check that the extension config was parsed and merged correctly.",
-                self.extension
-            ))?;
+                    self.extension
+                )
+            })?;
 
         // Get overlay configuration
         let overlay_config = ext_config.get("overlay").map(|v| {
@@ -527,9 +539,10 @@ impl ExtBuildCommand {
 
         // Write extension build stamp (unless --no-stamps)
         if !self.no_stamps {
-            let parsed: serde_yaml::Value =
-                serde_yaml::from_str(&std::fs::read_to_string(&self.config_path)?)?;
-            let inputs = compute_ext_input_hash(&parsed, &self.extension)?;
+            // Use the composed/merged config (which includes remote extension configs)
+            // rather than re-reading the raw local file, so that path-based extension
+            // packages are included in the hash for proper staleness detection.
+            let inputs = compute_ext_input_hash(parsed, &self.extension)?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);
             let stamp_script = generate_write_stamp_script(&stamp)?;

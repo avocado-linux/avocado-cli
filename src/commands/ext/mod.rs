@@ -81,7 +81,10 @@ extensions:
         );
         let result = find_ext_in_mapping(&config, "avocado-bsp-raspberrypi5", "raspberrypi5");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().get("version").unwrap().as_str(), Some("1.0.0"));
+        assert_eq!(
+            result.unwrap().get("version").unwrap().as_str(),
+            Some("1.0.0")
+        );
     }
 
     #[test]
@@ -98,7 +101,10 @@ extensions:
         // Direct lookup for the interpolated name should fail, but template matching succeeds
         let result = find_ext_in_mapping(&config, "avocado-bsp-raspberrypi5", "raspberrypi5");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().get("version").unwrap().as_str(), Some("2.0.0"));
+        assert_eq!(
+            result.unwrap().get("version").unwrap().as_str(),
+            Some("2.0.0")
+        );
     }
 
     #[test]
@@ -110,9 +116,13 @@ extensions:
     version: "3.0.0"
 "#,
         );
-        let result = find_ext_in_mapping(&config, "avocado-bsp-jetson-orin-nano", "jetson-orin-nano");
+        let result =
+            find_ext_in_mapping(&config, "avocado-bsp-jetson-orin-nano", "jetson-orin-nano");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().get("version").unwrap().as_str(), Some("3.0.0"));
+        assert_eq!(
+            result.unwrap().get("version").unwrap().as_str(),
+            Some("3.0.0")
+        );
     }
 
     #[test]
@@ -146,6 +156,9 @@ extensions:
         );
         let result = find_ext_in_mapping(&config, "avocado-bsp-raspberrypi5", "raspberrypi5");
         assert!(result.is_some());
-        assert_eq!(result.unwrap().get("version").unwrap().as_str(), Some("4.0.0"));
+        assert_eq!(
+            result.unwrap().get("version").unwrap().as_str(),
+            Some("4.0.0")
+        );
     }
 }
