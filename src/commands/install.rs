@@ -376,94 +376,6 @@ impl InstallCommand {
         Ok(relevant_runtimes)
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new() {
-        let cmd = InstallCommand::new(
-            "avocado.yaml".to_string(),
-            true,
-            false,
-            Some("my-runtime".to_string()),
-            Some("x86_64".to_string()),
-            Some(vec!["--privileged".to_string()]),
-            Some(vec!["--nogpgcheck".to_string()]),
-        );
-
-        assert_eq!(cmd.config_path, "avocado.yaml");
-        assert!(cmd.verbose);
-        assert!(!cmd.force);
-        assert_eq!(cmd.runtime, Some("my-runtime".to_string()));
-        assert_eq!(cmd.target, Some("x86_64".to_string()));
-        assert_eq!(cmd.container_args, Some(vec!["--privileged".to_string()]));
-        assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
-    }
-
-    #[test]
-    fn test_new_minimal() {
-        let cmd = InstallCommand::new(
-            "config.toml".to_string(),
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        assert_eq!(cmd.config_path, "config.toml");
-        assert!(!cmd.verbose);
-        assert!(!cmd.force);
-        assert_eq!(cmd.runtime, None);
-        assert_eq!(cmd.target, None);
-        assert_eq!(cmd.container_args, None);
-        assert_eq!(cmd.dnf_args, None);
-    }
-
-    #[test]
-    fn test_new_with_runtime() {
-        let cmd = InstallCommand::new(
-            "avocado.yaml".to_string(),
-            false,
-            true,
-            Some("test-runtime".to_string()),
-            None,
-            None,
-            None,
-        );
-
-        assert_eq!(cmd.config_path, "avocado.yaml");
-        assert!(!cmd.verbose);
-        assert!(cmd.force);
-        assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
-        assert_eq!(cmd.target, None);
-        assert_eq!(cmd.container_args, None);
-        assert_eq!(cmd.dnf_args, None);
-    }
-
-    #[test]
-    fn test_extension_dependency_variants() {
-        // Test that ExtensionDependency::Local can be created, compared, cloned, and hashed
-        let local_a = ExtensionDependency::Local("test-ext".to_string());
-        let local_b = ExtensionDependency::Local("other-ext".to_string());
-
-        // Test equality
-        assert_eq!(local_a, ExtensionDependency::Local("test-ext".to_string()));
-        assert_ne!(local_a, local_b);
-
-        // Test that they can be cloned and hashed (for HashSet usage)
-        let mut set = std::collections::HashSet::new();
-        set.insert(local_a.clone());
-        set.insert(local_b.clone());
-        assert_eq!(set.len(), 2);
-
-        // Inserting a duplicate should not increase the set size
-        set.insert(local_a.clone());
-        assert_eq!(set.len(), 2);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Imperative add / remove commands
@@ -710,5 +622,94 @@ fn scope_label(scope: &PackageScope) -> String {
         PackageScope::Extension(name) => format!("extension '{name}'"),
         PackageScope::Runtime(name) => format!("runtime '{name}'"),
         PackageScope::Sdk => "SDK".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let cmd = InstallCommand::new(
+            "avocado.yaml".to_string(),
+            true,
+            false,
+            Some("my-runtime".to_string()),
+            Some("x86_64".to_string()),
+            Some(vec!["--privileged".to_string()]),
+            Some(vec!["--nogpgcheck".to_string()]),
+        );
+
+        assert_eq!(cmd.config_path, "avocado.yaml");
+        assert!(cmd.verbose);
+        assert!(!cmd.force);
+        assert_eq!(cmd.runtime, Some("my-runtime".to_string()));
+        assert_eq!(cmd.target, Some("x86_64".to_string()));
+        assert_eq!(cmd.container_args, Some(vec!["--privileged".to_string()]));
+        assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
+    }
+
+    #[test]
+    fn test_new_minimal() {
+        let cmd = InstallCommand::new(
+            "config.toml".to_string(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(cmd.config_path, "config.toml");
+        assert!(!cmd.verbose);
+        assert!(!cmd.force);
+        assert_eq!(cmd.runtime, None);
+        assert_eq!(cmd.target, None);
+        assert_eq!(cmd.container_args, None);
+        assert_eq!(cmd.dnf_args, None);
+    }
+
+    #[test]
+    fn test_new_with_runtime() {
+        let cmd = InstallCommand::new(
+            "avocado.yaml".to_string(),
+            false,
+            true,
+            Some("test-runtime".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(cmd.config_path, "avocado.yaml");
+        assert!(!cmd.verbose);
+        assert!(cmd.force);
+        assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
+        assert_eq!(cmd.target, None);
+        assert_eq!(cmd.container_args, None);
+        assert_eq!(cmd.dnf_args, None);
+    }
+
+    #[test]
+    fn test_extension_dependency_variants() {
+        // Test that ExtensionDependency::Local can be created, compared, cloned, and hashed
+        let local_a = ExtensionDependency::Local("test-ext".to_string());
+        let local_b = ExtensionDependency::Local("other-ext".to_string());
+
+        // Test equality
+        assert_eq!(local_a, ExtensionDependency::Local("test-ext".to_string()));
+        assert_ne!(local_a, local_b);
+
+        // Test that they can be cloned and hashed (for HashSet usage)
+        let mut set = std::collections::HashSet::new();
+        set.insert(local_a.clone());
+        set.insert(local_b.clone());
+        assert_eq!(set.len(), 2);
+
+        // Inserting a duplicate should not increase the set size
+        set.insert(local_a.clone());
+        assert_eq!(set.len(), 2);
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::fs;
 use std::path::PathBuf;
 
+use super::find_ext_in_mapping;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::SdkContainer;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
@@ -148,9 +149,8 @@ impl ExtPackageCommand {
             ExtensionLocation::Remote { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 // Then apply target-specific overrides manually
-                let ext_section = parsed
-                    .get("extensions")
-                    .and_then(|ext| ext.get(&self.extension));
+                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
+                let ext_section = find_ext_in_mapping(parsed, &self.extension, &target);
                 if let Some(ext_val) = ext_section {
                     let base_ext = ext_val.clone();
                     // Check for target-specific override within this extension
@@ -177,10 +177,9 @@ impl ExtPackageCommand {
         // Also get the raw (unmerged) extension config to find all target-specific overlays
         // For remote extensions, use the parsed config; for local, read from file
         let raw_ext_config = match &extension_location {
-            ExtensionLocation::Remote { .. } => parsed
-                .get("extensions")
-                .and_then(|ext| ext.get(&self.extension))
-                .cloned(),
+            ExtensionLocation::Remote { .. } => {
+                find_ext_in_mapping(parsed, &self.extension, &target).cloned()
+            }
             _ => self.get_raw_extension_config(&ext_config_path)?,
         };
 

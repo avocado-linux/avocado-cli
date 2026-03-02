@@ -7680,10 +7680,8 @@ sdk:
 
     #[test]
     fn test_validate_cli_requirement_invalid_syntax() {
-        let config = Config::load_from_str(
-            "cli_requirement: \"not-valid\"\nsdk:\n  image: test",
-        )
-        .unwrap();
+        let config =
+            Config::load_from_str("cli_requirement: \"not-valid\"\nsdk:\n  image: test").unwrap();
         let result = config.validate_cli_requirement();
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
