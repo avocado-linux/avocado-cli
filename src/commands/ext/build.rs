@@ -154,11 +154,14 @@ impl ExtBuildCommand {
 
             // Compute current inputs from composed config for staleness detection.
             // This ensures that changes to path-based extension packages are detected.
+            // Only compare against Extension stamps — SDK/compile-deps stamps use their own hash.
             let current_inputs = compute_ext_input_hash(parsed, &self.extension).ok();
             let validation = validate_stamps_batch(
                 &required,
                 output.as_deref().unwrap_or(""),
-                current_inputs.as_ref(),
+                current_inputs
+                    .as_ref()
+                    .map(|i| (&StampComponent::Extension, i)),
             );
 
             if !validation.is_satisfied() {

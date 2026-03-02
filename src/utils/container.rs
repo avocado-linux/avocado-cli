@@ -1475,6 +1475,8 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
         target_path="$EXT_PREFIX/$ext_name"
 
         if [ -d "$mnt_path" ]; then
+            # Clear any stale files from a previous source type (e.g. package -> path switch)
+            rm -rf "$target_path"
             mkdir -p "$target_path"
             if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
                 if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
@@ -1696,6 +1698,8 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
         target_path="$EXT_PREFIX/$ext_name"
 
         if [ -d "$mnt_path" ]; then
+            # Clear any stale files from a previous source type (e.g. package -> path switch)
+            rm -rf "$target_path"
             mkdir -p "$target_path"
             if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
                 if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then

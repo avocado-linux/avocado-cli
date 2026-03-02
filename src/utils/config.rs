@@ -156,22 +156,6 @@ pub enum ExtensionSource {
 }
 
 impl ExtensionSource {
-    /// Get the include patterns for this extension source.
-    /// Returns an empty slice if no include patterns are specified.
-    pub fn get_include_patterns(&self) -> &[String] {
-        match self {
-            ExtensionSource::Package { include, .. } => {
-                include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
-            }
-            ExtensionSource::Git { include, .. } => {
-                include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
-            }
-            ExtensionSource::Path { include, .. } => {
-                include.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
-            }
-        }
-    }
-
     /// Check if a config path matches any of the include patterns.
     ///
     /// Supports:
@@ -1101,19 +1085,19 @@ impl Config {
                 }
             }
 
-            // Get include patterns from the extension source
-            // For path-based extensions (type: path), use permissive patterns similar to legacy
-            // external configs to ensure sdk.compile sections are included
+            // Get include patterns from the extension source.
+            // Default to merging sdk.packages and sdk.compile sections for all source types
+            // so that switching between package/path/git doesn't change the composed config hash.
             let include_patterns: Vec<String> = match &source {
-                ExtensionSource::Path { include, .. } => {
+                ExtensionSource::Path { include, .. }
+                | ExtensionSource::Git { include, .. }
+                | ExtensionSource::Package { include, .. } => {
                     if let Some(patterns) = include {
                         patterns.clone()
                     } else {
-                        // Default: include all sdk sections for path-based extensions
                         vec!["sdk.packages.*".to_string(), "sdk.compile.*".to_string()]
                     }
                 }
-                _ => source.get_include_patterns().to_vec(),
             };
             let include_patterns = include_patterns.as_slice();
 
@@ -3761,6 +3745,7 @@ pub fn find_active_compile_sections(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -4275,6 +4260,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_get_sdk_repo_url_env_override() {
         // Test environment variable override for SDK repo URL
         let config_content = r#"
@@ -4285,6 +4271,8 @@ sdk:
 
         let config = Config::load_from_str(config_content).unwrap();
 
+        // Clear higher-priority env var to avoid interference
+        std::env::remove_var("AVOCADO_REPO_URL");
         // Test without environment variable - should return config value
         std::env::remove_var("AVOCADO_SDK_REPO_URL");
         let repo_url = config.get_sdk_repo_url();
@@ -4300,6 +4288,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_get_sdk_repo_release_env_override() {
         // Test environment variable override for SDK repo release
         let config_content = r#"
@@ -4310,6 +4299,8 @@ sdk:
 
         let config = Config::load_from_str(config_content).unwrap();
 
+        // Clear higher-priority env var to avoid interference
+        std::env::remove_var("AVOCADO_RELEASEVER");
         // Test without environment variable - should return config value
         std::env::remove_var("AVOCADO_SDK_REPO_RELEASE");
         let repo_release = config.get_sdk_repo_release();
@@ -4325,6 +4316,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_get_sdk_repo_url_env_only() {
         // Test environment variable when no config value exists
         let config_content = r#"
@@ -4334,6 +4326,8 @@ sdk:
 
         let config = Config::load_from_str(config_content).unwrap();
 
+        // Clear higher-priority env var to avoid interference
+        std::env::remove_var("AVOCADO_REPO_URL");
         // Test without environment variable - should return None
         std::env::remove_var("AVOCADO_SDK_REPO_URL");
         let repo_url = config.get_sdk_repo_url();
@@ -4349,6 +4343,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_expand_env_vars() {
         // Set up test environment variables
         std::env::set_var("TEST_USER", "testuser");
@@ -4380,6 +4375,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_merge_sdk_container_args_with_env_expansion() {
         // Set up test environment variable
         std::env::set_var("TEST_USER", "myuser");
@@ -4408,6 +4404,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_process_container_args() {
         // Set up test environment variable
         std::env::set_var("TEST_VAR", "testvalue");
@@ -7015,49 +7012,6 @@ distro:
     // in the extensions section and this functionality is handled by ext fetch.
 
     #[test]
-    fn test_extension_source_get_include_patterns() {
-        // Test Repo variant with include patterns
-        let source = ExtensionSource::Package {
-            version: "*".to_string(),
-            package: None,
-            repo_name: None,
-            include: Some(vec![
-                "provision_profiles.tegraflash".to_string(),
-                "sdk.compile.*".to_string(),
-            ]),
-        };
-        let patterns = source.get_include_patterns();
-        assert_eq!(patterns.len(), 2);
-        assert_eq!(patterns[0], "provision_profiles.tegraflash");
-        assert_eq!(patterns[1], "sdk.compile.*");
-
-        // Test Repo variant without include patterns
-        let source_no_include = ExtensionSource::Package {
-            version: "*".to_string(),
-            package: None,
-            repo_name: None,
-            include: None,
-        };
-        assert!(source_no_include.get_include_patterns().is_empty());
-
-        // Test Git variant with include patterns
-        let git_source = ExtensionSource::Git {
-            url: "https://example.com/repo.git".to_string(),
-            git_ref: Some("main".to_string()),
-            sparse_checkout: None,
-            include: Some(vec!["provision_profiles.*".to_string()]),
-        };
-        assert_eq!(git_source.get_include_patterns().len(), 1);
-
-        // Test Path variant with include patterns
-        let path_source = ExtensionSource::Path {
-            path: "./external".to_string(),
-            include: Some(vec!["sdk.packages.*".to_string()]),
-        };
-        assert_eq!(path_source.get_include_patterns().len(), 1);
-    }
-
-    #[test]
     fn test_matches_include_pattern_exact() {
         let patterns = vec![
             "provision_profiles.tegraflash".to_string(),
@@ -7320,6 +7274,104 @@ include:
             }
             _ => panic!("Expected Repo variant"),
         }
+    }
+
+    /// Verify that all extension source types produce the same default include patterns
+    /// when no explicit `include` is specified. This ensures switching between package/path/git
+    /// doesn't change the composed config hash and trigger false SDK staleness.
+    #[test]
+    fn test_default_include_patterns_consistent_across_source_types() {
+        let ext_config_content = r#"
+extensions:
+  my-ext:
+    types:
+      - sysext
+    packages:
+      ext-pkg: "*"
+sdk:
+  packages:
+    ext-sdk-dep: "*"
+  compile:
+    ext-compile:
+      compile: build.sh
+"#;
+        let main_config_content = r#"
+extensions:
+  local-ext:
+    types:
+      - sysext
+"#;
+        let ext_config: serde_yaml::Value = serde_yaml::from_str(ext_config_content).unwrap();
+
+        // Simulate merge with each source type using no explicit include (default behavior)
+        let sources: Vec<ExtensionSource> = vec![
+            ExtensionSource::Package {
+                version: "*".to_string(),
+                package: None,
+                repo_name: None,
+                include: None,
+            },
+            ExtensionSource::Git {
+                url: "https://example.com/repo.git".to_string(),
+                git_ref: Some("main".to_string()),
+                sparse_checkout: None,
+                include: None,
+            },
+            ExtensionSource::Path {
+                path: "./external".to_string(),
+                include: None,
+            },
+        ];
+
+        let mut merged_results: Vec<String> = Vec::new();
+        for source in &sources {
+            let mut main_config: serde_yaml::Value =
+                serde_yaml::from_str(main_config_content).unwrap();
+
+            let include_patterns: Vec<String> = match source {
+                ExtensionSource::Path { include, .. }
+                | ExtensionSource::Git { include, .. }
+                | ExtensionSource::Package { include, .. } => {
+                    if let Some(patterns) = include {
+                        patterns.clone()
+                    } else {
+                        vec!["sdk.packages.*".to_string(), "sdk.compile.*".to_string()]
+                    }
+                }
+            };
+
+            Config::merge_external_config(
+                &mut main_config,
+                &ext_config,
+                "my-ext",
+                &include_patterns,
+                &[],
+            );
+
+            merged_results.push(serde_yaml::to_string(&main_config).unwrap());
+        }
+
+        // All source types should produce identical merged configs
+        assert_eq!(
+            merged_results[0], merged_results[1],
+            "Package vs Git mismatch"
+        );
+        assert_eq!(merged_results[1], merged_results[2], "Git vs Path mismatch");
+
+        // Verify that sdk.packages was actually merged (not empty)
+        let merged: serde_yaml::Value = serde_yaml::from_str(&merged_results[0]).unwrap();
+        assert!(
+            merged.get("sdk").is_some(),
+            "sdk section should be merged with default patterns"
+        );
+        let sdk_packages = merged
+            .get("sdk")
+            .unwrap()
+            .get("packages")
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert!(sdk_packages.contains_key(serde_yaml::Value::String("ext-sdk-dep".to_string())));
     }
 
     #[test]

@@ -5,7 +5,7 @@ edition = "2021"
 description = "Command line interface for Avocado."
 authors = ["Avocado"]
 license = "MIT"
-repository = "https://github.com/avocado-framework/avocado-cli"
+repository = "https://github.com/avocado-linux/avocado-cli"
 keywords = ["cli", "build", "provisioning", "containers", "extensions"]
 categories = ["command-line-utilities", "development-tools"]
 

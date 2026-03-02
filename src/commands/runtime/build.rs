@@ -6,7 +6,8 @@ use crate::utils::{
     runs_on::RunsOnContext,
     stamps::{
         compute_runtime_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
-        resolve_required_stamps_for_runtime_build, validate_stamps_batch, Stamp, StampOutputs,
+        resolve_required_stamps_for_runtime_build, validate_stamps_batch, Stamp, StampComponent,
+        StampOutputs,
     },
     target::resolve_target_required,
 };
@@ -218,11 +219,21 @@ impl RuntimeBuildCommand {
 
             // Compute current inputs for staleness detection so that changes to
             // extension packages (e.g. from path-based sources) are detected.
-            let current_inputs = compute_runtime_input_hash(parsed, &self.runtime_name).ok();
+            // Only compare against Runtime stamps — SDK/compile-deps stamps use their own hash.
+            // Use get_merged_runtime_config to match how the install stamp was created.
+            let merged_runtime = config
+                .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)
+                .ok()
+                .flatten();
+            let current_inputs = merged_runtime
+                .as_ref()
+                .and_then(|mr| compute_runtime_input_hash(mr, &self.runtime_name).ok());
             let validation = validate_stamps_batch(
                 &required,
                 output.as_deref().unwrap_or(""),
-                current_inputs.as_ref(),
+                current_inputs
+                    .as_ref()
+                    .map(|i| (&StampComponent::Runtime, i)),
             );
 
             if !validation.is_satisfied() {

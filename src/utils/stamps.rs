@@ -994,11 +994,16 @@ pub fn parse_batch_stamps_output(
     result
 }
 
-/// Validate all stamp requirements from batch output in a single pass
+/// Validate all stamp requirements from batch output in a single pass.
+///
+/// `current_inputs` is an optional (component, hash) pair used for staleness detection.
+/// The hash is only compared against stamps matching the specified component type.
+/// Dependency stamps (e.g., SDK stamps when building an extension) are validated
+/// for existence only — their content hash was verified when they were created.
 pub fn validate_stamps_batch(
     requirements: &[StampRequirement],
     batch_output: &str,
-    current_inputs: Option<&StampInputs>,
+    current_inputs: Option<(&StampComponent, &StampInputs)>,
 ) -> StampValidationResult {
     let stamp_data = parse_batch_stamps_output(batch_output);
     let mut validation = StampValidationResult::new();
@@ -1007,10 +1012,15 @@ pub fn validate_stamps_batch(
         let stamp_path = req.relative_path();
         let json_content = stamp_data.get(&stamp_path).and_then(|v| v.as_ref());
 
+        // Only apply current_inputs to stamps matching the specified component type.
+        let inputs_for_req = current_inputs
+            .filter(|(component, _)| req.component == **component)
+            .map(|(_, inputs)| inputs);
+
         check_stamp_requirement(
             req,
             json_content.map(|s| s.as_str()),
-            current_inputs,
+            inputs_for_req,
             &mut validation,
         );
     }
@@ -2135,7 +2145,11 @@ runtime/my-runtime/build.stamp:::null"#,
         let output = format!("ext/my-ext/install.stamp:::{json}");
 
         // With changed inputs, stamp should be stale
-        let result = validate_stamps_batch(&requirements, &output, Some(&changed_inputs));
+        let result = validate_stamps_batch(
+            &requirements,
+            &output,
+            Some((&StampComponent::Extension, &changed_inputs)),
+        );
 
         assert!(!result.is_satisfied());
         assert!(result.satisfied.is_empty());
@@ -2176,13 +2190,19 @@ runtime/my-runtime/build.stamp:::null"#,
             ext_json
         );
 
-        // With changed inputs (simulating config change)
+        // With changed inputs (simulating extension config change).
+        // Only the extension stamp should be stale — SDK stamp uses its own hash.
         let changed_inputs = StampInputs::new("sha256:config-v2".to_string());
-        let result = validate_stamps_batch(&requirements, &output, Some(&changed_inputs));
+        let result = validate_stamps_batch(
+            &requirements,
+            &output,
+            Some((&StampComponent::Extension, &changed_inputs)),
+        );
 
-        // Both should be stale since config changed
         assert!(!result.is_satisfied());
-        assert_eq!(result.stale.len(), 2);
+        // Only the extension stamp should be stale, SDK stamp is a dependency (existence only)
+        assert_eq!(result.stale.len(), 1);
+        assert_eq!(result.satisfied.len(), 1);
     }
 
     // ========================================================================
