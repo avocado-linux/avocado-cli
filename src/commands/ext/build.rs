@@ -369,8 +369,17 @@ impl ExtBuildCommand {
         // For remote extensions, the version comes from the merged remote extension avocado.yaml.
         let config_version = ext_config
             .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0.1.0");
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{}", v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).unwrap_or(0)))
+            })
+            .ok_or_else(|| anyhow::anyhow!(
+                "Extension '{}' is missing a 'version' field. \
+                 Remote extensions must define 'version' in their avocado.yaml. \
+                 Check that the extension config was parsed and merged correctly.",
+                self.extension
+            ))?;
 
         // Get overlay configuration
         let overlay_config = ext_config.get("overlay").map(|v| {
