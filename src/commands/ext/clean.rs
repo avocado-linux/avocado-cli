@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use super::find_ext_in_mapping;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
@@ -110,9 +111,8 @@ impl ExtCleanCommand {
         match extension_location {
             ExtensionLocation::Remote { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
-                let ext_section = parsed
-                    .get("extensions")
-                    .and_then(|ext| ext.get(&self.extension));
+                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
+                let ext_section = find_ext_in_mapping(parsed, &self.extension, target);
                 if let Some(ext_val) = ext_section {
                     let base_ext = ext_val.clone();
                     // Check for target-specific override within this extension

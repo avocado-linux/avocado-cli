@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use super::find_ext_in_mapping;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
@@ -156,9 +157,8 @@ impl ExtImageCommand {
         // and may not find templated extension names like "avocado-bsp-{{ avocado.target }}"
         let extension_location = {
             // First check if extension exists in the composed config's ext section
-            let ext_in_composed = parsed
-                .get("extensions")
-                .and_then(|e| e.get(&self.extension));
+            // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
+            let ext_in_composed = find_ext_in_mapping(parsed, &self.extension, &target);
 
             if let Some(ext_config) = ext_in_composed {
                 // Check if it has a source: field (indicating remote extension)
@@ -233,9 +233,8 @@ impl ExtImageCommand {
             ExtensionLocation::Remote { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 // Then apply target-specific overrides manually
-                let ext_section = parsed
-                    .get("extensions")
-                    .and_then(|ext| ext.get(&self.extension));
+                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
+                let ext_section = find_ext_in_mapping(parsed, &self.extension, &target);
 
                 if self.verbose {
                     if let Some(all_ext) = parsed.get("extensions") {
