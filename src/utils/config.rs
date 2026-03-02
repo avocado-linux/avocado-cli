@@ -1065,11 +1065,10 @@ impl Config {
                     cfg
                 }
                 Err(e) => {
-                    if verbose {
-                        eprintln!("[DEBUG] Failed to parse config for '{ext_name}': {e}");
-                    }
-                    // Failed to parse config, skip this extension
-                    continue;
+                    return Err(anyhow::anyhow!(
+                        "Failed to parse config for remote extension '{ext_name}': {e}\n\
+                         Check the extension's avocado.yaml for syntax errors."
+                    ));
                 }
             };
 

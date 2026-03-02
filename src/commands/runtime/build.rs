@@ -549,8 +549,15 @@ impl RuntimeBuildCommand {
                     if all_required_extensions.contains(ext_name) {
                         let ext_version = ext_data
                             .get("version")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0.1.0");
+                            .map(|v| {
+                                v.as_str()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| format!("{}", v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).unwrap_or(0)))
+                            })
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "Extension '{ext_name}' is missing a 'version' field. \
+                                 Check that the extension config was parsed and merged correctly."
+                            ))?;
 
                         copy_commands.push(format!(
                             r#"
