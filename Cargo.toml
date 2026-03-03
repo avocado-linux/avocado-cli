@@ -37,6 +37,7 @@ directories = "6.0"
 reqwest = { version = "0.13", default-features = false, features = [
     "cookies",
     "json",
+    "multipart",
     "rustls",
     "stream",
 ] }

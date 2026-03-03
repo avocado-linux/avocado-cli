@@ -35,6 +35,7 @@ use commands::signing_keys::{
 use commands::connect::auth::{
     ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
 };
+use commands::connect::upload::ConnectUploadCommand;
 use commands::unlock::UnlockCommand;
 use commands::upgrade::UpgradeCommand;
 
@@ -387,7 +388,7 @@ enum Commands {
         #[arg(long)]
         sdk: bool,
     },
-    /// Avocado Connect platform commands
+    /// Avocado Connect platform commands (auth, upload)
     Connect {
         #[command(subcommand)]
         command: ConnectCommands,
@@ -400,6 +401,36 @@ enum ConnectCommands {
     Auth {
         #[command(subcommand)]
         command: ConnectAuthCommands,
+    },
+    /// Upload current runtime build to the Connect platform
+    Upload {
+        /// Organization slug
+        #[arg(long, required = true)]
+        org: String,
+        /// Project ID
+        #[arg(long, required = true)]
+        project: String,
+        /// Runtime name (defaults to "dev")
+        #[arg(short = 'r', long = "runtime", default_value = "dev")]
+        runtime: String,
+        /// Version string (defaults to runtime name-version from manifest)
+        #[arg(long)]
+        version: Option<String>,
+        /// Description for the upload
+        #[arg(long)]
+        description: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Path to pre-built tarball or artifact directory (skips export from Docker volume)
+        #[arg(long)]
+        file: Option<String>,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -1947,6 +1978,31 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
             },
+            ConnectCommands::Upload {
+                org,
+                project,
+                runtime,
+                version,
+                description,
+                config,
+                target,
+                file,
+                profile,
+            } => {
+                let cmd = ConnectUploadCommand {
+                    org,
+                    project,
+                    runtime,
+                    version,
+                    description,
+                    config_path: config,
+                    target: target.or(cli.target),
+                    file,
+                    profile,
+                };
+                cmd.execute().await?;
+                Ok(())
+            }
         },
     };
 

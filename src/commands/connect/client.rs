@@ -88,6 +88,108 @@ pub struct CsrfResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime upload request types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct CreateRuntimeRequest {
+    pub runtime: RuntimeParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeParams {
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<serde_json::Value>,
+    pub artifacts: Vec<ArtifactParam>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArtifactParam {
+    pub image_id: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompleteRuntimeRequest {
+    pub parts: Vec<BlobParts>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlobParts {
+    pub image_id: String,
+    pub parts: Vec<CompletedPart>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletedPart {
+    pub part_number: u64,
+    pub etag: String,
+}
+
+// ---------------------------------------------------------------------------
+// Runtime upload response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CreateRuntimeResponse {
+    pub data: RuntimeCreateData,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct RuntimeCreateData {
+    pub id: String,
+    pub version: String,
+    pub status: String,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactUploadSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ArtifactUploadSpec {
+    pub image_id: String,
+    pub upload_id: Option<String>,
+    #[serde(default)]
+    pub parts: Vec<PartSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PartSpec {
+    pub part_number: u64,
+    pub upload_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteRuntimeResponse {
+    pub data: RuntimeSummary,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct RuntimeSummary {
+    pub id: String,
+    pub version: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct UploadUrlsResponse {
+    data: UploadUrlsData,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct UploadUrlsData {
+    image_id: String,
+    parts: Vec<PartSpec>,
+}
+
+// ---------------------------------------------------------------------------
 // Config file I/O
 // ---------------------------------------------------------------------------
 
@@ -188,6 +290,129 @@ impl ConnectClient {
         Ok(me)
     }
 
+    /// Step 1: Create a runtime record with artifact metadata.
+    /// Returns upload specs with presigned URLs for each artifact.
+    pub async fn create_runtime(
+        &self,
+        org_slug: &str,
+        project_id: &str,
+        req: &CreateRuntimeRequest,
+    ) -> Result<RuntimeCreateData> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/runtimes",
+            self.api_url, org_slug, project_id
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create runtime")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create runtime (HTTP {}): {}", status, body);
+        }
+
+        let resp: CreateRuntimeResponse = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Step 2: Upload a single part to a presigned S3 URL.
+    /// Returns the ETag from the response headers.
+    pub async fn upload_part(&self, presigned_url: &str, body: Vec<u8>) -> Result<String> {
+        let res = self
+            .http
+            .put(presigned_url)
+            .body(body)
+            .send()
+            .await
+            .context("Failed to upload part")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Part upload failed (HTTP {}): {}", status, body);
+        }
+
+        let etag = res
+            .headers()
+            .get("etag")
+            .context("S3 response missing ETag header")?
+            .to_str()
+            .context("Invalid ETag header")?
+            .to_string();
+
+        Ok(etag)
+    }
+
+    /// Step 3: Complete the runtime upload (finalize all multipart uploads).
+    pub async fn complete_runtime(
+        &self,
+        org_slug: &str,
+        project_id: &str,
+        runtime_id: &str,
+        req: &CompleteRuntimeRequest,
+    ) -> Result<RuntimeSummary> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/runtimes/{}/complete",
+            self.api_url, org_slug, project_id, runtime_id
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to complete runtime upload")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to complete runtime (HTTP {}): {}", status, body);
+        }
+
+        let resp: CompleteRuntimeResponse = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Re-fetch presigned URLs for an artifact (crash recovery).
+    #[allow(dead_code)]
+    pub async fn get_upload_urls(
+        &self,
+        org_slug: &str,
+        project_id: &str,
+        runtime_id: &str,
+        image_id: &str,
+    ) -> Result<Vec<PartSpec>> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/runtimes/{}/artifacts/{}/upload-urls",
+            self.api_url, org_slug, project_id, runtime_id, image_id
+        );
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to get upload URLs")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get upload URLs (HTTP {}): {}", status, body);
+        }
+
+        let resp: UploadUrlsResponse = res.json().await?;
+        Ok(resp.data.parts)
+    }
 }
 
 /// Session-based client for login flow (cookie-based, not Bearer).
