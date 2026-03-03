@@ -315,6 +315,12 @@ cp -r /etc/rpm $AVOCADO_SDK_PREFIX/etc
 cp -r /etc/dnf $AVOCADO_SDK_PREFIX/etc
 cp -r /etc/yum.repos.d $AVOCADO_SDK_PREFIX/etc
 
+# Restore custom repo URL after copying container defaults (which may overwrite it)
+if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
+    mkdir -p $AVOCADO_SDK_PREFIX/etc/dnf/vars
+    echo "$AVOCADO_SDK_REPO_URL" > $AVOCADO_SDK_PREFIX/etc/dnf/vars/repo_url
+fi
+
 mkdir -p $AVOCADO_SDK_PREFIX/usr/lib/rpm
 cp -r /usr/lib/rpm/* $AVOCADO_SDK_PREFIX/usr/lib/rpm/
 

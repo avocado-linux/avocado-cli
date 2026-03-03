@@ -383,11 +383,21 @@ $DNF_SDK_HOST \
         // 1. Fetch SDK host metadata
         self.fetch_sdk_host_metadata(container_config).await?;
 
-        // 2. Fetch rootfs metadata
-        self.fetch_rootfs_metadata(container_config).await?;
+        // 2. Fetch rootfs metadata (non-fatal if sysroot doesn't exist yet)
+        if let Err(e) = self.fetch_rootfs_metadata(container_config).await {
+            print_error(
+                &format!("Failed to fetch rootfs metadata: {e}"),
+                OutputLevel::Normal,
+            );
+        }
 
-        // 3. Fetch SDK target sysroot metadata
-        self.fetch_sdk_target_metadata(container_config).await?;
+        // 3. Fetch SDK target sysroot metadata (non-fatal if sysroot doesn't exist yet)
+        if let Err(e) = self.fetch_sdk_target_metadata(container_config).await {
+            print_error(
+                &format!("Failed to fetch SDK target sysroot metadata: {e}"),
+                OutputLevel::Normal,
+            );
+        }
 
         // 4. Fetch all extension metadata (including nested external extensions)
         if let Some(extensions) = config_toml
@@ -444,6 +454,28 @@ $DNF_SDK_HOST \
 
         let makecache_command = format!(
             r#"
+# Auto-initialize minimal SDK environment if not yet set up for this target
+if [ ! -d "$AVOCADO_SDK_PREFIX/usr/lib/rpm" ]; then
+    echo "[INFO] SDK not initialized for target, initializing minimal SDK environment..."
+    mkdir -p $AVOCADO_SDK_PREFIX/etc
+    mkdir -p $AVOCADO_SDK_PREFIX/var/cache
+    mkdir -p $AVOCADO_SDK_PREFIX/var/log
+    mkdir -p $AVOCADO_SDK_PREFIX/var/lib/dnf
+    mkdir -p $AVOCADO_SDK_PREFIX/usr/lib/rpm
+    cp /etc/rpmrc $AVOCADO_SDK_PREFIX/etc/
+    cp -r /etc/rpm $AVOCADO_SDK_PREFIX/etc/
+    cp -r /etc/dnf $AVOCADO_SDK_PREFIX/etc/
+    cp -r /etc/yum.repos.d $AVOCADO_SDK_PREFIX/etc/
+    cp -r /usr/lib/rpm/* $AVOCADO_SDK_PREFIX/usr/lib/rpm/
+    sed -i "s|^%_usr[[:space:]]*/usr$|%_usr                   $AVOCADO_SDK_PREFIX/usr|" $AVOCADO_SDK_PREFIX/usr/lib/rpm/macros
+    sed -i "s|^%_var[[:space:]]*/var$|%_var                   $AVOCADO_SDK_PREFIX/var|" $AVOCADO_SDK_PREFIX/usr/lib/rpm/macros
+    # Restore custom repo URL after copying container defaults
+    if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
+        mkdir -p $AVOCADO_SDK_PREFIX/etc/dnf/vars
+        echo "$AVOCADO_SDK_REPO_URL" > $AVOCADO_SDK_PREFIX/etc/dnf/vars/repo_url
+    fi
+fi
+
 RPM_CONFIGDIR="$AVOCADO_SDK_PREFIX/usr/lib/rpm" \
 RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
@@ -508,11 +540,11 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
         let rootfs_exists = container_config.helper.run_in_container(run_config).await?;
 
         if !rootfs_exists {
-            print_error(
-                "Rootfs sysroot does not exist. Run 'avocado sdk install' first.",
+            print_info(
+                "Rootfs sysroot does not exist yet. Skipping metadata fetch. Run 'avocado sdk install' to create it.",
                 OutputLevel::Normal,
             );
-            return Err(anyhow::anyhow!("Rootfs sysroot not found"));
+            return Ok(());
         }
 
         let dnf_args_str = if let Some(args) = &self.dnf_args {
@@ -589,11 +621,11 @@ $DNF_SDK_HOST \
         let target_sysroot_exists = container_config.helper.run_in_container(run_config).await?;
 
         if !target_sysroot_exists {
-            print_error(
-                "SDK target sysroot does not exist. Run 'avocado sdk install' first.",
+            print_info(
+                "SDK target sysroot does not exist yet. Skipping metadata fetch. Run 'avocado sdk install' to create it.",
                 OutputLevel::Normal,
             );
-            return Err(anyhow::anyhow!("SDK target sysroot not found"));
+            return Ok(());
         }
 
         let dnf_args_str = if let Some(args) = &self.dnf_args {
