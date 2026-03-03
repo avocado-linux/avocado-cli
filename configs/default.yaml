@@ -1,3 +1,5 @@
+cli_requirement: ">=0.26.0"
+
 default_target: "{target}"
 
 # Add additional supported targets or use "*" for all targets
@@ -9,8 +11,8 @@ supported_targets:
 ##
 
 distro:
-  channel: apollo-edge
-  release: 0.1.0
+  release: 2024
+  channel: edge
 
 ##
 ## Runtimes
@@ -78,7 +80,7 @@ extensions:
 ##
 
 sdk:
-  image: "docker.io/avocadolinux/sdk:{{ config.distro.channel }}"
+  image: "docker.io/avocadolinux/sdk:{{ config.distro.release }}-{{ config.distro.channel }}"
 
   container_args:
     - --privileged

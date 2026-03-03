@@ -1027,9 +1027,10 @@ mod tests {
         let content = fs::read_to_string(&config_path).unwrap();
         let expected_target = InitCommand::get_default_target();
         assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
+        assert!(content.contains("cli_requirement: \">=0.26.0\""));
         assert!(content.contains("distro:"));
-        assert!(content.contains("channel: apollo-edge"));
-        assert!(content.contains("release: 0.1.0"));
+        assert!(content.contains("channel: edge"));
+        assert!(content.contains("release: 2024"));
         assert!(content.contains("runtimes:"));
         assert!(content.contains("dev:"));
         assert!(content.contains("packages:"));
@@ -1037,7 +1038,7 @@ mod tests {
         assert!(content.contains("avocado-ext-dev:"));
         assert!(content.contains("type: package"));
         assert!(
-            content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.channel }}\"")
+            content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.release }}-{{ config.distro.channel }}\"")
         );
         assert!(content.contains("extensions:"));
         assert!(content.contains("app:"));

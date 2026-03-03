@@ -2121,7 +2121,7 @@ impl Config {
         // Derive from distro.release/distro.channel
         let release = self.get_distro_release()?;
         let channel = self.get_distro_channel()?;
-        Some(format!("{}/{}", release, channel))
+        Some(format!("{release}/{channel}"))
     }
 
     /// Get distro release (feed year).

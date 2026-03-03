@@ -505,10 +505,9 @@ impl LockFile {
         {
             if locked_release != current_release {
                 eprintln!(
-                    "[WARNING] Lock file was created with distro.release '{}' but config has '{}'. \
+                    "[WARNING] Lock file was created with distro.release '{locked_release}' but config has '{current_release}'. \
                      This may indicate an incompatible feed year change. \
-                     Run 'avocado unlock' and reinstall to update.",
-                    locked_release, current_release
+                     Run 'avocado unlock' and reinstall to update."
                 );
             }
         }
