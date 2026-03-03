@@ -827,8 +827,10 @@ avocado-provision-{} {}
             }
         }
 
-        extensions.sort();
-        extensions.dedup();
+        // Deduplicate while preserving declaration order from the config.
+        // The order in the extensions array determines merge priority in avocadoctl.
+        let mut seen = std::collections::HashSet::new();
+        extensions.retain(|ext| seen.insert(ext.clone()));
 
         Ok(extensions)
     }
