@@ -32,6 +32,9 @@ use commands::sign::SignCommand;
 use commands::signing_keys::{
     SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
 };
+use commands::connect::auth::{
+    ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
+};
 use commands::unlock::UnlockCommand;
 use commands::upgrade::UpgradeCommand;
 
@@ -383,6 +386,51 @@ enum Commands {
         /// Unlock SDK (rootfs, target-sysroot, and all SDK arches)
         #[arg(long)]
         sdk: bool,
+    },
+    /// Avocado Connect platform commands
+    Connect {
+        #[command(subcommand)]
+        command: ConnectCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectCommands {
+    /// Authenticate with the Connect platform
+    Auth {
+        #[command(subcommand)]
+        command: ConnectAuthCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectAuthCommands {
+    /// Login to the Connect platform
+    Login {
+        /// API URL (defaults to https://connect.peridio.com or AVOCADO_CONNECT_URL env var)
+        #[arg(long)]
+        url: Option<String>,
+        /// Email (prompts interactively if not provided)
+        #[arg(long)]
+        email: Option<String>,
+        /// Password (prompts interactively if not provided)
+        #[arg(long)]
+        password: Option<String>,
+        /// Profile name (defaults to "default")
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Logout from the Connect platform
+    Logout {
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Show current auth status
+    Status {
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -1875,6 +1923,30 @@ async fn main() -> Result<()> {
                 package_cmd.execute().await?;
                 Ok(())
             }
+        },
+        Commands::Connect { command } => match command {
+            ConnectCommands::Auth { command } => match command {
+                ConnectAuthCommands::Login {
+                    url,
+                    email,
+                    password,
+                    profile,
+                } => {
+                    let cmd = ConnectAuthLoginCommand::new(url, email, password, profile);
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectAuthCommands::Logout { profile } => {
+                    let cmd = ConnectAuthLogoutCommand { profile };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectAuthCommands::Status { profile } => {
+                    let cmd = ConnectAuthStatusCommand { profile };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
         },
     };
 
