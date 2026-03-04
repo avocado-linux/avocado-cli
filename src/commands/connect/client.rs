@@ -294,13 +294,13 @@ impl ConnectClient {
     /// Returns upload specs with presigned URLs for each artifact.
     pub async fn create_runtime(
         &self,
-        org_slug: &str,
+        org: &str,
         project_id: &str,
         req: &CreateRuntimeRequest,
     ) -> Result<RuntimeCreateData> {
         let url = format!(
             "{}/api/orgs/{}/projects/{}/runtimes",
-            self.api_url, org_slug, project_id
+            self.api_url, org, project_id
         );
 
         let res = self
@@ -353,14 +353,14 @@ impl ConnectClient {
     /// Step 3: Complete the runtime upload (finalize all multipart uploads).
     pub async fn complete_runtime(
         &self,
-        org_slug: &str,
+        org: &str,
         project_id: &str,
         runtime_id: &str,
         req: &CompleteRuntimeRequest,
     ) -> Result<RuntimeSummary> {
         let url = format!(
             "{}/api/orgs/{}/projects/{}/runtimes/{}/complete",
-            self.api_url, org_slug, project_id, runtime_id
+            self.api_url, org, project_id, runtime_id
         );
 
         let res = self
@@ -386,14 +386,14 @@ impl ConnectClient {
     #[allow(dead_code)]
     pub async fn get_upload_urls(
         &self,
-        org_slug: &str,
+        org: &str,
         project_id: &str,
         runtime_id: &str,
         image_id: &str,
     ) -> Result<Vec<PartSpec>> {
         let url = format!(
             "{}/api/orgs/{}/projects/{}/runtimes/{}/artifacts/{}/upload-urls",
-            self.api_url, org_slug, project_id, runtime_id, image_id
+            self.api_url, org, project_id, runtime_id, image_id
         );
 
         let res = self

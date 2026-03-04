@@ -404,12 +404,12 @@ enum ConnectCommands {
     },
     /// Upload current runtime build to the Connect platform
     Upload {
-        /// Organization slug
-        #[arg(long, required = true)]
-        org: String,
-        /// Project ID
-        #[arg(long, required = true)]
-        project: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID (or set connect.project in avocado.yaml)
+        #[arg(long)]
+        project: Option<String>,
         /// Runtime name (defaults to "dev")
         #[arg(short = 'r', long = "runtime", default_value = "dev")]
         runtime: String,
@@ -1989,9 +1989,31 @@ async fn main() -> Result<()> {
                 file,
                 profile,
             } => {
+                // Load connect defaults from avocado.yaml if it exists
+                let connect_config = std::path::Path::new(&config)
+                    .exists()
+                    .then(|| crate::utils::config::load_config(&config).ok())
+                    .flatten()
+                    .and_then(|c| c.connect);
+
+                let resolved_org = org
+                    .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--org is required (or set connect.org in {})", config)
+                    })?;
+
+                let resolved_project = project
+                    .or_else(|| connect_config.as_ref().and_then(|c| c.project.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--project is required (or set connect.project in {})",
+                            config
+                        )
+                    })?;
+
                 let cmd = ConnectUploadCommand {
-                    org,
-                    project,
+                    org: resolved_org,
+                    project: resolved_project,
                     runtime,
                     version,
                     description,

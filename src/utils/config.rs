@@ -636,6 +636,13 @@ pub enum SupportedTargets {
     List(Vec<String>), // ["target1", "target2", ...]
 }
 
+/// Connect platform configuration (org/project defaults for `connect upload`)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConnectConfig {
+    pub org: Option<String>,
+    pub project: Option<String>,
+}
+
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -654,6 +661,7 @@ pub struct Config {
     /// Acts as a local bridge between the config and the global signing keys registry
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
     pub signing_keys: Option<HashMap<String, String>>,
+    pub connect: Option<ConnectConfig>,
 }
 
 impl Config {
@@ -902,6 +910,7 @@ impl Config {
                 sdk: None,
                 provision_profiles: None,
                 signing_keys: None,
+                connect: None,
             });
 
         // Resolve target: CLI arg > env var > config default
