@@ -79,6 +79,42 @@ pub fn sdk_arch_to_platform(sdk_arch: &str) -> Result<String> {
 ///
 /// # Returns
 /// Normalized architecture name (e.g., "aarch64", "x86_64")
+/// Inspect Docker daemon stderr output and return a user-friendly hint when a
+/// known daemon health problem is detected (e.g. broken bridge networking after
+/// Docker-in-Docker teardown).  Returns `None` for unrecognised errors.
+fn docker_daemon_hint(stderr: &str) -> Option<String> {
+    // Bridge / veth errors indicate that docker0 was removed from the host
+    // network namespace (commonly caused by an inner dockerd started with
+    // --network=host tearing down the bridge on exit).
+    if stderr.contains("docker0")
+        || (stderr.contains("bridge") && stderr.contains("Device does not exist"))
+        || stderr.contains("failed to create endpoint")
+        || stderr.contains("failed to set up container networking")
+    {
+        return Some(
+            "The Docker daemon appears to have a broken network bridge (docker0 missing).\n\
+             This can happen after Docker-in-Docker teardown. Fix with:\n\
+             \n  sudo systemctl restart docker\n"
+                .to_string(),
+        );
+    }
+
+    // Daemon not responding / socket errors
+    if stderr.contains("Cannot connect to the Docker daemon")
+        || stderr.contains("Is the docker daemon running")
+        || stderr.contains("dial unix") && stderr.contains("connect: no such file or directory")
+    {
+        return Some(
+            "The Docker daemon is not running or its socket is not accessible.\n\
+             Start it with:\n\
+             \n  sudo systemctl start docker\n"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 pub fn normalize_sdk_arch(sdk_arch: &str) -> Result<String> {
     match sdk_arch.to_lowercase().as_str() {
         "aarch64" | "arm64" => Ok("aarch64".to_string()),
@@ -956,6 +992,9 @@ impl SdkContainer {
                     OutputLevel::Normal,
                 );
             }
+            if let Some(hint) = docker_daemon_hint(&stderr) {
+                print_error(&hint, OutputLevel::Normal);
+            }
             Ok(None)
         }
     }
@@ -1216,6 +1255,9 @@ impl SdkContainer {
                     &format!("Container execution failed: {stderr}"),
                     OutputLevel::Normal,
                 );
+                if let Some(hint) = docker_daemon_hint(&stderr) {
+                    print_error(&hint, OutputLevel::Normal);
+                }
                 Ok(false)
             }
         } else {
