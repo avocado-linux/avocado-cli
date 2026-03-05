@@ -1028,27 +1028,64 @@ impl Config {
                         }
                     }
                 } else if let Some(vs) = &volume_state {
-                    // Method 2: Use container command to read from Docker volume
-                    if verbose {
-                        eprintln!(
-                            "[DEBUG]   Trying via container command (volume: {})",
-                            vs.volume_name
-                        );
-                    }
-                    match Self::read_extension_config_via_container(vs, &resolved_target, &ext_name)
-                    {
-                        Ok(content) => {
+                    // Method 2: Read directly from the Docker volume's host mountpoint.
+                    // This is fast and reliable — no throwaway container needed.
+                    // Falls back to Method 3 if the mountpoint isn't accessible (e.g. permission denied).
+                    let host_content = Self::get_volume_mountpoint_sync(vs)
+                        .ok()
+                        .and_then(|mountpoint| {
+                            let p = mountpoint
+                                .join(&resolved_target)
+                                .join("includes")
+                                .join(&ext_name)
+                                .join("avocado.yaml");
                             if verbose {
-                                eprintln!("[DEBUG]   Read {} bytes via container", content.len());
+                                eprintln!(
+                                    "[DEBUG]   Trying host volume path: {}",
+                                    p.display()
+                                );
                             }
-                            content
+                            fs::read_to_string(&p).ok()
+                        });
+
+                    if let Some(content) = host_content {
+                        if verbose {
+                            eprintln!(
+                                "[DEBUG]   Read {} bytes from host volume mountpoint",
+                                content.len()
+                            );
                         }
-                        Err(e) => {
-                            if verbose {
-                                eprintln!("[DEBUG]   Container read failed: {e}");
+                        content
+                    } else {
+                        // Method 3: Fall back to spinning up a container to read from the volume.
+                        // Used when the host mountpoint isn't directly accessible.
+                        if verbose {
+                            eprintln!(
+                                "[DEBUG]   Host path not accessible, trying via container command (volume: {})",
+                                vs.volume_name
+                            );
+                        }
+                        match Self::read_extension_config_via_container(
+                            vs,
+                            &resolved_target,
+                            &ext_name,
+                        ) {
+                            Ok(content) => {
+                                if verbose {
+                                    eprintln!(
+                                        "[DEBUG]   Read {} bytes via container",
+                                        content.len()
+                                    );
+                                }
+                                content
                             }
-                            // Extension not installed yet or config not found, skip
-                            continue;
+                            Err(e) => {
+                                if verbose {
+                                    eprintln!("[DEBUG]   Container read failed: {e}");
+                                }
+                                // Extension not installed yet or config not found, skip
+                                continue;
+                            }
                         }
                     }
                 } else {

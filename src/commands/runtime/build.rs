@@ -931,9 +931,48 @@ case "$DOCKER_TARGET_ARCH" in
     *) echo "WARNING: Unknown target architecture '$DOCKER_TARGET_ARCH' for Docker platform mapping, defaulting to amd64"; DOCKER_ARCH="amd64" ;;
 esac
 
-# Start temporary dockerd with data-root pointing at var staging
+# The SDK container may have the host's /sys bind-mounted (-v /sys:/sys),
+# and --privileged gives write access even without that flag.
+# Overmount /sys/fs/cgroup with a private hierarchy so the inner dockerd
+# cannot write into the host's cgroup tree.  When we umount afterwards
+# the host hierarchy is restored untouched.
+_AVOCADO_CGROUP_PRIVATE=0
+if mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null; then
+    _AVOCADO_CGROUP_PRIVATE=1
+elif mount -t tmpfs tmpfs /sys/fs/cgroup 2>/dev/null; then
+    _AVOCADO_CGROUP_PRIVATE=1
+else
+    echo "WARNING: Could not overmount /sys/fs/cgroup — inner dockerd may leave stale cgroup entries on the host."
+fi
+
+# When the SDK container uses --network=host the inner dockerd shares the
+# host network namespace and may delete the host's docker0 bridge on exit.
+# Save its address now so we can restore it if needed.
+_DOCKER0_ADDR=""
+if ip link show docker0 >/dev/null 2>&1; then
+    _DOCKER0_ADDR=$(ip -4 addr show docker0 2>/dev/null | awk '/inet /{{print $2}}' | head -1)
+fi
+
+_avocado_docker_cleanup() {{
+    kill $DOCKERD_PID 2>/dev/null || true
+    wait $DOCKERD_PID 2>/dev/null || true
+    rm -f /tmp/avocado-dockerd.sock /tmp/avocado-dockerd.pid /tmp/avocado-dockerd.log
+    [ "$_AVOCADO_CGROUP_PRIVATE" = "1" ] && umount /sys/fs/cgroup 2>/dev/null || true
+    # Restore docker0 if the inner dockerd removed it from the host network namespace
+    if [ -n "$_DOCKER0_ADDR" ] && ! ip link show docker0 >/dev/null 2>&1; then
+        echo "NOTE: inner dockerd removed host docker0 — restoring."
+        ip link add name docker0 type bridge 2>/dev/null || true
+        ip addr add "$_DOCKER0_ADDR" dev docker0 2>/dev/null || true
+        ip link set docker0 up 2>/dev/null || true
+    fi
+}}
+trap _avocado_docker_cleanup EXIT
+
+# Start temporary dockerd with data-root pointing at var staging.
+# cgroupdriver=cgroupfs avoids systemd-cgroup interaction inside the container.
 dockerd --data-root "$VAR_DIR/lib/docker" \
     --host unix:///tmp/avocado-dockerd.sock \
+    --exec-opt native.cgroupdriver=cgroupfs \
     --iptables=false --ip-masq=false \
     --bridge=none \
     --exec-root /tmp/avocado-dockerd \
@@ -957,7 +996,6 @@ done
 
 if ! docker --host unix:///tmp/avocado-dockerd.sock info >/dev/null 2>&1; then
     echo "ERROR: dockerd failed to start within 30 seconds"
-    kill $DOCKERD_PID 2>/dev/null || true
     cat /tmp/avocado-dockerd.log
     exit 1
 fi
@@ -965,10 +1003,8 @@ fi
 echo "Pulling Docker images for platform linux/$DOCKER_ARCH..."
 {pull_commands}
 
-# Stop temporary dockerd
-kill $DOCKERD_PID 2>/dev/null || true
-wait $DOCKERD_PID 2>/dev/null || true
-rm -f /tmp/avocado-dockerd.sock /tmp/avocado-dockerd.pid /tmp/avocado-dockerd.log
+trap - EXIT
+_avocado_docker_cleanup
 echo "Docker image priming complete.""#,
                     pull_commands = pull_commands.join("\n")
                 )
