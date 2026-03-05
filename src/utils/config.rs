@@ -1031,22 +1031,20 @@ impl Config {
                     // Method 2: Read directly from the Docker volume's host mountpoint.
                     // This is fast and reliable — no throwaway container needed.
                     // Falls back to Method 3 if the mountpoint isn't accessible (e.g. permission denied).
-                    let host_content = Self::get_volume_mountpoint_sync(vs)
-                        .ok()
-                        .and_then(|mountpoint| {
-                            let p = mountpoint
-                                .join(&resolved_target)
-                                .join("includes")
-                                .join(&ext_name)
-                                .join("avocado.yaml");
-                            if verbose {
-                                eprintln!(
-                                    "[DEBUG]   Trying host volume path: {}",
-                                    p.display()
-                                );
-                            }
-                            fs::read_to_string(&p).ok()
-                        });
+                    let host_content =
+                        Self::get_volume_mountpoint_sync(vs)
+                            .ok()
+                            .and_then(|mountpoint| {
+                                let p = mountpoint
+                                    .join(&resolved_target)
+                                    .join("includes")
+                                    .join(&ext_name)
+                                    .join("avocado.yaml");
+                                if verbose {
+                                    eprintln!("[DEBUG]   Trying host volume path: {}", p.display());
+                                }
+                                fs::read_to_string(&p).ok()
+                            });
 
                     if let Some(content) = host_content {
                         if verbose {

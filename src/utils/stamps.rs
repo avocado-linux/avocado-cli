@@ -2429,8 +2429,7 @@ kernel:
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         let hash_without =
             compute_runtime_input_hash(&without_kernel, "dev", &empty_parsed).unwrap();
-        let hash_with =
-            compute_runtime_input_hash(&with_kernel, "dev", &empty_parsed).unwrap();
+        let hash_with = compute_runtime_input_hash(&with_kernel, "dev", &empty_parsed).unwrap();
 
         // Hashes should differ when kernel config is added
         assert_ne!(hash_without.config_hash, hash_with.config_hash);
@@ -2543,10 +2542,8 @@ extensions:
         )
         .unwrap();
 
-        let hash_without =
-            compute_runtime_input_hash(&runtime, "dev", &parsed_without).unwrap();
-        let hash_with =
-            compute_runtime_input_hash(&runtime, "dev", &parsed_with).unwrap();
+        let hash_without = compute_runtime_input_hash(&runtime, "dev", &parsed_without).unwrap();
+        let hash_with = compute_runtime_input_hash(&runtime, "dev", &parsed_with).unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -2578,8 +2575,7 @@ var_files:
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         let hash_without =
             compute_runtime_input_hash(&runtime_without, "dev", &empty_parsed).unwrap();
-        let hash_with =
-            compute_runtime_input_hash(&runtime_with, "dev", &empty_parsed).unwrap();
+        let hash_with = compute_runtime_input_hash(&runtime_with, "dev", &empty_parsed).unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,

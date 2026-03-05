@@ -513,9 +513,7 @@ impl ExtImageCommand {
             .iter()
             .map(|pattern| {
                 // Strip trailing /** or /* glob suffixes to get the directory path for exclusion
-                let clean = pattern
-                    .trim_end_matches("/**")
-                    .trim_end_matches("/*");
+                let clean = pattern.trim_end_matches("/**").trim_end_matches("/*");
                 clean.to_string()
             })
             .collect::<Vec<_>>();

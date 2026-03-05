@@ -448,9 +448,7 @@ impl RuntimeBuildCommand {
             });
 
             if has_docker_images {
-                let mut args = merged_container_args
-                    .clone()
-                    .unwrap_or_default();
+                let mut args = merged_container_args.clone().unwrap_or_default();
                 if !args.iter().any(|a| a == "--privileged") {
                     args.push("--privileged".to_string());
                 }
@@ -821,9 +819,7 @@ echo "Provisioned update authority: metadata/root.json""#
                 if !var_files.is_empty() {
                     for pattern in &var_files {
                         // Strip trailing glob suffixes and leading "var/" to get the dest path under $VAR_DIR
-                        let clean_pattern = pattern
-                            .trim_end_matches("/**")
-                            .trim_end_matches("/*");
+                        let clean_pattern = pattern.trim_end_matches("/**").trim_end_matches("/*");
                         // The pattern is relative to the sysroot (e.g., "var/lib/docker")
                         // $VAR_DIR maps to /var on the target, so strip the leading "var/" for dest
                         let dest = clean_pattern.strip_prefix("var/").unwrap_or(clean_pattern);
