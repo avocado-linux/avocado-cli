@@ -227,7 +227,7 @@ impl RuntimeBuildCommand {
                 .flatten();
             let current_inputs = merged_runtime
                 .as_ref()
-                .and_then(|mr| compute_runtime_input_hash(mr, &self.runtime_name).ok());
+                .and_then(|mr| compute_runtime_input_hash(mr, &self.runtime_name, parsed).ok());
             let validation = validate_stamps_batch(
                 &required,
                 output.as_deref().unwrap_or(""),
@@ -429,6 +429,37 @@ impl RuntimeBuildCommand {
             Some(env_vars)
         };
 
+        // If any extension in this runtime declares docker_images, add --privileged
+        // to container args so dockerd can run inside the SDK container (Docker-in-Docker)
+        let build_container_args = {
+            let ext_list: Vec<&str> = merged_runtime
+                .as_ref()
+                .and_then(|rt| rt.get("extensions"))
+                .and_then(|e| e.as_sequence())
+                .map(|seq| seq.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+
+            let has_docker_images = ext_list.iter().any(|ext_name| {
+                parsed
+                    .get("extensions")
+                    .and_then(|e| e.get(*ext_name))
+                    .map(|ext| !crate::utils::config::get_docker_images(ext).is_empty())
+                    .unwrap_or(false)
+            });
+
+            if has_docker_images {
+                let mut args = merged_container_args
+                    .clone()
+                    .unwrap_or_default();
+                if !args.iter().any(|a| a == "--privileged") {
+                    args.push("--privileged".to_string());
+                }
+                Some(args)
+            } else {
+                merged_container_args.clone()
+            }
+        };
+
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.to_string(),
@@ -438,7 +469,7 @@ impl RuntimeBuildCommand {
             interactive: false,       // build script runs non-interactively
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
-            container_args: merged_container_args.clone(),
+            container_args: build_container_args,
             dnf_args: self.dnf_args.clone(),
             env_vars,
             // runs_on handled by shared context
@@ -463,7 +494,7 @@ impl RuntimeBuildCommand {
             let merged_runtime = config
                 .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
                 .unwrap_or_default();
-            let inputs = compute_runtime_input_hash(&merged_runtime, &self.runtime_name)?;
+            let inputs = compute_runtime_input_hash(&merged_runtime, &self.runtime_name, parsed)?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::runtime_build(&self.runtime_name, target_arch, inputs, outputs);
             let stamp_script = generate_write_stamp_script(&stamp)?;
@@ -767,11 +798,188 @@ cp "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1.ro
 echo "Provisioned update authority: metadata/root.json""#
         );
 
+        // Extension list from runtime config (used by var_files and docker priming)
+        let ext_list: Vec<&str> = merged_runtime
+            .get("extensions")
+            .and_then(|e| e.as_sequence())
+            .map(|seq| seq.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        // Build var_files section: apply extension var_files to var staging in reverse order
+        // (last in extensions list applied first = lowest priority, first applied last = wins conflicts)
+        let var_files_section = {
+            let mut var_files_commands = Vec::new();
+
+            // Process in reverse order so first-listed extension wins conflicts
+            for ext_name in ext_list.iter().rev() {
+                let var_files = parsed
+                    .get("extensions")
+                    .and_then(|e| e.get(*ext_name))
+                    .map(crate::utils::config::get_ext_var_files)
+                    .unwrap_or_default();
+
+                if !var_files.is_empty() {
+                    for pattern in &var_files {
+                        // Strip trailing glob suffixes and leading "var/" to get the dest path under $VAR_DIR
+                        let clean_pattern = pattern
+                            .trim_end_matches("/**")
+                            .trim_end_matches("/*");
+                        // The pattern is relative to the sysroot (e.g., "var/lib/docker")
+                        // $VAR_DIR maps to /var on the target, so strip the leading "var/" for dest
+                        let dest = clean_pattern.strip_prefix("var/").unwrap_or(clean_pattern);
+                        var_files_commands.push(format!(
+                            r#"
+if [ -d "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}" ]; then
+    echo "  Applying var files from extension '{ext_name}': {clean_pattern}/"
+    mkdir -p "$VAR_DIR/{dest}"
+    rsync -a "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}/" "$VAR_DIR/{dest}/"
+elif [ -f "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}" ]; then
+    echo "  Applying var file from extension '{ext_name}': {clean_pattern}"
+    mkdir -p "$(dirname "$VAR_DIR/{dest}")"
+    cp -f "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}" "$VAR_DIR/{dest}"
+fi"#
+                        ));
+                    }
+                }
+            }
+
+            if var_files_commands.is_empty() {
+                "# No extension var_files to apply".to_string()
+            } else {
+                format!(
+                    "echo \"Applying extension var files to var partition...\"\n{}",
+                    var_files_commands.join("\n")
+                )
+            }
+        };
+
+        // Build runtime-level var_files section
+        let runtime_var_files_section = {
+            let runtime_var_files = crate::utils::config::get_runtime_var_files(&merged_runtime);
+            if runtime_var_files.is_empty() {
+                "# No runtime var_files to apply".to_string()
+            } else {
+                let commands: Vec<String> = runtime_var_files
+                    .iter()
+                    .map(|mapping| {
+                        format!(
+                            r#"
+if [ -e "/opt/src/{source}" ]; then
+    mkdir -p "$VAR_DIR/{dest}"
+    rsync -a "/opt/src/{source}" "$VAR_DIR/{dest}"
+    echo "  Copied runtime var_files: {source} -> {dest}"
+else
+    echo "WARNING: runtime var_files source not found: /opt/src/{source}"
+fi"#,
+                            source = mapping.source,
+                            dest = mapping.dest
+                        )
+                    })
+                    .collect();
+                format!(
+                    "echo \"Applying runtime var files to var partition...\"\n{}",
+                    commands.join("\n")
+                )
+            }
+        };
+
+        // Build Docker image priming section
+        // Collect docker_images from all extensions in the runtime
+        let docker_section = {
+            let docker_images: Vec<crate::utils::config::DockerImageRef> = ext_list
+                .iter()
+                .flat_map(|ext_name| {
+                    parsed
+                        .get("extensions")
+                        .and_then(|e| e.get(*ext_name))
+                        .map(crate::utils::config::get_docker_images)
+                        .unwrap_or_default()
+                })
+                .collect();
+            if docker_images.is_empty() {
+                "# No Docker images to prime".to_string()
+            } else {
+                let pull_commands: Vec<String> = docker_images
+                    .iter()
+                    .map(|img| {
+                        format!(
+                            r#"docker --host unix:///tmp/avocado-dockerd.sock pull --platform "linux/$DOCKER_ARCH" "{image}:{tag}"
+echo "  Primed: {image}:{tag}""#,
+                            image = img.image,
+                            tag = img.tag
+                        )
+                    })
+                    .collect();
+
+                format!(
+                    r#"# Prime Docker image cache on var partition
+echo "Priming Docker images on var partition..."
+mkdir -p "$VAR_DIR/lib/docker"
+
+# Verify dockerd is available
+if ! command -v dockerd >/dev/null 2>&1; then
+    echo "ERROR: dockerd not found in SDK container. Docker image priming requires dockerd, containerd, runc, and docker CLI."
+    exit 1
+fi
+
+# Map target arch to Docker platform
+# Use OECORE_TARGET_ARCH (CPU arch like x86_64/aarch64) from SDK environment
+DOCKER_TARGET_ARCH="${{OECORE_TARGET_ARCH:-$TARGET_ARCH}}"
+case "$DOCKER_TARGET_ARCH" in
+    aarch64) DOCKER_ARCH="arm64" ;;
+    x86_64) DOCKER_ARCH="amd64" ;;
+    *) echo "WARNING: Unknown target architecture '$DOCKER_TARGET_ARCH' for Docker platform mapping, defaulting to amd64"; DOCKER_ARCH="amd64" ;;
+esac
+
+# Start temporary dockerd with data-root pointing at var staging
+dockerd --data-root "$VAR_DIR/lib/docker" \
+    --host unix:///tmp/avocado-dockerd.sock \
+    --iptables=false --ip-masq=false \
+    --bridge=none \
+    --exec-root /tmp/avocado-dockerd \
+    --pidfile /tmp/avocado-dockerd.pid \
+    >/tmp/avocado-dockerd.log 2>&1 &
+DOCKERD_PID=$!
+
+# Wait for dockerd to be ready
+echo "Waiting for temporary dockerd..."
+for i in $(seq 1 30); do
+    if docker --host unix:///tmp/avocado-dockerd.sock info >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 $DOCKERD_PID 2>/dev/null; then
+        echo "ERROR: dockerd exited unexpectedly. Check /tmp/avocado-dockerd.log"
+        cat /tmp/avocado-dockerd.log
+        exit 1
+    fi
+    sleep 1
+done
+
+if ! docker --host unix:///tmp/avocado-dockerd.sock info >/dev/null 2>&1; then
+    echo "ERROR: dockerd failed to start within 30 seconds"
+    kill $DOCKERD_PID 2>/dev/null || true
+    cat /tmp/avocado-dockerd.log
+    exit 1
+fi
+
+echo "Pulling Docker images for platform linux/$DOCKER_ARCH..."
+{pull_commands}
+
+# Stop temporary dockerd
+kill $DOCKERD_PID 2>/dev/null || true
+wait $DOCKERD_PID 2>/dev/null || true
+rm -f /tmp/avocado-dockerd.sock /tmp/avocado-dockerd.pid /tmp/avocado-dockerd.log
+echo "Docker image priming complete.""#,
+                    pull_commands = pull_commands.join("\n")
+                )
+            }
+        };
+
         let script = format!(
             r#"
 # Set common variables
-RUNTIME_NAME="{}"
-TARGET_ARCH="{}"
+RUNTIME_NAME="{runtime_name}"
+TARGET_ARCH="{target_arch}"
 
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/images"
@@ -790,9 +998,12 @@ rm -f "$RUNTIME_EXT_DIR"/*.raw 2>/dev/null || true
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
-{}
-{}
-{}
+{copy_section}
+{var_files_section}
+{runtime_var_files_section}
+{manifest_section}
+{update_authority_section}
+{docker_section}
 
 # Potential future SDK target hook.
 # echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
@@ -805,11 +1016,14 @@ mkfs.btrfs -r "$VAR_DIR" \
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
 avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
-            self.runtime_name,
-            target_arch,
-            copy_section,
-            manifest_section,
-            update_authority_section
+            runtime_name = self.runtime_name,
+            target_arch = target_arch,
+            copy_section = copy_section,
+            var_files_section = var_files_section,
+            runtime_var_files_section = runtime_var_files_section,
+            manifest_section = manifest_section,
+            update_authority_section = update_authority_section,
+            docker_section = docker_section,
         );
 
         Ok(script)

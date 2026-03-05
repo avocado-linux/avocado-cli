@@ -377,6 +377,9 @@ impl ExtImageCommand {
 
         let source_date_epoch = config.source_date_epoch.unwrap_or(0);
 
+        // Get var_files patterns — these files go on the var partition and are excluded from the .raw image
+        let var_files = crate::utils::config::get_ext_var_files(&ext_config);
+
         let result = self
             .create_image(
                 &container_helper,
@@ -389,6 +392,7 @@ impl ExtImageCommand {
                 &merged_container_args,
                 source_date_epoch,
                 filesystem,
+                &var_files,
             )
             .await?;
 
@@ -460,10 +464,16 @@ impl ExtImageCommand {
         merged_container_args: &Option<Vec<String>>,
         source_date_epoch: u64,
         filesystem: &str,
+        var_files: &[String],
     ) -> Result<bool> {
         // Create the build script
-        let build_script =
-            self.create_build_script(ext_version, extension_type, source_date_epoch, filesystem);
+        let build_script = self.create_build_script(
+            ext_version,
+            extension_type,
+            source_date_epoch,
+            filesystem,
+            var_files,
+        );
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -496,25 +506,64 @@ impl ExtImageCommand {
         _extension_type: &str,
         source_date_epoch: u64,
         filesystem: &str,
+        var_files: &[String],
     ) -> String {
+        // Build exclude flags for var_files patterns (these go on the var partition, not in the .raw image)
+        let var_excludes = var_files
+            .iter()
+            .map(|pattern| {
+                // Strip trailing /** or /* glob suffixes to get the directory path for exclusion
+                let clean = pattern
+                    .trim_end_matches("/**")
+                    .trim_end_matches("/*");
+                clean.to_string()
+            })
+            .collect::<Vec<_>>();
+
         let mkfs_command = match filesystem {
-            "erofs" => r#"# Create erofs image
+            "erofs" => {
+                let exclude_flags = var_excludes
+                    .iter()
+                    .map(|p| format!("  --exclude-path={p} \\"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let exclude_section = if exclude_flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{exclude_flags}")
+                };
+                format!(
+                    r#"# Create erofs image
 mkfs.erofs \
   -T "$SOURCE_DATE_EPOCH" \
   -U 00000000-0000-0000-0000-000000000000 \
   -x -1 \
-  --all-root \
+  --all-root \{exclude_section}
   "$OUTPUT_FILE" \
   "$AVOCADO_EXT_SYSROOTS/$EXT_NAME""#
-                .to_string(),
-            _ => r#"# Create squashfs image
+                )
+            }
+            _ => {
+                let exclude_flags = var_excludes
+                    .iter()
+                    .map(|p| format!("  -e \"{p}\""))
+                    .collect::<Vec<_>>()
+                    .join(" \\\n");
+                let exclude_section = if exclude_flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \\\n{exclude_flags}")
+                };
+                format!(
+                    r#"# Create squashfs image
 mksquashfs \
   "$AVOCADO_EXT_SYSROOTS/$EXT_NAME" \
   "$OUTPUT_FILE" \
   -noappend \
   -no-xattrs \
-  -reproducible"#
-                .to_string(),
+  -reproducible{exclude_section}"#
+                )
+            }
         };
 
         format!(
@@ -572,7 +621,7 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[]);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -595,7 +644,7 @@ mod tests {
     #[test]
     fn test_create_build_script_squashfs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[]);
 
         assert!(
             script.contains("mksquashfs"),
@@ -623,7 +672,7 @@ mod tests {
     fn test_create_build_script_defaults_to_squashfs() {
         let cmd = make_cmd("my-ext");
         // Passing "squashfs" simulates the default behavior
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[]);
 
         assert!(
             script.contains("mksquashfs"),
@@ -634,7 +683,7 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_default() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[]);
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=0"),
@@ -649,7 +698,7 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_custom() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 1700000000, "erofs");
+        let script = cmd.create_build_script("1.0.0", "sysext", 1700000000, "erofs", &[]);
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=1700000000"),
@@ -664,7 +713,7 @@ mod tests {
     #[test]
     fn test_create_build_script_extension_name_and_version() {
         let cmd = make_cmd("test-extension");
-        let script = cmd.create_build_script("2.3.4", "sysext", 0, "squashfs");
+        let script = cmd.create_build_script("2.3.4", "sysext", 0, "squashfs", &[]);
 
         assert!(
             script.contains("EXT_NAME=\"test-extension\""),
@@ -679,11 +728,53 @@ mod tests {
     #[test]
     fn test_create_build_script_output_path() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[]);
 
         assert!(
             script.contains("OUTPUT_FILE=\"$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw\""),
             "script should set the output file with .raw extension"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_squashfs_var_files_excludes() {
+        let cmd = make_cmd("my-ext");
+        let var_files = vec![
+            "var/lib/docker/**".to_string(),
+            "var/lib/myapp/data".to_string(),
+        ];
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &var_files);
+
+        assert!(
+            script.contains("-e \"var/lib/docker\""),
+            "squashfs script should exclude var/lib/docker"
+        );
+        assert!(
+            script.contains("-e \"var/lib/myapp/data\""),
+            "squashfs script should exclude var/lib/myapp/data"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_erofs_var_files_excludes() {
+        let cmd = make_cmd("my-ext");
+        let var_files = vec!["var/lib/docker/**".to_string()];
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &var_files);
+
+        assert!(
+            script.contains("--exclude-path=var/lib/docker"),
+            "erofs script should exclude var/lib/docker"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_no_var_files_no_excludes() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[]);
+
+        assert!(
+            !script.contains("-e \"var/"),
+            "script should not contain exclude flags when no var_files"
         );
     }
 }

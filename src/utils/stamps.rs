@@ -853,6 +853,13 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
                 types.clone(),
             );
         }
+        // Include var_files as they affect which files are excluded from the .raw image
+        if let Some(var_files) = ext.get("var_files") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.var_files")),
+                var_files.clone(),
+            );
+        }
     }
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
@@ -860,10 +867,12 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
 }
 
 /// Compute input hash for runtime install
-/// Includes: runtime.<name>.dependencies (merged with target), kernel config
+/// Includes: runtime.<name>.dependencies (merged with target), kernel config,
+/// extension docker_images (affects var partition priming)
 pub fn compute_runtime_input_hash(
     merged_runtime: &serde_yaml::Value,
     runtime_name: &str,
+    parsed: &serde_yaml::Value,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -888,6 +897,36 @@ pub fn compute_runtime_input_hash(
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
             kernel.clone(),
+        );
+    }
+
+    // Include docker_images from extensions in this runtime
+    // (changes to extension docker_images should trigger runtime rebuild to re-prime images)
+    if let Some(ext_list) = merged_runtime
+        .get("extensions")
+        .and_then(|e| e.as_sequence())
+    {
+        for ext_val in ext_list {
+            if let Some(ext_name) = ext_val.as_str() {
+                if let Some(docker_images) = parsed
+                    .get("extensions")
+                    .and_then(|e| e.get(ext_name))
+                    .and_then(|ext| ext.get("docker_images"))
+                {
+                    hash_data.insert(
+                        serde_yaml::Value::String(format!("ext.{ext_name}.docker_images")),
+                        docker_images.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Include runtime-level var_files if specified
+    if let Some(var_files) = merged_runtime.get("var_files") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.var_files")),
+            var_files.clone(),
         );
     }
 
@@ -2387,8 +2426,11 @@ kernel:
         )
         .unwrap();
 
-        let hash_without = compute_runtime_input_hash(&without_kernel, "dev").unwrap();
-        let hash_with = compute_runtime_input_hash(&with_kernel, "dev").unwrap();
+        let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let hash_without =
+            compute_runtime_input_hash(&without_kernel, "dev", &empty_parsed).unwrap();
+        let hash_with =
+            compute_runtime_input_hash(&with_kernel, "dev", &empty_parsed).unwrap();
 
         // Hashes should differ when kernel config is added
         assert_ne!(hash_without.config_hash, hash_with.config_hash);
@@ -2418,10 +2460,130 @@ kernel:
         )
         .unwrap();
 
-        let hash_package = compute_runtime_input_hash(&kernel_package, "dev").unwrap();
-        let hash_compile = compute_runtime_input_hash(&kernel_compile, "dev").unwrap();
+        let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let hash_package =
+            compute_runtime_input_hash(&kernel_package, "dev", &empty_parsed).unwrap();
+        let hash_compile =
+            compute_runtime_input_hash(&kernel_compile, "dev", &empty_parsed).unwrap();
 
         // Switching kernel mode should produce a different hash
         assert_ne!(hash_package.config_hash, hash_compile.config_hash);
+    }
+
+    #[test]
+    fn test_ext_input_hash_includes_var_files() {
+        let config_without: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    version: "1.0.0"
+    types: [sysext]
+    packages:
+      foo: "*"
+"#,
+        )
+        .unwrap();
+
+        let config_with: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    version: "1.0.0"
+    types: [sysext]
+    packages:
+      foo: "*"
+    var_files:
+      - "var/lib/docker/**"
+"#,
+        )
+        .unwrap();
+
+        let hash_without = compute_ext_input_hash(&config_without, "my-ext").unwrap();
+        let hash_with = compute_ext_input_hash(&config_with, "my-ext").unwrap();
+
+        assert_ne!(
+            hash_without.config_hash, hash_with.config_hash,
+            "Adding var_files should change the ext input hash"
+        );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_includes_ext_docker_images() {
+        // Runtime references extension "app" which has docker_images
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+extensions:
+  - app
+"#,
+        )
+        .unwrap();
+
+        let parsed_without: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  app:
+    version: "1.0.0"
+    types: [sysext]
+"#,
+        )
+        .unwrap();
+
+        let parsed_with: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  app:
+    version: "1.0.0"
+    types: [sysext]
+    docker_images:
+      - image: "docker.io/library/redis"
+        tag: "7-alpine"
+"#,
+        )
+        .unwrap();
+
+        let hash_without =
+            compute_runtime_input_hash(&runtime, "dev", &parsed_without).unwrap();
+        let hash_with =
+            compute_runtime_input_hash(&runtime, "dev", &parsed_with).unwrap();
+
+        assert_ne!(
+            hash_without.config_hash, hash_with.config_hash,
+            "Adding docker_images to an extension should change the runtime input hash"
+        );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_includes_var_files() {
+        let runtime_without: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+"#,
+        )
+        .unwrap();
+
+        let runtime_with: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+var_files:
+  - source: "files/data/"
+    dest: "lib/myapp/"
+"#,
+        )
+        .unwrap();
+
+        let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let hash_without =
+            compute_runtime_input_hash(&runtime_without, "dev", &empty_parsed).unwrap();
+        let hash_with =
+            compute_runtime_input_hash(&runtime_with, "dev", &empty_parsed).unwrap();
+
+        assert_ne!(
+            hash_without.config_hash, hash_with.config_hash,
+            "Adding var_files should change the runtime input hash"
+        );
     }
 }

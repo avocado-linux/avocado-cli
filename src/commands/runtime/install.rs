@@ -272,7 +272,7 @@ impl RuntimeInstallCommand {
                     &target_arch,
                     &self.config_path,
                 )? {
-                    let inputs = compute_runtime_input_hash(&merged_runtime, runtime_name)?;
+                    let inputs = compute_runtime_input_hash(&merged_runtime, runtime_name, parsed)?;
                     let outputs = StampOutputs::default();
                     let stamp = Stamp::runtime_install(runtime_name, &target_arch, inputs, outputs);
                     let stamp_script = generate_write_stamp_script(&stamp)?;

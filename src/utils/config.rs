@@ -491,6 +491,70 @@ pub struct DistroRepoConfig {
     pub releasever: Option<String>,
 }
 
+/// Reference to a Docker image for priming on the var partition at build time.
+#[derive(Debug, Clone)]
+pub struct DockerImageRef {
+    pub image: String,
+    pub tag: String,
+}
+
+/// Mapping of a source file/directory to a destination on the var partition.
+#[derive(Debug, Clone)]
+pub struct VarFileMapping {
+    pub source: String,
+    pub dest: String,
+}
+
+/// Extract var_files glob patterns from an extension config value.
+/// Returns an empty Vec if no var_files are configured.
+pub fn get_ext_var_files(ext_config: &serde_yaml::Value) -> Vec<String> {
+    ext_config
+        .get("var_files")
+        .and_then(|v| v.as_sequence())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract docker_images from a config value (extension or runtime).
+/// Returns an empty Vec if no docker_images are configured.
+pub fn get_docker_images(config: &serde_yaml::Value) -> Vec<DockerImageRef> {
+    config
+        .get("docker_images")
+        .and_then(|v| v.as_sequence())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let image = entry.get("image")?.as_str()?.to_string();
+                    let tag = entry.get("tag")?.as_str()?.to_string();
+                    Some(DockerImageRef { image, tag })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract var_files source/dest mappings from a runtime config value.
+/// Returns an empty Vec if no var_files are configured.
+pub fn get_runtime_var_files(runtime_config: &serde_yaml::Value) -> Vec<VarFileMapping> {
+    runtime_config
+        .get("var_files")
+        .and_then(|v| v.as_sequence())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let source = entry.get("source")?.as_str()?.to_string();
+                    let dest = entry.get("dest")?.as_str()?.to_string();
+                    Some(VarFileMapping { source, dest })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Helper module for deserializing signing keys list
 mod signing_keys_deserializer {
     use serde::{Deserialize, Deserializer};
@@ -1227,6 +1291,7 @@ impl Config {
                                 "stone_include_paths",
                                 "stone_manifest",
                                 "signing",
+                                "var_files",
                             ]
                             .contains(&key_str)
                             {
@@ -1274,6 +1339,8 @@ impl Config {
                                 "confext",
                                 "sysext",
                                 "overlay",
+                                "var_files",
+                                "docker_images",
                             ]
                             .contains(&key_str)
                             {
@@ -7737,5 +7804,115 @@ sdk:
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Invalid cli_requirement"));
+    }
+
+    #[test]
+    fn test_get_ext_var_files_returns_patterns() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+version: "1.0.0"
+types: [sysext]
+var_files:
+  - "var/lib/docker/**"
+  - "var/lib/myapp/data/"
+"#,
+        )
+        .unwrap();
+
+        let result = get_ext_var_files(&yaml);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "var/lib/docker/**");
+        assert_eq!(result[1], "var/lib/myapp/data/");
+    }
+
+    #[test]
+    fn test_get_ext_var_files_returns_empty_when_missing() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+version: "1.0.0"
+types: [sysext]
+"#,
+        )
+        .unwrap();
+
+        let result = get_ext_var_files(&yaml);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_docker_images_returns_refs() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [base]
+docker_images:
+  - image: "docker.io/library/redis"
+    tag: "7-alpine"
+  - image: "docker.io/library/nginx"
+    tag: "1.25"
+"#,
+        )
+        .unwrap();
+
+        let result = get_docker_images(&yaml);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].image, "docker.io/library/redis");
+        assert_eq!(result[0].tag, "7-alpine");
+        assert_eq!(result[1].image, "docker.io/library/nginx");
+        assert_eq!(result[1].tag, "1.25");
+    }
+
+    #[test]
+    fn test_get_docker_images_returns_empty_when_missing() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [base]
+"#,
+        )
+        .unwrap();
+
+        let result = get_docker_images(&yaml);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_docker_images_skips_incomplete_entries() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+docker_images:
+  - image: "docker.io/library/redis"
+  - image: "docker.io/library/nginx"
+    tag: "1.25"
+"#,
+        )
+        .unwrap();
+
+        // First entry missing tag should be skipped
+        let result = get_docker_images(&yaml);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].image, "docker.io/library/nginx");
+    }
+
+    #[test]
+    fn test_get_runtime_var_files_returns_mappings() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+var_files:
+  - source: "files/var-data/"
+    dest: "lib/myapp/"
+"#,
+        )
+        .unwrap();
+
+        let result = get_runtime_var_files(&yaml);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].source, "files/var-data/");
+        assert_eq!(result[0].dest, "lib/myapp/");
+    }
+
+    #[test]
+    fn test_get_runtime_var_files_returns_empty_when_missing() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("extensions: [base]").unwrap();
+        let result = get_runtime_var_files(&yaml);
+        assert!(result.is_empty());
     }
 }
