@@ -507,25 +507,25 @@ impl StampRequirement {
                 None => "avocado sdk install".to_string(),
             },
             (StampComponent::Extension, Some(name), StampCommand::Install) => {
-                format!("avocado ext install -e {name}")
+                format!("avocado ext install {name}")
             }
             (StampComponent::Extension, Some(name), StampCommand::Build) => {
-                format!("avocado ext build -e {name}")
+                format!("avocado ext build {name}")
             }
             (StampComponent::Extension, Some(name), StampCommand::Image) => {
-                format!("avocado ext image -e {name}")
+                format!("avocado ext image {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Install) => {
-                format!("avocado runtime install -r {name}")
+                format!("avocado runtime install {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Build) => {
-                format!("avocado runtime build -r {name}")
+                format!("avocado runtime build {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Sign) => {
-                format!("avocado runtime sign -r {name}")
+                format!("avocado runtime sign {name}")
             }
             (StampComponent::Runtime, Some(name), StampCommand::Provision) => {
-                format!("avocado runtime provision -r {name}")
+                format!("avocado runtime provision {name}")
             }
             _ => format!("avocado {} {}", self.component, self.command),
         }
@@ -1363,11 +1363,11 @@ mod tests {
 
         let req = StampRequirement::ext_install("gpu-driver");
         assert_eq!(req.description(), "extension 'gpu-driver' install");
-        assert_eq!(req.fix_command(), "avocado ext install -e gpu-driver");
+        assert_eq!(req.fix_command(), "avocado ext install gpu-driver");
 
         let req = StampRequirement::runtime_build("my-runtime");
         assert_eq!(req.description(), "runtime 'my-runtime' build");
-        assert_eq!(req.fix_command(), "avocado runtime build -r my-runtime");
+        assert_eq!(req.fix_command(), "avocado runtime build my-runtime");
     }
 
     #[test]
@@ -1570,7 +1570,7 @@ mod tests {
         assert!(error_str.contains("config changed"));
         assert!(error_str.contains("To fix:"));
         assert!(error_str.contains("avocado sdk install"));
-        assert!(error_str.contains("avocado ext install -e gpu-driver"));
+        assert!(error_str.contains("avocado ext install gpu-driver"));
     }
 
     #[test]
@@ -1748,7 +1748,7 @@ mod tests {
     fn test_ext_image_requirement_description_and_fix() {
         let req = StampRequirement::ext_image("gpu-driver");
         assert_eq!(req.description(), "extension 'gpu-driver' image");
-        assert_eq!(req.fix_command(), "avocado ext image -e gpu-driver");
+        assert_eq!(req.fix_command(), "avocado ext image gpu-driver");
         assert_eq!(req.relative_path(), "ext/gpu-driver/image.stamp");
     }
 
@@ -1920,8 +1920,8 @@ ext/my-ext/build.stamp:::null"#
 
         // Verify fix commands are correct
         assert_eq!(reqs[0].fix_command(), "avocado sdk install");
-        assert_eq!(reqs[1].fix_command(), "avocado ext install -e my-ext");
-        assert_eq!(reqs[2].fix_command(), "avocado ext build -e my-ext");
+        assert_eq!(reqs[1].fix_command(), "avocado ext install my-ext");
+        assert_eq!(reqs[2].fix_command(), "avocado ext build my-ext");
 
         // Verify descriptions are helpful (SDK now includes architecture)
         assert_eq!(
@@ -1943,7 +1943,7 @@ ext/my-ext/build.stamp:::null"#
 
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].fix_command(), "avocado sdk install");
-        assert_eq!(reqs[1].fix_command(), "avocado ext install -e my-ext");
+        assert_eq!(reqs[1].fix_command(), "avocado ext install my-ext");
     }
 
     #[test]
@@ -2260,8 +2260,8 @@ runtime/my-runtime/build.stamp:::null"#,
 
         // Should include all fix commands
         assert!(msg.contains("avocado sdk install"));
-        assert!(msg.contains("avocado ext install -e app"));
-        assert!(msg.contains("avocado ext build -e app"));
+        assert!(msg.contains("avocado ext install app"));
+        assert!(msg.contains("avocado ext build app"));
     }
 
     #[test]

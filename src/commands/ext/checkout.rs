@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(requirements[0].fix_command(), "avocado sdk install");
         assert_eq!(
             requirements[1].fix_command(),
-            "avocado ext install -e config-files"
+            "avocado ext install config-files"
         );
     }
 

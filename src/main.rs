@@ -263,6 +263,8 @@ enum Commands {
     },
     /// Provision a runtime (shortcut for 'runtime provision')
     Provision {
+        /// Runtime name (must be defined in config)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -272,9 +274,9 @@ enum Commands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
-        /// Runtime name to provision
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name to provision (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -296,15 +298,17 @@ enum Commands {
     },
     /// Deploy a runtime to a device (shortcut for 'runtime deploy')
     Deploy {
+        /// Runtime name (must be defined in config)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Runtime name to deploy
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name to deploy (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -326,14 +330,16 @@ enum Commands {
     },
     /// Sign runtime images (shortcut for 'runtime sign')
     Sign {
+        /// Runtime name to sign (if not provided, signs all runtimes with signing config)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Runtime name to sign (if not provided, signs all runtimes with signing config)
-        #[arg(short = 'r', long = "runtime")]
+        /// Runtime name to sign (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
         runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
@@ -1066,6 +1072,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Provision {
+            name,
             config,
             verbose,
             force,
@@ -1077,6 +1084,10 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            let runtime = name
+                .or(runtime)
+                .context("runtime name is required (provide as positional or -r/--runtime)")?;
+
             // Validate runtime exists (required argument)
             validate_runtime_required(&config, &runtime)?;
 
@@ -1101,6 +1112,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Deploy {
+            name,
             config,
             verbose,
             runtime,
@@ -1109,6 +1121,10 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            let runtime = name
+                .or(runtime)
+                .context("runtime name is required (provide as positional or -r/--runtime)")?;
+
             // Validate runtime exists (required argument)
             validate_runtime_required(&config, &runtime)?;
 
@@ -1160,6 +1176,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Sign {
+            name,
             config,
             verbose,
             runtime,
@@ -1167,6 +1184,8 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
+            let runtime = name.or(runtime);
+
             // Validate runtime exists if provided
             validate_runtime_if_provided(&config, runtime.as_ref())?;
 
