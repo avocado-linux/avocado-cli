@@ -1617,6 +1617,32 @@ mkdir -p ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars
 echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars/repo_url
+
+# Re-apply machine-scoped SDK arch and rpm platform to override any package scriptlet
+# resets. Package post-install scripts (via update-alternatives) may register a generic
+# (host-arch-only) alternative. Without this repair the rpm platform stays at
+# x86_64_avocadosdk and RPM rejects qemux86_64_x86_64_avocadosdk packages as
+# "intended for a different architecture" during the transaction check.
+_SDK_MACHINE_US=$(echo "${{AVOCADO_TARGET}}" | tr '-' '_')
+_SDK_HOST_US=$(uname -m | tr '-' '_')
+_SDKIMGARCH="${{_SDK_MACHINE_US}}_${{_SDK_HOST_US}}_avocadosdk"
+if [ -f "${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars/arch" ]; then
+    _ARCH_FILE="${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars/arch"
+    _ARCH_CURRENT=$(cat "${{_ARCH_FILE}}" 2>/dev/null || echo "")
+    _ARCH_FIRST=$(echo "${{_ARCH_CURRENT}}" | cut -d: -f1)
+    if [ -n "${{_ARCH_CURRENT}}" ] && [ "${{_ARCH_FIRST}}" != "${{_SDKIMGARCH}}" ]; then
+        rm -f "${{_ARCH_FILE}}"
+        echo "${{_SDKIMGARCH}}:${{_ARCH_CURRENT}}" > "${{_ARCH_FILE}}"
+    fi
+fi
+if [ -f "${{AVOCADO_SDK_PREFIX}}/etc/rpm/platform" ]; then
+    _PLATFORM_FILE="${{AVOCADO_SDK_PREFIX}}/etc/rpm/platform"
+    _PLATFORM_CURRENT=$(cat "${{_PLATFORM_FILE}}" 2>/dev/null || echo "")
+    if [ "${{_PLATFORM_CURRENT}}" != "${{_SDKIMGARCH}}-avocado-linux" ]; then
+        rm -f "${{_PLATFORM_FILE}}"
+        echo "${{_SDKIMGARCH}}-avocado-linux" > "${{_PLATFORM_FILE}}"
+    fi
+fi
 "#
         );
 
@@ -1840,6 +1866,32 @@ mkdir -p ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars
 echo "${{REPO_URL}}" > /etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars/repo_url
 echo "${{REPO_URL}}" > ${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars/repo_url
+
+# Re-apply machine-scoped SDK arch and rpm platform to override any package scriptlet
+# resets. Package post-install scripts (via update-alternatives) may register a generic
+# (host-arch-only) alternative. Without this repair the rpm platform stays at
+# x86_64_avocadosdk and RPM rejects qemux86_64_x86_64_avocadosdk packages as
+# "intended for a different architecture" during the transaction check.
+_SDK_MACHINE_US=$(echo "${{AVOCADO_TARGET}}" | tr '-' '_')
+_SDK_HOST_US=$(uname -m | tr '-' '_')
+_SDKIMGARCH="${{_SDK_MACHINE_US}}_${{_SDK_HOST_US}}_avocadosdk"
+if [ -f "${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars/arch" ]; then
+    _ARCH_FILE="${{AVOCADO_SDK_PREFIX}}/etc/dnf/vars/arch"
+    _ARCH_CURRENT=$(cat "${{_ARCH_FILE}}" 2>/dev/null || echo "")
+    _ARCH_FIRST=$(echo "${{_ARCH_CURRENT}}" | cut -d: -f1)
+    if [ -n "${{_ARCH_CURRENT}}" ] && [ "${{_ARCH_FIRST}}" != "${{_SDKIMGARCH}}" ]; then
+        rm -f "${{_ARCH_FILE}}"
+        echo "${{_SDKIMGARCH}}:${{_ARCH_CURRENT}}" > "${{_ARCH_FILE}}"
+    fi
+fi
+if [ -f "${{AVOCADO_SDK_PREFIX}}/etc/rpm/platform" ]; then
+    _PLATFORM_FILE="${{AVOCADO_SDK_PREFIX}}/etc/rpm/platform"
+    _PLATFORM_CURRENT=$(cat "${{_PLATFORM_FILE}}" 2>/dev/null || echo "")
+    if [ "${{_PLATFORM_CURRENT}}" != "${{_SDKIMGARCH}}-avocado-linux" ]; then
+        rm -f "${{_PLATFORM_FILE}}"
+        echo "${{_SDKIMGARCH}}-avocado-linux" > "${{_PLATFORM_FILE}}"
+    fi
+fi
 "#
         );
 
@@ -2224,6 +2276,23 @@ mod tests {
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/runtimes/test-runtime"));
         assert!(!script.contains("cd /opt/src"));
+    }
+
+    #[test]
+    fn test_entrypoint_script_sdkimgarch_repair() {
+        let container = SdkContainer::new();
+        let script =
+            container.create_entrypoint_script(true, None, None, "qemux86-64", false, false);
+        // Verify arch repair block
+        assert!(script.contains("_SDKIMGARCH="));
+        assert!(script.contains("_ARCH_FIRST=$(echo \"${_ARCH_CURRENT}\" | cut -d: -f1)"));
+        assert!(script.contains("[ \"${_ARCH_FIRST}\" != \"${_SDKIMGARCH}\" ]"));
+        assert!(script.contains("echo \"${_SDKIMGARCH}:${_ARCH_CURRENT}\""));
+        // Verify platform repair block
+        assert!(script.contains("etc/rpm/platform"));
+        assert!(script.contains("\"${_SDKIMGARCH}-avocado-linux\""));
+        // AVOCADO_TARGET is used to derive machine component
+        assert!(script.contains("echo \"${AVOCADO_TARGET}\" | tr '-' '_'"));
     }
 
     #[test]

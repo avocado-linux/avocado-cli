@@ -1663,12 +1663,12 @@ echo "Set proper permissions on authentication files""#,
             // Note: Use double quotes for workdir so $AVOCADO_PREFIX gets expanded by the shell
             let install_command = if let Some(workdir) = ext_script_workdir {
                 format!(
-                    r#"cd "{workdir}" && if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
+                    r#"cd "{workdir}" && if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_BUILD_DIR=$AVOCADO_SDK_PREFIX/build/{compile_section} AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
                     extension_name = self.extension
                 )
             } else {
                 format!(
-                    r#"if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
+                    r#"if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{extension_name}"; AVOCADO_BUILD_DIR=$AVOCADO_SDK_PREFIX/build/{compile_section} AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
                     extension_name = self.extension
                 )
             };

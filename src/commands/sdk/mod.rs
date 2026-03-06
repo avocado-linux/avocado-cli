@@ -3,6 +3,7 @@ pub mod compile;
 pub mod deps;
 pub mod dnf;
 pub mod install;
+pub mod package;
 pub mod run;
 
 #[allow(unused_imports)]
@@ -13,5 +14,6 @@ pub use deps::SdkDepsCommand;
 #[allow(unused_imports)]
 pub use dnf::SdkDnfCommand;
 pub use install::SdkInstallCommand;
+pub use package::SdkPackageCommand;
 #[allow(unused_imports)]
 pub use run::SdkRunCommand;

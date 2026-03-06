@@ -269,14 +269,15 @@ impl SdkCompileCommand {
             // Build compile command with optional workdir prefix
             // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext>/ instead of /opt/src
             // Note: Use double quotes for workdir so $AVOCADO_PREFIX gets expanded by the shell
+            let section_name = &section.name;
             let compile_command = if let Some(ref workdir) = self.workdir {
                 format!(
-                    r#"cd "{workdir}" && if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
+                    r#"cd "{workdir}" && if [ -f '{}' ]; then echo 'Running compile script: {}'; mkdir -p $AVOCADO_SDK_PREFIX/build/{section_name} && AVOCADO_BUILD_DIR=$AVOCADO_SDK_PREFIX/build/{section_name} AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
                     section.script, section.script, section.script, section.script
                 )
             } else {
                 format!(
-                    r#"if [ -f '{}' ]; then echo 'Running compile script: {}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
+                    r#"if [ -f '{}' ]; then echo 'Running compile script: {}'; mkdir -p $AVOCADO_SDK_PREFIX/build/{section_name} && AVOCADO_BUILD_DIR=$AVOCADO_SDK_PREFIX/build/{section_name} AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{}'; else echo 'Compile script {} not found.' && ls -la; exit 1; fi"#,
                     section.script, section.script, section.script, section.script
                 )
             };
@@ -459,6 +460,7 @@ dependencies = { gcc = "*" }
             compile: Some("my_script.sh".to_string()),
             clean: None,
             packages: Some(deps),
+            package: None,
         };
 
         let script = cmd.find_compile_script_in_section(&section_config);
@@ -469,6 +471,7 @@ dependencies = { gcc = "*" }
             compile: None,
             clean: None,
             packages: None,
+            package: None,
         };
 
         let script = cmd.find_compile_script_in_section(&section_config_no_script);

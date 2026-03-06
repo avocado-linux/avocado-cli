@@ -416,6 +416,49 @@ pub struct CompileConfig {
     pub clean: Option<String>,
     #[serde(alias = "dependencies")]
     pub packages: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(default)]
+    pub package: Option<PackageConfig>,
+}
+
+/// RPM packaging configuration for a compiled SDK section
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PackageConfig {
+    /// Script that stages files to $DESTDIR (required)
+    pub install: String,
+    /// RPM version in semver format (required)
+    pub version: String,
+    /// RPM package name (defaults to section name)
+    pub name: Option<String>,
+    /// RPM release tag (defaults to "1")
+    pub release: Option<String>,
+    /// RPM license field (defaults to "Unspecified")
+    pub license: Option<String>,
+    /// RPM summary line (auto-generated from name if missing)
+    pub summary: Option<String>,
+    /// RPM description (auto-generated from name if missing)
+    pub description: Option<String>,
+    /// RPM vendor field (defaults to "Unspecified")
+    pub vendor: Option<String>,
+    /// RPM URL field (optional)
+    pub url: Option<String>,
+    /// RPM target architecture (derived from target triple if not set)
+    pub arch: Option<String>,
+    /// RPM Requires dependencies
+    pub requires: Option<Vec<String>>,
+    /// Glob patterns for files included in main package (all staged files if omitted)
+    pub files: Option<Vec<String>>,
+    /// Sub-package definitions (Yocto-inspired splitting)
+    pub split: Option<HashMap<String, SplitPackageConfig>>,
+}
+
+/// Sub-package configuration for split RPM packages
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SplitPackageConfig {
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub requires: Option<Vec<String>>,
+    /// Glob patterns for files belonging to this sub-package (required)
+    pub files: Vec<String>,
 }
 
 /// Provision profile configuration
@@ -3820,9 +3863,13 @@ pub fn find_active_extensions(
     Ok(active_extensions)
 }
 
-/// Find the set of sdk.compile section names that are referenced by active extensions.
+/// Find the set of sdk.compile section names that are referenced by active extensions
+/// or by any runtime's `kernel.compile` field.
 ///
-/// This examines the `packages` section of each active extension for `compile:` references,
+/// This examines:
+/// - The `packages` section of each active extension for `compile:` references
+/// - The `kernel.compile` field of every runtime
+///
 /// returning only the compile section names that are actually needed.
 pub fn find_active_compile_sections(
     parsed: &serde_yaml::Value,
@@ -3836,6 +3883,21 @@ pub fn find_active_compile_sections(
         for section_name in compile_refs {
             if seen.insert(section_name.clone()) {
                 active_sections.push(section_name);
+            }
+        }
+    }
+
+    // Also include compile sections referenced by runtimes via kernel.compile
+    if let Some(runtimes) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
+        for (_runtime_name, runtime_val) in runtimes {
+            if let Some(section_name) = runtime_val
+                .get("kernel")
+                .and_then(|k| k.get("compile"))
+                .and_then(|c| c.as_str())
+            {
+                if seen.insert(section_name.to_string()) {
+                    active_sections.push(section_name.to_string());
+                }
             }
         }
     }
@@ -4212,6 +4274,63 @@ extensions:
 
         let result = Config::load(temp_file.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_via_runtime_kernel() {
+        let config_content = r#"
+runtimes:
+  dev:
+    kernel:
+      compile: kernel
+      install: kernel-install.sh
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    kernel:
+      compile: kernel-compile.sh
+      packages:
+        glibc-dev: '*'
+        libelf1: '*'
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let no_extensions = std::collections::HashSet::new();
+
+        let active = find_active_compile_sections(&parsed, &no_extensions);
+
+        assert_eq!(active, vec!["kernel"]);
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_deduplicates() {
+        // A section referenced both by an extension and a runtime kernel.compile should appear once
+        let config_content = r#"
+runtimes:
+  dev:
+    kernel:
+      compile: kernel
+
+extensions:
+  my-ext:
+    packages:
+      my-dep:
+        compile: kernel
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    kernel:
+      compile: kernel-compile.sh
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let mut active_exts = std::collections::HashSet::new();
+        active_exts.insert("my-ext".to_string());
+
+        let active = find_active_compile_sections(&parsed, &active_exts);
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0], "kernel");
     }
 
     #[test]

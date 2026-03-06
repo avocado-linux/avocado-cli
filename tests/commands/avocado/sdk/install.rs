@@ -30,3 +30,17 @@ fn test_short_help() {
         common::assert_cmd(&["sdk", "install", "-h"], None, None);
     });
 }
+
+/// The SDKIMGARCH arch repair logic in the entrypoint setup script ensures that
+/// (target_underscored)_(host_arch)_avocadosdk is always first in
+/// $AVOCADO_SDK_PREFIX/etc/dnf/vars/arch, overriding any package post-install
+/// scripts that register a generic host-arch-only alternative via update-alternatives.
+/// The unit-level coverage for this lives in container.rs (test_entrypoint_script_sdkimgarch_repair).
+#[test]
+fn test_sdk_install_help_sdkimgarch() {
+    with_rust_cli(|| {
+        // Verify the sdk install subcommand is reachable; this guards against
+        // regressions introduced while adding the SDKIMGARCH init changes.
+        common::assert_cmd(&["sdk", "install", "--help"], None, None);
+    });
+}

@@ -26,7 +26,7 @@ use commands::runtime::{
 };
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
-    SdkRunCommand,
+    SdkPackageCommand, SdkRunCommand,
 };
 use commands::sign::SignCommand;
 use commands::signing_keys::{
@@ -555,6 +555,29 @@ enum SdkCommands {
         target: Option<String>,
         /// Specific compile sections to clean (runs their clean scripts)
         sections: Vec<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Package a compiled SDK section into an RPM
+    Package {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Compile section to package (must have a 'package' block in config)
+        section: String,
+        /// Output directory on host for the built RPM(s)
+        #[arg(long = "out")]
+        out_dir: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -1735,6 +1758,29 @@ async fn main() -> Result<()> {
                 )
                 .with_sdk_arch(cli.sdk_arch.clone());
                 clean_cmd.execute().await?;
+                Ok(())
+            }
+            SdkCommands::Package {
+                config,
+                verbose,
+                target,
+                section,
+                out_dir,
+                container_args,
+                dnf_args,
+            } => {
+                let package_cmd = SdkPackageCommand::new(
+                    config,
+                    verbose,
+                    section,
+                    out_dir,
+                    target.or(cli.target),
+                    container_args,
+                    dnf_args,
+                )
+                .with_no_stamps(cli.no_stamps)
+                .with_sdk_arch(cli.sdk_arch.clone());
+                package_cmd.execute().await?;
                 Ok(())
             }
         },

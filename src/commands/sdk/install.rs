@@ -315,6 +315,37 @@ cp -r /etc/rpm $AVOCADO_SDK_PREFIX/etc
 cp -r /etc/dnf $AVOCADO_SDK_PREFIX/etc
 cp -r /etc/yum.repos.d $AVOCADO_SDK_PREFIX/etc
 
+# Compute the machine-scoped SDK arch (SDKIMGARCH) for this machine+host combination.
+# This arch is used by nativesdk packages so that each machine gets independent PR
+# revision tracking while sharing the same SDK host arch repo path.
+MACHINE_US=$(echo "$AVOCADO_TARGET" | tr '-' '_')
+SDK_ARCH_US=$(uname -m | tr '-' '_')
+SDKIMGARCH_US="${MACHINE_US}_${SDK_ARCH_US}_avocadosdk"
+GENERIC_SDK_ARCH_US="${SDK_ARCH_US}_avocadosdk"
+
+# Append arch compat entries to the rpmrc so RPM will accept SDKIMGARCH packages
+# during bootstrap install. RPM_ETCCONFIGDIR points here for the bootstrap dnf call.
+echo "arch_compat: ${SDKIMGARCH_US}: all any noarch ${SDK_ARCH_US} ${GENERIC_SDK_ARCH_US} all_avocadosdk ${SDKIMGARCH_US}" >> $AVOCADO_SDK_PREFIX/etc/rpmrc
+echo "buildarch_compat: ${SDKIMGARCH_US}: noarch" >> $AVOCADO_SDK_PREFIX/etc/rpmrc
+
+# Prepend the SDKIMGARCH to the dnf arch vars so DNF searches the machine-scoped
+# SDK repo for bootstrap packages (varsdir points here for the bootstrap dnf call).
+ARCH_FILE=$AVOCADO_SDK_PREFIX/etc/dnf/vars/arch
+EXISTING_ARCH=$(cat "$ARCH_FILE" 2>/dev/null || echo "")
+if [ -n "$EXISTING_ARCH" ]; then
+    echo "${SDKIMGARCH_US}:${EXISTING_ARCH}" > "$ARCH_FILE"
+else
+    echo "${SDKIMGARCH_US}" > "$ARCH_FILE"
+fi
+
+# Update the rpm platform file to SDKIMGARCH so RPM's transaction check accepts
+# machine-scoped packages. The platform file determines the host arch for RPM;
+# without this, RPM sees x86_64_avocadosdk and rejects qemux86_64_x86_64_avocadosdk
+# packages as "intended for a different architecture".
+PLATFORM_FILE=$AVOCADO_SDK_PREFIX/etc/rpm/platform
+rm -f "$PLATFORM_FILE"
+echo "${SDKIMGARCH_US}-avocado-linux" > "$PLATFORM_FILE"
+
 # Restore custom repo URL after copying container defaults (which may overwrite it)
 if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
     mkdir -p $AVOCADO_SDK_PREFIX/etc/dnf/vars
