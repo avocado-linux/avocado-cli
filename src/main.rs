@@ -1554,6 +1554,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                out_dir,
                 container_args,
                 dnf_args,
             } => {
@@ -1566,7 +1567,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_output_dir(out_dir);
                 image_cmd.execute().await?;
                 Ok(())
             }
@@ -1959,6 +1961,9 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Output directory on host to copy the resulting image to
+        #[arg(long = "out")]
+        out_dir: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

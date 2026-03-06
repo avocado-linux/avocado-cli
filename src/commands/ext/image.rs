@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::find_ext_in_mapping;
@@ -23,6 +24,7 @@ pub struct ExtImageCommand {
     runs_on: Option<String>,
     nfs_port: Option<u16>,
     sdk_arch: Option<String>,
+    output_dir: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -47,6 +49,7 @@ impl ExtImageCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            output_dir: None,
             composed_config: None,
         }
     }
@@ -67,6 +70,12 @@ impl ExtImageCommand {
     /// Set SDK container architecture for cross-arch emulation
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
+        self
+    }
+
+    /// Set host output directory to copy the image to after creation
+    pub fn with_output_dir(mut self, output_dir: Option<String>) -> Self {
+        self.output_dir = output_dir;
         self
     }
 
@@ -397,15 +406,44 @@ impl ExtImageCommand {
             .await?;
 
         if result {
-            print_success(
-                &format!(
-                    "Successfully created image for extension '{}-{}' (types: {}).",
-                    self.extension,
-                    &ext_version,
-                    ext_types.join(", ")
-                ),
-                OutputLevel::Normal,
-            );
+            let image_filename = format!("{}-{}.raw", self.extension, ext_version);
+            let container_image_path =
+                format!("/opt/_avocado/{target_arch}/output/extensions/{image_filename}");
+
+            // Copy image to host if --out specified
+            if let Some(output_dir) = &self.output_dir {
+                let cwd = std::env::current_dir().context("Failed to get current directory")?;
+                let volume_manager =
+                    crate::utils::volume::VolumeManager::new("docker".to_string(), self.verbose);
+                let volume_state = volume_manager.get_or_create_volume(&cwd).await?;
+                self.copy_image_to_host(
+                    &volume_state.volume_name,
+                    &container_image_path,
+                    output_dir,
+                    &image_filename,
+                    container_image,
+                )
+                .await?;
+                print_success(
+                    &format!(
+                        "Successfully created image for extension '{}-{}': {}",
+                        self.extension,
+                        &ext_version,
+                        PathBuf::from(output_dir).join(&image_filename).display()
+                    ),
+                    OutputLevel::Normal,
+                );
+            } else {
+                print_success(
+                    &format!(
+                        "Successfully created image for extension '{}-{}' (types: {}).",
+                        self.extension,
+                        &ext_version,
+                        ext_types.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
 
             // Write extension image stamp (unless --no-stamps)
             if !self.no_stamps {
@@ -449,6 +487,74 @@ impl ExtImageCommand {
         }
 
         Ok(())
+    }
+
+    async fn copy_image_to_host(
+        &self,
+        volume_name: &str,
+        container_image_path: &str,
+        output_dir: &str,
+        image_filename: &str,
+        _container_image: &str,
+    ) -> Result<()> {
+        if self.verbose {
+            print_info(
+                &format!("Copying image to host: {output_dir}/{image_filename}"),
+                OutputLevel::Normal,
+            );
+        }
+
+        let host_output_dir = if output_dir.starts_with('/') {
+            PathBuf::from(output_dir)
+        } else {
+            std::env::current_dir()?.join(output_dir)
+        };
+        std::fs::create_dir_all(&host_output_dir)?;
+
+        let temp_container_id = self.create_temp_container(volume_name).await?;
+
+        let docker_cp_source = format!("{temp_container_id}:{container_image_path}");
+        let docker_cp_dest = host_output_dir.join(image_filename);
+
+        let output = tokio::process::Command::new("docker")
+            .args(["cp", &docker_cp_source, docker_cp_dest.to_str().unwrap()])
+            .output()
+            .await
+            .context("Failed to run docker cp")?;
+
+        let _ = tokio::process::Command::new("docker")
+            .args(["rm", "-f", &temp_container_id])
+            .output()
+            .await;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to copy image to host: {stderr}"));
+        }
+
+        Ok(())
+    }
+
+    async fn create_temp_container(&self, volume_name: &str) -> Result<String> {
+        let output = tokio::process::Command::new("docker")
+            .args([
+                "create",
+                "--rm",
+                "-v",
+                &format!("{volume_name}:/opt/_avocado"),
+                "busybox",
+                "true",
+            ])
+            .output()
+            .await
+            .context("Failed to create temp container")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to create temp container: {stderr}"));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
