@@ -591,6 +591,8 @@ enum SdkCommands {
 enum RuntimeCommands {
     /// Install dependencies into runtime installroots
     Install {
+        /// Runtime name (if not provided, installs for all runtimes)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -600,8 +602,8 @@ enum RuntimeCommands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
-        /// Runtime name to install dependencies for (if not provided, installs for all runtimes)
-        #[arg(short = 'r', long = "runtime")]
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
         runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
@@ -615,6 +617,8 @@ enum RuntimeCommands {
     },
     /// Build a runtime
     Build {
+        /// Runtime name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -624,9 +628,9 @@ enum RuntimeCommands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
-        /// Runtime name to build
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -639,6 +643,8 @@ enum RuntimeCommands {
     },
     /// Provision a runtime
     Provision {
+        /// Runtime name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -648,9 +654,9 @@ enum RuntimeCommands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
-        /// Runtime name to provision
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -681,12 +687,14 @@ enum RuntimeCommands {
     },
     /// List dependencies for a runtime
     Deps {
+        /// Runtime name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
-        /// Runtime name to list dependencies for
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -717,15 +725,17 @@ enum RuntimeCommands {
     },
     /// Clean runtime installroot directory
     Clean {
+        /// Runtime name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Name of the runtime to clean
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -738,15 +748,17 @@ enum RuntimeCommands {
     },
     /// Deploy a runtime to a device
     Deploy {
+        /// Runtime name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Runtime name to deploy
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -762,15 +774,17 @@ enum RuntimeCommands {
     },
     /// Sign runtime images
     Sign {
+        /// Runtime name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Runtime name to sign
-        #[arg(short = 'r', long = "runtime", required = true)]
-        runtime: String,
+        /// Runtime name (deprecated, use positional argument)
+        #[arg(short = 'r', long = "runtime", hide = true)]
+        runtime: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -1200,6 +1214,7 @@ async fn main() -> Result<()> {
         }
         Commands::Runtime { command } => match command {
             RuntimeCommands::Install {
+                name,
                 runtime,
                 config,
                 verbose,
@@ -1208,6 +1223,7 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let runtime = name.or(runtime);
                 // Validate runtime exists if provided
                 validate_runtime_if_provided(&config, runtime.as_ref())?;
 
@@ -1226,6 +1242,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RuntimeCommands::Build {
+                name,
                 runtime,
                 config,
                 verbose,
@@ -1234,6 +1251,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let runtime = name
+                    .or(runtime)
+                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
@@ -1252,6 +1272,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RuntimeCommands::Provision {
+                name,
                 runtime,
                 config,
                 verbose,
@@ -1263,6 +1284,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let runtime = name
+                    .or(runtime)
+                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
@@ -1294,10 +1318,14 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RuntimeCommands::Deps {
+                name,
                 config,
                 runtime,
                 target: _,
             } => {
+                let runtime = name
+                    .or(runtime)
+                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
@@ -1331,6 +1359,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RuntimeCommands::Clean {
+                name,
                 config,
                 verbose,
                 runtime,
@@ -1338,6 +1367,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let runtime = name
+                    .or(runtime)
+                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
@@ -1354,6 +1386,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RuntimeCommands::Deploy {
+                name,
                 config,
                 verbose,
                 runtime,
@@ -1362,6 +1395,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let runtime = name
+                    .or(runtime)
+                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
@@ -1380,6 +1416,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RuntimeCommands::Sign {
+                name,
                 config,
                 verbose,
                 runtime,
@@ -1387,6 +1424,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let runtime = name
+                    .or(runtime)
+                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
@@ -1406,6 +1446,7 @@ async fn main() -> Result<()> {
         },
         Commands::Ext { command } => match command {
             ExtCommands::Install {
+                name,
                 config,
                 verbose,
                 force,
@@ -1415,7 +1456,7 @@ async fn main() -> Result<()> {
                 dnf_args,
             } => {
                 let install_cmd = ExtInstallCommand::new(
-                    extension,
+                    name.or(extension),
                     config,
                     verbose,
                     force,
@@ -1429,6 +1470,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Fetch {
+                name,
                 config,
                 verbose,
                 force,
@@ -1438,7 +1480,7 @@ async fn main() -> Result<()> {
             } => {
                 let fetch_cmd = ExtFetchCommand::new(
                     config,
-                    extension,
+                    name.or(extension),
                     verbose,
                     force,
                     target.or(cli.target.clone()),
@@ -1449,6 +1491,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Build {
+                name,
                 extension,
                 config,
                 verbose,
@@ -1456,6 +1499,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let extension = name.or(extension).context(
+                    "extension name is required (provide as positional or -e/--extension)",
+                )?;
                 let build_cmd = ExtBuildCommand::new(
                     extension,
                     config,
@@ -1471,6 +1517,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Checkout {
+                name,
                 config,
                 verbose,
                 extension,
@@ -1479,6 +1526,9 @@ async fn main() -> Result<()> {
                 src_path,
                 container_tool,
             } => {
+                let extension = name.or(extension).context(
+                    "extension name is required (provide as positional or -e/--extension)",
+                )?;
                 let checkout_cmd = ExtCheckoutCommand::new(
                     extension,
                     ext_path,
@@ -1499,11 +1549,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Deps {
+                name,
                 config,
                 extension,
                 target,
             } => {
-                let deps_cmd = ExtDepsCommand::new(config, extension, target.or(cli.target));
+                let deps_cmd =
+                    ExtDepsCommand::new(config, name.or(extension), target.or(cli.target));
                 deps_cmd.execute()?;
                 Ok(())
             }
@@ -1530,6 +1582,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Clean {
+                name,
                 extension,
                 config,
                 verbose,
@@ -1537,6 +1590,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let extension = name.or(extension).context(
+                    "extension name is required (provide as positional or -e/--extension)",
+                )?;
                 let clean_cmd = ExtCleanCommand::new(
                     extension,
                     config,
@@ -1550,6 +1606,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Image {
+                name,
                 extension,
                 config,
                 verbose,
@@ -1558,6 +1615,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let extension = name.or(extension).context(
+                    "extension name is required (provide as positional or -e/--extension)",
+                )?;
                 let image_cmd = ExtImageCommand::new(
                     extension,
                     config,
@@ -1573,6 +1633,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ExtCommands::Package {
+                name,
                 extension,
                 target,
                 config,
@@ -1581,6 +1642,9 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let extension = name.or(extension).context(
+                    "extension name is required (provide as positional or -e/--extension)",
+                )?;
                 let package_cmd = ExtPackageCommand::new(
                     config,
                     extension,
@@ -1793,6 +1857,8 @@ async fn main() -> Result<()> {
 enum ExtCommands {
     /// Install dependencies into extension sysroots
     Install {
+        /// Extension name (if not provided, installs all extensions)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -1802,8 +1868,8 @@ enum ExtCommands {
         /// Force the operation to proceed, bypassing warnings or confirmation prompts
         #[arg(short, long)]
         force: bool,
-        /// Name of the extension to install (if not provided, installs all extensions)
-        #[arg(short = 'e', long = "extension")]
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
         extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
@@ -1817,6 +1883,8 @@ enum ExtCommands {
     },
     /// Fetch remote extensions from repo, git, or path sources
     Fetch {
+        /// Extension name (if not provided, fetches all remote extensions)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -1826,8 +1894,8 @@ enum ExtCommands {
         /// Force re-fetch even if already installed
         #[arg(short, long)]
         force: bool,
-        /// Name of the extension to fetch (if not provided, fetches all remote extensions)
-        #[arg(short = 'e', long = "extension")]
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
         extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
@@ -1838,15 +1906,17 @@ enum ExtCommands {
     },
     /// Build sysext and/or confext extensions from configuration
     Build {
+        /// Extension name (must be defined in config)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Name of the extension to build (must be defined in config)
-        #[arg(short = 'e', long = "extension", required = true)]
-        extension: String,
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
+        extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -1868,11 +1938,13 @@ enum ExtCommands {
     },
     /// List dependencies for extensions
     Deps {
+        /// Extension name (if not provided, shows all extensions)
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
-        /// Name of the extension to show dependencies for (if not provided, shows all extensions)
-        #[arg(short = 'e', long = "extension")]
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
         extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
@@ -1904,15 +1976,17 @@ enum ExtCommands {
     },
     /// Clean an extension's sysroot
     Clean {
+        /// Extension name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Name of the extension to clean
-        #[arg(short = 'e', long = "extension", required = true)]
-        extension: String,
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
+        extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -1925,15 +1999,17 @@ enum ExtCommands {
     },
     /// Check out files from extension sysroot to source directory
     Checkout {
+        /// Extension name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Name of the extension to checkout from
-        #[arg(short = 'e', long = "extension", required = true)]
-        extension: String,
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
+        extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -1949,15 +2025,17 @@ enum ExtCommands {
     },
     /// Create squashfs image from system extension
     Image {
+        /// Extension name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Name of the extension to create image for
-        #[arg(short = 'e', long = "extension", required = true)]
-        extension: String,
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
+        extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
@@ -1973,15 +2051,17 @@ enum ExtCommands {
     },
     /// Package extension sysroot into an RPM
     Package {
+        /// Extension name
+        name: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Name of the extension to package
-        #[arg(short = 'e', long = "extension", required = true)]
-        extension: String,
+        /// Extension name (deprecated, use positional argument)
+        #[arg(short = 'e', long = "extension", hide = true)]
+        extension: Option<String>,
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
