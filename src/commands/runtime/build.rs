@@ -293,7 +293,7 @@ impl RuntimeBuildCommand {
                     target_arch, self.runtime_name
                 );
                 let install_cmd = format!(
-                    r#"mkdir -p "{runtime_build_dir}" && if [ -f '{install_script}' ]; then echo 'Running kernel install script: {install_script}'; export AVOCADO_RUNTIME_BUILD_DIR="{runtime_build_dir}"; bash '{install_script}'; else echo 'Kernel install script {install_script} not found.'; ls -la; exit 1; fi"#
+                    r#"mkdir -p "{runtime_build_dir}" && if [ -f '{install_script}' ]; then echo 'Running kernel install script: {install_script}'; export AVOCADO_RUNTIME_BUILD_DIR="{runtime_build_dir}"; export AVOCADO_BUILD_DIR="$AVOCADO_SDK_PREFIX/build/{compile_section}"; bash '{install_script}'; else echo 'Kernel install script {install_script} not found.'; ls -la; exit 1; fi"#
                 );
 
                 if self.verbose {
