@@ -15,6 +15,7 @@ pub mod signing_keys;
 pub mod signing_service;
 pub mod stamps;
 pub mod target;
+pub mod update_check;
 pub mod update_repo;
 pub mod update_signing;
 pub mod version;

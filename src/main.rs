@@ -859,7 +859,14 @@ fn build_env_vars(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let is_upgrade = matches!(cli.command, Commands::Upgrade { .. });
+    let update_handle = if !is_upgrade {
+        Some(tokio::spawn(utils::update_check::check_for_update()))
+    } else {
+        None
+    };
+
+    let result = match cli.command {
         Commands::Init {
             directory,
             target,
@@ -1869,7 +1876,21 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+    };
+
+    if let Some(handle) = update_handle {
+        if let Ok(Ok(Some(version))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
+        {
+            eprintln!(
+                "\n\x1b[93m[UPDATE]\x1b[0m avocado {} is available (you have {}).\n         Run 'avocado upgrade' to update.",
+                version,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
     }
+
+    result
 }
 
 #[derive(Subcommand)]
