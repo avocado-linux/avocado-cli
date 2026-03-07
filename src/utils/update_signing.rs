@@ -121,7 +121,9 @@ fn uri_to_path(uri: &str) -> Result<PathBuf> {
     if let Some(path) = uri.strip_prefix("file://") {
         Ok(PathBuf::from(path))
     } else {
-        anyhow::bail!("Unsupported key URI: '{uri}'. Only file:// URIs are supported for TUF signing.");
+        anyhow::bail!(
+            "Unsupported key URI: '{uri}'. Only file:// URIs are supported for TUF signing."
+        );
     }
 }
 
@@ -278,8 +280,8 @@ pub fn generate_multi_key_root_json(
     // Canonical JSON per RFC 8785
     let canonical = serde_jcs::to_string(&signed).context("Failed to serialize canonical JSON")?;
 
-    let sig_bytes = (root_signer.sign_fn)(canonical.as_bytes())
-        .context("Failed to sign root.json")?;
+    let sig_bytes =
+        (root_signer.sign_fn)(canonical.as_bytes()).context("Failed to sign root.json")?;
     let sig_hex = hex_encode(&sig_bytes);
 
     let root_json: serde_json::Value = serde_json::json!({
@@ -460,8 +462,7 @@ mod tests {
         let server_kp = KeyPair::from_seed(Seed::from([99u8; 32]));
         let server_hex = hex_encode(server_kp.pk.as_ref());
 
-        let root_json =
-            generate_multi_key_root_json(&signer, &server_hex, 1, 365).unwrap();
+        let root_json = generate_multi_key_root_json(&signer, &server_hex, 1, 365).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&root_json).unwrap();
         let keys = parsed["signed"]["keys"].as_object().unwrap();

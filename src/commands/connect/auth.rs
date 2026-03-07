@@ -32,10 +32,7 @@ impl ConnectAuthLoginCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        print_info(
-            &format!("Logging in to {}", self.url),
-            OutputLevel::Normal,
-        );
+        print_info(&format!("Logging in to {}", self.url), OutputLevel::Normal);
 
         // Use provided email or prompt interactively
         let email = if let Some(ref e) = self.email {
@@ -138,8 +135,7 @@ impl ConnectAuthLogoutCommand {
                 let profile_name = profile_name.to_string(); // avoid borrow issue
 
                 if !cfg.remove_profile(&profile_name) {
-                    let available: Vec<&str> =
-                        cfg.profiles.keys().map(|s| s.as_str()).collect();
+                    let available: Vec<&str> = cfg.profiles.keys().map(|s| s.as_str()).collect();
                     if available.is_empty() {
                         print_info("No profiles configured.", OutputLevel::Normal);
                     } else {
@@ -203,10 +199,9 @@ impl ConnectAuthStatusCommand {
                 let client = ConnectClient::from_profile(profile)?;
                 match client.get_me().await {
                     Ok(_) => print_success("Token is valid.", OutputLevel::Normal),
-                    Err(e) => print_error(
-                        &format!("Token may be invalid: {e}"),
-                        OutputLevel::Normal,
-                    ),
+                    Err(e) => {
+                        print_error(&format!("Token may be invalid: {e}"), OutputLevel::Normal)
+                    }
                 }
             }
             None => {

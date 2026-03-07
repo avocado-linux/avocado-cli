@@ -50,12 +50,15 @@ pub fn generate_repo_metadata(
     let delegated_targets_json =
         generate_delegated_targets_json(runtime_uuid, targets, content_signer)?;
 
-    let targets_json =
-        generate_targets_json(runtime_uuid, content_signer, signer)?;
+    let targets_json = generate_targets_json(runtime_uuid, content_signer, signer)?;
 
     let delegation_path = format!("delegations/runtime-{runtime_uuid}.json");
-    let snapshot_json =
-        generate_snapshot_json(&targets_json, &delegated_targets_json, &delegation_path, signer)?;
+    let snapshot_json = generate_snapshot_json(
+        &targets_json,
+        &delegated_targets_json,
+        &delegation_path,
+        signer,
+    )?;
 
     let timestamp_json = generate_timestamp_json(&snapshot_json, signer)?;
 
@@ -212,8 +215,7 @@ fn generate_timestamp_json(snapshot_json: &str, signer: &TufSigner) -> Result<St
 
 fn sign_metadata(signed: &serde_json::Value, signer: &TufSigner) -> Result<String> {
     let canonical = serde_jcs::to_string(signed).context("Failed to serialize canonical JSON")?;
-    let sig_bytes = (signer.sign_fn)(canonical.as_bytes())
-        .context("Failed to sign metadata")?;
+    let sig_bytes = (signer.sign_fn)(canonical.as_bytes()).context("Failed to sign metadata")?;
     let sig_hex = hex_encode(&sig_bytes);
 
     let envelope: serde_json::Value = serde_json::json!({
@@ -298,8 +300,7 @@ mod tests {
         let repo = generate_repo_metadata(&targets, TEST_UUID, &signer, &content_signer).unwrap();
 
         let targets_parsed: serde_json::Value = serde_json::from_str(&repo.targets_json).unwrap();
-        let snapshot_parsed: serde_json::Value =
-            serde_json::from_str(&repo.snapshot_json).unwrap();
+        let snapshot_parsed: serde_json::Value = serde_json::from_str(&repo.snapshot_json).unwrap();
         let timestamp_parsed: serde_json::Value =
             serde_json::from_str(&repo.timestamp_json).unwrap();
         let delegated_parsed: serde_json::Value =
@@ -309,11 +310,17 @@ mod tests {
         assert_eq!(targets_parsed["signed"]["_type"], "targets");
         assert_eq!(targets_parsed["signed"]["version"], 1);
         let inline_targets = targets_parsed["signed"]["targets"].as_object().unwrap();
-        assert!(inline_targets.is_empty(), "targets.json must have empty targets map");
+        assert!(
+            inline_targets.is_empty(),
+            "targets.json must have empty targets map"
+        );
 
         // targets.json must have delegation block
         let delegations = &targets_parsed["signed"]["delegations"];
-        assert!(delegations.is_object(), "targets.json must contain delegations");
+        assert!(
+            delegations.is_object(),
+            "targets.json must contain delegations"
+        );
         let roles = delegations["roles"].as_array().unwrap();
         assert_eq!(roles.len(), 1);
         assert_eq!(
@@ -369,7 +376,10 @@ mod tests {
         // 5-year TTL
         let expires = parsed["signed"]["expires"].as_str().unwrap();
         let years_from_now = (parse_utc(expires) - chrono::Utc::now()).num_days() / 365;
-        assert!(years_from_now >= 4, "Delegated targets should expire ~5 years from now");
+        assert!(
+            years_from_now >= 4,
+            "Delegated targets should expire ~5 years from now"
+        );
 
         // Signature present
         let sigs = parsed["signatures"].as_array().unwrap();
@@ -396,7 +406,10 @@ mod tests {
         assert!(delegation_entry.is_object());
         let recorded_hash = delegation_entry["hashes"]["sha256"].as_str().unwrap();
         let recorded_len = delegation_entry["length"].as_u64().unwrap();
-        assert_eq!(recorded_hash, sha256_hex(repo.delegated_targets_json.as_bytes()));
+        assert_eq!(
+            recorded_hash,
+            sha256_hex(repo.delegated_targets_json.as_bytes())
+        );
         assert_eq!(recorded_len, repo.delegated_targets_json.len() as u64);
     }
 
@@ -408,7 +421,10 @@ mod tests {
         let expires = parsed["signed"]["expires"].as_str().unwrap();
         let expiry = parse_utc(expires);
         let days = (expiry - chrono::Utc::now()).num_days();
-        assert!(days > 365 * 4, "targets.json should have ~5yr TTL, got {days} days");
+        assert!(
+            days > 365 * 4,
+            "targets.json should have ~5yr TTL, got {days} days"
+        );
     }
 
     #[test]
@@ -419,7 +435,10 @@ mod tests {
         let expires = parsed["signed"]["expires"].as_str().unwrap();
         let expiry = parse_utc(expires);
         let days = (expiry - chrono::Utc::now()).num_days();
-        assert!((89..=91).contains(&days), "snapshot.json should have ~90d TTL, got {days} days");
+        assert!(
+            (89..=91).contains(&days),
+            "snapshot.json should have ~90d TTL, got {days} days"
+        );
     }
 
     #[test]
@@ -430,7 +449,10 @@ mod tests {
         let expires = parsed["signed"]["expires"].as_str().unwrap();
         let expiry = parse_utc(expires);
         let days = (expiry - chrono::Utc::now()).num_days();
-        assert!((6..=8).contains(&days), "timestamp.json should have ~7d TTL, got {days} days");
+        assert!(
+            (6..=8).contains(&days),
+            "timestamp.json should have ~7d TTL, got {days} days"
+        );
     }
 
     #[test]
@@ -469,8 +491,7 @@ mod tests {
             size: 256,
         }];
 
-        let repo =
-            generate_repo_metadata(&targets, TEST_UUID, &signer, &content_signer).unwrap();
+        let repo = generate_repo_metadata(&targets, TEST_UUID, &signer, &content_signer).unwrap();
 
         // targets.json is signed by signer's key
         let targets_parsed: serde_json::Value = serde_json::from_str(&repo.targets_json).unwrap();

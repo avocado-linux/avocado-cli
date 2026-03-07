@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
-    self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompletedPart, CompleteRuntimeRequest,
+    self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
     ConnectClient, CreateRuntimeRequest, RuntimeParams,
 };
 use crate::utils::output::{print_info, print_success, OutputLevel};
@@ -53,11 +53,7 @@ impl ConnectUploadCommand {
 
         for info in &artifact_infos {
             print_info(
-                &format!(
-                    "  {} ({})",
-                    info.image_id,
-                    format_bytes(info.size_bytes),
-                ),
+                &format!("  {} ({})", info.image_id, format_bytes(info.size_bytes),),
                 OutputLevel::Normal,
             );
         }
@@ -294,8 +290,7 @@ fn read_manifest(dir: &Path) -> Result<serde_json::Value> {
                 let manifest_path = entry.path().join("manifest.json");
                 if manifest_path.exists() {
                     let content = std::fs::read_to_string(&manifest_path)?;
-                    return serde_json::from_str(&content)
-                        .context("Failed to parse manifest.json");
+                    return serde_json::from_str(&content).context("Failed to parse manifest.json");
                 }
             }
         }
@@ -366,9 +361,7 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
     }
 
     if artifacts.is_empty() {
-        anyhow::bail!(
-            "No extensions found in manifest. Have you run 'avocado build'?"
-        );
+        anyhow::bail!("No extensions found in manifest. Have you run 'avocado build'?");
     }
 
     Ok(artifacts)

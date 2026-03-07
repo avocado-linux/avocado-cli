@@ -9,6 +9,10 @@ use utils::config::Config;
 
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
+use commands::connect::auth::{
+    ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
+};
+use commands::connect::upload::ConnectUploadCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
     ExtFetchCommand, ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
@@ -32,10 +36,6 @@ use commands::sign::SignCommand;
 use commands::signing_keys::{
     SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
 };
-use commands::connect::auth::{
-    ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
-};
-use commands::connect::upload::ConnectUploadCommand;
 use commands::unlock::UnlockCommand;
 use commands::upgrade::UpgradeCommand;
 

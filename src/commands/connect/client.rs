@@ -50,7 +50,9 @@ impl ConnectConfig {
             None => {
                 let available: Vec<&str> = self.profiles.keys().map(|s| s.as_str()).collect();
                 if available.is_empty() {
-                    anyhow::bail!("No profiles configured. Run 'avocado connect auth login' to authenticate.");
+                    anyhow::bail!(
+                        "No profiles configured. Run 'avocado connect auth login' to authenticate."
+                    );
                 }
                 anyhow::bail!(
                     "Profile '{}' not found. Available profiles: {}",
@@ -212,8 +214,8 @@ pub fn load_config() -> Result<Option<ConnectConfig>> {
     }
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
-    let config: ConnectConfig = serde_json::from_str(&contents)
-        .with_context(|| "Failed to parse config file")?;
+    let config: ConnectConfig =
+        serde_json::from_str(&contents).with_context(|| "Failed to parse config file")?;
     Ok(Some(config))
 }
 
@@ -239,7 +241,6 @@ pub fn delete_config_file() -> Result<bool> {
         Ok(false)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // HTTP clients
