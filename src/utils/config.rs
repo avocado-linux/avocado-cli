@@ -333,6 +333,10 @@ pub struct SigningConfig {
     /// Falls back to `key` if not set.
     #[serde(default)]
     pub content_key: Option<String>,
+    /// Connect server's TUF signing public key (hex). When set, root.json trusts
+    /// this key for targets/snapshot/timestamp roles. Overrides connect.server_key.
+    #[serde(default)]
+    pub server_key: Option<String>,
 }
 
 fn default_checksum_algorithm() -> String {
@@ -645,6 +649,10 @@ pub enum SupportedTargets {
 pub struct ConnectConfig {
     pub org: Option<String>,
     pub project: Option<String>,
+    /// Default server signing public key (hex) for all runtimes.
+    /// Per-runtime signing.server_key overrides this.
+    #[serde(default)]
+    pub server_key: Option<String>,
 }
 
 /// Main configuration structure
@@ -2400,6 +2408,21 @@ impl Config {
     pub fn get_runtime_content_key_name(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
         runtime_config.signing.as_ref()?.content_key.clone()
+    }
+
+    /// Resolve the Connect server key for a runtime.
+    /// Per-runtime signing.server_key takes priority, falls back to connect.server_key.
+    pub fn get_server_key_for_runtime(&self, runtime_name: &str) -> Option<String> {
+        // Per-runtime override
+        if let Some(runtime_config) = self.runtimes.as_ref().and_then(|r| r.get(runtime_name)) {
+            if let Some(signing) = &runtime_config.signing {
+                if signing.server_key.is_some() {
+                    return signing.server_key.clone();
+                }
+            }
+        }
+        // Global fallback
+        self.connect.as_ref()?.server_key.clone()
     }
 
     /// Get signing key for a specific runtime

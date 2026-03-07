@@ -200,7 +200,7 @@ fn ensure_auto_generated_key(project_dir: &Path) -> Result<(SecretKey, PublicKey
 
 /// Compute the TUF key ID from a hex-encoded public key.
 /// Key ID = SHA-256 of the canonical JSON key descriptor.
-fn compute_key_id_from_hex(public_key_hex: &str) -> String {
+pub fn compute_key_id_from_hex(public_key_hex: &str) -> String {
     let canonical = format!(
         r#"{{"keytype":"ed25519","keyval":{{"public":"{public_key_hex}"}},"scheme":"ed25519"}}"#
     );

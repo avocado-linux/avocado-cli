@@ -12,6 +12,11 @@ use commands::clean::CleanCommand;
 use commands::connect::auth::{
     ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
 };
+use commands::connect::keys::{
+    ConnectKeysApproveCommand, ConnectKeysListCommand, ConnectKeysRegisterCommand,
+    ConnectKeysRetireCommand,
+};
+use commands::connect::server_key::ConnectServerKeyCommand;
 use commands::connect::upload::ConnectUploadCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
@@ -428,6 +433,96 @@ enum ConnectCommands {
         #[arg(long)]
         file: Option<String>,
         /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Retrieve the Connect server's TUF signing public key
+    ServerKey {
+        /// Organization slug (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Manage signing keys registered with the Connect server
+    Keys {
+        #[command(subcommand)]
+        command: ConnectKeysCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectKeysCommands {
+    /// Register a local signing key with the Connect server
+    Register {
+        /// Key type: content or root
+        #[arg(long = "type")]
+        key_type: String,
+        /// Name of the local signing key (from 'avocado signing-keys list')
+        #[arg(long)]
+        key: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Approve a staged delegate key (admin only)
+    Approve {
+        /// Key type: content or root
+        #[arg(long = "type")]
+        key_type: String,
+        /// User ID whose key to approve
+        #[arg(long)]
+        user: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// List delegate keys registered with the server
+    List {
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Filter by key type: content or root
+        #[arg(long = "type")]
+        key_type: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Discard a staged delegate key
+    Retire {
+        /// Key type: content or root
+        #[arg(long = "type")]
+        key_type: String,
+        /// User ID whose staged key to discard
+        #[arg(long)]
+        user: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name
         #[arg(long)]
         profile: Option<String>,
     },
@@ -2023,6 +2118,142 @@ async fn main() -> Result<()> {
                 cmd.execute().await?;
                 Ok(())
             }
+            ConnectCommands::ServerKey {
+                org,
+                config,
+                profile,
+            } => {
+                let connect_config = std::path::Path::new(&config)
+                    .exists()
+                    .then(|| crate::utils::config::load_config(&config).ok())
+                    .flatten()
+                    .and_then(|c| c.connect);
+
+                let resolved_org = org
+                    .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--org is required (or set connect.org in {config})")
+                    })?;
+
+                let cmd = ConnectServerKeyCommand {
+                    org: resolved_org,
+                    profile,
+                };
+                cmd.execute().await?;
+                Ok(())
+            }
+            ConnectCommands::Keys { command } => match command {
+                ConnectKeysCommands::Register {
+                    key_type,
+                    key,
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let connect_config = std::path::Path::new(&config)
+                        .exists()
+                        .then(|| crate::utils::config::load_config(&config).ok())
+                        .flatten()
+                        .and_then(|c| c.connect);
+
+                    let resolved_org = org
+                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
+                        })?;
+
+                    let cmd = ConnectKeysRegisterCommand {
+                        org: resolved_org,
+                        key_name: key,
+                        key_type,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectKeysCommands::Approve {
+                    key_type,
+                    user,
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let connect_config = std::path::Path::new(&config)
+                        .exists()
+                        .then(|| crate::utils::config::load_config(&config).ok())
+                        .flatten()
+                        .and_then(|c| c.connect);
+
+                    let resolved_org = org
+                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
+                        })?;
+
+                    let cmd = ConnectKeysApproveCommand {
+                        org: resolved_org,
+                        user_id: user,
+                        key_type,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectKeysCommands::List {
+                    org,
+                    key_type,
+                    config,
+                    profile,
+                } => {
+                    let connect_config = std::path::Path::new(&config)
+                        .exists()
+                        .then(|| crate::utils::config::load_config(&config).ok())
+                        .flatten()
+                        .and_then(|c| c.connect);
+
+                    let resolved_org = org
+                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
+                        })?;
+
+                    let cmd = ConnectKeysListCommand {
+                        org: resolved_org,
+                        key_type,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectKeysCommands::Retire {
+                    key_type,
+                    user,
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let connect_config = std::path::Path::new(&config)
+                        .exists()
+                        .then(|| crate::utils::config::load_config(&config).ok())
+                        .flatten()
+                        .and_then(|c| c.connect);
+
+                    let resolved_org = org
+                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
+                        })?;
+
+                    let cmd = ConnectKeysRetireCommand {
+                        org: resolved_org,
+                        user_id: user,
+                        key_type,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
         },
     };
 

@@ -59,8 +59,8 @@ impl ConnectUploadCommand {
                 .clone()
                 .or_else(|| std::env::var("AVOCADO_TARGET").ok())
                 .context("No target specified. Set AVOCADO_TARGET or use --target.")?;
-            let project_config = load_config(&self.config_path)
-                .context("Failed to load avocado.yaml")?;
+            let project_config =
+                load_config(&self.config_path).context("Failed to load avocado.yaml")?;
             let container_image = project_config
                 .get_sdk_image()
                 .context("No SDK container image specified in configuration")?;

@@ -1011,7 +1011,25 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             signing_key_name.as_deref(),
             project_dir,
         )?;
-        let root_json_content = crate::utils::update_signing::generate_root_json(&signer)?;
+        let root_json_content = match config.get_server_key_for_runtime(&self.runtime_name) {
+            Some(server_key_hex) => {
+                let keyid = crate::utils::update_signing::compute_key_id_from_hex(&server_key_hex);
+                print_info(
+                    &format!(
+                        "Generating root.json with Connect server key trust (keyid: {}...)",
+                        &keyid[..16]
+                    ),
+                    OutputLevel::Normal,
+                );
+                crate::utils::update_signing::generate_multi_key_root_json(
+                    &signer,
+                    &server_key_hex,
+                    1,
+                    3650, // 10-year expiry for Connect-managed devices
+                )?
+            }
+            None => crate::utils::update_signing::generate_root_json(&signer)?,
+        };
 
         let update_authority_section = format!(
             r#"

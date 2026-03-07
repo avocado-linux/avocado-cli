@@ -90,6 +90,21 @@ pub struct CsrfResponse {
 }
 
 // ---------------------------------------------------------------------------
+// TUF server key response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ServerKeyResponse {
+    pub public_key_hex: String,
+    pub keyid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerKeyWrapper {
+    data: ServerKeyResponse,
+}
+
+// ---------------------------------------------------------------------------
 // Runtime upload request types
 // ---------------------------------------------------------------------------
 
@@ -419,6 +434,191 @@ impl ConnectClient {
 
         let resp: UploadUrlsResponse = res.json().await?;
         Ok(resp.data.parts)
+    }
+
+    /// Fetch the org's TUF server signing public key.
+    pub async fn get_tuf_server_key(&self, org: &str) -> Result<ServerKeyResponse> {
+        let url = format!("{}/api/orgs/{}/tuf/server-key", self.api_url, org);
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to fetch server key")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to fetch server key (HTTP {status}): {body}");
+        }
+
+        let resp: ServerKeyWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delegate key types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct RegisterDelegateKeyRequest {
+    pub public_key_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApproveDelegateKeyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DelegateKeyWrapper {
+    data: DelegateKeyData,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DelegateKeyData {
+    pub keyid: String,
+    pub public_key_hex: String,
+    pub status: String,
+    pub key_type: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub staged_at: Option<String>,
+    #[serde(default)]
+    pub activated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DelegateKeyListWrapper {
+    data: Vec<DelegateKeyData>,
+}
+
+impl ConnectClient {
+    /// Register a delegate key with the server.
+    pub async fn register_delegate_key(
+        &self,
+        org: &str,
+        req: &RegisterDelegateKeyRequest,
+    ) -> Result<DelegateKeyData> {
+        let url = format!("{}/api/orgs/{}/tuf/delegate-keys", self.api_url, org);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to register delegate key")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to register delegate key (HTTP {status}): {body}");
+        }
+
+        let resp: DelegateKeyWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Approve a staged delegate key.
+    pub async fn approve_delegate_key(
+        &self,
+        org: &str,
+        user_id: &str,
+        req: &ApproveDelegateKeyRequest,
+    ) -> Result<DelegateKeyData> {
+        let url = format!(
+            "{}/api/orgs/{}/tuf/delegate-keys/{}/approve",
+            self.api_url, org, user_id
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to approve delegate key")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to approve delegate key (HTTP {status}): {body}");
+        }
+
+        let resp: DelegateKeyWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// List delegate keys for an org.
+    pub async fn list_delegate_keys(
+        &self,
+        org: &str,
+        key_type: Option<&str>,
+    ) -> Result<Vec<DelegateKeyData>> {
+        let mut url = format!("{}/api/orgs/{}/tuf/delegate-keys", self.api_url, org);
+        if let Some(kt) = key_type {
+            url.push_str(&format!("?key_type={kt}"));
+        }
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list delegate keys")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list delegate keys (HTTP {status}): {body}");
+        }
+
+        let resp: DelegateKeyListWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Discard a staged delegate key.
+    pub async fn discard_staged_key(
+        &self,
+        org: &str,
+        user_id: &str,
+        key_type: Option<&str>,
+    ) -> Result<()> {
+        let mut url = format!(
+            "{}/api/orgs/{}/tuf/delegate-keys/{}/staged",
+            self.api_url, org, user_id
+        );
+        if let Some(kt) = key_type {
+            url.push_str(&format!("?key_type={kt}"));
+        }
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to discard staged key")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to discard staged key (HTTP {status}): {body}");
+        }
+
+        Ok(())
     }
 }
 
