@@ -7,7 +7,11 @@ use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
     ConnectClient, CreateRuntimeRequest, RuntimeParams,
 };
+use crate::utils::config::load_config;
+use crate::utils::container::SdkContainer;
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
+use crate::utils::stamps::StampRequirement;
 
 const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
 
@@ -29,6 +33,16 @@ struct ArtifactInfo {
     size_bytes: u64,
 }
 
+impl TaskPrerequisites for ConnectUploadCommand {
+    fn required_stamps(&self) -> Vec<StampRequirement> {
+        vec![StampRequirement::runtime_build(&self.runtime)]
+    }
+
+    fn task_description(&self) -> String {
+        format!("Cannot upload runtime '{}'", self.runtime)
+    }
+}
+
 impl ConnectUploadCommand {
     pub async fn execute(&self) -> Result<()> {
         // 1. Load config and resolve profile
@@ -37,17 +51,34 @@ impl ConnectUploadCommand {
         let (_name, profile) = config.resolve_profile(self.profile.as_deref())?;
         let connect = ConnectClient::from_profile(profile)?;
 
-        // 2. Get artifacts on disk (export from Docker or use --file)
+        // 2. When exporting from Docker, validate that the runtime has been built
+        //    before attempting anything. Skip when --file is provided (user manages state).
+        if self.file.is_none() {
+            let target = self
+                .target
+                .clone()
+                .or_else(|| std::env::var("AVOCADO_TARGET").ok())
+                .context("No target specified. Set AVOCADO_TARGET or use --target.")?;
+            let project_config = load_config(&self.config_path)
+                .context("Failed to load avocado.yaml")?;
+            let container_image = project_config
+                .get_sdk_image()
+                .context("No SDK container image specified in configuration")?;
+            let container = SdkContainer::from_config(&self.config_path, &project_config)?;
+            check_prerequisites(self, &target, &container, container_image).await?;
+        }
+
+        // 3. Get artifacts on disk (export from Docker or use --file)
         let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir().await?;
 
-        // 3. Read manifest and derive version
+        // 4. Read manifest and derive version
         let manifest = read_manifest(&artifacts_dir)?;
         let version = self
             .version
             .clone()
             .unwrap_or_else(|| format_version_from_manifest(&manifest));
 
-        // 4. Discover artifacts from manifest (no hashing needed — image_id is the dedup key)
+        // 5. Discover artifacts from manifest (no hashing needed — image_id is the dedup key)
         print_info("Discovering artifacts...", OutputLevel::Normal);
         let artifact_infos = discover_artifacts(&artifacts_dir, &manifest)?;
 
@@ -58,7 +89,11 @@ impl ConnectUploadCommand {
             );
         }
 
-        // 5. Create runtime (Step 1)
+        // 6. Read delegation info from the exported build volume (required).
+        let delegation = read_delegation_info(&artifacts_dir)
+            .context("No TUF delegation files found in build volume. Run 'avocado build' with signing keys configured to generate them.")?;
+
+        // 7. Create runtime (Step 1)
         print_info(
             &format!("Creating runtime {version}..."),
             OutputLevel::Normal,
@@ -75,13 +110,16 @@ impl ConnectUploadCommand {
                         size_bytes: a.size_bytes,
                     })
                     .collect(),
+                delegated_targets_json: Some(delegation.delegated_targets_json.clone()),
+                content_key_hex: Some(delegation.content_key_hex.clone()),
+                content_keyid: Some(delegation.content_keyid.clone()),
             },
         };
         let runtime = connect
             .create_runtime(&self.org, &self.project, &create_req)
             .await?;
 
-        // 6. If runtime is already draft (full dedup or idempotent return), we're done
+        // 7. If runtime is already draft (full dedup or idempotent return), we're done
         if runtime.status == "draft" {
             print_success(
                 &format!(
@@ -94,11 +132,11 @@ impl ConnectUploadCommand {
             return Ok(());
         }
 
-        // 7. Upload artifacts (Step 2)
+        // 8. Upload artifacts (Step 2)
         let completed_parts =
             upload_artifacts(&connect, &runtime.artifacts, &artifact_infos).await?;
 
-        // 8. Complete runtime (Step 3)
+        // 9. Complete runtime (Step 3)
         print_info("Completing upload...", OutputLevel::Normal);
         let result = connect
             .complete_runtime(
@@ -188,11 +226,6 @@ impl ConnectUploadCommand {
         let inner_script = format!(
             r#"set -euo pipefail
 STAGING="${{AVOCADO_PREFIX}}/runtimes/{runtime}/var-staging"
-if [ ! -d "${{STAGING}}/lib/avocado" ]; then
-    echo "Error: No build artifacts found at ${{STAGING}}/lib/avocado"
-    echo "Have you run 'avocado build' yet?"
-    exit 1
-fi
 tar czf /opt/src/{output} -C "${{STAGING}}" lib/avocado
 "#,
             runtime = self.runtime,
@@ -492,6 +525,59 @@ async fn upload_artifacts(
     }
 
     Ok(all_completed)
+}
+
+// ---------------------------------------------------------------------------
+// Delegation info
+// ---------------------------------------------------------------------------
+
+struct DelegationInfo {
+    delegated_targets_json: String,
+    content_key_hex: String,
+    content_keyid: String,
+}
+
+/// Read TUF delegation info from `lib/avocado/tuf-staging/` inside the exported artifacts dir.
+/// Returns `None` if the staging directory or required files are absent.
+fn read_delegation_info(artifacts_dir: &Path) -> Option<DelegationInfo> {
+    let staging = artifacts_dir.join("lib/avocado/tuf-staging");
+
+    // Parse targets.json to extract content key and role name
+    let targets_path = staging.join("targets.json");
+    let targets_raw = std::fs::read_to_string(&targets_path).ok()?;
+    let targets: serde_json::Value = serde_json::from_str(&targets_raw).ok()?;
+
+    let delegations = targets.pointer("/signed/delegations")?;
+    let roles = delegations.get("roles")?.as_array()?;
+    let role = roles.first()?;
+
+    let role_name = role.get("name")?.as_str()?;
+    let content_keyid = role
+        .get("keyids")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .to_string();
+
+    let content_key_hex = delegations
+        .pointer(&format!("/keys/{content_keyid}/keyval/public"))?
+        .as_str()?
+        .to_string();
+
+    // Derive runtime UUID from role name ("runtime-<uuid>")
+    let runtime_uuid = role_name.strip_prefix("runtime-")?;
+
+    // Read the delegation file as raw JSON
+    let delegation_path = staging
+        .join("delegations")
+        .join(format!("runtime-{runtime_uuid}.json"));
+    let delegated_targets_json = std::fs::read_to_string(&delegation_path).ok()?;
+
+    Some(DelegationInfo {
+        delegated_targets_json,
+        content_key_hex,
+        content_keyid,
+    })
 }
 
 // ---------------------------------------------------------------------------

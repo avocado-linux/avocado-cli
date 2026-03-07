@@ -10,6 +10,7 @@ use crate::utils::{
         StampOutputs,
     },
     target::resolve_target_required,
+    update_repo,
 };
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -513,7 +514,14 @@ impl RuntimeBuildCommand {
                 ..Default::default()
             };
 
-            run_container_command(container_helper, run_config, runs_on_context).await?;
+            let stamp_ok =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
+            if !stamp_ok {
+                return Err(anyhow::anyhow!(
+                    "Failed to write build stamp for runtime '{}'",
+                    self.runtime_name
+                ));
+            }
 
             if self.verbose {
                 print_info(
@@ -522,6 +530,228 @@ impl RuntimeBuildCommand {
                 );
             }
         }
+
+        // Generate TUF delegation staging and write into the build volume.
+        // If signing keys are not configured this step is skipped with a warning.
+        let project_dir = std::path::Path::new(&self.config_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        if let Err(e) = self
+            .generate_tuf_staging(
+                config,
+                container_image,
+                target_arch,
+                merged_container_args,
+                repo_url,
+                repo_release,
+                container_helper,
+                runs_on_context,
+                project_dir,
+            )
+            .await
+        {
+            print_info(
+                &format!("Skipping TUF delegation staging: {e:#}"),
+                OutputLevel::Normal,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Generate a shell script that enumerates built artifacts, computes their SHA-256
+    /// hashes and sizes, and outputs structured JSON for TUF metadata signing.
+    fn create_hash_collection_script(&self) -> String {
+        format!(
+            r#"
+set -e
+
+RUNTIME_NAME="{runtime_name}"
+VAR_STAGING="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"
+IMAGES_DIR="$VAR_STAGING/lib/avocado/images"
+
+# Find the active manifest (prefer active symlink over find)
+ACTIVE_LINK="$VAR_STAGING/lib/avocado/active"
+RUNTIME_UUID=""
+if [ -L "$ACTIVE_LINK" ]; then
+    ACTIVE_TARGET=$(readlink "$ACTIVE_LINK")
+    MANIFEST_FILE="$VAR_STAGING/lib/avocado/$ACTIVE_TARGET/manifest.json"
+    # Extract UUID from path like "runtimes/<uuid>"
+    RUNTIME_UUID=$(basename "$ACTIVE_TARGET")
+fi
+if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
+    MANIFEST_FILE=$(find "$VAR_STAGING/lib/avocado/runtimes" -name manifest.json -type f 2>/dev/null | head -n 1)
+    if [ -n "$MANIFEST_FILE" ]; then
+        RUNTIME_UUID=$(basename "$(dirname "$MANIFEST_FILE")")
+    fi
+fi
+if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
+    echo "ERROR: No manifest.json found in $VAR_STAGING/lib/avocado/runtimes/" >&2
+    exit 1
+fi
+if [ -z "$RUNTIME_UUID" ]; then
+    echo "ERROR: Could not determine runtime UUID from active symlink" >&2
+    exit 1
+fi
+
+# Read root.json
+ROOT_JSON_FILE="$VAR_STAGING/lib/avocado/metadata/root.json"
+if [ ! -f "$ROOT_JSON_FILE" ]; then
+    echo "ERROR: No root.json found at $ROOT_JSON_FILE" >&2
+    exit 1
+fi
+
+# Start building JSON output
+echo -n '{{"targets":['
+
+FIRST=true
+
+# Hash the manifest
+HASH=$(sha256sum "$MANIFEST_FILE" | awk '{{print $1}}')
+SIZE=$(stat -c '%s' "$MANIFEST_FILE")
+echo -n '{{"name":"manifest.json","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
+FIRST=false
+
+# Hash all image .raw files (content-addressable by UUIDv5)
+if [ -d "$IMAGES_DIR" ]; then
+    for RAW_FILE in "$IMAGES_DIR"/*.raw; do
+        [ -f "$RAW_FILE" ] || continue
+        BASENAME=$(basename "$RAW_FILE")
+        HASH=$(sha256sum "$RAW_FILE" | awk '{{print $1}}')
+        SIZE=$(stat -c '%s' "$RAW_FILE")
+        if [ "$FIRST" = "false" ]; then
+            echo -n ','
+        fi
+        echo -n '{{"name":"'"$BASENAME"'","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
+        FIRST=false
+    done
+fi
+
+# Read and escape root.json for embedding
+ROOT_JSON_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$ROOT_JSON_FILE")
+
+echo -n '],"root_json":'
+echo -n "$ROOT_JSON_ESCAPED"
+echo -n ',"runtime_uuid":"'"$RUNTIME_UUID"'"'
+echo -n '}}'
+"#,
+            runtime_name = self.runtime_name,
+        )
+    }
+
+    /// Collect artifact hashes from the build volume, sign TUF metadata, and write the
+    /// delegation files into `lib/avocado/tuf-staging/` inside the build volume so that
+    /// `avocado connect upload` can include them without a separate `avocado deploy` step.
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_tuf_staging(
+        &self,
+        config: &crate::utils::config::Config,
+        container_image: &str,
+        target_arch: &str,
+        merged_container_args: &Option<Vec<String>>,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        container_helper: &SdkContainer,
+        runs_on_context: Option<&RunsOnContext>,
+        project_dir: &std::path::Path,
+    ) -> Result<()> {
+        // Resolve signing keys — bail early (gracefully) if not configured.
+        let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
+        let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
+        let signer = crate::utils::update_signing::resolve_signing_key(
+            signing_key_name.as_deref(),
+            project_dir,
+        )?;
+        let content_signer = crate::utils::update_signing::resolve_content_key(
+            content_key_name.as_deref(),
+            signing_key_name.as_deref(),
+            project_dir,
+        )?;
+
+        // Phase 1: Collect artifact hashes from inside the build volume.
+        let hash_script = self.create_hash_collection_script();
+        let hash_run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command: hash_script,
+            verbose: false,
+            source_environment: true,
+            interactive: false,
+            container_args: merged_container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        let hash_output =
+            run_container_command_with_output(container_helper, hash_run_config, runs_on_context)
+                .await?
+                .context("Hash collection script produced no output")?;
+
+        let collection: update_repo::HashCollectionOutput =
+            serde_json::from_str(&hash_output).context("Failed to parse hash collection output")?;
+
+        // Phase 2: Generate and sign TUF metadata on the host.
+        let repo_metadata = update_repo::generate_repo_metadata(
+            &collection.targets,
+            &collection.runtime_uuid,
+            &signer,
+            &content_signer,
+        )?;
+
+        // Phase 3: Write signed files into the build volume via a container run.
+        // We write them to a temp dir under the project directory (accessible inside
+        // the container as /opt/src/.tuf-staging-tmp/), then copy into the volume.
+        let tmp_dir = project_dir.join(".tuf-staging-tmp");
+        let tmp_delegations = tmp_dir.join("delegations");
+        std::fs::create_dir_all(&tmp_delegations)
+            .context("Failed to create TUF staging temp directory")?;
+
+        std::fs::write(tmp_dir.join("targets.json"), &repo_metadata.targets_json)
+            .context("Failed to write targets.json to temp dir")?;
+        std::fs::write(
+            tmp_delegations.join(format!("runtime-{}.json", collection.runtime_uuid)),
+            &repo_metadata.delegated_targets_json,
+        )
+        .context("Failed to write delegated targets to temp dir")?;
+
+        let runtime_name = &self.runtime_name;
+        let runtime_uuid = &collection.runtime_uuid;
+        let copy_script = format!(
+            r#"set -euo pipefail
+DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
+mkdir -p "$DEST/delegations"
+cp /opt/src/.tuf-staging-tmp/targets.json "$DEST/targets.json"
+cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
+   "$DEST/delegations/runtime-{runtime_uuid}.json"
+"#
+        );
+
+        let copy_run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command: copy_script,
+            verbose: false,
+            source_environment: true,
+            interactive: false,
+            container_args: merged_container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        run_container_command(container_helper, copy_run_config, runs_on_context).await?;
+
+        // Clean up host temp files.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        print_info(
+            &format!(
+                "Generated deployment delegation staging for runtime '{}'.",
+                self.runtime_name
+            ),
+            OutputLevel::Normal,
+        );
 
         Ok(())
     }
@@ -1308,6 +1538,22 @@ async fn run_container_command(
             .await
     } else {
         container_helper.run_in_container(config).await
+    }
+}
+
+/// Helper function to run a container command and capture its output,
+/// using shared context if available.
+async fn run_container_command_with_output(
+    container_helper: &SdkContainer,
+    config: RunConfig,
+    runs_on_context: Option<&RunsOnContext>,
+) -> Result<Option<String>> {
+    if let Some(context) = runs_on_context {
+        container_helper
+            .run_in_container_with_output_remote(&config, context)
+            .await
+    } else {
+        container_helper.run_in_container_with_output(config).await
     }
 }
 

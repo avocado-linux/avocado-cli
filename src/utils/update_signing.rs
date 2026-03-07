@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::utils::output::{print_warning, OutputLevel};
 use crate::utils::signing_keys::{is_file_uri, is_pkcs11_uri, KeysRegistry};
 
 const AUTO_KEY_DIR: &str = "signing";
@@ -76,18 +77,24 @@ pub fn resolve_signing_key(key_name: Option<&str>, project_dir: &Path) -> Result
             let key_dir = project_dir.join(".avocado").join(AUTO_KEY_DIR);
             let key_path = key_dir.join(AUTO_KEY_NAME).with_extension("key");
             if key_path.exists() {
-                eprintln!(
-                    "WARNING: No signing key configured. Using auto-generated key at {}.\n\
-                     \x20        This key is NOT suitable for production use.\n\
-                     \x20        Run 'avocado signing-keys create' and set 'signing.key' in your config.",
-                    key_path.display()
+                print_warning(
+                    &format!(
+                        "No signing key configured. Using auto-generated key at {}.\n\
+                         \x20        This key is NOT suitable for production use.\n\
+                         \x20        Run 'avocado signing-keys create' and set 'signing.key' in your config.",
+                        key_path.display()
+                    ),
+                    OutputLevel::Normal,
                 );
             } else {
-                eprintln!(
-                    "WARNING: No signing key configured. Generating a new key at {}.\n\
-                     \x20        This key is NOT suitable for production use.\n\
-                     \x20        Run 'avocado signing-keys create' and set 'signing.key' in your config.",
-                    key_path.display()
+                print_warning(
+                    &format!(
+                        "No signing key configured. Generating a new key at {}.\n\
+                         \x20        This key is NOT suitable for production use.\n\
+                         \x20        Run 'avocado signing-keys create' and set 'signing.key' in your config.",
+                        key_path.display()
+                    ),
+                    OutputLevel::Normal,
                 );
             }
             let (sk, pk) = ensure_auto_generated_key(project_dir)?;

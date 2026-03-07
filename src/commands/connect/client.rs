@@ -106,6 +106,12 @@ pub struct RuntimeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<serde_json::Value>,
     pub artifacts: Vec<ArtifactParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_targets_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_key_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_keyid: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1122,7 +1122,7 @@ impl SdkContainer {
     ///
     /// This is similar to `run_in_container_with_output` but uses the provided
     /// RunsOnContext for remote execution.
-    async fn run_in_container_with_output_remote(
+    pub async fn run_in_container_with_output_remote(
         &self,
         config: &RunConfig,
         context: &crate::utils::runs_on::RunsOnContext,

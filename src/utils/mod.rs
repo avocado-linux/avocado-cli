@@ -8,6 +8,7 @@ pub mod lockfile;
 pub mod nfs_server;
 pub mod output;
 pub mod pkcs11_devices;
+pub mod prerequisites;
 pub mod remote;
 pub mod runs_on;
 pub mod signing_keys;

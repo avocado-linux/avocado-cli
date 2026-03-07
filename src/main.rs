@@ -410,8 +410,7 @@ enum ConnectCommands {
         /// Project ID (or set connect.project in avocado.yaml)
         #[arg(long)]
         project: Option<String>,
-        /// Runtime name (defaults to "dev")
-        #[arg(short = 'r', long = "runtime", default_value = "dev")]
+        /// Runtime name to upload
         runtime: String,
         /// Version string (defaults to runtime name-version from manifest)
         #[arg(long)]
