@@ -17,6 +17,7 @@ use commands::connect::keys::{
     ConnectKeysRetireCommand,
 };
 use commands::connect::server_key::ConnectServerKeyCommand;
+use commands::connect::trust::ConnectTrustStatusCommand;
 use commands::connect::upload::ConnectUploadCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
@@ -452,6 +453,27 @@ enum ConnectCommands {
     Keys {
         #[command(subcommand)]
         command: ConnectKeysCommands,
+    },
+    /// Fleet trust posture commands
+    Trust {
+        #[command(subcommand)]
+        command: ConnectTrustCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectTrustCommands {
+    /// Show fleet trust status for an organization
+    Status {
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -2248,6 +2270,32 @@ async fn main() -> Result<()> {
                         org: resolved_org,
                         user_id: user,
                         key_type,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::Trust { command } => match command {
+                ConnectTrustCommands::Status {
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let connect_config = std::path::Path::new(&config)
+                        .exists()
+                        .then(|| crate::utils::config::load_config(&config).ok())
+                        .flatten()
+                        .and_then(|c| c.connect);
+
+                    let resolved_org = org
+                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
+                        })?;
+
+                    let cmd = ConnectTrustStatusCommand {
+                        org: resolved_org,
                         profile,
                     };
                     cmd.execute().await?;

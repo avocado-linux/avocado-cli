@@ -622,6 +622,50 @@ impl ConnectClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Trust status types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct TrustStatusData {
+    pub current_root_version: i64,
+    pub setup_complete: bool,
+    pub root_rotated: bool,
+    pub root_version_distribution: Vec<RootVersionBucket>,
+    pub total_tracked_devices: i64,
+    pub stale_device_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RootVersionBucket {
+    pub root_version: i64,
+    pub count: i64,
+}
+
+impl ConnectClient {
+    /// Fetch fleet trust posture for an org.
+    pub async fn get_trust_status(&self, org: &str) -> Result<TrustStatusData> {
+        let url = format!("{}/api/orgs/{}/trust/status", self.api_url, org);
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to fetch trust status")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to fetch trust status (HTTP {status}): {body}");
+        }
+
+        let data: TrustStatusData = res.json().await?;
+        Ok(data)
+    }
+}
+
 /// Session-based client for login flow (cookie-based, not Bearer).
 pub struct LoginClient {
     http: reqwest::Client,
