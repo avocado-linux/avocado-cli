@@ -329,6 +329,10 @@ pub struct SigningConfig {
     /// Checksum algorithm to use (sha256 or blake3, defaults to sha256)
     #[serde(default = "default_checksum_algorithm")]
     pub checksum_algorithm: String,
+    /// Optional separate key for signing delegated-targets metadata only.
+    /// Falls back to `key` if not set.
+    #[serde(default)]
+    pub content_key: Option<String>,
 }
 
 fn default_checksum_algorithm() -> String {
@@ -2386,6 +2390,16 @@ impl Config {
     pub fn get_runtime_signing_key_name(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
         Some(runtime_config.signing.as_ref()?.key.clone())
+    }
+
+    /// Get the declared content key name for a runtime (for signing delegated-targets only).
+    ///
+    /// Returns Some(key_name) if the runtime has a content_key configured,
+    /// None if not set (caller should fall back to the signing key or auto-generate).
+    #[allow(dead_code)] // Public API for future use
+    pub fn get_runtime_content_key_name(&self, runtime_name: &str) -> Option<String> {
+        let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
+        runtime_config.signing.as_ref()?.content_key.clone()
     }
 
     /// Get signing key for a specific runtime

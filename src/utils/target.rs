@@ -241,6 +241,7 @@ mod tests {
             sdk: None,
             provision_profiles: None,
             signing_keys: None,
+            connect: None,
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             sdk: None,
             provision_profiles: None,
             signing_keys: None,
+            connect: None,
         }
     }
 
@@ -273,6 +275,7 @@ mod tests {
             sdk: None,
             provision_profiles: None,
             signing_keys: None,
+            connect: None,
         }
     }
 

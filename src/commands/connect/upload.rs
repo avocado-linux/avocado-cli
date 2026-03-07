@@ -64,7 +64,7 @@ impl ConnectUploadCommand {
 
         // 5. Create runtime (Step 1)
         print_info(
-            &format!("Creating runtime {}...", version),
+            &format!("Creating runtime {version}..."),
             OutputLevel::Normal,
         );
         let create_req = CreateRuntimeRequest {
@@ -313,7 +313,7 @@ fn format_version_from_manifest(manifest: &serde_json::Value) -> String {
             runtime.get("name").and_then(|v| v.as_str()),
             runtime.get("version").and_then(|v| v.as_str()),
         ) {
-            return format!("{}-{}", name, ver);
+            return format!("{name}-{ver}");
         }
     }
     manifest
@@ -345,7 +345,7 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
             .and_then(|v| v.as_str())
             .context("Extension missing 'image_id' field")?;
 
-        let path = images_dir.join(format!("{}.raw", image_id));
+        let path = images_dir.join(format!("{image_id}.raw"));
         if !path.exists() {
             anyhow::bail!(
                 "Artifact file not found: {} (image_id: {})",
@@ -402,7 +402,7 @@ async fn upload_artifacts(
     if to_upload.is_empty() {
         if skipped > 0 {
             print_info(
-                &format!("All {} artifact(s) already uploaded.", skipped),
+                &format!("All {skipped} artifact(s) already uploaded."),
                 OutputLevel::Normal,
             );
         }
@@ -414,7 +414,7 @@ async fn upload_artifacts(
             "Uploading {} artifact(s){}...",
             to_upload.len(),
             if skipped > 0 {
-                format!(" ({} already uploaded)", skipped)
+                format!(" ({skipped} already uploaded)")
             } else {
                 String::new()
             }
@@ -514,7 +514,7 @@ fn format_bytes(bytes: u64) -> String {
         i += 1;
     }
     if i == 0 {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     } else {
         format!("{:.1} {}", size, UNITS[i])
     }

@@ -247,22 +247,34 @@ impl RuntimeDeployCommand {
         );
 
         let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
+        let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
         let project_dir = std::path::Path::new(&self.config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
 
-        let (sk, pk) = crate::utils::update_signing::resolve_signing_key(
+        let signer = crate::utils::update_signing::resolve_signing_key(
+            signing_key_name.as_deref(),
+            project_dir,
+        )?;
+        let content_signer = crate::utils::update_signing::resolve_content_key(
+            content_key_name.as_deref(),
             signing_key_name.as_deref(),
             project_dir,
         )?;
 
-        let repo_metadata = update_repo::generate_repo_metadata(&collection.targets, &sk, &pk)?;
+        let repo_metadata = update_repo::generate_repo_metadata(
+            &collection.targets,
+            &collection.runtime_uuid,
+            &signer,
+            &content_signer,
+        )?;
 
         let staging_dir = project_dir.join(DEPLOY_STAGING_DIR);
-        std::fs::create_dir_all(&staging_dir).with_context(|| {
+        let delegations_dir = staging_dir.join("delegations");
+        std::fs::create_dir_all(&delegations_dir).with_context(|| {
             format!(
                 "Failed to create deploy staging directory: {}",
-                staging_dir.display()
+                delegations_dir.display()
             )
         })?;
 
@@ -283,6 +295,11 @@ impl RuntimeDeployCommand {
         .context("Failed to write timestamp.json")?;
         std::fs::write(staging_dir.join("root.json"), &collection.root_json)
             .context("Failed to write root.json to staging")?;
+        std::fs::write(
+            delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
+            &repo_metadata.delegated_targets_json,
+        )
+        .context("Failed to write delegated targets json")?;
 
         if self.verbose {
             print_info(
@@ -297,7 +314,7 @@ impl RuntimeDeployCommand {
             OutputLevel::Normal,
         );
 
-        let deploy_script = self.create_deploy_script(&target_arch)?;
+        let deploy_script = self.create_deploy_script(&target_arch, &collection.runtime_uuid)?;
 
         let mut env_vars = HashMap::new();
         env_vars.insert("AVOCADO_TARGET".to_string(), target_arch.clone());
@@ -360,14 +377,25 @@ IMAGES_DIR="$VAR_STAGING/lib/avocado/images"
 
 # Find the active manifest (prefer active symlink over find)
 ACTIVE_LINK="$VAR_STAGING/lib/avocado/active"
+RUNTIME_UUID=""
 if [ -L "$ACTIVE_LINK" ]; then
-    MANIFEST_FILE="$VAR_STAGING/lib/avocado/$(readlink "$ACTIVE_LINK")/manifest.json"
+    ACTIVE_TARGET=$(readlink "$ACTIVE_LINK")
+    MANIFEST_FILE="$VAR_STAGING/lib/avocado/$ACTIVE_TARGET/manifest.json"
+    # Extract UUID from path like "runtimes/<uuid>"
+    RUNTIME_UUID=$(basename "$ACTIVE_TARGET")
 fi
 if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
     MANIFEST_FILE=$(find "$VAR_STAGING/lib/avocado/runtimes" -name manifest.json -type f 2>/dev/null | head -n 1)
+    if [ -n "$MANIFEST_FILE" ]; then
+        RUNTIME_UUID=$(basename "$(dirname "$MANIFEST_FILE")")
+    fi
 fi
 if [ -z "$MANIFEST_FILE" ] || [ ! -f "$MANIFEST_FILE" ]; then
     echo "ERROR: No manifest.json found in $VAR_STAGING/lib/avocado/runtimes/" >&2
+    exit 1
+fi
+if [ -z "$RUNTIME_UUID" ]; then
+    echo "ERROR: Could not determine runtime UUID from active symlink" >&2
     exit 1
 fi
 
@@ -409,6 +437,7 @@ ROOT_JSON_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[
 
 echo -n '],"root_json":'
 echo -n "$ROOT_JSON_ESCAPED"
+echo -n ',"runtime_uuid":"'"$RUNTIME_UUID"'"'
 echo -n '}}'
 "#,
             runtime_name = self.runtime_name,
@@ -417,7 +446,7 @@ echo -n '}}'
 
     /// Phase 3: Generate a shell script that assembles the TUF repo,
     /// starts an HTTP server, SSHes into the device, and triggers the update.
-    fn create_deploy_script(&self, _target_arch: &str) -> Result<String> {
+    fn create_deploy_script(&self, _target_arch: &str, runtime_uuid: &str) -> Result<String> {
         let port = DEFAULT_DEPLOY_REPO_PORT;
         let spec = DeviceSpec::parse(&self.device)?;
 
@@ -426,6 +455,7 @@ echo -n '}}'
 set -e
 
 RUNTIME_NAME="{runtime_name}"
+RUNTIME_UUID="{runtime_uuid}"
 SSH_DEST="{ssh_dest}"
 SSH_PORT_ARGS="{ssh_port_args}"
 DEVICE_HOST="{device_host}"
@@ -437,12 +467,14 @@ STAGING_DIR="/opt/src/{staging_dir}"
 
 # Clean up any previous repo
 rm -rf "$REPO_DIR"
-mkdir -p "$REPO_DIR/metadata" "$REPO_DIR/targets"
+mkdir -p "$REPO_DIR/metadata/delegations" "$REPO_DIR/targets"
 
 # Copy metadata from deploy-staging (signed in Phase 2)
 cp "$STAGING_DIR/targets.json" "$REPO_DIR/metadata/targets.json"
 cp "$STAGING_DIR/snapshot.json" "$REPO_DIR/metadata/snapshot.json"
 cp "$STAGING_DIR/timestamp.json" "$REPO_DIR/metadata/timestamp.json"
+cp "$STAGING_DIR/delegations/runtime-${{RUNTIME_UUID}}.json" \
+   "$REPO_DIR/metadata/delegations/runtime-${{RUNTIME_UUID}}.json"
 
 # Copy root.json from build output
 cp "$VAR_STAGING/lib/avocado/metadata/root.json" "$REPO_DIR/metadata/root.json"
@@ -539,6 +571,7 @@ else
 fi
 "#,
             runtime_name = self.runtime_name,
+            runtime_uuid = runtime_uuid,
             ssh_dest = spec.ssh_destination(),
             ssh_port_args = spec.ssh_port_args(),
             device_host = spec.host,
@@ -662,15 +695,18 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("x86_64").unwrap();
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let script = cmd.create_deploy_script("x86_64", uuid).unwrap();
 
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
+        assert!(script.contains(&format!("RUNTIME_UUID=\"{uuid}\"")));
         assert!(script.contains("SSH_DEST=\"root@device.local\""));
         assert!(script.contains("DEVICE_HOST=\"device.local\""));
         assert!(script.contains("SSH_PORT_ARGS=\"\""));
         assert!(script.contains("python3 -m http.server"));
         assert!(script.contains("avocadoctl runtime add --url"));
         assert!(script.contains("ssh -o StrictHostKeyChecking=no"));
+        assert!(script.contains("delegations/runtime-${RUNTIME_UUID}.json"));
     }
 
     #[test]
@@ -685,7 +721,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("qemux86-64").unwrap();
+        let script = cmd.create_deploy_script("qemux86-64", "test-uuid").unwrap();
 
         assert!(script.contains("SSH_DEST=\"root@127.0.0.1\""));
         assert!(script.contains("SSH_PORT_ARGS=\"-p 2222\""));
@@ -710,7 +746,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("x86_64").unwrap();
+        let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
         assert!(script.contains("SSH_DEST=\"root@10.0.0.42\""));
         assert!(script.contains("SSH_PORT_ARGS=\"-p 2222\""));
@@ -754,7 +790,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("qemux86-64").unwrap();
+        let script = cmd.create_deploy_script("qemux86-64", "test-uuid").unwrap();
 
         assert!(script.contains("SSH_DEST=\"root@10.0.0.42\""));
         assert!(script.contains("DEVICE_HOST=\"10.0.0.42\""));
@@ -772,7 +808,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("aarch64").unwrap();
+        let script = cmd.create_deploy_script("aarch64", "test-uuid").unwrap();
 
         assert!(script.contains("SSH_DEST=\"root@edge-device.company.com\""));
         assert!(script.contains("DEVICE_HOST=\"edge-device.company.com\""));
@@ -797,6 +833,7 @@ mod tests {
         assert!(script.contains("manifest.json"));
         assert!(script.contains("root.json"));
         assert!(script.contains(r#""targets":["#));
+        assert!(script.contains("runtime_uuid"));
     }
 
     #[test]
@@ -846,7 +883,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("x86_64").unwrap();
+        let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
         assert!(script.contains("AVOCADO_DEPLOY_REPO_HOST"));
         assert!(script.contains("HOST_IP=\"$AVOCADO_DEPLOY_REPO_HOST\""));
@@ -864,7 +901,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("x86_64").unwrap();
+        let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
         assert!(script.contains("ip route get \"$DEVICE_HOST\""));
     }
@@ -881,7 +918,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("x86_64").unwrap();
+        let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
         assert!(script.contains("--bind 0.0.0.0"));
     }
@@ -898,7 +935,7 @@ mod tests {
             None,
         );
 
-        let script = cmd.create_deploy_script("x86_64").unwrap();
+        let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
         assert!(script.contains("trap cleanup EXIT"));
         assert!(script.contains("kill \"$HTTP_PID\""));

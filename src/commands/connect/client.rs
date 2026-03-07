@@ -315,7 +315,7 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to create runtime (HTTP {}): {}", status, body);
+            anyhow::bail!("Failed to create runtime (HTTP {status}): {body}");
         }
 
         let resp: CreateRuntimeResponse = res.json().await?;
@@ -336,7 +336,7 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Part upload failed (HTTP {}): {}", status, body);
+            anyhow::bail!("Part upload failed (HTTP {status}): {body}");
         }
 
         let etag = res
@@ -375,7 +375,7 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to complete runtime (HTTP {}): {}", status, body);
+            anyhow::bail!("Failed to complete runtime (HTTP {status}): {body}");
         }
 
         let resp: CompleteRuntimeResponse = res.json().await?;
@@ -407,7 +407,7 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get upload URLs (HTTP {}): {}", status, body);
+            anyhow::bail!("Failed to get upload URLs (HTTP {status}): {body}");
         }
 
         let resp: UploadUrlsResponse = res.json().await?;
@@ -470,7 +470,7 @@ impl LoginClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Login failed (HTTP {}): {}", status, body);
+            anyhow::bail!("Login failed (HTTP {status}): {body}");
         }
 
         Ok(())
@@ -515,7 +515,7 @@ impl LoginClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to create API token (HTTP {}): {}", status, body);
+            anyhow::bail!("Failed to create API token (HTTP {status}): {body}");
         }
 
         let body: serde_json::Value = res.json().await?;

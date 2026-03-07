@@ -73,7 +73,7 @@ impl ConnectAuthLoginCommand {
             .unwrap_or_else(|_| "unknown".to_string());
 
         let profile_name = self.profile.as_deref().unwrap_or("default");
-        let token_name = format!("avocado-cli-{}-{}", hostname, profile_name);
+        let token_name = format!("avocado-cli-{hostname}-{profile_name}");
 
         print_info("Creating API token...", OutputLevel::Normal);
         let raw_token = login_client.create_api_token(&token_name).await?;
@@ -107,11 +107,11 @@ impl ConnectAuthLoginCommand {
         client::save_config(&cfg)?;
 
         let action = if is_new_config {
-            format!("Created new profile '{}' (set as default)", profile_name)
+            format!("Created new profile '{profile_name}' (set as default)")
         } else if existed {
-            format!("Updated profile '{}'", profile_name)
+            format!("Updated profile '{profile_name}'")
         } else {
-            format!("Created new profile '{}'", profile_name)
+            format!("Created new profile '{profile_name}'")
         };
 
         print_success(
@@ -162,7 +162,7 @@ impl ConnectAuthLogoutCommand {
                 }
 
                 print_success(
-                    &format!("Logged out of profile '{}'. Credentials removed.", profile_name),
+                    &format!("Logged out of profile '{profile_name}'. Credentials removed."),
                     OutputLevel::Normal,
                 );
             }
@@ -190,7 +190,7 @@ impl ConnectAuthStatusCommand {
                     }
                 };
 
-                println!("Profile: {}", profile_name);
+                println!("Profile: {profile_name}");
                 println!(
                     "Logged in as {} ({})",
                     profile.user.name, profile.user.email
@@ -204,7 +204,7 @@ impl ConnectAuthStatusCommand {
                 match client.get_me().await {
                     Ok(_) => print_success("Token is valid.", OutputLevel::Normal),
                     Err(e) => print_error(
-                        &format!("Token may be invalid: {}", e),
+                        &format!("Token may be invalid: {e}"),
                         OutputLevel::Normal,
                     ),
                 }

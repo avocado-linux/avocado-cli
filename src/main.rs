@@ -1999,15 +1999,14 @@ async fn main() -> Result<()> {
                 let resolved_org = org
                     .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
                     .ok_or_else(|| {
-                        anyhow::anyhow!("--org is required (or set connect.org in {})", config)
+                        anyhow::anyhow!("--org is required (or set connect.org in {config})")
                     })?;
 
                 let resolved_project = project
                     .or_else(|| connect_config.as_ref().and_then(|c| c.project.clone()))
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "--project is required (or set connect.project in {})",
-                            config
+                            "--project is required (or set connect.project in {config})"
                         )
                     })?;
 

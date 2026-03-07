@@ -777,11 +777,11 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
         let project_dir = std::path::Path::new(&self.config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
-        let (sk, pk) = crate::utils::update_signing::resolve_signing_key(
+        let signer = crate::utils::update_signing::resolve_signing_key(
             signing_key_name.as_deref(),
             project_dir,
         )?;
-        let root_json_content = crate::utils::update_signing::generate_root_json(&sk, &pk)?;
+        let root_json_content = crate::utils::update_signing::generate_root_json(&signer)?;
 
         let update_authority_section = format!(
             r#"
