@@ -438,7 +438,7 @@ impl ConnectClient {
 
     /// Fetch the org's TUF server signing public key.
     pub async fn get_tuf_server_key(&self, org: &str) -> Result<ServerKeyResponse> {
-        let url = format!("{}/api/orgs/{}/tuf/server-key", self.api_url, org);
+        let url = format!("{}/api/orgs/{}/signing/server-key", self.api_url, org);
 
         let res = self
             .http
@@ -508,7 +508,7 @@ impl ConnectClient {
         org: &str,
         req: &RegisterDelegateKeyRequest,
     ) -> Result<DelegateKeyData> {
-        let url = format!("{}/api/orgs/{}/tuf/delegate-keys", self.api_url, org);
+        let url = format!("{}/api/orgs/{}/signing/keys", self.api_url, org);
 
         let res = self
             .http
@@ -537,7 +537,7 @@ impl ConnectClient {
         req: &ApproveDelegateKeyRequest,
     ) -> Result<DelegateKeyData> {
         let url = format!(
-            "{}/api/orgs/{}/tuf/delegate-keys/{}/approve",
+            "{}/api/orgs/{}/signing/keys/{}/approve",
             self.api_url, org, user_id
         );
 
@@ -566,7 +566,7 @@ impl ConnectClient {
         org: &str,
         key_type: Option<&str>,
     ) -> Result<Vec<DelegateKeyData>> {
-        let mut url = format!("{}/api/orgs/{}/tuf/delegate-keys", self.api_url, org);
+        let mut url = format!("{}/api/orgs/{}/signing/keys", self.api_url, org);
         if let Some(kt) = key_type {
             url.push_str(&format!("?key_type={kt}"));
         }
@@ -597,7 +597,7 @@ impl ConnectClient {
         key_type: Option<&str>,
     ) -> Result<()> {
         let mut url = format!(
-            "{}/api/orgs/{}/tuf/delegate-keys/{}/staged",
+            "{}/api/orgs/{}/signing/keys/{}/staged",
             self.api_url, org, user_id
         );
         if let Some(kt) = key_type {
@@ -631,9 +631,50 @@ pub struct TrustStatusData {
     pub current_root_version: i64,
     pub setup_complete: bool,
     pub root_rotated: bool,
+    #[serde(default)]
+    pub security_level: i64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub has_pending_promotion: bool,
     pub root_version_distribution: Vec<RootVersionBucket>,
     pub total_tracked_devices: i64,
     pub stale_device_count: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Root promotion / server key rotation response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ProposeWrapper {
+    data: ProposeData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProposeData {
+    pub pending_root_json: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitWrapper {
+    data: CommitData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitData {
+    pub version: i64,
+    pub security_level: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RotateWrapper {
+    data: RotateData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RotateData {
+    pub version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +704,163 @@ impl ConnectClient {
 
         let data: TrustStatusData = res.json().await?;
         Ok(data)
+    }
+
+    /// Propose root promotion (Level 1 → 2).
+    pub async fn propose_promote_root(&self, org: &str) -> Result<ProposeData> {
+        let url = format!(
+            "{}/api/orgs/{}/trust/promote-root/propose",
+            self.api_url, org
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to propose root promotion")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to propose root promotion (HTTP {status}): {body}");
+        }
+
+        let resp: ProposeWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Commit root promotion with the user's co-signature.
+    pub async fn commit_promote_root(
+        &self,
+        org: &str,
+        signature: &serde_json::Value,
+    ) -> Result<CommitData> {
+        let url = format!(
+            "{}/api/orgs/{}/trust/promote-root/commit",
+            self.api_url, org
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(&serde_json::json!({ "signature": signature }))
+            .send()
+            .await
+            .context("Failed to commit root promotion")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to commit root promotion (HTTP {status}): {body}");
+        }
+
+        let resp: CommitWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Cancel a pending root promotion.
+    #[allow(dead_code)]
+    pub async fn cancel_promote_root(&self, org: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/orgs/{}/trust/promote-root/pending",
+            self.api_url, org
+        );
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to cancel root promotion")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to cancel root promotion (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// Rotate server signing key at Level 0/1 (no user action needed).
+    pub async fn rotate_server_key(&self, org: &str) -> Result<RotateData> {
+        let url = format!("{}/api/orgs/{}/trust/rotate-server-key", self.api_url, org);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to rotate server key")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to rotate server key (HTTP {status}): {body}");
+        }
+
+        let resp: RotateWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Propose server key rotation at Level 2 (requires user co-signing).
+    pub async fn propose_rotate_server_key(&self, org: &str) -> Result<ProposeData> {
+        let url = format!(
+            "{}/api/orgs/{}/trust/rotate-server-key/propose",
+            self.api_url, org
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to propose server key rotation")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to propose server key rotation (HTTP {status}): {body}");
+        }
+
+        let resp: ProposeWrapper = res.json().await?;
+        Ok(resp.data)
+    }
+
+    /// Commit Level 2 server key rotation with the user's signature.
+    pub async fn commit_rotate_server_key(
+        &self,
+        org: &str,
+        signature: &serde_json::Value,
+    ) -> Result<CommitData> {
+        let url = format!(
+            "{}/api/orgs/{}/trust/rotate-server-key/commit",
+            self.api_url, org
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(&serde_json::json!({ "signature": signature }))
+            .send()
+            .await
+            .context("Failed to commit server key rotation")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to commit server key rotation (HTTP {status}): {body}");
+        }
+
+        let resp: CommitWrapper = res.json().await?;
+        Ok(resp.data)
     }
 }
 
