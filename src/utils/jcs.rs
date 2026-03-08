@@ -99,4 +99,59 @@ mod tests {
         // Same input always produces same output
         assert_eq!(key_id, compute_tuf_key_id(pub_hex));
     }
+
+    #[test]
+    fn test_jcs_encode_matches_known_vectors() {
+        // RFC 8785 style: empty object
+        let value: serde_json::Value = serde_json::json!({});
+        assert_eq!(jcs_encode(&value), "{}");
+
+        // RFC 8785 style: empty array
+        let value: serde_json::Value = serde_json::json!([]);
+        assert_eq!(jcs_encode(&value), "[]");
+
+        // Typical TUF root signed portion structure
+        let value: serde_json::Value = serde_json::json!({
+            "_type": "root",
+            "version": 1,
+            "spec_version": "1.0.0",
+            "keys": {},
+            "roles": {}
+        });
+        let canonical = jcs_encode(&value);
+        // Keys must be sorted: _type < keys < roles < spec_version < version
+        assert_eq!(
+            canonical,
+            r#"{"_type":"root","keys":{},"roles":{},"spec_version":"1.0.0","version":1}"#
+        );
+
+        // Boolean values
+        let value: serde_json::Value = serde_json::json!({"b": true, "a": false});
+        assert_eq!(jcs_encode(&value), r#"{"a":false,"b":true}"#);
+
+        // String escaping
+        let value: serde_json::Value = serde_json::json!({"key": "hello \"world\""});
+        assert_eq!(jcs_encode(&value), r#"{"key":"hello \"world\""}"#);
+    }
+
+    #[test]
+    fn test_compute_tuf_key_id_known_vector() {
+        // For a known public hex, verify the key ID is SHA-256 of the canonical key descriptor.
+        // The canonical form is: {"keytype":"ed25519","keyval":{"public":"<hex>"},"scheme":"ed25519"}
+        let pub_hex = "0000000000000000000000000000000000000000000000000000000000000000";
+        let key_id = compute_tuf_key_id(pub_hex);
+
+        // Manually compute expected: sha256 of the canonical descriptor
+        use sha2::{Digest, Sha256};
+        let canonical = format!(
+            r#"{{"keytype":"ed25519","keyval":{{"public":"{}"}},"scheme":"ed25519"}}"#,
+            pub_hex
+        );
+        let expected = hex_encode(&Sha256::digest(canonical.as_bytes()));
+        assert_eq!(key_id, expected);
+
+        // Different key should produce different ID
+        let other_hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert_ne!(key_id, compute_tuf_key_id(other_hex));
+    }
 }

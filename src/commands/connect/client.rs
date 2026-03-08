@@ -979,3 +979,94 @@ impl LoginClient {
         Ok(raw_token)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_trust_status_data_deserializes_all_fields() {
+        let json_val = json!({
+            "current_root_version": 3,
+            "setup_complete": true,
+            "root_rotated": true,
+            "security_level": 2,
+            "has_pending_promotion": false,
+            "root_version_distribution": [
+                {"root_version": 1, "count": 5},
+                {"root_version": 2, "count": 10}
+            ],
+            "total_tracked_devices": 15,
+            "stale_device_count": 2
+        });
+
+        let data: TrustStatusData = serde_json::from_value(json_val).unwrap();
+        assert_eq!(data.current_root_version, 3);
+        assert!(data.setup_complete);
+        assert!(data.root_rotated);
+        assert_eq!(data.security_level, 2);
+        assert!(!data.has_pending_promotion);
+        assert_eq!(data.root_version_distribution.len(), 2);
+        assert_eq!(data.root_version_distribution[0].root_version, 1);
+        assert_eq!(data.root_version_distribution[0].count, 5);
+        assert_eq!(data.total_tracked_devices, 15);
+        assert_eq!(data.stale_device_count, 2);
+    }
+
+    #[test]
+    fn test_trust_status_data_defaults_for_missing_optional_fields() {
+        let json_val = json!({
+            "current_root_version": 0,
+            "setup_complete": false,
+            "root_rotated": false,
+            "root_version_distribution": [],
+            "total_tracked_devices": 0,
+            "stale_device_count": 0
+        });
+
+        let data: TrustStatusData = serde_json::from_value(json_val).unwrap();
+        assert_eq!(data.security_level, 0);
+        assert!(!data.has_pending_promotion);
+    }
+
+    #[test]
+    fn test_propose_data_deserializes() {
+        let json_val = json!({
+            "data": {
+                "pending_root_json": "{\"signed\":{\"_type\":\"root\"}}",
+                "version": 2
+            }
+        });
+
+        let wrapper: ProposeWrapper = serde_json::from_value(json_val).unwrap();
+        assert_eq!(wrapper.data.version, 2);
+        assert!(!wrapper.data.pending_root_json.is_empty());
+    }
+
+    #[test]
+    fn test_commit_data_deserializes() {
+        let json_val = json!({
+            "data": {
+                "version": 3,
+                "security_level": 2
+            }
+        });
+
+        let wrapper: CommitWrapper = serde_json::from_value(json_val).unwrap();
+        assert_eq!(wrapper.data.version, 3);
+        assert_eq!(wrapper.data.security_level, 2);
+    }
+
+    #[test]
+    fn test_rotate_data_deserializes() {
+        let json_val = json!({
+            "data": {
+                "version": 4
+            }
+        });
+
+        let wrapper: RotateWrapper = serde_json::from_value(json_val).unwrap();
+        assert_eq!(wrapper.data.version, 4);
+    }
+}

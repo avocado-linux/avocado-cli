@@ -33,6 +33,22 @@ impl ConnectTrustStatusCommand {
             &format!("  Root rotated:         {}", status.root_rotated),
             OutputLevel::Normal,
         );
+        let level_label = match status.security_level {
+            0 => "0 (server-managed)".to_string(),
+            1 => "1 (content-delegated)".to_string(),
+            2 => "2 (user-controlled root)".to_string(),
+            n => format!("{n} (unknown)"),
+        };
+        print_info(
+            &format!("  Security level:       {level_label}"),
+            OutputLevel::Normal,
+        );
+        if status.has_pending_promotion {
+            print_info(
+                "  Pending promotion:    yes (awaiting co-signature)",
+                OutputLevel::Normal,
+            );
+        }
         print_info(
             &format!("  Tracked devices:      {}", status.total_tracked_devices),
             OutputLevel::Normal,
