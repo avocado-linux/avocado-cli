@@ -655,18 +655,45 @@ echo -n '}}'
         runs_on_context: Option<&RunsOnContext>,
         project_dir: &std::path::Path,
     ) -> Result<()> {
-        // Resolve signing keys — bail early (gracefully) if not configured.
+        // Resolve signing keys. At Level 0 (Connect, no local key), skip TUF staging entirely.
         let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
         let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
-        let signer = crate::utils::update_signing::resolve_signing_key(
-            signing_key_name.as_deref(),
-            project_dir,
-        )?;
+        let is_connect = config
+            .connect
+            .as_ref()
+            .and_then(|c| c.org.as_ref())
+            .is_some();
+
+        let signer =
+            crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())?;
+
+        // Level 0: no signing key, Connect project — server manages TUF, skip staging
+        if signer.is_none() {
+            if is_connect {
+                print_info(
+                    "Connect Level 0: skipping TUF staging (server manages signing)",
+                    OutputLevel::Normal,
+                );
+                return Ok(());
+            } else {
+                anyhow::bail!(
+                    "No signing key configured. Either:\n\
+                     - Create a key: avocado signing-keys create <name>\n\
+                     - Or connect to a server: avocado connect init"
+                );
+            }
+        }
+        let signer = signer.unwrap();
+
         let content_signer = crate::utils::update_signing::resolve_content_key(
             content_key_name.as_deref(),
             signing_key_name.as_deref(),
-            project_dir,
-        )?;
+        )?
+        .unwrap_or_else(|| {
+            // Sideload: no content key, reuse signing key for content delegation
+            // This is handled by the caller providing the same key
+            unreachable!("signing key is set, so content key resolution should return Some")
+        });
 
         // Phase 1: Collect artifact hashes from inside the build volume.
         let hash_script = self.create_hash_collection_script();
@@ -1002,37 +1029,60 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             runtime_name = self.runtime_name,
         );
 
-        // Generate update authority (root.json) for verified updates
+        // Generate update authority (root.json) for verified updates.
+        // Level 0 (Connect, no signing key): skip — device gets root.json at claim time.
+        // Level 2 (Connect + signing key): multi-key root.json with server key.
+        // Sideload (signing key, no server): single-key root.json.
         let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
-        let project_dir = std::path::Path::new(&self.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let signer = crate::utils::update_signing::resolve_signing_key(
-            signing_key_name.as_deref(),
-            project_dir,
-        )?;
-        let root_json_content = match config.get_server_key_for_runtime(&self.runtime_name) {
-            Some(server_key_hex) => {
-                let keyid = crate::utils::update_signing::compute_key_id_from_hex(&server_key_hex);
+        let server_key = config.get_server_key_for_runtime(&self.runtime_name);
+        let is_connect = config
+            .connect
+            .as_ref()
+            .and_then(|c| c.org.as_ref())
+            .is_some();
+
+        let signer =
+            crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())?;
+
+        let update_authority_section = match (&signer, is_connect) {
+            // Level 0/1: Connect project, no local signing key — device gets root.json at claim time
+            (None, true) => {
                 print_info(
-                    &format!(
-                        "Generating root.json with Connect server key trust (keyid: {}...)",
-                        &keyid[..16]
-                    ),
+                    "Connect Level 0: root.json will be delivered at device claim time",
                     OutputLevel::Normal,
                 );
-                crate::utils::update_signing::generate_multi_key_root_json(
-                    &signer,
-                    &server_key_hex,
-                    1,
-                    3650, // 10-year expiry for Connect-managed devices
-                )?
+                "# Level 0: root.json delivered at claim time (not baked into image)".to_string()
             }
-            None => crate::utils::update_signing::generate_root_json(&signer)?,
-        };
-
-        let update_authority_section = format!(
-            r#"
+            // No signing key, not a Connect project — error
+            (None, false) => {
+                anyhow::bail!(
+                    "No signing key configured. Either:\n\
+                     - Create a key: avocado signing-keys create <name>\n\
+                     - Or connect to a server: avocado connect init"
+                );
+            }
+            // Level 2: user's root key + Connect with server key
+            (Some(signer), true) => {
+                match &server_key {
+                    Some(server_key_hex) => {
+                        let keyid =
+                            crate::utils::update_signing::compute_key_id_from_hex(server_key_hex);
+                        print_info(
+                            &format!(
+                                "Generating root.json with Connect server key trust (keyid: {}...)",
+                                &keyid[..16]
+                            ),
+                            OutputLevel::Normal,
+                        );
+                        let root_json_content =
+                            crate::utils::update_signing::generate_multi_key_root_json(
+                                signer,
+                                server_key_hex,
+                                1,
+                                3650, // 10-year expiry for Connect-managed devices
+                            )?;
+                        format!(
+                            r#"
 # Provision update authority (trust anchor for verified updates)
 mkdir -p "$VAR_DIR/lib/avocado/metadata"
 
@@ -1042,7 +1092,35 @@ ROOT_EOF
 
 cp "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1.root.json"
 echo "Provisioned update authority: metadata/root.json""#
-        );
+                        )
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "Signing key is configured but connect.server_key is missing.\n\
+                             Level 2 requires the server key to build a multi-key root.json.\n\
+                             Run 'avocado connect trust promote-root' to set up Level 2,\n\
+                             or remove signing.key to use Level 0 (server-managed)."
+                        );
+                    }
+                }
+            }
+            // Sideload: user's key for all roles, not a Connect project
+            (Some(signer), false) => {
+                let root_json_content = crate::utils::update_signing::generate_root_json(signer)?;
+                format!(
+                    r#"
+# Provision update authority (trust anchor for verified updates)
+mkdir -p "$VAR_DIR/lib/avocado/metadata"
+
+cat > "$VAR_DIR/lib/avocado/metadata/root.json" <<'ROOT_EOF'
+{root_json_content}
+ROOT_EOF
+
+cp "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1.root.json"
+echo "Provisioned update authority: metadata/root.json""#
+                )
+            }
+        };
 
         // Extension list from runtime config (used by var_files and docker priming)
         let ext_list: Vec<&str> = merged_runtime
@@ -1611,6 +1689,9 @@ mod tests {
 sdk:
   image: "test-image"
 
+connect:
+  org: test
+
 runtimes:
   test-runtime:
     target: "x86_64"
@@ -1649,6 +1730,9 @@ runtimes:
         let config_content = r#"
 sdk:
   image: "test-image"
+
+connect:
+  org: test
 
 runtimes:
   test-runtime:
@@ -1692,6 +1776,9 @@ extensions:
 sdk:
   image: "test-image"
 
+connect:
+  org: test
+
 runtimes:
   test-runtime:
     target: "x86_64"
@@ -1733,6 +1820,9 @@ extensions:
         let config_content = r#"
 sdk:
   image: "test-image"
+
+connect:
+  org: test
 
 runtimes:
   test-runtime:
@@ -1861,6 +1951,9 @@ runtimes:
 sdk:
   image: "test-image"
 
+connect:
+  org: test
+
 distro:
   version: "0.1.0"
 
@@ -1914,6 +2007,9 @@ extensions:
 sdk:
   image: "test-image"
 
+connect:
+  org: test
+
 distro:
   version: "2.0.0"
 
@@ -1950,6 +2046,9 @@ runtimes:
         let config_content = r#"
 sdk:
   image: "test-image"
+
+connect:
+  org: test
 
 runtimes:
   dev:

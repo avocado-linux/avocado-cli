@@ -194,11 +194,37 @@ impl ConnectAuthStatusCommand {
                 println!("API URL: {}", profile.api_url);
                 println!("Token created: {}", profile.created_at);
 
-                // Verify token is still valid
+                // Verify token is still valid and show org memberships
                 print_info("Verifying token...", OutputLevel::Normal);
                 let client = ConnectClient::from_profile(profile)?;
-                match client.get_me().await {
-                    Ok(_) => print_success("Token is valid.", OutputLevel::Normal),
+                match client.get_me_full().await {
+                    Ok(me_full) => {
+                        print_success("Token is valid.", OutputLevel::Normal);
+
+                        if !me_full.organizations.is_empty() {
+                            println!("\nOrganizations:");
+                            // Calculate column widths
+                            let max_slug = me_full
+                                .organizations
+                                .iter()
+                                .map(|o| o.slug.len())
+                                .max()
+                                .unwrap_or(0);
+                            for org in &me_full.organizations {
+                                println!(
+                                    "  {:<width$}  role: {}",
+                                    org.slug,
+                                    org.role,
+                                    width = max_slug
+                                );
+                            }
+                            println!(
+                                "\nTip: Use org slugs with --org (e.g., --org {})",
+                                me_full.organizations[0].slug
+                            );
+                            println!("     or set connect.org in avocado.yaml");
+                        }
+                    }
                     Err(e) => {
                         print_error(&format!("Token may be invalid: {e}"), OutputLevel::Normal)
                     }

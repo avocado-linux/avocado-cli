@@ -296,6 +296,92 @@ fn leading_spaces(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// Set connect fields (org, project, server_key) in avocado.yaml.
+///
+/// If a `connect:` section already exists, updates fields in place.
+/// If no `connect:` section exists, appends one at the end of the file.
+pub fn set_connect_fields(
+    config_path: &Path,
+    org: &str,
+    project: &str,
+    server_key: &str,
+) -> Result<()> {
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+    let new_content = set_connect_fields_in_yaml(&content, org, project, server_key);
+
+    std::fs::write(config_path, &new_content)
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+    Ok(())
+}
+
+fn set_connect_fields_in_yaml(content: &str, org: &str, project: &str, server_key: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Try to find existing `connect:` top-level key
+    let connect_line = lines.iter().enumerate().find(|(_, line)| {
+        let trimmed = line.trim();
+        trimmed.starts_with("connect:") && leading_spaces(line) == 0
+    });
+
+    match connect_line {
+        Some((idx, _)) => {
+            // Found existing connect: section — replace its fields
+            let connect_indent = 2;
+            let mut result_lines: Vec<String> = Vec::with_capacity(lines.len() + 3);
+
+            // Copy lines up to and including `connect:`
+            for line in &lines[..=idx] {
+                result_lines.push(line.to_string());
+            }
+
+            // Skip old connect fields (lines indented deeper than connect:)
+            let mut skip_end = idx + 1;
+            for (i, line) in lines.iter().enumerate().skip(idx + 1) {
+                if line.trim().is_empty() || line.trim().starts_with('#') {
+                    skip_end = i + 1;
+                    continue;
+                }
+                let indent = leading_spaces(line);
+                if indent == 0 {
+                    break;
+                }
+                skip_end = i + 1;
+            }
+
+            // Write new connect fields
+            let indent = " ".repeat(connect_indent);
+            result_lines.push(format!("{indent}org: {org}"));
+            result_lines.push(format!("{indent}project: {project}"));
+            result_lines.push(format!("{indent}server_key: {server_key}"));
+
+            // Copy remaining lines
+            for line in &lines[skip_end..] {
+                result_lines.push(line.to_string());
+            }
+
+            let mut out = result_lines.join("\n");
+            if content.ends_with('\n') && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        }
+        None => {
+            // No connect: section — append one
+            let mut out = content.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "\nconnect:\n  org: {org}\n  project: {project}\n  server_key: {server_key}\n"
+            ));
+            out
+        }
+    }
+}
+
 fn scope_label(scope: &PackageScope) -> String {
     match scope {
         PackageScope::Extension(name) => format!("extension '{name}'"),

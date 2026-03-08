@@ -12,9 +12,23 @@ use commands::clean::CleanCommand;
 use commands::connect::auth::{
     ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
 };
+use commands::connect::claim_tokens::{
+    ConnectClaimTokensCreateCommand, ConnectClaimTokensDeleteCommand, ConnectClaimTokensListCommand,
+};
+use commands::connect::cohorts::{
+    ConnectCohortsCreateCommand, ConnectCohortsDeleteCommand, ConnectCohortsListCommand,
+};
+use commands::connect::devices::{
+    ConnectDevicesCreateCommand, ConnectDevicesDeleteCommand, ConnectDevicesListCommand,
+};
+use commands::connect::init::ConnectInitCommand;
 use commands::connect::keys::{
     ConnectKeysApproveCommand, ConnectKeysListCommand, ConnectKeysRegisterCommand,
     ConnectKeysRetireCommand,
+};
+use commands::connect::orgs::ConnectOrgsListCommand;
+use commands::connect::projects::{
+    ConnectProjectsCreateCommand, ConnectProjectsDeleteCommand, ConnectProjectsListCommand,
 };
 use commands::connect::server_key::ConnectServerKeyCommand;
 use commands::connect::trust::{
@@ -410,9 +424,49 @@ enum ConnectCommands {
         #[command(subcommand)]
         command: ConnectAuthCommands,
     },
+    /// Initialize connect settings in avocado.yaml (org, project, server key)
+    Init {
+        /// Organization slug or ID (skip interactive prompt)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project name or ID (skip interactive prompt)
+        #[arg(long)]
+        project: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Manage organizations
+    Orgs {
+        #[command(subcommand)]
+        command: ConnectOrgsCommands,
+    },
+    /// Manage projects
+    Projects {
+        #[command(subcommand)]
+        command: ConnectProjectsCommands,
+    },
+    /// Manage devices
+    Devices {
+        #[command(subcommand)]
+        command: ConnectDevicesCommands,
+    },
+    /// Manage cohorts
+    Cohorts {
+        #[command(subcommand)]
+        command: ConnectCohortsCommands,
+    },
+    /// Manage claim tokens
+    ClaimTokens {
+        #[command(subcommand)]
+        command: ConnectClaimTokensCommands,
+    },
     /// Upload current runtime build to the Connect platform
     Upload {
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project ID (or set connect.project in avocado.yaml)
@@ -441,7 +495,7 @@ enum ConnectCommands {
     },
     /// Retrieve the Connect server's TUF signing public key
     ServerKey {
-        /// Organization slug (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -467,7 +521,7 @@ enum ConnectCommands {
 enum ConnectTrustCommands {
     /// Show fleet trust status for an organization
     Status {
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -482,7 +536,7 @@ enum ConnectTrustCommands {
         /// Name of the local root signing key to use
         #[arg(long)]
         key: String,
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -497,7 +551,7 @@ enum ConnectTrustCommands {
         /// Name of the local root signing key (required at security level 2)
         #[arg(long)]
         key: Option<String>,
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -519,7 +573,7 @@ enum ConnectKeysCommands {
         /// Name of the local signing key (from 'avocado signing-keys list')
         #[arg(long)]
         key: String,
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -537,7 +591,7 @@ enum ConnectKeysCommands {
         /// User ID whose key to approve
         #[arg(long)]
         user: String,
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -549,7 +603,7 @@ enum ConnectKeysCommands {
     },
     /// List delegate keys registered with the server
     List {
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Filter by key type: content or root
@@ -570,13 +624,246 @@ enum ConnectKeysCommands {
         /// User ID whose staged key to discard
         #[arg(long)]
         user: String,
-        /// Organization ID (or set connect.org in avocado.yaml)
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
         /// Profile name
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectOrgsCommands {
+    /// List organizations you belong to
+    List {
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectProjectsCommands {
+    /// List projects in an organization
+    List {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Create a new project
+    Create {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project name
+        #[arg(long)]
+        name: String,
+        /// Project description
+        #[arg(long)]
+        description: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Delete a project
+    Delete {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID to delete
+        #[arg(long)]
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectDevicesCommands {
+    /// List devices in an organization
+    List {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Create a new device
+    Create {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Device name
+        #[arg(long)]
+        name: String,
+        /// Device identifier (must be unique per org)
+        #[arg(long)]
+        identifier: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Delete a device
+    Delete {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Device ID to delete
+        #[arg(long)]
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectCohortsCommands {
+    /// List cohorts in a project
+    List {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID (or set connect.project in avocado.yaml)
+        #[arg(long)]
+        project: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Create a new cohort
+    Create {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID (or set connect.project in avocado.yaml)
+        #[arg(long)]
+        project: Option<String>,
+        /// Cohort name
+        #[arg(long)]
+        name: String,
+        /// Cohort description
+        #[arg(long)]
+        description: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Delete a cohort
+    Delete {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID (or set connect.project in avocado.yaml)
+        #[arg(long)]
+        project: Option<String>,
+        /// Cohort ID to delete
+        #[arg(long)]
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectClaimTokensCommands {
+    /// List claim tokens in an organization
+    List {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Create a new claim token
+    Create {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Token name
+        #[arg(long)]
+        name: String,
+        /// Cohort ID to assign claimed devices to
+        #[arg(long)]
+        cohort_id: Option<String>,
+        /// Maximum number of times this token can be used
+        #[arg(long)]
+        max_uses: Option<i64>,
+        /// Disable expiration (default: expires in 24h)
+        #[arg(long)]
+        no_expiration: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Delete a claim token
+    Delete {
+        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Claim token ID to delete
+        #[arg(long)]
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
     },
@@ -2126,6 +2413,237 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
             },
+            ConnectCommands::Init {
+                org,
+                project,
+                config,
+                profile,
+            } => {
+                let cmd = ConnectInitCommand {
+                    org,
+                    project,
+                    config_path: config,
+                    profile,
+                };
+                cmd.execute().await?;
+                Ok(())
+            }
+            ConnectCommands::Orgs { command } => match command {
+                ConnectOrgsCommands::List { profile } => {
+                    let cmd = ConnectOrgsListCommand { profile };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::Projects { command } => match command {
+                ConnectProjectsCommands::List {
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectProjectsListCommand {
+                        org: resolved_org,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectProjectsCommands::Create {
+                    org,
+                    name,
+                    description,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectProjectsCreateCommand {
+                        org: resolved_org,
+                        name,
+                        description,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectProjectsCommands::Delete {
+                    org,
+                    id,
+                    yes,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectProjectsDeleteCommand {
+                        org: resolved_org,
+                        id,
+                        yes,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::Devices { command } => match command {
+                ConnectDevicesCommands::List {
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectDevicesListCommand {
+                        org: resolved_org,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectDevicesCommands::Create {
+                    org,
+                    name,
+                    identifier,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectDevicesCreateCommand {
+                        org: resolved_org,
+                        name,
+                        identifier,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectDevicesCommands::Delete {
+                    org,
+                    id,
+                    yes,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectDevicesDeleteCommand {
+                        org: resolved_org,
+                        id,
+                        yes,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::Cohorts { command } => match command {
+                ConnectCohortsCommands::List {
+                    org,
+                    project,
+                    config,
+                    profile,
+                } => {
+                    let (resolved_org, resolved_project) =
+                        commands::connect::resolve_org_and_project(org, project, &config)?;
+                    let cmd = ConnectCohortsListCommand {
+                        org: resolved_org,
+                        project: resolved_project,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectCohortsCommands::Create {
+                    org,
+                    project,
+                    name,
+                    description,
+                    config,
+                    profile,
+                } => {
+                    let (resolved_org, resolved_project) =
+                        commands::connect::resolve_org_and_project(org, project, &config)?;
+                    let cmd = ConnectCohortsCreateCommand {
+                        org: resolved_org,
+                        project: resolved_project,
+                        name,
+                        description,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectCohortsCommands::Delete {
+                    org,
+                    project,
+                    id,
+                    yes,
+                    config,
+                    profile,
+                } => {
+                    let (resolved_org, resolved_project) =
+                        commands::connect::resolve_org_and_project(org, project, &config)?;
+                    let cmd = ConnectCohortsDeleteCommand {
+                        org: resolved_org,
+                        project: resolved_project,
+                        id,
+                        yes,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::ClaimTokens { command } => match command {
+                ConnectClaimTokensCommands::List {
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectClaimTokensListCommand {
+                        org: resolved_org,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectClaimTokensCommands::Create {
+                    org,
+                    name,
+                    cohort_id,
+                    max_uses,
+                    no_expiration,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectClaimTokensCreateCommand {
+                        org: resolved_org,
+                        name,
+                        cohort_id,
+                        max_uses,
+                        no_expiration,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectClaimTokensCommands::Delete {
+                    org,
+                    id,
+                    yes,
+                    config,
+                    profile,
+                } => {
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let cmd = ConnectClaimTokensDeleteCommand {
+                        org: resolved_org,
+                        id,
+                        yes,
+                        profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
             ConnectCommands::Upload {
                 org,
                 project,
@@ -2137,26 +2655,8 @@ async fn main() -> Result<()> {
                 file,
                 profile,
             } => {
-                // Load connect defaults from avocado.yaml if it exists
-                let connect_config = std::path::Path::new(&config)
-                    .exists()
-                    .then(|| crate::utils::config::load_config(&config).ok())
-                    .flatten()
-                    .and_then(|c| c.connect);
-
-                let resolved_org = org
-                    .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                    })?;
-
-                let resolved_project = project
-                    .or_else(|| connect_config.as_ref().and_then(|c| c.project.clone()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--project is required (or set connect.project in {config})"
-                        )
-                    })?;
+                let (resolved_org, resolved_project) =
+                    commands::connect::resolve_org_and_project(org, project, &config)?;
 
                 let cmd = ConnectUploadCommand {
                     org: resolved_org,
@@ -2177,17 +2677,7 @@ async fn main() -> Result<()> {
                 config,
                 profile,
             } => {
-                let connect_config = std::path::Path::new(&config)
-                    .exists()
-                    .then(|| crate::utils::config::load_config(&config).ok())
-                    .flatten()
-                    .and_then(|c| c.connect);
-
-                let resolved_org = org
-                    .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                    })?;
+                let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                 let cmd = ConnectServerKeyCommand {
                     org: resolved_org,
@@ -2204,17 +2694,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectKeysRegisterCommand {
                         org: resolved_org,
@@ -2232,17 +2712,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectKeysApproveCommand {
                         org: resolved_org,
@@ -2259,17 +2729,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectKeysListCommand {
                         org: resolved_org,
@@ -2286,17 +2746,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectKeysRetireCommand {
                         org: resolved_org,
@@ -2314,17 +2764,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectTrustStatusCommand {
                         org: resolved_org,
@@ -2339,17 +2779,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectTrustPromoteRootCommand {
                         key,
@@ -2365,17 +2795,7 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let connect_config = std::path::Path::new(&config)
-                        .exists()
-                        .then(|| crate::utils::config::load_config(&config).ok())
-                        .flatten()
-                        .and_then(|c| c.connect);
-
-                    let resolved_org = org
-                        .or_else(|| connect_config.as_ref().and_then(|c| c.org.clone()))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--org is required (or set connect.org in {config})")
-                        })?;
+                    let resolved_org = commands::connect::resolve_org(org, &config)?;
 
                     let cmd = ConnectTrustRotateServerKeyCommand {
                         key,

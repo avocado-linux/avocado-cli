@@ -84,6 +84,20 @@ pub struct MeResponse {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrgInfo {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub role: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MeFullResponse {
+    pub user: MeResponse,
+    pub organizations: Vec<OrgInfo>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CsrfResponse {
     pub csrf_token: String,
@@ -102,6 +116,107 @@ pub struct ServerKeyResponse {
 #[derive(Debug, Deserialize)]
 struct ServerKeyWrapper {
     data: ServerKeyResponse,
+}
+
+// ---------------------------------------------------------------------------
+// Resource listing response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DeviceInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub identifier: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub cohort_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CohortInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ClaimTokenInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub cohort_id: Option<String>,
+    #[serde(default)]
+    pub max_uses: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Resource CRUD request types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct CreateProjectRequest {
+    pub project: CreateProjectParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateProjectParams {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateDeviceRequest {
+    pub device: CreateDeviceParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateDeviceParams {
+    pub name: String,
+    pub identifier: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateCohortRequest {
+    pub cohort: CreateCohortParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateCohortParams {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateClaimTokenRequest {
+    pub claim_token: CreateClaimTokenParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateClaimTokenParams {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cohort_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    /// Set to a far-future date for no expiration, or omit for default (24h).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +404,7 @@ impl ConnectClient {
     }
 
     /// Verify auth by calling GET /api/me.
+    #[allow(dead_code)]
     pub async fn get_me(&self) -> Result<MeResponse> {
         let res = self
             .http
@@ -310,6 +426,362 @@ impl ConnectClient {
             .context("Response missing data.user")?;
         let me: MeResponse = serde_json::from_value(user_val)?;
         Ok(me)
+    }
+
+    /// Fetch full user info including organizations from GET /api/me.
+    pub async fn get_me_full(&self) -> Result<MeFullResponse> {
+        let res = self
+            .http
+            .get(format!("{}/api/me", self.api_url))
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to connect to API")?;
+
+        if !res.status().is_success() {
+            anyhow::bail!("Auth check failed (HTTP {})", res.status());
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").context("Response missing data")?;
+
+        let user_val = data
+            .get("user")
+            .cloned()
+            .context("Response missing data.user")?;
+        let user: MeResponse = serde_json::from_value(user_val)?;
+
+        let orgs_val = data
+            .get("organizations")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let organizations: Vec<OrgInfo> = serde_json::from_value(orgs_val)?;
+
+        Ok(MeFullResponse {
+            user,
+            organizations,
+        })
+    }
+
+    /// List projects for an organization.
+    pub async fn list_projects(&self, org: &str) -> Result<Vec<ProjectInfo>> {
+        let url = format!("{}/api/orgs/{}/projects", self.api_url, org);
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list projects")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list projects (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let projects: Vec<ProjectInfo> = serde_json::from_value(data)?;
+        Ok(projects)
+    }
+
+    /// List devices for an organization.
+    pub async fn list_devices(&self, org: &str) -> Result<Vec<DeviceInfo>> {
+        let url = format!("{}/api/orgs/{}/devices", self.api_url, org);
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list devices")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list devices (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let devices: Vec<DeviceInfo> = serde_json::from_value(data)?;
+        Ok(devices)
+    }
+
+    /// List cohorts for an organization's project.
+    pub async fn list_cohorts(&self, org: &str, project: &str) -> Result<Vec<CohortInfo>> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/cohorts",
+            self.api_url, org, project
+        );
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list cohorts")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list cohorts (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let cohorts: Vec<CohortInfo> = serde_json::from_value(data)?;
+        Ok(cohorts)
+    }
+
+    /// List claim tokens for an organization.
+    pub async fn list_claim_tokens(&self, org: &str) -> Result<Vec<ClaimTokenInfo>> {
+        let url = format!("{}/api/orgs/{}/claim_tokens", self.api_url, org);
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list claim tokens")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list claim tokens (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let tokens: Vec<ClaimTokenInfo> = serde_json::from_value(data)?;
+        Ok(tokens)
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource create/delete methods
+    // -----------------------------------------------------------------------
+
+    /// Create a project in an organization.
+    pub async fn create_project(
+        &self,
+        org: &str,
+        req: &CreateProjectRequest,
+    ) -> Result<ProjectInfo> {
+        let url = format!("{}/api/orgs/{}/projects", self.api_url, org);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create project")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create project (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().context("Response missing data")?;
+        let project: ProjectInfo = serde_json::from_value(data)?;
+        Ok(project)
+    }
+
+    /// Delete a project.
+    pub async fn delete_project(&self, org: &str, project_id: &str) -> Result<()> {
+        let url = format!("{}/api/orgs/{}/projects/{}", self.api_url, org, project_id);
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to delete project")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete project (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// Create a device in an organization.
+    pub async fn create_device(&self, org: &str, req: &CreateDeviceRequest) -> Result<DeviceInfo> {
+        let url = format!("{}/api/orgs/{}/devices", self.api_url, org);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create device")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create device (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().context("Response missing data")?;
+        let device: DeviceInfo = serde_json::from_value(data)?;
+        Ok(device)
+    }
+
+    /// Delete a device.
+    pub async fn delete_device(&self, org: &str, device_id: &str) -> Result<()> {
+        let url = format!("{}/api/orgs/{}/devices/{}", self.api_url, org, device_id);
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to delete device")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete device (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// Create a cohort in a project.
+    pub async fn create_cohort(
+        &self,
+        org: &str,
+        project: &str,
+        req: &CreateCohortRequest,
+    ) -> Result<CohortInfo> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/cohorts",
+            self.api_url, org, project
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create cohort")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create cohort (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().context("Response missing data")?;
+        let cohort: CohortInfo = serde_json::from_value(data)?;
+        Ok(cohort)
+    }
+
+    /// Delete a cohort.
+    pub async fn delete_cohort(&self, org: &str, project: &str, cohort_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/cohorts/{}",
+            self.api_url, org, project, cohort_id
+        );
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to delete cohort")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete cohort (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// Create a claim token.
+    pub async fn create_claim_token(
+        &self,
+        org: &str,
+        req: &CreateClaimTokenRequest,
+    ) -> Result<ClaimTokenInfo> {
+        let url = format!("{}/api/orgs/{}/claim_tokens", self.api_url, org);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create claim token")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create claim token (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().context("Response missing data")?;
+        let token: ClaimTokenInfo = serde_json::from_value(data)?;
+        Ok(token)
+    }
+
+    /// Delete a claim token.
+    pub async fn delete_claim_token(&self, org: &str, token_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/orgs/{}/claim_tokens/{}",
+            self.api_url, org, token_id
+        );
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to delete claim token")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete claim token (HTTP {status}): {body}");
+        }
+
+        Ok(())
     }
 
     /// Step 1: Create a runtime record with artifact metadata.

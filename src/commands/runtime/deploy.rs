@@ -252,15 +252,23 @@ impl RuntimeDeployCommand {
             .parent()
             .unwrap_or(std::path::Path::new("."));
 
-        let signer = crate::utils::update_signing::resolve_signing_key(
-            signing_key_name.as_deref(),
-            project_dir,
-        )?;
+        let signer =
+            crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No signing key configured. Sideload deploy requires a signing key.\n\
+             Run 'avocado signing-keys create <name>' and set 'signing.key' in avocado.yaml."
+                    )
+                })?;
         let content_signer = crate::utils::update_signing::resolve_content_key(
             content_key_name.as_deref(),
             signing_key_name.as_deref(),
-            project_dir,
-        )?;
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No content signing key resolved. This should not happen when signing.key is set."
+            )
+        })?;
 
         let repo_metadata = update_repo::generate_repo_metadata(
             &collection.targets,

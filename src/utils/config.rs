@@ -2404,7 +2404,6 @@ impl Config {
     ///
     /// Returns Some(key_name) if the runtime has a content_key configured,
     /// None if not set (caller should fall back to the signing key or auto-generate).
-    #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_content_key_name(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
         runtime_config.signing.as_ref()?.content_key.clone()

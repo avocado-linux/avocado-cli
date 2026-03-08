@@ -51,7 +51,11 @@ impl ConnectUploadCommand {
         let (_name, profile) = config.resolve_profile(self.profile.as_deref())?;
         let connect = ConnectClient::from_profile(profile)?;
 
-        // 2. When exporting from Docker, validate that the runtime has been built
+        // 2. Load project config (needed for prerequisite checks and content key detection)
+        let project_config =
+            load_config(&self.config_path).context("Failed to load avocado.yaml")?;
+
+        // 3. When exporting from Docker, validate that the runtime has been built
         //    before attempting anything. Skip when --file is provided (user manages state).
         if self.file.is_none() {
             let target = self
@@ -59,8 +63,6 @@ impl ConnectUploadCommand {
                 .clone()
                 .or_else(|| std::env::var("AVOCADO_TARGET").ok())
                 .context("No target specified. Set AVOCADO_TARGET or use --target.")?;
-            let project_config =
-                load_config(&self.config_path).context("Failed to load avocado.yaml")?;
             let container_image = project_config
                 .get_sdk_image()
                 .context("No SDK container image specified in configuration")?;
@@ -89,9 +91,22 @@ impl ConnectUploadCommand {
             );
         }
 
-        // 6. Read delegation info from the exported build volume (required).
-        let delegation = read_delegation_info(&artifacts_dir)
-            .context("No TUF delegation files found in build volume. Run 'avocado build' with signing keys configured to generate them.")?;
+        // 6. Read delegation info from build volume.
+        // Only send delegation fields if the runtime has an explicit content_key configured
+        // (Level 1+). At Level 0 (server-managed), the server handles targets signing and
+        // expects these fields to be absent.
+        let has_content_key = project_config
+            .get_runtime_content_key_name(&self.runtime)
+            .is_some();
+
+        let delegation = if has_content_key {
+            let d = read_delegation_info(&artifacts_dir)
+                .context("No TUF delegation files found in build volume. A content_key is configured — run 'avocado build' first.")?;
+            Some(d)
+        } else {
+            // Level 0: delegation files may exist (for sideload) but the server doesn't need them
+            None
+        };
 
         // 7. Create runtime (Step 1)
         print_info(
@@ -110,9 +125,11 @@ impl ConnectUploadCommand {
                         size_bytes: a.size_bytes,
                     })
                     .collect(),
-                delegated_targets_json: Some(delegation.delegated_targets_json.clone()),
-                content_key_hex: Some(delegation.content_key_hex.clone()),
-                content_keyid: Some(delegation.content_keyid.clone()),
+                delegated_targets_json: delegation
+                    .as_ref()
+                    .map(|d| d.delegated_targets_json.clone()),
+                content_key_hex: delegation.as_ref().map(|d| d.content_key_hex.clone()),
+                content_keyid: delegation.as_ref().map(|d| d.content_keyid.clone()),
             },
         };
         let runtime = connect
