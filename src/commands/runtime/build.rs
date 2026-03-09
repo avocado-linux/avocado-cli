@@ -594,13 +594,6 @@ if [ -z "$RUNTIME_UUID" ]; then
     exit 1
 fi
 
-# Read root.json
-ROOT_JSON_FILE="$VAR_STAGING/lib/avocado/metadata/root.json"
-if [ ! -f "$ROOT_JSON_FILE" ]; then
-    echo "ERROR: No root.json found at $ROOT_JSON_FILE" >&2
-    exit 1
-fi
-
 # Start building JSON output
 echo -n '{{"targets":['
 
@@ -627,11 +620,16 @@ if [ -d "$IMAGES_DIR" ]; then
     done
 fi
 
-# Read and escape root.json for embedding
-ROOT_JSON_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$ROOT_JSON_FILE")
+echo -n ']'
 
-echo -n '],"root_json":'
-echo -n "$ROOT_JSON_ESCAPED"
+# Include root.json if present (Level 2 / Sideload). Absent at Level 1.
+ROOT_JSON_FILE="$VAR_STAGING/lib/avocado/metadata/root.json"
+if [ -f "$ROOT_JSON_FILE" ]; then
+    ROOT_JSON_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$ROOT_JSON_FILE")
+    echo -n ',"root_json":'
+    echo -n "$ROOT_JSON_ESCAPED"
+fi
+
 echo -n ',"runtime_uuid":"'"$RUNTIME_UUID"'"'
 echo -n '}}'
 "#,
@@ -664,30 +662,65 @@ echo -n '}}'
             .and_then(|c| c.org.as_ref())
             .is_some();
 
-        let signer =
+        let mut resolved_signing_key_name = signing_key_name.clone();
+        let mut signer =
             crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())?;
 
-        // Level 0: no signing key, Connect project — server manages TUF, skip staging
+        // Determine build level based on key configuration:
+        // - Level 0: Connect project, no signing key, no content key → server manages everything
+        // - Level 1: Connect project, content key only → CLI signs delegation, server signs rest
+        // - Level 2: Connect project, signing key (+ optional content key) → CLI signs everything
+        // - Sideload: no Connect, auto-generate dev key if needed
+        let content_signer = crate::utils::update_signing::resolve_content_key(
+            content_key_name.as_deref(),
+            None, // Don't fall back to signing key yet — check Level 1 first
+        )?;
+
+        if let (None, Some(content_signer)) = (&signer, content_signer) {
+            if is_connect {
+                // Level 1: content key only, server manages root/targets/snapshot/timestamp
+                print_info(
+                    "Connect Level 1: generating content delegation (server manages root signing)",
+                    OutputLevel::Normal,
+                );
+                return self
+                    .run_content_only_staging(
+                        config,
+                        container_image,
+                        target_arch,
+                        merged_container_args,
+                        repo_url,
+                        repo_release,
+                        container_helper,
+                        runs_on_context,
+                        project_dir,
+                        &content_signer,
+                    )
+                    .await;
+            }
+        }
+
         if signer.is_none() {
             if is_connect {
+                // Level 0: no signing key, no content key — server manages everything
                 print_info(
                     "Connect Level 0: skipping TUF staging (server manages signing)",
                     OutputLevel::Normal,
                 );
                 return Ok(());
             } else {
-                anyhow::bail!(
-                    "No signing key configured. Either:\n\
-                     - Create a key: avocado signing-keys create <name>\n\
-                     - Or connect to a server: avocado connect init"
-                );
+                // Auto-generate a development signing key for local builds
+                let dev_key_name = crate::utils::signing_keys::ensure_dev_signing_key()?;
+                signer = crate::utils::update_signing::resolve_signing_key(Some(&dev_key_name))?;
+                resolved_signing_key_name = Some(dev_key_name);
             }
         }
         let signer = signer.unwrap();
 
+        // Level 2 or Sideload: resolve content signer (falls back to signing key)
         let content_signer = crate::utils::update_signing::resolve_content_key(
             content_key_name.as_deref(),
-            signing_key_name.as_deref(),
+            resolved_signing_key_name.as_deref(),
         )?
         .unwrap_or_else(|| {
             // Sideload: no content key, reuse signing key for content delegation
@@ -775,6 +808,106 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         print_info(
             &format!(
                 "Generated deployment delegation staging for runtime '{}'.",
+                self.runtime_name
+            ),
+            OutputLevel::Normal,
+        );
+
+        Ok(())
+    }
+
+    /// Level 1: generate only the content delegation metadata (no root/snapshot/timestamp).
+    /// The server manages those roles; the CLI only signs the delegated-targets file.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_content_only_staging(
+        &self,
+        _config: &crate::utils::config::Config,
+        container_image: &str,
+        target_arch: &str,
+        merged_container_args: &Option<Vec<String>>,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        container_helper: &SdkContainer,
+        runs_on_context: Option<&RunsOnContext>,
+        project_dir: &std::path::Path,
+        content_signer: &crate::utils::update_signing::TufSigner,
+    ) -> Result<()> {
+        // Phase 1: Collect artifact hashes from inside the build volume.
+        let hash_script = self.create_hash_collection_script();
+        let hash_run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command: hash_script,
+            verbose: false,
+            source_environment: true,
+            interactive: false,
+            container_args: merged_container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        let hash_output =
+            run_container_command_with_output(container_helper, hash_run_config, runs_on_context)
+                .await?
+                .context("Hash collection script produced no output")?;
+
+        let collection: update_repo::HashCollectionOutput =
+            serde_json::from_str(&hash_output).context("Failed to parse hash collection output")?;
+
+        // Phase 2: Generate content-only metadata (delegation + unsigned targets carrier).
+        let metadata = update_repo::generate_content_only_metadata(
+            &collection.targets,
+            &collection.runtime_uuid,
+            content_signer,
+        )?;
+
+        // Phase 3: Write files into the build volume.
+        let tmp_dir = project_dir.join(".tuf-staging-tmp");
+        let tmp_delegations = tmp_dir.join("delegations");
+        std::fs::create_dir_all(&tmp_delegations)
+            .context("Failed to create TUF staging temp directory")?;
+
+        std::fs::write(tmp_dir.join("targets.json"), &metadata.targets_json)
+            .context("Failed to write targets.json to temp dir")?;
+        std::fs::write(
+            tmp_delegations.join(format!("runtime-{}.json", collection.runtime_uuid)),
+            &metadata.delegated_targets_json,
+        )
+        .context("Failed to write delegated targets to temp dir")?;
+
+        let runtime_name = &self.runtime_name;
+        let runtime_uuid = &collection.runtime_uuid;
+        let copy_script = format!(
+            r#"set -euo pipefail
+DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
+mkdir -p "$DEST/delegations"
+cp /opt/src/.tuf-staging-tmp/targets.json "$DEST/targets.json"
+cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
+   "$DEST/delegations/runtime-{runtime_uuid}.json"
+"#
+        );
+
+        let copy_run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command: copy_script,
+            verbose: false,
+            source_environment: true,
+            interactive: false,
+            container_args: merged_container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            ..Default::default()
+        };
+        run_container_command(container_helper, copy_run_config, runs_on_context).await?;
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        print_info(
+            &format!(
+                "Generated content delegation staging for runtime '{}' (Level 1).",
                 self.runtime_name
             ),
             OutputLevel::Normal,
@@ -919,9 +1052,10 @@ fi"#
         let build_id = uuid::Uuid::new_v4().to_string();
         let built_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-        let distro_version = config
-            .get_distro_version()
-            .unwrap_or_else(|| "unknown".to_string());
+        // Runtime version: use runtimes.<name>.version if declared, otherwise short UUID
+        let runtime_version = config
+            .get_runtime_version(&self.runtime_name)
+            .unwrap_or_else(|| build_id[..8].to_string());
 
         // Build "name:version" pairs for dynamic manifest generation.
         // The shell script will compute SHA-256 + UUIDv5 image IDs at build time.
@@ -957,7 +1091,7 @@ IMAGES_DIR="$VAR_DIR/lib/avocado/images"
 mkdir -p "$IMAGES_DIR"
 BUILD_ID="{build_id}"
 BUILT_AT="{built_at}"
-DISTRO_VERSION="{distro_version}"
+RUNTIME_VERSION="{runtime_version}"
 MANIFEST_DIR="$VAR_DIR/lib/avocado/runtimes/$BUILD_ID"
 mkdir -p "$MANIFEST_DIR"
 
@@ -968,7 +1102,7 @@ export AVOCADO_MANIFEST_PATH="$MANIFEST_DIR/manifest.json"
 export AVOCADO_BUILD_ID="$BUILD_ID"
 export AVOCADO_BUILT_AT="$BUILT_AT"
 export AVOCADO_RUNTIME_NAME="{runtime_name}"
-export AVOCADO_DISTRO_VERSION="$DISTRO_VERSION"
+export AVOCADO_RUNTIME_VERSION="$RUNTIME_VERSION"
 export AVOCADO_EXT_PAIRS="{ext_info_str}"
 
 echo "Computing content-addressable image IDs..."
@@ -982,7 +1116,7 @@ manifest_path = os.environ["AVOCADO_MANIFEST_PATH"]
 build_id = os.environ["AVOCADO_BUILD_ID"]
 built_at = os.environ["AVOCADO_BUILT_AT"]
 runtime_name = os.environ["AVOCADO_RUNTIME_NAME"]
-distro_version = os.environ["AVOCADO_DISTRO_VERSION"]
+runtime_version = os.environ["AVOCADO_RUNTIME_VERSION"]
 ext_pairs_str = os.environ.get("AVOCADO_EXT_PAIRS", "")
 
 ext_pairs = ext_pairs_str.split() if ext_pairs_str else []
@@ -1006,7 +1140,7 @@ manifest = dict(
     manifest_version=1,
     id=build_id,
     built_at=built_at,
-    runtime=dict(name=runtime_name, version=distro_version),
+    runtime=dict(name=runtime_name, version=runtime_version),
     extensions=extensions,
 )
 
@@ -1041,8 +1175,14 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             .and_then(|c| c.org.as_ref())
             .is_some();
 
-        let signer =
+        let mut signer =
             crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())?;
+
+        // Auto-generate a development signing key if none configured and not a Connect project
+        if signer.is_none() && !is_connect {
+            let dev_key_name = crate::utils::signing_keys::ensure_dev_signing_key()?;
+            signer = crate::utils::update_signing::resolve_signing_key(Some(&dev_key_name))?;
+        }
 
         let update_authority_section = match (&signer, is_connect) {
             // Level 0/1: Connect project, no local signing key — device gets root.json at claim time
@@ -1052,14 +1192,6 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                     OutputLevel::Normal,
                 );
                 "# Level 0: root.json delivered at claim time (not baked into image)".to_string()
-            }
-            // No signing key, not a Connect project — error
-            (None, false) => {
-                anyhow::bail!(
-                    "No signing key configured. Either:\n\
-                     - Create a key: avocado signing-keys create <name>\n\
-                     - Or connect to a server: avocado connect init"
-                );
             }
             // Level 2: user's root key + Connect with server key
             (Some(signer), true) => {
@@ -1120,6 +1252,8 @@ cp "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1.ro
 echo "Provisioned update authority: metadata/root.json""#
                 )
             }
+            // Unreachable: handled above by auto-generating a dev signing key
+            (None, false) => unreachable!("dev signing key should have been auto-generated above"),
         };
 
         // Extension list from runtime config (used by var_files and docker priming)
@@ -2035,7 +2169,7 @@ runtimes:
             .unwrap();
 
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"empty-runtime\""));
-        assert!(script.contains("AVOCADO_DISTRO_VERSION=\"$DISTRO_VERSION\""));
+        assert!(script.contains("AVOCADO_RUNTIME_VERSION=\"$RUNTIME_VERSION\""));
         assert!(script.contains("AVOCADO_EXT_PAIRS=\"\""));
         assert!(script.contains("ln -sfn \"runtimes/"));
     }

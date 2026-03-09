@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -31,6 +32,7 @@ struct ArtifactInfo {
     image_id: String,
     path: PathBuf,
     size_bytes: u64,
+    sha256: String,
 }
 
 impl TaskPrerequisites for ConnectUploadCommand {
@@ -73,12 +75,16 @@ impl ConnectUploadCommand {
         // 3. Get artifacts on disk (export from Docker or use --file)
         let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir().await?;
 
-        // 4. Read manifest and derive version
+        // 4. Read manifest and derive version + build_id
         let manifest = read_manifest(&artifacts_dir)?;
         let version = self
             .version
             .clone()
             .unwrap_or_else(|| format_version_from_manifest(&manifest));
+        let build_id = manifest
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         // 5. Discover artifacts from manifest (no hashing needed — image_id is the dedup key)
         print_info("Discovering artifacts...", OutputLevel::Normal);
@@ -116,6 +122,7 @@ impl ConnectUploadCommand {
         let create_req = CreateRuntimeRequest {
             runtime: RuntimeParams {
                 version: version.clone(),
+                build_id,
                 description: self.description.clone(),
                 manifest: Some(manifest),
                 artifacts: artifact_infos
@@ -123,6 +130,7 @@ impl ConnectUploadCommand {
                     .map(|a| ArtifactParam {
                         image_id: a.image_id.clone(),
                         size_bytes: a.size_bytes,
+                        sha256: a.sha256.clone(),
                     })
                     .collect(),
                 delegated_targets_json: delegation
@@ -369,11 +377,12 @@ fn format_version_from_manifest(manifest: &serde_json::Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Artifact discovery (manifest-driven, no hashing)
+// Artifact discovery (manifest-driven, with SHA256 hashing for TUF)
 // ---------------------------------------------------------------------------
 
 /// Discover artifacts from the manifest's extensions list.
 /// Each extension has an `image_id` that maps to a `{image_id}.raw` file on disk.
+/// Computes SHA256 of each artifact for TUF target metadata.
 fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<ArtifactInfo>> {
     let images_dir = dir.join("lib/avocado/images");
 
@@ -403,10 +412,14 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
             .with_context(|| format!("Failed to stat {}", path.display()))?
             .len();
 
+        let sha256 =
+            compute_sha256(&path).with_context(|| format!("Failed to hash {}", path.display()))?;
+
         artifacts.push(ArtifactInfo {
             image_id: image_id.to_string(),
             path,
             size_bytes,
+            sha256,
         });
     }
 
@@ -415,6 +428,21 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
     }
 
     Ok(artifacts)
+}
+
+fn compute_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 // ---------------------------------------------------------------------------

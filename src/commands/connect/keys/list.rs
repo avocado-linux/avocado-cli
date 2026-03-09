@@ -27,10 +27,10 @@ impl ConnectKeysListCommand {
 
         // Print header
         println!(
-            "{:<12} {:<10} {:<10} {:<40} {:<24}",
+            "{:<12} {:<10} {:<10} {:<66} {:<24}",
             "TYPE", "STATUS", "USER", "KEYID", "ACTIVATED"
         );
-        println!("{}", "-".repeat(96));
+        println!("{}", "-".repeat(122));
 
         for key in &keys {
             let user = key
@@ -39,15 +39,10 @@ impl ConnectKeysListCommand {
                 .map(|u| &u[..8.min(u.len())])
                 .unwrap_or("-");
             let activated = key.activated_at.as_deref().unwrap_or("-");
-            let keyid_short = &key.keyid[..16.min(key.keyid.len())];
 
             println!(
-                "{:<12} {:<10} {:<10} {:<40} {:<24}",
-                key.key_type,
-                key.status,
-                user,
-                format!("{keyid_short}..."),
-                activated
+                "{:<12} {:<10} {:<10} {:<66} {:<24}",
+                key.key_type, key.status, user, &key.keyid, activated
             );
         }
 

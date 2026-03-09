@@ -252,23 +252,23 @@ impl RuntimeDeployCommand {
             .parent()
             .unwrap_or(std::path::Path::new("."));
 
+        let mut resolved_signing_key_name = signing_key_name.clone();
         let signer =
-            crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No signing key configured. Sideload deploy requires a signing key.\n\
-             Run 'avocado signing-keys create <name>' and set 'signing.key' in avocado.yaml."
-                    )
-                })?;
+            match crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())? {
+                Some(s) => s,
+                None => {
+                    // Auto-generate a development signing key for local deploys
+                    let dev_key_name = crate::utils::signing_keys::ensure_dev_signing_key()?;
+                    resolved_signing_key_name = Some(dev_key_name.clone());
+                    crate::utils::update_signing::resolve_signing_key(Some(&dev_key_name))?
+                        .expect("dev signing key was just created")
+                }
+            };
         let content_signer = crate::utils::update_signing::resolve_content_key(
             content_key_name.as_deref(),
-            signing_key_name.as_deref(),
+            resolved_signing_key_name.as_deref(),
         )?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No content signing key resolved. This should not happen when signing.key is set."
-            )
-        })?;
+        .expect("signing key is set, so content key resolution should return Some");
 
         let repo_metadata = update_repo::generate_repo_metadata(
             &collection.targets,
@@ -301,8 +301,10 @@ impl RuntimeDeployCommand {
             &repo_metadata.timestamp_json,
         )
         .context("Failed to write timestamp.json")?;
-        std::fs::write(staging_dir.join("root.json"), &collection.root_json)
-            .context("Failed to write root.json to staging")?;
+        if let Some(root_json) = &collection.root_json {
+            std::fs::write(staging_dir.join("root.json"), root_json)
+                .context("Failed to write root.json to staging")?;
+        }
         std::fs::write(
             delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
             &repo_metadata.delegated_targets_json,

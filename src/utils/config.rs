@@ -324,8 +324,10 @@ pub enum ConfigError {
 /// Signing configuration for runtime
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SigningConfig {
-    /// Name of the signing key to use (references a key from signing_keys section)
-    pub key: String,
+    /// Name of the signing key to use (references a key from signing_keys section).
+    /// Required for Level 2 (user-controlled root). Optional at Level 1 (content-only).
+    #[serde(default)]
+    pub key: Option<String>,
     /// Checksum algorithm to use (sha256 or blake3, defaults to sha256)
     #[serde(default = "default_checksum_algorithm")]
     pub checksum_algorithm: String,
@@ -388,6 +390,9 @@ impl KernelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub target: Option<String>,
+    /// Optional human-readable version label for this runtime (e.g. "1.0.0").
+    /// When omitted, a short UUID is generated at build time.
+    pub version: Option<String>,
     pub dependencies: Option<HashMap<String, serde_yaml::Value>>,
     pub stone_include_paths: Option<Vec<String>>,
     pub stone_manifest: Option<String>,
@@ -2392,12 +2397,19 @@ impl Config {
 
     /// Get the declared signing key name for a runtime (without resolving it).
     ///
+    /// Get the declared version for a runtime, if any.
+    /// Returns None if the runtime doesn't exist or has no version field.
+    pub fn get_runtime_version(&self, runtime_name: &str) -> Option<String> {
+        let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
+        runtime_config.version.clone()
+    }
+
     /// Returns Some(key_name) if the runtime has a signing configuration declared,
     /// None if the runtime doesn't exist or has no signing section.
     #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_signing_key_name(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
-        Some(runtime_config.signing.as_ref()?.key.clone())
+        runtime_config.signing.as_ref()?.key.clone()
     }
 
     /// Get the declared content key name for a runtime (for signing delegated-targets only).
@@ -2434,7 +2446,7 @@ impl Config {
     #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_signing_key(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
-        let signing_key_name = &runtime_config.signing.as_ref()?.key;
+        let signing_key_name = runtime_config.signing.as_ref()?.key.as_ref()?;
 
         // First, check the local signing_keys mapping
         if let Some(key_ref) = self.get_signing_key_id(signing_key_name) {
@@ -6971,21 +6983,21 @@ runtimes:
         let runtime = config.runtimes.as_ref().unwrap().get("dev").unwrap();
         assert!(runtime.signing.is_some());
         let signing = runtime.signing.as_ref().unwrap();
-        assert_eq!(signing.key, "my-production-key");
+        assert_eq!(signing.key.as_deref(), Some("my-production-key"));
         assert_eq!(signing.checksum_algorithm, "sha256");
 
         // Test production runtime with blake3
         let production = config.runtimes.as_ref().unwrap().get("production").unwrap();
         assert!(production.signing.is_some());
         let prod_signing = production.signing.as_ref().unwrap();
-        assert_eq!(prod_signing.key, "backup-key");
+        assert_eq!(prod_signing.key.as_deref(), Some("backup-key"));
         assert_eq!(prod_signing.checksum_algorithm, "blake3");
 
         // Test staging runtime with default checksum_algorithm
         let staging = config.runtimes.as_ref().unwrap().get("staging").unwrap();
         assert!(staging.signing.is_some());
         let staging_signing = staging.signing.as_ref().unwrap();
-        assert_eq!(staging_signing.key, "my-production-key");
+        assert_eq!(staging_signing.key.as_deref(), Some("my-production-key"));
         assert_eq!(staging_signing.checksum_algorithm, "sha256"); // Default
     }
 

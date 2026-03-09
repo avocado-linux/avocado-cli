@@ -232,6 +232,8 @@ pub struct CreateRuntimeRequest {
 pub struct RuntimeParams {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<serde_json::Value>,
@@ -248,6 +250,7 @@ pub struct RuntimeParams {
 pub struct ArtifactParam {
     pub image_id: String,
     pub size_bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -944,8 +947,7 @@ pub struct RegisterDelegateKeyRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ApproveDelegateKeyRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_type: Option<String>,
+    pub keyid: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,13 +1007,9 @@ impl ConnectClient {
     pub async fn approve_delegate_key(
         &self,
         org: &str,
-        user_id: &str,
         req: &ApproveDelegateKeyRequest,
     ) -> Result<DelegateKeyData> {
-        let url = format!(
-            "{}/api/orgs/{}/signing/keys/{}/approve",
-            self.api_url, org, user_id
-        );
+        let url = format!("{}/api/orgs/{}/signing/keys/approve", self.api_url, org);
 
         let res = self
             .http
@@ -1061,20 +1059,12 @@ impl ConnectClient {
         Ok(resp.data)
     }
 
-    /// Discard a staged delegate key.
-    pub async fn discard_staged_key(
-        &self,
-        org: &str,
-        user_id: &str,
-        key_type: Option<&str>,
-    ) -> Result<()> {
-        let mut url = format!(
-            "{}/api/orgs/{}/signing/keys/{}/staged",
-            self.api_url, org, user_id
+    /// Discard a staged delegate key by keyid.
+    pub async fn discard_staged_key(&self, org: &str, keyid: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/orgs/{}/signing/keys/staged?keyid={}",
+            self.api_url, org, keyid
         );
-        if let Some(kt) = key_type {
-            url.push_str(&format!("?key_type={kt}"));
-        }
 
         let res = self
             .http

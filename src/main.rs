@@ -585,12 +585,8 @@ enum ConnectKeysCommands {
     },
     /// Approve a staged delegate key (admin only)
     Approve {
-        /// Key type: content or root
-        #[arg(long = "type")]
-        key_type: String,
-        /// User ID whose key to approve
-        #[arg(long)]
-        user: String,
+        /// Key ID of the staged key to approve
+        keyid: String,
         /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
@@ -618,12 +614,8 @@ enum ConnectKeysCommands {
     },
     /// Discard a staged delegate key
     Retire {
-        /// Key type: content or root
-        #[arg(long = "type")]
-        key_type: String,
-        /// User ID whose staged key to discard
-        #[arg(long)]
-        user: String,
+        /// Key ID of the staged key to discard
+        keyid: String,
         /// Organization slug or ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
@@ -2706,8 +2698,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConnectKeysCommands::Approve {
-                    key_type,
-                    user,
+                    keyid,
                     org,
                     config,
                     profile,
@@ -2716,8 +2707,7 @@ async fn main() -> Result<()> {
 
                     let cmd = ConnectKeysApproveCommand {
                         org: resolved_org,
-                        user_id: user,
-                        key_type,
+                        keyid,
                         profile,
                     };
                     cmd.execute().await?;
@@ -2740,8 +2730,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ConnectKeysCommands::Retire {
-                    key_type,
-                    user,
+                    keyid,
                     org,
                     config,
                     profile,
@@ -2750,8 +2739,7 @@ async fn main() -> Result<()> {
 
                     let cmd = ConnectKeysRetireCommand {
                         org: resolved_org,
-                        user_id: user,
-                        key_type,
+                        keyid,
                         profile,
                     };
                     cmd.execute().await?;

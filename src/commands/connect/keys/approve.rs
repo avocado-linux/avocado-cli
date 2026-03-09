@@ -5,18 +5,14 @@ use crate::utils::output::{print_info, print_success, OutputLevel};
 
 pub struct ConnectKeysApproveCommand {
     pub org: String,
-    pub user_id: String,
-    pub key_type: String,
+    pub keyid: String,
     pub profile: Option<String>,
 }
 
 impl ConnectKeysApproveCommand {
     pub async fn execute(&self) -> Result<()> {
         print_info(
-            &format!(
-                "Approving {} key for user {} in org {}...",
-                self.key_type, self.user_id, self.org
-            ),
+            &format!("Approving key {} in org {}...", self.keyid, self.org),
             OutputLevel::Normal,
         );
 
@@ -28,9 +24,8 @@ impl ConnectKeysApproveCommand {
         let result = connect
             .approve_delegate_key(
                 &self.org,
-                &self.user_id,
                 &ApproveDelegateKeyRequest {
-                    key_type: Some(self.key_type.clone()),
+                    keyid: self.keyid.clone(),
                 },
             )
             .await?;

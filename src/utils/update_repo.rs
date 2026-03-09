@@ -32,6 +32,36 @@ pub struct RepoMetadata {
     pub delegated_targets_json: String,
 }
 
+/// Level 1 (content-only) metadata: delegated-targets signed by content key,
+/// plus an unsigned targets.json carrier with delegation info for upload to read.
+pub struct ContentOnlyMetadata {
+    /// Unsigned targets.json with delegation keys/roles (read by upload to extract content key info)
+    pub targets_json: String,
+    /// Delegated-targets metadata signed by the content key
+    pub delegated_targets_json: String,
+}
+
+/// Generate Level 1 metadata: only the content delegation, no root/snapshot/timestamp.
+///
+/// The server manages targets/snapshot/timestamp signing. The CLI only produces:
+/// - `delegated_targets_json`: lists target files, signed by `content_signer`
+/// - `targets_json`: unsigned carrier with delegation structure (so upload can extract content key info)
+pub fn generate_content_only_metadata(
+    targets: &[TargetFileInfo],
+    runtime_uuid: &str,
+    content_signer: &TufSigner,
+) -> Result<ContentOnlyMetadata> {
+    let delegated_targets_json =
+        generate_delegated_targets_json(runtime_uuid, targets, content_signer)?;
+
+    let targets_json = generate_unsigned_targets_json(runtime_uuid, content_signer)?;
+
+    Ok(ContentOnlyMetadata {
+        targets_json,
+        delegated_targets_json,
+    })
+}
+
 /// Generate all TUF metadata files using the delegated targets format.
 ///
 /// - `targets.json`: empty inline targets, contains a delegation entry for `runtime-<uuid>`
@@ -149,6 +179,51 @@ fn generate_targets_json(
     sign_metadata(&signed, signer)
 }
 
+/// Generate an unsigned `targets.json` with delegation structure.
+/// Used at Level 1 where the server signs targets.json, but the CLI needs to
+/// record the content key info so upload can read it.
+fn generate_unsigned_targets_json(
+    runtime_uuid: &str,
+    content_signer: &TufSigner,
+) -> Result<String> {
+    let expires = chrono::Utc::now() + chrono::Duration::days(365 * 5);
+    let expires_str = expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let signed: serde_json::Value = serde_json::json!({
+        "_type": "targets",
+        "expires": expires_str,
+        "spec_version": "1.0.0",
+        "targets": {},
+        "delegations": {
+            "keys": {
+                &content_signer.key_id: {
+                    "keytype": "ed25519",
+                    "keyval": { "public": &content_signer.public_key_hex },
+                    "scheme": "ed25519"
+                }
+            },
+            "roles": [
+                {
+                    "name": format!("runtime-{runtime_uuid}"),
+                    "keyids": [&content_signer.key_id],
+                    "threshold": 1,
+                    "paths": ["manifest.json", "*.raw"],
+                    "terminating": true
+                }
+            ]
+        },
+        "version": 1
+    });
+
+    // Wrap in TUF envelope format (unsigned — signatures array is empty)
+    let envelope = serde_json::json!({
+        "signed": signed,
+        "signatures": []
+    });
+
+    serde_json::to_string_pretty(&envelope).context("Failed to serialize unsigned targets.json")
+}
+
 /// Generate `snapshot.json` covering both `targets.json` and the delegation file.
 fn generate_snapshot_json(
     targets_json: &str,
@@ -251,7 +326,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Deserialize)]
 pub struct HashCollectionOutput {
     pub targets: Vec<TargetFileInfo>,
-    pub root_json: String,
+    /// root.json content. Present at Level 2 / Sideload, absent at Level 1.
+    #[serde(default)]
+    pub root_json: Option<String>,
     /// UUID of the active runtime (from the `runtimes/<uuid>` symlink target)
     pub runtime_uuid: String,
 }
@@ -608,5 +685,94 @@ mod tests {
             uuid::Uuid::parse_str(&id).is_ok(),
             "image_id must be a valid UUID"
         );
+    }
+
+    #[test]
+    fn test_generate_content_only_metadata_valid_json() {
+        let content_signer = test_signer();
+        let targets = vec![
+            TargetFileInfo {
+                name: "manifest.json".to_string(),
+                sha256: "abcd1234".repeat(8),
+                size: 512,
+            },
+            TargetFileInfo {
+                name: "app-0.1.0.raw".to_string(),
+                sha256: "ef567890".repeat(8),
+                size: 1048576,
+            },
+        ];
+
+        let metadata =
+            generate_content_only_metadata(&targets, TEST_UUID, &content_signer).unwrap();
+
+        // delegated_targets_json should be signed by content key
+        let delegated: serde_json::Value =
+            serde_json::from_str(&metadata.delegated_targets_json).unwrap();
+        assert_eq!(delegated["signed"]["_type"], "targets");
+        let del_targets = delegated["signed"]["targets"].as_object().unwrap();
+        assert_eq!(del_targets.len(), 2);
+        assert!(!delegated["signatures"].as_array().unwrap().is_empty());
+
+        // targets.json should be unsigned (empty signatures) with delegation info
+        let targets_parsed: serde_json::Value =
+            serde_json::from_str(&metadata.targets_json).unwrap();
+        assert_eq!(targets_parsed["signed"]["_type"], "targets");
+        assert!(
+            targets_parsed["signatures"].as_array().unwrap().is_empty(),
+            "Level 1 targets.json must be unsigned"
+        );
+
+        // Should have delegation structure with content key info
+        let delegations = &targets_parsed["signed"]["delegations"];
+        assert!(delegations["keys"].is_object());
+        let keys = delegations["keys"].as_object().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains_key(&content_signer.key_id));
+
+        let roles = delegations["roles"].as_array().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0]["name"], format!("runtime-{TEST_UUID}"));
+    }
+
+    #[test]
+    fn test_content_only_metadata_readable_by_upload() {
+        // Verify that the upload's read_delegation_info logic can extract
+        // content key info from Level 1 unsigned targets.json
+        let content_signer = test_signer();
+        let targets = vec![TargetFileInfo {
+            name: "manifest.json".to_string(),
+            sha256: "abcd1234".repeat(8),
+            size: 512,
+        }];
+
+        let metadata =
+            generate_content_only_metadata(&targets, TEST_UUID, &content_signer).unwrap();
+
+        // Simulate what upload's read_delegation_info does:
+        let targets_parsed: serde_json::Value =
+            serde_json::from_str(&metadata.targets_json).unwrap();
+        let delegations = &targets_parsed["signed"]["delegations"];
+
+        // Extract role name
+        let roles = delegations["roles"].as_array().unwrap();
+        let role = &roles[0];
+        let role_name = role["name"].as_str().unwrap();
+        assert!(role_name.starts_with("runtime-"));
+
+        // Extract content keyid
+        let content_keyid = role["keyids"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(content_keyid, content_signer.key_id);
+
+        // Extract content key hex
+        let content_key_hex = delegations
+            .pointer(&format!("/keys/{content_keyid}/keyval/public"))
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(content_key_hex, content_signer.public_key_hex);
     }
 }

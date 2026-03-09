@@ -197,6 +197,43 @@ pub fn save_keypair(
     Ok(base_path)
 }
 
+/// Name used for the auto-generated development signing key.
+const DEV_SIGNING_KEY_NAME: &str = "dev-signing-key";
+
+/// Ensure a development signing key exists, creating one if necessary.
+///
+/// Checks the global registry for a key named "dev-signing-key". If it doesn't
+/// exist, generates a new ed25519 keypair and registers it. Returns the key name.
+pub fn ensure_dev_signing_key() -> Result<String> {
+    let mut registry = KeysRegistry::load()?;
+
+    if registry.get_key(DEV_SIGNING_KEY_NAME).is_some() {
+        return Ok(DEV_SIGNING_KEY_NAME.to_string());
+    }
+
+    let (signing_key, verifying_key) = generate_keypair();
+    let keyid = generate_keyid(&verifying_key);
+    let key_path = save_keypair(&keyid, &signing_key, &verifying_key)?;
+    let uri = path_to_file_uri(&key_path);
+
+    let entry = KeyEntry {
+        keyid,
+        algorithm: "ed25519".to_string(),
+        created_at: chrono::Utc::now(),
+        uri,
+    };
+
+    registry.add_key(DEV_SIGNING_KEY_NAME.to_string(), entry)?;
+    registry.save()?;
+
+    println!(
+        "Auto-generated development signing key '{DEV_SIGNING_KEY_NAME}'. \
+         This key is for local development only."
+    );
+
+    Ok(DEV_SIGNING_KEY_NAME.to_string())
+}
+
 /// Delete key files from disk
 pub fn delete_key_files(keyid: &str) -> Result<()> {
     let base_path = get_key_file_path(keyid)?;
