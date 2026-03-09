@@ -29,6 +29,8 @@ pub enum SysrootType {
     Sdk(String),
     /// Rootfs sysroot ($AVOCADO_PREFIX/rootfs)
     Rootfs,
+    /// Initramfs sysroot ($AVOCADO_PREFIX/initramfs)
+    Initramfs,
     /// Target sysroot ($AVOCADO_PREFIX/sdk/target-sysroot)
     TargetSysroot,
     /// Extension sysroot ($AVOCADO_EXT_SYSROOTS/{name})
@@ -61,6 +63,11 @@ impl SysrootType {
                 rpm_etcconfigdir: None,
                 rpm_configdir: None,
                 root_path: Some("$AVOCADO_PREFIX/rootfs".to_string()),
+            },
+            SysrootType::Initramfs => RpmQueryConfig {
+                rpm_etcconfigdir: None,
+                rpm_configdir: None,
+                root_path: Some("$AVOCADO_PREFIX/initramfs".to_string()),
             },
             SysrootType::TargetSysroot => RpmQueryConfig {
                 // Target-sysroot: same approach as rootfs - unset config and use --root
@@ -202,6 +209,10 @@ pub struct TargetLocks {
     /// Rootfs packages (shared across all host architectures)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rootfs: PackageVersions,
+
+    /// Initramfs packages (shared across all host architectures)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub initramfs: PackageVersions,
 
     /// Target-sysroot packages (shared across all host architectures)
     #[serde(
@@ -528,6 +539,7 @@ impl LockFile {
                 .get(arch)
                 .and_then(|pkgs| pkgs.get(package)),
             SysrootType::Rootfs => target_locks.rootfs.get(package),
+            SysrootType::Initramfs => target_locks.initramfs.get(package),
             SysrootType::TargetSysroot => target_locks.target_sysroot.get(package),
             SysrootType::Extension(name) => target_locks
                 .extensions
@@ -554,6 +566,7 @@ impl LockFile {
         let packages = match sysroot {
             SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
             SysrootType::Rootfs => &mut target_locks.rootfs,
+            SysrootType::Initramfs => &mut target_locks.initramfs,
             SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
             SysrootType::Extension(name) => {
                 &mut target_locks
@@ -580,6 +593,7 @@ impl LockFile {
         let packages = match sysroot {
             SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
             SysrootType::Rootfs => &mut target_locks.rootfs,
+            SysrootType::Initramfs => &mut target_locks.initramfs,
             SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
             SysrootType::Extension(name) => {
                 &mut target_locks
@@ -609,6 +623,7 @@ impl LockFile {
         let result = match sysroot {
             SysrootType::Sdk(arch) => target_locks.sdk.get(arch),
             SysrootType::Rootfs => Some(&target_locks.rootfs),
+            SysrootType::Initramfs => Some(&target_locks.initramfs),
             SysrootType::TargetSysroot => Some(&target_locks.target_sysroot),
             SysrootType::Extension(name) => {
                 target_locks.extensions.get(name).map(|ext| &ext.packages)
@@ -626,6 +641,7 @@ impl LockFile {
             || self.targets.values().all(|target_locks| {
                 target_locks.sdk.is_empty()
                     && target_locks.rootfs.is_empty()
+                    && target_locks.initramfs.is_empty()
                     && target_locks.target_sysroot.is_empty()
                     && extensions_are_empty(&target_locks.extensions)
                     && target_locks.runtimes.is_empty()
@@ -711,6 +727,7 @@ impl LockFile {
         let pkg_map = match sysroot {
             SysrootType::Sdk(arch) => target_locks.sdk.get_mut(arch),
             SysrootType::Rootfs => Some(&mut target_locks.rootfs),
+            SysrootType::Initramfs => Some(&mut target_locks.initramfs),
             SysrootType::TargetSysroot => Some(&mut target_locks.target_sysroot),
             SysrootType::Extension(name) => target_locks
                 .extensions

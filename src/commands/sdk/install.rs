@@ -446,7 +446,7 @@ chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/grep
 # Create symlinks for common scriptlet commands that should noop
 # Allowlist approach: we create wrappers for what we DON'T want, not for what we DO want
 for cmd in useradd groupadd usermod groupmod userdel groupdel chown chmod chgrp \
-           flock systemctl systemd-tmpfiles ldconfig depmod udevadm \
+           flock systemd-tmpfiles udevadm \
            dbus-send killall service update-rc.d invoke-rc.d \
            gtk-update-icon-cache glib-compile-schemas update-desktop-database \
            fc-cache mkfontdir mkfontscale install-info update-mime-database \
@@ -459,6 +459,242 @@ for cmd in useradd groupadd usermod groupmod userdel groupdel chown chmod chgrp 
            bbnote bbfatal bbwarn bbdebug; do
     ln -sf noop-command $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/$cmd
 done
+
+# Create depmod wrapper that operates against the installroot sysroot
+# Only runs when AVOCADO_SYSROOT_SCRIPTS=1 (set for rootfs/initramfs installs,
+# NOT for extension installs where depmod is unnecessary)
+cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/depmod << 'DEPMOD_EOF'
+#!/bin/bash
+# depmod wrapper for sysroot installs
+# Only active for rootfs/initramfs (AVOCADO_SYSROOT_SCRIPTS=1), noop for extensions
+if [ "$AVOCADO_SYSROOT_SCRIPTS" = "1" ] && [ -n "$AVOCADO_EXT_INSTALLROOT" ]; then
+    # Extract kernel version from arguments (last non-flag argument)
+    KVER=""
+    ARGS=()
+    for arg in "$@"; do
+        case "$arg" in
+            -*) ARGS+=("$arg") ;;
+            *)  KVER="$arg" ;;
+        esac
+    done
+    if [ -z "$KVER" ]; then
+        KVER=$(ls "$AVOCADO_EXT_INSTALLROOT/usr/lib/modules/" 2>/dev/null | head -n 1)
+    fi
+    if [ -n "$KVER" ] && [ -d "$AVOCADO_EXT_INSTALLROOT/usr/lib/modules/$KVER" ]; then
+        exec /sbin/depmod "${ARGS[@]}" -b "$AVOCADO_EXT_INSTALLROOT" "$KVER"
+    fi
+fi
+exit 0
+DEPMOD_EOF
+chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/depmod
+
+# ldconfig is noop'd during install — ldconfig -r requires chroot which doesn't
+# work cross-arch. Instead, ldconfig is run during the rootfs/initramfs build step
+# against the work copy so ld.so.cache is baked into the final image.
+ln -sf noop-command $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/ldconfig
+
+# Create systemctl wrapper that handles enable/disable/preset for sysroot installs.
+# Only active for rootfs/initramfs (AVOCADO_SYSROOT_SCRIPTS=1), noop for extensions.
+# This is a minimal offline implementation (like Yocto's systemd-systemctl-native)
+# because the SDK's systemctl has hardcoded sysconfdir paths that break --root.
+cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl << 'SYSTEMCTL_EOF'
+#!/bin/bash
+# Minimal offline systemctl for sysroot enable/disable/preset operations.
+# Parses [Install] sections and creates symlinks directly — no running systemd needed.
+
+ROOT=""
+ACTION=""
+UNITS=()
+PRESET_MODE=""
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root=*) ROOT="${1#--root=}" ;;
+        --root) shift; ROOT="$1" ;;
+        --preset-mode=*) PRESET_MODE="${1#--preset-mode=}" ;;
+        --no-block|--no-reload|--force|-f|--now) ;; # ignore
+        enable|disable|preset|preset-all|mask|unmask|daemon-reload|restart|start|stop|reload|is-enabled)
+            ACTION="$1" ;;
+        -*) ;; # ignore unknown flags
+        *) UNITS+=("$1") ;;
+    esac
+    shift
+done
+
+# For scriptlet calls, use AVOCADO_EXT_INSTALLROOT as root if --root not given
+if [ "$AVOCADO_SYSROOT_SCRIPTS" = "1" ] && [ -z "$ROOT" ] && [ -n "$AVOCADO_EXT_INSTALLROOT" ]; then
+    ROOT="$AVOCADO_EXT_INSTALLROOT"
+fi
+
+# Noop for actions we don't handle offline, or if no root is set
+case "$ACTION" in
+    enable|disable|preset|preset-all|mask|unmask) ;;
+    *) exit 0 ;;
+esac
+
+[ -z "$ROOT" ] && exit 0
+
+UNIT_DIR="$ROOT/usr/lib/systemd/system"
+ETC_DIR="$ROOT/etc/systemd/system"
+
+# Parse WantedBy/RequiredBy/Alias from a unit file's [Install] section
+parse_install_section() {
+    local unit_file="$1"
+    local key="$2"
+    [ -f "$unit_file" ] || return
+    local in_install=false
+    while IFS= read -r line; do
+        line="${line%%#*}"  # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
+        [ -z "$line" ] && continue
+        case "$line" in
+            \[Install\]*) in_install=true; continue ;;
+            \[*) in_install=false; continue ;;
+        esac
+        if $in_install; then
+            case "$line" in
+                ${key}=*)
+                    local val="${line#*=}"
+                    val="${val#"${val%%[![:space:]]*}"}"
+                    echo "$val"
+                    ;;
+            esac
+        fi
+    done < "$unit_file"
+}
+
+do_enable() {
+    local unit="$1"
+    local unit_file="$UNIT_DIR/$unit"
+    [ -f "$unit_file" ] || return 0
+
+    # Process WantedBy
+    for target in $(parse_install_section "$unit_file" "WantedBy"); do
+        local wants_dir="$ETC_DIR/${target}.wants"
+        mkdir -p "$wants_dir"
+        ln -sf "/usr/lib/systemd/system/$unit" "$wants_dir/$unit"
+    done
+
+    # Process RequiredBy
+    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
+        local requires_dir="$ETC_DIR/${target}.requires"
+        mkdir -p "$requires_dir"
+        ln -sf "/usr/lib/systemd/system/$unit" "$requires_dir/$unit"
+    done
+
+    # Process Alias
+    for alias in $(parse_install_section "$unit_file" "Alias"); do
+        ln -sf "/usr/lib/systemd/system/$unit" "$ETC_DIR/$alias"
+    done
+
+    # Process Also (recursive enable)
+    for also in $(parse_install_section "$unit_file" "Also"); do
+        do_enable "$also"
+    done
+}
+
+do_disable() {
+    local unit="$1"
+    local unit_file="$UNIT_DIR/$unit"
+    [ -f "$unit_file" ] || return 0
+
+    for target in $(parse_install_section "$unit_file" "WantedBy"); do
+        rm -f "$ETC_DIR/${target}.wants/$unit"
+    done
+    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
+        rm -f "$ETC_DIR/${target}.requires/$unit"
+    done
+    for alias in $(parse_install_section "$unit_file" "Alias"); do
+        rm -f "$ETC_DIR/$alias"
+    done
+}
+
+do_mask() {
+    local unit="$1"
+    ln -sf /dev/null "$ETC_DIR/$unit"
+}
+
+do_unmask() {
+    local unit="$1"
+    local link="$ETC_DIR/$unit"
+    [ -L "$link" ] && [ "$(readlink "$link")" = "/dev/null" ] && rm -f "$link"
+}
+
+# Load preset rules: returns lines like "enable <pattern>" or "disable <pattern>"
+load_presets() {
+    local preset_dirs=("$ROOT/etc/systemd/system-preset" "$ROOT/usr/lib/systemd/system-preset")
+    # In initrd mode, also check initrd-preset
+    if [ -f "$ROOT/etc/initrd-release" ]; then
+        preset_dirs=("$ROOT/usr/lib/systemd/initrd-preset" "${preset_dirs[@]}")
+    fi
+    for dir in "${preset_dirs[@]}"; do
+        [ -d "$dir" ] || continue
+        for f in $(ls "$dir"/*.preset 2>/dev/null | sort); do
+            while IFS= read -r line; do
+                line="${line%%#*}"
+                line="${line#"${line%%[![:space:]]*}"}"
+                [ -z "$line" ] && continue
+                echo "$line"
+            done < "$f"
+        done
+    done
+}
+
+check_preset() {
+    local unit="$1"
+    local rules
+    rules=$(load_presets)
+    while IFS= read -r rule; do
+        local action pattern
+        action="${rule%% *}"
+        pattern="${rule#* }"
+        pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+        [ -z "$pattern" ] && continue
+        # fnmatch-style: check if unit matches pattern
+        case "$unit" in
+            $pattern) echo "$action"; return ;;
+        esac
+    done <<< "$rules"
+    # Default: enable
+    echo "enable"
+}
+
+case "$ACTION" in
+    enable)
+        for unit in "${UNITS[@]}"; do do_enable "$unit"; done ;;
+    disable)
+        for unit in "${UNITS[@]}"; do do_disable "$unit"; done ;;
+    mask)
+        for unit in "${UNITS[@]}"; do do_mask "$unit"; done ;;
+    unmask)
+        for unit in "${UNITS[@]}"; do do_unmask "$unit"; done ;;
+    preset)
+        for unit in "${UNITS[@]}"; do
+            result=$(check_preset "$unit")
+            if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
+                do_enable "$unit"
+            elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
+                do_disable "$unit"
+            fi
+        done ;;
+    preset-all)
+        if [ -d "$UNIT_DIR" ]; then
+            for unit_file in "$UNIT_DIR"/*.service "$UNIT_DIR"/*.socket "$UNIT_DIR"/*.timer "$UNIT_DIR"/*.path "$UNIT_DIR"/*.target; do
+                [ -f "$unit_file" ] || continue
+                unit="$(basename "$unit_file")"
+                result=$(check_preset "$unit")
+                if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
+                    do_enable "$unit"
+                elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
+                    do_disable "$unit"
+                fi
+            done
+        fi ;;
+esac
+exit 0
+SYSTEMCTL_EOF
+chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl
 
 # Create shell wrapper for scriptlet interpreter
 cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh << 'SHELL_EOF'
@@ -904,10 +1140,20 @@ $DNF_SDK_HOST \
         }
 
         // Install rootfs sysroot — repo scoping via --releasever, lock file pins exact version
+        // Read rootfs packages from top-level config (defaults to avocado-pkg-rootfs if absent)
         print_info("Installing rootfs sysroot.", OutputLevel::Normal);
 
-        let rootfs_base_pkg = "avocado-pkg-rootfs";
-        let rootfs_config_version = "*";
+        let rootfs_packages = config.get_rootfs_packages();
+        let rootfs_base_pkg = rootfs_packages
+            .keys()
+            .next()
+            .map(|s| s.as_str())
+            .unwrap_or("avocado-pkg-rootfs");
+        let rootfs_config_version = rootfs_packages
+            .values()
+            .next()
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
         let rootfs_pkg = build_package_spec_with_lock(
             &lock_file,
             target,
@@ -925,8 +1171,20 @@ $DNF_SDK_HOST \
 
         let rootfs_command = format!(
             r#"
+# Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
+# resolve /lib/modules, /sbin, /bin paths within the sysroot
+mkdir -p $AVOCADO_PREFIX/rootfs/usr/bin $AVOCADO_PREFIX/rootfs/usr/sbin $AVOCADO_PREFIX/rootfs/usr/lib
+ln -sfn usr/bin $AVOCADO_PREFIX/rootfs/bin
+ln -sfn usr/sbin $AVOCADO_PREFIX/rootfs/sbin
+ln -sfn usr/lib $AVOCADO_PREFIX/rootfs/lib
+
+RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/rootfs \
+AVOCADO_SYSROOT_SCRIPTS=1 \
+PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-$DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/rootfs install {rootfs_pkg}
 "#
         );
@@ -986,6 +1244,106 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         } else {
             return Err(anyhow::anyhow!("Failed to install rootfs sysroot."));
+        }
+
+        // Install initramfs sysroot — parallel to rootfs, defaults to avocado-pkg-initramfs
+        print_info("Installing initramfs sysroot.", OutputLevel::Normal);
+
+        let initramfs_packages = config.get_initramfs_packages();
+        let initramfs_base_pkg = initramfs_packages
+            .keys()
+            .next()
+            .map(|s| s.as_str())
+            .unwrap_or("avocado-pkg-initramfs");
+        let initramfs_config_version = initramfs_packages
+            .values()
+            .next()
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+        let initramfs_pkg = build_package_spec_with_lock(
+            &lock_file,
+            target,
+            &SysrootType::Initramfs,
+            initramfs_base_pkg,
+            initramfs_config_version,
+        );
+
+        let initramfs_command = format!(
+            r#"
+# Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
+# resolve /lib/modules, /sbin, /bin paths within the sysroot
+mkdir -p $AVOCADO_PREFIX/initramfs/usr/bin $AVOCADO_PREFIX/initramfs/usr/sbin $AVOCADO_PREFIX/initramfs/usr/lib
+ln -sfn usr/bin $AVOCADO_PREFIX/initramfs/bin
+ln -sfn usr/sbin $AVOCADO_PREFIX/initramfs/sbin
+ln -sfn usr/lib $AVOCADO_PREFIX/initramfs/lib
+
+RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/initramfs \
+AVOCADO_SYSROOT_SCRIPTS=1 \
+PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
+    {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/initramfs install {initramfs_pkg}
+"#
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: initramfs_command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: !self.force,
+            repo_url: repo_url.map(|s| s.to_string()),
+            repo_release: repo_release.map(|s| s.to_string()),
+            container_args: merged_container_args.cloned(),
+            dnf_args: self.dnf_args.clone(),
+            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+            ..Default::default()
+        };
+
+        let initramfs_success = run_container_command(
+            container_helper,
+            run_config,
+            runs_on_context,
+            self.sdk_arch.as_ref(),
+        )
+        .await?;
+
+        if initramfs_success {
+            print_success("Installed initramfs sysroot.", OutputLevel::Normal);
+
+            let installed_versions = container_helper
+                .query_installed_packages(
+                    &SysrootType::Initramfs,
+                    &[initramfs_base_pkg.to_string()],
+                    container_image,
+                    target,
+                    repo_url.map(|s| s.to_string()),
+                    repo_release.map(|s| s.to_string()),
+                    merged_container_args.cloned(),
+                    runs_on_context,
+                    self.sdk_arch.as_ref(),
+                )
+                .await?;
+
+            if !installed_versions.is_empty() {
+                lock_file.update_sysroot_versions(
+                    target,
+                    &SysrootType::Initramfs,
+                    installed_versions,
+                );
+                if self.verbose {
+                    print_info(
+                        "Updated lock file with initramfs package version.",
+                        OutputLevel::Normal,
+                    );
+                }
+                lock_file.save(&src_dir)?;
+            }
+        } else {
+            return Err(anyhow::anyhow!("Failed to install initramfs sysroot."));
         }
 
         // Install target-sysroot if there are compile sections referenced by active extensions.

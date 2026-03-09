@@ -159,7 +159,8 @@ impl SdkCleanCommand {
             );
         }
 
-        let remove_command = "rm -rf $AVOCADO_SDK_PREFIX";
+        let remove_command =
+            "rm -rf $AVOCADO_SDK_PREFIX $AVOCADO_PREFIX/rootfs $AVOCADO_PREFIX/initramfs";
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.clone(),

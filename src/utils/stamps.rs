@@ -784,6 +784,26 @@ pub fn compute_sdk_input_hash(config: &serde_yaml::Value) -> Result<StampInputs>
         }
     }
 
+    // Include rootfs.packages (affects rootfs sysroot installed during sdk install)
+    if let Some(rootfs) = config.get("rootfs") {
+        if let Some(packages) = rootfs.get("packages") {
+            hash_data.insert(
+                serde_yaml::Value::String("rootfs.packages".to_string()),
+                packages.clone(),
+            );
+        }
+    }
+
+    // Include initramfs.packages (affects initramfs sysroot installed during sdk install)
+    if let Some(initramfs) = config.get("initramfs") {
+        if let Some(packages) = initramfs.get("packages") {
+            hash_data.insert(
+                serde_yaml::Value::String("initramfs.packages".to_string()),
+                packages.clone(),
+            );
+        }
+    }
+
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }

@@ -1467,11 +1467,141 @@ echo "Docker image priming complete.""#,
             }
         };
 
+        let rootfs_build_section = format!(
+            r#"
+# Build rootfs image from shared sysroot
+ROOTFS_SYSROOT="$AVOCADO_PREFIX/rootfs"
+if [ -d "$ROOTFS_SYSROOT/usr" ]; then
+    echo "Building rootfs image from packages..."
+
+    # Work on a copy so we don't mutate the shared sysroot used for extension priming
+    ROOTFS_WORK="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/rootfs-work"
+    rm -rf "$ROOTFS_WORK"
+    cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
+
+    # Create usrmerge symlinks (Yocto image class does this, not any RPM package)
+    ln -sfn usr/bin "$ROOTFS_WORK/bin"
+    ln -sfn usr/sbin "$ROOTFS_WORK/sbin"
+    ln -sfn usr/lib "$ROOTFS_WORK/lib"
+
+    # Post-processing (matches Yocto avocado-image-rootfs.bb)
+    rm -rf "$ROOTFS_WORK/media" "$ROOTFS_WORK/mnt" "$ROOTFS_WORK/srv"
+    rm -rf "$ROOTFS_WORK/boot/"*
+    mkdir -p "$ROOTFS_WORK/opt"
+
+    # Create empty /etc/machine-id for stateless systemd on read-only rootfs.
+    # systemd will bind-mount a transient machine-id at boot.
+    # (matches OE read_only_rootfs_hook in rootfs-postcommands.bbclass)
+    touch "$ROOTFS_WORK/etc/machine-id"
+
+    # Enable systemd service units via preset files.
+    # (matches OE systemd_preset_all in image.bbclass)
+    if [ -e "$ROOTFS_WORK/usr/lib/systemd/systemd" ]; then
+        "$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl" --root="$ROOTFS_WORK" --preset-mode=enable-only preset-all 2>/dev/null || true
+        echo "Applied systemd presets"
+    fi
+
+    # Generate ld.so.cache so the read-only rootfs has a working linker cache.
+    # Uses the container's host-native ldconfig with -r (chroot flag).
+    # ldconfig -r does chroot() but continues as the host binary — no binfmt needed.
+    # This matches Yocto's ldconfig-native approach.
+    /usr/sbin/ldconfig -r "$ROOTFS_WORK" -c new -X 2>/dev/null || true
+    echo "Generated ld.so.cache"
+
+    # Compute deterministic AVOCADO_OS_BUILD_ID from installed packages
+    PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | sort)
+    PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
+    OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH'))")
+
+    # Inject identity into os-release (in the work copy only)
+    echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_WORK/usr/lib/os-release"
+    echo "AVOCADO_RUNTIME_NAME=$RUNTIME_NAME" >> "$ROOTFS_WORK/usr/lib/os-release"
+    echo "AVOCADO_RUNTIME_VERSION=$RUNTIME_VERSION" >> "$ROOTFS_WORK/usr/lib/os-release"
+
+    # Build erofs image (reproducible flags matching ext/image.rs)
+    ROOTFS_OUTPUT="$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.erofs-lz4"
+    mkfs.erofs \
+        -T "${{SOURCE_DATE_EPOCH:-0}}" \
+        -U 00000000-0000-0000-0000-000000000000 \
+        -x -1 \
+        --all-root \
+        -z lz4hc \
+        "$ROOTFS_OUTPUT" \
+        "$ROOTFS_WORK"
+
+    rm -rf "$ROOTFS_WORK"
+    export AVOCADO_ROOTFS_IMAGE="$ROOTFS_OUTPUT"
+    export AVOCADO_OS_BUILD_ID="$OS_BUILD_ID"
+    echo "Built rootfs: $ROOTFS_OUTPUT (AVOCADO_OS_BUILD_ID=$OS_BUILD_ID)"
+else
+    echo "No rootfs sysroot found — skipping rootfs image build."
+fi"#,
+            namespace_uuid = namespace_uuid,
+        );
+
+        let initramfs_build_section = format!(
+            r#"
+# Build initramfs image from shared sysroot
+INITRAMFS_SYSROOT="$AVOCADO_PREFIX/initramfs"
+if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
+    echo "Building initramfs image from packages..."
+
+    INITRAMFS_WORK="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/initramfs-work"
+    rm -rf "$INITRAMFS_WORK"
+    cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
+
+    # Create usrmerge symlinks (Yocto image class does this, not any RPM package)
+    ln -sfn usr/bin "$INITRAMFS_WORK/bin"
+    ln -sfn usr/sbin "$INITRAMFS_WORK/sbin"
+    ln -sfn usr/lib "$INITRAMFS_WORK/lib"
+
+    # Post-processing (matches Yocto avocado-image-initramfs.bb)
+    rm -rf "$INITRAMFS_WORK/media" "$INITRAMFS_WORK/mnt" "$INITRAMFS_WORK/srv"
+    rm -rf "$INITRAMFS_WORK/boot/"*
+    mkdir -p "$INITRAMFS_WORK/sysroot"
+    mkdir -p "$INITRAMFS_WORK/opt"
+
+    # Compute deterministic build ID for initramfs
+    INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | sort)
+    INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
+    INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH'))")
+
+    # Inject identity into os-release-initrd (if it exists in the sysroot)
+    if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
+        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
+    fi
+
+    # Create /init symlink so the kernel can find the init process in the initramfs.
+    # (matches OE IMAGE_CMD:cpio in image_types.bbclass — creates /init -> /sbin/init)
+    if [ ! -L "$INITRAMFS_WORK/init" ] && [ ! -e "$INITRAMFS_WORK/init" ]; then
+        if [ -L "$INITRAMFS_WORK/sbin/init" ] || [ -e "$INITRAMFS_WORK/sbin/init" ]; then
+            ln -sf /sbin/init "$INITRAMFS_WORK/init"
+            echo "Created /init -> /sbin/init symlink"
+        else
+            echo "WARNING: /sbin/init not found in initramfs — kernel may not find init"
+        fi
+    fi
+
+    # Build cpio archive (zstd compressed)
+    INITRAMFS_OUTPUT="$OUTPUT_DIR/avocado-image-initramfs-$TARGET_ARCH.cpio.zst"
+    (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | zstd -3 -f -o "$INITRAMFS_OUTPUT")
+
+    rm -rf "$INITRAMFS_WORK"
+    export AVOCADO_INITRAMFS_IMAGE="$INITRAMFS_OUTPUT"
+    export AVOCADO_INITRAMFS_BUILD_ID="$INITRAMFS_BUILD_ID"
+    echo "Built initramfs: $INITRAMFS_OUTPUT"
+else
+    echo "No initramfs sysroot found — skipping initramfs image build."
+fi"#,
+            namespace_uuid = namespace_uuid,
+        );
+
         let script = format!(
             r#"
 # Set common variables
 RUNTIME_NAME="{runtime_name}"
 TARGET_ARCH="{target_arch}"
+RUNTIME_VERSION="{runtime_version}"
 
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/images"
@@ -1491,26 +1621,32 @@ rm -f "$RUNTIME_EXT_DIR"/*.raw 2>/dev/null || true
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
 {copy_section}
+
+# Build rootfs and initramfs images from package sysroots
+{rootfs_build_section}
+{initramfs_build_section}
+
+# Assemble var partition content
 {var_files_section}
 {runtime_var_files_section}
 {manifest_section}
 {update_authority_section}
 {docker_section}
 
-# Potential future SDK target hook.
-# echo "Run: avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME"
-# avocado-pre-image-var-$TARGET_ARCH $RUNTIME_NAME
-
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado \
     -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 
+# Run SDK lifecycle hook (stone create) — uses newly built rootfs + initramfs + var
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
 avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
             runtime_name = self.runtime_name,
             target_arch = target_arch,
+            runtime_version = runtime_version,
             copy_section = copy_section,
+            rootfs_build_section = rootfs_build_section,
+            initramfs_build_section = initramfs_build_section,
             var_files_section = var_files_section,
             runtime_var_files_section = runtime_var_files_section,
             manifest_section = manifest_section,

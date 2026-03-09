@@ -242,6 +242,8 @@ mod tests {
             provision_profiles: None,
             signing_keys: None,
             connect: None,
+            rootfs: None,
+            initramfs: None,
         }
     }
 
@@ -259,6 +261,8 @@ mod tests {
             provision_profiles: None,
             signing_keys: None,
             connect: None,
+            rootfs: None,
+            initramfs: None,
         }
     }
 
@@ -276,6 +280,8 @@ mod tests {
             provision_profiles: None,
             signing_keys: None,
             connect: None,
+            rootfs: None,
+            initramfs: None,
         }
     }
 

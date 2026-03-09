@@ -474,6 +474,13 @@ pub struct SplitPackageConfig {
     pub files: Vec<String>,
 }
 
+/// Rootfs or initramfs image configuration (top-level)
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ImageConfig {
+    #[serde(alias = "dependencies")]
+    pub packages: Option<HashMap<String, serde_yaml::Value>>,
+}
+
 /// Provision profile configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvisionProfileConfig {
@@ -672,6 +679,12 @@ pub struct Config {
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
+    /// Top-level rootfs image configuration. When absent, defaults to
+    /// `{ packages: { "avocado-pkg-rootfs": "*" } }`.
+    pub rootfs: Option<ImageConfig>,
+    /// Top-level initramfs image configuration. When absent, defaults to
+    /// `{ packages: { "avocado-pkg-initramfs": "*" } }`.
+    pub initramfs: Option<ImageConfig>,
     #[serde(alias = "provision")]
     pub provision_profiles: Option<HashMap<String, ProvisionProfileConfig>>,
     /// Signing keys mapping friendly names to key IDs
@@ -925,6 +938,8 @@ impl Config {
                 distro: None,
                 runtimes: None,
                 sdk: None,
+                rootfs: None,
+                initramfs: None,
                 provision_profiles: None,
                 signing_keys: None,
                 connect: None,
@@ -2340,6 +2355,38 @@ impl Config {
             .as_ref()
             .and_then(|sdk| sdk.disable_weak_dependencies)
             .unwrap_or(false) // Default to false (enable weak dependencies)
+    }
+
+    /// Get rootfs packages from top-level config.
+    /// Defaults to `{ "avocado-pkg-rootfs": "*" }` when the section is absent.
+    pub fn get_rootfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
+        if let Some(ref rootfs) = self.rootfs {
+            if let Some(ref packages) = rootfs.packages {
+                return packages.clone();
+            }
+        }
+        let mut default = HashMap::new();
+        default.insert(
+            "avocado-pkg-rootfs".to_string(),
+            serde_yaml::Value::String("*".to_string()),
+        );
+        default
+    }
+
+    /// Get initramfs packages from top-level config.
+    /// Defaults to `{ "avocado-pkg-initramfs": "*" }` when the section is absent.
+    pub fn get_initramfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
+        if let Some(ref initramfs) = self.initramfs {
+            if let Some(ref packages) = initramfs.packages {
+                return packages.clone();
+            }
+        }
+        let mut default = HashMap::new();
+        default.insert(
+            "avocado-pkg-initramfs".to_string(),
+            serde_yaml::Value::String("*".to_string()),
+        );
+        default
     }
 
     /// Get signing keys mapping (name -> keyid or global name)
