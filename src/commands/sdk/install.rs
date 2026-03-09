@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::commands::rootfs::install::{install_sysroot, SysrootInstallParams};
 use crate::utils::{
     config::{find_active_compile_sections, find_active_extensions, ComposedConfig, Config},
     container::{normalize_sdk_arch, RunConfig, SdkContainer},
@@ -1139,212 +1140,45 @@ $DNF_SDK_HOST \
             }
         }
 
-        // Install rootfs sysroot — repo scoping via --releasever, lock file pins exact version
-        // Read rootfs packages from top-level config (defaults to avocado-pkg-rootfs if absent)
-        print_info("Installing rootfs sysroot.", OutputLevel::Normal);
-
-        let rootfs_packages = config.get_rootfs_packages();
-        let rootfs_base_pkg = rootfs_packages
-            .keys()
-            .next()
-            .map(|s| s.as_str())
-            .unwrap_or("avocado-pkg-rootfs");
-        let rootfs_config_version = rootfs_packages
-            .values()
-            .next()
-            .and_then(|v| v.as_str())
-            .unwrap_or("*");
-        let rootfs_pkg = build_package_spec_with_lock(
-            &lock_file,
-            target,
-            &SysrootType::Rootfs,
-            rootfs_base_pkg,
-            rootfs_config_version,
-        );
-
-        let yes = if self.force { "-y" } else { "" };
-        let dnf_args_str = if let Some(args) = &self.dnf_args {
-            format!(" {} ", args.join(" "))
-        } else {
-            String::new()
-        };
-
-        let rootfs_command = format!(
-            r#"
-# Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
-# resolve /lib/modules, /sbin, /bin paths within the sysroot
-mkdir -p $AVOCADO_PREFIX/rootfs/usr/bin $AVOCADO_PREFIX/rootfs/usr/sbin $AVOCADO_PREFIX/rootfs/usr/lib
-ln -sfn usr/bin $AVOCADO_PREFIX/rootfs/bin
-ln -sfn usr/sbin $AVOCADO_PREFIX/rootfs/sbin
-ln -sfn usr/lib $AVOCADO_PREFIX/rootfs/lib
-
-RPM_NO_CHROOT_FOR_SCRIPTS=1 \
-AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/rootfs \
-AVOCADO_SYSROOT_SCRIPTS=1 \
-PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
-RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
-RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/rootfs install {rootfs_pkg}
-"#
-        );
-
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: rootfs_command,
-            verbose: self.verbose,
-            source_environment: false,
-            interactive: !self.force,
-            repo_url: repo_url.map(|s| s.to_string()),
-            repo_release: repo_release.map(|s| s.to_string()),
-            container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            // runs_on handled by shared context
-            ..Default::default()
-        };
-
-        let rootfs_success = run_container_command(
+        // Install rootfs sysroot via shared install logic
+        install_sysroot(&mut SysrootInstallParams {
+            sysroot_type: SysrootType::Rootfs,
+            config,
+            lock_file: &mut lock_file,
+            src_dir: &src_dir,
             container_helper,
-            run_config,
+            container_image,
+            target,
+            repo_url,
+            repo_release,
+            merged_container_args: merged_container_args.cloned(),
+            dnf_args: self.dnf_args.clone(),
+            verbose: self.verbose,
+            force: self.force,
             runs_on_context,
-            self.sdk_arch.as_ref(),
-        )
+            sdk_arch: self.sdk_arch.as_ref(),
+        })
         .await?;
 
-        if rootfs_success {
-            print_success("Installed rootfs sysroot.", OutputLevel::Normal);
-
-            // Query installed version and update lock file
-            let installed_versions = container_helper
-                .query_installed_packages(
-                    &SysrootType::Rootfs,
-                    &[rootfs_base_pkg.to_string()],
-                    container_image,
-                    target,
-                    repo_url.map(|s| s.to_string()),
-                    repo_release.map(|s| s.to_string()),
-                    merged_container_args.cloned(),
-                    runs_on_context,
-                    self.sdk_arch.as_ref(),
-                )
-                .await?;
-
-            if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(target, &SysrootType::Rootfs, installed_versions);
-                if self.verbose {
-                    print_info(
-                        "Updated lock file with rootfs package version.",
-                        OutputLevel::Normal,
-                    );
-                }
-                // Save lock file immediately after rootfs install
-                lock_file.save(&src_dir)?;
-            }
-        } else {
-            return Err(anyhow::anyhow!("Failed to install rootfs sysroot."));
-        }
-
-        // Install initramfs sysroot — parallel to rootfs, defaults to avocado-pkg-initramfs
-        print_info("Installing initramfs sysroot.", OutputLevel::Normal);
-
-        let initramfs_packages = config.get_initramfs_packages();
-        let initramfs_base_pkg = initramfs_packages
-            .keys()
-            .next()
-            .map(|s| s.as_str())
-            .unwrap_or("avocado-pkg-initramfs");
-        let initramfs_config_version = initramfs_packages
-            .values()
-            .next()
-            .and_then(|v| v.as_str())
-            .unwrap_or("*");
-        let initramfs_pkg = build_package_spec_with_lock(
-            &lock_file,
-            target,
-            &SysrootType::Initramfs,
-            initramfs_base_pkg,
-            initramfs_config_version,
-        );
-
-        let initramfs_command = format!(
-            r#"
-# Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
-# resolve /lib/modules, /sbin, /bin paths within the sysroot
-mkdir -p $AVOCADO_PREFIX/initramfs/usr/bin $AVOCADO_PREFIX/initramfs/usr/sbin $AVOCADO_PREFIX/initramfs/usr/lib
-ln -sfn usr/bin $AVOCADO_PREFIX/initramfs/bin
-ln -sfn usr/sbin $AVOCADO_PREFIX/initramfs/sbin
-ln -sfn usr/lib $AVOCADO_PREFIX/initramfs/lib
-
-RPM_NO_CHROOT_FOR_SCRIPTS=1 \
-AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/initramfs \
-AVOCADO_SYSROOT_SCRIPTS=1 \
-PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
-RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
-RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/initramfs install {initramfs_pkg}
-"#
-        );
-
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: initramfs_command,
-            verbose: self.verbose,
-            source_environment: false,
-            interactive: !self.force,
-            repo_url: repo_url.map(|s| s.to_string()),
-            repo_release: repo_release.map(|s| s.to_string()),
-            container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            ..Default::default()
-        };
-
-        let initramfs_success = run_container_command(
+        // Install initramfs sysroot via shared install logic
+        install_sysroot(&mut SysrootInstallParams {
+            sysroot_type: SysrootType::Initramfs,
+            config,
+            lock_file: &mut lock_file,
+            src_dir: &src_dir,
             container_helper,
-            run_config,
+            container_image,
+            target,
+            repo_url,
+            repo_release,
+            merged_container_args: merged_container_args.cloned(),
+            dnf_args: self.dnf_args.clone(),
+            verbose: self.verbose,
+            force: self.force,
             runs_on_context,
-            self.sdk_arch.as_ref(),
-        )
+            sdk_arch: self.sdk_arch.as_ref(),
+        })
         .await?;
-
-        if initramfs_success {
-            print_success("Installed initramfs sysroot.", OutputLevel::Normal);
-
-            let installed_versions = container_helper
-                .query_installed_packages(
-                    &SysrootType::Initramfs,
-                    &[initramfs_base_pkg.to_string()],
-                    container_image,
-                    target,
-                    repo_url.map(|s| s.to_string()),
-                    repo_release.map(|s| s.to_string()),
-                    merged_container_args.cloned(),
-                    runs_on_context,
-                    self.sdk_arch.as_ref(),
-                )
-                .await?;
-
-            if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(
-                    target,
-                    &SysrootType::Initramfs,
-                    installed_versions,
-                );
-                if self.verbose {
-                    print_info(
-                        "Updated lock file with initramfs package version.",
-                        OutputLevel::Normal,
-                    );
-                }
-                lock_file.save(&src_dir)?;
-            }
-        } else {
-            return Err(anyhow::anyhow!("Failed to install initramfs sysroot."));
-        }
 
         // Install target-sysroot if there are compile sections referenced by active extensions.
         // Only install compile deps for extensions that are dependencies of active runtimes.

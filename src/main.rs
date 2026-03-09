@@ -42,9 +42,11 @@ use commands::ext::{
 use commands::fetch::FetchCommand;
 use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
+use commands::initramfs::{InitramfsCleanCommand, InitramfsImageCommand, InitramfsInstallCommand};
 use commands::install::InstallCommand;
 use commands::provision::ProvisionCommand;
 use commands::prune::PruneCommand;
+use commands::rootfs::{RootfsCleanCommand, RootfsImageCommand, RootfsInstallCommand};
 use commands::runtime::{
     RuntimeBuildCommand, RuntimeCleanCommand, RuntimeDeployCommand, RuntimeDepsCommand,
     RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
@@ -102,6 +104,16 @@ enum Commands {
     Ext {
         #[command(subcommand)]
         command: ExtCommands,
+    },
+    /// Rootfs sysroot and image commands
+    Rootfs {
+        #[command(subcommand)]
+        command: RootfsCommands,
+    },
+    /// Initramfs sysroot and image commands
+    Initramfs {
+        #[command(subcommand)]
+        command: InitramfsCommands,
     },
     /// Initialize a new avocado project
     Init {
@@ -2192,6 +2204,132 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Rootfs { command } => match command {
+            RootfsCommands::Install {
+                config,
+                verbose,
+                force,
+                target,
+                container_args,
+                dnf_args,
+            } => {
+                let install_cmd = RootfsInstallCommand::new(
+                    config,
+                    verbose,
+                    force,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_no_stamps(cli.no_stamps)
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone());
+                install_cmd.execute().await?;
+                Ok(())
+            }
+            RootfsCommands::Image {
+                config,
+                verbose,
+                target,
+                out_dir,
+                container_args,
+                dnf_args,
+            } => {
+                let image_cmd = RootfsImageCommand::new(
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_output_dir(out_dir);
+                image_cmd.execute().await?;
+                Ok(())
+            }
+            RootfsCommands::Clean {
+                config,
+                verbose,
+                target,
+                container_args,
+                dnf_args,
+            } => {
+                let clean_cmd = RootfsCleanCommand::new(
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
+                clean_cmd.execute().await?;
+                Ok(())
+            }
+        },
+        Commands::Initramfs { command } => match command {
+            InitramfsCommands::Install {
+                config,
+                verbose,
+                force,
+                target,
+                container_args,
+                dnf_args,
+            } => {
+                let install_cmd = InitramfsInstallCommand::new(
+                    config,
+                    verbose,
+                    force,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_no_stamps(cli.no_stamps)
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone());
+                install_cmd.execute().await?;
+                Ok(())
+            }
+            InitramfsCommands::Image {
+                config,
+                verbose,
+                target,
+                out_dir,
+                container_args,
+                dnf_args,
+            } => {
+                let image_cmd = InitramfsImageCommand::new(
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_output_dir(out_dir);
+                image_cmd.execute().await?;
+                Ok(())
+            }
+            InitramfsCommands::Clean {
+                config,
+                verbose,
+                target,
+                container_args,
+                dnf_args,
+            } => {
+                let clean_cmd = InitramfsCleanCommand::new(
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    container_args,
+                    dnf_args,
+                )
+                .with_sdk_arch(cli.sdk_arch.clone());
+                clean_cmd.execute().await?;
+                Ok(())
+            }
+        },
         Commands::Hitl { command } => match command {
             HitlCommands::Server {
                 config_path,
@@ -3027,6 +3165,134 @@ enum ExtCommands {
         /// Output directory on host for the RPM package (relative or absolute path). If not specified, RPM stays in container at $AVOCADO_PREFIX/output/extensions
         #[arg(long = "out-dir")]
         output_dir: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RootfsCommands {
+    /// Install rootfs sysroot packages via DNF
+    Install {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Build rootfs image from sysroot
+    Image {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Output directory on host for the resulting image
+        #[arg(long = "out")]
+        out_dir: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Remove rootfs sysroot
+    Clean {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InitramfsCommands {
+    /// Install initramfs sysroot packages via DNF
+    Install {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        #[arg(short, long)]
+        force: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Build initramfs image from sysroot
+    Image {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Output directory on host for the resulting image
+        #[arg(long = "out")]
+        out_dir: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+    },
+    /// Remove initramfs sysroot
+    Clean {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

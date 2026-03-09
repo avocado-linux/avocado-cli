@@ -479,6 +479,9 @@ pub struct SplitPackageConfig {
 pub struct ImageConfig {
     #[serde(alias = "dependencies")]
     pub packages: Option<HashMap<String, serde_yaml::Value>>,
+    /// Filesystem format for the image (e.g., "erofs-zstd", "erofs-lz4", "cpio", "cpio-zstd").
+    /// Defaults depend on context: rootfs defaults to "erofs-zstd", initramfs to "cpio".
+    pub filesystem: Option<String>,
 }
 
 /// Provision profile configuration
@@ -1686,6 +1689,52 @@ impl Config {
                 }
             }
         }
+
+        // Merge rootfs section based on include patterns
+        if let Some(external_rootfs) = external_config.get("rootfs") {
+            if ExtensionSource::matches_include_pattern("rootfs", include_patterns) {
+                let main_map = main_config.as_mapping_mut().unwrap();
+                let rootfs_key = serde_yaml::Value::String("rootfs".to_string());
+                if !main_map.contains_key(&rootfs_key) {
+                    // Main config has no rootfs section — use the external one
+                    main_map.insert(rootfs_key, external_rootfs.clone());
+                } else if let (Some(main_rootfs), Some(ext_rootfs_map)) = (
+                    main_map
+                        .get_mut(&rootfs_key)
+                        .and_then(|v| v.as_mapping_mut()),
+                    external_rootfs.as_mapping(),
+                ) {
+                    // Deep merge: add fields from external that don't exist in main
+                    for (k, v) in ext_rootfs_map {
+                        if !main_rootfs.contains_key(k) {
+                            main_rootfs.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge initramfs section based on include patterns
+        if let Some(external_initramfs) = external_config.get("initramfs") {
+            if ExtensionSource::matches_include_pattern("initramfs", include_patterns) {
+                let main_map = main_config.as_mapping_mut().unwrap();
+                let initramfs_key = serde_yaml::Value::String("initramfs".to_string());
+                if !main_map.contains_key(&initramfs_key) {
+                    main_map.insert(initramfs_key, external_initramfs.clone());
+                } else if let (Some(main_initramfs), Some(ext_initramfs_map)) = (
+                    main_map
+                        .get_mut(&initramfs_key)
+                        .and_then(|v| v.as_mapping_mut()),
+                    external_initramfs.as_mapping(),
+                ) {
+                    for (k, v) in ext_initramfs_map {
+                        if !main_initramfs.contains_key(k) {
+                            main_initramfs.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Find a matching extension key in the main config's ext section.
@@ -2387,6 +2436,24 @@ impl Config {
             serde_yaml::Value::String("*".to_string()),
         );
         default
+    }
+
+    /// Get rootfs filesystem format from top-level config.
+    /// Defaults to `"erofs.lz4"` when the section or field is absent.
+    pub fn get_rootfs_filesystem(&self) -> String {
+        self.rootfs
+            .as_ref()
+            .and_then(|r| r.filesystem.clone())
+            .unwrap_or_else(|| "erofs.lz4".to_string())
+    }
+
+    /// Get initramfs filesystem format from top-level config.
+    /// Defaults to `"cpio.zst"` when the section or field is absent.
+    pub fn get_initramfs_filesystem(&self) -> String {
+        self.initramfs
+            .as_ref()
+            .and_then(|i| i.filesystem.clone())
+            .unwrap_or_else(|| "cpio.zst".to_string())
     }
 
     /// Get signing keys mapping (name -> keyid or global name)

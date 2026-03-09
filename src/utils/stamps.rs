@@ -950,6 +950,24 @@ pub fn compute_runtime_input_hash(
         );
     }
 
+    // Include rootfs/initramfs filesystem formats (changes should trigger rebuild)
+    if let Some(rootfs) = parsed.get("rootfs") {
+        if let Some(fs) = rootfs.get("filesystem") {
+            hash_data.insert(
+                serde_yaml::Value::String("rootfs.filesystem".to_string()),
+                fs.clone(),
+            );
+        }
+    }
+    if let Some(initramfs) = parsed.get("initramfs") {
+        if let Some(fs) = initramfs.get("filesystem") {
+            hash_data.insert(
+                serde_yaml::Value::String("initramfs.filesystem".to_string()),
+                fs.clone(),
+            );
+        }
+    }
+
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }
