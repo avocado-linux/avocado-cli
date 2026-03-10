@@ -1157,6 +1157,8 @@ $DNF_SDK_HOST \
             force: self.force,
             runs_on_context,
             sdk_arch: self.sdk_arch.as_ref(),
+            no_stamps: self.no_stamps,
+            parsed: Some(&composed.merged_value),
         })
         .await?;
 
@@ -1177,6 +1179,8 @@ $DNF_SDK_HOST \
             force: self.force,
             runs_on_context,
             sdk_arch: self.sdk_arch.as_ref(),
+            no_stamps: self.no_stamps,
+            parsed: Some(&composed.merged_value),
         })
         .await?;
 

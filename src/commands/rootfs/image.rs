@@ -71,16 +71,19 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     echo "Generated ld.so.cache"
 
     # Compute deterministic AVOCADO_OS_BUILD_ID from installed packages
-    PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | sort)
+    PKG_NEVRA=$(rpm --dbpath /var/lib/rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | sort)
     PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
     OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH'))")
 
     # Inject identity into os-release (work copy for the image, sysroot for stone)
+    # Strip any prior injected fields from the work copy before appending
+    sed -i '/^AVOCADO_OS_BUILD_ID=/d;/^AVOCADO_RUNTIME_NAME=/d;/^AVOCADO_RUNTIME_VERSION=/d' "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_NAME=$RUNTIME_NAME" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_VERSION=$RUNTIME_VERSION" >> "$ROOTFS_WORK/usr/lib/os-release"
 
     # Also write AVOCADO_OS_BUILD_ID to the sysroot so stone bundle can read it
+    sed -i '/^AVOCADO_OS_BUILD_ID=/d' "$ROOTFS_SYSROOT/usr/lib/os-release"
     echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_SYSROOT/usr/lib/os-release"
 
     # Build rootfs image using configured filesystem format
@@ -88,7 +91,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     ROOTFS_OUTPUT="$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.$ROOTFS_FS"
     echo "Building rootfs image: $ROOTFS_FS"
     case "$ROOTFS_FS" in
-        erofs.zst)
+        erofs-zst)
             mkfs.erofs \
                 -T "${{SOURCE_DATE_EPOCH:-0}}" \
                 -U 00000000-0000-0000-0000-000000000000 \
@@ -98,7 +101,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
                 "$ROOTFS_OUTPUT" \
                 "$ROOTFS_WORK"
             ;;
-        erofs.lz4)
+        erofs-lz4)
             mkfs.erofs \
                 -T "${{SOURCE_DATE_EPOCH:-0}}" \
                 -U 00000000-0000-0000-0000-000000000000 \

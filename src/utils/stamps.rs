@@ -70,6 +70,8 @@ pub enum StampComponent {
     Sdk,
     Extension,
     Runtime,
+    Rootfs,
+    Initramfs,
 }
 
 impl fmt::Display for StampComponent {
@@ -78,6 +80,8 @@ impl fmt::Display for StampComponent {
             StampComponent::Sdk => write!(f, "sdk"),
             StampComponent::Extension => write!(f, "ext"),
             StampComponent::Runtime => write!(f, "runtime"),
+            StampComponent::Rootfs => write!(f, "rootfs"),
+            StampComponent::Initramfs => write!(f, "initramfs"),
         }
     }
 }
@@ -308,6 +312,30 @@ impl Stamp {
         )
     }
 
+    /// Create rootfs install stamp
+    pub fn rootfs_install(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Install,
+            StampComponent::Rootfs,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Create initramfs install stamp
+    pub fn initramfs_install(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Install,
+            StampComponent::Initramfs,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
     ///
     /// For SDK stamps, the path includes the target architecture (which represents
@@ -321,6 +349,8 @@ impl Stamp {
             (StampComponent::Runtime, Some(name)) => {
                 format!("runtime/{}/{}.stamp", name, self.command)
             }
+            (StampComponent::Rootfs, _) => format!("rootfs/{}.stamp", self.command),
+            (StampComponent::Initramfs, _) => format!("initramfs/{}.stamp", self.command),
             _ => panic!("Component name required for Extension and Runtime"),
         }
     }
@@ -449,6 +479,16 @@ impl StampRequirement {
         Self::new(StampCommand::Provision, StampComponent::Runtime, Some(name))
     }
 
+    /// Rootfs install requirement
+    pub fn rootfs_install() -> Self {
+        Self::new(StampCommand::Install, StampComponent::Rootfs, None)
+    }
+
+    /// Initramfs install requirement
+    pub fn initramfs_install() -> Self {
+        Self::new(StampCommand::Install, StampComponent::Initramfs, None)
+    }
+
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
     ///
     /// For SDK stamps, the path includes the host architecture to support
@@ -468,6 +508,8 @@ impl StampRequirement {
             (StampComponent::Runtime, Some(name), _) => {
                 format!("runtime/{}/{}.stamp", name, self.command)
             }
+            (StampComponent::Rootfs, _, _) => format!("rootfs/{}.stamp", self.command),
+            (StampComponent::Initramfs, _, _) => format!("initramfs/{}.stamp", self.command),
             _ => panic!("Component name required for Extension and Runtime"),
         }
     }
@@ -485,6 +527,8 @@ impl StampRequirement {
             (StampComponent::Runtime, Some(name), _) => {
                 format!("runtime '{}' {}", name, self.command)
             }
+            (StampComponent::Rootfs, _, _) => format!("rootfs {}", self.command),
+            (StampComponent::Initramfs, _, _) => format!("initramfs {}", self.command),
             _ => format!("{} {}", self.component, self.command),
         }
     }
@@ -526,6 +570,12 @@ impl StampRequirement {
             }
             (StampComponent::Runtime, Some(name), StampCommand::Provision) => {
                 format!("avocado runtime provision {name}")
+            }
+            (StampComponent::Rootfs, _, StampCommand::Install) => {
+                "avocado rootfs install".to_string()
+            }
+            (StampComponent::Initramfs, _, StampCommand::Install) => {
+                "avocado initramfs install".to_string()
             }
             _ => format!("avocado {} {}", self.component, self.command),
         }
@@ -878,6 +928,42 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
             hash_data.insert(
                 serde_yaml::Value::String(format!("ext.{ext_name}.var_files")),
                 var_files.clone(),
+            );
+        }
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for rootfs install
+/// Includes: rootfs.packages
+pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+
+    if let Some(rootfs) = config.get("rootfs") {
+        if let Some(packages) = rootfs.get("packages") {
+            hash_data.insert(
+                serde_yaml::Value::String("rootfs.packages".to_string()),
+                packages.clone(),
+            );
+        }
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for initramfs install
+/// Includes: initramfs.packages
+pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+
+    if let Some(initramfs) = config.get("initramfs") {
+        if let Some(packages) = initramfs.get("packages") {
+            hash_data.insert(
+                serde_yaml::Value::String("initramfs.packages".to_string()),
+                packages.clone(),
             );
         }
     }
@@ -1277,6 +1363,8 @@ pub fn resolve_required_stamps_for_runtime_build_with_arch(
     let mut reqs = vec![
         sdk_install,
         compile_deps_install,
+        StampRequirement::rootfs_install(),
+        StampRequirement::initramfs_install(),
         StampRequirement::runtime_install(runtime_name),
     ];
 
@@ -1698,16 +1786,20 @@ mod tests {
         // Should have:
         // - SDK install (1)
         // - compile-deps install (1)
+        // - rootfs install (1)
+        // - initramfs install (1)
         // - Runtime install (1)
         // - app install + build + image (3)
         // - config-dev install + build + image (3)
         // - avocado-ext-dev install + build + image (3)
-        // Total: 12
-        assert_eq!(reqs.len(), 12);
+        // Total: 14
+        assert_eq!(reqs.len(), 14);
 
-        // Verify SDK, compile-deps, and runtime install are present
+        // Verify SDK, compile-deps, rootfs, initramfs, and runtime install are present
         assert!(reqs.contains(&StampRequirement::sdk_install()));
         assert!(reqs.contains(&StampRequirement::compile_deps_install()));
+        assert!(reqs.contains(&StampRequirement::rootfs_install()));
+        assert!(reqs.contains(&StampRequirement::initramfs_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("my-runtime")));
 
         // Verify all extensions have install, build, and image
@@ -1739,11 +1831,13 @@ mod tests {
         // Should have:
         // - SDK install (1)
         // - compile-deps install (1)
+        // - rootfs install (1)
+        // - initramfs install (1)
         // - Runtime install (1)
         // - app install + build + image (3)
         // - config-dev install + build + image (3)
-        // Total: 9
-        assert_eq!(reqs.len(), 9);
+        // Total: 11
+        assert_eq!(reqs.len(), 11);
 
         // Verify local extensions require install, build, and image
         assert!(reqs.contains(&StampRequirement::ext_install("app")));
@@ -1799,10 +1893,12 @@ mod tests {
 
         let reqs = resolve_required_stamps_for_runtime_build("minimal-runtime", &ext_deps);
 
-        // Should have SDK install + compile-deps + runtime install
-        assert_eq!(reqs.len(), 3);
+        // Should have SDK install + compile-deps + rootfs + initramfs + runtime install
+        assert_eq!(reqs.len(), 5);
         assert!(reqs.contains(&StampRequirement::sdk_install()));
         assert!(reqs.contains(&StampRequirement::compile_deps_install()));
+        assert!(reqs.contains(&StampRequirement::rootfs_install()));
+        assert!(reqs.contains(&StampRequirement::initramfs_install()));
         assert!(reqs.contains(&StampRequirement::runtime_install("minimal-runtime")));
     }
 

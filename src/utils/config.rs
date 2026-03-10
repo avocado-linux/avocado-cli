@@ -479,8 +479,8 @@ pub struct SplitPackageConfig {
 pub struct ImageConfig {
     #[serde(alias = "dependencies")]
     pub packages: Option<HashMap<String, serde_yaml::Value>>,
-    /// Filesystem format for the image (e.g., "erofs-zstd", "erofs-lz4", "cpio", "cpio-zstd").
-    /// Defaults depend on context: rootfs defaults to "erofs-zstd", initramfs to "cpio".
+    /// Filesystem format for the image (e.g., "erofs-zst", "erofs-lz4", "cpio", "cpio.zst").
+    /// Defaults depend on context: rootfs defaults to "erofs-lz4", initramfs to "cpio.zst".
     pub filesystem: Option<String>,
 }
 
@@ -2439,12 +2439,12 @@ impl Config {
     }
 
     /// Get rootfs filesystem format from top-level config.
-    /// Defaults to `"erofs.lz4"` when the section or field is absent.
+    /// Defaults to `"erofs-lz4"` when the section or field is absent.
     pub fn get_rootfs_filesystem(&self) -> String {
         self.rootfs
             .as_ref()
             .and_then(|r| r.filesystem.clone())
-            .unwrap_or_else(|| "erofs.lz4".to_string())
+            .unwrap_or_else(|| "erofs-lz4".to_string())
     }
 
     /// Get initramfs filesystem format from top-level config.

@@ -1,6 +1,7 @@
 //! Rootfs sysroot install command and shared install logic for rootfs/initramfs.
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,6 +11,10 @@ use crate::utils::{
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
+    stamps::{
+        compute_initramfs_input_hash, compute_rootfs_input_hash, generate_write_stamp_script,
+        Stamp, StampOutputs,
+    },
     target::validate_and_log_target,
 };
 
@@ -30,12 +35,67 @@ pub struct SysrootInstallParams<'a> {
     pub force: bool,
     pub runs_on_context: Option<&'a RunsOnContext>,
     pub sdk_arch: Option<&'a String>,
+    /// Skip stamp writing when true.
+    pub no_stamps: bool,
+    /// Parsed (merged) YAML config — needed for stamp hash computation.
+    pub parsed: Option<&'a serde_yaml::Value>,
+}
+
+/// Detect package removals by comparing config packages against lock file.
+/// Returns true if the sysroot needs to be cleaned and reinstalled from scratch.
+fn detect_sysroot_package_removals(
+    config: &Config,
+    sysroot_type: &SysrootType,
+    target: &str,
+    lock_file: &mut LockFile,
+) -> bool {
+    let locked_names = lock_file.get_locked_package_names(target, sysroot_type);
+
+    if locked_names.is_empty() {
+        return false;
+    }
+
+    let config_names: HashSet<String> = match sysroot_type {
+        SysrootType::Rootfs => config.get_rootfs_packages().keys().cloned().collect(),
+        SysrootType::Initramfs => config.get_initramfs_packages().keys().cloned().collect(),
+        _ => return false,
+    };
+
+    let removed: Vec<String> = locked_names.difference(&config_names).cloned().collect();
+
+    if removed.is_empty() {
+        return false;
+    }
+
+    let label = match sysroot_type {
+        SysrootType::Rootfs => "rootfs",
+        SysrootType::Initramfs => "initramfs",
+        _ => "sysroot",
+    };
+    print_info(
+        &format!(
+            "Packages removed from {label}: {}. Cleaning sysroot for fresh install.",
+            removed.join(", ")
+        ),
+        OutputLevel::Normal,
+    );
+
+    // Remove only the stale entries, preserving version pins for remaining packages
+    lock_file.remove_packages_from_sysroot(target, sysroot_type, &removed);
+
+    true
 }
 
 /// Install a sysroot (rootfs or initramfs) via DNF into the SDK container volume.
 ///
 /// This is the shared implementation used by both `avocado rootfs install`,
 /// `avocado initramfs install`, and `avocado sdk install`.
+///
+/// Features:
+/// - Detects package removals by comparing config against lock file
+/// - Forces clean reinstall when packages are removed (DNF is additive-only)
+/// - Tracks all installed packages in the lock file
+/// - Writes install stamps for staleness detection
 pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()> {
     let (label, sysroot_dir, default_pkg) = match params.sysroot_type {
         SysrootType::Rootfs => ("rootfs", "rootfs", "avocado-pkg-rootfs"),
@@ -44,6 +104,47 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     };
 
     print_info(&format!("Installing {label} sysroot."), OutputLevel::Normal);
+
+    // Detect package removals: compare current config packages with lock file.
+    // If packages were removed, we must clean the sysroot and reinstall from scratch
+    // because DNF install is additive-only and cannot remove packages.
+    let needs_clean_reinstall = detect_sysroot_package_removals(
+        params.config,
+        &params.sysroot_type,
+        params.target,
+        params.lock_file,
+    );
+
+    if needs_clean_reinstall {
+        let clean_command = format!(r#"rm -rf "$AVOCADO_PREFIX/{sysroot_dir}""#);
+        let clean_config = RunConfig {
+            container_image: params.container_image.to_string(),
+            target: params.target.to_string(),
+            command: clean_command,
+            verbose: params.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: params.repo_url.map(|s| s.to_string()),
+            repo_release: params.repo_release.map(|s| s.to_string()),
+            container_args: params.merged_container_args.clone(),
+            sdk_arch: params.sdk_arch.cloned(),
+            ..Default::default()
+        };
+
+        if let Some(context) = params.runs_on_context {
+            params
+                .container_helper
+                .run_in_container_with_context(&clean_config, context)
+                .await
+                .ok();
+        } else {
+            params
+                .container_helper
+                .run_in_container(clean_config)
+                .await
+                .ok();
+        }
+    }
 
     // Get packages from config
     let packages = match params.sysroot_type {
@@ -77,12 +178,13 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             .collect()
     };
     let pkg = pkg_specs.join(" ");
-    // The first package name is used as the base for lock file queries
-    let base_pkg = packages
-        .keys()
-        .next()
-        .map(|s| s.as_str())
-        .unwrap_or(default_pkg);
+
+    // Collect all package names for lock file queries
+    let all_package_names: Vec<String> = if packages.is_empty() {
+        vec![default_pkg.to_string()]
+    } else {
+        packages.keys().cloned().collect()
+    };
 
     let yes = if params.force { "-y" } else { "" };
     let dnf_args_str = if let Some(args) = &params.dnf_args {
@@ -143,12 +245,12 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     if success {
         print_success(&format!("Installed {label} sysroot."), OutputLevel::Normal);
 
-        // Query installed version and update lock file
+        // Query installed versions for ALL config packages and update lock file
         let installed_versions = params
             .container_helper
             .query_installed_packages(
                 &params.sysroot_type,
-                &[base_pkg.to_string()],
+                &all_package_names,
                 params.container_image,
                 params.target,
                 params.repo_url.map(|s| s.to_string()),
@@ -167,11 +269,66 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             );
             if params.verbose {
                 print_info(
-                    &format!("Updated lock file with {label} package version."),
+                    &format!("Updated lock file with {label} package versions."),
                     OutputLevel::Normal,
                 );
             }
             params.lock_file.save(params.src_dir)?;
+        }
+
+        // Write install stamp (unless --no-stamps or no parsed config available)
+        if !params.no_stamps {
+            if let Some(parsed) = params.parsed {
+                let stamp_result = match params.sysroot_type {
+                    SysrootType::Rootfs => {
+                        let inputs = compute_rootfs_input_hash(parsed)?;
+                        let outputs = StampOutputs::default();
+                        Ok(Stamp::rootfs_install(params.target, inputs, outputs))
+                    }
+                    SysrootType::Initramfs => {
+                        let inputs = compute_initramfs_input_hash(parsed)?;
+                        let outputs = StampOutputs::default();
+                        Ok(Stamp::initramfs_install(params.target, inputs, outputs))
+                    }
+                    _ => Err(anyhow::anyhow!("Unsupported sysroot type for stamps")),
+                };
+
+                if let Ok(stamp) = stamp_result {
+                    let stamp_script = generate_write_stamp_script(&stamp)?;
+                    let stamp_config = RunConfig {
+                        container_image: params.container_image.to_string(),
+                        target: params.target.to_string(),
+                        command: stamp_script,
+                        verbose: params.verbose,
+                        source_environment: true,
+                        interactive: false,
+                        repo_url: params.repo_url.map(|s| s.to_string()),
+                        repo_release: params.repo_release.map(|s| s.to_string()),
+                        container_args: params.merged_container_args.clone(),
+                        sdk_arch: params.sdk_arch.cloned(),
+                        ..Default::default()
+                    };
+
+                    if let Some(context) = params.runs_on_context {
+                        params
+                            .container_helper
+                            .run_in_container_with_context(&stamp_config, context)
+                            .await?;
+                    } else {
+                        params
+                            .container_helper
+                            .run_in_container(stamp_config)
+                            .await?;
+                    }
+
+                    if params.verbose {
+                        print_info(
+                            &format!("Wrote install stamp for {label}."),
+                            OutputLevel::Normal,
+                        );
+                    }
+                }
+            }
         }
     } else {
         return Err(anyhow::anyhow!("Failed to install {label} sysroot."));
@@ -295,6 +452,8 @@ impl RootfsInstallCommand {
             force: self.force,
             runs_on_context: runs_on_context.as_ref(),
             sdk_arch: self.sdk_arch.as_ref(),
+            no_stamps: self.no_stamps,
+            parsed: Some(&composed.merged_value),
         })
         .await;
 

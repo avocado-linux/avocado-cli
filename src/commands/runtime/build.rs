@@ -1537,8 +1537,15 @@ echo -e "  Manifest:  $STONE_MANIFEST"
 echo -e "  Output:    $STONE_AOS_OUTPUT"
 echo -e "  Build dir: $STONE_BUILD_DIR"
 
+STONE_INITRD_FLAG=""
+INITRD_OS_RELEASE="$AVOCADO_PREFIX/initramfs/usr/lib/os-release-initrd"
+if [ -f "$INITRD_OS_RELEASE" ]; then
+    STONE_INITRD_FLAG="--os-release-initrd $INITRD_OS_RELEASE"
+fi
+
 stone bundle \
     --os-release "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
+    $STONE_INITRD_FLAG \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
     -o "$STONE_AOS_OUTPUT" \
@@ -1568,7 +1575,23 @@ print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
 
 with open(manifest_path, "r") as f:
     manifest = json.load(f)
-manifest["os_bundle"] = dict(image_id=aos_image_id, sha256=aos_sha256)
+os_build_id = None
+os_release_path = os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "rootfs/usr/lib/os-release")
+if os.path.isfile(os_release_path):
+    with open(os_release_path) as f:
+        for line in f:
+            if line.startswith("AVOCADO_OS_BUILD_ID="):
+                os_build_id = line.strip().split("=", 1)[1]
+                break
+
+initramfs_build_id = os.environ.get("AVOCADO_INITRAMFS_BUILD_ID")
+
+os_bundle = dict(image_id=aos_image_id, sha256=aos_sha256)
+if os_build_id:
+    os_bundle["os_build_id"] = os_build_id
+if initramfs_build_id:
+    os_bundle["initramfs_build_id"] = initramfs_build_id
+manifest["os_bundle"] = os_bundle
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
 print("Patched manifest with os_bundle reference.")
