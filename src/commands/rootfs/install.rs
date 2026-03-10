@@ -52,23 +52,37 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         _ => unreachable!(),
     };
 
+    // Build package specs for all configured packages
+    let pkg_specs: Vec<String> = if packages.is_empty() {
+        vec![build_package_spec_with_lock(
+            params.lock_file,
+            params.target,
+            &params.sysroot_type,
+            default_pkg,
+            "*",
+        )]
+    } else {
+        packages
+            .iter()
+            .map(|(name, version)| {
+                let ver = version.as_str().unwrap_or("*");
+                build_package_spec_with_lock(
+                    params.lock_file,
+                    params.target,
+                    &params.sysroot_type,
+                    name,
+                    ver,
+                )
+            })
+            .collect()
+    };
+    let pkg = pkg_specs.join(" ");
+    // The first package name is used as the base for lock file queries
     let base_pkg = packages
         .keys()
         .next()
         .map(|s| s.as_str())
         .unwrap_or(default_pkg);
-    let config_version = packages
-        .values()
-        .next()
-        .and_then(|v| v.as_str())
-        .unwrap_or("*");
-    let pkg = build_package_spec_with_lock(
-        params.lock_file,
-        params.target,
-        &params.sysroot_type,
-        base_pkg,
-        config_version,
-    );
 
     let yes = if params.force { "-y" } else { "" };
     let dnf_args_str = if let Some(args) = &params.dnf_args {

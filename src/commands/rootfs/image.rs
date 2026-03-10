@@ -75,10 +75,13 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
     OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH'))")
 
-    # Inject identity into os-release (in the work copy only)
+    # Inject identity into os-release (work copy for the image, sysroot for stone)
     echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_NAME=$RUNTIME_NAME" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_VERSION=$RUNTIME_VERSION" >> "$ROOTFS_WORK/usr/lib/os-release"
+
+    # Also write AVOCADO_OS_BUILD_ID to the sysroot so stone bundle can read it
+    echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_SYSROOT/usr/lib/os-release"
 
     # Build rootfs image using configured filesystem format
     ROOTFS_FS="{rootfs_filesystem}"
