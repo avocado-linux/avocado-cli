@@ -1146,28 +1146,12 @@ manifest = dict(
     extensions=extensions,
 )
 
-# Include os_bundle if the .aos file was built
-aos_path = os.environ.get("STONE_AOS_OUTPUT", "")
-if aos_path and os.path.isfile(aos_path):
-    with open(aos_path, "rb") as f:
-        aos_sha256 = hashlib.sha256(f.read()).hexdigest()
-    aos_image_id = str(uuid.uuid5(namespace, aos_sha256))
-    dest = os.path.join(images_dir, aos_image_id + ".raw")
-    shutil.copy2(aos_path, dest)
-    print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
-    manifest["os_bundle"] = dict(
-        image_id=aos_image_id,
-        sha256=aos_sha256,
-    )
-
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
 print("Created runtime manifest with " + str(len(extensions)) + " extension(s)")
 
-# Clean up stale images not referenced by the current manifest
+# Clean up stale extension images (os_bundle cleanup happens after stone bundle)
 current_image_files = set(ext["image_id"] + ".raw" for ext in extensions)
-if "os_bundle" in manifest:
-    current_image_files.add(manifest["os_bundle"]["image_id"] + ".raw")
 for fname in os.listdir(images_dir):
     if fname.endswith(".raw") and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
@@ -1521,7 +1505,18 @@ echo "Copying required extension images to runtime-specific directory..."
 {rootfs_build_section}
 {initramfs_build_section}
 
-# Build OS bundle (.aos) — needs rootfs + initramfs + kernel (all built above)
+# Assemble var partition content and build var image
+{var_files_section}
+{runtime_var_files_section}
+{manifest_section}
+{update_authority_section}
+{docker_section}
+
+mkfs.btrfs -r "$VAR_DIR" \
+    --subvol rw:lib/avocado \
+    -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+
+# Build OS bundle (.aos) — needs rootfs + initramfs + kernel + var (all built above)
 STONE_MANIFEST="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-$TARGET_ARCH.json}}"
 STONE_INPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 STONE_BUILD_DIR="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/stone"
@@ -1549,16 +1544,45 @@ stone bundle \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
 
-# Assemble var partition content (after stone bundle so manifest can include os_bundle)
-{var_files_section}
-{runtime_var_files_section}
-{manifest_section}
-{update_authority_section}
-{docker_section}
+# Patch manifest in var-staging to add os_bundle reference (for connect upload)
+# The btrfs image for provisioning doesn't need os_bundle — initial flash doesn't OTA.
+# Connect upload reads from var-staging directly, so it sees this update.
+python3 << 'PYEOF'
+import json, hashlib, uuid, os, shutil
 
-mkfs.btrfs -r "$VAR_DIR" \
-    --subvol rw:lib/avocado \
-    -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+aos_path = os.environ.get("STONE_AOS_OUTPUT", "")
+if not (aos_path and os.path.isfile(aos_path)):
+    print("No .aos file found, skipping os_bundle manifest patch.")
+    exit(0)
+
+namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
+images_dir = os.environ["AVOCADO_IMAGES_DIR"]
+manifest_path = os.environ["AVOCADO_MANIFEST_PATH"]
+
+with open(aos_path, "rb") as f:
+    aos_sha256 = hashlib.sha256(f.read()).hexdigest()
+aos_image_id = str(uuid.uuid5(namespace, aos_sha256))
+dest = os.path.join(images_dir, aos_image_id + ".raw")
+shutil.copy2(aos_path, dest)
+print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
+
+with open(manifest_path, "r") as f:
+    manifest = json.load(f)
+manifest["os_bundle"] = dict(image_id=aos_image_id, sha256=aos_sha256)
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+print("Patched manifest with os_bundle reference.")
+
+# Clean up stale os_bundle images
+current_image_files = set()
+for ext in manifest.get("extensions", []):
+    current_image_files.add(ext["image_id"] + ".raw")
+current_image_files.add(aos_image_id + ".raw")
+for fname in os.listdir(images_dir):
+    if fname.endswith(".raw") and fname not in current_image_files:
+        os.remove(os.path.join(images_dir, fname))
+        print("  Removed stale image: " + fname)
+PYEOF
 "#,
             runtime_name = self.runtime_name,
             target_arch = target_arch,
