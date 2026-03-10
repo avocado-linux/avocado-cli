@@ -380,8 +380,9 @@ fn format_version_from_manifest(manifest: &serde_json::Value) -> String {
 // Artifact discovery (manifest-driven, with SHA256 hashing for TUF)
 // ---------------------------------------------------------------------------
 
-/// Discover artifacts from the manifest's extensions list.
+/// Discover artifacts from the manifest's extensions list and os_bundle.
 /// Each extension has an `image_id` that maps to a `{image_id}.raw` file on disk.
+/// The os_bundle (if present) is also included as an artifact.
 /// Computes SHA256 of each artifact for TUF target metadata.
 fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<ArtifactInfo>> {
     let images_dir = dir.join("lib/avocado/images");
@@ -423,8 +424,39 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
         });
     }
 
+    // Include OS bundle artifact if present in manifest
+    if let Some(os_bundle) = manifest.get("os_bundle") {
+        let image_id = os_bundle
+            .get("image_id")
+            .and_then(|v| v.as_str())
+            .context("os_bundle missing 'image_id' field")?;
+
+        let path = images_dir.join(format!("{image_id}.raw"));
+        if !path.exists() {
+            anyhow::bail!(
+                "OS bundle artifact not found: {} (image_id: {})",
+                path.display(),
+                image_id,
+            );
+        }
+
+        let size_bytes = std::fs::metadata(&path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?
+            .len();
+
+        let sha256 =
+            compute_sha256(&path).with_context(|| format!("Failed to hash {}", path.display()))?;
+
+        artifacts.push(ArtifactInfo {
+            image_id: image_id.to_string(),
+            path,
+            size_bytes,
+            sha256,
+        });
+    }
+
     if artifacts.is_empty() {
-        anyhow::bail!("No extensions found in manifest. Have you run 'avocado build'?");
+        anyhow::bail!("No artifacts found in manifest. Have you run 'avocado build'?");
     }
 
     Ok(artifacts)

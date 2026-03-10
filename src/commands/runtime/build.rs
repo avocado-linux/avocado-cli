@@ -1139,12 +1139,26 @@ for pair in ext_pairs:
     extensions.append(dict(name=name, version=version, image_id=image_id))
 
 manifest = dict(
-    manifest_version=1,
+    manifest_version=2,
     id=build_id,
     built_at=built_at,
     runtime=dict(name=runtime_name, version=runtime_version),
     extensions=extensions,
 )
+
+# Include os_bundle if the .aos file was built
+aos_path = os.environ.get("STONE_AOS_OUTPUT", "")
+if aos_path and os.path.isfile(aos_path):
+    with open(aos_path, "rb") as f:
+        aos_sha256 = hashlib.sha256(f.read()).hexdigest()
+    aos_image_id = str(uuid.uuid5(namespace, aos_sha256))
+    dest = os.path.join(images_dir, aos_image_id + ".raw")
+    shutil.copy2(aos_path, dest)
+    print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
+    manifest["os_bundle"] = dict(
+        image_id=aos_image_id,
+        sha256=aos_sha256,
+    )
 
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
@@ -1152,6 +1166,8 @@ print("Created runtime manifest with " + str(len(extensions)) + " extension(s)")
 
 # Clean up stale images not referenced by the current manifest
 current_image_files = set(ext["image_id"] + ".raw" for ext in extensions)
+if "os_bundle" in manifest:
+    current_image_files.add(manifest["os_bundle"]["image_id"] + ".raw")
 for fname in os.listdir(images_dir):
     if fname.endswith(".raw") and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
@@ -1505,7 +1521,35 @@ echo "Copying required extension images to runtime-specific directory..."
 {rootfs_build_section}
 {initramfs_build_section}
 
-# Assemble var partition content
+# Build OS bundle (.aos) — needs rootfs + initramfs + kernel (all built above)
+STONE_MANIFEST="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-$TARGET_ARCH.json}}"
+STONE_INPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
+STONE_BUILD_DIR="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/stone"
+STONE_AOS_OUTPUT="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/os-bundle.aos"
+export STONE_AOS_OUTPUT
+
+# Build include path flags from AVOCADO_STONE_INCLUDE_PATHS
+STONE_INCLUDE_FLAGS=""
+if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
+    for path in $AVOCADO_STONE_INCLUDE_PATHS; do
+        STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $path"
+    done
+fi
+STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
+
+echo -e "\033[94m[INFO]\033[0m Running stone bundle."
+echo -e "  Manifest:  $STONE_MANIFEST"
+echo -e "  Output:    $STONE_AOS_OUTPUT"
+echo -e "  Build dir: $STONE_BUILD_DIR"
+
+stone bundle \
+    --os-release "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
+    -m "$STONE_MANIFEST" \
+    $STONE_INCLUDE_FLAGS \
+    -o "$STONE_AOS_OUTPUT" \
+    --build-dir "$STONE_BUILD_DIR"
+
+# Assemble var partition content (after stone bundle so manifest can include os_bundle)
 {var_files_section}
 {runtime_var_files_section}
 {manifest_section}
@@ -1515,10 +1559,6 @@ echo "Copying required extension images to runtime-specific directory..."
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado \
     -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
-
-# Run SDK lifecycle hook (stone create) — uses newly built rootfs + initramfs + var
-echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$TARGET_ARCH'."
-avocado-build-$TARGET_ARCH $RUNTIME_NAME
 "#,
             runtime_name = self.runtime_name,
             target_arch = target_arch,
@@ -1869,7 +1909,7 @@ runtimes:
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("TARGET_ARCH=\"x86_64\""));
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
-        assert!(script.contains("avocado-build-$TARGET_ARCH $RUNTIME_NAME"));
+        assert!(script.contains("stone bundle"));
         assert!(script.contains("mkfs.btrfs"));
     }
 
@@ -2137,7 +2177,7 @@ extensions:
 
         // Manifest should be generated dynamically via Python
         assert!(script.contains("manifest.json"));
-        assert!(script.contains("manifest_version=1"));
+        assert!(script.contains("manifest_version=2"));
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
