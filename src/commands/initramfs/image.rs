@@ -53,7 +53,10 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
     INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH'))")
 
-    # Inject identity into os-release-initrd (if it exists in the sysroot)
+    # Inject identity into initrd-release and os-release-initrd
+    if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
+        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/initrd-release"
+    fi
     if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
         echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
     fi
