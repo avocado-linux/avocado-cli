@@ -7,9 +7,9 @@ use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::stamps::{
-    compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
-    resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
-    StampOutputs,
+    compute_ext_input_hash, compute_ext_input_hash_with_fs, generate_batch_read_stamps_script,
+    generate_write_stamp_script, resolve_required_stamps, validate_stamps_batch, Stamp,
+    StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 
@@ -111,6 +111,16 @@ impl ExtImageCommand {
             .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration."))?;
 
+        // Resolve the effective filesystem for this extension early — needed for stamp hashing.
+        // If the extension explicitly sets `filesystem`, use that; otherwise inherit from rootfs.
+        let rootfs_fs = config.get_rootfs_filesystem();
+        let effective_fs = parsed
+            .get("extensions")
+            .and_then(|e| e.get(&self.extension))
+            .and_then(|ext| ext.get("filesystem"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&rootfs_fs);
+
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             let container_helper =
@@ -148,7 +158,8 @@ impl ExtImageCommand {
                 .await?;
 
             // Compute current inputs from composed config for staleness detection.
-            // Only compare against Extension stamps — SDK/compile-deps stamps use their own hash.
+            // Use the base hash (without filesystem) to match what install/build stamps wrote.
+            // The filesystem-aware hash is only used when writing/reading the image stamp itself.
             let current_inputs = compute_ext_input_hash(parsed, &self.extension).ok();
             let validation = validate_stamps_batch(
                 &required,
@@ -326,17 +337,19 @@ impl ExtImageCommand {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_else(|| vec!["sysext", "confext"]);
 
-        // Get filesystem type (defaults to "squashfs")
+        // Use the effective filesystem resolved earlier (from ext config or rootfs default).
+        // The per-extension `filesystem` key can still override via ext_config, but
+        // effective_fs already accounts for that from the raw parsed YAML.
         let filesystem = ext_config
             .get("filesystem")
             .and_then(|v| v.as_str())
-            .unwrap_or("squashfs");
+            .unwrap_or(effective_fs);
 
         match filesystem {
-            "squashfs" | "erofs" => {}
+            "squashfs" | "erofs" | "erofs-lz4" | "erofs-zst" => {}
             other => {
                 return Err(anyhow::anyhow!(
-                    "Extension '{}' has invalid filesystem type '{}'. Must be 'squashfs' or 'erofs'.",
+                    "Extension '{}' has invalid filesystem type '{}'. Must be 'squashfs', 'erofs', 'erofs-lz4', or 'erofs-zst'.",
                     self.extension,
                     other
                 ));
@@ -447,7 +460,8 @@ impl ExtImageCommand {
 
             // Write extension image stamp (unless --no-stamps)
             if !self.no_stamps {
-                let inputs = compute_ext_input_hash(parsed, &self.extension)?;
+                let inputs =
+                    compute_ext_input_hash_with_fs(parsed, &self.extension, Some(filesystem))?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;
@@ -625,7 +639,12 @@ impl ExtImageCommand {
             .collect::<Vec<_>>();
 
         let mkfs_command = match filesystem {
-            "erofs" => {
+            "erofs" | "erofs-lz4" | "erofs-zst" => {
+                let compress_flag = match filesystem {
+                    "erofs-lz4" => "\n  -z lz4hc \\",
+                    "erofs-zst" => "\n  -z zstd \\",
+                    _ => "",
+                };
                 let exclude_flags = var_excludes
                     .iter()
                     .map(|p| format!("  --exclude-path={p} \\"))
@@ -642,7 +661,7 @@ mkfs.erofs \
   -T "$SOURCE_DATE_EPOCH" \
   -U 00000000-0000-0000-0000-000000000000 \
   -x -1 \
-  --all-root \{exclude_section}
+  --all-root \{compress_flag}{exclude_section}
   "$OUTPUT_FILE" \
   "$AVOCADO_EXT_SYSROOTS/$EXT_NAME""#
                 )
@@ -742,6 +761,59 @@ mod tests {
         assert!(
             script.contains("--all-root"),
             "script should include --all-root flag"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_erofs_lz4_includes_compression() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-lz4", &[]);
+
+        assert!(
+            script.contains("mkfs.erofs"),
+            "erofs-lz4 should invoke mkfs.erofs"
+        );
+        assert!(
+            script.contains("-z lz4hc"),
+            "erofs-lz4 should include -z lz4hc compression flag"
+        );
+        assert!(
+            !script.contains("-z zstd"),
+            "erofs-lz4 should not include zstd compression"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_erofs_zst_includes_compression() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-zst", &[]);
+
+        assert!(
+            script.contains("mkfs.erofs"),
+            "erofs-zst should invoke mkfs.erofs"
+        );
+        assert!(
+            script.contains("-z zstd"),
+            "erofs-zst should include -z zstd compression flag"
+        );
+        assert!(
+            !script.contains("-z lz4hc"),
+            "erofs-zst should not include lz4 compression"
+        );
+    }
+
+    #[test]
+    fn test_create_build_script_erofs_uncompressed_no_z_flag() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[]);
+
+        assert!(
+            script.contains("mkfs.erofs"),
+            "erofs should invoke mkfs.erofs"
+        );
+        assert!(
+            !script.contains("-z "),
+            "plain erofs should not include any -z compression flag"
         );
     }
 

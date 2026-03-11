@@ -906,6 +906,18 @@ pub fn compute_compile_deps_input_hash(
 }
 
 pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Result<StampInputs> {
+    compute_ext_input_hash_with_fs(config, ext_name, None)
+}
+
+/// Compute input hash for an extension, including an optional resolved filesystem format.
+/// When `filesystem` is `Some`, it is included in the hash so that changing the image
+/// format (e.g. squashfs → erofs-lz4) invalidates the stamp.  The caller is responsible
+/// for resolving the effective value (explicit per-extension override or rootfs default).
+pub fn compute_ext_input_hash_with_fs(
+    config: &serde_yaml::Value,
+    ext_name: &str,
+    filesystem: Option<&str>,
+) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
     // Include ext.<name>.dependencies
@@ -930,6 +942,15 @@ pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Res
                 var_files.clone(),
             );
         }
+    }
+
+    // Include the resolved filesystem format when provided — determines the image
+    // format (.raw contents) and must invalidate the stamp when it changes.
+    if let Some(fs) = filesystem {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.filesystem")),
+            serde_yaml::Value::String(fs.to_string()),
+        );
     }
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
