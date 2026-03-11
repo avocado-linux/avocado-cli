@@ -1094,6 +1094,8 @@ mkdir -p "$IMAGES_DIR"
 BUILD_ID="{build_id}"
 BUILT_AT="{built_at}"
 RUNTIME_VERSION="{runtime_version}"
+# Clean stale runtime manifests from previous builds
+rm -rf "$VAR_DIR/lib/avocado/runtimes"
 MANIFEST_DIR="$VAR_DIR/lib/avocado/runtimes/$BUILD_ID"
 mkdir -p "$MANIFEST_DIR"
 
@@ -1520,6 +1522,8 @@ mkfs.btrfs -r "$VAR_DIR" \
 STONE_MANIFEST="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-$TARGET_ARCH.json}}"
 STONE_INPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 STONE_BUILD_DIR="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/stone"
+# Clean previous stone build artifacts to prevent stale image reuse
+rm -rf "$STONE_BUILD_DIR"
 STONE_AOS_OUTPUT="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/os-bundle.aos"
 export STONE_AOS_OUTPUT
 
