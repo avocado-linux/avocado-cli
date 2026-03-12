@@ -36,7 +36,7 @@ impl ConnectInitCommand {
             // Non-interactive: use provided org
             me.organizations
                 .iter()
-                .find(|o| o.slug == *org_flag || o.id == *org_flag)
+                .find(|o| o.id == *org_flag)
                 .cloned()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -44,7 +44,7 @@ impl ConnectInitCommand {
                         org_flag,
                         me.organizations
                             .iter()
-                            .map(|o| o.slug.as_str())
+                            .map(|o| o.name.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -52,7 +52,7 @@ impl ConnectInitCommand {
         } else if me.organizations.len() == 1 {
             let org = me.organizations[0].clone();
             print_info(
-                &format!("Auto-selected organization: {} ({})", org.name, org.slug),
+                &format!("Auto-selected organization: {} ({})", org.name, org.id),
                 OutputLevel::Normal,
             );
             org
@@ -61,12 +61,12 @@ impl ConnectInitCommand {
         };
 
         // 3. Fetch projects for selected org
-        let projects = client.list_projects(&selected_org.slug).await?;
+        let projects = client.list_projects(&selected_org.id).await?;
 
         if projects.is_empty() {
             anyhow::bail!(
                 "No projects found in org '{}'. Create a project in the web UI first.",
-                selected_org.slug
+                selected_org.name
             );
         }
 
@@ -100,7 +100,7 @@ impl ConnectInitCommand {
 
         // 5. Fetch server key
         print_info("Fetching server signing key...", OutputLevel::Normal);
-        let server_key = client.get_tuf_server_key(&selected_org.slug).await?;
+        let server_key = client.get_tuf_server_key(&selected_org.id).await?;
 
         // 6. Write to avocado.yaml
         let config_path = Path::new(&self.config_path);
@@ -113,7 +113,7 @@ impl ConnectInitCommand {
 
         config_edit::set_connect_fields(
             config_path,
-            &selected_org.slug,
+            &selected_org.id,
             &selected_project.id,
             &server_key.public_key_hex,
         )?;
@@ -132,10 +132,7 @@ impl ConnectInitCommand {
 
         println!();
         print_success("Connect configured:", OutputLevel::Normal);
-        println!(
-            "  Org:        {} ({})",
-            selected_org.name, selected_org.slug
-        );
+        println!("  Org:        {} ({})", selected_org.name, selected_org.id);
         println!(
             "  Project:    {} (id: {})",
             selected_project.name, selected_project.id
@@ -156,7 +153,7 @@ fn prompt_select_org(orgs: &[OrgInfo]) -> Result<OrgInfo> {
             "  [{}] {} ({}) - role: {}",
             i + 1,
             org.name,
-            org.slug,
+            org.id,
             org.role
         );
     }

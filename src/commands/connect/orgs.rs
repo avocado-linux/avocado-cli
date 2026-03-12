@@ -21,12 +21,6 @@ impl ConnectOrgsListCommand {
             return Ok(());
         }
 
-        let max_slug = me
-            .organizations
-            .iter()
-            .map(|o| o.slug.len())
-            .max()
-            .unwrap_or(0);
         let max_name = me
             .organizations
             .iter()
@@ -35,20 +29,20 @@ impl ConnectOrgsListCommand {
             .unwrap_or(0);
 
         println!(
-            "{:<slug_w$}  {:<name_w$}  ROLE",
-            "SLUG",
+            "{:<name_w$}  {:<id_w$}  ROLE",
             "NAME",
-            slug_w = max_slug,
+            "ID",
             name_w = max_name,
+            id_w = 36,
         );
         for org in &me.organizations {
             println!(
-                "{:<slug_w$}  {:<name_w$}  {}",
-                org.slug,
+                "{:<name_w$}  {:<id_w$}  {}",
                 org.name,
+                org.id,
                 org.role,
-                slug_w = max_slug,
                 name_w = max_name,
+                id_w = 36,
             );
         }
 

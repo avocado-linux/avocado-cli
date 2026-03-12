@@ -203,26 +203,12 @@ impl ConnectAuthStatusCommand {
 
                         if !me_full.organizations.is_empty() {
                             println!("\nOrganizations:");
-                            // Calculate column widths
-                            let max_slug = me_full
-                                .organizations
-                                .iter()
-                                .map(|o| o.slug.len())
-                                .max()
-                                .unwrap_or(0);
                             for org in &me_full.organizations {
-                                println!(
-                                    "  {:<width$}  role: {}",
-                                    org.slug,
-                                    org.role,
-                                    width = max_slug
-                                );
+                                println!("  {}  (id: {})  role: {}", org.name, org.id, org.role);
                             }
                             println!(
-                                "\nTip: Use org slugs with --org (e.g., --org {})",
-                                me_full.organizations[0].slug
+                                "\nTip: Use org ID with --org or set connect.org in avocado.yaml"
                             );
-                            println!("     or set connect.org in avocado.yaml");
                         }
                     }
                     Err(e) => {

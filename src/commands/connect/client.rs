@@ -88,7 +88,6 @@ pub struct MeResponse {
 pub struct OrgInfo {
     pub id: String,
     pub name: String,
-    pub slug: String,
     pub role: String,
 }
 

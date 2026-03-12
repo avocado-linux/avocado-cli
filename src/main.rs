@@ -438,7 +438,7 @@ enum ConnectCommands {
     },
     /// Initialize connect settings in avocado.yaml (org, project, server key)
     Init {
-        /// Organization slug or ID (skip interactive prompt)
+        /// Organization ID (skip interactive prompt)
         #[arg(long)]
         org: Option<String>,
         /// Project name or ID (skip interactive prompt)
@@ -478,7 +478,7 @@ enum ConnectCommands {
     },
     /// Upload current runtime build to the Connect platform
     Upload {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project ID (or set connect.project in avocado.yaml)
@@ -507,7 +507,7 @@ enum ConnectCommands {
     },
     /// Retrieve the Connect server's TUF signing public key
     ServerKey {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -533,7 +533,7 @@ enum ConnectCommands {
 enum ConnectTrustCommands {
     /// Show fleet trust status for an organization
     Status {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -548,7 +548,7 @@ enum ConnectTrustCommands {
         /// Name of the local root signing key to use
         #[arg(long)]
         key: String,
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -563,7 +563,7 @@ enum ConnectTrustCommands {
         /// Name of the local root signing key (required at security level 2)
         #[arg(long)]
         key: Option<String>,
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -585,7 +585,7 @@ enum ConnectKeysCommands {
         /// Name of the local signing key (from 'avocado signing-keys list')
         #[arg(long)]
         key: String,
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -599,7 +599,7 @@ enum ConnectKeysCommands {
     Approve {
         /// Key ID of the staged key to approve
         keyid: String,
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -611,7 +611,7 @@ enum ConnectKeysCommands {
     },
     /// List delegate keys registered with the server
     List {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Filter by key type: content or root
@@ -628,7 +628,7 @@ enum ConnectKeysCommands {
     Retire {
         /// Key ID of the staged key to discard
         keyid: String,
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -654,7 +654,7 @@ enum ConnectOrgsCommands {
 enum ConnectProjectsCommands {
     /// List projects in an organization
     List {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -666,7 +666,7 @@ enum ConnectProjectsCommands {
     },
     /// Create a new project
     Create {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project name
@@ -684,7 +684,7 @@ enum ConnectProjectsCommands {
     },
     /// Delete a project
     Delete {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project ID to delete
@@ -706,7 +706,7 @@ enum ConnectProjectsCommands {
 enum ConnectDevicesCommands {
     /// List devices in an organization
     List {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -718,7 +718,7 @@ enum ConnectDevicesCommands {
     },
     /// Create a new device
     Create {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Device name
@@ -736,7 +736,7 @@ enum ConnectDevicesCommands {
     },
     /// Delete a device
     Delete {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Device ID to delete
@@ -758,7 +758,7 @@ enum ConnectDevicesCommands {
 enum ConnectCohortsCommands {
     /// List cohorts in a project
     List {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project ID (or set connect.project in avocado.yaml)
@@ -773,7 +773,7 @@ enum ConnectCohortsCommands {
     },
     /// Create a new cohort
     Create {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project ID (or set connect.project in avocado.yaml)
@@ -794,7 +794,7 @@ enum ConnectCohortsCommands {
     },
     /// Delete a cohort
     Delete {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Project ID (or set connect.project in avocado.yaml)
@@ -819,7 +819,7 @@ enum ConnectCohortsCommands {
 enum ConnectClaimTokensCommands {
     /// List claim tokens in an organization
     List {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Path to avocado.yaml configuration file
@@ -831,7 +831,7 @@ enum ConnectClaimTokensCommands {
     },
     /// Create a new claim token
     Create {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Token name
@@ -855,7 +855,7 @@ enum ConnectClaimTokensCommands {
     },
     /// Delete a claim token
     Delete {
-        /// Organization slug or ID (or set connect.org in avocado.yaml)
+        /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
         /// Claim token ID to delete
