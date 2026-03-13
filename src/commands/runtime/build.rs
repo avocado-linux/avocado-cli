@@ -1393,16 +1393,16 @@ esac
 
 # The SDK container may have the host's /sys bind-mounted (-v /sys:/sys),
 # and --privileged gives write access even without that flag.
-# Overmount /sys/fs/cgroup with a private hierarchy so the inner dockerd
-# cannot write into the host's cgroup tree.  When we umount afterwards
-# the host hierarchy is restored untouched.
+# Make the /sys/fs/cgroup mount private so the inner dockerd's mount
+# events do not propagate to the host.  A bind+private mount preserves
+# the existing cgroup controllers (required by dockerd) while isolating
+# mount propagation.
 _AVOCADO_CGROUP_PRIVATE=0
-if mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null; then
-    _AVOCADO_CGROUP_PRIVATE=1
-elif mount -t tmpfs tmpfs /sys/fs/cgroup 2>/dev/null; then
+if mount --bind /sys/fs/cgroup /sys/fs/cgroup 2>/dev/null \
+   && mount --make-private /sys/fs/cgroup 2>/dev/null; then
     _AVOCADO_CGROUP_PRIVATE=1
 else
-    echo "WARNING: Could not overmount /sys/fs/cgroup — inner dockerd may leave stale cgroup entries on the host."
+    echo "WARNING: Could not make /sys/fs/cgroup private — inner dockerd may leave stale cgroup entries on the host."
 fi
 
 # When the SDK container uses --network=host the inner dockerd shares the
