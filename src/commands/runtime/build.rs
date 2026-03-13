@@ -1514,9 +1514,38 @@ echo "Copying required extension images to runtime-specific directory..."
 {update_authority_section}
 {docker_section}
 
+VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+VAR_INPUT_SIZE=$(du -sb "$VAR_DIR" 2>/dev/null | awk '{{print $1}}')
+VAR_INPUT_MB=$(( VAR_INPUT_SIZE / 1048576 ))
+echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
+
+# Background progress reporter — prints size and estimated % every 5s
+(
+    while [ ! -f "$VAR_IMAGE" ]; do sleep 1; done
+    while kill -0 $$ 2>/dev/null; do
+        CUR=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
+        CUR_MB=$(( CUR / 1048576 ))
+        if [ "$VAR_INPUT_SIZE" -gt 0 ] 2>/dev/null; then
+            PCT=$(( CUR * 100 / VAR_INPUT_SIZE ))
+            [ "$PCT" -gt 99 ] && PCT=99
+            printf "\r  var image: %dMB written (~%d%%)" "$CUR_MB" "$PCT"
+        else
+            printf "\r  var image: %dMB written" "$CUR_MB"
+        fi
+        sleep 5
+    done
+) &
+_PROGRESS_PID=$!
+
 mkfs.btrfs -r "$VAR_DIR" \
     --subvol rw:lib/avocado \
-    -f "$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+    -f "$VAR_IMAGE"
+
+kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
+FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
+FINAL_MB=$(( FINAL_SIZE / 1048576 ))
+echo ""
+echo "Built var image: ${{FINAL_MB}}MB"
 
 # Build OS bundle (.aos) — needs rootfs + initramfs + kernel + var (all built above)
 STONE_MANIFEST="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-$TARGET_ARCH.json}}"
