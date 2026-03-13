@@ -97,11 +97,6 @@ pub struct MeFullResponse {
     pub organizations: Vec<OrgInfo>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CsrfResponse {
-    pub csrf_token: String,
-}
-
 // ---------------------------------------------------------------------------
 // TUF server key response types
 // ---------------------------------------------------------------------------
@@ -1322,122 +1317,6 @@ impl ConnectClient {
 
         let resp: CommitWrapper = res.json().await?;
         Ok(resp.data)
-    }
-}
-
-/// Session-based client for login flow (cookie-based, not Bearer).
-pub struct LoginClient {
-    http: reqwest::Client,
-    api_url: String,
-}
-
-impl LoginClient {
-    pub fn new(api_url: &str) -> Result<Self> {
-        let http = reqwest::ClientBuilder::new()
-            .use_rustls_tls()
-            .cookie_store(true)
-            .build()
-            .context("Failed to build HTTP client")?;
-        Ok(Self {
-            http,
-            api_url: api_url.to_string(),
-        })
-    }
-
-    /// Get a CSRF token (also sets the session cookie).
-    async fn get_csrf_token(&self) -> Result<String> {
-        let res = self
-            .http
-            .get(format!("{}/auth/csrf-token", self.api_url))
-            .send()
-            .await
-            .context("Failed to fetch CSRF token")?;
-
-        if !res.status().is_success() {
-            anyhow::bail!("Failed to get CSRF token (HTTP {})", res.status());
-        }
-
-        let body: CsrfResponse = res.json().await?;
-        Ok(body.csrf_token)
-    }
-
-    /// Login with email + password. Returns session cookie (managed by cookie jar).
-    pub async fn login(&self, email: &str, password: &str) -> Result<()> {
-        let csrf = self.get_csrf_token().await?;
-
-        let res = self
-            .http
-            .post(format!("{}/auth/login", self.api_url))
-            .header("x-csrf-token", &csrf)
-            .json(&serde_json::json!({
-                "email": email,
-                "password": password
-            }))
-            .send()
-            .await
-            .context("Failed to login")?;
-
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Login failed (HTTP {status}): {body}");
-        }
-
-        Ok(())
-    }
-
-    /// Get current user info (requires active session).
-    pub async fn get_me(&self) -> Result<MeResponse> {
-        let res = self
-            .http
-            .get(format!("{}/api/me", self.api_url))
-            .send()
-            .await
-            .context("Failed to fetch user info")?;
-
-        if !res.status().is_success() {
-            anyhow::bail!("Failed to get user info (HTTP {})", res.status());
-        }
-
-        let body: serde_json::Value = res.json().await?;
-        let user_val = body
-            .get("data")
-            .and_then(|d| d.get("user"))
-            .cloned()
-            .context("Response missing data.user")?;
-        let me: MeResponse = serde_json::from_value(user_val)?;
-        Ok(me)
-    }
-
-    /// Create a personal API token (requires active session).
-    pub async fn create_api_token(&self, name: &str) -> Result<String> {
-        let csrf = self.get_csrf_token().await?;
-
-        let res = self
-            .http
-            .post(format!("{}/api/me/api-tokens", self.api_url))
-            .header("x-csrf-token", &csrf)
-            .json(&serde_json::json!({ "name": name }))
-            .send()
-            .await
-            .context("Failed to create API token")?;
-
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to create API token (HTTP {status}): {body}");
-        }
-
-        let body: serde_json::Value = res.json().await?;
-        let raw_token = body
-            .get("data")
-            .and_then(|d| d.get("token"))
-            .and_then(|t| t.get("token"))
-            .and_then(|v| v.as_str())
-            .context("Response missing data.token.token field")?
-            .to_string();
-
-        Ok(raw_token)
     }
 }
 

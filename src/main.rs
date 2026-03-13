@@ -880,15 +880,12 @@ enum ConnectAuthCommands {
         /// API URL (defaults to https://connect.peridio.com or AVOCADO_CONNECT_URL env var)
         #[arg(long)]
         url: Option<String>,
-        /// Email (prompts interactively if not provided)
-        #[arg(long)]
-        email: Option<String>,
-        /// Password (prompts interactively if not provided)
-        #[arg(long)]
-        password: Option<String>,
         /// Profile name (defaults to "default")
         #[arg(long)]
         profile: Option<String>,
+        /// Use an existing API token instead of browser login
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Logout from the Connect platform
     Logout {
@@ -2524,11 +2521,10 @@ async fn main() -> Result<()> {
             ConnectCommands::Auth { command } => match command {
                 ConnectAuthCommands::Login {
                     url,
-                    email,
-                    password,
                     profile,
+                    token,
                 } => {
-                    let cmd = ConnectAuthLoginCommand::new(url, email, password, profile);
+                    let cmd = ConnectAuthLoginCommand::new(url, profile, token);
                     cmd.execute().await?;
                     Ok(())
                 }
