@@ -11,7 +11,7 @@ impl ConnectOrgsListCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), None)?;
         let client = ConnectClient::from_profile(profile)?;
 
         let me = client.get_me_full().await?;

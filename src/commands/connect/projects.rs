@@ -14,7 +14,7 @@ impl ConnectProjectsListCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let projects = client.list_projects(&self.org).await?;
@@ -54,7 +54,7 @@ impl ConnectProjectsCreateCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let req = CreateProjectRequest {
@@ -99,7 +99,7 @@ impl ConnectProjectsDeleteCommand {
 
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         client.delete_project(&self.org, &self.id).await?;
