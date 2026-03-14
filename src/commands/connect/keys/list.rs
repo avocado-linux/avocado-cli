@@ -13,7 +13,7 @@ impl ConnectKeysListCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .context("Not logged in. Run 'avocado connect auth login' first.")?;
-        let (_name, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_name, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let connect = ConnectClient::from_profile(profile)?;
 
         let keys = connect

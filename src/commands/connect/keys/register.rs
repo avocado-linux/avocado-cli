@@ -34,7 +34,7 @@ impl ConnectKeysRegisterCommand {
         // 3. Connect to the API
         let config = client::load_config()?
             .context("Not logged in. Run 'avocado connect auth login' first.")?;
-        let (_name, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_name, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let connect = ConnectClient::from_profile(profile)?;
 
         // 4. Register the key

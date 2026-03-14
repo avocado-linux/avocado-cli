@@ -5,7 +5,9 @@ use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::commands::connect::client::{self, ConnectClient, ConnectConfig, Profile, ProfileUser};
+use crate::commands::connect::client::{
+    self, ConnectClient, ConnectConfig, Profile, ProfileUser,
+};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 
 pub struct ConnectAuthLoginCommand {
@@ -118,7 +120,30 @@ impl ConnectAuthLoginCommand {
         let success_url = format!("{}/cli/success", self.url);
         respond_redirect(&mut stream, &success_url).await;
 
-        self.save_profile(profile_name, token, user_email, user_name)?;
+        // Provision an org-scoped token from the unscoped browser token.
+        let temp_profile = Profile {
+            api_url: self.url.clone(),
+            token: token.to_string(),
+            user: ProfileUser {
+                email: user_email.to_string(),
+                name: user_name.to_string(),
+            },
+            created_at: chrono::Utc::now().to_rfc3339(),
+            organization_id: None,
+        };
+        let temp_client = ConnectClient::from_profile(&temp_profile)?;
+        let me = temp_client.get_me_full().await?;
+
+        let (final_token, organization_id) =
+            provision_org_token(&temp_client, &me, token, &token_name).await?;
+
+        self.save_profile(
+            profile_name,
+            &final_token,
+            user_email,
+            user_name,
+            organization_id,
+        )?;
 
         Ok(())
     }
@@ -138,20 +163,42 @@ impl ConnectAuthLoginCommand {
                 name: String::new(),
             },
             created_at: Utc::now().to_rfc3339(),
+            organization_id: None,
         };
 
-        let client = ConnectClient::from_profile(&temp_profile)?;
-        let me = client
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let token_name = format!("avocado-cli-{hostname}-{profile_name}");
+
+        let temp_client = ConnectClient::from_profile(&temp_profile)?;
+        let me = temp_client
             .get_me_full()
             .await
             .context("token validation failed — is the token valid?")?;
 
-        self.save_profile(profile_name, token, &me.user.email, &me.user.name)?;
+        let (final_token, organization_id) =
+            provision_org_token(&temp_client, &me, token, &token_name).await?;
+
+        self.save_profile(
+            profile_name,
+            &final_token,
+            &me.user.email,
+            &me.user.name,
+            organization_id,
+        )?;
 
         Ok(())
     }
 
-    fn save_profile(&self, profile_name: &str, token: &str, email: &str, name: &str) -> Result<()> {
+    fn save_profile(
+        &self,
+        profile_name: &str,
+        token: &str,
+        email: &str,
+        name: &str,
+        organization_id: Option<String>,
+    ) -> Result<()> {
         let profile = Profile {
             api_url: self.url.clone(),
             token: token.to_string(),
@@ -160,6 +207,7 @@ impl ConnectAuthLoginCommand {
                 name: name.to_string(),
             },
             created_at: Utc::now().to_rfc3339(),
+            organization_id,
         };
 
         let mut config = client::load_config()?;
@@ -295,6 +343,45 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+/// Given an authenticated client and its /api/me response, return (token, Option<org_id>).
+///
+/// - If the token is already org-scoped (`me.token.organization_id` is set), return it as-is.
+/// - If unscoped and orgs are available, create an org-scoped token for the first org.
+/// - If unscoped and no orgs, return the original token with no org.
+async fn provision_org_token(
+    client: &ConnectClient,
+    me: &crate::commands::connect::client::MeFullResponse,
+    original_token: &str,
+    token_name: &str,
+) -> Result<(String, Option<String>)> {
+    // Already org-scoped?
+    if let Some(ref token_info) = me.token {
+        if let Some(ref org_id) = token_info.organization_id {
+            return Ok((original_token.to_string(), Some(org_id.clone())));
+        }
+    }
+
+    // Unscoped — try to create an org-scoped token for the first org.
+    if let Some(org) = me.organizations.first() {
+        print_info(
+            &format!("Creating org-scoped token for '{}'...", org.name),
+            OutputLevel::Normal,
+        );
+        match client.create_org_token(&org.id, token_name).await {
+            Ok((new_token, org_id)) => return Ok((new_token, Some(org_id))),
+            Err(e) => {
+                // Non-fatal: fall back to unscoped token with a warning.
+                print_info(
+                    &format!("Warning: could not create org-scoped token: {e}"),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+    }
+
+    Ok((original_token.to_string(), None))
+}
+
 pub struct ConnectAuthLogoutCommand {
     pub profile: Option<String>,
 }
@@ -351,7 +438,7 @@ impl ConnectAuthStatusCommand {
     pub async fn execute(&self) -> Result<()> {
         match client::load_config()? {
             Some(cfg) => {
-                let (profile_name, profile) = match cfg.resolve_profile(self.profile.as_deref()) {
+                let (profile_name, profile) = match cfg.resolve_profile(self.profile.as_deref(), None) {
                     Ok(p) => p,
                     Err(e) => {
                         print_error(&e.to_string(), OutputLevel::Normal);
@@ -366,6 +453,11 @@ impl ConnectAuthStatusCommand {
                 );
                 println!("API URL: {}", profile.api_url);
                 println!("Token created: {}", profile.created_at);
+                if let Some(ref org_id) = profile.organization_id {
+                    println!("Token scope: org {org_id}");
+                } else {
+                    println!("Token scope: unscoped (all orgs)");
+                }
 
                 // Verify token is still valid and show org memberships
                 print_info("Verifying token...", OutputLevel::Normal);
@@ -373,6 +465,15 @@ impl ConnectAuthStatusCommand {
                 match client.get_me_full().await {
                     Ok(me_full) => {
                         print_success("Token is valid.", OutputLevel::Normal);
+
+                        // Show live scope from API (may differ if token was upgraded server-side)
+                        if let Some(ref token_info) = me_full.token {
+                            if let Some(ref org_id) = token_info.organization_id {
+                                println!("API token scope: org {org_id} (token: {})", token_info.name);
+                            } else {
+                                println!("API token scope: unscoped (token: {})", token_info.name);
+                            }
+                        }
 
                         if !me_full.organizations.is_empty() {
                             println!("\nOrganizations:");
