@@ -15,7 +15,7 @@ impl ConnectCohortsListCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let cohorts = client.list_cohorts(&self.org, &self.project).await?;
@@ -48,7 +48,7 @@ impl ConnectCohortsCreateCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let req = CreateCohortRequest {
@@ -94,7 +94,7 @@ impl ConnectCohortsDeleteCommand {
 
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         client

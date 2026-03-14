@@ -23,6 +23,8 @@ pub struct Profile {
     pub token: String,
     pub user: ProfileUser,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,9 +44,42 @@ impl ConnectConfig {
         }
     }
 
-    /// Resolve a profile by explicit name or fall back to the default.
-    pub fn resolve_profile<'a>(&'a self, name: Option<&'a str>) -> Result<(&'a str, &'a Profile)> {
-        let profile_name = name.unwrap_or(&self.default_profile);
+    /// Resolve a profile: explicit name > org-based lookup > default profile.
+    pub fn resolve_profile<'a>(
+        &'a self,
+        name: Option<&'a str>,
+        org_id: Option<&str>,
+    ) -> Result<(&'a str, &'a Profile)> {
+        // Explicit --profile flag always wins.
+        if let Some(profile_name) = name {
+            return match self.profiles.get(profile_name) {
+                Some(p) => Ok((profile_name, p)),
+                None => {
+                    let available: Vec<&str> =
+                        self.profiles.keys().map(|s| s.as_str()).collect();
+                    if available.is_empty() {
+                        anyhow::bail!(
+                            "No profiles configured. Run 'avocado connect auth login' to authenticate."
+                        );
+                    }
+                    anyhow::bail!(
+                        "Profile '{}' not found. Available profiles: {}",
+                        profile_name,
+                        available.join(", ")
+                    );
+                }
+            };
+        }
+
+        // Org-based lookup: find a profile whose organization_id matches.
+        if let Some(oid) = org_id {
+            if let Some(found) = self.find_profile_by_org(oid) {
+                return Ok(found);
+            }
+        }
+
+        // Fall back to default profile.
+        let profile_name = self.default_profile.as_str();
         match self.profiles.get(profile_name) {
             Some(p) => Ok((profile_name, p)),
             None => {
@@ -61,6 +96,14 @@ impl ConnectConfig {
                 );
             }
         }
+    }
+
+    /// Find a profile whose organization_id matches the given org ID.
+    pub fn find_profile_by_org<'a>(&'a self, org_id: &str) -> Option<(&'a str, &'a Profile)> {
+        self.profiles
+            .iter()
+            .find(|(_, p)| p.organization_id.as_deref() == Some(org_id))
+            .map(|(name, p)| (name.as_str(), p))
     }
 
     /// Insert or update a profile.
@@ -92,9 +135,16 @@ pub struct OrgInfo {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TokenInfo {
+    pub name: String,
+    pub organization_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MeFullResponse {
     pub user: MeResponse,
     pub organizations: Vec<OrgInfo>,
+    pub token: Option<TokenInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,10 +504,48 @@ impl ConnectClient {
             .unwrap_or_else(|| serde_json::Value::Array(vec![]));
         let organizations: Vec<OrgInfo> = serde_json::from_value(orgs_val)?;
 
+        let token = match data.get("token") {
+            Some(t) if !t.is_null() => Some(serde_json::from_value::<TokenInfo>(t.clone())?),
+            _ => None,
+        };
+
         Ok(MeFullResponse {
             user,
             organizations,
+            token,
         })
+    }
+
+    /// Create an org-scoped API token.  Returns (token_string, organization_id).
+    pub async fn create_org_token(&self, org_id: &str, name: &str) -> Result<(String, String)> {
+        let url = format!("{}/api/orgs/{}/api-tokens", self.api_url, org_id);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(&serde_json::json!({ "api_token": { "name": name } }))
+            .send()
+            .await
+            .context("Failed to create org-scoped token")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create org-scoped token (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let token_str = body["data"]["token"]["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no token in create-org-token response"))?
+            .to_string();
+        let token_org_id = body["data"]["token"]["organization_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no organization_id in create-org-token response"))?
+            .to_string();
+
+        Ok((token_str, token_org_id))
     }
 
     /// List projects for an organization.

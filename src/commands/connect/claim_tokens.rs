@@ -14,7 +14,7 @@ impl ConnectClaimTokensListCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let tokens = client.list_claim_tokens(&self.org).await?;
@@ -61,7 +61,7 @@ impl ConnectClaimTokensCreateCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let expires_at = if self.no_expiration {
@@ -121,7 +121,7 @@ impl ConnectClaimTokensDeleteCommand {
 
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         client.delete_claim_token(&self.org, &self.id).await?;

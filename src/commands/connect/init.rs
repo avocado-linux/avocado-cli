@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::path::Path;
 
-use crate::commands::connect::client::{self, ConnectClient, OrgInfo, ProjectInfo};
+use crate::commands::connect::client::{self, ConnectClient, OrgInfo, Profile, ProjectInfo};
 use crate::utils::config_edit;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
@@ -15,10 +16,12 @@ pub struct ConnectInitCommand {
 impl ConnectInitCommand {
     pub async fn execute(&self) -> Result<()> {
         // 1. Verify login
-        let config = client::load_config()?
+        let mut config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
-        let client = ConnectClient::from_profile(profile)?;
+        let (_, initial_profile) = config.resolve_profile(self.profile.as_deref(), None)?;
+        let mut client = ConnectClient::from_profile(initial_profile)?;
+        let initial_api_url = initial_profile.api_url.clone();
+        let initial_user = initial_profile.user.clone();
 
         print_info("Verifying authentication...", OutputLevel::Normal);
         let me = client.get_me_full().await?;
@@ -60,7 +63,54 @@ impl ConnectInitCommand {
             prompt_select_org(&me.organizations)?
         };
 
-        // 3. Fetch projects for selected org
+        // 3. Ensure we have an org-scoped profile for the selected org (unless --profile was explicit)
+        if self.profile.is_none() {
+            if let Some((_, org_profile)) = config.find_profile_by_org(&selected_org.id) {
+                // Reuse existing org-scoped profile.
+                print_info(
+                    &format!(
+                        "Using existing org-scoped profile for '{}'.",
+                        selected_org.name
+                    ),
+                    OutputLevel::Normal,
+                );
+                client = ConnectClient::from_profile(org_profile)?;
+            } else {
+                // Create a new org-scoped token and profile.
+                let hostname = std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let token_name =
+                    format!("avocado-cli-{hostname}-{}", selected_org.name.to_lowercase().replace(' ', "-"));
+                print_info(
+                    &format!(
+                        "Creating org-scoped token for '{}'...",
+                        selected_org.name
+                    ),
+                    OutputLevel::Normal,
+                );
+                let (new_token, org_id) = client.create_org_token(&selected_org.id, &token_name).await?;
+
+                // Derive a profile name from the org name.
+                let profile_name = selected_org.name.to_lowercase().replace(' ', "-");
+                let new_profile = Profile {
+                    api_url: initial_api_url.clone(),
+                    token: new_token,
+                    user: initial_user.clone(),
+                    created_at: Utc::now().to_rfc3339(),
+                    organization_id: Some(org_id),
+                };
+                client = ConnectClient::from_profile(&new_profile)?;
+                config.upsert_profile(&profile_name, new_profile);
+                client::save_config(&config)?;
+                print_success(
+                    &format!("Created org-scoped profile '{profile_name}'."),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        // 4. Fetch projects for selected org
         let projects = client.list_projects(&selected_org.id).await?;
 
         if projects.is_empty() {

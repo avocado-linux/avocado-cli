@@ -14,7 +14,7 @@ impl ConnectDevicesListCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let devices = client.list_devices(&self.org).await?;
@@ -73,7 +73,7 @@ impl ConnectDevicesCreateCommand {
     pub async fn execute(&self) -> Result<()> {
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         let req = CreateDeviceRequest {
@@ -123,7 +123,7 @@ impl ConnectDevicesDeleteCommand {
 
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
-        let (_, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
         client.delete_device(&self.org, &self.id).await?;

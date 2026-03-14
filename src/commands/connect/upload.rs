@@ -50,7 +50,7 @@ impl ConnectUploadCommand {
         // 1. Load config and resolve profile
         let config = client::load_config()?
             .context("Not logged in. Run 'avocado connect auth login' first.")?;
-        let (_name, profile) = config.resolve_profile(self.profile.as_deref())?;
+        let (_name, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let connect = ConnectClient::from_profile(profile)?;
 
         // 2. Load project config (needed for prerequisite checks and content key detection)
