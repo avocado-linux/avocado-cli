@@ -5,9 +5,7 @@ use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::commands::connect::client::{
-    self, ConnectClient, ConnectConfig, Profile, ProfileUser,
-};
+use crate::commands::connect::client::{self, ConnectClient, ConnectConfig, Profile, ProfileUser};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 
 pub struct ConnectAuthLoginCommand {
@@ -446,13 +444,14 @@ impl ConnectAuthStatusCommand {
     pub async fn execute(&self) -> Result<()> {
         match client::load_config()? {
             Some(cfg) => {
-                let (profile_name, profile) = match cfg.resolve_profile(self.profile.as_deref(), None) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        print_error(&e.to_string(), OutputLevel::Normal);
-                        return Ok(());
-                    }
-                };
+                let (profile_name, profile) =
+                    match cfg.resolve_profile(self.profile.as_deref(), None) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            print_error(&e.to_string(), OutputLevel::Normal);
+                            return Ok(());
+                        }
+                    };
 
                 println!("Profile: {profile_name}");
                 println!(
@@ -477,7 +476,10 @@ impl ConnectAuthStatusCommand {
                         // Show live scope from API (may differ if token was upgraded server-side)
                         if let Some(ref token_info) = me_full.token {
                             if let Some(ref org_id) = token_info.organization_id {
-                                println!("API token scope: org {org_id} (token: {})", token_info.name);
+                                println!(
+                                    "API token scope: org {org_id} (token: {})",
+                                    token_info.name
+                                );
                             } else {
                                 println!("API token scope: unscoped (token: {})", token_info.name);
                             }

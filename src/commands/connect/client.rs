@@ -55,8 +55,7 @@ impl ConnectConfig {
             return match self.profiles.get(profile_name) {
                 Some(p) => Ok((profile_name, p)),
                 None => {
-                    let available: Vec<&str> =
-                        self.profiles.keys().map(|s| s.as_str()).collect();
+                    let available: Vec<&str> = self.profiles.keys().map(|s| s.as_str()).collect();
                     if available.is_empty() {
                         anyhow::bail!(
                             "No profiles configured. Run 'avocado connect auth login' to authenticate."
