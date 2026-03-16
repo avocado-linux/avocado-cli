@@ -80,16 +80,17 @@ impl ConnectInitCommand {
                 let hostname = std::env::var("HOSTNAME")
                     .or_else(|_| std::env::var("COMPUTERNAME"))
                     .unwrap_or_else(|_| "unknown".to_string());
-                let token_name =
-                    format!("avocado-cli-{hostname}-{}", selected_org.name.to_lowercase().replace(' ', "-"));
+                let token_name = format!(
+                    "avocado-cli-{hostname}-{}",
+                    selected_org.name.to_lowercase().replace(' ', "-")
+                );
                 print_info(
-                    &format!(
-                        "Creating org-scoped token for '{}'...",
-                        selected_org.name
-                    ),
+                    &format!("Creating org-scoped token for '{}'...", selected_org.name),
                     OutputLevel::Normal,
                 );
-                let (new_token, org_id) = client.create_org_token(&selected_org.id, &token_name).await?;
+                let (new_token, org_id) = client
+                    .create_org_token(&selected_org.id, &token_name)
+                    .await?;
 
                 // Derive a profile name from the org name.
                 let profile_name = selected_org.name.to_lowercase().replace(' ', "-");
