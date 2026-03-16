@@ -121,6 +121,8 @@ impl ConnectAuthLoginCommand {
         respond_redirect(&mut stream, &success_url).await;
 
         // Provision an org-scoped token from the unscoped browser token.
+        // If this fails for any reason, fall back to saving the unscoped token so
+        // the user is always logged in after a successful browser auth.
         let temp_profile = Profile {
             api_url: self.url.clone(),
             token: token.to_string(),
@@ -132,10 +134,16 @@ impl ConnectAuthLoginCommand {
             organization_id: None,
         };
         let temp_client = ConnectClient::from_profile(&temp_profile)?;
-        let me = temp_client.get_me_full().await?;
-
-        let (final_token, organization_id) =
-            provision_org_token(&temp_client, &me, token, &token_name).await?;
+        let (final_token, organization_id) = match temp_client.get_me_full().await {
+            Ok(me) => provision_org_token(&temp_client, &me, token, &token_name).await?,
+            Err(e) => {
+                print_info(
+                    &format!("Warning: could not fetch org info ({e}); saving unscoped profile."),
+                    OutputLevel::Normal,
+                );
+                (token.to_string(), None)
+            }
+        };
 
         self.save_profile(
             profile_name,
