@@ -545,7 +545,7 @@ parse_install_section() {
     local key="$2"
     [ -f "$unit_file" ] || return
     local in_install=false
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%#*}"  # strip comments
         line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
         [ -z "$line" ] && continue
@@ -632,7 +632,7 @@ load_presets() {
     for dir in "${preset_dirs[@]}"; do
         [ -d "$dir" ] || continue
         for f in $(ls "$dir"/*.preset 2>/dev/null | sort); do
-            while IFS= read -r line; do
+            while IFS= read -r line || [[ -n "$line" ]]; do
                 line="${line%%#*}"
                 line="${line#"${line%%[![:space:]]*}"}"
                 [ -z "$line" ] && continue
