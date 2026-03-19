@@ -1069,12 +1069,62 @@ impl Config {
                             continue;
                         }
                     } else {
-                        // Not a path-based extension, fall through to other methods
-                        "".to_string()
+                        // Not in path state — check if source declares a path and read directly
+                        if let ExtensionSource::Path { path, .. } = &source {
+                            let source_dir = if Path::new(path).is_absolute() {
+                                PathBuf::from(path)
+                            } else {
+                                src_dir.join(path)
+                            };
+                            let config_yaml = source_dir.join("avocado.yaml");
+                            let config_yml = source_dir.join("avocado.yml");
+                            if verbose {
+                                eprintln!(
+                                    "[DEBUG] Extension '{}' not in path state, trying source path: {}",
+                                    ext_name,
+                                    source_dir.display()
+                                );
+                            }
+                            if config_yaml.exists() {
+                                fs::read_to_string(&config_yaml).unwrap_or_default()
+                            } else if config_yml.exists() {
+                                fs::read_to_string(&config_yml).unwrap_or_default()
+                            } else {
+                                "".to_string()
+                            }
+                        } else {
+                            // Not a path-based extension, fall through to other methods
+                            "".to_string()
+                        }
                     }
                 } else {
-                    // No path state, fall through to other methods
-                    "".to_string()
+                    // No path state — check if source declares a path and read directly
+                    if let ExtensionSource::Path { path, .. } = &source {
+                        let source_dir = if Path::new(path).is_absolute() {
+                            PathBuf::from(path)
+                        } else {
+                            src_dir.join(path)
+                        };
+                        let config_yaml = source_dir.join("avocado.yaml");
+                        let config_yml = source_dir.join("avocado.yml");
+                        if verbose {
+                            eprintln!(
+                                "[DEBUG] No path state, trying source path for '{}': {}",
+                                ext_name,
+                                source_dir.display()
+                            );
+                        }
+                        if config_yaml.exists() {
+                            fs::read_to_string(&config_yaml).unwrap_or_default()
+                        } else if config_yml.exists() {
+                            fs::read_to_string(&config_yml).unwrap_or_default()
+                        } else {
+                            "".to_string()
+                        }
+                    } else {
+                        // No path state, fall through to other methods
+                        "".to_string()
+                    }
                 }
             };
 
