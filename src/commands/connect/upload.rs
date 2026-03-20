@@ -8,11 +8,12 @@ use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
     ConnectClient, CreateRuntimeRequest, RuntimeParams,
 };
-use crate::utils::config::load_config;
+use crate::utils::config::{load_config, Config};
 use crate::utils::container::SdkContainer;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
+use crate::utils::target::resolve_target_required;
 
 const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
 
@@ -60,11 +61,7 @@ impl ConnectUploadCommand {
         // 3. When exporting from Docker, validate that the runtime has been built
         //    before attempting anything. Skip when --file is provided (user manages state).
         if self.file.is_none() {
-            let target = self
-                .target
-                .clone()
-                .or_else(|| std::env::var("AVOCADO_TARGET").ok())
-                .context("No target specified. Set AVOCADO_TARGET or use --target.")?;
+            let target = resolve_target_required(self.target.as_deref(), &project_config)?;
             let container_image = project_config
                 .get_sdk_image()
                 .context("No SDK container image specified in configuration")?;
@@ -73,7 +70,7 @@ impl ConnectUploadCommand {
         }
 
         // 3. Get artifacts on disk (export from Docker or use --file)
-        let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir().await?;
+        let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir(&project_config).await?;
 
         // 4. Read manifest and derive version + build_id
         let manifest = read_manifest(&artifacts_dir)?;
@@ -188,7 +185,10 @@ impl ConnectUploadCommand {
     }
 
     /// Get artifact files on disk, either from --file or by exporting from Docker.
-    async fn get_artifacts_dir(&self) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    async fn get_artifacts_dir(
+        &self,
+        config: &Config,
+    ) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
         if let Some(ref file_or_dir) = self.file {
             let path = PathBuf::from(file_or_dir);
             if path.is_dir() {
@@ -207,7 +207,7 @@ impl ConnectUploadCommand {
             "Exporting runtime artifacts from build volume...",
             OutputLevel::Normal,
         );
-        let tarball = self.export_tarball().await?;
+        let tarball = self.export_tarball(config).await?;
         let tmp = tempfile::tempdir()?;
         extract_tarball(&tarball, tmp.path())?;
         let _ = std::fs::remove_file(&tarball);
@@ -215,7 +215,7 @@ impl ConnectUploadCommand {
     }
 
     /// Export the runtime tarball from the Docker volume using `avocado sdk run`.
-    async fn export_tarball(&self) -> Result<PathBuf> {
+    async fn export_tarball(&self, config: &Config) -> Result<PathBuf> {
         let output_file = ".connect-upload.tar.gz";
         let parent = PathBuf::from(&self.config_path)
             .parent()
@@ -231,11 +231,7 @@ impl ConnectUploadCommand {
         let _ = std::fs::remove_file(&tarball_path);
 
         // Resolve target
-        let target = self
-            .target
-            .clone()
-            .or_else(|| std::env::var("AVOCADO_TARGET").ok())
-            .context("No target specified. Set AVOCADO_TARGET or use --target.")?;
+        let target = resolve_target_required(self.target.as_deref(), config)?;
 
         // Write inner script to cwd (mounted as /opt/src in container)
         let config_parent = PathBuf::from(&self.config_path)
