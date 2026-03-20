@@ -440,14 +440,20 @@ enum ConnectCommands {
         #[command(subcommand)]
         command: ConnectAuthCommands,
     },
-    /// Initialize connect settings in avocado.yaml (org, project, server key)
+    /// Initialize connect settings in avocado.yaml (org, project, server key, extensions, claim token, device config)
     Init {
         /// Organization ID (skip interactive prompt)
         #[arg(long)]
         org: Option<String>,
-        /// Project name or ID (skip interactive prompt)
+        /// Project ID (skip interactive prompt)
         #[arg(long)]
         project: Option<String>,
+        /// Cohort ID (skip interactive prompt)
+        #[arg(long)]
+        cohort: Option<String>,
+        /// Runtime to add connect extensions to (default: dev)
+        #[arg(short, long, default_value = "dev")]
+        runtime: String,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
@@ -2551,12 +2557,16 @@ async fn main() -> Result<()> {
             ConnectCommands::Init {
                 org,
                 project,
+                cohort,
+                runtime,
                 config,
                 profile,
             } => {
                 let cmd = ConnectInitCommand {
                     org,
                     project,
+                    cohort,
+                    runtime,
                     config_path: config,
                     profile,
                 };
