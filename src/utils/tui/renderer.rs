@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::{cursor, execute, terminal::Clear, terminal::ClearType};
+use crossterm::{cursor, execute, terminal, terminal::Clear, terminal::ClearType};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -280,6 +280,8 @@ impl TaskRenderer {
         let mut stderr = std::io::stderr();
         let prev_rendered = *self.rendered_lines.lock().unwrap();
 
+        let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+
         // Advance spinner
         let frame = self.spin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let spinner = SPINNER[frame % SPINNER.len()];
@@ -327,17 +329,37 @@ impl TaskRenderer {
                 TaskStatus::Running => {
                     let elapsed = format_duration(task.elapsed());
                     let is_peek_task = !showed_peek && task.id == peek_task_id;
-                    let _ = writeln!(
-                        stderr,
-                        "\x1b[94m  {spinner}\x1b[0m {} {}",
-                        task.label, elapsed
-                    );
+
+                    // Try to show a progress counter on the status line
+                    let progress = task
+                        .output_ring
+                        .back()
+                        .and_then(|l| extract_progress(&strip_ansi(l)));
+                    if let Some(ref p) = progress {
+                        let _ = writeln!(
+                            stderr,
+                            "\x1b[94m  {spinner}\x1b[0m {} {} \x1b[2m{p}\x1b[0m",
+                            task.label, elapsed
+                        );
+                    } else {
+                        let _ = writeln!(
+                            stderr,
+                            "\x1b[94m  {spinner}\x1b[0m {} {}",
+                            task.label, elapsed
+                        );
+                    }
                     lines_written += 1;
-                    // Show peek for the running task with the most recent output.
+
+                    // Show the best non-noise line as a peek
                     if is_peek_task {
-                        if let Some(last_line) = task.output_ring.back() {
-                            let _ = writeln!(stderr, "\x1b[2m    {}\x1b[0m", strip_ansi(last_line));
-                            lines_written += 1;
+                        if let Some(peek) = best_peek_line(&task.output_ring) {
+                            let trimmed = peek.trim().to_string();
+                            if !trimmed.is_empty() {
+                                let max_w = term_width.saturating_sub(6);
+                                let display = truncate_with_ellipsis(&trimmed, max_w);
+                                let _ = writeln!(stderr, "\x1b[2m    {display}\x1b[0m");
+                                lines_written += 1;
+                            }
                         }
                         showed_peek = true;
                     }
@@ -474,6 +496,106 @@ fn format_duration(duration: Option<Duration>) -> String {
 }
 
 /// Strip ANSI escape sequences from a string.
+/// Lines matching these prefixes are noise from container scriptlets — skip them.
+const NOISE_PREFIXES: &[&str] = &[
+    "%post(",
+    "%prein(",
+    "%preun(",
+    "%posttrans(",
+    "%triggerin(",
+    "update-alternatives:",
+    "+ set -e",
+    "+ '[' ",
+    "+ test ",
+    "+ echo ",
+    "+ true",
+    "+ false",
+    "NOTE: ",
+    "Running groupadd",
+    "Running useradd",
+    "Running groupmems",
+    "+ perform_groupadd",
+    "+ perform_useradd",
+    "+ local ",
+    "++ echo ",
+    "++ grep ",
+    "++ cut ",
+    "++ sed ",
+    "++ awk ",
+    "++ tr ",
+    "+ bbnote ",
+    "+ break",
+    "+ opts=",
+    "+ remaining=",
+    "+ OPT=",
+    "+ SYSROOT=",
+    "+ GROUPADD_PARAM=",
+    "+ USERADD_PARAM=",
+    "+ GROUPMEMS_PARAM=",
+    "waitpid(",
+];
+
+/// Check if a line is just noise that should be skipped in the peek.
+fn is_noise(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    NOISE_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+}
+
+/// Try to extract a progress counter like "(45/120)" from a dnf-style line.
+/// Returns `Some("45/120")` if found.
+fn extract_progress(line: &str) -> Option<String> {
+    // Match patterns like "  Installing : foo  45/120" or "(45/120)" or "[45/120]"
+    // DNF format: "  Installing       : pkg-name   N/M"
+    let trimmed = line.trim();
+
+    // Look for N/M pattern at the end of the line (dnf progress)
+    if let Some(pos) = trimmed.rfind(|c: char| c.is_ascii_whitespace()) {
+        let tail = trimmed[pos..].trim();
+        if let Some((a, b)) = tail.split_once('/') {
+            if a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok() {
+                return Some(tail.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Find the best line to show as the peek from the ring buffer.
+/// Skips noise lines and returns the last meaningful one.
+fn best_peek_line(ring: &std::collections::VecDeque<String>) -> Option<String> {
+    // Walk backwards to find the last non-noise line
+    for line in ring.iter().rev() {
+        let clean = strip_ansi(line);
+        if !is_noise(&clean) {
+            return Some(clean);
+        }
+    }
+    // Fall back to the very last line if everything is noise
+    ring.back().map(|l| strip_ansi(l))
+}
+
+/// Truncate a string to fit within `max_width` visible characters, adding
+/// "..." if truncated.
+fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    if max_width < 4 {
+        return s.chars().take(max_width).collect();
+    }
+    if s.len() <= max_width {
+        return s.to_string();
+    }
+    // Count visible chars (rough — doesn't handle wide chars)
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_width {
+        return s.to_string();
+    }
+    let mut result: String = chars[..max_width - 3].iter().collect();
+    result.push_str("...");
+    result
+}
+
 pub fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -508,5 +630,61 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[91mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("no ansi here"), "no ansi here");
         assert_eq!(strip_ansi("\x1b[2m\x1b[94mblue\x1b[0m"), "blue");
+    }
+
+    #[test]
+    fn test_is_noise() {
+        assert!(is_noise(""));
+        assert!(is_noise("   "));
+        assert!(is_noise(
+            "%post(kmod-31-r0.0.core2_64): waitpid(7857) rc 7857 status 0"
+        ));
+        assert!(is_noise("+ set -e"));
+        assert!(is_noise("update-alternatives: Linking /opt/foo to /bar"));
+        assert!(is_noise("  + '[' x = x ']'"));
+        assert!(is_noise("NOTE: systemd: group render already exists"));
+        assert!(is_noise("Running groupadd commands..."));
+        assert!(!is_noise("Installing : kmod-31-r0.0.core2_64  45/240"));
+        assert!(!is_noise("Complete!"));
+        assert!(!is_noise("Dependencies resolved."));
+    }
+
+    #[test]
+    fn test_extract_progress() {
+        assert_eq!(
+            extract_progress("  Installing : kmod-31-r0.0.core2_64                     45/240"),
+            Some("45/240".to_string())
+        );
+        assert_eq!(
+            extract_progress("  Preparing  :                                            1/1"),
+            Some("1/1".to_string())
+        );
+        assert_eq!(extract_progress("Complete!"), None);
+        assert_eq!(extract_progress("Dependencies resolved."), None);
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("short", 80), "short");
+        assert_eq!(
+            truncate_with_ellipsis("this is a very long line that should be truncated", 20),
+            "this is a very lo..."
+        );
+        assert_eq!(truncate_with_ellipsis("exact", 5), "exact");
+    }
+
+    #[test]
+    fn test_best_peek_line() {
+        use std::collections::VecDeque;
+
+        let mut ring = VecDeque::new();
+        ring.push_back("+ set -e".to_string());
+        ring.push_back("%post(foo): waitpid(123) rc 123 status 0".to_string());
+        ring.push_back("  Installing : kmod-31  45/240".to_string());
+        ring.push_back("+ '[' x = x ']'".to_string());
+
+        // Should skip the noise and find the Installing line
+        let peek = best_peek_line(&ring);
+        assert_eq!(peek, Some("  Installing : kmod-31  45/240".to_string()));
     }
 }
