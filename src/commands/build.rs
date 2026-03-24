@@ -12,7 +12,7 @@ use crate::commands::{
 use crate::utils::{
     config::{ComposedConfig, Config, ExtensionSource},
     container::{SdkContainer, TuiContext},
-    output::{print_info, print_success, should_use_tui, OutputLevel},
+    output::{print_error, print_info, print_success, should_use_tui, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
     tui::{TaskId, TaskRenderer, TaskStatus},
 };
@@ -355,11 +355,12 @@ impl BuildCommand {
 
             // Always shut down BEFORE propagating the error so the render
             // loop stops and can't corrupt the terminal.
-            if sched_result.is_err() {
+            if let Err(e) = sched_result {
                 if let Some(ref r) = renderer {
                     r.shutdown();
                 }
-                sched_result?;
+                print_error(&format!("{e:#}"), OutputLevel::Normal);
+                std::process::exit(1);
             }
         }
 
@@ -416,7 +417,8 @@ impl BuildCommand {
         }
 
         if let Some(e) = rt_error {
-            return Err(e);
+            print_error(&format!("{e:#}"), OutputLevel::Normal);
+            std::process::exit(1);
         }
 
         print_success("All components built successfully!", OutputLevel::Normal);

@@ -10,7 +10,7 @@ use crate::commands::{
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::TuiContext,
-    output::{print_info, print_success, should_use_tui, OutputLevel},
+    output::{print_error, print_info, print_success, should_use_tui, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
     target::validate_and_log_target,
     tui::{TaskId, TaskRenderer, TaskStatus},
@@ -198,7 +198,13 @@ impl InstallCommand {
             } else {
                 r.set_status(&TaskId::SdkInstall, TaskStatus::Failed);
                 r.shutdown();
-                return sdk_result.with_context(|| "Failed to install SDK dependencies");
+                if let Err(e) = sdk_result {
+                    print_error(
+                        &format!("{:#}", e.context("Failed to install SDK dependencies")),
+                        OutputLevel::Normal,
+                    );
+                }
+                std::process::exit(1);
             }
         }
 
@@ -359,7 +365,10 @@ impl InstallCommand {
             if let Some(ref r) = renderer {
                 r.shutdown();
             }
-            sched_result?;
+            if let Err(e) = sched_result {
+                print_error(&format!("{e:#}"), OutputLevel::Normal);
+                std::process::exit(1);
+            }
         } else {
             // No scheduler tasks — still need to shut down the renderer
             if let Some(ref r) = renderer {
@@ -502,7 +511,7 @@ impl InstallCommand {
 // ---------------------------------------------------------------------------
 
 use crate::utils::config_edit::PackageScope;
-use crate::utils::output::{print_error, OutputLevel as OL};
+use crate::utils::output::OutputLevel as OL;
 
 /// `avocado install <packages> -e <ext>` -- add packages to config + install
 pub struct PackageAddCommand {
