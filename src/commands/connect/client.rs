@@ -260,6 +260,8 @@ pub struct CreateClaimTokenParams {
     /// Set to a far-future date for no expiration, or omit for default (24h).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

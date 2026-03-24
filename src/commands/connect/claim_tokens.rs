@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::commands::connect::client::{
-    self, ConnectClient, CreateClaimTokenParams, CreateClaimTokenRequest,
+    self, CohortInfo, ConnectClient, CreateClaimTokenParams, CreateClaimTokenRequest, ProjectInfo,
 };
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
@@ -50,8 +50,10 @@ impl ConnectClaimTokensListCommand {
 
 pub struct ConnectClaimTokensCreateCommand {
     pub org: String,
+    pub project: Option<String>,
+    pub cohort: Option<String>,
     pub name: String,
-    pub cohort_id: Option<String>,
+    pub tags: Vec<String>,
     pub max_uses: Option<i64>,
     pub no_expiration: bool,
     pub profile: Option<String>,
@@ -64,8 +66,10 @@ impl ConnectClaimTokensCreateCommand {
         let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
+        // Select project → cohort (interactive if flags not provided)
+        let selected_cohort = self.resolve_cohort(&client).await?;
+
         let expires_at = if self.no_expiration {
-            // Far-future date to effectively disable expiration
             Some("2099-12-31T23:59:59Z".to_string())
         } else {
             None
@@ -74,9 +78,10 @@ impl ConnectClaimTokensCreateCommand {
         let req = CreateClaimTokenRequest {
             claim_token: CreateClaimTokenParams {
                 name: self.name.clone(),
-                cohort_id: self.cohort_id.clone(),
+                cohort_id: selected_cohort.as_ref().map(|c| c.id.clone()),
                 max_uses: self.max_uses,
                 expires_at,
+                tags: self.tags.clone(),
             },
         };
 
@@ -87,6 +92,17 @@ impl ConnectClaimTokensCreateCommand {
             OutputLevel::Normal,
         );
 
+        if let Some(ref cohort) = selected_cohort {
+            if cohort.name.is_empty() {
+                println!("  Cohort: {}", cohort.id);
+            } else {
+                println!("  Cohort: {} ({})", cohort.name, cohort.id);
+            }
+        }
+        if !self.tags.is_empty() {
+            println!("  Tags:   {}", self.tags.join(", "));
+        }
+
         // The raw token is only shown on creation
         if let Some(ref raw_token) = token.token {
             println!("\nToken value (save this — it cannot be retrieved later):");
@@ -94,6 +110,76 @@ impl ConnectClaimTokensCreateCommand {
         }
 
         Ok(())
+    }
+
+    async fn resolve_cohort(&self, client: &ConnectClient) -> Result<Option<CohortInfo>> {
+        // If --cohort provided directly, use it as-is (API validates the ID)
+        if let Some(ref cohort_flag) = self.cohort {
+            return Ok(Some(CohortInfo {
+                id: cohort_flag.clone(),
+                name: String::new(),
+            }));
+        }
+
+        // Interactive: select project then cohort
+        let projects = client.list_projects(&self.org).await?;
+
+        if projects.is_empty() {
+            print_info(
+                "No projects found — claim token will be org-scoped.",
+                OutputLevel::Normal,
+            );
+            return Ok(None);
+        }
+
+        let selected_project = if let Some(ref proj_flag) = self.project {
+            projects
+                .iter()
+                .find(|p| p.id == *proj_flag)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Project '{}' not found. Available: {}",
+                        proj_flag,
+                        projects
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?
+        } else if projects.len() == 1 {
+            let proj = projects[0].clone();
+            print_info(
+                &format!("Auto-selected project: {} ({})", proj.name, proj.id),
+                OutputLevel::Normal,
+            );
+            proj
+        } else {
+            prompt_select_project(&projects)?
+        };
+
+        let cohorts = client.list_cohorts(&self.org, &selected_project.id).await?;
+
+        if cohorts.is_empty() {
+            anyhow::bail!(
+                "No cohorts found in project '{}'. Create a cohort first, or use --cohort to specify one directly.",
+                selected_project.name
+            );
+        }
+
+        let selected_cohort = if cohorts.len() == 1 {
+            let cohort = cohorts[0].clone();
+            print_info(
+                &format!("Auto-selected cohort: {} ({})", cohort.name, cohort.id),
+                OutputLevel::Normal,
+            );
+            cohort
+        } else {
+            prompt_select_cohort(&cohorts)?
+        };
+
+        Ok(Some(selected_cohort))
     }
 }
 
@@ -133,4 +219,46 @@ impl ConnectClaimTokensDeleteCommand {
 
         Ok(())
     }
+}
+
+fn prompt_select_project(projects: &[ProjectInfo]) -> Result<ProjectInfo> {
+    println!("\nSelect a project:");
+    for (i, proj) in projects.iter().enumerate() {
+        println!("  [{}] {} (id: {})", i + 1, proj.name, proj.id);
+    }
+    eprint!("\nEnter number (1-{}): ", projects.len());
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read input")?;
+
+    let choice: usize = input.trim().parse().context("Invalid number")?;
+
+    if choice < 1 || choice > projects.len() {
+        anyhow::bail!("Selection out of range");
+    }
+
+    Ok(projects[choice - 1].clone())
+}
+
+fn prompt_select_cohort(cohorts: &[CohortInfo]) -> Result<CohortInfo> {
+    println!("\nSelect a cohort:");
+    for (i, cohort) in cohorts.iter().enumerate() {
+        println!("  [{}] {} (id: {})", i + 1, cohort.name, cohort.id);
+    }
+    eprint!("\nEnter number (1-{}): ", cohorts.len());
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read input")?;
+
+    let choice: usize = input.trim().parse().context("Invalid number")?;
+
+    if choice < 1 || choice > cohorts.len() {
+        anyhow::bail!("Selection out of range");
+    }
+
+    Ok(cohorts[choice - 1].clone())
 }

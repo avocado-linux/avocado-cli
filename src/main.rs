@@ -844,12 +844,18 @@ enum ConnectClaimTokensCommands {
         /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
         org: Option<String>,
+        /// Project ID (skip interactive prompt)
+        #[arg(long)]
+        project: Option<String>,
+        /// Cohort ID (skip interactive prompt)
+        #[arg(long)]
+        cohort: Option<String>,
         /// Token name
         #[arg(long)]
         name: String,
-        /// Cohort ID to assign claimed devices to
-        #[arg(long)]
-        cohort_id: Option<String>,
+        /// Tags to associate with devices claimed using this token (repeatable)
+        #[arg(long, short = 't')]
+        tag: Vec<String>,
         /// Maximum number of times this token can be used
         #[arg(long)]
         max_uses: Option<i64>,
@@ -2752,8 +2758,10 @@ async fn main() -> Result<()> {
                 }
                 ConnectClaimTokensCommands::Create {
                     org,
+                    project,
+                    cohort,
                     name,
-                    cohort_id,
+                    tag,
                     max_uses,
                     no_expiration,
                     config,
@@ -2762,8 +2770,10 @@ async fn main() -> Result<()> {
                     let resolved_org = commands::connect::resolve_org(org, &config)?;
                     let cmd = ConnectClaimTokensCreateCommand {
                         org: resolved_org,
+                        project,
+                        cohort,
                         name,
-                        cohort_id,
+                        tags: tag,
                         max_uses,
                         no_expiration,
                         profile,
