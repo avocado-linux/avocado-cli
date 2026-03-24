@@ -91,6 +91,10 @@ struct Cli {
     /// SDK container architecture for cross-arch emulation via Docker buildx/QEMU (aarch64 or x86-64)
     #[arg(long, value_name = "ARCH", global = true)]
     sdk_arch: Option<String>,
+
+    /// Disable TUI output (use legacy sequential output with inherited stdio)
+    #[arg(long, global = true)]
+    no_tui: bool,
 }
 
 #[derive(Subcommand)]
@@ -1374,6 +1378,11 @@ fn build_env_vars(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Set AVOCADO_NO_TUI env var so all should_use_tui() calls respect --no-tui
+    if cli.no_tui {
+        std::env::set_var("AVOCADO_NO_TUI", "1");
+    }
+
     let is_upgrade = matches!(cli.command, Commands::Upgrade { .. });
     let update_handle = if !is_upgrade {
         Some(tokio::spawn(utils::update_check::check_for_update()))
@@ -1768,7 +1777,7 @@ async fn main() -> Result<()> {
                 // Validate runtime exists if provided
                 validate_runtime_if_provided(&config, runtime.as_ref())?;
 
-                let install_cmd = RuntimeInstallCommand::new(
+                let mut install_cmd = RuntimeInstallCommand::new(
                     runtime,
                     config,
                     verbose,
@@ -1798,7 +1807,7 @@ async fn main() -> Result<()> {
                 // Validate runtime exists (required argument)
                 validate_runtime_required(&config, &runtime)?;
 
-                let build_cmd = RuntimeBuildCommand::new(
+                let mut build_cmd = RuntimeBuildCommand::new(
                     runtime,
                     config,
                     verbose,
@@ -2363,7 +2372,7 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let install_cmd = SdkInstallCommand::new(
+                let mut install_cmd = SdkInstallCommand::new(
                     config,
                     verbose,
                     force,

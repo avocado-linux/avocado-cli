@@ -8,8 +8,10 @@ use crate::commands::{
 };
 use crate::utils::{
     config::{ComposedConfig, Config},
-    output::{print_info, print_success, OutputLevel},
+    container::TuiContext,
+    output::{print_info, print_success, should_use_tui, OutputLevel},
     target::validate_and_log_target,
+    tui::{TaskId, TaskRenderer, TaskStatus},
 };
 
 /// Represents an extension dependency
@@ -122,9 +124,31 @@ impl InstallCommand {
             OutputLevel::Normal,
         );
 
+        // Create a single TUI renderer for the entire install flow.
+        // We register the SDK task now; ext/runtime tasks are added after
+        // config reload (once we know which extensions were fetched).
+        let renderer = if should_use_tui() && !self.verbose {
+            let r = Arc::new(TaskRenderer::new(false));
+            r.register_task(TaskId::SdkInstall, "sdk install".to_string());
+            crate::utils::tui::set_active_renderer(&r);
+            r.start();
+            Some(r)
+        } else {
+            None
+        };
+
         // 1. Install SDK dependencies
+        if let Some(ref r) = renderer {
+            r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        }
         print_info("Step 1/3: Installing SDK dependencies", OutputLevel::Normal);
-        let sdk_install_cmd = SdkInstallCommand::new(
+
+        let sdk_tui_ctx = renderer.as_ref().map(|r| TuiContext {
+            task_id: TaskId::SdkInstall,
+            renderer: Arc::clone(r),
+        });
+
+        let mut sdk_install_cmd = SdkInstallCommand::new(
             self.config_path.clone(),
             self.verbose,
             self.force,
@@ -136,13 +160,26 @@ impl InstallCommand {
         .with_runs_on(self.runs_on.clone(), self.nfs_port)
         .with_sdk_arch(self.sdk_arch.clone())
         .with_composed_config(Arc::clone(&composed));
-        sdk_install_cmd
-            .execute()
-            .await
-            .with_context(|| "Failed to install SDK dependencies")?;
+
+        if let Some(ctx) = sdk_tui_ctx {
+            sdk_install_cmd = sdk_install_cmd.with_tui_context(ctx);
+        }
+
+        let sdk_result = sdk_install_cmd.execute().await;
+
+        if let Some(ref r) = renderer {
+            if sdk_result.is_ok() {
+                r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
+            } else {
+                r.set_status(&TaskId::SdkInstall, TaskStatus::Failed);
+                r.shutdown();
+                return sdk_result.with_context(|| "Failed to install SDK dependencies");
+            }
+        }
+
+        sdk_result.with_context(|| "Failed to install SDK dependencies")?;
 
         // Reload composed config after SDK install to pick up newly fetched remote extensions
-        // SDK install includes ext fetch which downloads remote extensions to $AVOCADO_PREFIX/includes/
         let composed = Arc::new(
             Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
                 || {
@@ -156,14 +193,43 @@ impl InstallCommand {
         let config = &composed.config;
         let parsed = &composed.merged_value;
 
+        // Determine which extensions and runtimes to install
+        let extensions_to_install = self.find_required_extensions(&composed, &_target)?;
+        let target_runtimes = self.find_target_relevant_runtimes(config, parsed, &_target)?;
+
+        // Register ext/runtime tasks on the existing renderer now that we
+        // know which extensions were fetched by SDK install.
+        if let Some(ref r) = renderer {
+            for ext_dep in &extensions_to_install {
+                let ExtensionDependency::Local(name) = ext_dep;
+                r.register_task(
+                    TaskId::ExtInstall(name.clone()),
+                    format!("ext install {name}"),
+                );
+            }
+            for rt in &target_runtimes {
+                r.register_task(
+                    TaskId::RuntimeInstall(rt.clone()),
+                    format!("runtime install {rt}"),
+                );
+            }
+        }
+
+        fn make_tui_ctx(
+            renderer: &Option<Arc<TaskRenderer>>,
+            task_id: TaskId,
+        ) -> Option<TuiContext> {
+            renderer.as_ref().map(|r| TuiContext {
+                task_id,
+                renderer: Arc::clone(r),
+            })
+        }
+
         // 2. Install extension dependencies
         print_info(
             "Step 2/3: Installing extension dependencies",
             OutputLevel::Normal,
         );
-
-        // Determine which extensions to install based on runtime dependencies and target
-        let extensions_to_install = self.find_required_extensions(&composed, &_target)?;
 
         if !extensions_to_install.is_empty() {
             for extension_dep in &extensions_to_install {
@@ -175,7 +241,13 @@ impl InstallCommand {
                     );
                 }
 
-                let ext_install_cmd = ExtInstallCommand::new(
+                let ext_task_id = TaskId::ExtInstall(extension_name.clone());
+                if let Some(ref r) = renderer {
+                    r.set_status(&ext_task_id, TaskStatus::Running);
+                }
+                let tui_ctx = make_tui_ctx(&renderer, ext_task_id.clone());
+
+                let mut ext_install_cmd = ExtInstallCommand::new(
                     Some(extension_name.clone()),
                     self.config_path.clone(),
                     self.verbose,
@@ -188,7 +260,22 @@ impl InstallCommand {
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(&composed));
-                ext_install_cmd.execute().await.with_context(|| {
+
+                if let Some(ctx) = tui_ctx {
+                    ext_install_cmd = ext_install_cmd.with_tui_context(ctx);
+                }
+
+                let result = ext_install_cmd.execute().await;
+
+                if let Some(ref r) = renderer {
+                    if result.is_ok() {
+                        r.set_status(&ext_task_id, TaskStatus::Success);
+                    } else {
+                        r.set_status(&ext_task_id, TaskStatus::Failed);
+                    }
+                }
+
+                result.with_context(|| {
                     format!("Failed to install extension dependencies for '{extension_name}'")
                 })?;
             }
@@ -197,8 +284,6 @@ impl InstallCommand {
         }
 
         // 3. Install runtime dependencies (filtered by target)
-        let target_runtimes = self.find_target_relevant_runtimes(config, parsed, &_target)?;
-
         if target_runtimes.is_empty() {
             print_info(
                 &format!("Step 3/3: No runtimes found for target '{_target}'. Skipping runtime dependencies."),
@@ -228,8 +313,14 @@ impl InstallCommand {
                     );
                 }
 
-                let runtime_install_cmd = RuntimeInstallCommand::new(
-                    Some(runtime_name.clone()), // Install for this specific target-relevant runtime
+                let rt_task_id = TaskId::RuntimeInstall(runtime_name.clone());
+                if let Some(ref r) = renderer {
+                    r.set_status(&rt_task_id, TaskStatus::Running);
+                }
+                let tui_ctx = make_tui_ctx(&renderer, rt_task_id.clone());
+
+                let mut runtime_install_cmd = RuntimeInstallCommand::new(
+                    Some(runtime_name.clone()),
                     self.config_path.clone(),
                     self.verbose,
                     self.force,
@@ -241,10 +332,29 @@ impl InstallCommand {
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
                 .with_composed_config(Arc::clone(&composed));
-                runtime_install_cmd.execute().await.with_context(|| {
+
+                if let Some(ctx) = tui_ctx {
+                    runtime_install_cmd = runtime_install_cmd.with_tui_context(ctx);
+                }
+
+                let result = runtime_install_cmd.execute().await;
+
+                if let Some(ref r) = renderer {
+                    if result.is_ok() {
+                        r.set_status(&rt_task_id, TaskStatus::Success);
+                    } else {
+                        r.set_status(&rt_task_id, TaskStatus::Failed);
+                    }
+                }
+
+                result.with_context(|| {
                     format!("Failed to install runtime dependencies for '{runtime_name}'")
                 })?;
             }
+        }
+
+        if let Some(ref r) = renderer {
+            r.shutdown();
         }
 
         print_success(
@@ -466,7 +576,7 @@ impl PackageAddCommand {
                 cmd.execute().await
             }
             PackageScope::Runtime(name) => {
-                let cmd = RuntimeInstallCommand::new(
+                let mut cmd = RuntimeInstallCommand::new(
                     Some(name.clone()),
                     self.config_path.clone(),
                     self.verbose,
@@ -481,7 +591,7 @@ impl PackageAddCommand {
                 cmd.execute().await
             }
             PackageScope::Sdk => {
-                let cmd = SdkInstallCommand::new(
+                let mut cmd = SdkInstallCommand::new(
                     self.config_path.clone(),
                     self.verbose,
                     self.force,
@@ -585,7 +695,7 @@ impl PackageRemoveCommand {
                 cmd.execute().await
             }
             PackageScope::Runtime(name) => {
-                let cmd = RuntimeInstallCommand::new(
+                let mut cmd = RuntimeInstallCommand::new(
                     Some(name.clone()),
                     self.config_path.clone(),
                     self.verbose,
@@ -600,7 +710,7 @@ impl PackageRemoveCommand {
                 cmd.execute().await
             }
             PackageScope::Sdk => {
-                let cmd = SdkInstallCommand::new(
+                let mut cmd = SdkInstallCommand::new(
                     self.config_path.clone(),
                     self.verbose,
                     self.force,

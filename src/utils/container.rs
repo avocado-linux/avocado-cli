@@ -3,12 +3,29 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::env;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
+use crate::utils::tui::{TaskId, TaskRenderer, TaskStatus};
 use crate::utils::volume::{VolumeManager, VolumeState};
+
+/// Context for TUI-managed output capture.
+#[derive(Clone)]
+pub struct TuiContext {
+    pub task_id: TaskId,
+    pub renderer: std::sync::Arc<TaskRenderer>,
+}
+
+impl std::fmt::Debug for TuiContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiContext")
+            .field("task_id", &self.task_id)
+            .finish()
+    }
+}
 
 /// Check if SELinux is enabled on the host system.
 /// Returns true if SELinux is present and enabled (enforcing or permissive).
@@ -202,6 +219,9 @@ pub struct RunConfig {
     /// Extension source paths to mount via bindfs (extension name -> host path)
     /// These are mounted at /mnt/ext/<ext_name> and bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
     pub ext_path_mounts: Option<HashMap<String, PathBuf>>,
+    /// TUI context for managed output capture. When set, container output is
+    /// piped and fed to the TUI renderer instead of inheriting stdio.
+    pub tui_context: Option<TuiContext>,
 }
 
 impl Default for RunConfig {
@@ -234,6 +254,7 @@ impl Default for RunConfig {
             nfs_port: None,
             sdk_arch: None,
             ext_path_mounts: None,
+            tui_context: None,
         }
     }
 }
@@ -472,14 +493,25 @@ impl SdkContainer {
         let container_cmd =
             self.build_container_command(&effective_config, &bash_cmd, &env_vars, &volume_state)?;
 
-        // Execute the command
-        self.execute_container_command(
-            &container_cmd,
-            effective_config.detach,
-            effective_config.verbose || self.verbose,
-            effective_container_name.as_deref(),
-        )
-        .await
+        // Execute the command — route to TUI method if context is present
+        if let Some(ref tui_ctx) = effective_config.tui_context {
+            self.execute_container_command_with_tui(
+                &container_cmd,
+                effective_config.detach,
+                effective_config.verbose || self.verbose,
+                effective_container_name.as_deref(),
+                tui_ctx,
+            )
+            .await
+        } else {
+            self.execute_container_command(
+                &container_cmd,
+                effective_config.detach,
+                effective_config.verbose || self.verbose,
+                effective_container_name.as_deref(),
+            )
+            .await
+        }
     }
 
     /// Run a command in a container on a remote host via NFS
@@ -719,6 +751,13 @@ impl SdkContainer {
         }
         if config.interactive {
             container_cmd.push("-i".to_string());
+        }
+        // Allocate a PTY inside the container when:
+        // - interactive mode is on (existing behavior)
+        // - host stdout is a TTY AND we're NOT piping through TUI
+        // This makes programs like dnf output live progress bars. We skip -t
+        // in TUI mode because Docker -t with Stdio::piped() can cause hangs.
+        if config.interactive || (std::io::stdout().is_terminal() && config.tui_context.is_none()) {
             container_cmd.push("-t".to_string());
         }
 
@@ -1261,19 +1300,72 @@ impl SdkContainer {
                 Ok(false)
             }
         } else {
-            // In non-detached mode, inherit stdio and wait for completion
-            // We use spawn + select to handle Ctrl-C properly
+            // In non-detached mode, wait for completion with Ctrl-C handling.
             let mut cmd = AsyncCommand::new(&container_cmd[0]);
             cmd.args(&container_cmd[1..]);
-            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+            // When a TUI renderer is globally active, pipe output instead of
+            // inheriting stdio.  This prevents container output from leaking
+            // past the TUI display region.  The piped output is captured so
+            // it can be dumped on failure.
+            let global_renderer = crate::utils::tui::get_active_renderer();
+            if global_renderer.is_some() {
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            } else {
+                cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            }
 
             let mut child = cmd
                 .spawn()
                 .with_context(|| "Failed to spawn container command")?;
 
+            // If we piped output because a global renderer is active, spawn
+            // readers that silently capture it (available on failure via the
+            // renderer's task state).
+            let stdout_reader = if global_renderer.is_some() {
+                child.stdout.take().map(|s| {
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut reader = tokio::io::BufReader::new(s);
+                        let mut buf = [0u8; 4096];
+                        // Drain stdout — output is discarded (print_info calls
+                        // from within the command already route through the
+                        // global renderer).
+                        loop {
+                            match reader.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+            let stderr_reader = if global_renderer.is_some() {
+                child.stderr.take().map(|s| {
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut reader = tokio::io::BufReader::new(s);
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match reader.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+
             // Wait for either the process to complete or Ctrl-C
             tokio::select! {
                 status = child.wait() => {
+                    // Wait for readers to finish
+                    if let Some(h) = stdout_reader { let _ = h.await; }
+                    if let Some(h) = stderr_reader { let _ = h.await; }
                     let status = status.with_context(|| "Failed to wait for container command")?;
                     Ok(status.success())
                 }
@@ -1326,6 +1418,106 @@ impl SdkContainer {
                 }
             }
         }
+    }
+
+    /// Execute a container command with TUI output capture.
+    ///
+    /// Instead of inheriting stdio, this pipes stdout/stderr and feeds lines
+    /// to the TUI renderer for collapsible display. Handles carriage-return
+    /// progress bars and prompt detection for interactive input.
+    async fn execute_container_command_with_tui(
+        &self,
+        container_cmd: &[String],
+        detach: bool,
+        verbose: bool,
+        container_name: Option<&str>,
+        tui_ctx: &TuiContext,
+    ) -> Result<bool> {
+        // tokio::io imports are used by read_output_stream below
+
+        if verbose {
+            tui_ctx.renderer.print_above(&format!(
+                "\x1b[94m[INFO]\x1b[0m Container command: {}",
+                container_cmd.join(" ")
+            ));
+        }
+
+        // For detached mode, fall back to the normal path
+        if detach {
+            return self
+                .execute_container_command(container_cmd, detach, verbose, container_name)
+                .await;
+        }
+
+        tui_ctx
+            .renderer
+            .set_status(&tui_ctx.task_id, TaskStatus::Running);
+
+        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        cmd.args(&container_cmd[1..]);
+        // Pipe stdout/stderr so we can capture output line by line.
+        // The container still gets a PTY (-t flag) so programs like dnf
+        // produce live progress output.
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| "Failed to spawn container command")?;
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let task_id = tui_ctx.task_id.clone();
+        let renderer = tui_ctx.renderer.clone();
+        let task_id2 = tui_ctx.task_id.clone();
+        let renderer2 = tui_ctx.renderer.clone();
+
+        // Spawn stdout reader
+        let stdout_handle = stdout.map(|stdout| {
+            tokio::spawn(async move {
+                read_output_stream(stdout, &task_id, &renderer).await;
+            })
+        });
+
+        // Spawn stderr reader
+        let stderr_handle = stderr.map(|stderr| {
+            tokio::spawn(async move {
+                read_output_stream(stderr, &task_id2, &renderer2).await;
+            })
+        });
+
+        // Wait for either the process to complete or Ctrl-C
+        let result = tokio::select! {
+            status = child.wait() => {
+                let status = status.with_context(|| "Failed to wait for container command")?;
+                Ok(status.success())
+            }
+            _ = tokio::signal::ctrl_c() => {
+                // Stop the container gracefully
+                if let Some(name) = container_name {
+                    let _ = AsyncCommand::new(&self.container_tool)
+                        .args(["stop", "-t", "2", name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .await;
+                } else {
+                    let _ = child.kill().await;
+                }
+                let _ = child.wait().await;
+                Err(anyhow::anyhow!("Interrupted by user"))
+            }
+        };
+
+        // Wait for output readers to finish
+        if let Some(h) = stdout_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = stderr_handle {
+            let _ = h.await;
+        }
+
+        result
     }
 
     /// Run a simple command in the container without the full SDK entrypoint.
@@ -2130,6 +2322,56 @@ fi
     }
 }
 
+/// Read an output stream (stdout or stderr) from a container process and feed
+/// lines to the TUI renderer. Handles both newlines (`\n`) and carriage returns
+/// (`\r`) — the latter is used by progress bars (e.g. dnf) to overwrite the
+/// current line in place.
+async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
+    stream: R,
+    task_id: &TaskId,
+    renderer: &std::sync::Arc<TaskRenderer>,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut buf = [0u8; 4096];
+    let mut current_line = String::new();
+
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                for ch in chunk.chars() {
+                    match ch {
+                        '\n' => {
+                            // Complete line — append to ring buffer
+                            let line = std::mem::take(&mut current_line);
+                            renderer.append_output(task_id, line);
+                        }
+                        '\r' => {
+                            // Carriage return — replace last line (progress bar update)
+                            if !current_line.is_empty() {
+                                let line = std::mem::take(&mut current_line);
+                                renderer.replace_last_output(task_id, line);
+                            }
+                        }
+                        _ => {
+                            current_line.push(ch);
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Flush any remaining partial line
+    if !current_line.is_empty() {
+        renderer.append_output(task_id, current_line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2189,6 +2431,7 @@ mod tests {
             nfs_port: None,
             sdk_arch: None,
             ext_path_mounts: None,
+            tui_context: None,
         };
 
         let result = container.build_container_command(&config, &command, &env_vars, &volume_state);

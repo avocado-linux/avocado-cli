@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
-use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -12,6 +12,7 @@ use crate::utils::stamps::{
     compute_ext_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
+use crate::utils::tui::{TaskId, TaskStatus};
 
 pub struct ExtInstallCommand {
     extension: Option<String>,
@@ -27,6 +28,7 @@ pub struct ExtInstallCommand {
     sdk_arch: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    pub tui_context: Option<TuiContext>,
 }
 
 impl ExtInstallCommand {
@@ -52,6 +54,7 @@ impl ExtInstallCommand {
             nfs_port: None,
             sdk_arch: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -80,7 +83,28 @@ impl ExtInstallCommand {
         self
     }
 
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
+        let ext_label = self.extension.as_deref().unwrap_or("all");
+        let _standalone_tui = if self.tui_context.is_none() && self.force {
+            crate::utils::tui::create_standalone_tui(
+                TaskId::ExtInstall(ext_label.to_string()),
+                &format!("ext install {}", ext_label),
+                self.verbose,
+            )
+        } else {
+            None
+        };
+        // Use either the provided tui_context or the standalone one
+        let effective_tui_context = self
+            .tui_context
+            .clone()
+            .or_else(|| _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone()));
+
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -235,6 +259,7 @@ impl ExtInstallCommand {
                 repo_release.as_ref(),
                 &merged_container_args,
                 runs_on_context.as_ref(),
+                &effective_tui_context,
             )
             .await;
 
@@ -246,6 +271,15 @@ impl ExtInstallCommand {
                     OutputLevel::Normal,
                 );
             }
+        }
+
+        if let Some((ref ctx, ref renderer)) = _standalone_tui {
+            if result.is_ok() {
+                renderer.set_status(&ctx.task_id, TaskStatus::Success);
+            } else {
+                renderer.set_status(&ctx.task_id, TaskStatus::Failed);
+            }
+            renderer.shutdown();
         }
 
         result
@@ -265,6 +299,7 @@ impl ExtInstallCommand {
         repo_release: Option<&String>,
         merged_container_args: &Option<Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
+        effective_tui_context: &Option<TuiContext>,
     ) -> Result<()> {
         let total = extensions_to_install.len();
 
@@ -313,6 +348,7 @@ impl ExtInstallCommand {
                     &mut lock_file,
                     &src_dir,
                     runs_on_context,
+                    effective_tui_context,
                 )
                 .await?
             {
@@ -339,6 +375,7 @@ impl ExtInstallCommand {
                     dnf_args: self.dnf_args.clone(),
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
+                    tui_context: effective_tui_context.clone(),
                     ..Default::default()
                 };
 
@@ -445,6 +482,7 @@ impl ExtInstallCommand {
         lock_file: &mut LockFile,
         src_dir: &Path,
         runs_on_context: Option<&RunsOnContext>,
+        effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
         let sysroot = SysrootType::Extension(extension.to_string());
 
@@ -476,6 +514,7 @@ impl ExtInstallCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: effective_tui_context.clone(),
                 ..Default::default()
             };
             // Best-effort clean -- if sysroot doesn't exist, this is a no-op
@@ -499,6 +538,7 @@ impl ExtInstallCommand {
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
+            tui_context: effective_tui_context.clone(),
             ..Default::default()
         };
         let sysroot_exists =
@@ -516,6 +556,7 @@ impl ExtInstallCommand {
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
+                tui_context: effective_tui_context.clone(),
                 ..Default::default()
             };
             let success =
@@ -731,6 +772,7 @@ $DNF_SDK_HOST \
                     disable_weak_dependencies,
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
+                    tui_context: effective_tui_context.clone(),
                     ..Default::default()
                 };
                 let install_success =

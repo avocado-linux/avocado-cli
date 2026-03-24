@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::commands::rootfs::install::{install_sysroot, SysrootInstallParams};
 use crate::utils::{
     config::{find_active_compile_sections, find_active_extensions, ComposedConfig, Config},
-    container::{normalize_sdk_arch, RunConfig, SdkContainer},
+    container::{normalize_sdk_arch, RunConfig, SdkContainer, TuiContext},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -18,6 +18,7 @@ use crate::utils::{
         Stamp, StampOutputs,
     },
     target::validate_and_log_target,
+    tui::{TaskId, TaskStatus},
 };
 
 /// Implementation of the 'sdk install' command.
@@ -44,6 +45,7 @@ pub struct SdkInstallCommand {
     pub sdk_arch: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    pub tui_context: Option<TuiContext>,
 }
 
 impl SdkInstallCommand {
@@ -68,6 +70,7 @@ impl SdkInstallCommand {
             nfs_port: None,
             sdk_arch: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -96,8 +99,27 @@ impl SdkInstallCommand {
         self
     }
 
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
+        self
+    }
+
     /// Execute the sdk install command
-    pub async fn execute(&self) -> Result<()> {
+    pub async fn execute(&mut self) -> Result<()> {
+        let _standalone_tui = if self.tui_context.is_none() && self.force {
+            crate::utils::tui::create_standalone_tui(
+                TaskId::SdkInstall,
+                "sdk install",
+                self.verbose,
+            )
+        } else {
+            None
+        };
+        // Use either the provided tui_context or the standalone one
+        if self.tui_context.is_none() {
+            self.tui_context = _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone());
+        }
+
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -181,6 +203,13 @@ impl SdkInstallCommand {
                     &format!("Warning: Failed to cleanup remote resources: {e}"),
                     OutputLevel::Normal,
                 );
+            }
+        }
+
+        if result.is_ok() {
+            if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                renderer.shutdown();
             }
         }
 
@@ -740,6 +769,7 @@ MACROS_EOF
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             // runs_on handled by shared context
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
 
@@ -800,6 +830,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             // runs_on handled by shared context
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
 
@@ -852,6 +883,7 @@ $DNF_SDK_HOST \
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             // runs_on handled by shared context
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
 
@@ -905,6 +937,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             // runs_on handled by shared context
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
 
@@ -1001,6 +1034,7 @@ fi
             dnf_args: self.dnf_args.clone(),
             disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
             // runs_on handled by shared context
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
 
@@ -1086,6 +1120,7 @@ $DNF_SDK_HOST \
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
             let install_success = run_container_command(
@@ -1267,6 +1302,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
 
@@ -1369,6 +1405,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
                 container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
 
@@ -1419,6 +1456,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
 

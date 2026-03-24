@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::find_ext_in_mapping;
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
-use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::stamps::{
     compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
@@ -12,6 +12,7 @@ use crate::utils::stamps::{
     StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
+use crate::utils::tui::{TaskId, TaskStatus};
 
 #[derive(Debug, Clone)]
 struct OverlayConfig {
@@ -39,6 +40,7 @@ pub struct ExtBuildCommand {
     pub sdk_arch: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    pub tui_context: Option<TuiContext>,
 }
 
 impl ExtBuildCommand {
@@ -62,6 +64,7 @@ impl ExtBuildCommand {
             nfs_port: None,
             sdk_arch: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -90,7 +93,28 @@ impl ExtBuildCommand {
         self
     }
 
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
+        // Create standalone TUI if not provided by parent orchestrator
+        let _standalone_tui = if self.tui_context.is_none() {
+            crate::utils::tui::create_standalone_tui(
+                TaskId::ExtBuild(self.extension.clone()),
+                &format!("ext build {}", self.extension),
+                self.verbose,
+            )
+        } else {
+            None
+        };
+        // Use either the provided tui_context or the standalone one
+        let effective_tui_context = self
+            .tui_context
+            .clone()
+            .or_else(|| _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone()));
+
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -145,6 +169,7 @@ impl ExtBuildCommand {
                 sdk_arch: self.sdk_arch.clone(),
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
+                tui_context: effective_tui_context.clone(),
                 ..Default::default()
             };
 
@@ -260,6 +285,7 @@ impl ExtBuildCommand {
             &target,
             &ext_config_path,
             ext_script_workdir.as_deref(),
+            &effective_tui_context,
         )
         .await?;
 
@@ -487,6 +513,7 @@ impl ExtBuildCommand {
                         groups_config,
                         reload_service_manager,
                         &ext_src_path,
+                        &effective_tui_context,
                     )
                     .await?
                 }
@@ -508,6 +535,7 @@ impl ExtBuildCommand {
                         groups_config,
                         reload_service_manager,
                         &ext_src_path,
+                        &effective_tui_context,
                     )
                     .await?
                 }
@@ -535,6 +563,10 @@ impl ExtBuildCommand {
         }
 
         if !overall_success {
+            if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                renderer.set_status(&ctx.task_id, TaskStatus::Failed);
+                renderer.shutdown();
+            }
             return Err(anyhow::anyhow!(
                 "Failed to build one or more extension types"
             ));
@@ -564,6 +596,7 @@ impl ExtBuildCommand {
                 sdk_arch: self.sdk_arch.clone(),
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
+                tui_context: effective_tui_context.clone(),
                 ..Default::default()
             };
 
@@ -577,6 +610,11 @@ impl ExtBuildCommand {
                     OutputLevel::Normal,
                 );
             }
+        }
+
+        if let Some((ref ctx, ref renderer)) = _standalone_tui {
+            renderer.set_status(&ctx.task_id, TaskStatus::Success);
+            renderer.shutdown();
         }
 
         Ok(())
@@ -601,6 +639,7 @@ impl ExtBuildCommand {
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
         ext_src_path: &str,
+        effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
         // Create the build script for sysext extension
         let build_script = self.create_sysext_build_script(
@@ -638,6 +677,7 @@ impl ExtBuildCommand {
             sdk_arch: self.sdk_arch.clone(),
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
+            tui_context: effective_tui_context.clone(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -671,6 +711,7 @@ impl ExtBuildCommand {
         groups_config: Option<&serde_yaml::Mapping>,
         reload_service_manager: bool,
         ext_src_path: &str,
+        effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
         // Create the build script for confext extension
         let build_script = self.create_confext_build_script(
@@ -708,6 +749,7 @@ impl ExtBuildCommand {
             sdk_arch: self.sdk_arch.clone(),
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
+            tui_context: effective_tui_context.clone(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -1565,6 +1607,7 @@ echo "Set proper permissions on authentication files""#,
         target: &str,
         sdk_config_path: &str,
         ext_script_workdir: Option<&str>,
+        effective_tui_context: &Option<TuiContext>,
     ) -> Result<()> {
         // Get dependencies from extension configuration
         let dependencies = ext_config.get("packages").and_then(|v| v.as_mapping());
@@ -1703,6 +1746,7 @@ echo "Set proper permissions on authentication files""#,
                 sdk_arch: self.sdk_arch.clone(),
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
+                tui_context: effective_tui_context.clone(),
                 ..Default::default()
             };
 

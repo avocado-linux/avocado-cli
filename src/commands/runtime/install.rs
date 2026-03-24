@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config};
-use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -12,6 +12,7 @@ use crate::utils::stamps::{
     compute_runtime_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
+use crate::utils::tui::{TaskId, TaskStatus};
 
 pub struct RuntimeInstallCommand {
     runtime: Option<String>,
@@ -27,6 +28,7 @@ pub struct RuntimeInstallCommand {
     sdk_arch: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    pub tui_context: Option<TuiContext>,
 }
 
 impl RuntimeInstallCommand {
@@ -52,6 +54,7 @@ impl RuntimeInstallCommand {
             nfs_port: None,
             sdk_arch: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -80,7 +83,27 @@ impl RuntimeInstallCommand {
         self
     }
 
-    pub async fn execute(&self) -> Result<()> {
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
+        self
+    }
+
+    pub async fn execute(&mut self) -> Result<()> {
+        let name = self.runtime.as_deref().unwrap_or("all");
+        let _standalone_tui = if self.tui_context.is_none() && self.force {
+            crate::utils::tui::create_standalone_tui(
+                TaskId::RuntimeInstall(name.to_string()),
+                &format!("runtime install {}", name),
+                self.verbose,
+            )
+        } else {
+            None
+        };
+        // Use either the provided tui_context or the standalone one
+        if self.tui_context.is_none() {
+            self.tui_context = _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone());
+        }
+
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -109,9 +132,17 @@ impl RuntimeInstallCommand {
                         &format!("Runtime '{runtime}' not found in configuration."),
                         OutputLevel::Normal,
                     );
+                    if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                        renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                        renderer.shutdown();
+                    }
                     return Ok(());
                 } else {
                     print_info("No runtimes found in configuration.", OutputLevel::Normal);
+                    if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                        renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                        renderer.shutdown();
+                    }
                     return Ok(());
                 }
             }
@@ -129,6 +160,10 @@ impl RuntimeInstallCommand {
                     &format!("Runtime '{runtime_name}' not found in configuration."),
                     OutputLevel::Normal,
                 );
+                if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                    renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                    renderer.shutdown();
+                }
                 return Ok(());
             }
             vec![runtime_name.clone()]
@@ -148,6 +183,10 @@ impl RuntimeInstallCommand {
                 "No runtimes to install dependencies for.",
                 OutputLevel::Normal,
             );
+            if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                renderer.shutdown();
+            }
             return Ok(());
         }
 
@@ -192,6 +231,13 @@ impl RuntimeInstallCommand {
                     &format!("Warning: Failed to cleanup remote resources: {e}"),
                     OutputLevel::Normal,
                 );
+            }
+        }
+
+        if result.is_ok() {
+            if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                renderer.shutdown();
             }
         }
 
@@ -290,6 +336,7 @@ impl RuntimeInstallCommand {
                         dnf_args: self.dnf_args.clone(),
                         // runs_on handled by shared context
                         sdk_arch: self.sdk_arch.clone(),
+                        tui_context: self.tui_context.clone(),
                         ..Default::default()
                     };
 
@@ -429,6 +476,7 @@ impl RuntimeInstallCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
             let _ = run_container_command(container_helper, run_config, runs_on_context).await;
@@ -452,6 +500,7 @@ impl RuntimeInstallCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
         let installroot_exists =
@@ -470,6 +519,7 @@ impl RuntimeInstallCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
             let success =
@@ -612,6 +662,7 @@ $DNF_SDK_HOST \
                     disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
+                    tui_context: self.tui_context.clone(),
                     ..Default::default()
                 };
                 let success =
@@ -757,7 +808,7 @@ sdk:
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
-        let cmd = RuntimeInstallCommand::new(
+        let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
             false,
@@ -785,7 +836,7 @@ runtimes:
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
-        let cmd = RuntimeInstallCommand::new(
+        let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
             false,
@@ -812,7 +863,7 @@ runtimes:
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
-        let cmd = RuntimeInstallCommand::new(
+        let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
             false,
@@ -846,7 +897,7 @@ runtimes:
 "#;
         let config_path = create_test_config_file(&temp_dir, config_content);
 
-        let cmd = RuntimeInstallCommand::new(
+        let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
             false,

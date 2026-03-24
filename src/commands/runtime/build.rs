@@ -3,7 +3,7 @@ use crate::commands::rootfs::image::{generate_rootfs_build_script, NAMESPACE_UUI
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::{RunConfig, SdkContainer},
+    container::{RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
     stamps::{
@@ -12,6 +12,7 @@ use crate::utils::{
         StampOutputs,
     },
     target::resolve_target_required,
+    tui::{TaskId, TaskStatus},
     update_repo,
 };
 use anyhow::{Context, Result};
@@ -31,6 +32,7 @@ pub struct RuntimeBuildCommand {
     sdk_arch: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    pub tui_context: Option<TuiContext>,
 }
 
 impl RuntimeBuildCommand {
@@ -54,6 +56,7 @@ impl RuntimeBuildCommand {
             nfs_port: None,
             sdk_arch: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -82,7 +85,28 @@ impl RuntimeBuildCommand {
         self
     }
 
-    pub async fn execute(&self) -> Result<()> {
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
+        self
+    }
+
+    pub async fn execute(&mut self) -> Result<()> {
+        // Create standalone TUI if not provided by parent orchestrator
+        let name = self.runtime_name.clone();
+        let _standalone_tui = if self.tui_context.is_none() {
+            crate::utils::tui::create_standalone_tui(
+                TaskId::RuntimeBuild(name.clone()),
+                &format!("runtime build {}", name),
+                self.verbose,
+            )
+        } else {
+            None
+        };
+        // Use either the provided tui_context or the standalone one
+        if self.tui_context.is_none() {
+            self.tui_context = _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone());
+        }
+
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -166,6 +190,13 @@ impl RuntimeBuildCommand {
             }
         }
 
+        if result.is_ok() {
+            if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                renderer.set_status(&ctx.task_id, TaskStatus::Success);
+                renderer.shutdown();
+            }
+        }
+
         result
     }
 
@@ -213,6 +244,7 @@ impl RuntimeBuildCommand {
                 dnf_args: self.dnf_args.clone(),
                 // runs_on handled by shared context
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
 
@@ -318,6 +350,7 @@ impl RuntimeBuildCommand {
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     sdk_arch: self.sdk_arch.clone(),
+                    tui_context: self.tui_context.clone(),
                     ..Default::default()
                 };
 
@@ -475,6 +508,7 @@ impl RuntimeBuildCommand {
             env_vars,
             // runs_on handled by shared context
             sdk_arch: self.sdk_arch.clone(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
         let complete_result = run_container_command(container_helper, run_config, runs_on_context)
@@ -513,6 +547,7 @@ impl RuntimeBuildCommand {
                 dnf_args: self.dnf_args.clone(),
                 // runs_on handled by shared context
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
 
@@ -743,6 +778,7 @@ echo -n '}}'
             sdk_arch: self.sdk_arch.clone(),
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
         let hash_output =
@@ -800,6 +836,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             sdk_arch: self.sdk_arch.clone(),
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
         run_container_command(container_helper, copy_run_config, runs_on_context).await?;
@@ -847,6 +884,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             sdk_arch: self.sdk_arch.clone(),
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
         let hash_output =
@@ -901,6 +939,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             sdk_arch: self.sdk_arch.clone(),
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
         run_container_command(container_helper, copy_run_config, runs_on_context).await?;
@@ -1860,6 +1899,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             // runs_on handled by shared context
             container_args,
             sdk_arch: self.sdk_arch.clone(),
+            tui_context: self.tui_context.clone(),
             ..Default::default()
         };
 

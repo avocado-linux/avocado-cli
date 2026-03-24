@@ -10,7 +10,9 @@ use crate::commands::{
 };
 use crate::utils::{
     config::{ComposedConfig, Config, ExtensionSource},
-    output::{print_info, print_success, OutputLevel},
+    container::TuiContext,
+    output::{print_info, print_success, should_use_tui, OutputLevel},
+    tui::{TaskId, TaskRenderer, TaskStatus},
 };
 
 /// Represents an extension dependency that can be either local or remote
@@ -157,61 +159,92 @@ impl BuildCommand {
         // Note: SDK compile sections are now compiled on-demand when extensions are built
         // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
 
+        // Set up TUI renderer if applicable
+        let renderer = if should_use_tui() && !self.verbose {
+            let r = Arc::new(TaskRenderer::new(false));
+            // Register all known tasks
+            for ext_dep in &required_extensions {
+                let name = match ext_dep {
+                    ExtensionDependency::Local(n) => n.clone(),
+                    ExtensionDependency::Remote { name, .. } => name.clone(),
+                };
+                r.register_task(TaskId::ExtBuild(name.clone()), format!("ext build {name}"));
+                r.register_task(TaskId::ExtImage(name.clone()), format!("ext image {name}"));
+            }
+            for rt in &runtimes_to_build {
+                r.register_task(
+                    TaskId::RuntimeBuild(rt.clone()),
+                    format!("runtime build {rt}"),
+                );
+            }
+            crate::utils::tui::set_active_renderer(&r);
+            r.start();
+            Some(r)
+        } else {
+            None
+        };
+
+        /// Helper to create a TuiContext for a given task, if the renderer is active.
+        fn make_tui_ctx(
+            renderer: &Option<Arc<TaskRenderer>>,
+            task_id: TaskId,
+        ) -> Option<TuiContext> {
+            renderer.as_ref().map(|r| TuiContext {
+                task_id,
+                renderer: Arc::clone(r),
+            })
+        }
+
         // Step 2: Build extensions
         print_info("Step 2/4: Building extensions", OutputLevel::Normal);
         if !required_extensions.is_empty() {
             for extension_dep in &required_extensions {
-                match extension_dep {
-                    ExtensionDependency::Local(extension_name) => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Building local extension '{extension_name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
+                let ext_name = match extension_dep {
+                    ExtensionDependency::Local(n) => n.clone(),
+                    ExtensionDependency::Remote { name, .. } => name.clone(),
+                };
 
-                        let ext_build_cmd = ExtBuildCommand::new(
-                            extension_name.clone(),
-                            self.config_path.clone(),
-                            self.verbose,
-                            self.target.clone(),
-                            self.container_args.clone(),
-                            self.dnf_args.clone(),
-                        )
-                        .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                        .with_sdk_arch(self.sdk_arch.clone())
-                        .with_composed_config(Arc::clone(&composed));
-                        ext_build_cmd.execute().await.with_context(|| {
-                            format!("Failed to build extension '{extension_name}'")
-                        })?;
-                    }
-                    ExtensionDependency::Remote { name, source: _ } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Building remote extension '{name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
+                if self.verbose {
+                    print_info(
+                        &format!("Building extension '{ext_name}'"),
+                        OutputLevel::Normal,
+                    );
+                }
 
-                        // Build remote extension - ExtBuildCommand will load config from container
-                        let ext_build_cmd = ExtBuildCommand::new(
-                            name.clone(),
-                            self.config_path.clone(),
-                            self.verbose,
-                            self.target.clone(),
-                            self.container_args.clone(),
-                            self.dnf_args.clone(),
-                        )
-                        .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                        .with_sdk_arch(self.sdk_arch.clone())
-                        .with_composed_config(Arc::clone(&composed));
-                        ext_build_cmd.execute().await.with_context(|| {
-                            format!("Failed to build remote extension '{name}'")
-                        })?;
+                let build_task_id = TaskId::ExtBuild(ext_name.clone());
+                if let Some(ref r) = renderer {
+                    r.set_status(&build_task_id, TaskStatus::Running);
+                }
+                let tui_ctx = make_tui_ctx(&renderer, build_task_id.clone());
+
+                let mut ext_build_cmd = ExtBuildCommand::new(
+                    ext_name.clone(),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
+                .with_composed_config(Arc::clone(&composed));
+
+                if let Some(ctx) = tui_ctx {
+                    ext_build_cmd = ext_build_cmd.with_tui_context(ctx);
+                }
+
+                let build_result = ext_build_cmd.execute().await;
+
+                if let Some(ref r) = renderer {
+                    if build_result.is_ok() {
+                        r.set_status(&build_task_id, TaskStatus::Success);
+                    } else {
+                        r.set_status(&build_task_id, TaskStatus::Failed);
                     }
                 }
+
+                build_result.with_context(|| format!("Failed to build extension '{ext_name}'"))?;
             }
         } else {
             print_info("No extensions to build.", OutputLevel::Normal);
@@ -221,57 +254,54 @@ impl BuildCommand {
         print_info("Step 3/4: Creating extension images", OutputLevel::Normal);
         if !required_extensions.is_empty() {
             for extension_dep in &required_extensions {
-                match extension_dep {
-                    ExtensionDependency::Local(extension_name) => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Creating image for local extension '{extension_name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
+                let ext_name = match extension_dep {
+                    ExtensionDependency::Local(n) => n.clone(),
+                    ExtensionDependency::Remote { name, .. } => name.clone(),
+                };
 
-                        let ext_image_cmd = ExtImageCommand::new(
-                            extension_name.clone(),
-                            self.config_path.clone(),
-                            self.verbose,
-                            self.target.clone(),
-                            self.container_args.clone(),
-                            self.dnf_args.clone(),
-                        )
-                        .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                        .with_sdk_arch(self.sdk_arch.clone())
-                        .with_composed_config(Arc::clone(&composed));
-                        ext_image_cmd.execute().await.with_context(|| {
-                            format!("Failed to create image for extension '{extension_name}'")
-                        })?;
-                    }
-                    ExtensionDependency::Remote { name, source: _ } => {
-                        if self.verbose {
-                            print_info(
-                                &format!("Creating image for remote extension '{name}'"),
-                                OutputLevel::Normal,
-                            );
-                        }
+                if self.verbose {
+                    print_info(
+                        &format!("Creating image for extension '{ext_name}'"),
+                        OutputLevel::Normal,
+                    );
+                }
 
-                        // Create image for remote extension - ExtImageCommand will load config from container
-                        let ext_image_cmd = ExtImageCommand::new(
-                            name.clone(),
-                            self.config_path.clone(),
-                            self.verbose,
-                            self.target.clone(),
-                            self.container_args.clone(),
-                            self.dnf_args.clone(),
-                        )
-                        .with_no_stamps(self.no_stamps)
-                        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                        .with_sdk_arch(self.sdk_arch.clone())
-                        .with_composed_config(Arc::clone(&composed));
-                        ext_image_cmd.execute().await.with_context(|| {
-                            format!("Failed to create image for remote extension '{name}'")
-                        })?;
+                let image_task_id = TaskId::ExtImage(ext_name.clone());
+                if let Some(ref r) = renderer {
+                    r.set_status(&image_task_id, TaskStatus::Running);
+                }
+                let tui_ctx = make_tui_ctx(&renderer, image_task_id.clone());
+
+                let mut ext_image_cmd = ExtImageCommand::new(
+                    ext_name.clone(),
+                    self.config_path.clone(),
+                    self.verbose,
+                    self.target.clone(),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_no_stamps(self.no_stamps)
+                .with_runs_on(self.runs_on.clone(), self.nfs_port)
+                .with_sdk_arch(self.sdk_arch.clone())
+                .with_composed_config(Arc::clone(&composed));
+
+                if let Some(ctx) = tui_ctx {
+                    ext_image_cmd = ext_image_cmd.with_tui_context(ctx);
+                }
+
+                let image_result = ext_image_cmd.execute().await;
+
+                if let Some(ref r) = renderer {
+                    if image_result.is_ok() {
+                        r.set_status(&image_task_id, TaskStatus::Success);
+                    } else {
+                        r.set_status(&image_task_id, TaskStatus::Failed);
                     }
                 }
+
+                image_result.with_context(|| {
+                    format!("Failed to create image for extension '{ext_name}'")
+                })?;
             }
         } else {
             print_info("No extension images to create.", OutputLevel::Normal);
@@ -295,7 +325,13 @@ impl BuildCommand {
                 );
             }
 
-            let runtime_build_cmd = RuntimeBuildCommand::new(
+            let rt_task_id = TaskId::RuntimeBuild(runtime_name.clone());
+            if let Some(ref r) = renderer {
+                r.set_status(&rt_task_id, TaskStatus::Running);
+            }
+            let tui_ctx = make_tui_ctx(&renderer, rt_task_id.clone());
+
+            let mut runtime_build_cmd = RuntimeBuildCommand::new(
                 runtime_name.clone(),
                 self.config_path.clone(),
                 self.verbose,
@@ -307,10 +343,27 @@ impl BuildCommand {
             .with_runs_on(self.runs_on.clone(), self.nfs_port)
             .with_sdk_arch(self.sdk_arch.clone())
             .with_composed_config(Arc::clone(&composed));
-            runtime_build_cmd
-                .execute()
-                .await
-                .with_context(|| format!("Failed to build runtime '{runtime_name}'"))?;
+
+            if let Some(ctx) = tui_ctx {
+                runtime_build_cmd = runtime_build_cmd.with_tui_context(ctx);
+            }
+
+            let build_result = runtime_build_cmd.execute().await;
+
+            if let Some(ref r) = renderer {
+                if build_result.is_ok() {
+                    r.set_status(&rt_task_id, TaskStatus::Success);
+                } else {
+                    r.set_status(&rt_task_id, TaskStatus::Failed);
+                }
+            }
+
+            build_result.with_context(|| format!("Failed to build runtime '{runtime_name}'"))?;
+        }
+
+        // Shut down the TUI renderer
+        if let Some(ref r) = renderer {
+            r.shutdown();
         }
 
         print_success("All components built successfully!", OutputLevel::Normal);
@@ -758,7 +811,7 @@ impl BuildCommand {
             OutputLevel::Normal,
         );
 
-        let runtime_build_cmd = RuntimeBuildCommand::new(
+        let mut runtime_build_cmd = RuntimeBuildCommand::new(
             runtime_name.to_string(),
             self.config_path.clone(),
             self.verbose,

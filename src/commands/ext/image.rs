@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::find_ext_in_mapping;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
-use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::stamps::{
     compute_ext_input_hash, compute_ext_input_hash_with_fs, generate_batch_read_stamps_script,
@@ -12,6 +12,7 @@ use crate::utils::stamps::{
     StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
+use crate::utils::tui::{TaskId, TaskStatus};
 
 pub struct ExtImageCommand {
     extension: String,
@@ -27,6 +28,7 @@ pub struct ExtImageCommand {
     output_dir: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    pub tui_context: Option<TuiContext>,
 }
 
 impl ExtImageCommand {
@@ -51,6 +53,7 @@ impl ExtImageCommand {
             sdk_arch: None,
             output_dir: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -85,7 +88,28 @@ impl ExtImageCommand {
         self
     }
 
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
+        self
+    }
+
     pub async fn execute(&self) -> Result<()> {
+        // Create standalone TUI if not provided by parent orchestrator
+        let _standalone_tui = if self.tui_context.is_none() {
+            crate::utils::tui::create_standalone_tui(
+                TaskId::ExtImage(self.extension.clone()),
+                &format!("ext image {}", self.extension),
+                self.verbose,
+            )
+        } else {
+            None
+        };
+        // Use either the provided tui_context or the standalone one
+        let effective_tui_context = self
+            .tui_context
+            .clone()
+            .or_else(|| _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone()));
+
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -150,6 +174,7 @@ impl ExtImageCommand {
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: effective_tui_context.clone(),
                 ..Default::default()
             };
 
@@ -415,6 +440,7 @@ impl ExtImageCommand {
                 source_date_epoch,
                 filesystem,
                 &var_files,
+                &effective_tui_context,
             )
             .await?;
 
@@ -478,6 +504,7 @@ impl ExtImageCommand {
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     sdk_arch: self.sdk_arch.clone(),
+                    tui_context: effective_tui_context.clone(),
                     ..Default::default()
                 };
 
@@ -493,11 +520,20 @@ impl ExtImageCommand {
                 }
             }
         } else {
+            if let Some((ref ctx, ref renderer)) = _standalone_tui {
+                renderer.set_status(&ctx.task_id, TaskStatus::Failed);
+                renderer.shutdown();
+            }
             return Err(anyhow::anyhow!(
                 "Failed to create extension image for '{}-{}'",
                 self.extension,
                 ext_version
             ));
+        }
+
+        if let Some((ref ctx, ref renderer)) = _standalone_tui {
+            renderer.set_status(&ctx.task_id, TaskStatus::Success);
+            renderer.shutdown();
         }
 
         Ok(())
@@ -585,6 +621,7 @@ impl ExtImageCommand {
         source_date_epoch: u64,
         filesystem: &str,
         var_files: &[String],
+        effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
         // Create the build script
         let build_script = self.create_build_script(
@@ -613,6 +650,7 @@ impl ExtImageCommand {
             dnf_args: self.dnf_args.clone(),
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
+            tui_context: effective_tui_context.clone(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
