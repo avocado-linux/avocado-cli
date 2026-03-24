@@ -43,6 +43,8 @@ pub struct TaskRenderer {
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Spinner frame counter (incremented each render tick).
     spin: Arc<std::sync::atomic::AtomicUsize>,
+    /// When the renderer was created (for total elapsed time).
+    created_at: std::time::Instant,
 }
 
 impl TaskRenderer {
@@ -61,6 +63,7 @@ impl TaskRenderer {
             rendered_lines: Arc::new(Mutex::new(0)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spin: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            created_at: std::time::Instant::now(),
         }
     }
 
@@ -233,9 +236,20 @@ impl TaskRenderer {
                         eprintln!("    \x1b[2m{}\x1b[0m", strip_ansi(line));
                     }
                 }
+                TaskStatus::Skipped => {
+                    eprintln!("\x1b[2m  - {} (skipped)\x1b[0m", task.label);
+                }
+                TaskStatus::Pending => {
+                    // Still pending at shutdown = never ran (e.g. stamps satisfied)
+                    eprintln!("\x1b[2m  \u{2713} {} (up to date)\x1b[0m", task.label);
+                }
                 _ => {}
             }
         }
+
+        // Total elapsed time
+        let total = format_duration(Some(self.created_at.elapsed()));
+        eprintln!("\x1b[2m  Total: {total}\x1b[0m");
     }
 
     /// The main rendering loop, run as a tokio task.
@@ -278,6 +292,16 @@ impl TaskRenderer {
         }
 
         let mut lines_written = 0;
+        let mut showed_peek = false;
+
+        // Show the peek for the longest-running task.  When it completes the
+        // peek naturally jumps to the next longest, giving a stable display.
+        let peek_task_id = state
+            .iter()
+            .filter(|t| t.status == TaskStatus::Running)
+            .max_by_key(|t| t.elapsed().unwrap_or_default())
+            .map(|t| t.id.clone())
+            .unwrap_or(TaskId::SdkInstall);
 
         // Show every task — pending ones are visible from the start as a
         // checklist so the user can see the full scope of work.
@@ -302,16 +326,20 @@ impl TaskRenderer {
                 }
                 TaskStatus::Running => {
                     let elapsed = format_duration(task.elapsed());
+                    let is_peek_task = !showed_peek && task.id == peek_task_id;
                     let _ = writeln!(
                         stderr,
                         "\x1b[94m  {spinner}\x1b[0m {} {}",
                         task.label, elapsed
                     );
                     lines_written += 1;
-                    // Show the last line of output as a peek
-                    if let Some(last_line) = task.output_ring.back() {
-                        let _ = writeln!(stderr, "\x1b[2m    {}\x1b[0m", strip_ansi(last_line));
-                        lines_written += 1;
+                    // Show peek for the running task with the most recent output.
+                    if is_peek_task {
+                        if let Some(last_line) = task.output_ring.back() {
+                            let _ = writeln!(stderr, "\x1b[2m    {}\x1b[0m", strip_ansi(last_line));
+                            lines_written += 1;
+                        }
+                        showed_peek = true;
                     }
                     continue; // already counted
                 }
@@ -369,6 +397,17 @@ impl TaskRenderer {
     // ------------------------------------------------------------------
     // Query helpers (for scheduler / Phase 2)
     // ------------------------------------------------------------------
+
+    /// Return the ID of the first currently-running task (if any).
+    /// Used to attribute orphan container output to a task.
+    pub fn first_running_task(&self) -> Option<TaskId> {
+        self.state
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.status == TaskStatus::Running)
+            .map(|t| t.id.clone())
+    }
 
     #[allow(dead_code)]
     pub fn get_task_status(&self, id: &TaskId) -> Option<TaskStatus> {

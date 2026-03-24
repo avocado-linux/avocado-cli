@@ -1,7 +1,7 @@
 //! SDK install command implementation.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,6 +20,26 @@ use crate::utils::{
     target::validate_and_log_target,
     tui::{TaskId, TaskStatus},
 };
+
+/// Data produced by the bootstrap phase, consumed by the parallel install phase.
+struct BootstrapResult {
+    /// Reloaded composed config (after fetching remote extensions)
+    composed: ComposedConfig,
+    /// Extension SDK dependencies filtered to active extensions
+    extension_sdk_dependencies: HashMap<String, HashMap<String, serde_yaml::Value>>,
+    /// SDK dependencies from the config
+    sdk_dependencies: Option<HashMap<String, serde_yaml::Value>>,
+    /// All SDK package names installed during bootstrap (to be extended by SDK packages phase)
+    all_sdk_package_names: Vec<String>,
+    /// SDK sysroot type with host architecture
+    sdk_sysroot: SysrootType,
+    /// Lock file (to be cloned for each parallel task)
+    lock_file: LockFile,
+    /// Active extensions after config reload
+    active_extensions: HashSet<String>,
+    /// Resolved src_dir for lock file save path
+    src_dir: PathBuf,
+}
 
 /// Implementation of the 'sdk install' command.
 pub struct SdkInstallCommand {
@@ -157,7 +177,7 @@ impl SdkInstallCommand {
             .get_sdk_dependencies_for_target(&self.config_path, &target)
             .with_context(|| "Failed to get SDK dependencies with target interpolation")?;
 
-        // Note: extension_sdk_dependencies is computed inside execute_install after
+        // Note: extension_sdk_dependencies is computed inside execute_bootstrap after
         // fetching remote extensions, since we need SDK repos to be available first
 
         // Get repo_url and repo_release from config
@@ -180,9 +200,9 @@ impl SdkInstallCommand {
             None
         };
 
-        // Execute the main installation logic, ensuring cleanup on error
-        let result = self
-            .execute_install(
+        // Phase 1: Bootstrap — sets up SDK env, installs bootstrap package, fetches extensions
+        let bootstrap_result = self
+            .execute_bootstrap(
                 config,
                 &target,
                 container_image,
@@ -193,6 +213,37 @@ impl SdkInstallCommand {
                 merged_container_args.as_ref(),
                 runs_on_context.as_ref(),
                 &active_extensions,
+            )
+            .await;
+
+        // On bootstrap failure, teardown and return early
+        let bootstrap = match bootstrap_result {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(ref mut context) = runs_on_context {
+                    if let Err(te) = context.teardown().await {
+                        print_error(
+                            &format!("Warning: Failed to cleanup remote resources: {te}"),
+                            OutputLevel::Normal,
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        // Phase 2: Run SDK packages, rootfs, initramfs, and target-dev in parallel.
+        // Each task gets its own lock_file clone since they write to different sections.
+        let result = self
+            .execute_parallel_phase(
+                &bootstrap,
+                container_image,
+                repo_url.as_deref(),
+                repo_release.as_deref(),
+                &container_helper,
+                merged_container_args.as_ref(),
+                runs_on_context.as_ref(),
+                &target,
             )
             .await;
 
@@ -214,6 +265,446 @@ impl SdkInstallCommand {
         }
 
         result
+    }
+
+    /// Phase 2: Run SDK packages, rootfs, initramfs, and target-dev in parallel
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_parallel_phase(
+        &self,
+        bootstrap: &BootstrapResult,
+        container_image: &str,
+        repo_url: Option<&str>,
+        repo_release: Option<&str>,
+        container_helper: &SdkContainer,
+        merged_container_args: Option<&Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+        target: &str,
+    ) -> Result<()> {
+        let composed = &bootstrap.composed;
+        let config = &composed.config;
+        let active_extensions = &bootstrap.active_extensions;
+        let lock_file = &bootstrap.lock_file;
+        let src_dir = &bootstrap.src_dir;
+
+        // Discover whether target-dev sysroot is needed (compile sections from
+        // fetched external extensions). Prepare the command BEFORE launching
+        // the parallel sysroot installs so all four can run concurrently.
+        let active_compile_sections =
+            find_active_compile_sections(&composed.merged_value, active_extensions);
+        let need_target_dev = config.has_compile_sections() && !active_compile_sections.is_empty();
+
+        // Prepare target-dev install command if needed (CPU-only prep, no container calls)
+        let target_dev_command = if need_target_dev {
+            let compile_dependencies = config.get_compile_dependencies();
+            let mut all_compile_packages: Vec<String> = Vec::new();
+            let mut all_compile_package_names: Vec<String> = Vec::new();
+            for section_name in &active_compile_sections {
+                if let Some(dependencies) = compile_dependencies.get(section_name) {
+                    let packages = self.build_package_list_with_lock(
+                        dependencies,
+                        lock_file,
+                        target,
+                        &SysrootType::TargetSysroot,
+                    );
+                    all_compile_packages.extend(packages);
+                    all_compile_package_names.extend(self.extract_package_names(dependencies));
+                }
+            }
+            all_compile_packages.sort();
+            all_compile_packages.dedup();
+            all_compile_package_names.sort();
+            all_compile_package_names.dedup();
+
+            let yes = if self.force { "-y" } else { "" };
+            let dnf_args_str = if let Some(args) = &self.dnf_args {
+                format!(" {} ", args.join(" "))
+            } else {
+                String::new()
+            };
+            let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
+            let target_sysroot_config_version = "*";
+            let target_sysroot_pkg = build_package_spec_with_lock(
+                lock_file,
+                target,
+                &SysrootType::TargetSysroot,
+                target_sysroot_base_pkg,
+                target_sysroot_config_version,
+            );
+
+            let command = format!(
+                r#"
+unset RPM_CONFIGDIR
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
+    {} {} --installroot ${{AVOCADO_PREFIX}}/sdk/target-sysroot \
+    install {} {}
+"#,
+                dnf_args_str,
+                yes,
+                target_sysroot_pkg,
+                all_compile_packages.join(" ")
+            );
+
+            Some((
+                command,
+                all_compile_package_names,
+                target_sysroot_base_pkg.to_string(),
+            ))
+        } else {
+            None
+        };
+
+        // Register parallel tasks on TUI and signal status transitions.
+        if let Some(r) = crate::utils::tui::get_active_renderer() {
+            r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
+            r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+            r.set_status(&TaskId::SdkPackages, TaskStatus::Running);
+            r.set_status(&TaskId::RootfsInstall, TaskStatus::Running);
+            r.set_status(&TaskId::InitramfsInstall, TaskStatus::Running);
+            if need_target_dev {
+                r.register_task(TaskId::TargetDevInstall, "target-dev install".to_string());
+                r.set_status(&TaskId::TargetDevInstall, TaskStatus::Running);
+            }
+        }
+
+        // Clone lock files for each parallel task (they write to different sections)
+        let mut sdk_pkg_lock = lock_file.clone();
+        let mut rootfs_lock = lock_file.clone();
+        let mut initramfs_lock = lock_file.clone();
+        #[allow(unused_variables)]
+        let target_dev_lock = lock_file.clone();
+
+        // Build SDK packages future
+        let sdk_pkg_fut = self.install_sdk_packages(
+            config,
+            &bootstrap.sdk_dependencies,
+            &bootstrap.extension_sdk_dependencies,
+            &mut sdk_pkg_lock,
+            &bootstrap.all_sdk_package_names,
+            &bootstrap.sdk_sysroot,
+            container_image,
+            target,
+            repo_url,
+            repo_release,
+            container_helper,
+            merged_container_args,
+            runs_on_context,
+        );
+
+        // Build sysroot install params
+        let mut rootfs_params = SysrootInstallParams {
+            sysroot_type: SysrootType::Rootfs,
+            config,
+            lock_file: &mut rootfs_lock,
+            src_dir,
+            container_helper,
+            container_image,
+            target,
+            repo_url,
+            repo_release,
+            merged_container_args: merged_container_args.cloned(),
+            dnf_args: self.dnf_args.clone(),
+            verbose: self.verbose,
+            force: self.force,
+            runs_on_context,
+            sdk_arch: self.sdk_arch.as_ref(),
+            no_stamps: self.no_stamps,
+            parsed: Some(&composed.merged_value),
+        };
+        let mut initramfs_params = SysrootInstallParams {
+            sysroot_type: SysrootType::Initramfs,
+            config,
+            lock_file: &mut initramfs_lock,
+            src_dir,
+            container_helper,
+            container_image,
+            target,
+            repo_url,
+            repo_release,
+            merged_container_args: merged_container_args.cloned(),
+            dnf_args: self.dnf_args.clone(),
+            verbose: self.verbose,
+            force: self.force,
+            runs_on_context,
+            sdk_arch: self.sdk_arch.as_ref(),
+            no_stamps: self.no_stamps,
+            parsed: Some(&composed.merged_value),
+        };
+
+        // Build the target-dev future (or a no-op if not needed)
+        let target_dev_tui_ctx = if need_target_dev {
+            self.tui_context.as_ref().map(|ctx| TuiContext {
+                task_id: TaskId::TargetDevInstall,
+                renderer: ctx.renderer.clone(),
+            })
+        } else {
+            None
+        };
+
+        let target_dev_fut = async {
+            if let Some((ref cmd, _, _)) = target_dev_command {
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.to_string(),
+                    command: cmd.clone(),
+                    verbose: self.verbose,
+                    source_environment: false,
+                    interactive: !self.force,
+                    repo_url: repo_url.map(|s| s.to_string()),
+                    repo_release: repo_release.map(|s| s.to_string()),
+                    container_args: merged_container_args.cloned(),
+                    dnf_args: self.dnf_args.clone(),
+                    disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                    tui_context: target_dev_tui_ctx.clone(),
+                    ..Default::default()
+                };
+                let success = run_container_command(
+                    container_helper,
+                    run_config,
+                    runs_on_context,
+                    self.sdk_arch.as_ref(),
+                )
+                .await?;
+                if success {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to install target-sysroot with compile dependencies."
+                    ))
+                }
+            } else {
+                Ok(())
+            }
+        };
+
+        // Run all four tasks in parallel
+        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
+            sdk_pkg_fut,
+            install_sysroot(&mut rootfs_params),
+            install_sysroot(&mut initramfs_params),
+            target_dev_fut,
+        );
+
+        // Update TUI statuses
+        if let Some(r) = crate::utils::tui::get_active_renderer() {
+            if sdk_pkg_result.is_ok() {
+                r.set_status(&TaskId::SdkPackages, TaskStatus::Success);
+            } else {
+                r.set_status(&TaskId::SdkPackages, TaskStatus::Failed);
+            }
+            if rootfs_result.is_ok() {
+                r.set_status(&TaskId::RootfsInstall, TaskStatus::Success);
+            } else {
+                r.set_status(&TaskId::RootfsInstall, TaskStatus::Failed);
+            }
+            if initramfs_result.is_ok() {
+                r.set_status(&TaskId::InitramfsInstall, TaskStatus::Success);
+            } else {
+                r.set_status(&TaskId::InitramfsInstall, TaskStatus::Failed);
+            }
+            if need_target_dev {
+                if target_dev_result.is_ok() {
+                    r.set_status(&TaskId::TargetDevInstall, TaskStatus::Success);
+                } else {
+                    r.set_status(&TaskId::TargetDevInstall, TaskStatus::Failed);
+                }
+            }
+        }
+
+        // Merge lock file changes back into a single lock file for saving
+        let mut final_lock = lock_file.clone();
+
+        // Merge SDK packages lock
+        if sdk_pkg_result.is_ok() {
+            if let Some(target_locks) = sdk_pkg_lock.targets.get(target) {
+                let entry = final_lock.targets.entry(target.to_string()).or_default();
+                entry.sdk = target_locks.sdk.clone();
+            }
+        }
+        // Merge rootfs lock
+        if rootfs_result.is_ok() {
+            if let Some(target_locks) = rootfs_lock.targets.get(target) {
+                final_lock
+                    .targets
+                    .entry(target.to_string())
+                    .or_default()
+                    .rootfs = target_locks.rootfs.clone();
+            }
+        }
+        // Merge initramfs lock
+        if initramfs_result.is_ok() {
+            if let Some(target_locks) = initramfs_lock.targets.get(target) {
+                final_lock
+                    .targets
+                    .entry(target.to_string())
+                    .or_default()
+                    .initramfs = target_locks.initramfs.clone();
+            }
+        }
+        // Merge target-dev lock
+        if need_target_dev && target_dev_result.is_ok() {
+            if let Some(target_locks) = target_dev_lock.targets.get(target) {
+                final_lock
+                    .targets
+                    .entry(target.to_string())
+                    .or_default()
+                    .target_sysroot = target_locks.target_sysroot.clone();
+            }
+            // Post-install: query versions and update lock file
+            if let Some((_, ref all_compile_package_names, ref base_pkg)) = target_dev_command {
+                print_success(
+                    "Installed target-sysroot with compile dependencies.",
+                    OutputLevel::Normal,
+                );
+                let mut packages_to_query = all_compile_package_names.clone();
+                packages_to_query.push(base_pkg.clone());
+
+                let installed_versions = container_helper
+                    .query_installed_packages(
+                        &SysrootType::TargetSysroot,
+                        &packages_to_query,
+                        container_image,
+                        target,
+                        repo_url.map(|s| s.to_string()),
+                        repo_release.map(|s| s.to_string()),
+                        merged_container_args.cloned(),
+                        runs_on_context,
+                        self.sdk_arch.as_ref(),
+                    )
+                    .await?;
+
+                if !installed_versions.is_empty() {
+                    final_lock.update_sysroot_versions(
+                        target,
+                        &SysrootType::TargetSysroot,
+                        installed_versions,
+                    );
+                }
+            }
+        }
+        final_lock.save(src_dir)?;
+
+        // Propagate errors
+        sdk_pkg_result?;
+        rootfs_result?;
+        initramfs_result?;
+        target_dev_result?;
+
+        // Write compile-deps stamp (unless --no-stamps)
+        // This tracks which compile dependencies are installed in the target-sysroot.
+        // When runtimes change, the active compile sections change, making this stamp stale.
+        if !self.no_stamps {
+            let compile_inputs =
+                compute_compile_deps_input_hash(&composed.merged_value, &active_compile_sections)?;
+
+            let stamp_script = if self.runs_on.is_some() {
+                // For remote execution, use dynamic arch detection
+                // Build the stamp JSON with a placeholder that gets replaced at runtime
+                let outputs = StampOutputs::default();
+                let stamp = Stamp::compile_deps_install("DYNAMIC_ARCH", compile_inputs, outputs);
+                let stamp_json = stamp.to_json()?;
+                // Replace the placeholder with dynamic arch detection
+                let stamp_json_escaped = stamp_json.replace('"', "\\\"");
+                format!(
+                    r#"
+HOST_ARCH=$(uname -m)
+STAMP_DIR="${{AVOCADO_PREFIX}}/.stamps/sdk/${{HOST_ARCH}}"
+mkdir -p "$STAMP_DIR"
+STAMP_JSON="{stamp_json_escaped}"
+STAMP_JSON=$(echo "$STAMP_JSON" | sed "s/DYNAMIC_ARCH/$HOST_ARCH/g")
+echo "$STAMP_JSON" > "$STAMP_DIR/compile-deps.stamp"
+echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
+"#
+                )
+            } else {
+                let outputs = StampOutputs::default();
+                let host_arch = get_local_arch();
+                let stamp = Stamp::compile_deps_install(host_arch, compile_inputs, outputs);
+                generate_write_stamp_script(&stamp)?
+            };
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                tui_context: self.tui_context.clone(),
+                ..Default::default()
+            };
+
+            run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
+
+            if self.verbose {
+                print_info("Wrote compile-deps stamp.", OutputLevel::Normal);
+            }
+        }
+
+        // Write SDK install stamp (unless --no-stamps)
+        // The stamp uses the host architecture (CPU arch where SDK runs) rather than
+        // the target architecture (what you're building for). This allows --runs-on
+        // to detect if the SDK is installed for the remote's architecture.
+        if !self.no_stamps {
+            let inputs = compute_sdk_input_hash(&composed.merged_value)?;
+
+            // When using --runs-on, we need to detect the remote architecture dynamically
+            // since the remote host may have a different CPU arch than the local machine.
+            // Otherwise, use the local architecture.
+            let stamp_script = if self.runs_on.is_some() {
+                // Use dynamic arch detection for remote execution
+                generate_write_sdk_stamp_script_dynamic_arch(inputs)
+            } else {
+                // Use local architecture for local execution
+                let outputs = StampOutputs::default();
+                let host_arch = get_local_arch();
+                let stamp = Stamp::sdk_install(host_arch, inputs, outputs);
+                generate_write_stamp_script(&stamp)?
+            };
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: stamp_script,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
+                ..Default::default()
+            };
+
+            run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
+
+            if self.verbose {
+                print_info("Wrote SDK install stamp.", OutputLevel::Normal);
+            }
+        }
+
+        Ok(())
     }
 
     /// Fetch remote extensions after SDK bootstrap
@@ -274,9 +765,11 @@ impl SdkInstallCommand {
         Ok(())
     }
 
-    /// Internal implementation of the install logic
+    /// Bootstrap phase: sets up SDK environment, installs bootstrap package,
+    /// fetches remote extensions, reloads config. Returns data needed for the
+    /// parallel install phase.
     #[allow(clippy::too_many_arguments)]
-    async fn execute_install(
+    async fn execute_bootstrap(
         &self,
         config: &Config,
         target: &str,
@@ -287,8 +780,8 @@ impl SdkInstallCommand {
         container_helper: &SdkContainer,
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
-        initial_active_extensions: &std::collections::HashSet<String>,
-    ) -> Result<()> {
+        initial_active_extensions: &HashSet<String>,
+    ) -> Result<BootstrapResult> {
         // Determine host architecture for SDK package tracking
         // Priority: sdk_arch (for cross-arch emulation) > runs_on remote arch > local arch
         let host_arch = if let Some(ref arch) = self.sdk_arch {
@@ -1046,7 +1539,38 @@ fi
         )
         .await?;
 
-        // Install SDK dependencies (into SDK)
+        // Return data needed for the parallel phase
+        Ok(BootstrapResult {
+            composed,
+            extension_sdk_dependencies,
+            sdk_dependencies: sdk_dependencies.clone(),
+            all_sdk_package_names,
+            sdk_sysroot,
+            lock_file,
+            active_extensions,
+            src_dir,
+        })
+    }
+
+    /// Install SDK packages (dependencies from config + extension SDK deps).
+    /// Runs as one of the parallel tasks after bootstrap completes.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_sdk_packages(
+        &self,
+        config: &Config,
+        sdk_dependencies: &Option<HashMap<String, serde_yaml::Value>>,
+        extension_sdk_dependencies: &HashMap<String, HashMap<String, serde_yaml::Value>>,
+        lock_file: &mut LockFile,
+        bootstrap_package_names: &[String],
+        sdk_sysroot: &SysrootType,
+        container_image: &str,
+        target: &str,
+        repo_url: Option<&str>,
+        repo_release: Option<&str>,
+        container_helper: &SdkContainer,
+        merged_container_args: Option<&Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+    ) -> Result<()> {
         let mut sdk_packages = Vec::new();
         let mut sdk_package_names = Vec::new();
 
@@ -1054,15 +1578,15 @@ fi
         if let Some(ref dependencies) = sdk_dependencies {
             sdk_packages.extend(self.build_package_list_with_lock(
                 dependencies,
-                &lock_file,
+                lock_file,
                 target,
-                &sdk_sysroot,
+                sdk_sysroot,
             ));
             sdk_package_names.extend(self.extract_package_names(dependencies));
         }
 
         // Add extension SDK dependencies to the package list
-        for (ext_name, ext_deps) in &extension_sdk_dependencies {
+        for (ext_name, ext_deps) in extension_sdk_dependencies {
             if self.verbose {
                 print_info(
                     &format!("Adding SDK dependencies from extension '{ext_name}'"),
@@ -1070,10 +1594,13 @@ fi
                 );
             }
             let ext_packages =
-                self.build_package_list_with_lock(ext_deps, &lock_file, target, &sdk_sysroot);
+                self.build_package_list_with_lock(ext_deps, lock_file, target, sdk_sysroot);
             sdk_packages.extend(ext_packages);
             sdk_package_names.extend(self.extract_package_names(ext_deps));
         }
+
+        // Track all SDK package names for version query (bootstrap pkgs + new deps)
+        let mut all_sdk_package_names: Vec<String> = bootstrap_package_names.to_vec();
 
         if !sdk_packages.is_empty() {
             let yes = if self.force { "-y" } else { "" };
@@ -1088,6 +1615,10 @@ fi
             // (from arch-specific SDK) and target-specific repos (from target-repoconf).
             // The combined config uses arch-specific varsdir for correct architecture
             // filtering, which is critical for --runs-on with cross-arch targets.
+            let sdk_pkg_tui_ctx = self.tui_context.as_ref().map(|ctx| TuiContext {
+                task_id: TaskId::SdkPackages,
+                renderer: ctx.renderer.clone(),
+            });
             let command = format!(
                 r#"
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
@@ -1120,7 +1651,7 @@ $DNF_SDK_HOST \
                 dnf_args: self.dnf_args.clone(),
                 disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
                 // runs_on handled by shared context
-                tui_context: self.tui_context.clone(),
+                tui_context: sdk_pkg_tui_ctx,
                 ..Default::default()
             };
             let install_success = run_container_command(
@@ -1147,7 +1678,7 @@ $DNF_SDK_HOST \
         if !all_sdk_package_names.is_empty() {
             let installed_versions = container_helper
                 .query_installed_packages(
-                    &sdk_sysroot,
+                    sdk_sysroot,
                     &all_sdk_package_names,
                     container_image,
                     target,
@@ -1160,7 +1691,7 @@ $DNF_SDK_HOST \
                 .await?;
 
             if !installed_versions.is_empty() {
-                lock_file.update_sysroot_versions(target, &sdk_sysroot, installed_versions);
+                lock_file.update_sysroot_versions(target, sdk_sysroot, installed_versions);
                 if self.verbose {
                     print_info(
                         &format!(
@@ -1170,306 +1701,6 @@ $DNF_SDK_HOST \
                         OutputLevel::Normal,
                     );
                 }
-                // Save lock file immediately after SDK install
-                lock_file.save(&src_dir)?;
-            }
-        }
-
-        // Install rootfs sysroot via shared install logic
-        install_sysroot(&mut SysrootInstallParams {
-            sysroot_type: SysrootType::Rootfs,
-            config,
-            lock_file: &mut lock_file,
-            src_dir: &src_dir,
-            container_helper,
-            container_image,
-            target,
-            repo_url,
-            repo_release,
-            merged_container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            force: self.force,
-            runs_on_context,
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-        })
-        .await?;
-
-        // Install initramfs sysroot via shared install logic
-        install_sysroot(&mut SysrootInstallParams {
-            sysroot_type: SysrootType::Initramfs,
-            config,
-            lock_file: &mut lock_file,
-            src_dir: &src_dir,
-            container_helper,
-            container_image,
-            target,
-            repo_url,
-            repo_release,
-            merged_container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            force: self.force,
-            runs_on_context,
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-        })
-        .await?;
-
-        // Install target-sysroot if there are compile sections referenced by active extensions.
-        // Only install compile deps for extensions that are dependencies of active runtimes.
-        let active_compile_sections =
-            find_active_compile_sections(&composed.merged_value, &active_extensions);
-        if config.has_compile_sections() && !active_compile_sections.is_empty() {
-            // Aggregate compile dependencies only from active sections (with lock file support)
-            let compile_dependencies = config.get_compile_dependencies();
-            let mut all_compile_packages: Vec<String> = Vec::new();
-            let mut all_compile_package_names: Vec<String> = Vec::new();
-            for section_name in &active_compile_sections {
-                if let Some(dependencies) = compile_dependencies.get(section_name) {
-                    let packages = self.build_package_list_with_lock(
-                        dependencies,
-                        &lock_file,
-                        target,
-                        &SysrootType::TargetSysroot,
-                    );
-                    all_compile_packages.extend(packages);
-                    all_compile_package_names.extend(self.extract_package_names(dependencies));
-                }
-            }
-
-            // Deduplicate packages
-            all_compile_packages.sort();
-            all_compile_packages.dedup();
-            all_compile_package_names.sort();
-            all_compile_package_names.dedup();
-
-            print_info(
-                &format!(
-                    "Installing target-sysroot with {} compile dependencies.",
-                    all_compile_packages.len()
-                ),
-                OutputLevel::Normal,
-            );
-
-            let yes = if self.force { "-y" } else { "" };
-            let dnf_args_str = if let Some(args) = &self.dnf_args {
-                format!(" {} ", args.join(" "))
-            } else {
-                String::new()
-            };
-
-            // Build the target-sysroot package spec — repo scoping via --releasever, lock file pins exact version
-            let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
-            let target_sysroot_config_version = "*";
-            let target_sysroot_pkg = build_package_spec_with_lock(
-                &lock_file,
-                target,
-                &SysrootType::TargetSysroot,
-                target_sysroot_base_pkg,
-                target_sysroot_config_version,
-            );
-
-            // Install the target-sysroot with avocado-sdk-target-sysroot plus compile deps
-            let command = format!(
-                r#"
-unset RPM_CONFIGDIR
-RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
-$DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
-    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
-    {} {} --installroot ${{AVOCADO_PREFIX}}/sdk/target-sysroot \
-    install {} {}
-"#,
-                dnf_args_str,
-                yes,
-                target_sysroot_pkg,
-                all_compile_packages.join(" ")
-            );
-
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.to_string(),
-                command,
-                verbose: self.verbose,
-                source_environment: false, // Don't source environment - matches rootfs install behavior
-                interactive: !self.force,
-                repo_url: repo_url.map(|s| s.to_string()),
-                repo_release: repo_release.map(|s| s.to_string()),
-                container_args: merged_container_args.cloned(),
-                dnf_args: self.dnf_args.clone(),
-                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                // runs_on handled by shared context
-                tui_context: self.tui_context.clone(),
-                ..Default::default()
-            };
-
-            let install_success = run_container_command(
-                container_helper,
-                run_config,
-                runs_on_context,
-                self.sdk_arch.as_ref(),
-            )
-            .await?;
-
-            if install_success {
-                print_success(
-                    "Installed target-sysroot with compile dependencies.",
-                    OutputLevel::Normal,
-                );
-
-                // Query installed versions and update lock file
-                let mut packages_to_query = all_compile_package_names;
-                packages_to_query.push(target_sysroot_base_pkg.to_string());
-
-                let installed_versions = container_helper
-                    .query_installed_packages(
-                        &SysrootType::TargetSysroot,
-                        &packages_to_query,
-                        container_image,
-                        target,
-                        repo_url.map(|s| s.to_string()),
-                        repo_release.map(|s| s.to_string()),
-                        merged_container_args.cloned(),
-                        runs_on_context,
-                        self.sdk_arch.as_ref(),
-                    )
-                    .await?;
-
-                if !installed_versions.is_empty() {
-                    lock_file.update_sysroot_versions(
-                        target,
-                        &SysrootType::TargetSysroot,
-                        installed_versions,
-                    );
-                    if self.verbose {
-                        print_info(
-                            "Updated lock file with target-sysroot package versions.",
-                            OutputLevel::Normal,
-                        );
-                    }
-                    // Save lock file immediately after target-sysroot install
-                    lock_file.save(&src_dir)?;
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Failed to install target-sysroot with compile dependencies."
-                ));
-            }
-        }
-
-        // Write compile-deps stamp (unless --no-stamps)
-        // This tracks which compile dependencies are installed in the target-sysroot.
-        // When runtimes change, the active compile sections change, making this stamp stale.
-        if !self.no_stamps {
-            let compile_inputs =
-                compute_compile_deps_input_hash(&composed.merged_value, &active_compile_sections)?;
-
-            let stamp_script = if self.runs_on.is_some() {
-                // For remote execution, use dynamic arch detection
-                // Build the stamp JSON with a placeholder that gets replaced at runtime
-                let outputs = StampOutputs::default();
-                let stamp = Stamp::compile_deps_install("DYNAMIC_ARCH", compile_inputs, outputs);
-                let stamp_json = stamp.to_json()?;
-                // Replace the placeholder with dynamic arch detection
-                let stamp_json_escaped = stamp_json.replace('"', "\\\"");
-                format!(
-                    r#"
-HOST_ARCH=$(uname -m)
-STAMP_DIR="${{AVOCADO_PREFIX}}/.stamps/sdk/${{HOST_ARCH}}"
-mkdir -p "$STAMP_DIR"
-STAMP_JSON="{stamp_json_escaped}"
-STAMP_JSON=$(echo "$STAMP_JSON" | sed "s/DYNAMIC_ARCH/$HOST_ARCH/g")
-echo "$STAMP_JSON" > "$STAMP_DIR/compile-deps.stamp"
-echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
-"#
-                )
-            } else {
-                let outputs = StampOutputs::default();
-                let host_arch = get_local_arch();
-                let stamp = Stamp::compile_deps_install(host_arch, compile_inputs, outputs);
-                generate_write_stamp_script(&stamp)?
-            };
-
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.to_string(),
-                command: stamp_script,
-                verbose: self.verbose,
-                source_environment: true,
-                interactive: false,
-                repo_url: repo_url.map(|s| s.to_string()),
-                repo_release: repo_release.map(|s| s.to_string()),
-                container_args: merged_container_args.cloned(),
-                dnf_args: self.dnf_args.clone(),
-                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                tui_context: self.tui_context.clone(),
-                ..Default::default()
-            };
-
-            run_container_command(
-                container_helper,
-                run_config,
-                runs_on_context,
-                self.sdk_arch.as_ref(),
-            )
-            .await?;
-
-            if self.verbose {
-                print_info("Wrote compile-deps stamp.", OutputLevel::Normal);
-            }
-        }
-
-        // Write SDK install stamp (unless --no-stamps)
-        // The stamp uses the host architecture (CPU arch where SDK runs) rather than
-        // the target architecture (what you're building for). This allows --runs-on
-        // to detect if the SDK is installed for the remote's architecture.
-        if !self.no_stamps {
-            let inputs = compute_sdk_input_hash(&composed.merged_value)?;
-
-            // When using --runs-on, we need to detect the remote architecture dynamically
-            // since the remote host may have a different CPU arch than the local machine.
-            // Otherwise, use the local architecture.
-            let stamp_script = if self.runs_on.is_some() {
-                // Use dynamic arch detection for remote execution
-                generate_write_sdk_stamp_script_dynamic_arch(inputs)
-            } else {
-                // Use local architecture for local execution
-                let outputs = StampOutputs::default();
-                let host_arch = get_local_arch();
-                let stamp = Stamp::sdk_install(host_arch, inputs, outputs);
-                generate_write_stamp_script(&stamp)?
-            };
-
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.to_string(),
-                command: stamp_script,
-                verbose: self.verbose,
-                source_environment: true,
-                interactive: false,
-                repo_url: repo_url.map(|s| s.to_string()),
-                repo_release: repo_release.map(|s| s.to_string()),
-                container_args: merged_container_args.cloned(),
-                dnf_args: self.dnf_args.clone(),
-                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                // runs_on handled by shared context
-                tui_context: self.tui_context.clone(),
-                ..Default::default()
-            };
-
-            run_container_command(
-                container_helper,
-                run_config,
-                runs_on_context,
-                self.sdk_arch.as_ref(),
-            )
-            .await?;
-
-            if self.verbose {
-                print_info("Wrote SDK install stamp.", OutputLevel::Normal);
             }
         }
 

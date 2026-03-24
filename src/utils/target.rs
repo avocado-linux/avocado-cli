@@ -208,6 +208,14 @@ pub fn validate_and_log_target(
         OutputLevel::Normal,
     );
 
+    // Log AVOCADO_REPO_URL if explicitly set
+    if let Ok(repo_url) = std::env::var("AVOCADO_REPO_URL") {
+        print_info(
+            &format!("Using repo URL: {repo_url} (from AVOCADO_REPO_URL)"),
+            OutputLevel::Normal,
+        );
+    }
+
     Ok(resolution.target)
 }
 

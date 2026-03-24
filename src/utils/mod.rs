@@ -12,6 +12,7 @@ pub mod pkcs11_devices;
 pub mod prerequisites;
 pub mod remote;
 pub mod runs_on;
+pub mod scheduler;
 pub mod signing_keys;
 #[cfg(unix)]
 pub mod signing_service;

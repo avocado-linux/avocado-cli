@@ -7,6 +7,10 @@ use std::time::Instant;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TaskId {
     SdkInstall,
+    SdkPackages,
+    RootfsInstall,
+    InitramfsInstall,
+    TargetDevInstall,
     ExtInstall(String),
     ExtBuild(String),
     ExtImage(String),
@@ -18,6 +22,10 @@ impl std::fmt::Display for TaskId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TaskId::SdkInstall => write!(f, "sdk install"),
+            TaskId::SdkPackages => write!(f, "sdk packages"),
+            TaskId::RootfsInstall => write!(f, "rootfs install"),
+            TaskId::InitramfsInstall => write!(f, "initramfs install"),
+            TaskId::TargetDevInstall => write!(f, "target-dev install"),
             TaskId::ExtInstall(name) => write!(f, "ext install {name}"),
             TaskId::ExtBuild(name) => write!(f, "ext build {name}"),
             TaskId::ExtImage(name) => write!(f, "ext image {name}"),
@@ -57,6 +65,8 @@ pub struct TaskState {
     pub started_at: Option<Instant>,
     pub finished_at: Option<Instant>,
     pub error_message: Option<String>,
+    /// When this task last received output (for peek line selection).
+    pub last_output_at: Option<Instant>,
 }
 
 impl TaskState {
@@ -71,6 +81,7 @@ impl TaskState {
             started_at: None,
             finished_at: None,
             error_message: None,
+            last_output_at: None,
         }
     }
 
@@ -81,6 +92,7 @@ impl TaskState {
             self.output_ring.pop_front();
         }
         self.output_ring.push_back(line);
+        self.last_output_at = Some(Instant::now());
     }
 
     /// Replace the last line in the output ring (carriage-return output, e.g. progress bars).
@@ -97,6 +109,7 @@ impl TaskState {
         } else {
             self.output_ring.push_back(line);
         }
+        self.last_output_at = Some(Instant::now());
     }
 
     /// Elapsed duration since the task started, if applicable.

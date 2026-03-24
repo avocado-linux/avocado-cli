@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::commands::{
@@ -12,6 +13,7 @@ use crate::utils::{
     config::{ComposedConfig, Config, ExtensionSource},
     container::TuiContext,
     output::{print_info, print_success, should_use_tui, OutputLevel},
+    scheduler::{TaskGraph, TaskScheduler},
     tui::{TaskId, TaskRenderer, TaskStatus},
 };
 
@@ -138,11 +140,6 @@ impl BuildCommand {
                 .await;
         }
 
-        print_info(
-            "Starting comprehensive build process...",
-            OutputLevel::Normal,
-        );
-
         // Determine which runtimes to build based on target
         let runtimes_to_build = self.get_runtimes_to_build(config, parsed, &target)?;
 
@@ -151,8 +148,18 @@ impl BuildCommand {
             return Ok(());
         }
 
-        // Step 1: Analyze dependencies
-        print_info("Step 1/4: Analyzing dependencies", OutputLevel::Normal);
+        if runtimes_to_build.len() == 1 {
+            print_info(
+                &format!("Building '{}' runtime", runtimes_to_build[0]),
+                OutputLevel::Normal,
+            );
+        } else {
+            let names: Vec<&str> = runtimes_to_build.iter().map(|s| s.as_str()).collect();
+            print_info(
+                &format!("Building runtimes [{}]", names.join(", ")),
+                OutputLevel::Normal,
+            );
+        }
         let required_extensions =
             self.find_required_extensions(config, parsed, &runtimes_to_build, &target)?;
 
@@ -162,13 +169,20 @@ impl BuildCommand {
         // Set up TUI renderer if applicable
         let renderer = if should_use_tui() && !self.verbose {
             let r = Arc::new(TaskRenderer::new(false));
-            // Register all known tasks
+            // Register tasks in execution order: all builds, then all images,
+            // then all runtimes — so the checklist matches the dependency flow.
             for ext_dep in &required_extensions {
                 let name = match ext_dep {
                     ExtensionDependency::Local(n) => n.clone(),
                     ExtensionDependency::Remote { name, .. } => name.clone(),
                 };
                 r.register_task(TaskId::ExtBuild(name.clone()), format!("ext build {name}"));
+            }
+            for ext_dep in &required_extensions {
+                let name = match ext_dep {
+                    ExtensionDependency::Local(n) => n.clone(),
+                    ExtensionDependency::Remote { name, .. } => name.clone(),
+                };
                 r.register_task(TaskId::ExtImage(name.clone()), format!("ext image {name}"));
             }
             for rt in &runtimes_to_build {
@@ -184,154 +198,128 @@ impl BuildCommand {
             None
         };
 
-        /// Helper to create a TuiContext for a given task, if the renderer is active.
-        fn make_tui_ctx(
-            renderer: &Option<Arc<TaskRenderer>>,
-            task_id: TaskId,
-        ) -> Option<TuiContext> {
-            renderer.as_ref().map(|r| TuiContext {
-                task_id,
-                renderer: Arc::clone(r),
-            })
-        }
+        // Determine parallelism
+        let max_parallel: usize = std::env::var("AVOCADO_PARALLEL_TASKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| num_cpus::get().min(4));
 
-        // Step 2: Build extensions
-        print_info("Step 2/4: Building extensions", OutputLevel::Normal);
+        // --runs-on forces sequential (remote execution)
+        let max_parallel = if self.runs_on.is_some() {
+            1
+        } else {
+            max_parallel
+        };
+
+        // Phase 1: Build extension builds + images in parallel via the scheduler.
+        // ExtBuild(name) → no deps, ExtImage(name) → ExtBuild(name)
         if !required_extensions.is_empty() {
-            for extension_dep in &required_extensions {
-                let ext_name = match extension_dep {
+            let mut graph = TaskGraph::new();
+            for ext_dep in &required_extensions {
+                let name = match ext_dep {
                     ExtensionDependency::Local(n) => n.clone(),
                     ExtensionDependency::Remote { name, .. } => name.clone(),
                 };
-
-                if self.verbose {
-                    print_info(
-                        &format!("Building extension '{ext_name}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-
-                let build_task_id = TaskId::ExtBuild(ext_name.clone());
-                if let Some(ref r) = renderer {
-                    r.set_status(&build_task_id, TaskStatus::Running);
-                }
-                let tui_ctx = make_tui_ctx(&renderer, build_task_id.clone());
-
-                let mut ext_build_cmd = ExtBuildCommand::new(
-                    ext_name.clone(),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                )
-                .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                .with_sdk_arch(self.sdk_arch.clone())
-                .with_composed_config(Arc::clone(&composed));
-
-                if let Some(ctx) = tui_ctx {
-                    ext_build_cmd = ext_build_cmd.with_tui_context(ctx);
-                }
-
-                let build_result = ext_build_cmd.execute().await;
-
-                if let Some(ref r) = renderer {
-                    if build_result.is_ok() {
-                        r.set_status(&build_task_id, TaskStatus::Success);
-                    } else {
-                        r.set_status(&build_task_id, TaskStatus::Failed);
-                    }
-                }
-
-                build_result.with_context(|| format!("Failed to build extension '{ext_name}'"))?;
-            }
-        } else {
-            print_info("No extensions to build.", OutputLevel::Normal);
-        }
-
-        // Step 3: Create extension images
-        print_info("Step 3/4: Creating extension images", OutputLevel::Normal);
-        if !required_extensions.is_empty() {
-            for extension_dep in &required_extensions {
-                let ext_name = match extension_dep {
-                    ExtensionDependency::Local(n) => n.clone(),
-                    ExtensionDependency::Remote { name, .. } => name.clone(),
-                };
-
-                if self.verbose {
-                    print_info(
-                        &format!("Creating image for extension '{ext_name}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-
-                let image_task_id = TaskId::ExtImage(ext_name.clone());
-                if let Some(ref r) = renderer {
-                    r.set_status(&image_task_id, TaskStatus::Running);
-                }
-                let tui_ctx = make_tui_ctx(&renderer, image_task_id.clone());
-
-                let mut ext_image_cmd = ExtImageCommand::new(
-                    ext_name.clone(),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                )
-                .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                .with_sdk_arch(self.sdk_arch.clone())
-                .with_composed_config(Arc::clone(&composed));
-
-                if let Some(ctx) = tui_ctx {
-                    ext_image_cmd = ext_image_cmd.with_tui_context(ctx);
-                }
-
-                let image_result = ext_image_cmd.execute().await;
-
-                if let Some(ref r) = renderer {
-                    if image_result.is_ok() {
-                        r.set_status(&image_task_id, TaskStatus::Success);
-                    } else {
-                        r.set_status(&image_task_id, TaskStatus::Failed);
-                    }
-                }
-
-                image_result.with_context(|| {
-                    format!("Failed to create image for extension '{ext_name}'")
-                })?;
-            }
-        } else {
-            print_info("No extension images to create.", OutputLevel::Normal);
-        }
-
-        // Step 4: Build runtimes
-        if let Some(ref runtime_name) = self.runtime {
-            print_info(
-                &format!("Step 4/4: Building runtime '{runtime_name}'"),
-                OutputLevel::Normal,
-            );
-        } else {
-            print_info("Step 4/4: Building all runtimes", OutputLevel::Normal);
-        }
-
-        for runtime_name in &runtimes_to_build {
-            if self.verbose {
-                print_info(
-                    &format!("Building runtime '{runtime_name}'"),
-                    OutputLevel::Normal,
+                graph.add_task(TaskId::ExtBuild(name.clone()), vec![]);
+                graph.add_task(
+                    TaskId::ExtImage(name.clone()),
+                    vec![TaskId::ExtBuild(name.clone())],
                 );
             }
 
+            let config_path = self.config_path.clone();
+            let verbose = self.verbose;
+            let cli_target = self.target.clone();
+            let container_args = self.container_args.clone();
+            let dnf_args = self.dnf_args.clone();
+            let no_stamps = self.no_stamps;
+            let runs_on = self.runs_on.clone();
+            let nfs_port = self.nfs_port;
+            let sdk_arch = self.sdk_arch.clone();
+            let composed2 = Arc::clone(&composed);
+            let renderer2 = renderer.clone();
+
+            let sched_renderer = renderer
+                .clone()
+                .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
+            let mut scheduler = TaskScheduler::new(graph, sched_renderer, max_parallel);
+
+            scheduler
+                .run(move |task_id: TaskId| {
+                    let config_path = config_path.clone();
+                    let cli_target = cli_target.clone();
+                    let container_args = container_args.clone();
+                    let dnf_args = dnf_args.clone();
+                    let runs_on = runs_on.clone();
+                    let sdk_arch = sdk_arch.clone();
+                    let composed = Arc::clone(&composed2);
+                    let renderer = renderer2.clone();
+
+                    Box::pin(async move {
+                        let tui_ctx = renderer.as_ref().map(|r| TuiContext {
+                            task_id: task_id.clone(),
+                            renderer: Arc::clone(r),
+                        });
+
+                        match task_id {
+                            TaskId::ExtBuild(ref name) => {
+                                let mut cmd = ExtBuildCommand::new(
+                                    name.clone(),
+                                    config_path,
+                                    verbose,
+                                    cli_target,
+                                    container_args,
+                                    dnf_args,
+                                )
+                                .with_no_stamps(no_stamps)
+                                .with_runs_on(runs_on, nfs_port)
+                                .with_sdk_arch(sdk_arch)
+                                .with_composed_config(composed);
+                                if let Some(ctx) = tui_ctx {
+                                    cmd = cmd.with_tui_context(ctx);
+                                }
+                                cmd.execute().await
+                            }
+                            TaskId::ExtImage(ref name) => {
+                                let mut cmd = ExtImageCommand::new(
+                                    name.clone(),
+                                    config_path,
+                                    verbose,
+                                    cli_target,
+                                    container_args,
+                                    dnf_args,
+                                )
+                                .with_no_stamps(no_stamps)
+                                .with_runs_on(runs_on, nfs_port)
+                                .with_sdk_arch(sdk_arch)
+                                .with_composed_config(composed);
+                                if let Some(ctx) = tui_ctx {
+                                    cmd = cmd.with_tui_context(ctx);
+                                }
+                                cmd.execute().await
+                            }
+                            _ => Ok(()),
+                        }
+                    })
+                        as Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                })
+                .await?;
+        }
+
+        // Phase 2: Build runtimes sequentially (RuntimeBuildCommand contains
+        // non-Send types like TufSigner, so it cannot be spawned on tokio).
+        for runtime_name in &runtimes_to_build {
             let rt_task_id = TaskId::RuntimeBuild(runtime_name.clone());
             if let Some(ref r) = renderer {
                 r.set_status(&rt_task_id, TaskStatus::Running);
             }
-            let tui_ctx = make_tui_ctx(&renderer, rt_task_id.clone());
 
-            let mut runtime_build_cmd = RuntimeBuildCommand::new(
+            let tui_ctx = renderer.as_ref().map(|r| TuiContext {
+                task_id: rt_task_id.clone(),
+                renderer: Arc::clone(r),
+            });
+
+            let mut cmd = RuntimeBuildCommand::new(
                 runtime_name.clone(),
                 self.config_path.clone(),
                 self.verbose,
@@ -345,20 +333,20 @@ impl BuildCommand {
             .with_composed_config(Arc::clone(&composed));
 
             if let Some(ctx) = tui_ctx {
-                runtime_build_cmd = runtime_build_cmd.with_tui_context(ctx);
+                cmd = cmd.with_tui_context(ctx);
             }
 
-            let build_result = runtime_build_cmd.execute().await;
+            let result = cmd.execute().await;
 
             if let Some(ref r) = renderer {
-                if build_result.is_ok() {
+                if result.is_ok() {
                     r.set_status(&rt_task_id, TaskStatus::Success);
                 } else {
                     r.set_status(&rt_task_id, TaskStatus::Failed);
                 }
             }
 
-            build_result.with_context(|| format!("Failed to build runtime '{runtime_name}'"))?;
+            result.with_context(|| format!("Failed to build runtime '{runtime_name}'"))?;
         }
 
         // Shut down the TUI renderer

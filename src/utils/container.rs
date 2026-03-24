@@ -1319,22 +1319,25 @@ impl SdkContainer {
                 .spawn()
                 .with_context(|| "Failed to spawn container command")?;
 
-            // If we piped output because a global renderer is active, spawn
-            // readers that silently capture it (available on failure via the
-            // renderer's task state).
-            let stdout_reader = if global_renderer.is_some() {
+            // If we piped output because a global renderer is active, feed
+            // lines to the first running task so the peek line stays current.
+            let stdout_reader = if let Some(ref renderer) = global_renderer {
+                let task_id = renderer.first_running_task();
+                let renderer = renderer.clone();
                 child.stdout.take().map(|s| {
                     tokio::spawn(async move {
-                        use tokio::io::AsyncReadExt;
-                        let mut reader = tokio::io::BufReader::new(s);
-                        let mut buf = [0u8; 4096];
-                        // Drain stdout — output is discarded (print_info calls
-                        // from within the command already route through the
-                        // global renderer).
-                        loop {
-                            match reader.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {}
+                        if let Some(ref tid) = task_id {
+                            read_output_stream(s, tid, &renderer).await;
+                        } else {
+                            // No running task — just drain
+                            use tokio::io::AsyncReadExt;
+                            let mut r = tokio::io::BufReader::new(s);
+                            let mut buf = [0u8; 4096];
+                            loop {
+                                match r.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
                             }
                         }
                     })
@@ -1342,16 +1345,22 @@ impl SdkContainer {
             } else {
                 None
             };
-            let stderr_reader = if global_renderer.is_some() {
+            let stderr_reader = if let Some(ref renderer) = global_renderer {
+                let task_id = renderer.first_running_task();
+                let renderer = renderer.clone();
                 child.stderr.take().map(|s| {
                     tokio::spawn(async move {
-                        use tokio::io::AsyncReadExt;
-                        let mut reader = tokio::io::BufReader::new(s);
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match reader.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {}
+                        if let Some(ref tid) = task_id {
+                            read_output_stream(s, tid, &renderer).await;
+                        } else {
+                            use tokio::io::AsyncReadExt;
+                            let mut r = tokio::io::BufReader::new(s);
+                            let mut buf = [0u8; 4096];
+                            loop {
+                                match r.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
                             }
                         }
                     })

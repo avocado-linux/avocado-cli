@@ -1,6 +1,7 @@
 //! Install command implementation that runs SDK, extension, and runtime installs.
 
 use anyhow::{Context, Result};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::commands::{
@@ -10,6 +11,7 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::TuiContext,
     output::{print_info, print_success, should_use_tui, OutputLevel},
+    scheduler::{TaskGraph, TaskScheduler},
     target::validate_and_log_target,
     tui::{TaskId, TaskRenderer, TaskStatus},
 };
@@ -119,17 +121,40 @@ impl InstallCommand {
         let _parsed = &composed.merged_value;
         let _target = validate_and_log_target(self.target.as_deref(), config)?;
 
-        print_info(
-            "Starting comprehensive install process...",
-            OutputLevel::Normal,
-        );
+        // Compute target runtimes early so we can show a useful start message.
+        let initial_runtimes = self.find_target_relevant_runtimes(config, _parsed, &_target)?;
+        if initial_runtimes.len() == 1 {
+            print_info(
+                &format!(
+                    "Installing packages and dependencies for '{}' runtime",
+                    initial_runtimes[0]
+                ),
+                OutputLevel::Normal,
+            );
+        } else if initial_runtimes.is_empty() {
+            print_info("Installing SDK packages", OutputLevel::Normal);
+        } else {
+            let names: Vec<&str> = initial_runtimes.iter().map(|s| s.as_str()).collect();
+            print_info(
+                &format!(
+                    "Installing packages and dependencies for runtimes [{}]",
+                    names.join(", ")
+                ),
+                OutputLevel::Normal,
+            );
+        }
 
         // Create a single TUI renderer for the entire install flow.
-        // We register the SDK task now; ext/runtime tasks are added after
-        // config reload (once we know which extensions were fetched).
+        // Register SDK + sysroot tasks upfront (we know these from config).
+        // Ext/runtime tasks are added after config reload.
         let renderer = if should_use_tui() && !self.verbose {
             let r = Arc::new(TaskRenderer::new(false));
-            r.register_task(TaskId::SdkInstall, "sdk install".to_string());
+            r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+            r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+            r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+            r.register_task(TaskId::InitramfsInstall, "initramfs install".to_string());
+            // target-dev install is registered dynamically by sdk/install.rs
+            // after fetching extensions and discovering compile sections
             crate::utils::tui::set_active_renderer(&r);
             r.start();
             Some(r)
@@ -197,8 +222,8 @@ impl InstallCommand {
         let extensions_to_install = self.find_required_extensions(&composed, &_target)?;
         let target_runtimes = self.find_target_relevant_runtimes(config, parsed, &_target)?;
 
-        // Register ext/runtime tasks on the existing renderer now that we
-        // know which extensions were fetched by SDK install.
+        // Register ext/runtime tasks now that we know what was fetched.
+        // (Sysroot tasks were already registered upfront.)
         if let Some(ref r) = renderer {
             for ext_dep in &extensions_to_install {
                 let ExtensionDependency::Local(name) = ext_dep;
@@ -215,142 +240,119 @@ impl InstallCommand {
             }
         }
 
-        fn make_tui_ctx(
-            renderer: &Option<Arc<TaskRenderer>>,
-            task_id: TaskId,
-        ) -> Option<TuiContext> {
-            renderer.as_ref().map(|r| TuiContext {
-                task_id,
-                renderer: Arc::clone(r),
-            })
-        }
-
-        // 2. Install extension dependencies
-        print_info(
-            "Step 2/3: Installing extension dependencies",
-            OutputLevel::Normal,
-        );
-
-        if !extensions_to_install.is_empty() {
-            for extension_dep in &extensions_to_install {
-                let ExtensionDependency::Local(extension_name) = extension_dep;
-                if self.verbose {
-                    print_info(
-                        &format!("Installing local extension dependencies for '{extension_name}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-
-                let ext_task_id = TaskId::ExtInstall(extension_name.clone());
-                if let Some(ref r) = renderer {
-                    r.set_status(&ext_task_id, TaskStatus::Running);
-                }
-                let tui_ctx = make_tui_ctx(&renderer, ext_task_id.clone());
-
-                let mut ext_install_cmd = ExtInstallCommand::new(
-                    Some(extension_name.clone()),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.force,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                )
-                .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                .with_sdk_arch(self.sdk_arch.clone())
-                .with_composed_config(Arc::clone(&composed));
-
-                if let Some(ctx) = tui_ctx {
-                    ext_install_cmd = ext_install_cmd.with_tui_context(ctx);
-                }
-
-                let result = ext_install_cmd.execute().await;
-
-                if let Some(ref r) = renderer {
-                    if result.is_ok() {
-                        r.set_status(&ext_task_id, TaskStatus::Success);
-                    } else {
-                        r.set_status(&ext_task_id, TaskStatus::Failed);
-                    }
-                }
-
-                result.with_context(|| {
-                    format!("Failed to install extension dependencies for '{extension_name}'")
-                })?;
-            }
+        // Determine parallelism
+        let max_parallel: usize = std::env::var("AVOCADO_PARALLEL_TASKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| num_cpus::get().min(4));
+        let max_parallel = if self.runs_on.is_some() {
+            1
         } else {
-            print_info("No extension dependencies to install.", OutputLevel::Normal);
-        }
+            max_parallel
+        };
 
-        // 3. Install runtime dependencies (filtered by target)
-        if target_runtimes.is_empty() {
-            print_info(
-                &format!("Step 3/3: No runtimes found for target '{_target}'. Skipping runtime dependencies."),
-                OutputLevel::Normal,
-            );
-        } else {
-            if target_runtimes.len() == 1 {
-                print_info(
-                    &format!(
-                        "Step 3/3: Installing runtime dependencies for '{}' (target: {_target})",
-                        target_runtimes[0]
-                    ),
-                    OutputLevel::Normal,
-                );
-            } else {
-                print_info(
-                    &format!("Step 3/3: Installing runtime dependencies for {} runtimes (target: {_target})", target_runtimes.len()),
-                    OutputLevel::Normal,
-                );
+        // Build DAG: ext installs have no inter-dependencies (parallel),
+        // runtime installs depend on all ext installs completing first.
+        if !extensions_to_install.is_empty() || !target_runtimes.is_empty() {
+            let mut graph = TaskGraph::new();
+
+            let ext_task_ids: Vec<TaskId> = extensions_to_install
+                .iter()
+                .map(|e| {
+                    let ExtensionDependency::Local(name) = e;
+                    TaskId::ExtInstall(name.clone())
+                })
+                .collect();
+
+            for id in &ext_task_ids {
+                graph.add_task(id.clone(), vec![]);
             }
 
-            for runtime_name in &target_runtimes {
-                if self.verbose {
-                    print_info(
-                        &format!("Installing runtime dependencies for '{runtime_name}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-
-                let rt_task_id = TaskId::RuntimeInstall(runtime_name.clone());
-                if let Some(ref r) = renderer {
-                    r.set_status(&rt_task_id, TaskStatus::Running);
-                }
-                let tui_ctx = make_tui_ctx(&renderer, rt_task_id.clone());
-
-                let mut runtime_install_cmd = RuntimeInstallCommand::new(
-                    Some(runtime_name.clone()),
-                    self.config_path.clone(),
-                    self.verbose,
-                    self.force,
-                    self.target.clone(),
-                    self.container_args.clone(),
-                    self.dnf_args.clone(),
-                )
-                .with_no_stamps(self.no_stamps)
-                .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                .with_sdk_arch(self.sdk_arch.clone())
-                .with_composed_config(Arc::clone(&composed));
-
-                if let Some(ctx) = tui_ctx {
-                    runtime_install_cmd = runtime_install_cmd.with_tui_context(ctx);
-                }
-
-                let result = runtime_install_cmd.execute().await;
-
-                if let Some(ref r) = renderer {
-                    if result.is_ok() {
-                        r.set_status(&rt_task_id, TaskStatus::Success);
-                    } else {
-                        r.set_status(&rt_task_id, TaskStatus::Failed);
-                    }
-                }
-
-                result.with_context(|| {
-                    format!("Failed to install runtime dependencies for '{runtime_name}'")
-                })?;
+            for rt in &target_runtimes {
+                // Runtime installs depend on all ext installs
+                graph.add_task(TaskId::RuntimeInstall(rt.clone()), ext_task_ids.clone());
             }
+
+            let config_path = self.config_path.clone();
+            let verbose = self.verbose;
+            let force = self.force;
+            let cli_target = self.target.clone();
+            let container_args = self.container_args.clone();
+            let dnf_args = self.dnf_args.clone();
+            let no_stamps = self.no_stamps;
+            let runs_on = self.runs_on.clone();
+            let nfs_port = self.nfs_port;
+            let sdk_arch = self.sdk_arch.clone();
+            let composed2 = Arc::clone(&composed);
+            let renderer2 = renderer.clone();
+
+            let sched_renderer = renderer
+                .clone()
+                .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
+            let mut scheduler = TaskScheduler::new(graph, sched_renderer, max_parallel);
+
+            scheduler
+                .run(move |task_id: TaskId| {
+                    let config_path = config_path.clone();
+                    let cli_target = cli_target.clone();
+                    let container_args = container_args.clone();
+                    let dnf_args = dnf_args.clone();
+                    let runs_on = runs_on.clone();
+                    let sdk_arch = sdk_arch.clone();
+                    let composed = Arc::clone(&composed2);
+                    let renderer = renderer2.clone();
+
+                    Box::pin(async move {
+                        let tui_ctx = renderer.as_ref().map(|r| TuiContext {
+                            task_id: task_id.clone(),
+                            renderer: Arc::clone(r),
+                        });
+
+                        match task_id {
+                            TaskId::ExtInstall(ref name) => {
+                                let mut cmd = ExtInstallCommand::new(
+                                    Some(name.clone()),
+                                    config_path,
+                                    verbose,
+                                    force,
+                                    cli_target,
+                                    container_args,
+                                    dnf_args,
+                                )
+                                .with_no_stamps(no_stamps)
+                                .with_runs_on(runs_on, nfs_port)
+                                .with_sdk_arch(sdk_arch)
+                                .with_composed_config(composed);
+                                if let Some(ctx) = tui_ctx {
+                                    cmd = cmd.with_tui_context(ctx);
+                                }
+                                cmd.execute().await
+                            }
+                            TaskId::RuntimeInstall(ref name) => {
+                                let mut cmd = RuntimeInstallCommand::new(
+                                    Some(name.clone()),
+                                    config_path,
+                                    verbose,
+                                    force,
+                                    cli_target,
+                                    container_args,
+                                    dnf_args,
+                                )
+                                .with_no_stamps(no_stamps)
+                                .with_runs_on(runs_on, nfs_port)
+                                .with_sdk_arch(sdk_arch)
+                                .with_composed_config(composed);
+                                if let Some(ctx) = tui_ctx {
+                                    cmd = cmd.with_tui_context(ctx);
+                                }
+                                cmd.execute().await
+                            }
+                            _ => Ok(()),
+                        }
+                    })
+                        as Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                })
+                .await?;
         }
 
         if let Some(ref r) = renderer {
