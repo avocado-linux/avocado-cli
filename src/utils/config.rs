@@ -4007,25 +4007,35 @@ pub fn find_active_extensions(
     let target_runtimes =
         find_target_relevant_runtimes(config, parsed, target, config_path, requested_runtime)?;
 
-    if target_runtimes.is_empty() {
-        return Ok(active_extensions);
-    }
-
-    if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
-        for runtime_name in &target_runtimes {
-            if let Some(_runtime_config) = runtime_section.get(runtime_name.as_str()) {
-                let merged_runtime =
-                    config.get_merged_runtime_config(runtime_name, target, config_path)?;
-                if let Some(merged_value) = merged_runtime {
-                    if let Some(extensions_list) =
-                        merged_value.get("extensions").and_then(|e| e.as_sequence())
-                    {
-                        for ext_val in extensions_list {
-                            if let Some(ext_name) = ext_val.as_str() {
-                                active_extensions.insert(ext_name.to_string());
+    if !target_runtimes.is_empty() {
+        // Collect extensions referenced by active runtimes
+        if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
+            for runtime_name in &target_runtimes {
+                if let Some(_runtime_config) = runtime_section.get(runtime_name.as_str()) {
+                    let merged_runtime =
+                        config.get_merged_runtime_config(runtime_name, target, config_path)?;
+                    if let Some(merged_value) = merged_runtime {
+                        if let Some(extensions_list) =
+                            merged_value.get("extensions").and_then(|e| e.as_sequence())
+                        {
+                            for ext_val in extensions_list {
+                                if let Some(ext_name) = ext_val.as_str() {
+                                    active_extensions.insert(ext_name.to_string());
+                                }
                             }
                         }
                     }
+                }
+            }
+        }
+    } else {
+        // No runtimes defined — treat all top-level extensions as active.
+        // This supports standalone extension configs that define extensions
+        // without a runtime section.
+        if let Some(extensions_map) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
+            for (key, _) in extensions_map {
+                if let Some(ext_name) = key.as_str() {
+                    active_extensions.insert(ext_name.to_string());
                 }
             }
         }
