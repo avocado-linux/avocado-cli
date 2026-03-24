@@ -49,6 +49,8 @@ pub struct TaskRenderer {
     sticky_peek: Arc<Mutex<Option<TaskId>>>,
     /// Messages queued by print_above() for the render loop to drain.
     above_queue: Arc<Mutex<Vec<String>>>,
+    /// Set to true by the render loop when it has fully stopped.
+    loop_stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskRenderer {
@@ -70,6 +72,7 @@ impl TaskRenderer {
             created_at: std::time::Instant::now(),
             sticky_peek: Arc::new(Mutex::new(None)),
             above_queue: Arc::new(Mutex::new(Vec::new())),
+            loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -203,6 +206,16 @@ impl TaskRenderer {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.notify.notify_one();
 
+        // Wait for the render loop to fully stop so it won't write to
+        // stderr after we clear the TUI region and print the summary.
+        // Skip the wait if the loop was never started (Passthrough mode
+        // or start() was never called).
+        if self.mode == RenderMode::Tui {
+            while !self.loop_stopped.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
         let state = self.state.lock().unwrap();
 
         // Clear the live TUI region
@@ -280,6 +293,10 @@ impl TaskRenderer {
                 self.render_tui();
             }
         }
+
+        // Signal that the render loop has fully stopped — shutdown() waits on this.
+        self.loop_stopped
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Render the TUI region — status lines with animated spinner.

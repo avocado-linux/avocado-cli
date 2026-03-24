@@ -490,39 +490,33 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         };
 
-        // Run all four tasks in parallel
-        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
-            sdk_pkg_fut,
-            install_sysroot(&mut rootfs_params),
-            install_sysroot(&mut initramfs_params),
-            target_dev_fut,
-        );
-
-        // Update TUI statuses
-        if let Some(r) = crate::utils::tui::get_active_renderer() {
-            if sdk_pkg_result.is_ok() {
-                r.set_status(&TaskId::SdkPackages, TaskStatus::Success);
-            } else {
-                r.set_status(&TaskId::SdkPackages, TaskStatus::Failed);
-            }
-            if rootfs_result.is_ok() {
-                r.set_status(&TaskId::RootfsInstall, TaskStatus::Success);
-            } else {
-                r.set_status(&TaskId::RootfsInstall, TaskStatus::Failed);
-            }
-            if initramfs_result.is_ok() {
-                r.set_status(&TaskId::InitramfsInstall, TaskStatus::Success);
-            } else {
-                r.set_status(&TaskId::InitramfsInstall, TaskStatus::Failed);
-            }
-            if need_target_dev {
-                if target_dev_result.is_ok() {
-                    r.set_status(&TaskId::TargetDevInstall, TaskStatus::Success);
-                } else {
-                    r.set_status(&TaskId::TargetDevInstall, TaskStatus::Failed);
+        // Helper: wrap a future so it sets TUI status immediately on completion.
+        macro_rules! with_tui_status {
+            ($fut:expr, $task_id:expr) => {
+                async {
+                    let result = $fut.await;
+                    if let Some(r) = crate::utils::tui::get_active_renderer() {
+                        if result.is_ok() {
+                            r.set_status(&$task_id, TaskStatus::Success);
+                        } else {
+                            r.set_status(&$task_id, TaskStatus::Failed);
+                        }
+                    }
+                    result
                 }
-            }
+            };
         }
+
+        // Run all four tasks in parallel — each updates TUI immediately on completion
+        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
+            with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
+            with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
+            with_tui_status!(
+                install_sysroot(&mut initramfs_params),
+                TaskId::InitramfsInstall
+            ),
+            with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
+        );
 
         // Merge lock file changes back into a single lock file for saving
         let mut final_lock = lock_file.clone();
