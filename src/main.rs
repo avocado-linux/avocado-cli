@@ -18,6 +18,7 @@ use commands::connect::claim_tokens::{
 use commands::connect::cohorts::{
     ConnectCohortsCreateCommand, ConnectCohortsDeleteCommand, ConnectCohortsListCommand,
 };
+use commands::connect::deploy::ConnectDeployCommand;
 use commands::connect::devices::{
     ConnectDevicesCreateCommand, ConnectDevicesDeleteCommand, ConnectDevicesListCommand,
 };
@@ -511,6 +512,51 @@ enum ConnectCommands {
         /// Path to pre-built tarball or artifact directory (skips export from Docker volume)
         #[arg(long)]
         file: Option<String>,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+        /// Deploy after upload: cohort ID to target
+        #[arg(long)]
+        deploy_cohort: Option<String>,
+        /// Deploy after upload: deployment name (auto-generated if omitted)
+        #[arg(long)]
+        deploy_name: Option<String>,
+        /// Deploy after upload: filter by tags (repeatable)
+        #[arg(long)]
+        deploy_tag: Vec<String>,
+        /// Deploy after upload: activate immediately (skip draft)
+        #[arg(long)]
+        deploy_activate: bool,
+    },
+    /// Deploy a runtime to a cohort
+    Deploy {
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID (or set connect.project in avocado.yaml)
+        #[arg(long)]
+        project: Option<String>,
+        /// Runtime ID (skip interactive prompt)
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Cohort ID (skip interactive prompt)
+        #[arg(long)]
+        cohort: Option<String>,
+        /// Deployment name (auto-generated if omitted)
+        #[arg(long)]
+        name: Option<String>,
+        /// Description for the deployment
+        #[arg(long)]
+        description: Option<String>,
+        /// Filter by tags — only deploy to devices with these tags (repeatable)
+        #[arg(long, short = 't')]
+        tag: Vec<String>,
+        /// Activate immediately (skip draft status)
+        #[arg(long)]
+        activate: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
@@ -2809,19 +2855,58 @@ async fn main() -> Result<()> {
                 target,
                 file,
                 profile,
+                deploy_cohort,
+                deploy_name,
+                deploy_tag,
+                deploy_activate,
             } => {
-                let (resolved_org, resolved_project) =
-                    commands::connect::resolve_org_and_project(org, project, &config)?;
+                let (resolved_org, resolved_project) = commands::connect::resolve_org_and_project(
+                    org.clone(),
+                    project.clone(),
+                    &config,
+                )?;
 
                 let cmd = ConnectUploadCommand {
-                    org: resolved_org,
-                    project: resolved_project,
+                    org: resolved_org.clone(),
+                    project: resolved_project.clone(),
                     runtime,
                     version,
                     description,
                     config_path: config,
                     target: target.or(cli.target),
                     file,
+                    profile: profile.clone(),
+                    deploy_cohort,
+                    deploy_name,
+                    deploy_tags: deploy_tag,
+                    deploy_activate,
+                };
+                cmd.execute().await?;
+                Ok(())
+            }
+            ConnectCommands::Deploy {
+                org,
+                project,
+                runtime,
+                cohort,
+                name,
+                description,
+                tag,
+                activate,
+                config,
+                profile,
+            } => {
+                let (resolved_org, resolved_project) =
+                    commands::connect::resolve_org_and_project(org, project, &config)?;
+                let cmd = ConnectDeployCommand {
+                    org: resolved_org,
+                    project: resolved_project,
+                    runtime,
+                    cohort,
+                    name,
+                    description,
+                    tags: tag,
+                    activate,
                     profile,
                 };
                 cmd.execute().await?;

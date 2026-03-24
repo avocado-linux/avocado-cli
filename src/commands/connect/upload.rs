@@ -27,6 +27,10 @@ pub struct ConnectUploadCommand {
     pub target: Option<String>,
     pub file: Option<String>,
     pub profile: Option<String>,
+    pub deploy_cohort: Option<String>,
+    pub deploy_name: Option<String>,
+    pub deploy_tags: Vec<String>,
+    pub deploy_activate: bool,
 }
 
 struct ArtifactInfo {
@@ -48,6 +52,14 @@ impl TaskPrerequisites for ConnectUploadCommand {
 
 impl ConnectUploadCommand {
     pub async fn execute(&self) -> Result<()> {
+        // 0. Validate deploy-after-upload flags
+        super::deploy::validate_deploy_flags(
+            &self.deploy_cohort,
+            &self.deploy_name,
+            &self.deploy_tags,
+            self.deploy_activate,
+        )?;
+
         // 1. Load config and resolve profile
         let config = client::load_config()?
             .context("Not logged in. Run 'avocado connect auth login' first.")?;
@@ -141,7 +153,7 @@ impl ConnectUploadCommand {
             .create_runtime(&self.org, &self.project, &create_req)
             .await?;
 
-        // 7. If runtime is already draft (full dedup or idempotent return), we're done
+        // 7. If runtime is already draft (full dedup or idempotent return), skip upload
         if runtime.status == "draft" {
             print_success(
                 &format!(
@@ -151,6 +163,23 @@ impl ConnectUploadCommand {
                 ),
                 OutputLevel::Normal,
             );
+
+            if let Some(ref cohort_id) = self.deploy_cohort {
+                super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
+                    client: &connect,
+                    org: &self.org,
+                    project: &self.project,
+                    runtime_id: &runtime.id,
+                    runtime_version: &runtime.version,
+                    cohort_id,
+                    name: self.deploy_name.as_deref(),
+                    description: self.description.as_deref(),
+                    tags: &self.deploy_tags,
+                    activate: self.deploy_activate,
+                })
+                .await?;
+            }
+
             return Ok(());
         }
 
@@ -180,6 +209,23 @@ impl ConnectUploadCommand {
             ),
             OutputLevel::Normal,
         );
+
+        // 10. Deploy after upload if --deploy-cohort was specified
+        if let Some(ref cohort_id) = self.deploy_cohort {
+            super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
+                client: &connect,
+                org: &self.org,
+                project: &self.project,
+                runtime_id: &runtime.id,
+                runtime_version: &result.version,
+                cohort_id,
+                name: self.deploy_name.as_deref(),
+                description: self.description.as_deref(),
+                tags: &self.deploy_tags,
+                activate: self.deploy_activate,
+            })
+            .await?;
+        }
 
         Ok(())
     }

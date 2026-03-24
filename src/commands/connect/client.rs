@@ -265,6 +265,64 @@ pub struct CreateClaimTokenParams {
 }
 
 // ---------------------------------------------------------------------------
+// Deployment types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct CreateDeploymentRequest {
+    pub deployment: CreateDeploymentParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateDeploymentParams {
+    pub name: String,
+    pub cohort_id: String,
+    pub runtime_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filter_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DeploymentInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub status: String,
+    pub cohort_id: String,
+    pub runtime_id: String,
+    #[serde(default)]
+    pub filter_tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub is_targeted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateDeploymentRequest {
+    pub deployment: UpdateDeploymentParams,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateDeploymentParams {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct RuntimeListItem {
+    pub id: String,
+    pub version: String,
+    #[serde(default)]
+    pub build_id: Option<String>,
+    #[serde(default)]
+    pub display_version: Option<String>,
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
 // Runtime upload request types
 // ---------------------------------------------------------------------------
 
@@ -1406,6 +1464,109 @@ impl ConnectClient {
 
         let resp: CommitWrapper = res.json().await?;
         Ok(resp.data)
+    }
+
+    // -----------------------------------------------------------------------
+    // Deployments
+    // -----------------------------------------------------------------------
+
+    /// List runtimes for a project (for interactive picker).
+    pub async fn list_runtimes(&self, org: &str, project: &str) -> Result<Vec<RuntimeListItem>> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/runtimes?status=draft",
+            self.api_url, org, project
+        );
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list runtimes")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list runtimes (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().unwrap_or(serde_json::json!([]));
+        let runtimes: Vec<RuntimeListItem> = serde_json::from_value(data)?;
+        Ok(runtimes)
+    }
+
+    /// Create a deployment.
+    pub async fn create_deployment(
+        &self,
+        org: &str,
+        project: &str,
+        req: &CreateDeploymentRequest,
+    ) -> Result<DeploymentInfo> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/deployments",
+            self.api_url, org, project
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create deployment")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to create deployment (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().context("Response missing data")?;
+        let deployment: DeploymentInfo = serde_json::from_value(data)?;
+        Ok(deployment)
+    }
+
+    /// Activate a deployment (transition from draft to active).
+    pub async fn activate_deployment(
+        &self,
+        org: &str,
+        project: &str,
+        deployment_id: &str,
+    ) -> Result<DeploymentInfo> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/deployments/{}",
+            self.api_url, org, project, deployment_id
+        );
+
+        let req = UpdateDeploymentRequest {
+            deployment: UpdateDeploymentParams {
+                status: "active".to_string(),
+            },
+        };
+
+        let res = self
+            .http
+            .put(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(&req)
+            .send()
+            .await
+            .context("Failed to activate deployment")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to activate deployment (HTTP {status}): {body}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body.get("data").cloned().context("Response missing data")?;
+        let deployment: DeploymentInfo = serde_json::from_value(data)?;
+        Ok(deployment)
     }
 }
 

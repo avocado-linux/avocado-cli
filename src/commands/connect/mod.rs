@@ -2,6 +2,7 @@ pub mod auth;
 pub mod claim_tokens;
 pub mod client;
 pub mod cohorts;
+pub mod deploy;
 pub mod devices;
 pub mod init;
 pub mod keys;
