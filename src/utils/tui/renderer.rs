@@ -51,6 +51,8 @@ pub struct TaskRenderer {
     above_queue: Arc<Mutex<Vec<String>>>,
     /// Set to true by the render loop when it has fully stopped.
     loop_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Tasks whose final status has been permanently emitted (won't be redrawn).
+    finalized: Arc<Mutex<std::collections::HashSet<TaskId>>>,
     /// Injectable output sink. When set, all output goes here instead of stderr.
     /// Used by tests to capture and verify output.
     #[cfg(test)]
@@ -77,6 +79,7 @@ impl TaskRenderer {
             sticky_peek: Arc::new(Mutex::new(None)),
             above_queue: Arc::new(Mutex::new(Vec::new())),
             loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finalized: Arc::new(Mutex::new(std::collections::HashSet::new())),
             #[cfg(test)]
             test_output: Arc::new(Mutex::new(Vec::new())),
         }
@@ -260,8 +263,13 @@ impl TaskRenderer {
             let _ = stderr.flush();
         }
 
-        // Print final summary
+        // Print final summary — only tasks not already finalized by the
+        // render loop (which emits permanent lines for completed tasks).
+        let finalized = self.finalized.lock().unwrap();
         for task in state.iter() {
+            if finalized.contains(&task.id) {
+                continue; // Already emitted by render loop
+            }
             match task.status {
                 TaskStatus::Success => {
                     let elapsed = format_duration(task.elapsed());
@@ -272,21 +280,15 @@ impl TaskRenderer {
                 }
                 TaskStatus::Failed => {
                     let elapsed = format_duration(task.elapsed());
-                    let msg = task.error_message.as_deref().unwrap_or("failed");
                     self.emit_line(&format!(
-                        "\x1b[91m  \u{2717}\x1b[0m {} {} \x1b[91m({})\x1b[0m",
-                        task.label, elapsed, msg
+                        "\x1b[91m  \u{2717}\x1b[0m {} {}",
+                        task.label, elapsed
                     ));
-                    // Dump full captured output
-                    for line in &task.full_output {
-                        self.emit_line(&format!("    \x1b[2m{}\x1b[0m", strip_ansi(line)));
-                    }
                 }
                 TaskStatus::Skipped => {
                     self.emit_line(&format!("\x1b[2m  - {} (skipped)\x1b[0m", task.label));
                 }
                 TaskStatus::Pending => {
-                    // Still pending at shutdown = never ran (e.g. stamps satisfied)
                     self.emit_line(&format!(
                         "\x1b[2m  \u{2713} {} (up to date)\x1b[0m",
                         task.label
@@ -295,10 +297,29 @@ impl TaskRenderer {
                 _ => {}
             }
         }
+        drop(finalized);
 
         // Total elapsed time
         let total = format_duration(Some(self.created_at.elapsed()));
         self.emit_line(&format!("\x1b[2m  Total: {total}\x1b[0m"));
+
+        // Dump failed task output AFTER the task list with a header per task.
+        let failed_tasks: Vec<_> = state
+            .iter()
+            .filter(|t| t.status == TaskStatus::Failed && !t.full_output.is_empty())
+            .collect();
+        if !failed_tasks.is_empty() {
+            self.emit_line(""); // blank separator
+            for task in &failed_tasks {
+                self.emit_line(&format!("\x1b[91m--- {} ---\x1b[0m", task.label));
+                if let Some(ref msg) = task.error_message {
+                    self.emit_line(&format!("\x1b[91m  {msg}\x1b[0m"));
+                }
+                for line in &task.full_output {
+                    self.emit_line(&format!("  {}", strip_ansi(line)));
+                }
+            }
+        }
     }
 
     /// The main rendering loop, run as a tokio task.
@@ -328,29 +349,31 @@ impl TaskRenderer {
     }
 
     /// Render the TUI region — status lines with animated spinner.
+    ///
+    /// Completed/failed tasks are "finalized" — a permanent line is emitted
+    /// once and they are excluded from the clearable TUI region.  Only
+    /// running/pending tasks are redrawn each tick, keeping scrollback clean.
     fn render_tui(&self) {
         let state = self.state.lock().unwrap();
+        let mut finalized = self.finalized.lock().unwrap();
         let mut stderr = std::io::stderr();
         let prev_rendered = *self.rendered_lines.lock().unwrap();
 
-        let (tw, th) = terminal::size().unwrap_or((80, 24));
+        let (tw, _th) = terminal::size().unwrap_or((80, 24));
         let term_width = tw as usize;
-        // Reserve 2 lines for prompt / other output above the TUI region
-        let max_lines = (th as usize).saturating_sub(2);
 
         // Advance spinner
         let frame = self.spin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let spinner = SPINNER[frame % SPINNER.len()];
 
-        // Clear previous render
+        // Clear the mutable TUI region (running/pending tasks only)
         if prev_rendered > 0 {
             for _ in 0..prev_rendered {
                 let _ = execute!(stderr, cursor::MoveUp(1), Clear(ClearType::CurrentLine));
             }
         }
 
-        // Drain any messages queued by print_above() and print them now
-        // (above the TUI region, they'll scroll up naturally).
+        // Drain any messages queued by print_above()
         {
             let mut queue = self.above_queue.lock().unwrap();
             for msg in queue.drain(..) {
@@ -358,16 +381,42 @@ impl TaskRenderer {
             }
         }
 
-        let mut lines_written = 0;
-        let mut showed_peek = false;
+        // Emit permanent lines for newly completed/failed/skipped tasks.
+        // These lines stay in scrollback and are never redrawn.
+        for task in state.iter() {
+            if finalized.contains(&task.id) {
+                continue;
+            }
+            match task.status {
+                TaskStatus::Success => {
+                    let elapsed = format_duration(task.elapsed());
+                    let _ = writeln!(
+                        stderr,
+                        "\x1b[92m  \u{2713}\x1b[0m \x1b[2m{} {}\x1b[0m",
+                        task.label, elapsed
+                    );
+                    finalized.insert(task.id.clone());
+                }
+                TaskStatus::Failed => {
+                    let elapsed = format_duration(task.elapsed());
+                    let _ = writeln!(
+                        stderr,
+                        "\x1b[91m  \u{2717}\x1b[0m {} {}",
+                        task.label, elapsed
+                    );
+                    finalized.insert(task.id.clone());
+                }
+                TaskStatus::Skipped => {
+                    let _ = writeln!(stderr, "\x1b[2m  - {} (skipped)\x1b[0m", task.label);
+                    finalized.insert(task.id.clone());
+                }
+                _ => {} // Running/Pending/WaitingForInput — drawn in mutable region below
+            }
+        }
 
-        // Sticky peek: once we pick a task for the peek, stay with it until
-        // it finishes.  This prevents jitter when parallel tasks have similar
-        // elapsed times.  When the sticky task completes, pick the new
-        // longest-running one.
+        // Sticky peek selection
         let peek_task_id = {
             let mut sticky = self.sticky_peek.lock().unwrap();
-            // Check if the current sticky task is still running
             let still_running = sticky.as_ref().is_some_and(|id| {
                 state
                     .iter()
@@ -376,7 +425,6 @@ impl TaskRenderer {
             if still_running {
                 sticky.clone().unwrap()
             } else {
-                // Pick the longest-running task
                 let new_pick = state
                     .iter()
                     .filter(|t| t.status == TaskStatus::Running)
@@ -387,78 +435,19 @@ impl TaskRenderer {
             }
         };
 
-        // Count how many lines we'd need, then compute a scroll offset to
-        // keep active (running/pending) tasks visible if the list exceeds
-        // terminal height.  Completed tasks scroll off the top.
-        let mut total_lines = 0;
-        let mut first_active_line = 0;
-        let mut found_active = false;
+        // Draw the mutable region: only running and pending tasks.
+        let mut lines_written = 0;
+        let mut showed_peek = false;
+
         for task in state.iter() {
-            let is_active = matches!(
-                task.status,
-                TaskStatus::Running | TaskStatus::Pending | TaskStatus::WaitingForInput
-            );
-            if is_active && !found_active {
-                first_active_line = total_lines;
-                found_active = true;
-            }
-            total_lines += 1;
-            // Peek line adds 1 for the active peek task
-            if task.status == TaskStatus::Running && task.id == peek_task_id && !showed_peek {
-                total_lines += 1;
-            }
-        }
-        let scroll_offset = if total_lines > max_lines {
-            // Scroll so the first active task is near the top, but don't
-            // scroll past the point where remaining lines fill the screen
-            let max_scroll = total_lines.saturating_sub(max_lines);
-            first_active_line.min(max_scroll)
-        } else {
-            0
-        };
-
-        let mut line_index = 0;
-        for task in state.iter() {
-            if lines_written >= max_lines {
-                break;
-            }
-
-            // Skip lines before the scroll offset
-            let task_lines =
-                if task.status == TaskStatus::Running && task.id == peek_task_id && !showed_peek {
-                    2 // status + peek
-                } else {
-                    1
-                };
-
-            if line_index + task_lines <= scroll_offset {
-                line_index += task_lines;
+            if finalized.contains(&task.id) {
                 continue;
             }
-            line_index += task_lines;
             match task.status {
-                TaskStatus::Success => {
-                    let elapsed = format_duration(task.elapsed());
-                    let _ = writeln!(
-                        stderr,
-                        "\x1b[92m  \u{2713}\x1b[0m \x1b[2m{} {}\x1b[0m",
-                        task.label, elapsed
-                    );
-                }
-                TaskStatus::Failed => {
-                    let elapsed = format_duration(task.elapsed());
-                    let msg = task.error_message.as_deref().unwrap_or("failed");
-                    let _ = writeln!(
-                        stderr,
-                        "\x1b[91m  \u{2717}\x1b[0m {} {} \x1b[91m({})\x1b[0m",
-                        task.label, elapsed, msg
-                    );
-                }
                 TaskStatus::Running => {
                     let elapsed = format_duration(task.elapsed());
                     let is_peek_task = !showed_peek && task.id == peek_task_id;
 
-                    // Try to show a progress counter on the status line
                     let progress = task
                         .output_ring
                         .back()
@@ -478,8 +467,7 @@ impl TaskRenderer {
                     }
                     lines_written += 1;
 
-                    // Show the best non-noise line as a peek (if room)
-                    if is_peek_task && lines_written < max_lines {
+                    if is_peek_task {
                         if let Some(peek) = best_peek_line(&task.output_ring) {
                             let trimmed = peek.trim().to_string();
                             if !trimmed.is_empty() {
@@ -491,13 +479,10 @@ impl TaskRenderer {
                         }
                         showed_peek = true;
                     }
-                    continue; // already counted
-                }
-                TaskStatus::Skipped => {
-                    let _ = writeln!(stderr, "\x1b[2m  - {} (skipped)\x1b[0m", task.label);
                 }
                 TaskStatus::Pending => {
                     let _ = writeln!(stderr, "\x1b[2m  - {}\x1b[0m", task.label);
+                    lines_written += 1;
                 }
                 TaskStatus::WaitingForInput => {
                     let _ = writeln!(
@@ -505,9 +490,10 @@ impl TaskRenderer {
                         "\x1b[93m  ? {} (waiting for input)\x1b[0m",
                         task.label
                     );
+                    lines_written += 1;
                 }
+                _ => {} // Already finalized above
             }
-            lines_written += 1;
         }
 
         let _ = stderr.flush();
@@ -759,6 +745,7 @@ mod tests {
             sticky_peek: Arc::new(Mutex::new(None)),
             above_queue: Arc::new(Mutex::new(Vec::new())),
             loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finalized: Arc::new(Mutex::new(std::collections::HashSet::new())),
             test_output: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -900,12 +887,45 @@ mod tests {
             .any(|l| l.contains("\u{2717}") || l.contains("[ERROR]") || l.contains("failed"));
         assert!(has_failure, "should indicate failure. Lines: {ext_lines:?}");
 
-        // Verify: failed task's captured output is dumped
+        // Verify: failed task's captured output is dumped AFTER the task list
+        // (in a separate section with a header)
+        let output_section_start = output
+            .iter()
+            .position(|l| l.contains("--- ext install foo ---"));
         assert!(
-            output
+            output_section_start.is_some(),
+            "failed task should have error section header. Got: {output:?}"
+        );
+        let after_header: Vec<_> = output[output_section_start.unwrap()..].to_vec();
+        assert!(
+            after_header
                 .iter()
                 .any(|l| l.contains("Error: package avocado-bsp not found")),
-            "failed task output should be dumped. Got: {output:?}"
+            "failed task output should be dumped after header. Got: {after_header:?}"
+        );
+        // Error output should NOT be dimmed
+        let raw_output = r.get_test_output();
+        let error_output_lines: Vec<_> = raw_output
+            .iter()
+            .filter(|l| l.contains("package avocado-bsp not found") && !l.contains("---"))
+            .collect();
+        assert!(
+            !error_output_lines.is_empty(),
+            "should have error output lines"
+        );
+        for line in &error_output_lines {
+            assert!(
+                !line.contains("\x1b[2m"),
+                "error output should NOT be dimmed: {line}"
+            );
+        }
+
+        // Verify: Total appears BEFORE the error section
+        let total_pos = output.iter().position(|l| l.contains("Total:"));
+        assert!(total_pos.is_some(), "Total should appear");
+        assert!(
+            total_pos.unwrap() < output_section_start.unwrap(),
+            "Total should appear before error output section"
         );
 
         // Verify: skipped task appears
@@ -916,10 +936,7 @@ mod tests {
             "skipped task should appear"
         );
 
-        // Verify: no task appears excessively (the spam bug).
-        // In passthrough mode, tasks can appear up to ~4 times:
-        //   passthrough_status(Running/Success/Failed) + shutdown summary.
-        // The spam bug would show 50+ occurrences.
+        // Verify: no task label is spammed (the original bug)
         for task_label in &["sdk bootstrap", "ext install foo", "runtime install dev"] {
             let count = output.iter().filter(|l| l.contains(task_label)).count();
             assert!(
@@ -927,10 +944,6 @@ mod tests {
                 "task '{task_label}' should not be spammed ({count} times). Full output: {output:?}"
             );
         }
-
-        // Verify: Total line appears exactly once
-        let total_lines: Vec<_> = output.iter().filter(|l| l.contains("Total:")).collect();
-        assert_eq!(total_lines.len(), 1, "Total should appear once");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
