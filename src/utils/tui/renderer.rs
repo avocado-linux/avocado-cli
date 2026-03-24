@@ -51,6 +51,10 @@ pub struct TaskRenderer {
     above_queue: Arc<Mutex<Vec<String>>>,
     /// Set to true by the render loop when it has fully stopped.
     loop_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Injectable output sink. When set, all output goes here instead of stderr.
+    /// Used by tests to capture and verify output.
+    #[cfg(test)]
+    test_output: Arc<Mutex<Vec<String>>>,
 }
 
 impl TaskRenderer {
@@ -73,6 +77,8 @@ impl TaskRenderer {
             sticky_peek: Arc::new(Mutex::new(None)),
             above_queue: Arc::new(Mutex::new(Vec::new())),
             loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            test_output: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -81,6 +87,25 @@ impl TaskRenderer {
         std::io::stderr().is_terminal()
             && std::env::var("AVOCADO_NO_TUI").is_err()
             && std::env::var("CI").is_err()
+    }
+
+    /// Write a line to the output sink. In tests, appends to test_output.
+    /// In production, writes to stderr.
+    fn emit_line(&self, line: &str) {
+        #[cfg(test)]
+        {
+            self.test_output.lock().unwrap().push(line.to_string());
+        }
+        #[cfg(not(test))]
+        {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Get the captured test output lines.
+    #[cfg(test)]
+    pub fn get_test_output(&self) -> Vec<String> {
+        self.test_output.lock().unwrap().clone()
     }
 
     /// Get the render mode.
@@ -240,29 +265,32 @@ impl TaskRenderer {
             match task.status {
                 TaskStatus::Success => {
                     let elapsed = format_duration(task.elapsed());
-                    eprintln!(
+                    self.emit_line(&format!(
                         "\x1b[92m  \u{2713}\x1b[0m \x1b[2m{} {}\x1b[0m",
                         task.label, elapsed
-                    );
+                    ));
                 }
                 TaskStatus::Failed => {
                     let elapsed = format_duration(task.elapsed());
                     let msg = task.error_message.as_deref().unwrap_or("failed");
-                    eprintln!(
+                    self.emit_line(&format!(
                         "\x1b[91m  \u{2717}\x1b[0m {} {} \x1b[91m({})\x1b[0m",
                         task.label, elapsed, msg
-                    );
+                    ));
                     // Dump full captured output
                     for line in &task.full_output {
-                        eprintln!("    \x1b[2m{}\x1b[0m", strip_ansi(line));
+                        self.emit_line(&format!("    \x1b[2m{}\x1b[0m", strip_ansi(line)));
                     }
                 }
                 TaskStatus::Skipped => {
-                    eprintln!("\x1b[2m  - {} (skipped)\x1b[0m", task.label);
+                    self.emit_line(&format!("\x1b[2m  - {} (skipped)\x1b[0m", task.label));
                 }
                 TaskStatus::Pending => {
                     // Still pending at shutdown = never ran (e.g. stamps satisfied)
-                    eprintln!("\x1b[2m  \u{2713} {} (up to date)\x1b[0m", task.label);
+                    self.emit_line(&format!(
+                        "\x1b[2m  \u{2713} {} (up to date)\x1b[0m",
+                        task.label
+                    ));
                 }
                 _ => {}
             }
@@ -270,7 +298,7 @@ impl TaskRenderer {
 
         // Total elapsed time
         let total = format_duration(Some(self.created_at.elapsed()));
-        eprintln!("\x1b[2m  Total: {total}\x1b[0m");
+        self.emit_line(&format!("\x1b[2m  Total: {total}\x1b[0m"));
     }
 
     /// The main rendering loop, run as a tokio task.
@@ -490,7 +518,7 @@ impl TaskRenderer {
     fn passthrough_status(&self, id: &TaskId, status: TaskStatus) {
         match status {
             TaskStatus::Running => {
-                eprintln!("\x1b[94m[INFO]\x1b[0m Starting {id}");
+                self.emit_line(&format!("\x1b[94m[INFO]\x1b[0m Starting {id}"));
             }
             TaskStatus::Success => {
                 let state = self.state.lock().unwrap();
@@ -500,15 +528,15 @@ impl TaskRenderer {
                     .and_then(|t| t.elapsed())
                     .map(|d| format_duration(Some(d)))
                     .unwrap_or_default();
-                eprintln!("\x1b[92m[SUCCESS]\x1b[0m {id} {elapsed}");
+                self.emit_line(&format!("\x1b[92m[SUCCESS]\x1b[0m {id} {elapsed}"));
             }
             TaskStatus::Failed => {
-                eprintln!("\x1b[91m[ERROR]\x1b[0m {id} failed");
+                self.emit_line(&format!("\x1b[91m[ERROR]\x1b[0m {id} failed"));
                 // Dump full output in passthrough mode too
                 let state = self.state.lock().unwrap();
                 if let Some(task) = state.iter().find(|t| &t.id == id) {
                     for line in &task.full_output {
-                        eprintln!("    {}", strip_ansi(line));
+                        self.emit_line(&format!("    {}", strip_ansi(line)));
                     }
                 }
             }
@@ -717,8 +745,8 @@ pub fn strip_ansi(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Create a renderer in Passthrough mode for testing state logic
-    /// without needing a real TTY.
+    /// Create a renderer in Passthrough mode for testing.
+    /// Output is captured via test_output instead of stderr.
     fn test_renderer() -> Arc<TaskRenderer> {
         Arc::new(TaskRenderer {
             state: Arc::new(Mutex::new(Vec::new())),
@@ -731,7 +759,13 @@ mod tests {
             sticky_peek: Arc::new(Mutex::new(None)),
             above_queue: Arc::new(Mutex::new(Vec::new())),
             loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_output: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Strip ANSI codes from test output lines for easier assertions.
+    fn clean_output(r: &TaskRenderer) -> Vec<String> {
+        r.get_test_output().iter().map(|l| strip_ansi(l)).collect()
     }
 
     #[test]
@@ -792,22 +826,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_shutdown_shows_failed_output() {
+    async fn test_shutdown_output_shows_failed_task_with_output() {
         let r = test_renderer();
         r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
         r.register_task(
             TaskId::ExtInstall("foo".to_string()),
             "ext install foo".to_string(),
         );
+        r.register_task(
+            TaskId::RuntimeInstall("dev".to_string()),
+            "runtime install dev".to_string(),
+        );
         let _handle = r.start();
 
+        // SDK succeeds
         r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
         r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
 
+        // Ext install fails with captured output
         r.set_status(&TaskId::ExtInstall("foo".to_string()), TaskStatus::Running);
         r.append_output(
             &TaskId::ExtInstall("foo".to_string()),
-            "dnf install failed".to_string(),
+            "Downloading packages...".to_string(),
+        );
+        r.append_output(
+            &TaskId::ExtInstall("foo".to_string()),
+            "Error: package avocado-bsp not found".to_string(),
         );
         r.set_error(
             &TaskId::ExtInstall("foo".to_string()),
@@ -815,23 +859,102 @@ mod tests {
         );
         r.set_status(&TaskId::ExtInstall("foo".to_string()), TaskStatus::Failed);
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Runtime skipped (blocked by ext failure)
+        r.set_status(
+            &TaskId::RuntimeInstall("dev".to_string()),
+            TaskStatus::Skipped,
+        );
 
-        // Verify state before shutdown
-        {
-            let state = r.state.lock().unwrap();
-            let sdk = state.iter().find(|t| t.id == TaskId::SdkInstall).unwrap();
-            assert_eq!(sdk.status, TaskStatus::Success);
-            let ext = state
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        r.shutdown();
+
+        let output = clean_output(&r);
+
+        // Verify: success task appears once
+        let sdk_lines: Vec<_> = output
+            .iter()
+            .filter(|l| l.contains("sdk bootstrap"))
+            .collect();
+        assert_eq!(
+            sdk_lines.len(),
+            1,
+            "sdk bootstrap should appear exactly once in shutdown output, got: {sdk_lines:?}"
+        );
+        assert!(
+            sdk_lines[0].contains("\u{2713}"),
+            "sdk bootstrap should have checkmark"
+        );
+
+        // Verify: failed task appears with error indicator
+        // In passthrough mode, both passthrough_status and shutdown emit lines.
+        let ext_lines: Vec<_> = output
+            .iter()
+            .filter(|l| l.contains("ext install foo"))
+            .collect();
+        assert!(
+            !ext_lines.is_empty(),
+            "ext install foo should appear in output. Full: {output:?}"
+        );
+        let has_failure = ext_lines
+            .iter()
+            .any(|l| l.contains("\u{2717}") || l.contains("[ERROR]") || l.contains("failed"));
+        assert!(has_failure, "should indicate failure. Lines: {ext_lines:?}");
+
+        // Verify: failed task's captured output is dumped
+        assert!(
+            output
                 .iter()
-                .find(|t| t.id == TaskId::ExtInstall("foo".to_string()))
-                .unwrap();
-            assert_eq!(ext.status, TaskStatus::Failed);
-            assert_eq!(ext.full_output.len(), 1);
-            assert_eq!(ext.full_output[0], "dnf install failed");
+                .any(|l| l.contains("Error: package avocado-bsp not found")),
+            "failed task output should be dumped. Got: {output:?}"
+        );
+
+        // Verify: skipped task appears
+        assert!(
+            output
+                .iter()
+                .any(|l| l.contains("runtime install dev") && l.contains("skipped")),
+            "skipped task should appear"
+        );
+
+        // Verify: no task appears excessively (the spam bug).
+        // In passthrough mode, tasks can appear up to ~4 times:
+        //   passthrough_status(Running/Success/Failed) + shutdown summary.
+        // The spam bug would show 50+ occurrences.
+        for task_label in &["sdk bootstrap", "ext install foo", "runtime install dev"] {
+            let count = output.iter().filter(|l| l.contains(task_label)).count();
+            assert!(
+                count <= 5,
+                "task '{task_label}' should not be spammed ({count} times). Full output: {output:?}"
+            );
         }
 
+        // Verify: Total line appears exactly once
+        let total_lines: Vec<_> = output.iter().filter(|l| l.contains("Total:")).collect();
+        assert_eq!(total_lines.len(), 1, "Total should appear once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_output_after_shutdown() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        let _handle = r.start();
+
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         r.shutdown();
+
+        let count_at_shutdown = r.get_test_output().len();
+
+        // Wait a bit — if the render loop is still running, it would add more lines
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let count_after_wait = r.get_test_output().len();
+        assert_eq!(
+            count_at_shutdown, count_after_wait,
+            "no output should be written after shutdown"
+        );
     }
 
     #[test]
