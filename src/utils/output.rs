@@ -23,13 +23,11 @@ fn tui_is_active() -> bool {
 }
 
 /// Print an error message to stderr with red color.
-/// Errors are NEVER suppressed — they always show even when TUI is active.
+/// Suppressed when TUI is active — the error is already captured in task
+/// state and shown in the post-task-list error section at shutdown.
 pub fn print_error(message: &str, _level: OutputLevel) {
-    let formatted = format!("\x1b[91m[ERROR]\x1b[0m {message}");
-    if let Some(renderer) = crate::utils::tui::get_active_renderer() {
-        renderer.print_above(&formatted);
-    } else {
-        eprintln!("{formatted}");
+    if !tui_is_active() {
+        eprintln!("\x1b[91m[ERROR]\x1b[0m {message}");
     }
 }
 
