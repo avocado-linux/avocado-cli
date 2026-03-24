@@ -47,6 +47,8 @@ pub struct TaskRenderer {
     created_at: std::time::Instant,
     /// Sticky peek task — once chosen, stays until it completes.
     sticky_peek: Arc<Mutex<Option<TaskId>>>,
+    /// Messages queued by print_above() for the render loop to drain.
+    above_queue: Arc<Mutex<Vec<String>>>,
 }
 
 impl TaskRenderer {
@@ -67,6 +69,7 @@ impl TaskRenderer {
             spin: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             created_at: std::time::Instant::now(),
             sticky_peek: Arc::new(Mutex::new(None)),
+            above_queue: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -145,17 +148,13 @@ impl TaskRenderer {
     }
 
     /// Print a message above the TUI region (scrolls normally).
+    ///
+    /// In TUI mode, messages are queued and drained by the render loop on
+    /// the next tick so they never race with cursor manipulation.
     pub fn print_above(&self, message: &str) {
-        if self.mode == RenderMode::Tui {
-            let mut stderr = std::io::stderr();
-            let rendered = *self.rendered_lines.lock().unwrap();
-            if rendered > 0 {
-                for _ in 0..rendered {
-                    let _ = execute!(stderr, cursor::MoveUp(1), Clear(ClearType::CurrentLine));
-                }
-            }
-            eprintln!("{message}");
-            *self.rendered_lines.lock().unwrap() = 0;
+        if self.mode == RenderMode::Tui && self.running.load(std::sync::atomic::Ordering::Relaxed) {
+            self.above_queue.lock().unwrap().push(message.to_string());
+            self.notify.notify_one();
         } else {
             eprintln!("{message}");
         }
@@ -214,6 +213,12 @@ impl TaskRenderer {
                 let _ = execute!(stderr, cursor::MoveUp(1), Clear(ClearType::CurrentLine));
             }
             *self.rendered_lines.lock().unwrap() = 0;
+
+            // Drain any remaining queued messages
+            for msg in self.above_queue.lock().unwrap().drain(..) {
+                let _ = writeln!(stderr, "{msg}");
+            }
+
             let _ = stderr.flush();
         }
 
@@ -296,6 +301,15 @@ impl TaskRenderer {
         if prev_rendered > 0 {
             for _ in 0..prev_rendered {
                 let _ = execute!(stderr, cursor::MoveUp(1), Clear(ClearType::CurrentLine));
+            }
+        }
+
+        // Drain any messages queued by print_above() and print them now
+        // (above the TUI region, they'll scroll up naturally).
+        {
+            let mut queue = self.above_queue.lock().unwrap();
+            for msg in queue.drain(..) {
+                let _ = writeln!(stderr, "{msg}");
             }
         }
 
