@@ -45,6 +45,8 @@ pub struct TaskRenderer {
     spin: Arc<std::sync::atomic::AtomicUsize>,
     /// When the renderer was created (for total elapsed time).
     created_at: std::time::Instant,
+    /// Sticky peek task — once chosen, stays until it completes.
+    sticky_peek: Arc<Mutex<Option<TaskId>>>,
 }
 
 impl TaskRenderer {
@@ -64,6 +66,7 @@ impl TaskRenderer {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spin: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             created_at: std::time::Instant::now(),
+            sticky_peek: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -299,14 +302,31 @@ impl TaskRenderer {
         let mut lines_written = 0;
         let mut showed_peek = false;
 
-        // Show the peek for the longest-running task.  When it completes the
-        // peek naturally jumps to the next longest, giving a stable display.
-        let peek_task_id = state
-            .iter()
-            .filter(|t| t.status == TaskStatus::Running)
-            .max_by_key(|t| t.elapsed().unwrap_or_default())
-            .map(|t| t.id.clone())
-            .unwrap_or(TaskId::SdkInstall);
+        // Sticky peek: once we pick a task for the peek, stay with it until
+        // it finishes.  This prevents jitter when parallel tasks have similar
+        // elapsed times.  When the sticky task completes, pick the new
+        // longest-running one.
+        let peek_task_id = {
+            let mut sticky = self.sticky_peek.lock().unwrap();
+            // Check if the current sticky task is still running
+            let still_running = sticky.as_ref().is_some_and(|id| {
+                state
+                    .iter()
+                    .any(|t| &t.id == id && t.status == TaskStatus::Running)
+            });
+            if still_running {
+                sticky.clone().unwrap()
+            } else {
+                // Pick the longest-running task
+                let new_pick = state
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::Running)
+                    .max_by_key(|t| t.elapsed().unwrap_or_default())
+                    .map(|t| t.id.clone());
+                *sticky = new_pick.clone();
+                new_pick.unwrap_or(TaskId::SdkInstall)
+            }
+        };
 
         // Count how many lines we'd need, then compute a scroll offset to
         // keep active (running/pending) tasks visible if the list exceeds

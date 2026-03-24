@@ -178,9 +178,10 @@ impl BuildCommand {
             let container_helper =
                 SdkContainer::from_config(&self.config_path, config)?.verbose(false);
 
-            // Check that SDK install stamp exists (required for all builds)
+            // Check that SDK install stamp exists (required for all builds).
+            // Use Runtime/Install which just requires sdk_install().
             let required =
-                resolve_required_stamps(StampCommand::Build, StampComponent::Extension, None, &[]);
+                resolve_required_stamps(StampCommand::Install, StampComponent::Runtime, None, &[]);
 
             let batch_script = generate_batch_read_stamps_script(&required);
             let run_config = crate::utils::container::RunConfig {
