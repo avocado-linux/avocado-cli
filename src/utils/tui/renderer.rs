@@ -717,6 +717,123 @@ pub fn strip_ansi(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Create a renderer in Passthrough mode for testing state logic
+    /// without needing a real TTY.
+    fn test_renderer() -> Arc<TaskRenderer> {
+        Arc::new(TaskRenderer {
+            state: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            mode: RenderMode::Passthrough,
+            rendered_lines: Arc::new(Mutex::new(0)),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            spin: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            created_at: std::time::Instant::now(),
+            sticky_peek: Arc::new(Mutex::new(None)),
+            above_queue: Arc::new(Mutex::new(Vec::new())),
+            loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    #[test]
+    fn test_failed_task_captures_output() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.append_output(&TaskId::SdkInstall, "Installing packages...".to_string());
+        r.append_output(&TaskId::SdkInstall, "Error: package not found".to_string());
+        r.set_error(&TaskId::SdkInstall, "package not found".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Failed);
+
+        let state = r.state.lock().unwrap();
+        let task = state.iter().find(|t| t.id == TaskId::SdkInstall).unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.full_output.len(), 2);
+        assert_eq!(task.full_output[0], "Installing packages...");
+        assert_eq!(task.full_output[1], "Error: package not found");
+        assert!(task.error_message.as_deref() == Some("package not found"));
+    }
+
+    #[test]
+    fn test_register_task_idempotent() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        let state = r.state.lock().unwrap();
+        assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn test_set_status_on_missing_task_is_noop() {
+        let r = test_renderer();
+        // Should not panic
+        r.set_status(&TaskId::TargetDevInstall, TaskStatus::Success);
+        let state = r.state.lock().unwrap();
+        assert!(state.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_shutdown_stops_render_loop() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        let _handle = r.start();
+
+        // The render loop should be running
+        assert!(r.running.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Small delay to let the loop start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        r.shutdown();
+
+        // After shutdown, the render loop should have stopped
+        assert!(!r.running.load(std::sync::atomic::Ordering::Relaxed));
+        // In passthrough mode, loop_stopped won't be set (shutdown
+        // doesn't wait for it), but the loop should still exit.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_shutdown_shows_failed_output() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(
+            TaskId::ExtInstall("foo".to_string()),
+            "ext install foo".to_string(),
+        );
+        let _handle = r.start();
+
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
+
+        r.set_status(&TaskId::ExtInstall("foo".to_string()), TaskStatus::Running);
+        r.append_output(
+            &TaskId::ExtInstall("foo".to_string()),
+            "dnf install failed".to_string(),
+        );
+        r.set_error(
+            &TaskId::ExtInstall("foo".to_string()),
+            "package not found".to_string(),
+        );
+        r.set_status(&TaskId::ExtInstall("foo".to_string()), TaskStatus::Failed);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify state before shutdown
+        {
+            let state = r.state.lock().unwrap();
+            let sdk = state.iter().find(|t| t.id == TaskId::SdkInstall).unwrap();
+            assert_eq!(sdk.status, TaskStatus::Success);
+            let ext = state
+                .iter()
+                .find(|t| t.id == TaskId::ExtInstall("foo".to_string()))
+                .unwrap();
+            assert_eq!(ext.status, TaskStatus::Failed);
+            assert_eq!(ext.full_output.len(), 1);
+            assert_eq!(ext.full_output[0], "dnf install failed");
+        }
+
+        r.shutdown();
+    }
+
     #[test]
     fn test_format_duration() {
         assert_eq!(format_duration(None), "");

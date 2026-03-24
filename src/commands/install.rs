@@ -291,7 +291,7 @@ impl InstallCommand {
                 .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
             let mut scheduler = TaskScheduler::new(graph, sched_renderer, max_parallel);
 
-            scheduler
+            let sched_result = scheduler
                 .run(move |task_id: TaskId| {
                     let config_path = config_path.clone();
                     let cli_target = cli_target.clone();
@@ -352,11 +352,19 @@ impl InstallCommand {
                     })
                         as Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
                 })
-                .await?;
-        }
+                .await;
 
-        if let Some(ref r) = renderer {
-            r.shutdown();
+            // Always shut down BEFORE propagating the error so the render
+            // loop stops and can't corrupt the terminal.
+            if let Some(ref r) = renderer {
+                r.shutdown();
+            }
+            sched_result?;
+        } else {
+            // No scheduler tasks — still need to shut down the renderer
+            if let Some(ref r) = renderer {
+                r.shutdown();
+            }
         }
 
         print_success(

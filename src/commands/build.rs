@@ -292,7 +292,7 @@ impl BuildCommand {
                 .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
             let mut scheduler = TaskScheduler::new(graph, sched_renderer, max_parallel);
 
-            scheduler
+            let sched_result = scheduler
                 .run(move |task_id: TaskId| {
                     let config_path = config_path.clone();
                     let cli_target = cli_target.clone();
@@ -351,11 +351,21 @@ impl BuildCommand {
                     })
                         as Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
                 })
-                .await?;
+                .await;
+
+            // Always shut down BEFORE propagating the error so the render
+            // loop stops and can't corrupt the terminal.
+            if sched_result.is_err() {
+                if let Some(ref r) = renderer {
+                    r.shutdown();
+                }
+                sched_result?;
+            }
         }
 
         // Phase 2: Build runtimes sequentially (RuntimeBuildCommand contains
         // non-Send types like TufSigner, so it cannot be spawned on tokio).
+        let mut rt_error: Option<anyhow::Error> = None;
         for runtime_name in &runtimes_to_build {
             let rt_task_id = TaskId::RuntimeBuild(runtime_name.clone());
             if let Some(ref r) = renderer {
@@ -394,12 +404,19 @@ impl BuildCommand {
                 }
             }
 
-            result.with_context(|| format!("Failed to build runtime '{runtime_name}'"))?;
+            if let Err(e) = result {
+                rt_error = Some(e.context(format!("Failed to build runtime '{runtime_name}'")));
+                break;
+            }
         }
 
-        // Shut down the TUI renderer
+        // Always shut down the TUI renderer before returning
         if let Some(ref r) = renderer {
             r.shutdown();
+        }
+
+        if let Some(e) = rt_error {
+            return Err(e);
         }
 
         print_success("All components built successfully!", OutputLevel::Normal);
