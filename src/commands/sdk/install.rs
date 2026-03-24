@@ -393,6 +393,16 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         );
 
         // Build sysroot install params
+        // Build TUI contexts for each sysroot task
+        let rootfs_tui = self.tui_context.as_ref().map(|ctx| TuiContext {
+            task_id: TaskId::RootfsInstall,
+            renderer: ctx.renderer.clone(),
+        });
+        let initramfs_tui = self.tui_context.as_ref().map(|ctx| TuiContext {
+            task_id: TaskId::InitramfsInstall,
+            renderer: ctx.renderer.clone(),
+        });
+
         let mut rootfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,
@@ -411,6 +421,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            tui_context: rootfs_tui,
         };
         let mut initramfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Initramfs,
@@ -430,6 +441,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            tui_context: initramfs_tui,
         };
 
         // Build the target-dev future (or a no-op if not needed)

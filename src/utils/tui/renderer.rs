@@ -280,7 +280,10 @@ impl TaskRenderer {
         let mut stderr = std::io::stderr();
         let prev_rendered = *self.rendered_lines.lock().unwrap();
 
-        let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+        let (tw, th) = terminal::size().unwrap_or((80, 24));
+        let term_width = tw as usize;
+        // Reserve 2 lines for prompt / other output above the TUI region
+        let max_lines = (th as usize).saturating_sub(2);
 
         // Advance spinner
         let frame = self.spin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -305,9 +308,55 @@ impl TaskRenderer {
             .map(|t| t.id.clone())
             .unwrap_or(TaskId::SdkInstall);
 
-        // Show every task — pending ones are visible from the start as a
-        // checklist so the user can see the full scope of work.
+        // Count how many lines we'd need, then compute a scroll offset to
+        // keep active (running/pending) tasks visible if the list exceeds
+        // terminal height.  Completed tasks scroll off the top.
+        let mut total_lines = 0;
+        let mut first_active_line = 0;
+        let mut found_active = false;
         for task in state.iter() {
+            let is_active = matches!(
+                task.status,
+                TaskStatus::Running | TaskStatus::Pending | TaskStatus::WaitingForInput
+            );
+            if is_active && !found_active {
+                first_active_line = total_lines;
+                found_active = true;
+            }
+            total_lines += 1;
+            // Peek line adds 1 for the active peek task
+            if task.status == TaskStatus::Running && task.id == peek_task_id && !showed_peek {
+                total_lines += 1;
+            }
+        }
+        let scroll_offset = if total_lines > max_lines {
+            // Scroll so the first active task is near the top, but don't
+            // scroll past the point where remaining lines fill the screen
+            let max_scroll = total_lines.saturating_sub(max_lines);
+            first_active_line.min(max_scroll)
+        } else {
+            0
+        };
+
+        let mut line_index = 0;
+        for task in state.iter() {
+            if lines_written >= max_lines {
+                break;
+            }
+
+            // Skip lines before the scroll offset
+            let task_lines =
+                if task.status == TaskStatus::Running && task.id == peek_task_id && !showed_peek {
+                    2 // status + peek
+                } else {
+                    1
+                };
+
+            if line_index + task_lines <= scroll_offset {
+                line_index += task_lines;
+                continue;
+            }
+            line_index += task_lines;
             match task.status {
                 TaskStatus::Success => {
                     let elapsed = format_duration(task.elapsed());
@@ -350,8 +399,8 @@ impl TaskRenderer {
                     }
                     lines_written += 1;
 
-                    // Show the best non-noise line as a peek
-                    if is_peek_task {
+                    // Show the best non-noise line as a peek (if room)
+                    if is_peek_task && lines_written < max_lines {
                         if let Some(peek) = best_peek_line(&task.output_ring) {
                             let trimmed = peek.trim().to_string();
                             if !trimmed.is_empty() {

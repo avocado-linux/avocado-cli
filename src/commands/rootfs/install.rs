@@ -39,6 +39,8 @@ pub struct SysrootInstallParams<'a> {
     pub no_stamps: bool,
     /// Parsed (merged) YAML config — needed for stamp hash computation.
     pub parsed: Option<&'a serde_yaml::Value>,
+    /// TUI context for output capture (if TUI is active).
+    pub tui_context: Option<crate::utils::container::TuiContext>,
 }
 
 /// Detect package removals by comparing config packages against lock file.
@@ -128,6 +130,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             repo_release: params.repo_release.map(|s| s.to_string()),
             container_args: params.merged_container_args.clone(),
             sdk_arch: params.sdk_arch.cloned(),
+            tui_context: params.tui_context.clone(),
             ..Default::default()
         };
 
@@ -225,6 +228,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         container_args: params.merged_container_args.clone(),
         dnf_args: params.dnf_args.clone(),
         disable_weak_dependencies: params.config.get_sdk_disable_weak_dependencies(),
+        tui_context: params.tui_context.clone(),
         ..Default::default()
     };
 
@@ -306,6 +310,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                         repo_release: params.repo_release.map(|s| s.to_string()),
                         container_args: params.merged_container_args.clone(),
                         sdk_arch: params.sdk_arch.cloned(),
+                        tui_context: params.tui_context.clone(),
                         ..Default::default()
                     };
 
@@ -454,6 +459,7 @@ impl RootfsInstallCommand {
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            tui_context: None,
         })
         .await;
 

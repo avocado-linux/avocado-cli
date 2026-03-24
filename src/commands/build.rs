@@ -11,7 +11,7 @@ use crate::commands::{
 };
 use crate::utils::{
     config::{ComposedConfig, Config, ExtensionSource},
-    container::TuiContext,
+    container::{SdkContainer, TuiContext},
     output::{print_info, print_success, should_use_tui, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
     tui::{TaskId, TaskRenderer, TaskStatus},
@@ -163,8 +163,55 @@ impl BuildCommand {
         let required_extensions =
             self.find_required_extensions(config, parsed, &runtimes_to_build, &target)?;
 
-        // Note: SDK compile sections are now compiled on-demand when extensions are built
-        // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
+        // Pre-flight: verify dependencies are installed before drawing the
+        // task list.  This gives the user a clear "run avocado install" message
+        // instead of failing mid-build inside a TUI.
+        if !self.no_stamps {
+            use crate::utils::stamps::{
+                generate_batch_read_stamps_script, resolve_required_stamps, validate_stamps_batch,
+                StampCommand, StampComponent,
+            };
+
+            let container_image = config.get_sdk_image().ok_or_else(|| {
+                anyhow::anyhow!("No container image specified in config under 'sdk.image'")
+            })?;
+            let container_helper =
+                SdkContainer::from_config(&self.config_path, config)?.verbose(false);
+
+            // Check that SDK install stamp exists (required for all builds)
+            let required =
+                resolve_required_stamps(StampCommand::Build, StampComponent::Extension, None, &[]);
+
+            let batch_script = generate_batch_read_stamps_script(&required);
+            let run_config = crate::utils::container::RunConfig {
+                container_image: container_image.clone(),
+                target: target.clone(),
+                command: batch_script,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: config.get_sdk_repo_url(),
+                repo_release: config.get_sdk_repo_release(),
+                container_args: self.container_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                runs_on: self.runs_on.clone(),
+                nfs_port: self.nfs_port,
+                ..Default::default()
+            };
+
+            let output = container_helper
+                .run_in_container_with_output(run_config)
+                .await?;
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+
+            if !validation.is_satisfied() {
+                let error =
+                    validation.into_error_with_runs_on("Cannot build", self.runs_on.as_deref());
+                // Print the error with fix commands (includes "avocado install")
+                error.print_and_exit();
+            }
+        }
 
         // Set up TUI renderer if applicable
         let renderer = if should_use_tui() && !self.verbose {

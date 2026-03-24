@@ -131,6 +131,7 @@ impl InitramfsInstallCommand {
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            tui_context: None,
         })
         .await;
 
