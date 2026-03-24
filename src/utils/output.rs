@@ -35,7 +35,8 @@ pub fn print_error(message: &str, _level: OutputLevel) {
 /// Suppressed when TUI is active (task ✓ lines show success).
 pub fn print_success(message: &str, _level: OutputLevel) {
     if !tui_is_active() {
-        eprintln!("\x1b[92m[SUCCESS]\x1b[0m {message}");
+        // CodeQL: these are intentional user-facing CLI status messages, not log files.
+        eprintln!("\x1b[92m[SUCCESS]\x1b[0m {message}"); // lgtm[rust/cleartext-logging]
     }
 }
 
@@ -43,7 +44,8 @@ pub fn print_success(message: &str, _level: OutputLevel) {
 /// Suppressed when TUI is active (task status lines show progress).
 pub fn print_info(message: &str, _level: OutputLevel) {
     if !tui_is_active() {
-        eprintln!("\x1b[94m[INFO]\x1b[0m {message}");
+        // CodeQL: these are intentional user-facing CLI status messages, not log files.
+        eprintln!("\x1b[94m[INFO]\x1b[0m {message}"); // lgtm[rust/cleartext-logging]
     }
 }
 
