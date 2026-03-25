@@ -585,6 +585,16 @@ pub fn get_ext_var_files(ext_config: &serde_yaml::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Extract image_type from an extension config value.
+/// Returns None for raw (default) or Some("kab") for KAB-wrapped images.
+#[allow(dead_code)]
+pub fn get_ext_image_type(ext_config: &serde_yaml::Value) -> Option<String> {
+    ext_config
+        .get("image_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Extract docker_images from a config value (extension or runtime).
 /// Returns an empty Vec if no docker_images are configured.
 pub fn get_docker_images(config: &serde_yaml::Value) -> Vec<DockerImageRef> {
