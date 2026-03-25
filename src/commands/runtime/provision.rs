@@ -2,7 +2,7 @@
 use crate::utils::signing_service::{generate_helper_script, SigningService, SigningServiceConfig};
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::{RunConfig, SdkContainer},
+    container::{is_docker_desktop, RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
     remote::{RemoteHost, SshClient},
     stamps::{
@@ -237,8 +237,25 @@ impl RuntimeProvisionCommand {
             );
         }
 
+        // Signal USB passthrough availability to provisioning scripts.
+        // Docker Desktop (macOS/Windows) runs containers in a VM without host device access.
+        let usb_passthrough = if is_docker_desktop() { "0" } else { "1" };
+        env_vars.insert(
+            "AVOCADO_USB_PASSTHROUGH".to_string(),
+            usb_passthrough.to_string(),
+        );
+
         // Set AVOCADO_PROVISION_OUT if --out is specified
-        if let Some(out_path) = &self.config.out {
+        // On Docker Desktop, auto-set a default output path so provisioning scripts
+        // can produce disk images for host-side burning when device access is unavailable.
+        let provision_out_path = if let Some(out_path) = &self.config.out {
+            Some(out_path.clone())
+        } else if is_docker_desktop() {
+            Some(".avocado/provision-out".to_string())
+        } else {
+            None
+        };
+        if let Some(out_path) = &provision_out_path {
             // Construct the absolute path from the container's perspective
             // The src_dir is mounted at /opt/src in the container
             let container_out_path = format!("/opt/src/{out_path}");
@@ -387,6 +404,15 @@ impl RuntimeProvisionCommand {
                 container_image,
             )
             .await?;
+        }
+
+        // On Docker Desktop, check if the provisioning script produced a result file
+        // requesting host-side action (e.g., burning to removable storage).
+        if is_docker_desktop() {
+            if let Some(ref out_path) = provision_out_path {
+                let host_out_dir = src_dir.join(out_path);
+                self.handle_provision_result(&host_out_dir)?;
+            }
         }
 
         print_success(
@@ -568,6 +594,65 @@ avocado-provision-{} {}
         );
 
         Ok(script)
+    }
+
+    /// Check for a provision result file and perform host-side actions.
+    /// Called on Docker Desktop after the container provisioning succeeds.
+    fn handle_provision_result(&self, out_dir: &std::path::Path) -> Result<()> {
+        use crate::utils::provision_result::ProvisionResult;
+
+        let result = match ProvisionResult::read_from_dir(out_dir)? {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        if result.host_action != "burn_removable" {
+            if self.config.verbose {
+                print_info(
+                    &format!("Unknown host_action '{}', skipping.", result.host_action),
+                    OutputLevel::Normal,
+                );
+            }
+            return Ok(());
+        }
+
+        let image_path = out_dir.join(&result.image);
+        if !image_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Provision result references image '{}' but file not found at {}",
+                result.image,
+                image_path.display()
+            ));
+        }
+
+        print_info(
+            &format!(
+                "Disk image '{}' produced. Starting host-side SD card burning.",
+                result.image
+            ),
+            OutputLevel::Normal,
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            use crate::utils::disk_writer::DiskWriter;
+            let writer = DiskWriter::new(self.config.verbose);
+            writer.burn_to_removable(&image_path, self.config.force)?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            print_info(
+                &format!(
+                    "Host-side SD card burning is not yet supported on this platform.\n\
+                     The disk image is available at: {}",
+                    image_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        Ok(())
     }
 
     /// Copy state file from src_dir to container volume before provisioning.

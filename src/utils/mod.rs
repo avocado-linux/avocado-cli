@@ -1,6 +1,8 @@
 pub mod config;
 pub mod config_edit;
 pub mod container;
+#[cfg(target_os = "macos")]
+pub mod disk_writer;
 pub mod ext_fetch;
 pub mod image_signing;
 pub mod interpolation;
@@ -9,6 +11,7 @@ pub mod lockfile;
 pub mod nfs_server;
 pub mod output;
 pub mod pkcs11_devices;
+pub mod provision_result;
 pub mod prerequisites;
 pub mod remote;
 pub mod runs_on;
