@@ -3,7 +3,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::env;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command as AsyncCommand;
@@ -749,22 +748,26 @@ impl SdkContainer {
         if config.detach {
             container_cmd.push("-d".to_string());
         }
-        // Allocate a PTY and keep stdin open when:
-        // - interactive mode is explicitly on (existing behavior)
-        // - host stdout is a TTY AND we're NOT piping through TUI
-        // Both -i (stdin open) and -t (PTY) are needed for interactive
-        // prompts like dnf's "Is this ok [y/N]:". We skip both in TUI
-        // mode because Docker -it with Stdio::piped() causes hangs and
-        // raw escape sequences corrupt the display.
+        // Docker -t (PTY) puts the host terminal in raw mode, breaking
+        // println! formatting (\n no longer returns to column 0).  Only use
+        // -t for explicit interactive mode (e.g. `avocado shell`).
+        //
+        // For non-TUI installs (no --force): use only -i so the user can
+        // respond to dnf prompts.  dnf still prompts via stdout/stdin
+        // without a PTY — it just won't show fancy progress bars.
+        //
+        // For TUI installs (--force): skip both — output is piped and
+        // captured by the renderer.
         let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
-        let needs_tty = config.interactive
-            || (std::io::stdout().is_terminal()
-                && config.tui_context.is_none()
-                && !global_tui_active);
-        if needs_tty {
+        if config.interactive {
+            // Explicit interactive mode (e.g. avocado shell): full -it
             container_cmd.push("-i".to_string());
             container_cmd.push("-t".to_string());
+        } else if config.tui_context.is_none() && !global_tui_active {
+            // Non-TUI mode: keep stdin open for prompts, no PTY
+            container_cmd.push("-i".to_string());
         }
+        // TUI mode: no -i, no -t (output is piped)
 
         // Add FUSE device and capability for bindfs support
         container_cmd.push("--device".to_string());
@@ -1315,9 +1318,17 @@ impl SdkContainer {
             // it can be dumped on failure.
             let global_renderer = crate::utils::tui::get_active_renderer();
             if global_renderer.is_some() {
-                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
             } else {
-                cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                // Inherit all three so the user can interact with prompts
+                // (e.g. dnf "Is this ok [y/N]:").  Ctrl-C propagates
+                // naturally through the process group — Docker forwards
+                // SIGINT to the container which exits, then Docker exits.
+                cmd.stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
             }
 
             let mut child = cmd
@@ -1374,44 +1385,30 @@ impl SdkContainer {
                 None
             };
 
-            // Wait for either the process to complete or Ctrl-C
-            tokio::select! {
-                status = child.wait() => {
-                    // Wait for readers to finish
-                    if let Some(h) = stdout_reader { let _ = h.await; }
-                    if let Some(h) = stderr_reader { let _ = h.await; }
-                    let status = status.with_context(|| "Failed to wait for container command")?;
-                    Ok(status.success())
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    // Received Ctrl-C, need to stop the container
-                    if let Some(name) = container_name {
-                        // Stop the container gracefully (gives processes time to cleanup)
-                        let stop_result = AsyncCommand::new(&self.container_tool)
-                            .args(["stop", "-t", "2", name])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status()
-                            .await;
-
-                        if verbose {
-                            match stop_result {
-                                Ok(status) if status.success() => {
-                                    print_info("Container stopped", OutputLevel::Normal);
-                                }
-                                _ => {
-                                    // If stop fails, try kill
-                                    let _ = AsyncCommand::new(&self.container_tool)
-                                        .args(["kill", name])
-                                        .stdout(Stdio::null())
-                                        .stderr(Stdio::null())
-                                        .status()
-                                        .await;
-                                }
-                            }
-                        } else {
-                            // In non-verbose mode, still try to stop/kill
-                            if stop_result.is_err() || !stop_result.unwrap().success() {
+            if global_renderer.is_some() {
+                // TUI/piped mode: catch Ctrl-C ourselves and explicitly stop
+                // the container, since output is piped (no natural signal
+                // forwarding to the container).
+                tokio::select! {
+                    status = child.wait() => {
+                        // Wait for readers to finish
+                        if let Some(h) = stdout_reader { let _ = h.await; }
+                        if let Some(h) = stderr_reader { let _ = h.await; }
+                        let status = status.with_context(|| "Failed to wait for container command")?;
+                        Ok(status.success())
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        // Stop the container gracefully
+                        if let Some(name) = container_name {
+                            let stop_result = AsyncCommand::new(&self.container_tool)
+                                .args(["stop", "-t", "2", name])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status()
+                                .await;
+                            if stop_result.is_err()
+                                || !stop_result.as_ref().unwrap().success()
+                            {
                                 let _ = AsyncCommand::new(&self.container_tool)
                                     .args(["kill", name])
                                     .stdout(Stdio::null())
@@ -1419,17 +1416,24 @@ impl SdkContainer {
                                     .status()
                                     .await;
                             }
+                        } else {
+                            let _ = child.kill().await;
                         }
-                    } else {
-                        // No container name, just try to kill the child process
-                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        Err(anyhow::anyhow!("Interrupted by user"))
                     }
-
-                    // Wait for child to actually exit after stopping
-                    let _ = child.wait().await;
-
-                    Err(anyhow::anyhow!("Interrupted by user"))
                 }
+            } else {
+                // Interactive/inherited stdio: let Ctrl-C propagate
+                // naturally through the process group.  SIGINT goes to
+                // Docker and the container — no need to intercept.
+                // Avoiding tokio::signal::ctrl_c() here keeps the default
+                // SIGINT handler in place.
+                let status = child
+                    .wait()
+                    .await
+                    .with_context(|| "Failed to wait for container command")?;
+                Ok(status.success())
             }
         }
     }

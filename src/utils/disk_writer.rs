@@ -66,7 +66,14 @@ impl DiskWriter {
         } else {
             println!("Found {} removable devices:", disks.len());
             for (i, d) in disks.iter().enumerate() {
-                println!("  [{}] /dev/{} - {} ({}, {})", i + 1, d.identifier, d.name, d.display_size(), d.bus_type);
+                println!(
+                    "  [{}] /dev/{} - {} ({}, {})",
+                    i + 1,
+                    d.identifier,
+                    d.name,
+                    d.display_size(),
+                    d.bus_type
+                );
             }
             println!();
             let idx = self.prompt_disk_selection(disks.len())?;
@@ -81,7 +88,11 @@ impl DiskWriter {
         println!("==========================================");
         println!();
         self.print_disk_info(disk);
-        println!("  Image: {} ({})", image_path.file_name().unwrap_or_default().to_string_lossy(), format_bytes(image_size));
+        println!(
+            "  Image: {} ({})",
+            image_path.file_name().unwrap_or_default().to_string_lossy(),
+            format_bytes(image_size)
+        );
         println!();
 
         if !self.confirm("Are you sure you want to write to this device? (y/N): ")? {
@@ -97,7 +108,10 @@ impl DiskWriter {
             .status()
             .context("Failed to run diskutil unmountDisk")?;
         if !status.success() {
-            return Err(anyhow::anyhow!("Failed to unmount /dev/{}", disk.identifier));
+            return Err(anyhow::anyhow!(
+                "Failed to unmount /dev/{}",
+                disk.identifier
+            ));
         }
 
         // Write image to raw device with progress reporting.
@@ -176,10 +190,7 @@ impl DiskWriter {
 
         // Second: internal devices — needed for built-in SD card readers.
         // We enumerate all disks and rely on validate_disk() to filter safely.
-        if let Ok(output) = Command::new("diskutil")
-            .args(["list", "-plist"])
-            .output()
-        {
+        if let Ok(output) = Command::new("diskutil").args(["list", "-plist"]).output() {
             if output.status.success() {
                 let plist_str = String::from_utf8_lossy(&output.stdout);
                 for id in parse_disk_identifiers_from_plist(&plist_str) {
@@ -247,7 +258,10 @@ impl DiskWriter {
 
         if !is_usb && !is_sd {
             if self.verbose {
-                eprintln!("[DEBUG] Skipping {} — unsupported bus type: {}", disk_id, bus_protocol);
+                eprintln!(
+                    "[DEBUG] Skipping {} — unsupported bus type: {}",
+                    disk_id, bus_protocol
+                );
             }
             return Ok(None);
         }
@@ -287,7 +301,10 @@ impl DiskWriter {
                     return Ok(n - 1);
                 }
             }
-            println!("Invalid selection. Please enter a number between 1 and {}.", count);
+            println!(
+                "Invalid selection. Please enter a number between 1 and {}.",
+                count
+            );
         }
     }
 
@@ -332,7 +349,9 @@ impl DiskWriter {
             if n == 0 {
                 break;
             }
-            stdin.write_all(&buf[..n]).context("Failed to write to dd")?;
+            stdin
+                .write_all(&buf[..n])
+                .context("Failed to write to dd")?;
             written += n as u64;
 
             let pct = (written as f64 / image_size as f64) * 100.0;
@@ -361,7 +380,10 @@ impl DiskWriter {
 
         println!();
         if !status.success() {
-            return Err(anyhow::anyhow!("dd failed with exit code {:?}", status.code()));
+            return Err(anyhow::anyhow!(
+                "dd failed with exit code {:?}",
+                status.code()
+            ));
         }
 
         println!(
@@ -576,7 +598,8 @@ mod tests {
 
     #[test]
     fn test_plist_value_bool() {
-        let plist = "    <key>RemovableMedia</key>\n    <true/>\n    <key>Internal</key>\n    <false/>";
+        let plist =
+            "    <key>RemovableMedia</key>\n    <true/>\n    <key>Internal</key>\n    <false/>";
         assert!(plist_value_bool(plist, "RemovableMedia"));
         assert!(!plist_value_bool(plist, "Internal"));
         assert!(!plist_value_bool(plist, "NonExistent"));
@@ -585,7 +608,10 @@ mod tests {
     #[test]
     fn test_plist_value_string() {
         let plist = "    <key>BusProtocol</key>\n    <string>USB</string>";
-        assert_eq!(plist_value_string(plist, "BusProtocol"), Some("USB".to_string()));
+        assert_eq!(
+            plist_value_string(plist, "BusProtocol"),
+            Some("USB".to_string())
+        );
         assert_eq!(plist_value_string(plist, "Missing"), None);
     }
 

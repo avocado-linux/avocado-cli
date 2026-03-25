@@ -505,16 +505,31 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             };
         }
 
-        // Run all four tasks in parallel — each updates TUI immediately on completion
-        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
-            with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
-            with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
-            with_tui_status!(
+        // With --force (non-interactive), run all four tasks in parallel.
+        // Without --force, dnf may prompt — run sequentially so each prompt
+        // gets exclusive stdin access.
+        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = if self.force {
+            tokio::join!(
+                with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
+                with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
+                with_tui_status!(
+                    install_sysroot(&mut initramfs_params),
+                    TaskId::InitramfsInstall
+                ),
+                with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
+            )
+        } else {
+            let r1 = with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages).await;
+            let r2 =
+                with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall).await;
+            let r3 = with_tui_status!(
                 install_sysroot(&mut initramfs_params),
                 TaskId::InitramfsInstall
-            ),
-            with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
-        );
+            )
+            .await;
+            let r4 = with_tui_status!(target_dev_fut, TaskId::TargetDevInstall).await;
+            (r1, r2, r3, r4)
+        };
 
         // Merge lock file changes back into a single lock file for saving
         let mut final_lock = lock_file.clone();

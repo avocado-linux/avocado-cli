@@ -298,7 +298,10 @@ impl InstallCommand {
             let sched_renderer = renderer
                 .clone()
                 .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
-            let mut scheduler = TaskScheduler::new(graph, sched_renderer, max_parallel);
+            // Without TUI (no --force), run tasks sequentially so each
+            // interactive prompt gets exclusive stdin access.
+            let effective_parallel = if renderer.is_some() { max_parallel } else { 1 };
+            let mut scheduler = TaskScheduler::new(graph, sched_renderer, effective_parallel);
 
             let sched_result = scheduler
                 .run(move |task_id: TaskId| {
