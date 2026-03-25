@@ -281,6 +281,7 @@ impl ConnectInitCommand {
                         cohort_id: selected_cohort.as_ref().map(|c| c.id.clone()),
                         max_uses: None,
                         expires_at: Some("2099-12-31T23:59:59Z".to_string()),
+                        tags: vec![],
                     },
                 },
             )
