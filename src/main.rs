@@ -521,6 +521,9 @@ enum ConnectCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Publish the runtime immediately after upload (draft → published)
+        #[arg(long)]
+        publish: bool,
         /// Deploy after upload: cohort ID to target
         #[arg(long)]
         deploy_cohort: Option<String>,
@@ -2865,6 +2868,7 @@ async fn main() -> Result<()> {
                 target,
                 file,
                 profile,
+                publish,
                 deploy_cohort,
                 deploy_name,
                 deploy_tag,
@@ -2886,6 +2890,7 @@ async fn main() -> Result<()> {
                     target: target.or(cli.target),
                     file,
                     profile: profile.clone(),
+                    publish,
                     deploy_cohort,
                     deploy_name,
                     deploy_tags: deploy_tag,

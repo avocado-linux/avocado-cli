@@ -27,6 +27,7 @@ pub struct ConnectUploadCommand {
     pub target: Option<String>,
     pub file: Option<String>,
     pub profile: Option<String>,
+    pub publish: bool,
     pub deploy_cohort: Option<String>,
     pub deploy_name: Option<String>,
     pub deploy_tags: Vec<String>,
@@ -164,6 +165,20 @@ impl ConnectUploadCommand {
                 OutputLevel::Normal,
             );
 
+            if self.publish {
+                print_info("Publishing runtime...", OutputLevel::Normal);
+                let published = connect
+                    .publish_runtime(&self.org, &self.project, &runtime.id)
+                    .await?;
+                print_success(
+                    &format!(
+                        "Runtime {} published (status: {})",
+                        published.version, published.status
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+
             if let Some(ref cohort_id) = self.deploy_cohort {
                 super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
                     client: &connect,
@@ -210,7 +225,22 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
-        // 10. Deploy after upload if --deploy-cohort was specified
+        // 10. Publish if --publish was specified
+        if self.publish {
+            print_info("Publishing runtime...", OutputLevel::Normal);
+            let published = connect
+                .publish_runtime(&self.org, &self.project, &runtime.id)
+                .await?;
+            print_success(
+                &format!(
+                    "Runtime {} published (status: {})",
+                    published.version, published.status
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        // 11. Deploy after upload if --deploy-cohort was specified
         if let Some(ref cohort_id) = self.deploy_cohort {
             super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
                 client: &connect,
