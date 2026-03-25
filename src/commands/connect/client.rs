@@ -1020,6 +1020,41 @@ impl ConnectClient {
         Ok(resp.data)
     }
 
+    /// Publish a draft runtime (draft → published).
+    pub async fn publish_runtime(
+        &self,
+        org: &str,
+        project_id: &str,
+        runtime_id: &str,
+    ) -> Result<RuntimeSummary> {
+        let url = format!(
+            "{}/api/orgs/{}/projects/{}/runtimes/{}",
+            self.api_url, org, project_id, runtime_id
+        );
+
+        let body = serde_json::json!({
+            "runtime": { "status": "published" }
+        });
+
+        let res = self
+            .http
+            .put(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to publish runtime")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to publish runtime (HTTP {status}): {body}");
+        }
+
+        let resp: CompleteRuntimeResponse = res.json().await?;
+        Ok(resp.data)
+    }
+
     /// Re-fetch presigned URLs for an artifact (crash recovery).
     #[allow(dead_code)]
     pub async fn get_upload_urls(
