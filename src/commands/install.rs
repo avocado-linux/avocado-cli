@@ -147,7 +147,10 @@ impl InstallCommand {
         // Create a single TUI renderer for the entire install flow.
         // Register SDK + sysroot tasks upfront (we know these from config).
         // Ext/runtime tasks are added after config reload.
-        let renderer = if should_use_tui() && !self.verbose {
+        // Only use TUI when --force is set (dnf gets --assumeyes, so no
+        // prompts).  Without --force, dnf may ask for confirmation and the
+        // user needs to see and respond to the output directly.
+        let renderer = if should_use_tui() && !self.verbose && self.force {
             let r = Arc::new(TaskRenderer::new(false));
             r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
             r.register_task(TaskId::SdkPackages, "sdk packages".to_string());

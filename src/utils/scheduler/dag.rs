@@ -80,6 +80,16 @@ impl TaskGraph {
         !self.failed.is_empty()
     }
 
+    /// Return all task IDs that haven't started yet (not completed, not failed,
+    /// and not currently in-flight — i.e. dependencies not yet met).
+    pub fn all_pending(&self) -> Vec<TaskId> {
+        self.tasks
+            .keys()
+            .filter(|id| !self.completed.contains(id) && !self.failed.contains(id))
+            .cloned()
+            .collect()
+    }
+
     /// Return task IDs that are blocked because a dependency failed.
     pub fn blocked_by_failure(&self) -> Vec<TaskId> {
         self.tasks

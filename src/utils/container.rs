@@ -757,7 +757,14 @@ impl SdkContainer {
         // - host stdout is a TTY AND we're NOT piping through TUI
         // This makes programs like dnf output live progress bars. We skip -t
         // in TUI mode because Docker -t with Stdio::piped() can cause hangs.
-        if config.interactive || (std::io::stdout().is_terminal() && config.tui_context.is_none()) {
+        // Also skip when a global renderer is active (orphan RunConfigs without
+        // explicit tui_context still get piped by execute_container_command).
+        let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
+        if config.interactive
+            || (std::io::stdout().is_terminal()
+                && config.tui_context.is_none()
+                && !global_tui_active)
+        {
             container_cmd.push("-t".to_string());
         }
 

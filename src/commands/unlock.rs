@@ -36,6 +36,7 @@ pub struct UnlockCommand {
 
 impl UnlockCommand {
     /// Create a new UnlockCommand instance
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_path: String,
         verbose: bool,
