@@ -100,24 +100,13 @@ impl DiskWriter {
             return Err(anyhow::anyhow!("Failed to unmount /dev/{}", disk.identifier));
         }
 
-        // Write with dd via sudo, using raw device for speed
+        // Write image to raw device with progress reporting.
+        // We pipe data to dd ourselves so we can track bytes written.
         let raw_device = format!("/dev/r{}", disk.identifier);
-        println!("Writing image to {}...", raw_device);
+        println!("Writing {} to {}...", format_bytes(image_size), raw_device);
         println!("(sudo may prompt for your password)");
 
-        let status = Command::new("sudo")
-            .args([
-                "dd",
-                &format!("if={}", image_path.display()),
-                &format!("of={}", raw_device),
-                "bs=1m",
-            ])
-            .status()
-            .context("Failed to run dd")?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!("dd failed to write image to {}", raw_device));
-        }
+        self.write_image_with_progress(image_path, image_size, &raw_device)?;
 
         // Eject
         println!("Ejecting /dev/{}...", disk.identifier);
@@ -309,23 +298,124 @@ impl DiskWriter {
         std::io::stdin().lock().read_line(&mut input)?;
         Ok(input.trim().eq_ignore_ascii_case("y"))
     }
+
+    /// Write image to raw device with progress reporting.
+    /// Pipes data from the image file through to `sudo dd`, tracking bytes
+    /// written to display a progress bar.
+    fn write_image_with_progress(
+        &self,
+        image_path: &Path,
+        image_size: u64,
+        raw_device: &str,
+    ) -> Result<()> {
+        use std::io::Read as _;
+        use std::process::Stdio;
+
+        let file = std::fs::File::open(image_path)?;
+        let mut reader = std::io::BufReader::new(file);
+
+        let mut child = Command::new("sudo")
+            .args(["dd", &format!("of={}", raw_device), "bs=1m"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to spawn dd")?;
+
+        let mut stdin = child.stdin.take().context("Failed to open dd stdin")?;
+        let mut written: u64 = 0;
+        let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB chunks
+        let start = std::time::Instant::now();
+
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            stdin.write_all(&buf[..n]).context("Failed to write to dd")?;
+            written += n as u64;
+
+            let pct = (written as f64 / image_size as f64) * 100.0;
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                written as f64 / elapsed / 1_000_000.0
+            } else {
+                0.0
+            };
+
+            print!(
+                "\r  {:.1}%  {}/{}  {:.1} MB/s",
+                pct,
+                format_bytes(written),
+                format_bytes(image_size),
+                speed
+            );
+            std::io::stdout().flush()?;
+        }
+
+        // Close stdin to signal EOF to dd
+        drop(stdin);
+
+        let status = child.wait().context("Failed to wait for dd")?;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        println!();
+        if !status.success() {
+            return Err(anyhow::anyhow!("dd failed with exit code {:?}", status.code()));
+        }
+
+        println!(
+            "  Wrote {} in {:.1}s ({:.1} MB/s)",
+            format_bytes(written),
+            elapsed,
+            written as f64 / elapsed / 1_000_000.0
+        );
+
+        Ok(())
+    }
 }
 
-/// Parse whole-disk identifiers from `diskutil list -plist external` output.
-/// Looks for DeviceIdentifier values inside AllDisksAndPartitions array entries
-/// that don't contain "s" suffix (partitions like disk2s1).
+/// Parse whole-disk identifiers from `diskutil list -plist` output.
+/// Looks for the WholeDisks array first (most reliable), then falls back
+/// to filtering DeviceIdentifier values to exclude partitions.
 fn parse_disk_identifiers_from_plist(plist: &str) -> Vec<String> {
+    // Prefer the WholeDisks array — it lists only whole-disk identifiers
+    let mut in_whole_disks = false;
+    let mut in_array = false;
     let mut ids = Vec::new();
-    let mut in_device_id = false;
 
+    for line in plist.lines() {
+        let trimmed = line.trim();
+        if trimmed == "<key>WholeDisks</key>" {
+            in_whole_disks = true;
+        } else if in_whole_disks && trimmed == "<array>" {
+            in_array = true;
+        } else if in_array {
+            if trimmed == "</array>" {
+                break;
+            }
+            if let Some(value) = extract_plist_string_value(trimmed) {
+                if !ids.contains(&value) {
+                    ids.push(value);
+                }
+            }
+        }
+    }
+
+    if !ids.is_empty() {
+        return ids;
+    }
+
+    // Fallback: parse DeviceIdentifier values, filtering out partitions.
+    // Partitions have an "s" after the disk number (e.g., "disk4s1").
+    let mut in_device_id = false;
     for line in plist.lines() {
         let trimmed = line.trim();
         if trimmed == "<key>DeviceIdentifier</key>" {
             in_device_id = true;
         } else if in_device_id {
             if let Some(value) = extract_plist_string_value(trimmed) {
-                // Only include whole-disk identifiers (e.g., "disk2", not "disk2s1")
-                if value.starts_with("disk") && !value.contains('s') {
+                if value.starts_with("disk") && is_whole_disk_id(&value) {
                     if !ids.contains(&value) {
                         ids.push(value);
                     }
@@ -335,6 +425,18 @@ fn parse_disk_identifiers_from_plist(plist: &str) -> Vec<String> {
         }
     }
     ids
+}
+
+/// Check if a disk identifier is a whole disk (e.g., "disk4") vs a partition (e.g., "disk4s1").
+/// Partition identifiers have the pattern: disk<N>s<N>
+fn is_whole_disk_id(id: &str) -> bool {
+    if let Some(after_disk) = id.strip_prefix("disk") {
+        // A whole disk id is just digits after "disk" (e.g., "4")
+        // A partition has digits, then 's', then more digits (e.g., "4s1")
+        after_disk.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
+    }
 }
 
 /// Extract a boolean value for a key from plist XML text.
@@ -413,30 +515,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_disk_identifiers() {
+    fn test_parse_disk_identifiers_from_whole_disks() {
         let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>AllDisksAndPartitions</key>
     <array>
         <dict>
             <key>DeviceIdentifier</key>
-            <string>disk2</string>
+            <string>disk4</string>
             <key>Partitions</key>
             <array>
                 <dict>
                     <key>DeviceIdentifier</key>
-                    <string>disk2s1</string>
+                    <string>disk4s1</string>
                 </dict>
             </array>
         </dict>
+    </array>
+    <key>WholeDisks</key>
+    <array>
+        <string>disk4</string>
     </array>
 </dict>
 </plist>"#;
 
         let ids = parse_disk_identifiers_from_plist(plist);
-        assert_eq!(ids, vec!["disk2"]);
+        assert_eq!(ids, vec!["disk4"]);
+    }
+
+    #[test]
+    fn test_parse_disk_identifiers_fallback() {
+        // No WholeDisks key — falls back to DeviceIdentifier parsing
+        let plist = r#"<dict>
+    <key>AllDisksAndPartitions</key>
+    <array>
+        <dict>
+            <key>DeviceIdentifier</key>
+            <string>disk4</string>
+        </dict>
+        <dict>
+            <key>DeviceIdentifier</key>
+            <string>disk4s1</string>
+        </dict>
+    </array>
+</dict>"#;
+
+        let ids = parse_disk_identifiers_from_plist(plist);
+        assert_eq!(ids, vec!["disk4"]);
+    }
+
+    #[test]
+    fn test_is_whole_disk_id() {
+        assert!(is_whole_disk_id("disk4"));
+        assert!(is_whole_disk_id("disk12"));
+        assert!(!is_whole_disk_id("disk4s1"));
+        assert!(!is_whole_disk_id("disk4s12"));
+        assert!(!is_whole_disk_id("notadisk"));
     }
 
     #[test]
