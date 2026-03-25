@@ -24,8 +24,12 @@ pub struct UnlockCommand {
     extension: Option<String>,
     /// Unlock specific runtime
     runtime: Option<String>,
-    /// Unlock SDK (includes rootfs, target-sysroot, and all SDK arches)
+    /// Unlock SDK (includes rootfs, initramfs, target-sysroot, and all SDK arches)
     sdk: bool,
+    /// Unlock rootfs only
+    rootfs: bool,
+    /// Unlock initramfs only
+    initramfs: bool,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -39,6 +43,8 @@ impl UnlockCommand {
         extension: Option<String>,
         runtime: Option<String>,
         sdk: bool,
+        rootfs: bool,
+        initramfs: bool,
     ) -> Self {
         Self {
             config_path,
@@ -47,6 +53,8 @@ impl UnlockCommand {
             extension,
             runtime,
             sdk,
+            rootfs,
+            initramfs,
             composed_config: None,
         }
     }
@@ -96,7 +104,11 @@ impl UnlockCommand {
         }
 
         // Determine what to unlock
-        let unlock_all = !self.sdk && self.extension.is_none() && self.runtime.is_none();
+        let unlock_all = !self.sdk
+            && !self.rootfs
+            && !self.initramfs
+            && self.extension.is_none()
+            && self.runtime.is_none();
 
         let mut unlocked_something = false;
 
@@ -119,16 +131,49 @@ impl UnlockCommand {
             if self.sdk {
                 if self.verbose {
                     print_info(
-                        &format!("Unlocking SDK, rootfs, and target-sysroot for target '{target}'"),
+                        &format!("Unlocking SDK, rootfs, initramfs, and target-sysroot for target '{target}'"),
                         OutputLevel::Normal,
                     );
                 }
                 lock_file.clear_sdk(&target);
                 lock_file.clear_rootfs(&target);
+                lock_file.clear_initramfs(&target);
                 lock_file.clear_target_sysroot(&target);
                 unlocked_something = true;
                 print_success(
-                    &format!("Unlocked SDK, rootfs, and target-sysroot for target '{target}'."),
+                    &format!("Unlocked SDK, rootfs, initramfs, and target-sysroot for target '{target}'."),
+                    OutputLevel::Normal,
+                );
+            }
+
+            // Unlock rootfs if requested
+            if self.rootfs {
+                if self.verbose {
+                    print_info(
+                        &format!("Unlocking rootfs for target '{target}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                lock_file.clear_rootfs(&target);
+                unlocked_something = true;
+                print_success(
+                    &format!("Unlocked rootfs for target '{target}'."),
+                    OutputLevel::Normal,
+                );
+            }
+
+            // Unlock initramfs if requested
+            if self.initramfs {
+                if self.verbose {
+                    print_info(
+                        &format!("Unlocking initramfs for target '{target}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                lock_file.clear_initramfs(&target);
+                unlocked_something = true;
+                print_success(
+                    &format!("Unlocked initramfs for target '{target}'."),
                     OutputLevel::Normal,
                 );
             }
@@ -233,6 +278,12 @@ runtimes:
         );
         lock.set_locked_version(
             target,
+            &SysrootType::Initramfs,
+            "test-initramfs-pkg",
+            "1.0.0-r0",
+        );
+        lock.set_locked_version(
+            target,
             &SysrootType::Runtime("dev".to_string()),
             "test-runtime-pkg",
             "1.0.0-r0",
@@ -249,7 +300,7 @@ runtimes:
         let config_path = create_test_config(&temp_dir);
         create_test_lock_file(&temp_dir);
 
-        let cmd = UnlockCommand::new(config_path, false, None, None, None, false);
+        let cmd = UnlockCommand::new(config_path, false, None, None, None, false, false, false);
         let result = cmd.execute();
         assert!(result.is_ok());
 
@@ -262,6 +313,19 @@ runtimes:
                 "test-sdk-pkg"
             )
             .is_none());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Rootfs, "test-rootfs-pkg")
+            .is_none());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Initramfs, "test-initramfs-pkg")
+            .is_none());
+        assert!(lock
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::TargetSysroot,
+                "test-sysroot-pkg"
+            )
+            .is_none());
     }
 
     #[test]
@@ -272,11 +336,11 @@ runtimes:
         let config_path = create_test_config(&temp_dir);
         create_test_lock_file(&temp_dir);
 
-        let cmd = UnlockCommand::new(config_path, false, None, None, None, true);
+        let cmd = UnlockCommand::new(config_path, false, None, None, None, true, false, false);
         let result = cmd.execute();
         assert!(result.is_ok());
 
-        // Verify SDK, rootfs, and target-sysroot are cleared but extensions/runtimes remain
+        // Verify SDK, rootfs, initramfs, and target-sysroot are cleared but extensions/runtimes remain
         let lock = LockFile::load(temp_dir.path()).unwrap();
         assert!(lock
             .get_locked_version(
@@ -287,6 +351,9 @@ runtimes:
             .is_none());
         assert!(lock
             .get_locked_version("qemux86-64", &SysrootType::Rootfs, "test-rootfs-pkg")
+            .is_none());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Initramfs, "test-initramfs-pkg")
             .is_none());
         assert!(lock
             .get_locked_version(
@@ -314,6 +381,78 @@ runtimes:
 
     #[test]
     #[serial]
+    fn test_unlock_rootfs() {
+        env::remove_var("AVOCADO_TARGET");
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = create_test_config(&temp_dir);
+        create_test_lock_file(&temp_dir);
+
+        let cmd = UnlockCommand::new(config_path, false, None, None, None, false, true, false);
+        let result = cmd.execute();
+        assert!(result.is_ok());
+
+        // Verify rootfs is cleared but everything else remains
+        let lock = LockFile::load(temp_dir.path()).unwrap();
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Rootfs, "test-rootfs-pkg")
+            .is_none());
+        assert!(lock
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::Sdk("x86_64".to_string()),
+                "test-sdk-pkg"
+            )
+            .is_some());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Initramfs, "test-initramfs-pkg")
+            .is_some());
+        assert!(lock
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::TargetSysroot,
+                "test-sysroot-pkg"
+            )
+            .is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_unlock_initramfs() {
+        env::remove_var("AVOCADO_TARGET");
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = create_test_config(&temp_dir);
+        create_test_lock_file(&temp_dir);
+
+        let cmd = UnlockCommand::new(config_path, false, None, None, None, false, false, true);
+        let result = cmd.execute();
+        assert!(result.is_ok());
+
+        // Verify initramfs is cleared but everything else remains
+        let lock = LockFile::load(temp_dir.path()).unwrap();
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Initramfs, "test-initramfs-pkg")
+            .is_none());
+        assert!(lock
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::Sdk("x86_64".to_string()),
+                "test-sdk-pkg"
+            )
+            .is_some());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Rootfs, "test-rootfs-pkg")
+            .is_some());
+        assert!(lock
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::TargetSysroot,
+                "test-sysroot-pkg"
+            )
+            .is_some());
+    }
+
+    #[test]
+    #[serial]
     fn test_unlock_extension() {
         env::remove_var("AVOCADO_TARGET");
         let temp_dir = TempDir::new().unwrap();
@@ -326,6 +465,8 @@ runtimes:
             None,
             Some("my-app".to_string()),
             None,
+            false,
+            false,
             false,
         );
         let result = cmd.execute();
@@ -347,6 +488,9 @@ runtimes:
                 "test-sdk-pkg"
             )
             .is_some());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Initramfs, "test-initramfs-pkg")
+            .is_some());
     }
 
     #[test]
@@ -363,6 +507,8 @@ runtimes:
             None,
             None,
             Some("dev".to_string()),
+            false,
+            false,
             false,
         );
         let result = cmd.execute();
@@ -383,6 +529,9 @@ runtimes:
                 &SysrootType::Sdk("x86_64".to_string()),
                 "test-sdk-pkg"
             )
+            .is_some());
+        assert!(lock
+            .get_locked_version("qemux86-64", &SysrootType::Initramfs, "test-initramfs-pkg")
             .is_some());
     }
 }

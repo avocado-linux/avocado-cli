@@ -662,6 +662,13 @@ impl LockFile {
         }
     }
 
+    /// Clear initramfs entries for a specific target
+    pub fn clear_initramfs(&mut self, target: &str) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.initramfs.clear();
+        }
+    }
+
     /// Clear target-sysroot entries for a specific target
     pub fn clear_target_sysroot(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
@@ -780,11 +787,12 @@ impl LockFile {
         }
     }
 
-    /// Clear all entries for a target (SDK, rootfs, target-sysroot, extensions, runtimes)
+    /// Clear all entries for a target (SDK, rootfs, initramfs, target-sysroot, extensions, runtimes)
     pub fn clear_all(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.sdk.clear();
             target_locks.rootfs.clear();
+            target_locks.initramfs.clear();
             target_locks.target_sysroot.clear();
             target_locks.extensions.clear();
             target_locks.runtimes.clear();

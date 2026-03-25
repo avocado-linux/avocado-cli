@@ -423,9 +423,15 @@ enum Commands {
         /// Unlock a specific runtime
         #[arg(short = 'r', long = "runtime")]
         runtime: Option<String>,
-        /// Unlock SDK (rootfs, target-sysroot, and all SDK arches)
+        /// Unlock SDK (rootfs, initramfs, target-sysroot, and all SDK arches)
         #[arg(long)]
         sdk: bool,
+        /// Unlock rootfs
+        #[arg(long)]
+        rootfs: bool,
+        /// Unlock initramfs
+        #[arg(long)]
+        initramfs: bool,
     },
     /// Avocado Connect platform commands (auth, upload)
     Connect {
@@ -1805,6 +1811,8 @@ async fn main() -> Result<()> {
             extension,
             runtime,
             sdk,
+            rootfs,
+            initramfs,
         } => {
             // Validate runtime exists if provided
             validate_runtime_if_provided(&config, runtime.as_ref())?;
@@ -1816,6 +1824,8 @@ async fn main() -> Result<()> {
                 extension,
                 runtime,
                 sdk,
+                rootfs,
+                initramfs,
             );
             unlock_cmd.execute()?;
             Ok(())
