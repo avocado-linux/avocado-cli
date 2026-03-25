@@ -12,7 +12,7 @@ use crate::utils::stamps::{
     StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
-use crate::utils::tui::{TaskId, TaskStatus};
+use crate::utils::tui::{TaskId, TuiGuard};
 
 pub struct ExtImageCommand {
     extension: String,
@@ -94,21 +94,20 @@ impl ExtImageCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        // Create standalone TUI if not provided by parent orchestrator
-        let _standalone_tui = if self.tui_context.is_none() {
-            crate::utils::tui::create_standalone_tui(
+        // TuiGuard: RAII wrapper that guarantees shutdown on any exit path.
+        let tui_guard = if self.tui_context.is_none() {
+            Some(TuiGuard::new(
                 TaskId::ExtImage(self.extension.clone()),
                 &format!("ext image {}", self.extension),
                 self.verbose,
-            )
+            ))
         } else {
             None
         };
-        // Use either the provided tui_context or the standalone one
         let effective_tui_context = self
             .tui_context
             .clone()
-            .or_else(|| _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone()));
+            .or_else(|| tui_guard.as_ref().and_then(|g| g.tui_context()));
 
         // Use provided config or load fresh
         let composed = match &self.composed_config {
@@ -520,10 +519,6 @@ impl ExtImageCommand {
                 }
             }
         } else {
-            if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                renderer.set_status(&ctx.task_id, TaskStatus::Failed);
-                renderer.shutdown();
-            }
             return Err(anyhow::anyhow!(
                 "Failed to create extension image for '{}-{}'",
                 self.extension,
@@ -531,9 +526,8 @@ impl ExtImageCommand {
             ));
         }
 
-        if let Some((ref ctx, ref renderer)) = _standalone_tui {
-            renderer.set_status(&ctx.task_id, TaskStatus::Success);
-            renderer.shutdown();
+        if let Some(ref guard) = tui_guard {
+            guard.mark_success();
         }
 
         Ok(())

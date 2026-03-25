@@ -12,7 +12,7 @@ use crate::utils::{
         StampOutputs,
     },
     target::resolve_target_required,
-    tui::{TaskId, TaskStatus},
+    tui::{TaskId, TuiGuard},
     update_repo,
 };
 use anyhow::{Context, Result};
@@ -93,18 +93,17 @@ impl RuntimeBuildCommand {
     pub async fn execute(&mut self) -> Result<()> {
         // Create standalone TUI if not provided by parent orchestrator
         let name = self.runtime_name.clone();
-        let _standalone_tui = if self.tui_context.is_none() {
-            crate::utils::tui::create_standalone_tui(
+        let tui_guard = if self.tui_context.is_none() {
+            Some(TuiGuard::new(
                 TaskId::RuntimeBuild(name.clone()),
                 &format!("runtime build {}", name),
                 self.verbose,
-            )
+            ))
         } else {
             None
         };
-        // Use either the provided tui_context or the standalone one
         if self.tui_context.is_none() {
-            self.tui_context = _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone());
+            self.tui_context = tui_guard.as_ref().and_then(|g| g.tui_context());
         }
 
         // Use provided config or load fresh
@@ -191,9 +190,8 @@ impl RuntimeBuildCommand {
         }
 
         if result.is_ok() {
-            if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                renderer.shutdown();
+            if let Some(ref guard) = tui_guard {
+                guard.mark_success();
             }
         }
 

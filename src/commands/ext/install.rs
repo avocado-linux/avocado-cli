@@ -12,7 +12,7 @@ use crate::utils::stamps::{
     compute_ext_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
-use crate::utils::tui::{TaskId, TaskStatus};
+use crate::utils::tui::{TaskId, TuiGuard};
 
 pub struct ExtInstallCommand {
     extension: Option<String>,
@@ -90,20 +90,19 @@ impl ExtInstallCommand {
 
     pub async fn execute(&self) -> Result<()> {
         let ext_label = self.extension.as_deref().unwrap_or("all");
-        let _standalone_tui = if self.tui_context.is_none() && self.force {
-            crate::utils::tui::create_standalone_tui(
+        let tui_guard = if self.tui_context.is_none() && self.force {
+            Some(TuiGuard::new(
                 TaskId::ExtInstall(ext_label.to_string()),
                 &format!("ext install {}", ext_label),
                 self.verbose,
-            )
+            ))
         } else {
             None
         };
-        // Use either the provided tui_context or the standalone one
         let effective_tui_context = self
             .tui_context
             .clone()
-            .or_else(|| _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone()));
+            .or_else(|| tui_guard.as_ref().and_then(|g| g.tui_context()));
 
         // Use provided config or load fresh
         let composed = match &self.composed_config {
@@ -273,13 +272,10 @@ impl ExtInstallCommand {
             }
         }
 
-        if let Some((ref ctx, ref renderer)) = _standalone_tui {
-            if result.is_ok() {
-                renderer.set_status(&ctx.task_id, TaskStatus::Success);
-            } else {
-                renderer.set_status(&ctx.task_id, TaskStatus::Failed);
+        if result.is_ok() {
+            if let Some(ref guard) = tui_guard {
+                guard.mark_success();
             }
-            renderer.shutdown();
         }
 
         result

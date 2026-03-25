@@ -12,7 +12,7 @@ use crate::utils::stamps::{
     compute_runtime_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
-use crate::utils::tui::{TaskId, TaskStatus};
+use crate::utils::tui::{TaskId, TuiGuard};
 
 pub struct RuntimeInstallCommand {
     runtime: Option<String>,
@@ -90,18 +90,17 @@ impl RuntimeInstallCommand {
 
     pub async fn execute(&mut self) -> Result<()> {
         let name = self.runtime.as_deref().unwrap_or("all");
-        let _standalone_tui = if self.tui_context.is_none() && self.force {
-            crate::utils::tui::create_standalone_tui(
+        let tui_guard = if self.tui_context.is_none() && self.force {
+            Some(TuiGuard::new(
                 TaskId::RuntimeInstall(name.to_string()),
                 &format!("runtime install {}", name),
                 self.verbose,
-            )
+            ))
         } else {
             None
         };
-        // Use either the provided tui_context or the standalone one
         if self.tui_context.is_none() {
-            self.tui_context = _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone());
+            self.tui_context = tui_guard.as_ref().and_then(|g| g.tui_context());
         }
 
         // Use provided config or load fresh
@@ -132,16 +131,14 @@ impl RuntimeInstallCommand {
                         &format!("Runtime '{runtime}' not found in configuration."),
                         OutputLevel::Normal,
                     );
-                    if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                        renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                        renderer.shutdown();
+                    if let Some(ref guard) = tui_guard {
+                        guard.mark_success();
                     }
                     return Ok(());
                 } else {
                     print_info("No runtimes found in configuration.", OutputLevel::Normal);
-                    if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                        renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                        renderer.shutdown();
+                    if let Some(ref guard) = tui_guard {
+                        guard.mark_success();
                     }
                     return Ok(());
                 }
@@ -160,9 +157,8 @@ impl RuntimeInstallCommand {
                     &format!("Runtime '{runtime_name}' not found in configuration."),
                     OutputLevel::Normal,
                 );
-                if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                    renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                    renderer.shutdown();
+                if let Some(ref guard) = tui_guard {
+                    guard.mark_success();
                 }
                 return Ok(());
             }
@@ -183,9 +179,8 @@ impl RuntimeInstallCommand {
                 "No runtimes to install dependencies for.",
                 OutputLevel::Normal,
             );
-            if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                renderer.shutdown();
+            if let Some(ref guard) = tui_guard {
+                guard.mark_success();
             }
             return Ok(());
         }
@@ -235,9 +230,8 @@ impl RuntimeInstallCommand {
         }
 
         if result.is_ok() {
-            if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                renderer.shutdown();
+            if let Some(ref guard) = tui_guard {
+                guard.mark_success();
             }
         }
 

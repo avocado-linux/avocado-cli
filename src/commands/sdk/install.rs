@@ -18,7 +18,7 @@ use crate::utils::{
         Stamp, StampOutputs,
     },
     target::validate_and_log_target,
-    tui::{TaskId, TaskStatus},
+    tui::{TaskId, TaskStatus, TuiGuard},
 };
 
 /// Data produced by the bootstrap phase, consumed by the parallel install phase.
@@ -126,18 +126,17 @@ impl SdkInstallCommand {
 
     /// Execute the sdk install command
     pub async fn execute(&mut self) -> Result<()> {
-        let _standalone_tui = if self.tui_context.is_none() && self.force {
-            crate::utils::tui::create_standalone_tui(
+        let tui_guard = if self.tui_context.is_none() && self.force {
+            Some(TuiGuard::new(
                 TaskId::SdkInstall,
                 "sdk install",
                 self.verbose,
-            )
+            ))
         } else {
             None
         };
-        // Use either the provided tui_context or the standalone one
         if self.tui_context.is_none() {
-            self.tui_context = _standalone_tui.as_ref().map(|(ctx, _)| ctx.clone());
+            self.tui_context = tui_guard.as_ref().and_then(|g| g.tui_context());
         }
 
         // Use provided config or load fresh
@@ -258,9 +257,8 @@ impl SdkInstallCommand {
         }
 
         if result.is_ok() {
-            if let Some((ref ctx, ref renderer)) = _standalone_tui {
-                renderer.set_status(&ctx.task_id, TaskStatus::Success);
-                renderer.shutdown();
+            if let Some(ref guard) = tui_guard {
+                guard.mark_success();
             }
         }
 
