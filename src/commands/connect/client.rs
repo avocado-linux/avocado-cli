@@ -1473,7 +1473,7 @@ impl ConnectClient {
     /// List runtimes for a project (for interactive picker).
     pub async fn list_runtimes(&self, org: &str, project: &str) -> Result<Vec<RuntimeListItem>> {
         let url = format!(
-            "{}/api/orgs/{}/projects/{}/runtimes?status=draft",
+            "{}/api/orgs/{}/projects/{}/runtimes?status=published",
             self.api_url, org, project
         );
 
