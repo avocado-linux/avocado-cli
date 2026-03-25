@@ -640,13 +640,13 @@ SIZE=$(stat -c '%s' "$MANIFEST_FILE")
 echo -n '{{"name":"manifest.json","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
 FIRST=false
 
-# Hash all image .raw files (content-addressable by UUIDv5)
+# Hash all image files (content-addressable by UUIDv5) — .raw and .kab
 if [ -d "$IMAGES_DIR" ]; then
-    for RAW_FILE in "$IMAGES_DIR"/*.raw; do
-        [ -f "$RAW_FILE" ] || continue
-        BASENAME=$(basename "$RAW_FILE")
-        HASH=$(sha256sum "$RAW_FILE" | awk '{{print $1}}')
-        SIZE=$(stat -c '%s' "$RAW_FILE")
+    for IMG_FILE in "$IMAGES_DIR"/*.raw "$IMAGES_DIR"/*.kab; do
+        [ -f "$IMG_FILE" ] || continue
+        BASENAME=$(basename "$IMG_FILE")
+        HASH=$(sha256sum "$IMG_FILE" | awk '{{print $1}}')
+        SIZE=$(stat -c '%s' "$IMG_FILE")
         if [ "$FIRST" = "false" ]; then
             echo -n ','
         fi
@@ -1040,11 +1040,16 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                                 )
                             })?;
 
+                        let ext_suffix = ext_data
+                            .get("image_type")
+                            .and_then(|v| v.as_str())
+                            .map(|t| if t == "kab" { "kab" } else { "raw" })
+                            .unwrap_or("raw");
                         copy_commands.push(format!(
                             r#"
-if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw" ]; then
-    cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.raw" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.raw"
-    echo "  Copied: {ext_name}-{ext_version}.raw"
+if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
+    cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
+    echo "  Copied: {ext_name}-{ext_version}.{ext_suffix}"
 fi"#
                         ));
                         processed_extensions.insert(ext_name.to_string());
@@ -1096,7 +1101,7 @@ fi"#
             .get_runtime_version(&self.runtime_name)
             .unwrap_or_else(|| build_id[..8].to_string());
 
-        // Build "name:version" pairs for dynamic manifest generation.
+        // Build "name:version:image_type" triples for dynamic manifest generation.
         // The shell script will compute SHA-256 + UUIDv5 image IDs at build time.
         let ext_info_pairs: Vec<String> = resolved_extensions
             .iter()
@@ -1116,7 +1121,14 @@ fi"#
                 } else {
                     (versioned_name.clone(), "0.0.0".to_string())
                 };
-                format!("{name}:{version}")
+                // Look up image_type from parsed config
+                let image_type = parsed
+                    .get("extensions")
+                    .and_then(|e| e.get(&name))
+                    .and_then(|ext| ext.get("image_type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("raw");
+                format!("{name}:{version}:{image_type}")
             })
             .collect();
         let ext_info_str = ext_info_pairs.join(" ");
@@ -1164,18 +1176,24 @@ ext_pairs = ext_pairs_str.split() if ext_pairs_str else []
 
 extensions = []
 for pair in ext_pairs:
-    name, version = pair.split(":", 1)
-    raw_file = os.path.join(runtime_ext_dir, name + "-" + version + ".raw")
-    if not os.path.isfile(raw_file):
-        print("WARNING: Extension image not found: " + raw_file)
+    parts = pair.split(":", 2)
+    name, version = parts[0], parts[1]
+    image_type = parts[2] if len(parts) > 2 else "raw"
+    ext_suffix = ".kab" if image_type == "kab" else ".raw"
+    img_file = os.path.join(runtime_ext_dir, name + "-" + version + ext_suffix)
+    if not os.path.isfile(img_file):
+        print("WARNING: Extension image not found: " + img_file)
         continue
-    with open(raw_file, "rb") as f:
+    with open(img_file, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
     image_id = str(uuid.uuid5(namespace, sha256))
-    dest = os.path.join(images_dir, image_id + ".raw")
-    shutil.copy2(raw_file, dest)
-    print("  Image: " + name + "-" + version + ".raw -> " + image_id + ".raw")
-    extensions.append(dict(name=name, version=version, image_id=image_id))
+    dest = os.path.join(images_dir, image_id + ext_suffix)
+    shutil.copy2(img_file, dest)
+    print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
+    entry = dict(name=name, version=version, image_id=image_id)
+    if image_type != "raw":
+        entry["image_type"] = image_type
+    extensions.append(entry)
 
 manifest = dict(
     manifest_version=2,
@@ -1190,9 +1208,12 @@ with open(manifest_path, "w") as f:
 print("Created runtime manifest with " + str(len(extensions)) + " extension(s)")
 
 # Clean up stale extension images (os_bundle cleanup happens after stone bundle)
-current_image_files = set(ext["image_id"] + ".raw" for ext in extensions)
+current_image_files = set()
+for ext in extensions:
+    suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
+    current_image_files.add(ext["image_id"] + suffix)
 for fname in os.listdir(images_dir):
-    if fname.endswith(".raw") and fname not in current_image_files:
+    if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
         os.remove(stale_path)
         print("  Removed stale image: " + fname)
@@ -1534,7 +1555,7 @@ mkdir -p "$RUNTIME_EXT_DIR"
 
 # Clean up stale extensions to ensure fresh copies
 echo "Cleaning up stale extensions..."
-rm -f "$RUNTIME_EXT_DIR"/*.raw 2>/dev/null || true
+rm -f "$RUNTIME_EXT_DIR"/*.raw "$RUNTIME_EXT_DIR"/*.kab 2>/dev/null || true
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
@@ -2297,7 +2318,7 @@ extensions:
         assert!(script.contains("manifest.json"));
         assert!(script.contains("manifest_version=2"));
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
-        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0\""));
+        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
 
         // Active symlink should be created

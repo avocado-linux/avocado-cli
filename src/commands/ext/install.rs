@@ -353,6 +353,11 @@ impl ExtInstallCommand {
 
             // Write extension install stamp (unless --no-stamps)
             if !self.no_stamps {
+                // Update peek line so it doesn't stay on "Complete!" during stamp write
+                if let Some(ref ctx) = effective_tui_context {
+                    ctx.renderer
+                        .append_output(&ctx.task_id, "Writing install stamp...".to_string());
+                }
                 let inputs = compute_ext_input_hash(parsed, ext_name)?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);

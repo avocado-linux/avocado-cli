@@ -280,10 +280,17 @@ impl TaskRenderer {
                 }
                 TaskStatus::Failed => {
                     let elapsed = format_duration(task.elapsed());
-                    self.emit_line(&format!(
-                        "\x1b[91m  \u{2717}\x1b[0m {} {}",
-                        task.label, elapsed
-                    ));
+                    if let Some(ref msg) = task.error_message {
+                        self.emit_line(&format!(
+                            "\x1b[91m  \u{2717}\x1b[0m {} {} \x1b[91m({})\x1b[0m",
+                            task.label, elapsed, msg
+                        ));
+                    } else {
+                        self.emit_line(&format!(
+                            "\x1b[91m  \u{2717}\x1b[0m {} {}",
+                            task.label, elapsed
+                        ));
+                    }
                 }
                 TaskStatus::Skipped => {
                     self.emit_line(&format!("\x1b[2m  - {} (skipped)\x1b[0m", task.label));
@@ -304,9 +311,14 @@ impl TaskRenderer {
         self.emit_line(&format!("\x1b[2m  Total: {total}\x1b[0m"));
 
         // Dump failed task output AFTER the task list with a header per task.
+        // Include tasks with captured output OR an error message (a task can
+        // fail before running any container, so full_output may be empty).
         let failed_tasks: Vec<_> = state
             .iter()
-            .filter(|t| t.status == TaskStatus::Failed && !t.full_output.is_empty())
+            .filter(|t| {
+                t.status == TaskStatus::Failed
+                    && (!t.full_output.is_empty() || t.error_message.is_some())
+            })
             .collect();
         if !failed_tasks.is_empty() {
             self.emit_line(""); // blank separator
