@@ -749,22 +749,20 @@ impl SdkContainer {
         if config.detach {
             container_cmd.push("-d".to_string());
         }
-        if config.interactive {
-            container_cmd.push("-i".to_string());
-        }
-        // Allocate a PTY inside the container when:
-        // - interactive mode is on (existing behavior)
+        // Allocate a PTY and keep stdin open when:
+        // - interactive mode is explicitly on (existing behavior)
         // - host stdout is a TTY AND we're NOT piping through TUI
-        // This makes programs like dnf output live progress bars. We skip -t
-        // in TUI mode because Docker -t with Stdio::piped() can cause hangs.
-        // Also skip when a global renderer is active (orphan RunConfigs without
-        // explicit tui_context still get piped by execute_container_command).
+        // Both -i (stdin open) and -t (PTY) are needed for interactive
+        // prompts like dnf's "Is this ok [y/N]:". We skip both in TUI
+        // mode because Docker -it with Stdio::piped() causes hangs and
+        // raw escape sequences corrupt the display.
         let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
-        if config.interactive
+        let needs_tty = config.interactive
             || (std::io::stdout().is_terminal()
                 && config.tui_context.is_none()
-                && !global_tui_active)
-        {
+                && !global_tui_active);
+        if needs_tty {
+            container_cmd.push("-i".to_string());
             container_cmd.push("-t".to_string());
         }
 
