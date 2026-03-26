@@ -1682,7 +1682,7 @@ echo "Set proper permissions on authentication files""#,
                     );
                 }
             }
-            let compile_command = SdkCompileCommand::new(
+            let mut compile_command = SdkCompileCommand::new(
                 sdk_config_path.to_string(),
                 self.verbose,
                 vec![compile_section.clone()],
@@ -1691,6 +1691,9 @@ echo "Set proper permissions on authentication files""#,
                 self.dnf_args.clone(),
             )
             .with_workdir(ext_script_workdir.map(|s| s.to_string()));
+            if let Some(ref ctx) = effective_tui_context {
+                compile_command = compile_command.with_tui_context(ctx.clone());
+            }
 
             compile_command.execute().await.with_context(|| {
                 format!(

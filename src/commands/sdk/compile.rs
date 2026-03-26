@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::{RunConfig, SdkContainer},
+    container::{RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
     target::resolve_target_required,
@@ -42,6 +42,8 @@ pub struct SdkCompileCommand {
     pub workdir: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
+    /// TUI context for output capture when running under a parent orchestrator
+    tui_context: Option<TuiContext>,
 }
 
 impl SdkCompileCommand {
@@ -65,6 +67,7 @@ impl SdkCompileCommand {
             sdk_arch: None,
             workdir: None,
             composed_config: None,
+            tui_context: None,
         }
     }
 
@@ -90,6 +93,12 @@ impl SdkCompileCommand {
     #[allow(dead_code)]
     pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
         self.composed_config = Some(config);
+        self
+    }
+
+    /// Set TUI context for output capture under a parent orchestrator
+    pub fn with_tui_context(mut self, ctx: TuiContext) -> Self {
+        self.tui_context = Some(ctx);
         self
     }
 
@@ -230,14 +239,17 @@ impl SdkCompileCommand {
                 .collect()
         };
 
-        println!(
-            "Found {} compile section(s) to process: {}",
-            filtered_sections.len(),
-            filtered_sections
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        print_info(
+            &format!(
+                "Found {} compile section(s) to process: {}",
+                filtered_sections.len(),
+                filtered_sections
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            OutputLevel::Normal,
         );
 
         // Get the SDK image from configuration
@@ -294,6 +306,7 @@ impl SdkCompileCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
             let success = container_helper.run_in_container(config).await?;

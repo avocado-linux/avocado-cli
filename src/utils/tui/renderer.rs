@@ -396,14 +396,14 @@ impl TaskRenderer {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Render the TUI region — status lines with animated spinner.
+    /// Render the TUI region — all tasks redrawn in place each tick.
     ///
-    /// Completed/failed tasks are "finalized" — a permanent line is emitted
-    /// once and they are excluded from the clearable TUI region.  Only
-    /// running/pending tasks are redrawn each tick, keeping scrollback clean.
+    /// Every task is drawn every tick (running tasks with spinner, completed
+    /// with checkmark, etc.).  The entire region is cleared and redrawn,
+    /// avoiding the line-count mismatch bugs that arise from mixing permanent
+    /// and mutable lines.  Tasks appear to turn into checkmarks in place.
     fn render_tui(&self) {
         let state = self.state.lock().unwrap();
-        let mut finalized = self.finalized.lock().unwrap();
         let mut stderr = std::io::stderr();
         let prev_rendered = *self.rendered_lines.lock().unwrap();
 
@@ -414,7 +414,7 @@ impl TaskRenderer {
         let frame = self.spin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let spinner = SPINNER[frame % SPINNER.len()];
 
-        // Clear the mutable TUI region (running/pending tasks only)
+        // Clear the previous render region
         if prev_rendered > 0 {
             for _ in 0..prev_rendered {
                 let _ = execute!(stderr, cursor::MoveUp(1), Clear(ClearType::CurrentLine));
@@ -429,47 +429,7 @@ impl TaskRenderer {
             }
         }
 
-        // Emit permanent lines for completed/failed/skipped tasks in
-        // registration order.  A task is only finalized once all tasks
-        // before it (in registration order) have already been finalized.
-        // This keeps the output ordered consistently regardless of which
-        // parallel tasks finish first.
-        for task in state.iter() {
-            if finalized.contains(&task.id) {
-                continue;
-            }
-            match task.status {
-                TaskStatus::Success => {
-                    let elapsed = format_duration(task.elapsed());
-                    let _ = writeln!(
-                        stderr,
-                        "\x1b[92m  \u{2713}\x1b[0m \x1b[2m{} {}\x1b[0m",
-                        task.label, elapsed
-                    );
-                    finalized.insert(task.id.clone());
-                }
-                TaskStatus::Failed => {
-                    let elapsed = format_duration(task.elapsed());
-                    let _ = writeln!(
-                        stderr,
-                        "\x1b[91m  \u{2717}\x1b[0m {} {}",
-                        task.label, elapsed
-                    );
-                    finalized.insert(task.id.clone());
-                }
-                TaskStatus::Skipped => {
-                    let _ = writeln!(stderr, "\x1b[2m  - {} (skipped)\x1b[0m", task.label);
-                    finalized.insert(task.id.clone());
-                }
-                _ => {
-                    // This task is still running/pending — stop finalizing.
-                    // Later tasks cannot be emitted until this one completes.
-                    break;
-                }
-            }
-        }
-
-        // Sticky peek selection
+        // Sticky peek selection — pick the longest-running task for peek output
         let peek_task_id = {
             let mut sticky = self.sticky_peek.lock().unwrap();
             let still_running = sticky.as_ref().is_some_and(|id| {
@@ -490,17 +450,11 @@ impl TaskRenderer {
             }
         };
 
-        // Draw the mutable region: non-finalized tasks shown in place.
-        // Completed tasks that can't be finalized yet (a predecessor is still
-        // running) are rendered with their final status indicator so they
-        // appear to turn into checkmarks in place rather than disappearing.
+        // Draw ALL tasks in registration order.
         let mut lines_written = 0;
         let mut showed_peek = false;
 
         for task in state.iter() {
-            if finalized.contains(&task.id) {
-                continue;
-            }
             match task.status {
                 TaskStatus::Running => {
                     let elapsed = format_duration(task.elapsed());
@@ -551,8 +505,6 @@ impl TaskRenderer {
                     lines_written += 1;
                 }
                 TaskStatus::Success => {
-                    // Completed but waiting for predecessors to finalize —
-                    // show checkmark in the mutable region (redrawn each tick).
                     let elapsed = format_duration(task.elapsed());
                     let _ = writeln!(
                         stderr,
@@ -1123,11 +1075,9 @@ mod tests {
     }
 
     #[test]
-    fn test_finalized_output_preserves_registration_order() {
-        // Tasks A, B, C registered in that order.
-        // B completes first, then A, then C.
-        // The render_tui finalization should only finalize tasks when all
-        // preceding tasks are already finalized (preserving registration order).
+    fn test_render_tui_draws_all_tasks_every_tick() {
+        // render_tui redraws ALL tasks every tick (no finalization during render).
+        // Tasks that completed out of order still appear in registration order.
         let r = test_renderer();
         let id_a = TaskId::ExtBuild("a".to_string());
         let id_b = TaskId::ExtBuild("b".to_string());
@@ -1137,51 +1087,21 @@ mod tests {
         r.register_task(id_b.clone(), "ext build b".to_string());
         r.register_task(id_c.clone(), "ext build c".to_string());
 
-        // Directly set all tasks to Running
+        // Set all to Running, then B completes first
         {
             let mut state = r.state.lock().unwrap();
             for task in state.iter_mut() {
                 task.status = TaskStatus::Running;
                 task.started_at = Some(std::time::Instant::now());
             }
-        }
-
-        // B completes first
-        {
-            let mut state = r.state.lock().unwrap();
             state.iter_mut().find(|t| t.id == id_b).unwrap().status = TaskStatus::Success;
         }
         r.render_tui();
 
-        // B should NOT be finalized yet because A (before it) is still running
-        assert!(
-            !r.is_finalized(&id_b),
-            "B should NOT be finalized while A is still running"
-        );
-
-        // A completes — both A and B should now be finalized
-        {
-            let mut state = r.state.lock().unwrap();
-            state.iter_mut().find(|t| t.id == id_a).unwrap().status = TaskStatus::Success;
-        }
-        r.render_tui();
-
-        assert!(r.is_finalized(&id_a), "A should be finalized");
-        assert!(
-            r.is_finalized(&id_b),
-            "B should be finalized (all predecessors done)"
-        );
-        assert!(!r.is_finalized(&id_c), "C should NOT be finalized yet");
-
-        // C completes last — all three should be finalized
-        {
-            let mut state = r.state.lock().unwrap();
-            state.iter_mut().find(|t| t.id == id_c).unwrap().status = TaskStatus::Success;
-        }
-        r.render_tui();
-
-        assert!(r.is_finalized(&id_a), "A finalized");
-        assert!(r.is_finalized(&id_b), "B finalized");
-        assert!(r.is_finalized(&id_c), "C finalized");
+        // rendered_lines should count all 3 tasks (none finalized during render)
+        let lines = *r.rendered_lines.lock().unwrap();
+        assert_eq!(lines, 3, "all 3 tasks should be drawn");
+        // Nothing should be finalized (finalization only at shutdown)
+        assert!(!r.is_finalized(&id_b), "no finalization during render");
     }
 }
