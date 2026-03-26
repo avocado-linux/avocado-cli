@@ -296,11 +296,9 @@ impl RuntimeInstallCommand {
                 .await?;
 
             if !success {
-                print_error(
-                    &format!("Failed to install dependencies for runtime '{runtime_name}'"),
-                    OutputLevel::Normal,
-                );
-                return Ok(());
+                return Err(anyhow::anyhow!(
+                    "Failed to install dependencies for runtime '{runtime_name}'"
+                ));
             }
 
             // Write runtime install stamp (unless --no-stamps)

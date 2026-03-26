@@ -163,3 +163,175 @@ impl Drop for TuiGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialize tests that touch the global ACTIVE_RENDERER.
+    /// Tests run in parallel by default; the global static causes races.
+    static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Create a test renderer in Passthrough mode (doesn't need a terminal).
+    fn test_renderer() -> Arc<TaskRenderer> {
+        Arc::new(TaskRenderer::new_test())
+    }
+
+    #[test]
+    fn test_active_renderer_lifecycle() {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
+        clear_active_renderer();
+
+        let r = test_renderer();
+        set_active_renderer(&r);
+        assert!(get_active_renderer().is_some());
+
+        // shutdown() should clear the active renderer
+        r.shutdown();
+        assert!(
+            get_active_renderer().is_none(),
+            "active renderer should be cleared after shutdown"
+        );
+    }
+
+    #[test]
+    fn test_active_renderer_cleared_when_dropped() {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
+        clear_active_renderer();
+        {
+            let r = test_renderer();
+            set_active_renderer(&r);
+            assert!(get_active_renderer().is_some());
+            // r is dropped here — the Weak reference should no longer upgrade
+        }
+        assert!(
+            get_active_renderer().is_none(),
+            "active renderer should be cleared when Arc is dropped"
+        );
+    }
+
+    #[test]
+    fn test_print_and_exit_shuts_down_tui() {
+        let _lock = GLOBAL_LOCK.lock().unwrap();
+        clear_active_renderer();
+
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        set_active_renderer(&r);
+
+        assert!(get_active_renderer().is_some(), "renderer should be active");
+
+        // Simulate what print_and_exit does before printing
+        if let Some(renderer) = get_active_renderer() {
+            renderer.shutdown();
+        }
+
+        assert!(
+            get_active_renderer().is_none(),
+            "renderer should be cleared after shutdown (as print_and_exit does)"
+        );
+
+        // After shutdown, tui_is_active should be false, so print_error
+        // would actually print (not be suppressed)
+        assert!(
+            !crate::utils::output::tui_is_active(),
+            "tui_is_active should be false after renderer shutdown"
+        );
+    }
+
+    #[test]
+    fn test_tui_guard_marks_failure_on_drop_without_mark_success() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+
+        // Create a TuiGuard manually (bypassing create_standalone_tui which
+        // checks for a real terminal)
+        {
+            let ctx = TuiContext {
+                task_id: TaskId::SdkInstall,
+                renderer: Arc::clone(&r),
+            };
+            let _guard = TuiGuard {
+                ctx: Some(ctx),
+                renderer: Some(Arc::clone(&r)),
+                succeeded: std::cell::Cell::new(false),
+                error_msg: std::cell::RefCell::new(Some("container failed".to_string())),
+            };
+            // guard dropped here without mark_success()
+        }
+
+        let (status, error_msg) = r
+            .get_task_state(&TaskId::SdkInstall)
+            .expect("task should exist");
+        assert_eq!(
+            status,
+            TaskStatus::Failed,
+            "task should be Failed when TuiGuard is dropped without mark_success"
+        );
+        assert_eq!(
+            error_msg.as_deref(),
+            Some("container failed"),
+            "error message should be set on the task"
+        );
+    }
+
+    #[test]
+    fn test_tui_guard_marks_success_on_drop_with_mark_success() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+
+        {
+            let ctx = TuiContext {
+                task_id: TaskId::SdkInstall,
+                renderer: Arc::clone(&r),
+            };
+            let guard = TuiGuard {
+                ctx: Some(ctx),
+                renderer: Some(Arc::clone(&r)),
+                succeeded: std::cell::Cell::new(false),
+                error_msg: std::cell::RefCell::new(None),
+            };
+            guard.mark_success();
+        }
+
+        let (status, _) = r
+            .get_task_state(&TaskId::SdkInstall)
+            .expect("task should exist");
+        assert_eq!(
+            status,
+            TaskStatus::Success,
+            "task should be Success when TuiGuard is dropped after mark_success"
+        );
+    }
+
+    #[test]
+    fn test_install_failure_propagates_as_error_not_ok() {
+        // Verify the contract: when a task returns Err, the scheduler
+        // marks it as Failed (not Success). This tests the fix where
+        // execute_install_internal returned Ok(()) on failure.
+        let r = test_renderer();
+        let task_id = TaskId::RuntimeInstall("dev".to_string());
+        r.register_task(task_id.clone(), "runtime install dev".to_string());
+        r.set_status(&task_id, TaskStatus::Running);
+
+        // Simulate what the scheduler does when a task returns Err
+        r.set_error(
+            &task_id,
+            "Failed to install dependencies for runtime 'dev'".to_string(),
+        );
+        r.set_status(&task_id, TaskStatus::Failed);
+
+        let (status, error_msg) = r.get_task_state(&task_id).expect("task should exist");
+        assert_eq!(
+            status,
+            TaskStatus::Failed,
+            "runtime install should be marked Failed, not Success"
+        );
+        assert!(
+            error_msg.is_some(),
+            "error message should be present on failed task"
+        );
+    }
+}

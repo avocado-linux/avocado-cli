@@ -18,7 +18,7 @@ pub enum OutputLevel {
 /// When a TUI renderer is active, info/success/warning/plain messages are
 /// suppressed — the TUI task status lines are the progress indicator.
 /// Errors always print (via `print_above`) so they're visible immediately.
-fn tui_is_active() -> bool {
+pub fn tui_is_active() -> bool {
     crate::utils::tui::get_active_renderer().is_some()
 }
 

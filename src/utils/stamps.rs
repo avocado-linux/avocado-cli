@@ -712,6 +712,14 @@ impl StampValidationError {
     pub fn print_and_exit(&self) -> ! {
         use crate::utils::output::{print_error, print_info, print_warning, OutputLevel};
 
+        // Shut down any active TUI renderer before printing.  When a TUI is
+        // active, print_error/print_info are suppressed and process::exit
+        // bypasses Drop guards, so without this the error is invisible and the
+        // terminal is left in a broken state.
+        if let Some(renderer) = crate::utils::tui::get_active_renderer() {
+            renderer.shutdown();
+        }
+
         print_error(
             &format!("{} - dependencies not satisfied", self.context),
             OutputLevel::Normal,

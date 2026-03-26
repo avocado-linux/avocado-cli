@@ -85,6 +85,26 @@ impl TaskRenderer {
         }
     }
 
+    /// Create a renderer in Passthrough mode for testing.
+    /// Output is captured via `test_output` instead of stderr.
+    #[cfg(test)]
+    pub(crate) fn new_test() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            mode: RenderMode::Passthrough,
+            rendered_lines: Arc::new(Mutex::new(0)),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            spin: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            created_at: std::time::Instant::now(),
+            sticky_peek: Arc::new(Mutex::new(None)),
+            above_queue: Arc::new(Mutex::new(Vec::new())),
+            loop_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finalized: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            test_output: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     /// Check if TUI mode should be used.
     fn should_use_tui() -> bool {
         std::io::stderr().is_terminal()
@@ -109,6 +129,22 @@ impl TaskRenderer {
     #[cfg(test)]
     pub fn get_test_output(&self) -> Vec<String> {
         self.test_output.lock().unwrap().clone()
+    }
+
+    /// Check if a task has been finalized (permanently emitted) in the TUI.
+    #[cfg(test)]
+    pub(crate) fn is_finalized(&self, task_id: &TaskId) -> bool {
+        self.finalized.lock().unwrap().contains(task_id)
+    }
+
+    /// Get the status and error message of a task (for testing).
+    #[cfg(test)]
+    pub(crate) fn get_task_state(&self, task_id: &TaskId) -> Option<(TaskStatus, Option<String>)> {
+        let state = self.state.lock().unwrap();
+        state
+            .iter()
+            .find(|t| t.id == *task_id)
+            .map(|t| (t.status, t.error_message.clone()))
     }
 
     /// Get the render mode.
@@ -393,8 +429,11 @@ impl TaskRenderer {
             }
         }
 
-        // Emit permanent lines for newly completed/failed/skipped tasks.
-        // These lines stay in scrollback and are never redrawn.
+        // Emit permanent lines for completed/failed/skipped tasks in
+        // registration order.  A task is only finalized once all tasks
+        // before it (in registration order) have already been finalized.
+        // This keeps the output ordered consistently regardless of which
+        // parallel tasks finish first.
         for task in state.iter() {
             if finalized.contains(&task.id) {
                 continue;
@@ -422,7 +461,11 @@ impl TaskRenderer {
                     let _ = writeln!(stderr, "\x1b[2m  - {} (skipped)\x1b[0m", task.label);
                     finalized.insert(task.id.clone());
                 }
-                _ => {} // Running/Pending/WaitingForInput — drawn in mutable region below
+                _ => {
+                    // This task is still running/pending — stop finalizing.
+                    // Later tasks cannot be emitted until this one completes.
+                    break;
+                }
             }
         }
 
@@ -447,7 +490,10 @@ impl TaskRenderer {
             }
         };
 
-        // Draw the mutable region: only running and pending tasks.
+        // Draw the mutable region: non-finalized tasks shown in place.
+        // Completed tasks that can't be finalized yet (a predecessor is still
+        // running) are rendered with their final status indicator so they
+        // appear to turn into checkmarks in place rather than disappearing.
         let mut lines_written = 0;
         let mut showed_peek = false;
 
@@ -504,7 +550,30 @@ impl TaskRenderer {
                     );
                     lines_written += 1;
                 }
-                _ => {} // Already finalized above
+                TaskStatus::Success => {
+                    // Completed but waiting for predecessors to finalize —
+                    // show checkmark in the mutable region (redrawn each tick).
+                    let elapsed = format_duration(task.elapsed());
+                    let _ = writeln!(
+                        stderr,
+                        "\x1b[92m  \u{2713}\x1b[0m \x1b[2m{} {}\x1b[0m",
+                        task.label, elapsed
+                    );
+                    lines_written += 1;
+                }
+                TaskStatus::Failed => {
+                    let elapsed = format_duration(task.elapsed());
+                    let _ = writeln!(
+                        stderr,
+                        "\x1b[91m  \u{2717}\x1b[0m {} {}",
+                        task.label, elapsed
+                    );
+                    lines_written += 1;
+                }
+                TaskStatus::Skipped => {
+                    let _ = writeln!(stderr, "\x1b[2m  - {} (skipped)\x1b[0m", task.label);
+                    lines_written += 1;
+                }
             }
         }
 
@@ -1051,5 +1120,68 @@ mod tests {
         // Should skip the noise and find the Installing line
         let peek = best_peek_line(&ring);
         assert_eq!(peek, Some("  Installing : kmod-31  45/240".to_string()));
+    }
+
+    #[test]
+    fn test_finalized_output_preserves_registration_order() {
+        // Tasks A, B, C registered in that order.
+        // B completes first, then A, then C.
+        // The render_tui finalization should only finalize tasks when all
+        // preceding tasks are already finalized (preserving registration order).
+        let r = test_renderer();
+        let id_a = TaskId::ExtBuild("a".to_string());
+        let id_b = TaskId::ExtBuild("b".to_string());
+        let id_c = TaskId::ExtBuild("c".to_string());
+
+        r.register_task(id_a.clone(), "ext build a".to_string());
+        r.register_task(id_b.clone(), "ext build b".to_string());
+        r.register_task(id_c.clone(), "ext build c".to_string());
+
+        // Directly set all tasks to Running
+        {
+            let mut state = r.state.lock().unwrap();
+            for task in state.iter_mut() {
+                task.status = TaskStatus::Running;
+                task.started_at = Some(std::time::Instant::now());
+            }
+        }
+
+        // B completes first
+        {
+            let mut state = r.state.lock().unwrap();
+            state.iter_mut().find(|t| t.id == id_b).unwrap().status = TaskStatus::Success;
+        }
+        r.render_tui();
+
+        // B should NOT be finalized yet because A (before it) is still running
+        assert!(
+            !r.is_finalized(&id_b),
+            "B should NOT be finalized while A is still running"
+        );
+
+        // A completes — both A and B should now be finalized
+        {
+            let mut state = r.state.lock().unwrap();
+            state.iter_mut().find(|t| t.id == id_a).unwrap().status = TaskStatus::Success;
+        }
+        r.render_tui();
+
+        assert!(r.is_finalized(&id_a), "A should be finalized");
+        assert!(
+            r.is_finalized(&id_b),
+            "B should be finalized (all predecessors done)"
+        );
+        assert!(!r.is_finalized(&id_c), "C should NOT be finalized yet");
+
+        // C completes last — all three should be finalized
+        {
+            let mut state = r.state.lock().unwrap();
+            state.iter_mut().find(|t| t.id == id_c).unwrap().status = TaskStatus::Success;
+        }
+        r.render_tui();
+
+        assert!(r.is_finalized(&id_a), "A finalized");
+        assert!(r.is_finalized(&id_b), "B finalized");
+        assert!(r.is_finalized(&id_c), "C finalized");
     }
 }
