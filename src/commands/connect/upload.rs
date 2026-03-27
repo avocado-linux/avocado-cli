@@ -445,7 +445,7 @@ impl ConnectUploadCommand {
 
         for info in &result.artifacts {
             print_info(
-                &format!("  {} ({})", info.image_id, format_bytes(info.size_bytes)),
+                &format!("  {} ({})", info.name, format_bytes(info.size_bytes)),
                 OutputLevel::Normal,
             );
         }
@@ -493,27 +493,21 @@ impl ConnectUploadCommand {
             artifacts: to_upload
                 .iter()
                 .map(|api_spec| {
-                    let container_path = discovery
+                    let disc_artifact = discovery
                         .artifacts
                         .iter()
                         .find(|a| a.image_id == api_spec.image_id)
-                        .map(|a| a.container_path.clone())
                         .with_context(|| {
                             format!(
                                 "API returned image_id '{}' not found in discovery",
                                 api_spec.image_id
                             )
                         })?;
-                    let size_bytes = discovery
-                        .artifacts
-                        .iter()
-                        .find(|a| a.image_id == api_spec.image_id)
-                        .map(|a| a.size_bytes)
-                        .unwrap_or(0);
                     Ok(ContainerUploadArtifact {
                         image_id: api_spec.image_id.clone(),
-                        container_path,
-                        size_bytes,
+                        name: disc_artifact.name.clone(),
+                        container_path: disc_artifact.container_path.clone(),
+                        size_bytes: disc_artifact.size_bytes,
                         parts: api_spec
                             .parts
                             .iter()
@@ -974,26 +968,30 @@ fi
 MANIFEST=$(cat "$MANIFEST_PATH")
 
 # Discover artifacts from manifest (extensions + optional os_bundle)
-IMAGE_IDS=$(echo "$MANIFEST" | jq -r '
-  [(.extensions // [])[] .image_id, (.os_bundle // empty) .image_id]
-  | .[]')
+# Output tab-separated: name\timage_id
+ARTIFACT_ENTRIES=$(echo "$MANIFEST" | jq -r '
+  [(.extensions // [])[] | {{name: .name, image_id: .image_id}}]
+  + (if .os_bundle then [{{name: "os-bundle", image_id: .os_bundle.image_id}}] else [] end)
+  | .[] | "\(.name)\t\(.image_id)"')
 
 ARTIFACTS="[]"
-for IMAGE_ID in $IMAGE_IDS; do
+while IFS=$'\t' read -r NAME IMAGE_ID; do
+  [ -z "$IMAGE_ID" ] && continue
   RAW_PATH="${{IMAGES}}/${{IMAGE_ID}}.raw"
   if [ ! -f "$RAW_PATH" ]; then
-    echo "Artifact not found: $RAW_PATH (image_id: $IMAGE_ID)" >&2
+    echo "Artifact not found: $RAW_PATH ($NAME, image_id: $IMAGE_ID)" >&2
     exit 1
   fi
   SIZE=$(stat -c%s "$RAW_PATH")
   SHA=$(sha256sum "$RAW_PATH" | awk '{{print $1}}')
   ARTIFACTS=$(echo "$ARTIFACTS" | jq \
     --arg id "$IMAGE_ID" \
+    --arg name "$NAME" \
     --arg sz "$SIZE" \
     --arg sha "$SHA" \
     --arg p "$RAW_PATH" \
-    '. + [{{"image_id":$id,"size_bytes":($sz|tonumber),"sha256":$sha,"container_path":$p}}]')
-done
+    '. + [{{"image_id":$id,"name":$name,"size_bytes":($sz|tonumber),"sha256":$sha,"container_path":$p}}]')
+done <<< "$ARTIFACT_ENTRIES"
 
 if [ "$(echo "$ARTIFACTS" | jq 'length')" -eq 0 ]; then
   echo "No artifacts found in manifest. Have you run 'avocado build'?" >&2
@@ -1039,9 +1037,6 @@ CONCURRENCY=$(echo "$SPEC" | jq -r '.concurrency')
 PART_SIZE=$(echo "$SPEC" | jq -r '.part_size')
 RESULT_DIR=$(mktemp -d)
 trap 'rm -rf "$RESULT_DIR"' EXIT
-RUNNING=0
-FAILURES=0
-DONE_PARTS=0
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1054,19 +1049,21 @@ format_bytes() {
   }'
 }
 
-show_progress() {
-  local done_bytes=$(( DONE_PARTS * PART_SIZE ))
-  [ "$done_bytes" -gt "$TOTAL_BYTES" ] && done_bytes=$TOTAL_BYTES
+# Show a per-artifact progress bar: name [####----] bytes/total (pct%)
+show_artifact_progress() {
+  local name=$1 done_parts=$2 total_parts=$3 file_size=$4
+  local done_bytes=$(( done_parts * PART_SIZE ))
+  [ "$done_bytes" -gt "$file_size" ] && done_bytes=$file_size
   local pct=0
-  [ "$TOTAL_BYTES" -gt 0 ] && pct=$(( done_bytes * 100 / TOTAL_BYTES ))
-  local bar_w=30
+  [ "$file_size" -gt 0 ] && pct=$(( done_bytes * 100 / file_size ))
+  local bar_w=25
   local filled=$(( pct * bar_w / 100 ))
   local empty=$(( bar_w - filled ))
   local bar_fill=$(printf '%*s' "$filled" '' | tr ' ' '#')
   local bar_empty=$(printf '%*s' "$empty" '' | tr ' ' '-')
   local done_str=$(format_bytes $done_bytes)
-  local total_str=$(format_bytes $TOTAL_BYTES)
-  printf "\r  [%s] %s / %s (%d%%)" "$bar_fill$bar_empty" "$done_str" "$total_str" "$pct" >&2
+  local total_str=$(format_bytes $file_size)
+  printf "\r  %s [%s] %s/%s" "$name" "$bar_fill$bar_empty" "$done_str" "$total_str" >&2
 }
 
 # ── Upload worker ────────────────────────────────────────────────────────────
@@ -1113,27 +1110,23 @@ upload_part() {
     '{"part_number":$pn,"etag":$et}' > "$result_file"
 }
 
-# ── Pre-calculate totals ────────────────────────────────────────────────────
+# ── Upload each artifact with per-artifact progress ─────────────────────────
 
 ARTIFACT_COUNT=$(echo "$SPEC" | jq '.artifacts | length')
-TOTAL_PARTS=0
-TOTAL_BYTES=0
-for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
-  FILE_SIZE=$(echo "$SPEC" | jq -r ".artifacts[$i].size_bytes")
-  PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
-  TOTAL_PARTS=$((TOTAL_PARTS + PART_COUNT))
-  TOTAL_BYTES=$((TOTAL_BYTES + FILE_SIZE))
-done
-
-show_progress
-
-# ── Dispatch all parts with flat concurrency pool ───────────────────────────
+RESULT='{"completed":[]}'
 
 for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
   IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
+  NAME=$(echo "$SPEC" | jq -r ".artifacts[$i].name")
   RAW_PATH=$(echo "$SPEC" | jq -r ".artifacts[$i].container_path")
   FILE_SIZE=$(echo "$SPEC" | jq -r ".artifacts[$i].size_bytes")
   PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
+
+  RUNNING=0
+  FAILURES=0
+  DONE_PARTS=0
+
+  show_artifact_progress "$NAME" 0 "$PART_COUNT" "$FILE_SIZE"
 
   for j in $(seq 0 $((PART_COUNT - 1))); do
     PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")
@@ -1146,33 +1139,26 @@ for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
       wait -n || FAILURES=$((FAILURES + 1))
       RUNNING=$((RUNNING - 1))
       DONE_PARTS=$((DONE_PARTS + 1))
-      show_progress
+      show_artifact_progress "$NAME" "$DONE_PARTS" "$PART_COUNT" "$FILE_SIZE"
     fi
   done
-done
 
-# Drain remaining background jobs
-while [ "$RUNNING" -gt 0 ]; do
-  wait -n || FAILURES=$((FAILURES + 1))
-  RUNNING=$((RUNNING - 1))
-  DONE_PARTS=$((DONE_PARTS + 1))
-  show_progress
-done
+  # Drain remaining jobs for this artifact
+  while [ "$RUNNING" -gt 0 ]; do
+    wait -n || FAILURES=$((FAILURES + 1))
+    RUNNING=$((RUNNING - 1))
+    DONE_PARTS=$((DONE_PARTS + 1))
+    show_artifact_progress "$NAME" "$DONE_PARTS" "$PART_COUNT" "$FILE_SIZE"
+  done
 
-# Final newline after progress bar
-printf "\n" >&2
+  printf "\n" >&2
 
-if [ "$FAILURES" -gt 0 ]; then
-  echo "ERROR: ${FAILURES} part upload(s) failed" >&2
-  exit 1
-fi
+  if [ "$FAILURES" -gt 0 ]; then
+    echo "ERROR: ${FAILURES} part(s) failed for ${NAME}" >&2
+    exit 1
+  fi
 
-# ── Collect results ─────────────────────────────────────────────────────────
-
-RESULT='{"completed":[]}'
-for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
-  IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
-  PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
+  # Collect parts for this artifact
   PARTS="[]"
   for j in $(seq 0 $((PART_COUNT - 1))); do
     PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")

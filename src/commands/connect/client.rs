@@ -486,6 +486,8 @@ pub struct ContainerDiscoveryResult {
 #[derive(Debug, Deserialize)]
 pub struct ContainerArtifactInfo {
     pub image_id: String,
+    /// Friendly display name (e.g. "avocado-ext-connect" or "os-bundle").
+    pub name: String,
     pub size_bytes: u64,
     pub sha256: String,
     /// Absolute path inside the container (e.g. /opt/_avocado/.../images/UUID.raw)
@@ -510,6 +512,7 @@ pub struct ContainerUploadSpec {
 #[derive(Debug, Serialize)]
 pub struct ContainerUploadArtifact {
     pub image_id: String,
+    pub name: String,
     pub container_path: String,
     pub size_bytes: u64,
     pub parts: Vec<ContainerUploadPart>,
