@@ -4,6 +4,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use thiserror::Error;
+
+/// Typed error for part uploads so callers can distinguish expiry from real failures.
+#[derive(Debug, Error)]
+pub enum UploadPartError {
+    #[error("presigned URL expired (HTTP {status}): {body}")]
+    UrlExpired { status: u16, body: String },
+    #[error("part upload failed (HTTP {status}): {body}")]
+    HttpError { status: u16, body: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Classify an S3 error response into the appropriate `UploadPartError` variant.
+///
+/// S3 expiry signals:
+/// - HTTP 400 + `<Code>ExpiredToken</Code>`: STS credentials used to sign the URL have expired.
+/// - HTTP 403 + `<Code>RequestExpired</Code>`: presigned URL's own `X-Amz-Expires` has passed.
+/// - HTTP 403 + `<Message>` containing "Request has expired": same condition, alternate wording.
+///
+/// All other responses (including unrelated 403s like `SignatureDoesNotMatch`) are `HttpError`.
+pub(crate) fn classify_upload_part_error(status: u16, body: &str) -> UploadPartError {
+    let is_expired = (status == 400 && body.contains("<Code>ExpiredToken</Code>"))
+        || (status == 403 && body.contains("<Code>RequestExpired</Code>"))
+        || (status == 403 && body.contains("Request has expired"));
+
+    if is_expired {
+        UploadPartError::UrlExpired {
+            status,
+            body: body.to_string(),
+        }
+    } else {
+        UploadPartError::HttpError {
+            status,
+            body: body.to_string(),
+        }
+    }
+}
 
 const CONFIG_FILE: &str = "credentials.json";
 
@@ -401,7 +439,7 @@ pub struct ArtifactUploadSpec {
     pub parts: Vec<PartSpec>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PartSpec {
     pub part_number: u64,
     pub upload_url: String,
@@ -962,27 +1000,37 @@ impl ConnectClient {
 
     /// Step 2: Upload a single part to a presigned S3 URL.
     /// Returns the ETag from the response headers.
-    pub async fn upload_part(&self, presigned_url: &str, body: Vec<u8>) -> Result<String> {
+    /// Returns `UploadPartError::UrlExpired` when S3 responds with an expired-token error
+    /// (HTTP 400 with `<Code>ExpiredToken</Code>` or HTTP 403), so callers can refresh
+    /// presigned URLs and retry rather than treating it as a hard failure.
+    pub async fn upload_part(
+        &self,
+        presigned_url: &str,
+        body: Vec<u8>,
+    ) -> Result<String, UploadPartError> {
         let res = self
             .http
             .put(presigned_url)
             .body(body)
             .send()
             .await
-            .context("Failed to upload part")?;
+            .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}")))?;
 
         let status = res.status();
         if !status.is_success() {
+            let status_u16 = status.as_u16();
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Part upload failed (HTTP {status}): {body}");
+            return Err(classify_upload_part_error(status_u16, &body));
         }
 
         let etag = res
             .headers()
             .get("etag")
-            .context("S3 response missing ETag header")?
+            .ok_or_else(|| {
+                UploadPartError::Other(anyhow::anyhow!("S3 response missing ETag header"))
+            })?
             .to_str()
-            .context("Invalid ETag header")?
+            .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Invalid ETag header: {e}")))?
             .to_string();
 
         Ok(etag)
@@ -1693,5 +1741,89 @@ mod tests {
 
         let wrapper: RotateWrapper = serde_json::from_value(json_val).unwrap();
         assert_eq!(wrapper.data.version, 4);
+    }
+
+    // --- classify_upload_part_error ---
+
+    #[test]
+    fn test_classify_400_expired_token_is_url_expired() {
+        let body = "<Error><Code>ExpiredToken</Code><Message>The provided token has expired.</Message></Error>";
+        let err = classify_upload_part_error(400, body);
+        assert!(
+            matches!(err, UploadPartError::UrlExpired { status: 400, .. }),
+            "expected UrlExpired, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_403_request_expired_code_is_url_expired() {
+        let body =
+            "<Error><Code>RequestExpired</Code><Message>Request has expired.</Message></Error>";
+        let err = classify_upload_part_error(403, body);
+        assert!(
+            matches!(err, UploadPartError::UrlExpired { status: 403, .. }),
+            "expected UrlExpired, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_403_request_has_expired_message_is_url_expired() {
+        let body = "<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>";
+        let err = classify_upload_part_error(403, body);
+        assert!(
+            matches!(err, UploadPartError::UrlExpired { status: 403, .. }),
+            "expected UrlExpired, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_403_unrelated_access_denied_is_http_error() {
+        let body = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+        let err = classify_upload_part_error(403, body);
+        assert!(
+            matches!(err, UploadPartError::HttpError { status: 403, .. }),
+            "expected HttpError, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_403_signature_mismatch_is_http_error() {
+        let body = "<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message></Error>";
+        let err = classify_upload_part_error(403, body);
+        assert!(
+            matches!(err, UploadPartError::HttpError { status: 403, .. }),
+            "expected HttpError, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_400_without_expired_token_is_http_error() {
+        let body = "<Error><Code>MalformedXML</Code><Message>Bad request.</Message></Error>";
+        let err = classify_upload_part_error(400, body);
+        assert!(
+            matches!(err, UploadPartError::HttpError { status: 400, .. }),
+            "expected HttpError, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_500_is_http_error() {
+        let body = "Internal Server Error";
+        let err = classify_upload_part_error(500, body);
+        assert!(
+            matches!(err, UploadPartError::HttpError { status: 500, .. }),
+            "expected HttpError, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_preserves_body() {
+        let body = "<Error><Code>ExpiredToken</Code></Error>";
+        let err = classify_upload_part_error(400, body);
+        if let UploadPartError::UrlExpired { body: b, .. } = err {
+            assert_eq!(b, body);
+        } else {
+            panic!("expected UrlExpired");
+        }
     }
 }
