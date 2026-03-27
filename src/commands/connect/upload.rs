@@ -1041,6 +1041,35 @@ RESULT_DIR=$(mktemp -d)
 trap 'rm -rf "$RESULT_DIR"' EXIT
 RUNNING=0
 FAILURES=0
+DONE_PARTS=0
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+format_bytes() {
+  echo "$1" | awk '{
+    if ($1 >= 1073741824) printf "%.1f GB", $1/1073741824
+    else if ($1 >= 1048576) printf "%.1f MB", $1/1048576
+    else if ($1 >= 1024) printf "%.1f KB", $1/1024
+    else printf "%d B", $1
+  }'
+}
+
+show_progress() {
+  local done_bytes=$(( DONE_PARTS * PART_SIZE ))
+  [ "$done_bytes" -gt "$TOTAL_BYTES" ] && done_bytes=$TOTAL_BYTES
+  local pct=0
+  [ "$TOTAL_BYTES" -gt 0 ] && pct=$(( done_bytes * 100 / TOTAL_BYTES ))
+  local bar_w=30
+  local filled=$(( pct * bar_w / 100 ))
+  local empty=$(( bar_w - filled ))
+  local bar_fill=$(printf '%*s' "$filled" '' | tr ' ' '#')
+  local bar_empty=$(printf '%*s' "$empty" '' | tr ' ' '-')
+  local done_str=$(format_bytes $done_bytes)
+  local total_str=$(format_bytes $TOTAL_BYTES)
+  printf "\r  [%s] %s / %s (%d%%)" "$bar_fill$bar_empty" "$done_str" "$total_str" "$pct" >&2
+}
+
+# ── Upload worker ────────────────────────────────────────────────────────────
 
 upload_part() {
   local image_id=$1 raw_path=$2 file_size=$3
@@ -1072,32 +1101,39 @@ upload_part() {
       break
     fi
     rm -f "$headers_file"
-    if [ "$attempt" -lt 3 ]; then
-      echo "  [${image_id:0:8}] part ${part_number} retry ${attempt}/3..." >&2
-      sleep $((attempt * 2))
-    fi
+    [ "$attempt" -lt 3 ] && sleep $((attempt * 2))
   done
 
   if [ -z "$etag" ]; then
-    echo "FAILED: part ${part_number} of ${image_id}" >&2
     echo '{"error":true}' > "$result_file"
     return 1
   fi
 
   jq -n --argjson pn "$part_number" --arg et "$etag" \
     '{"part_number":$pn,"etag":$et}' > "$result_file"
-  echo "  [${image_id:0:8}] part ${part_number} done" >&2
 }
 
-# Dispatch all (artifact, part) pairs with a flat concurrency pool
+# ── Pre-calculate totals ────────────────────────────────────────────────────
+
 ARTIFACT_COUNT=$(echo "$SPEC" | jq '.artifacts | length')
+TOTAL_PARTS=0
+TOTAL_BYTES=0
+for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+  FILE_SIZE=$(echo "$SPEC" | jq -r ".artifacts[$i].size_bytes")
+  PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
+  TOTAL_PARTS=$((TOTAL_PARTS + PART_COUNT))
+  TOTAL_BYTES=$((TOTAL_BYTES + FILE_SIZE))
+done
+
+show_progress
+
+# ── Dispatch all parts with flat concurrency pool ───────────────────────────
+
 for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
   IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
   RAW_PATH=$(echo "$SPEC" | jq -r ".artifacts[$i].container_path")
   FILE_SIZE=$(echo "$SPEC" | jq -r ".artifacts[$i].size_bytes")
   PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
-
-  echo "Uploading ${IMAGE_ID:0:8}... (${PART_COUNT} part(s))" >&2
 
   for j in $(seq 0 $((PART_COUNT - 1))); do
     PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")
@@ -1109,6 +1145,8 @@ for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
     if [ "$RUNNING" -ge "$CONCURRENCY" ]; then
       wait -n || FAILURES=$((FAILURES + 1))
       RUNNING=$((RUNNING - 1))
+      DONE_PARTS=$((DONE_PARTS + 1))
+      show_progress
     fi
   done
 done
@@ -1117,14 +1155,20 @@ done
 while [ "$RUNNING" -gt 0 ]; do
   wait -n || FAILURES=$((FAILURES + 1))
   RUNNING=$((RUNNING - 1))
+  DONE_PARTS=$((DONE_PARTS + 1))
+  show_progress
 done
+
+# Final newline after progress bar
+printf "\n" >&2
 
 if [ "$FAILURES" -gt 0 ]; then
   echo "ERROR: ${FAILURES} part upload(s) failed" >&2
   exit 1
 fi
 
-# Collect per-part results into final JSON grouped by artifact
+# ── Collect results ─────────────────────────────────────────────────────────
+
 RESULT='{"completed":[]}'
 for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
   IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
@@ -1140,7 +1184,6 @@ for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
 done
 
 echo "$RESULT" > /opt/src/.connect-upload-result.json
-echo "All uploads complete." >&2
 "#
     .to_string()
 }
