@@ -6,8 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, ContainerDiscoveryResult, ContainerUploadArtifact, ContainerUploadPart,
-    ContainerUploadResult, ContainerUploadSpec, CreateRuntimeRequest, RuntimeParams,
+    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, RuntimeParams,
     UploadPartError,
 };
 use crate::utils::config::{load_config, Config};
@@ -239,9 +238,9 @@ impl ConnectUploadCommand {
             return Ok(());
         }
 
-        // Phase C: Upload artifacts in parallel inside the container
+        // Phase C: Stream artifacts from Docker volume and upload with progress
         let completed_parts = self
-            .upload_in_container(project_config, &runtime.artifacts, &discovery)
+            .upload_in_container(project_config, connect, &runtime.artifacts, &discovery)
             .await?;
 
         // Phase D: Complete and finalize
@@ -471,12 +470,18 @@ impl ConnectUploadCommand {
 
     /// Run the upload script inside the container, uploading artifact parts in
     /// parallel directly from the Docker volume to S3 via presigned URLs.
+    /// Upload artifacts by streaming file bytes from the Docker volume through
+    /// lightweight `cat` containers, with real-time indicatif progress bars.
     async fn upload_in_container(
         &self,
         config: &Config,
+        connect: &ConnectClient,
         upload_specs: &[ArtifactUploadSpec],
         discovery: &ContainerDiscoveryResult,
     ) -> Result<Vec<BlobParts>> {
+        use crate::utils::volume::VolumeManager;
+        use std::process::Stdio;
+
         // Filter to artifacts that actually need uploading (non-empty parts)
         let to_upload: Vec<&ArtifactUploadSpec> = upload_specs
             .iter()
@@ -502,119 +507,141 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
-        // Build the upload spec JSON, mapping API upload specs to container paths
-        let spec = ContainerUploadSpec {
-            concurrency: 8,
-            part_size: PART_SIZE,
-            artifacts: to_upload
-                .iter()
-                .map(|api_spec| {
-                    let disc_artifact = discovery
-                        .artifacts
-                        .iter()
-                        .find(|a| a.image_id == api_spec.image_id)
-                        .with_context(|| {
-                            format!(
-                                "API returned image_id '{}' not found in discovery",
-                                api_spec.image_id
-                            )
-                        })?;
-                    Ok(ContainerUploadArtifact {
-                        image_id: api_spec.image_id.clone(),
-                        name: disc_artifact.name.clone(),
-                        container_path: disc_artifact.container_path.clone(),
-                        size_bytes: disc_artifact.size_bytes,
-                        parts: api_spec
-                            .parts
-                            .iter()
-                            .map(|p| ContainerUploadPart {
-                                part_number: p.part_number,
-                                upload_url: p.upload_url.clone(),
-                            })
-                            .collect(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        };
-
-        // Write spec to host-visible bind mount
-        let config_dir = PathBuf::from(&self.config_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let config_dir = if config_dir.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            config_dir
-        };
-        let spec_path = config_dir.join(".connect-upload-spec.json");
-        let result_path = config_dir.join(".connect-upload-result.json");
-
-        // Cleanup helper: remove temp files when done (on success or error)
-        struct Cleanup {
-            paths: Vec<PathBuf>,
-        }
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                for p in &self.paths {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-        let _cleanup = Cleanup {
-            paths: vec![spec_path.clone(), result_path.clone()],
-        };
-
-        let spec_json = serde_json::to_string(&spec).context("Failed to serialize upload spec")?;
-        std::fs::write(&spec_path, &spec_json)
-            .with_context(|| format!("Failed to write upload spec to {}", spec_path.display()))?;
-
-        // Run upload script inside container (streaming mode for progress)
-        let target = resolve_target_required(self.target.as_deref(), config)?;
+        // Resolve container infrastructure for streaming files
         let container_image = config
             .get_sdk_image()
-            .context("No SDK container image specified in configuration")?;
+            .context("No SDK container image specified in configuration")?
+            .to_string();
         let container = SdkContainer::from_config(&self.config_path, config)?;
+        let volume_manager = VolumeManager::new(container.container_tool.clone(), false);
+        let volume_state = volume_manager.get_or_create_volume(&container.cwd).await?;
 
-        let upload_script = generate_upload_script();
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.clone(),
-            command: upload_script,
-            source_environment: true,
-            no_bootstrap: true,
-            ..Default::default()
-        };
+        let multi = MultiProgress::new();
+        let mut all_completed = Vec::new();
 
-        let success = container
-            .run_in_container(run_config)
-            .await
-            .context("Failed to run upload script in container")?;
+        for spec in &to_upload {
+            let artifact = discovery
+                .artifacts
+                .iter()
+                .find(|a| a.image_id == spec.image_id)
+                .with_context(|| {
+                    format!(
+                        "API returned image_id '{}' not found in discovery",
+                        spec.image_id
+                    )
+                })?;
 
-        if !success {
-            anyhow::bail!("Upload failed inside container. Run with --verbose for details.");
+            let pb = multi.add(ProgressBar::new(artifact.size_bytes));
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "  {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
+                )?
+                .progress_chars("#>-"),
+            );
+            pb.set_message(artifact.name.clone());
+
+            // Convert container path (/opt/_avocado/...) to volume-relative path
+            let volume_path = artifact
+                .container_path
+                .strip_prefix("/opt/_avocado/")
+                .unwrap_or(&artifact.container_path);
+
+            // Spawn a lightweight container to stream the file via stdout
+            let mut cmd = tokio::process::Command::new(&container.container_tool);
+            cmd.args([
+                "run",
+                "--rm",
+                "-v",
+                &format!("{}:/data:ro", volume_state.volume_name),
+                &container_image,
+                "cat",
+                &format!("/data/{volume_path}"),
+            ]);
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::null());
+
+            let mut child = cmd
+                .spawn()
+                .context("Failed to spawn container for file streaming")?;
+            let mut stdout = child
+                .stdout
+                .take()
+                .context("Failed to capture container stdout")?;
+
+            let mut completed_parts = Vec::new();
+
+            for part in &spec.parts {
+                let offset = (part.part_number - 1) * PART_SIZE;
+                let remaining = artifact.size_bytes.saturating_sub(offset);
+                let chunk_size = std::cmp::min(remaining, PART_SIZE) as usize;
+
+                // Read chunk from the container's stdout pipe
+                let mut buf = vec![0u8; chunk_size];
+                stdout.read_exact(&mut buf).await.with_context(|| {
+                    format!(
+                        "Failed to read part {} of '{}' from container",
+                        part.part_number, artifact.name
+                    )
+                })?;
+
+                // Upload with retry + real-time progress tracking
+                let mut etag = None;
+                for attempt in 0..3u32 {
+                    // Reset progress for retries (rewind the bytes we're about to re-send)
+                    if attempt > 0 {
+                        pb.set_position(pb.position().saturating_sub(chunk_size as u64));
+                    }
+                    match connect
+                        .upload_part_with_progress(&part.upload_url, buf.clone(), Some(&pb))
+                        .await
+                    {
+                        Ok(e) => {
+                            etag = Some(e);
+                            break;
+                        }
+                        Err(_) if attempt < 2 => {
+                            let delay = std::time::Duration::from_millis(
+                                500 * (u64::from(attempt) + 1),
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                        Err(e) => {
+                            pb.abandon_with_message(format!("{} (failed)", artifact.name));
+                            anyhow::bail!(
+                                "Failed to upload part {} of '{}' after 3 attempts: {}",
+                                part.part_number,
+                                artifact.name,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                completed_parts.push(CompletedPart {
+                    part_number: part.part_number,
+                    etag: etag.unwrap(),
+                });
+            }
+
+            pb.finish_with_message(format!("{} (done)", artifact.name));
+
+            // Ensure container exits cleanly
+            let status = child.wait().await?;
+            if !status.success() {
+                anyhow::bail!(
+                    "Container streaming failed for '{}' (exit code {:?})",
+                    artifact.name,
+                    status.code()
+                );
+            }
+
+            all_completed.push(BlobParts {
+                image_id: spec.image_id.clone(),
+                parts: completed_parts,
+            });
         }
 
-        // Read and parse the result JSON
-        let result_json = std::fs::read_to_string(&result_path).with_context(|| {
-            format!(
-                "Upload script succeeded but result file not found at {}",
-                result_path.display()
-            )
-        })?;
-
-        let result: ContainerUploadResult =
-            serde_json::from_str(&result_json).context("Failed to parse upload result JSON")?;
-
-        // Convert to BlobParts for the complete API
-        Ok(result
-            .completed
-            .into_iter()
-            .map(|a| BlobParts {
-                image_id: a.image_id,
-                parts: a.parts,
-            })
-            .collect())
+        Ok(all_completed)
     }
 }
 
@@ -1037,153 +1064,6 @@ jq -n \
 "#,
         runtime = runtime,
     )
-}
-
-/// Generate a bash script that uploads artifact parts in parallel from inside
-/// the container using curl, reading the upload spec from a JSON file.
-fn generate_upload_script() -> String {
-    r#"set -euo pipefail
-
-SPEC=$(cat /opt/src/.connect-upload-spec.json)
-CONCURRENCY=$(echo "$SPEC" | jq -r '.concurrency')
-PART_SIZE=$(echo "$SPEC" | jq -r '.part_size')
-RESULT_DIR=$(mktemp -d)
-trap 'rm -rf "$RESULT_DIR"' EXIT
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-format_bytes() {
-  echo "$1" | awk '{
-    if ($1 >= 1073741824) printf "%.1f GB", $1/1073741824
-    else if ($1 >= 1048576) printf "%.1f MB", $1/1048576
-    else if ($1 >= 1024) printf "%.1f KB", $1/1024
-    else printf "%d B", $1
-  }'
-}
-
-# Show a per-artifact progress bar: name [####----] bytes/total (pct%)
-show_artifact_progress() {
-  local name=$1 done_parts=$2 total_parts=$3 file_size=$4
-  local done_bytes=$(( done_parts * PART_SIZE ))
-  [ "$done_bytes" -gt "$file_size" ] && done_bytes=$file_size
-  local pct=0
-  [ "$file_size" -gt 0 ] && pct=$(( done_bytes * 100 / file_size ))
-  local bar_w=25
-  local filled=$(( pct * bar_w / 100 ))
-  local empty=$(( bar_w - filled ))
-  local bar_fill=$(printf '%*s' "$filled" '' | tr ' ' '#')
-  local bar_empty=$(printf '%*s' "$empty" '' | tr ' ' '-')
-  local done_str=$(format_bytes $done_bytes)
-  local total_str=$(format_bytes $file_size)
-  printf "\r  %s [%s] %s/%s" "$name" "$bar_fill$bar_empty" "$done_str" "$total_str" >&2
-}
-
-# ── Upload worker ────────────────────────────────────────────────────────────
-
-upload_part() {
-  local image_id=$1 raw_path=$2 file_size=$3
-  local part_number=$4 upload_url=$5
-  local result_file="${RESULT_DIR}/${image_id}_${part_number}.json"
-
-  local offset=$(( (part_number - 1) * PART_SIZE ))
-  local remaining=$(( file_size - offset ))
-  local chunk=$(( remaining < PART_SIZE ? remaining : PART_SIZE ))
-
-  local etag="" attempt
-  for attempt in 1 2 3; do
-    local headers_file
-    headers_file=$(mktemp)
-    local http_code
-    http_code=$(dd if="$raw_path" bs=4096 skip=$((offset / 4096)) \
-                   count=$(( (chunk + 4095) / 4096 )) 2>/dev/null \
-      | head -c "$chunk" \
-      | curl -s -X PUT "$upload_url" \
-          -H "Content-Type: application/octet-stream" \
-          --data-binary @- \
-          -D "$headers_file" \
-          -o /dev/null \
-          -w '%{http_code}')
-
-    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-      etag=$(grep -i '^etag:' "$headers_file" | tr -d '\r' | awk '{print $2}')
-      rm -f "$headers_file"
-      break
-    fi
-    rm -f "$headers_file"
-    [ "$attempt" -lt 3 ] && sleep $((attempt * 2))
-  done
-
-  if [ -z "$etag" ]; then
-    echo '{"error":true}' > "$result_file"
-    return 1
-  fi
-
-  jq -n --argjson pn "$part_number" --arg et "$etag" \
-    '{"part_number":$pn,"etag":$et}' > "$result_file"
-}
-
-# ── Upload each artifact with per-artifact progress ─────────────────────────
-
-ARTIFACT_COUNT=$(echo "$SPEC" | jq '.artifacts | length')
-RESULT='{"completed":[]}'
-
-for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
-  IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
-  NAME=$(echo "$SPEC" | jq -r ".artifacts[$i].name")
-  RAW_PATH=$(echo "$SPEC" | jq -r ".artifacts[$i].container_path")
-  FILE_SIZE=$(echo "$SPEC" | jq -r ".artifacts[$i].size_bytes")
-  PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
-
-  RUNNING=0
-  FAILURES=0
-  DONE_PARTS=0
-
-  show_artifact_progress "$NAME" 0 "$PART_COUNT" "$FILE_SIZE"
-
-  for j in $(seq 0 $((PART_COUNT - 1))); do
-    PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")
-    URL=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].upload_url")
-
-    upload_part "$IMAGE_ID" "$RAW_PATH" "$FILE_SIZE" "$PART_NUM" "$URL" &
-    RUNNING=$((RUNNING + 1))
-
-    if [ "$RUNNING" -ge "$CONCURRENCY" ]; then
-      wait -n || FAILURES=$((FAILURES + 1))
-      RUNNING=$((RUNNING - 1))
-      DONE_PARTS=$((DONE_PARTS + 1))
-      show_artifact_progress "$NAME" "$DONE_PARTS" "$PART_COUNT" "$FILE_SIZE"
-    fi
-  done
-
-  # Drain remaining jobs for this artifact
-  while [ "$RUNNING" -gt 0 ]; do
-    wait -n || FAILURES=$((FAILURES + 1))
-    RUNNING=$((RUNNING - 1))
-    DONE_PARTS=$((DONE_PARTS + 1))
-    show_artifact_progress "$NAME" "$DONE_PARTS" "$PART_COUNT" "$FILE_SIZE"
-  done
-
-  printf "\n" >&2
-
-  if [ "$FAILURES" -gt 0 ]; then
-    echo "ERROR: ${FAILURES} part(s) failed for ${NAME}" >&2
-    exit 1
-  fi
-
-  # Collect parts for this artifact
-  PARTS="[]"
-  for j in $(seq 0 $((PART_COUNT - 1))); do
-    PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")
-    PART_JSON=$(cat "${RESULT_DIR}/${IMAGE_ID}_${PART_NUM}.json")
-    PARTS=$(echo "$PARTS" | jq --argjson p "$PART_JSON" '. + [$p]')
-  done
-  RESULT=$(echo "$RESULT" | jq --arg id "$IMAGE_ID" --argjson p "$PARTS" \
-    '.completed += [{"image_id":$id,"parts":$p}]')
-done
-
-echo "$RESULT" > /opt/src/.connect-upload-result.json
-"#
-    .to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -501,41 +501,6 @@ pub struct ContainerDelegationInfo {
     pub content_keyid: String,
 }
 
-/// Phase C input: upload spec written by host for the container upload script.
-#[derive(Debug, Serialize)]
-pub struct ContainerUploadSpec {
-    pub concurrency: u32,
-    pub part_size: u64,
-    pub artifacts: Vec<ContainerUploadArtifact>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ContainerUploadArtifact {
-    pub image_id: String,
-    pub name: String,
-    pub container_path: String,
-    pub size_bytes: u64,
-    pub parts: Vec<ContainerUploadPart>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ContainerUploadPart {
-    pub part_number: u64,
-    pub upload_url: String,
-}
-
-/// Phase C output: upload results written by the container upload script.
-#[derive(Debug, Deserialize)]
-pub struct ContainerUploadResult {
-    pub completed: Vec<ContainerCompletedArtifact>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ContainerCompletedArtifact {
-    pub image_id: String,
-    pub parts: Vec<CompletedPart>,
-}
-
 // ---------------------------------------------------------------------------
 // Config file I/O
 // ---------------------------------------------------------------------------
@@ -1073,13 +1038,53 @@ impl ConnectClient {
         presigned_url: &str,
         body: Vec<u8>,
     ) -> Result<String, UploadPartError> {
-        let res = self
-            .http
-            .put(presigned_url)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}")))?;
+        self.upload_part_with_progress(presigned_url, body, None).await
+    }
+
+    /// Upload a single part with optional real-time progress tracking.
+    /// The progress bar is incremented as bytes are sent.
+    pub async fn upload_part_with_progress(
+        &self,
+        presigned_url: &str,
+        body: Vec<u8>,
+        progress: Option<&indicatif::ProgressBar>,
+    ) -> Result<String, UploadPartError> {
+        let body_len = body.len();
+
+        let res = if let Some(pb) = progress {
+            // Wrap body in a streaming reader that reports progress
+            let pb = pb.clone();
+            let stream = futures_util::stream::unfold(
+                (std::io::Cursor::new(body), pb, 0usize),
+                |(mut cursor, pb, sent)| async move {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; 64 * 1024]; // 64KB chunks for smooth progress
+                    match cursor.read(&mut buf) {
+                        Ok(0) => None,
+                        Ok(n) => {
+                            buf.truncate(n);
+                            pb.inc(n as u64);
+                            Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), (cursor, pb, sent + n)))
+                        }
+                        Err(e) => Some((Err(e), (cursor, pb, sent))),
+                    }
+                },
+            );
+            self.http
+                .put(presigned_url)
+                .header("content-length", body_len)
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await
+                .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}")))?
+        } else {
+            self.http
+                .put(presigned_url)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}")))?
+        };
 
         let status = res.status();
         if !status.is_success() {
