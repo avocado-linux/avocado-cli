@@ -387,7 +387,7 @@ pub struct RuntimeParams {
     pub content_keyid: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ArtifactParam {
     pub image_id: String,
     pub size_bytes: u64,
@@ -405,7 +405,7 @@ pub struct BlobParts {
     pub parts: Vec<CompletedPart>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CompletedPart {
     pub part_number: u64,
     pub etag: String,
@@ -469,6 +469,68 @@ struct UploadUrlsResponse {
 struct UploadUrlsData {
     image_id: String,
     parts: Vec<PartSpec>,
+}
+
+// ---------------------------------------------------------------------------
+// Container interchange types (for in-container upload flow)
+// ---------------------------------------------------------------------------
+
+/// Phase A output: metadata collected inside the container via discovery script.
+#[derive(Debug, Deserialize)]
+pub struct ContainerDiscoveryResult {
+    pub manifest: serde_json::Value,
+    pub artifacts: Vec<ContainerArtifactInfo>,
+    pub delegation: Option<ContainerDelegationInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContainerArtifactInfo {
+    pub image_id: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    /// Absolute path inside the container (e.g. /opt/_avocado/.../images/UUID.raw)
+    pub container_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContainerDelegationInfo {
+    pub delegated_targets_json: String,
+    pub content_key_hex: String,
+    pub content_keyid: String,
+}
+
+/// Phase C input: upload spec written by host for the container upload script.
+#[derive(Debug, Serialize)]
+pub struct ContainerUploadSpec {
+    pub concurrency: u32,
+    pub part_size: u64,
+    pub artifacts: Vec<ContainerUploadArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContainerUploadArtifact {
+    pub image_id: String,
+    pub container_path: String,
+    pub size_bytes: u64,
+    pub parts: Vec<ContainerUploadPart>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContainerUploadPart {
+    pub part_number: u64,
+    pub upload_url: String,
+}
+
+/// Phase C output: upload results written by the container upload script.
+#[derive(Debug, Deserialize)]
+pub struct ContainerUploadResult {
+    pub completed: Vec<ContainerCompletedArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContainerCompletedArtifact {
+    pub image_id: String,
+    pub parts: Vec<CompletedPart>,
 }
 
 // ---------------------------------------------------------------------------

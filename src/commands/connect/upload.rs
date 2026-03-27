@@ -6,10 +6,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, CreateRuntimeRequest, RuntimeParams, UploadPartError,
+    ConnectClient, ContainerDiscoveryResult, ContainerUploadArtifact, ContainerUploadPart,
+    ContainerUploadResult, ContainerUploadSpec, CreateRuntimeRequest,
+    RuntimeParams, UploadPartError,
 };
 use crate::utils::config::{load_config, Config};
-use crate::utils::container::SdkContainer;
+use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
@@ -71,21 +73,24 @@ impl ConnectUploadCommand {
         let project_config =
             load_config(&self.config_path).context("Failed to load avocado.yaml")?;
 
-        // 3. When exporting from Docker, validate that the runtime has been built
-        //    before attempting anything. Skip when --file is provided (user manages state).
-        if self.file.is_none() {
-            let target = resolve_target_required(self.target.as_deref(), &project_config)?;
-            let container_image = project_config
-                .get_sdk_image()
-                .context("No SDK container image specified in configuration")?;
-            let container = SdkContainer::from_config(&self.config_path, &project_config)?;
-            check_prerequisites(self, &target, &container, container_image).await?;
+        if self.file.is_some() {
+            // --file path: host-side artifacts (unchanged legacy flow)
+            return self.execute_host_path(&connect, &project_config).await;
         }
 
-        // 3. Get artifacts on disk (export from Docker or use --file)
-        let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir(&project_config).await?;
+        // In-container path: zero-copy discovery + parallel upload
+        self.execute_container_path(&connect, &project_config).await
+    }
 
-        // 4. Read manifest and derive version + build_id
+    /// Upload from host-side artifacts (--file flag). This is the legacy flow
+    /// used when the user provides a pre-built tarball or directory.
+    async fn execute_host_path(
+        &self,
+        connect: &ConnectClient,
+        project_config: &Config,
+    ) -> Result<()> {
+        let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir().await?;
+
         let manifest = read_manifest(&artifacts_dir)?;
         let version = self
             .version
@@ -96,21 +101,16 @@ impl ConnectUploadCommand {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        // 5. Discover artifacts from manifest (no hashing needed — image_id is the dedup key)
         print_info("Discovering artifacts...", OutputLevel::Normal);
         let artifact_infos = discover_artifacts(&artifacts_dir, &manifest)?;
 
         for info in &artifact_infos {
             print_info(
-                &format!("  {} ({})", info.image_id, format_bytes(info.size_bytes),),
+                &format!("  {} ({})", info.image_id, format_bytes(info.size_bytes)),
                 OutputLevel::Normal,
             );
         }
 
-        // 6. Read delegation info from build volume.
-        // Only send delegation fields if the runtime has an explicit content_key configured
-        // (Level 1+). At Level 0 (server-managed), the server handles targets signing and
-        // expects these fields to be absent.
         let has_content_key = project_config
             .get_runtime_content_key_name(&self.runtime)
             .is_some();
@@ -120,87 +120,33 @@ impl ConnectUploadCommand {
                 .context("No TUF delegation files found in build volume. A content_key is configured — run 'avocado build' first.")?;
             Some(d)
         } else {
-            // Level 0: delegation files may exist (for sideload) but the server doesn't need them
             None
         };
 
-        // 7. Create runtime (Step 1)
-        print_info(
-            &format!("Creating runtime {version}..."),
-            OutputLevel::Normal,
-        );
-        let create_req = CreateRuntimeRequest {
-            runtime: RuntimeParams {
-                version: version.clone(),
-                build_id,
-                description: self.description.clone(),
-                manifest: Some(manifest),
-                artifacts: artifact_infos
-                    .iter()
-                    .map(|a| ArtifactParam {
-                        image_id: a.image_id.clone(),
-                        size_bytes: a.size_bytes,
-                        sha256: a.sha256.clone(),
-                    })
-                    .collect(),
-                delegated_targets_json: delegation
-                    .as_ref()
-                    .map(|d| d.delegated_targets_json.clone()),
-                content_key_hex: delegation.as_ref().map(|d| d.content_key_hex.clone()),
-                content_keyid: delegation.as_ref().map(|d| d.content_keyid.clone()),
-            },
-        };
-        let runtime = connect
-            .create_runtime(&self.org, &self.project, &create_req)
-            .await?;
-
-        // 7. If runtime is already draft (full dedup or idempotent return), skip upload
-        if runtime.status == "draft" {
-            print_success(
-                &format!(
-                    "Runtime {} already up to date (status: draft, {} artifact(s))",
-                    runtime.version,
-                    artifact_infos.len()
-                ),
-                OutputLevel::Normal,
-            );
-
-            if self.publish {
-                print_info("Publishing runtime...", OutputLevel::Normal);
-                let published = connect
-                    .publish_runtime(&self.org, &self.project, &runtime.id)
-                    .await?;
-                print_success(
-                    &format!(
-                        "Runtime {} published (status: {})",
-                        published.version, published.status
-                    ),
-                    OutputLevel::Normal,
-                );
-            }
-
-            if let Some(ref cohort_id) = self.deploy_cohort {
-                super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
-                    client: &connect,
-                    org: &self.org,
-                    project: &self.project,
-                    runtime_id: &runtime.id,
-                    runtime_version: &runtime.version,
-                    cohort_id,
-                    name: self.deploy_name.as_deref(),
-                    description: self.description.as_deref(),
-                    tags: &self.deploy_tags,
-                    activate: self.deploy_activate,
+        let (runtime, num_artifacts) = self.create_runtime_api(
+            connect,
+            version,
+            build_id,
+            &manifest,
+            &artifact_infos
+                .iter()
+                .map(|a| ArtifactParam {
+                    image_id: a.image_id.clone(),
+                    size_bytes: a.size_bytes,
+                    sha256: a.sha256.clone(),
                 })
-                .await?;
-            }
+                .collect::<Vec<_>>(),
+            delegation.as_ref().map(|d| (&d.delegated_targets_json, &d.content_key_hex, &d.content_keyid)),
+        ).await?;
 
+        if runtime.status == "draft" {
+            self.handle_draft_status(connect, &runtime, num_artifacts).await?;
             return Ok(());
         }
 
-        // 8. Upload artifacts (Step 2)
+        // Upload artifacts from host
         let completed_parts = upload_artifacts(
-            &connect,
+            connect,
             &self.org,
             &self.project,
             &runtime.id,
@@ -209,7 +155,172 @@ impl ConnectUploadCommand {
         )
         .await?;
 
-        // 9. Complete runtime (Step 3)
+        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts).await
+    }
+
+    /// Upload directly from the Docker volume with zero-copy discovery and
+    /// parallel in-container uploads.
+    async fn execute_container_path(
+        &self,
+        connect: &ConnectClient,
+        project_config: &Config,
+    ) -> Result<()> {
+        // Validate prerequisites (runtime has been built)
+        let target = resolve_target_required(self.target.as_deref(), project_config)?;
+        let container_image = project_config
+            .get_sdk_image()
+            .context("No SDK container image specified in configuration")?;
+        let container = SdkContainer::from_config(&self.config_path, project_config)?;
+        check_prerequisites(self, &target, &container, container_image).await?;
+
+        // Phase A: Discover artifacts inside the container
+        let discovery = self.discover_in_container(project_config).await?;
+
+        let manifest = &discovery.manifest;
+        let version = self
+            .version
+            .clone()
+            .unwrap_or_else(|| format_version_from_manifest(manifest));
+        let build_id = manifest
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let has_content_key = project_config
+            .get_runtime_content_key_name(&self.runtime)
+            .is_some();
+
+        // Use delegation from container discovery if content_key is configured
+        let delegation_refs = if has_content_key {
+            let d = discovery.delegation.as_ref()
+                .context("No TUF delegation files found in build volume. A content_key is configured — run 'avocado build' first.")?;
+            Some((&d.delegated_targets_json, &d.content_key_hex, &d.content_keyid))
+        } else {
+            None
+        };
+
+        // Phase B: Create runtime via API
+        let (runtime, num_artifacts) = self.create_runtime_api(
+            connect,
+            version,
+            build_id,
+            manifest,
+            &discovery
+                .artifacts
+                .iter()
+                .map(|a| ArtifactParam {
+                    image_id: a.image_id.clone(),
+                    size_bytes: a.size_bytes,
+                    sha256: a.sha256.clone(),
+                })
+                .collect::<Vec<_>>(),
+            delegation_refs,
+        ).await?;
+
+        if runtime.status == "draft" {
+            self.handle_draft_status(connect, &runtime, num_artifacts).await?;
+            return Ok(());
+        }
+
+        // Phase C: Upload artifacts in parallel inside the container
+        let completed_parts = self
+            .upload_in_container(project_config, &runtime.artifacts, &discovery)
+            .await?;
+
+        // Phase D: Complete and finalize
+        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts).await
+    }
+
+    /// Create a runtime via the Connect API. Returns the runtime data and
+    /// artifact count.
+    async fn create_runtime_api(
+        &self,
+        connect: &ConnectClient,
+        version: String,
+        build_id: Option<String>,
+        manifest: &serde_json::Value,
+        artifacts: &[ArtifactParam],
+        delegation: Option<(&String, &String, &String)>,
+    ) -> Result<(client::RuntimeCreateData, usize)> {
+        print_info(
+            &format!("Creating runtime {version}..."),
+            OutputLevel::Normal,
+        );
+        let num_artifacts = artifacts.len();
+        let create_req = CreateRuntimeRequest {
+            runtime: RuntimeParams {
+                version,
+                build_id,
+                description: self.description.clone(),
+                manifest: Some(manifest.clone()),
+                artifacts: artifacts.to_vec(),
+                delegated_targets_json: delegation.map(|(d, _, _)| d.clone()),
+                content_key_hex: delegation.map(|(_, k, _)| k.clone()),
+                content_keyid: delegation.map(|(_, _, kid)| kid.clone()),
+            },
+        };
+        let runtime = connect
+            .create_runtime(&self.org, &self.project, &create_req)
+            .await?;
+        Ok((runtime, num_artifacts))
+    }
+
+    /// Handle the case where the runtime is already in draft status (full dedup).
+    async fn handle_draft_status(
+        &self,
+        connect: &ConnectClient,
+        runtime: &client::RuntimeCreateData,
+        num_artifacts: usize,
+    ) -> Result<()> {
+        print_success(
+            &format!(
+                "Runtime {} already up to date (status: draft, {} artifact(s))",
+                runtime.version, num_artifacts
+            ),
+            OutputLevel::Normal,
+        );
+
+        if self.publish {
+            print_info("Publishing runtime...", OutputLevel::Normal);
+            let published = connect
+                .publish_runtime(&self.org, &self.project, &runtime.id)
+                .await?;
+            print_success(
+                &format!(
+                    "Runtime {} published (status: {})",
+                    published.version, published.status
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        if let Some(ref cohort_id) = self.deploy_cohort {
+            super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
+                client: connect,
+                org: &self.org,
+                project: &self.project,
+                runtime_id: &runtime.id,
+                runtime_version: &runtime.version,
+                cohort_id,
+                name: self.deploy_name.as_deref(),
+                description: self.description.as_deref(),
+                tags: &self.deploy_tags,
+                activate: self.deploy_activate,
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Complete the upload and optionally publish/deploy.
+    async fn complete_and_finalize(
+        &self,
+        connect: &ConnectClient,
+        runtime: &client::RuntimeCreateData,
+        completed_parts: Vec<BlobParts>,
+        num_artifacts: usize,
+    ) -> Result<()> {
         print_info("Completing upload...", OutputLevel::Normal);
         let result = connect
             .complete_runtime(
@@ -225,14 +336,11 @@ impl ConnectUploadCommand {
         print_success(
             &format!(
                 "Runtime {} uploaded (status: {}, {} artifact(s))",
-                result.version,
-                result.status,
-                artifact_infos.len()
+                result.version, result.status, num_artifacts
             ),
             OutputLevel::Normal,
         );
 
-        // 10. Publish if --publish was specified
         if self.publish {
             print_info("Publishing runtime...", OutputLevel::Normal);
             let published = connect
@@ -247,10 +355,9 @@ impl ConnectUploadCommand {
             );
         }
 
-        // 11. Deploy after upload if --deploy-cohort was specified
         if let Some(ref cohort_id) = self.deploy_cohort {
             super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
-                client: &connect,
+                client: connect,
                 org: &self.org,
                 project: &self.project,
                 runtime_id: &runtime.id,
@@ -268,124 +375,232 @@ impl ConnectUploadCommand {
     }
 
     /// Get artifact files on disk, either from --file or by exporting from Docker.
+    /// Resolve --file to a directory of artifacts (used by the host path only).
     async fn get_artifacts_dir(
         &self,
-        config: &Config,
     ) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
-        if let Some(ref file_or_dir) = self.file {
-            let path = PathBuf::from(file_or_dir);
-            if path.is_dir() {
-                return Ok((path, None));
-            }
-            if path.is_file() {
-                let tmp = tempfile::tempdir()?;
-                extract_tarball(&path, tmp.path())?;
-                return Ok((tmp.path().to_path_buf(), Some(tmp)));
-            }
-            anyhow::bail!("Path not found: {}", path.display());
+        let file_or_dir = self.file.as_ref()
+            .context("get_artifacts_dir called without --file")?;
+        let path = PathBuf::from(file_or_dir);
+        if path.is_dir() {
+            return Ok((path, None));
         }
-
-        // Export tarball from Docker volume, then extract
-        print_info(
-            "Exporting runtime artifacts from build volume...",
-            OutputLevel::Normal,
-        );
-        let tarball = self.export_tarball(config).await?;
-        let tmp = tempfile::tempdir()?;
-        extract_tarball(&tarball, tmp.path())?;
-        let _ = std::fs::remove_file(&tarball);
-        Ok((tmp.path().to_path_buf(), Some(tmp)))
+        if path.is_file() {
+            let tmp = tempfile::tempdir()?;
+            extract_tarball(&path, tmp.path())?;
+            return Ok((tmp.path().to_path_buf(), Some(tmp)));
+        }
+        anyhow::bail!("Path not found: {}", path.display());
     }
 
-    /// Export the runtime tarball from the Docker volume using `avocado sdk run`.
-    async fn export_tarball(&self, config: &Config) -> Result<PathBuf> {
-        let output_file = ".connect-upload.tar.gz";
-        let parent = PathBuf::from(&self.config_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let tarball_path = if parent.as_os_str().is_empty() {
-            PathBuf::from(output_file)
-        } else {
-            parent.join(output_file)
-        };
-
-        // Clean up any stale file
-        let _ = std::fs::remove_file(&tarball_path);
-
-        // Resolve target
+    /// Run a discovery script inside the container to read the manifest, compute
+    /// artifact hashes, and collect TUF delegation info — all without copying
+    /// files out of the Docker volume.
+    async fn discover_in_container(
+        &self,
+        config: &Config,
+    ) -> Result<ContainerDiscoveryResult> {
         let target = resolve_target_required(self.target.as_deref(), config)?;
+        let container_image = config
+            .get_sdk_image()
+            .context("No SDK container image specified in configuration")?;
+        let container = SdkContainer::from_config(&self.config_path, config)?;
 
-        // Write inner script to cwd (mounted as /opt/src in container)
-        let config_parent = PathBuf::from(&self.config_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let config_dir = if config_parent.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            config_parent
-        };
-
-        let inner_script = format!(
-            r#"set -euo pipefail
-STAGING="${{AVOCADO_PREFIX}}/runtimes/{runtime}/var-staging"
-tar czf /opt/src/{output} -C "${{STAGING}}" lib/avocado
-"#,
-            runtime = self.runtime,
-            output = output_file,
+        print_info(
+            "Discovering artifacts in build volume...",
+            OutputLevel::Normal,
         );
 
-        let script_path = config_dir.join(".connect-upload-inner.sh");
-        std::fs::write(&script_path, &inner_script)?;
+        let script = generate_discovery_script(&self.runtime);
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: script,
+            source_environment: true,
+            no_bootstrap: true,
+            ..Default::default()
+        };
 
-        // Run via avocado sdk run (use argv[0] so avocado-dev works in dev)
-        let exe = std::env::args()
-            .next()
-            .unwrap_or_else(|| "avocado".to_string());
-        let status = tokio::process::Command::new(&exe)
-            .args([
-                "--target",
-                &target,
-                "sdk",
-                "run",
-                "--",
-                "bash",
-                "/opt/src/.connect-upload-inner.sh",
-            ])
-            .current_dir(&config_dir)
-            .status()
+        let stdout = container
+            .run_in_container_with_output(run_config)
             .await
-            .context("Failed to run 'avocado sdk run'")?;
+            .context("Failed to run discovery script in container")?
+            .context("Discovery script failed inside container. Run with --verbose for details.")?;
 
-        // Clean up inner script
-        let _ = std::fs::remove_file(&script_path);
+        let result: ContainerDiscoveryResult = serde_json::from_str(&stdout)
+            .with_context(|| {
+                format!(
+                    "Failed to parse discovery output as JSON (first 500 chars): {}",
+                    &stdout[..stdout.len().min(500)]
+                )
+            })?;
 
-        if !status.success() {
-            anyhow::bail!(
-                "Failed to export runtime artifacts (exit code {:?})",
-                status.code()
+        for info in &result.artifacts {
+            print_info(
+                &format!("  {} ({})", info.image_id, format_bytes(info.size_bytes)),
+                OutputLevel::Normal,
             );
         }
 
-        if !tarball_path.exists() {
-            anyhow::bail!(
-                "Export completed but tarball not found at {}",
-                tarball_path.display()
-            );
+        Ok(result)
+    }
+
+    /// Run the upload script inside the container, uploading artifact parts in
+    /// parallel directly from the Docker volume to S3 via presigned URLs.
+    async fn upload_in_container(
+        &self,
+        config: &Config,
+        upload_specs: &[ArtifactUploadSpec],
+        discovery: &ContainerDiscoveryResult,
+    ) -> Result<Vec<BlobParts>> {
+        // Filter to artifacts that actually need uploading (non-empty parts)
+        let to_upload: Vec<&ArtifactUploadSpec> = upload_specs
+            .iter()
+            .filter(|s| !s.parts.is_empty())
+            .collect();
+
+        if to_upload.is_empty() {
+            print_info("All artifact(s) already uploaded.", OutputLevel::Normal);
+            return Ok(Vec::new());
         }
 
-        let size = std::fs::metadata(&tarball_path)?.len();
+        let skipped = upload_specs.len() - to_upload.len();
         print_info(
             &format!(
-                "Exported {} ({})",
-                tarball_path.display(),
-                format_bytes(size)
+                "Uploading {} artifact(s){}...",
+                to_upload.len(),
+                if skipped > 0 {
+                    format!(" ({skipped} already uploaded)")
+                } else {
+                    String::new()
+                }
             ),
             OutputLevel::Normal,
         );
 
-        Ok(tarball_path)
+        // Build the upload spec JSON, mapping API upload specs to container paths
+        let spec = ContainerUploadSpec {
+            concurrency: 8,
+            part_size: PART_SIZE,
+            artifacts: to_upload
+                .iter()
+                .map(|api_spec| {
+                    let container_path = discovery
+                        .artifacts
+                        .iter()
+                        .find(|a| a.image_id == api_spec.image_id)
+                        .map(|a| a.container_path.clone())
+                        .with_context(|| {
+                            format!(
+                                "API returned image_id '{}' not found in discovery",
+                                api_spec.image_id
+                            )
+                        })?;
+                    let size_bytes = discovery
+                        .artifacts
+                        .iter()
+                        .find(|a| a.image_id == api_spec.image_id)
+                        .map(|a| a.size_bytes)
+                        .unwrap_or(0);
+                    Ok(ContainerUploadArtifact {
+                        image_id: api_spec.image_id.clone(),
+                        container_path,
+                        size_bytes,
+                        parts: api_spec
+                            .parts
+                            .iter()
+                            .map(|p| ContainerUploadPart {
+                                part_number: p.part_number,
+                                upload_url: p.upload_url.clone(),
+                            })
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+
+        // Write spec to host-visible bind mount
+        let config_dir = PathBuf::from(&self.config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let config_dir = if config_dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            config_dir
+        };
+        let spec_path = config_dir.join(".connect-upload-spec.json");
+        let result_path = config_dir.join(".connect-upload-result.json");
+
+        // Cleanup helper: remove temp files when done (on success or error)
+        struct Cleanup {
+            paths: Vec<PathBuf>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in &self.paths {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let _cleanup = Cleanup {
+            paths: vec![spec_path.clone(), result_path.clone()],
+        };
+
+        let spec_json = serde_json::to_string(&spec)
+            .context("Failed to serialize upload spec")?;
+        std::fs::write(&spec_path, &spec_json)
+            .with_context(|| format!("Failed to write upload spec to {}", spec_path.display()))?;
+
+        // Run upload script inside container (streaming mode for progress)
+        let target = resolve_target_required(self.target.as_deref(), config)?;
+        let container_image = config
+            .get_sdk_image()
+            .context("No SDK container image specified in configuration")?;
+        let container = SdkContainer::from_config(&self.config_path, config)?;
+
+        let upload_script = generate_upload_script();
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.clone(),
+            command: upload_script,
+            source_environment: true,
+            no_bootstrap: true,
+            ..Default::default()
+        };
+
+        let success = container
+            .run_in_container(run_config)
+            .await
+            .context("Failed to run upload script in container")?;
+
+        if !success {
+            anyhow::bail!(
+                "Upload failed inside container. Run with --verbose for details."
+            );
+        }
+
+        // Read and parse the result JSON
+        let result_json = std::fs::read_to_string(&result_path)
+            .with_context(|| {
+                format!(
+                    "Upload script succeeded but result file not found at {}",
+                    result_path.display()
+                )
+            })?;
+
+        let result: ContainerUploadResult = serde_json::from_str(&result_json)
+            .context("Failed to parse upload result JSON")?;
+
+        // Convert to BlobParts for the complete API
+        Ok(result
+            .completed
+            .into_iter()
+            .map(|a| BlobParts {
+                image_id: a.image_id,
+                parts: a.parts,
+            })
+            .collect())
     }
 }
 
@@ -715,6 +930,211 @@ async fn upload_artifacts(
     }
 
     Ok(all_completed)
+}
+
+// ---------------------------------------------------------------------------
+// In-container discovery & upload (zero-copy path)
+// ---------------------------------------------------------------------------
+
+/// Generate a bash script that discovers artifacts inside the container and
+/// outputs a JSON object (`ContainerDiscoveryResult`) to stdout.
+fn generate_discovery_script(runtime: &str) -> String {
+    format!(
+        r#"set -euo pipefail
+
+STAGING="${{AVOCADO_PREFIX}}/runtimes/{runtime}/var-staging/lib/avocado"
+IMAGES="${{STAGING}}/images"
+
+# Locate manifest.json
+MANIFEST_PATH=""
+if [ -f "${{STAGING}}/active/manifest.json" ]; then
+  MANIFEST_PATH="${{STAGING}}/active/manifest.json"
+else
+  for d in "${{STAGING}}/runtimes"/*/; do
+    if [ -f "${{d}}manifest.json" ]; then
+      MANIFEST_PATH="${{d}}manifest.json"
+      break
+    fi
+  done
+fi
+
+if [ -z "$MANIFEST_PATH" ]; then
+  echo "manifest.json not found in ${{STAGING}}. Have you run 'avocado build'?" >&2
+  exit 1
+fi
+
+MANIFEST=$(cat "$MANIFEST_PATH")
+
+# Discover artifacts from manifest (extensions + optional os_bundle)
+IMAGE_IDS=$(echo "$MANIFEST" | jq -r '
+  [(.extensions // [])[] .image_id, (.os_bundle // empty) .image_id]
+  | .[]')
+
+ARTIFACTS="[]"
+for IMAGE_ID in $IMAGE_IDS; do
+  RAW_PATH="${{IMAGES}}/${{IMAGE_ID}}.raw"
+  if [ ! -f "$RAW_PATH" ]; then
+    echo "Artifact not found: $RAW_PATH (image_id: $IMAGE_ID)" >&2
+    exit 1
+  fi
+  SIZE=$(stat -c%s "$RAW_PATH")
+  SHA=$(sha256sum "$RAW_PATH" | awk '{{print $1}}')
+  ARTIFACTS=$(echo "$ARTIFACTS" | jq \
+    --arg id "$IMAGE_ID" \
+    --arg sz "$SIZE" \
+    --arg sha "$SHA" \
+    --arg p "$RAW_PATH" \
+    '. + [{{"image_id":$id,"size_bytes":($sz|tonumber),"sha256":$sha,"container_path":$p}}]')
+done
+
+if [ "$(echo "$ARTIFACTS" | jq 'length')" -eq 0 ]; then
+  echo "No artifacts found in manifest. Have you run 'avocado build'?" >&2
+  exit 1
+fi
+
+# Read TUF delegation info (optional)
+DELEGATION="null"
+TARGETS_PATH="${{STAGING}}/tuf-staging/targets.json"
+if [ -f "$TARGETS_PATH" ]; then
+  ROLE_NAME=$(jq -r '.signed.delegations.roles[0].name' "$TARGETS_PATH")
+  KEYID=$(jq -r '.signed.delegations.roles[0].keyids[0]' "$TARGETS_PATH")
+  PUBKEY=$(jq -r ".signed.delegations.keys[\"$KEYID\"].keyval.public" "$TARGETS_PATH")
+  DELEG_PATH="${{STAGING}}/tuf-staging/delegations/${{ROLE_NAME}}.json"
+  if [ -f "$DELEG_PATH" ]; then
+    DELEG_JSON=$(cat "$DELEG_PATH")
+    DELEGATION=$(jq -n \
+      --arg d "$DELEG_JSON" \
+      --arg k "$PUBKEY" \
+      --arg kid "$KEYID" \
+      '{{"delegated_targets_json":$d,"content_key_hex":$k,"content_keyid":$kid}}')
+  fi
+fi
+
+# Output the discovery result as a single JSON object
+jq -n \
+  --argjson manifest "$MANIFEST" \
+  --argjson artifacts "$ARTIFACTS" \
+  --argjson delegation "$DELEGATION" \
+  '{{"manifest":$manifest,"artifacts":$artifacts,"delegation":$delegation}}'
+"#,
+        runtime = runtime,
+    )
+}
+
+/// Generate a bash script that uploads artifact parts in parallel from inside
+/// the container using curl, reading the upload spec from a JSON file.
+fn generate_upload_script() -> String {
+    r#"set -euo pipefail
+
+SPEC=$(cat /opt/src/.connect-upload-spec.json)
+CONCURRENCY=$(echo "$SPEC" | jq -r '.concurrency')
+PART_SIZE=$(echo "$SPEC" | jq -r '.part_size')
+RESULT_DIR=$(mktemp -d)
+trap 'rm -rf "$RESULT_DIR"' EXIT
+RUNNING=0
+FAILURES=0
+
+upload_part() {
+  local image_id=$1 raw_path=$2 file_size=$3
+  local part_number=$4 upload_url=$5
+  local result_file="${RESULT_DIR}/${image_id}_${part_number}.json"
+
+  local offset=$(( (part_number - 1) * PART_SIZE ))
+  local remaining=$(( file_size - offset ))
+  local chunk=$(( remaining < PART_SIZE ? remaining : PART_SIZE ))
+
+  local etag="" attempt
+  for attempt in 1 2 3; do
+    local headers_file
+    headers_file=$(mktemp)
+    local http_code
+    http_code=$(dd if="$raw_path" bs=4096 skip=$((offset / 4096)) \
+                   count=$(( (chunk + 4095) / 4096 )) 2>/dev/null \
+      | head -c "$chunk" \
+      | curl -s -X PUT "$upload_url" \
+          -H "Content-Type: application/octet-stream" \
+          --data-binary @- \
+          -D "$headers_file" \
+          -o /dev/null \
+          -w '%{http_code}')
+
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      etag=$(grep -i '^etag:' "$headers_file" | tr -d '\r' | awk '{print $2}')
+      rm -f "$headers_file"
+      break
+    fi
+    rm -f "$headers_file"
+    if [ "$attempt" -lt 3 ]; then
+      echo "  [${image_id:0:8}] part ${part_number} retry ${attempt}/3..." >&2
+      sleep $((attempt * 2))
+    fi
+  done
+
+  if [ -z "$etag" ]; then
+    echo "FAILED: part ${part_number} of ${image_id}" >&2
+    echo '{"error":true}' > "$result_file"
+    return 1
+  fi
+
+  jq -n --argjson pn "$part_number" --arg et "$etag" \
+    '{"part_number":$pn,"etag":$et}' > "$result_file"
+  echo "  [${image_id:0:8}] part ${part_number} done" >&2
+}
+
+# Dispatch all (artifact, part) pairs with a flat concurrency pool
+ARTIFACT_COUNT=$(echo "$SPEC" | jq '.artifacts | length')
+for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+  IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
+  RAW_PATH=$(echo "$SPEC" | jq -r ".artifacts[$i].container_path")
+  FILE_SIZE=$(echo "$SPEC" | jq -r ".artifacts[$i].size_bytes")
+  PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
+
+  echo "Uploading ${IMAGE_ID:0:8}... (${PART_COUNT} part(s))" >&2
+
+  for j in $(seq 0 $((PART_COUNT - 1))); do
+    PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")
+    URL=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].upload_url")
+
+    upload_part "$IMAGE_ID" "$RAW_PATH" "$FILE_SIZE" "$PART_NUM" "$URL" &
+    RUNNING=$((RUNNING + 1))
+
+    if [ "$RUNNING" -ge "$CONCURRENCY" ]; then
+      wait -n || FAILURES=$((FAILURES + 1))
+      RUNNING=$((RUNNING - 1))
+    fi
+  done
+done
+
+# Drain remaining background jobs
+while [ "$RUNNING" -gt 0 ]; do
+  wait -n || FAILURES=$((FAILURES + 1))
+  RUNNING=$((RUNNING - 1))
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+  echo "ERROR: ${FAILURES} part upload(s) failed" >&2
+  exit 1
+fi
+
+# Collect per-part results into final JSON grouped by artifact
+RESULT='{"completed":[]}'
+for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+  IMAGE_ID=$(echo "$SPEC" | jq -r ".artifacts[$i].image_id")
+  PART_COUNT=$(echo "$SPEC" | jq ".artifacts[$i].parts | length")
+  PARTS="[]"
+  for j in $(seq 0 $((PART_COUNT - 1))); do
+    PART_NUM=$(echo "$SPEC" | jq -r ".artifacts[$i].parts[$j].part_number")
+    PART_JSON=$(cat "${RESULT_DIR}/${IMAGE_ID}_${PART_NUM}.json")
+    PARTS=$(echo "$PARTS" | jq --argjson p "$PART_JSON" '. + [$p]')
+  done
+  RESULT=$(echo "$RESULT" | jq --arg id "$IMAGE_ID" --argjson p "$PARTS" \
+    '.completed += [{"image_id":$id,"parts":$p}]')
+done
+
+echo "$RESULT" > /opt/src/.connect-upload-result.json
+echo "All uploads complete." >&2
+"#
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
