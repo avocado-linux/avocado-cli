@@ -321,6 +321,14 @@ impl ConnectUploadCommand {
         completed_parts: Vec<BlobParts>,
         num_artifacts: usize,
     ) -> Result<()> {
+        // If all blobs were already uploaded (e.g. retrying after a prior partial
+        // upload that completed the blobs but not the runtime transition), skip
+        // the complete call — there are no multipart uploads to finalize.
+        if completed_parts.is_empty() {
+            self.handle_draft_status(connect, runtime, num_artifacts).await?;
+            return Ok(());
+        }
+
         print_info("Completing upload...", OutputLevel::Normal);
         let result = connect
             .complete_runtime(
