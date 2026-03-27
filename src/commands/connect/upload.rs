@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, CreateRuntimeRequest, RuntimeParams,
+    ConnectClient, CreateRuntimeRequest, RuntimeParams, UploadPartError,
 };
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::SdkContainer;
@@ -199,8 +199,15 @@ impl ConnectUploadCommand {
         }
 
         // 8. Upload artifacts (Step 2)
-        let completed_parts =
-            upload_artifacts(&connect, &runtime.artifacts, &artifact_infos).await?;
+        let completed_parts = upload_artifacts(
+            &connect,
+            &self.org,
+            &self.project,
+            &runtime.id,
+            &runtime.artifacts,
+            &artifact_infos,
+        )
+        .await?;
 
         // 9. Complete runtime (Step 3)
         print_info("Completing upload...", OutputLevel::Normal);
@@ -555,6 +562,9 @@ fn compute_sha256(path: &Path) -> Result<String> {
 
 async fn upload_artifacts(
     connect: &ConnectClient,
+    org: &str,
+    project_id: &str,
+    runtime_id: &str,
     upload_specs: &[ArtifactUploadSpec],
     artifact_infos: &[ArtifactInfo],
 ) -> Result<Vec<BlobParts>> {
@@ -617,6 +627,9 @@ async fn upload_artifacts(
         let mut file = tokio::fs::File::open(&artifact.path).await?;
         let mut completed_parts = Vec::new();
 
+        // Current presigned URLs for this artifact — may be refreshed on expiry.
+        let mut current_parts = spec.parts.clone();
+
         for part in &spec.parts {
             let offset = (part.part_number - 1) * PART_SIZE;
             let remaining = artifact.size_bytes.saturating_sub(offset);
@@ -626,40 +639,68 @@ async fn upload_artifacts(
             let mut buf = vec![0u8; chunk_size];
             file.read_exact(&mut buf).await?;
 
-            // Retry up to 3 times
-            let mut etag = None;
-            for attempt in 0..3u32 {
-                match connect.upload_part(&part.upload_url, buf.clone()).await {
-                    Ok(e) => {
-                        etag = Some(e);
-                        break;
+            // Retry up to 3 times for transient failures.
+            // On URL expiry, refresh presigned URLs and retry immediately — no cap on refreshes
+            // since fetching a new URL is safe (the S3 multipart upload_id does not expire).
+            let mut attempt = 0u32;
+            let etag: String = loop {
+                // Resolve the current upload URL for this part number (may have been refreshed).
+                let upload_url = current_parts
+                    .iter()
+                    .find(|p| p.part_number == part.part_number)
+                    .map(|p| p.upload_url.clone())
+                    .with_context(|| {
+                        format!(
+                            "Part {} missing from upload spec for {}",
+                            part.part_number, spec.image_id
+                        )
+                    })?;
+
+                match connect.upload_part(&upload_url, buf.clone()).await {
+                    Ok(e) => break e,
+                    Err(UploadPartError::UrlExpired { .. }) => {
+                        eprintln!(
+                            "  Presigned URL expired for part {} of {} — refreshing URLs...",
+                            part.part_number, spec.image_id
+                        );
+                        current_parts = connect
+                            .get_upload_urls(org, project_id, runtime_id, &spec.image_id)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to refresh upload URLs for artifact '{}'",
+                                    spec.image_id
+                                )
+                            })?;
+                        // Don't increment attempt — expiry is not a transient failure.
                     }
                     Err(e) if attempt < 2 => {
-                        let delay =
-                            std::time::Duration::from_millis(500 * (u64::from(attempt) + 1));
+                        attempt += 1;
+                        let delay = std::time::Duration::from_millis(500 * u64::from(attempt));
                         tokio::time::sleep(delay).await;
                         eprintln!(
                             "  Retrying part {} of {} (attempt {}/3): {}",
                             part.part_number,
                             spec.image_id,
-                            attempt + 2,
+                            attempt + 1,
                             e
                         );
                     }
                     Err(e) => {
                         anyhow::bail!(
-                            "Failed to upload part {} of '{}' after 3 attempts: {}",
+                            "Failed to upload part {} of '{}' after {} attempt(s): {}",
                             part.part_number,
                             spec.image_id,
+                            attempt + 1,
                             e
                         );
                     }
                 }
-            }
+            };
 
             completed_parts.push(CompletedPart {
                 part_number: part.part_number,
-                etag: etag.unwrap(),
+                etag,
             });
 
             pb.set_position(std::cmp::min(offset + PART_SIZE, artifact.size_bytes));
