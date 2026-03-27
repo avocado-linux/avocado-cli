@@ -7,8 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
     ConnectClient, ContainerDiscoveryResult, ContainerUploadArtifact, ContainerUploadPart,
-    ContainerUploadResult, ContainerUploadSpec, CreateRuntimeRequest,
-    RuntimeParams, UploadPartError,
+    ContainerUploadResult, ContainerUploadSpec, CreateRuntimeRequest, RuntimeParams,
+    UploadPartError,
 };
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -123,24 +123,33 @@ impl ConnectUploadCommand {
             None
         };
 
-        let (runtime, num_artifacts) = self.create_runtime_api(
-            connect,
-            version,
-            build_id,
-            &manifest,
-            &artifact_infos
-                .iter()
-                .map(|a| ArtifactParam {
-                    image_id: a.image_id.clone(),
-                    size_bytes: a.size_bytes,
-                    sha256: a.sha256.clone(),
-                })
-                .collect::<Vec<_>>(),
-            delegation.as_ref().map(|d| (&d.delegated_targets_json, &d.content_key_hex, &d.content_keyid)),
-        ).await?;
+        let (runtime, num_artifacts) = self
+            .create_runtime_api(
+                connect,
+                version,
+                build_id,
+                &manifest,
+                &artifact_infos
+                    .iter()
+                    .map(|a| ArtifactParam {
+                        image_id: a.image_id.clone(),
+                        size_bytes: a.size_bytes,
+                        sha256: a.sha256.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                delegation.as_ref().map(|d| {
+                    (
+                        &d.delegated_targets_json,
+                        &d.content_key_hex,
+                        &d.content_keyid,
+                    )
+                }),
+            )
+            .await?;
 
         if runtime.status == "draft" {
-            self.handle_draft_status(connect, &runtime, num_artifacts).await?;
+            self.handle_draft_status(connect, &runtime, num_artifacts)
+                .await?;
             return Ok(());
         }
 
@@ -155,7 +164,8 @@ impl ConnectUploadCommand {
         )
         .await?;
 
-        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts).await
+        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts)
+            .await
     }
 
     /// Upload directly from the Docker volume with zero-copy discovery and
@@ -194,31 +204,38 @@ impl ConnectUploadCommand {
         let delegation_refs = if has_content_key {
             let d = discovery.delegation.as_ref()
                 .context("No TUF delegation files found in build volume. A content_key is configured — run 'avocado build' first.")?;
-            Some((&d.delegated_targets_json, &d.content_key_hex, &d.content_keyid))
+            Some((
+                &d.delegated_targets_json,
+                &d.content_key_hex,
+                &d.content_keyid,
+            ))
         } else {
             None
         };
 
         // Phase B: Create runtime via API
-        let (runtime, num_artifacts) = self.create_runtime_api(
-            connect,
-            version,
-            build_id,
-            manifest,
-            &discovery
-                .artifacts
-                .iter()
-                .map(|a| ArtifactParam {
-                    image_id: a.image_id.clone(),
-                    size_bytes: a.size_bytes,
-                    sha256: a.sha256.clone(),
-                })
-                .collect::<Vec<_>>(),
-            delegation_refs,
-        ).await?;
+        let (runtime, num_artifacts) = self
+            .create_runtime_api(
+                connect,
+                version,
+                build_id,
+                manifest,
+                &discovery
+                    .artifacts
+                    .iter()
+                    .map(|a| ArtifactParam {
+                        image_id: a.image_id.clone(),
+                        size_bytes: a.size_bytes,
+                        sha256: a.sha256.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                delegation_refs,
+            )
+            .await?;
 
         if runtime.status == "draft" {
-            self.handle_draft_status(connect, &runtime, num_artifacts).await?;
+            self.handle_draft_status(connect, &runtime, num_artifacts)
+                .await?;
             return Ok(());
         }
 
@@ -228,7 +245,8 @@ impl ConnectUploadCommand {
             .await?;
 
         // Phase D: Complete and finalize
-        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts).await
+        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts)
+            .await
     }
 
     /// Create a runtime via the Connect API. Returns the runtime data and
@@ -325,7 +343,8 @@ impl ConnectUploadCommand {
         // upload that completed the blobs but not the runtime transition), skip
         // the complete call — there are no multipart uploads to finalize.
         if completed_parts.is_empty() {
-            self.handle_draft_status(connect, runtime, num_artifacts).await?;
+            self.handle_draft_status(connect, runtime, num_artifacts)
+                .await?;
             return Ok(());
         }
 
@@ -384,10 +403,10 @@ impl ConnectUploadCommand {
 
     /// Get artifact files on disk, either from --file or by exporting from Docker.
     /// Resolve --file to a directory of artifacts (used by the host path only).
-    async fn get_artifacts_dir(
-        &self,
-    ) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
-        let file_or_dir = self.file.as_ref()
+    async fn get_artifacts_dir(&self) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+        let file_or_dir = self
+            .file
+            .as_ref()
             .context("get_artifacts_dir called without --file")?;
         let path = PathBuf::from(file_or_dir);
         if path.is_dir() {
@@ -404,10 +423,7 @@ impl ConnectUploadCommand {
     /// Run a discovery script inside the container to read the manifest, compute
     /// artifact hashes, and collect TUF delegation info — all without copying
     /// files out of the Docker volume.
-    async fn discover_in_container(
-        &self,
-        config: &Config,
-    ) -> Result<ContainerDiscoveryResult> {
+    async fn discover_in_container(&self, config: &Config) -> Result<ContainerDiscoveryResult> {
         let target = resolve_target_required(self.target.as_deref(), config)?;
         let container_image = config
             .get_sdk_image()
@@ -435,8 +451,8 @@ impl ConnectUploadCommand {
             .context("Failed to run discovery script in container")?
             .context("Discovery script failed inside container. Run with --verbose for details.")?;
 
-        let result: ContainerDiscoveryResult = serde_json::from_str(&stdout)
-            .with_context(|| {
+        let result: ContainerDiscoveryResult =
+            serde_json::from_str(&stdout).with_context(|| {
                 format!(
                     "Failed to parse discovery output as JSON (first 500 chars): {}",
                     &stdout[..stdout.len().min(500)]
@@ -549,8 +565,7 @@ impl ConnectUploadCommand {
             paths: vec![spec_path.clone(), result_path.clone()],
         };
 
-        let spec_json = serde_json::to_string(&spec)
-            .context("Failed to serialize upload spec")?;
+        let spec_json = serde_json::to_string(&spec).context("Failed to serialize upload spec")?;
         std::fs::write(&spec_path, &spec_json)
             .with_context(|| format!("Failed to write upload spec to {}", spec_path.display()))?;
 
@@ -577,22 +592,19 @@ impl ConnectUploadCommand {
             .context("Failed to run upload script in container")?;
 
         if !success {
-            anyhow::bail!(
-                "Upload failed inside container. Run with --verbose for details."
-            );
+            anyhow::bail!("Upload failed inside container. Run with --verbose for details.");
         }
 
         // Read and parse the result JSON
-        let result_json = std::fs::read_to_string(&result_path)
-            .with_context(|| {
-                format!(
-                    "Upload script succeeded but result file not found at {}",
-                    result_path.display()
-                )
-            })?;
+        let result_json = std::fs::read_to_string(&result_path).with_context(|| {
+            format!(
+                "Upload script succeeded but result file not found at {}",
+                result_path.display()
+            )
+        })?;
 
-        let result: ContainerUploadResult = serde_json::from_str(&result_json)
-            .context("Failed to parse upload result JSON")?;
+        let result: ContainerUploadResult =
+            serde_json::from_str(&result_json).context("Failed to parse upload result JSON")?;
 
         // Convert to BlobParts for the complete API
         Ok(result

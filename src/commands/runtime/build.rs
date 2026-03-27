@@ -1193,7 +1193,7 @@ for pair in ext_pairs:
     dest = os.path.join(images_dir, image_id + ext_suffix)
     shutil.copy2(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
-    entry = dict(name=name, version=version, image_id=image_id)
+    entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
     if image_type != "raw":
         entry["image_type"] = image_type
     extensions.append(entry)
