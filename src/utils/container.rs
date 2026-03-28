@@ -1321,6 +1321,17 @@ impl SdkContainer {
                 cmd.stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
+                // Put the child in its own process group so Ctrl-C (SIGINT)
+                // from the terminal only reaches the CLI, not the docker
+                // client.  This lets the CLI do an orderly `docker stop`
+                // while the docker client stays alive to honour --rm cleanup.
+                #[cfg(unix)]
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::setpgid(0, 0);
+                        Ok(())
+                    });
+                }
             } else {
                 // Inherit all three so the user can interact with prompts
                 // (e.g. dnf "Is this ok [y/N]:").  Ctrl-C propagates
@@ -1477,6 +1488,17 @@ impl SdkContainer {
         // The container still gets a PTY (-t flag) so programs like dnf
         // produce live progress output.
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Put the child in its own process group so Ctrl-C (SIGINT) from
+        // the terminal only reaches the CLI, not the docker client.  This
+        // lets the CLI do an orderly `docker stop` while the docker client
+        // stays alive to honour --rm cleanup.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
 
         let mut child = cmd
             .spawn()

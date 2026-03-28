@@ -6,8 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, RuntimeParams,
-    UploadPartError,
+    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, RuntimeParams, UploadPartError,
 };
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
@@ -546,11 +545,14 @@ impl ConnectUploadCommand {
                 .strip_prefix("/opt/_avocado/")
                 .unwrap_or(&artifact.container_path);
 
-            // Spawn a lightweight container to stream the file via stdout
+            // Spawn a lightweight named container to stream the file via stdout
+            let cat_container_name = format!("avocado-upload-{}", uuid::Uuid::new_v4());
             let mut cmd = tokio::process::Command::new(&container.container_tool);
             cmd.args([
                 "run",
                 "--rm",
+                "--name",
+                &cat_container_name,
                 "-v",
                 &format!("{}:/data:ro", volume_state.volume_name),
                 &container_image,
@@ -589,7 +591,10 @@ impl ConnectUploadCommand {
                 })?;
 
                 // Wait for a concurrency slot before spawning (back-pressure on reads)
-                let permit = sem.clone().acquire_owned().await
+                let permit = sem
+                    .clone()
+                    .acquire_owned()
+                    .await
                     .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
 
                 let url = part.upload_url.clone();
@@ -624,7 +629,9 @@ impl ConnectUploadCommand {
                             Err(e) => {
                                 anyhow::bail!(
                                     "Failed to upload part {} of '{}' after 3 attempts: {}",
-                                    part_num, name, e
+                                    part_num,
+                                    name,
+                                    e
                                 );
                             }
                         }
@@ -641,9 +648,7 @@ impl ConnectUploadCommand {
             // Wait for all in-flight uploads to complete
             let mut completed_parts = Vec::new();
             for handle in upload_handles {
-                let part = handle
-                    .await
-                    .context("Upload task panicked")??;
+                let part = handle.await.context("Upload task panicked")??;
                 completed_parts.push(part);
             }
 

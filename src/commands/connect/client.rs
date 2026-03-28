@@ -1039,7 +1039,8 @@ impl ConnectClient {
         presigned_url: &str,
         body: Vec<u8>,
     ) -> Result<String, UploadPartError> {
-        self.upload_part_with_progress(presigned_url, body, None).await
+        self.upload_part_with_progress(presigned_url, body, None)
+            .await
     }
 
     /// Upload a single part with optional real-time progress tracking.
@@ -1065,7 +1066,10 @@ impl ConnectClient {
                         Ok(n) => {
                             buf.truncate(n);
                             pb.inc(n as u64);
-                            Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), (cursor, pb, sent + n)))
+                            Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(buf)),
+                                (cursor, pb, sent + n),
+                            ))
                         }
                         Err(e) => Some((Err(e), (cursor, pb, sent))),
                     }
@@ -1077,14 +1081,18 @@ impl ConnectClient {
                 .body(reqwest::Body::wrap_stream(stream))
                 .send()
                 .await
-                .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}")))?
+                .map_err(|e| {
+                    UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}"))
+                })?
         } else {
             self.http
                 .put(presigned_url)
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}")))?
+                .map_err(|e| {
+                    UploadPartError::Other(anyhow::anyhow!("Failed to upload part: {e}"))
+                })?
         };
 
         let status = res.status();
