@@ -557,6 +557,7 @@ pub fn delete_config_file() -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// HTTP client for the Connect platform (Bearer token auth).
+#[derive(Clone)]
 pub struct ConnectClient {
     http: reqwest::Client,
     pub api_url: String,
