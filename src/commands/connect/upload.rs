@@ -561,6 +561,15 @@ impl ConnectUploadCommand {
             ]);
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::null());
+            // Isolate from terminal SIGINT so Ctrl-C doesn't kill the docker
+            // client before --rm cleanup can run.
+            #[cfg(unix)]
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                });
+            }
 
             let mut child = cmd
                 .spawn()
@@ -570,87 +579,108 @@ impl ConnectUploadCommand {
                 .take()
                 .context("Failed to capture container stdout")?;
 
-            // Read chunks from the pipe sequentially, but upload them concurrently.
-            // The semaphore limits in-flight uploads to 8 (keeping ~400MB in memory).
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-            let mut upload_handles: Vec<tokio::task::JoinHandle<Result<CompletedPart>>> =
-                Vec::new();
+            // Upload all parts, stopping the container on Ctrl-C or error.
+            let container_tool = container.container_tool.clone();
+            let container_name_ref = cat_container_name.clone();
+            let upload_result: Result<Vec<CompletedPart>> = tokio::select! {
+                result = async {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+                let mut upload_handles: Vec<tokio::task::JoinHandle<Result<CompletedPart>>> =
+                    Vec::new();
 
-            for part in &spec.parts {
-                let offset = (part.part_number - 1) * PART_SIZE;
-                let remaining = artifact.size_bytes.saturating_sub(offset);
-                let chunk_size = std::cmp::min(remaining, PART_SIZE) as usize;
+                for part in &spec.parts {
+                    let offset = (part.part_number - 1) * PART_SIZE;
+                    let remaining = artifact.size_bytes.saturating_sub(offset);
+                    let chunk_size = std::cmp::min(remaining, PART_SIZE) as usize;
 
-                // Read chunk from the container's stdout pipe (sequential)
-                let mut buf = vec![0u8; chunk_size];
-                stdout.read_exact(&mut buf).await.with_context(|| {
-                    format!(
-                        "Failed to read part {} of '{}' from container",
-                        part.part_number, artifact.name
-                    )
-                })?;
+                    let mut buf = vec![0u8; chunk_size];
+                    stdout.read_exact(&mut buf).await.with_context(|| {
+                        format!(
+                            "Failed to read part {} of '{}' from container",
+                            part.part_number, artifact.name
+                        )
+                    })?;
 
-                // Wait for a concurrency slot before spawning (back-pressure on reads)
-                let permit = sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
+                    let permit = sem
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?;
 
-                let url = part.upload_url.clone();
-                let part_num = part.part_number;
-                let name = artifact.name.clone();
-                let pb = pb.clone();
-                let connect = connect.clone();
+                    let url = part.upload_url.clone();
+                    let part_num = part.part_number;
+                    let name = artifact.name.clone();
+                    let pb = pb.clone();
+                    let connect = connect.clone();
 
-                let handle = tokio::spawn(async move {
-                    let _permit = permit; // held until upload completes
-                    let cs = chunk_size as u64;
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit;
+                        let cs = chunk_size as u64;
 
-                    let mut etag = None;
-                    for attempt in 0..3u32 {
-                        if attempt > 0 {
-                            pb.set_position(pb.position().saturating_sub(cs));
+                        let mut etag = None;
+                        for attempt in 0..3u32 {
+                            if attempt > 0 {
+                                pb.set_position(pb.position().saturating_sub(cs));
+                            }
+                            match connect
+                                .upload_part_with_progress(&url, buf.clone(), Some(&pb))
+                                .await
+                            {
+                                Ok(e) => {
+                                    etag = Some(e);
+                                    break;
+                                }
+                                Err(_) if attempt < 2 => {
+                                    let delay = std::time::Duration::from_millis(
+                                        500 * (u64::from(attempt) + 1),
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                }
+                                Err(e) => {
+                                    anyhow::bail!(
+                                        "Failed to upload part {} of '{}' after 3 attempts: {}",
+                                        part_num,
+                                        name,
+                                        e
+                                    );
+                                }
+                            }
                         }
-                        match connect
-                            .upload_part_with_progress(&url, buf.clone(), Some(&pb))
-                            .await
-                        {
-                            Ok(e) => {
-                                etag = Some(e);
-                                break;
-                            }
-                            Err(_) if attempt < 2 => {
-                                let delay = std::time::Duration::from_millis(
-                                    500 * (u64::from(attempt) + 1),
-                                );
-                                tokio::time::sleep(delay).await;
-                            }
-                            Err(e) => {
-                                anyhow::bail!(
-                                    "Failed to upload part {} of '{}' after 3 attempts: {}",
-                                    part_num,
-                                    name,
-                                    e
-                                );
-                            }
-                        }
-                    }
 
-                    Ok(CompletedPart {
-                        part_number: part_num,
-                        etag: etag.unwrap(),
-                    })
-                });
-                upload_handles.push(handle);
-            }
+                        Ok(CompletedPart {
+                            part_number: part_num,
+                            etag: etag.unwrap(),
+                        })
+                    });
+                    upload_handles.push(handle);
+                }
 
-            // Wait for all in-flight uploads to complete
-            let mut completed_parts = Vec::new();
-            for handle in upload_handles {
-                let part = handle.await.context("Upload task panicked")??;
-                completed_parts.push(part);
-            }
+                let mut completed_parts = Vec::new();
+                for handle in upload_handles {
+                    let part = handle.await.context("Upload task panicked")??;
+                    completed_parts.push(part);
+                }
+                Ok(completed_parts)
+                } => result,
+                _ = tokio::signal::ctrl_c() => {
+                    Err(anyhow::anyhow!("Interrupted by user"))
+                }
+            };
+
+            // On error or interrupt, stop the container so --rm can clean it up
+            let completed_parts = match upload_result {
+                Ok(parts) => parts,
+                Err(e) => {
+                    let _ = tokio::process::Command::new(&container_tool)
+                        .args(["stop", "-t", "2", &container_name_ref])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .await;
+                    let _ = child.wait().await;
+                    return Err(e);
+                }
+            };
 
             pb.finish_with_message(format!("{} (done)", artifact.name));
 
