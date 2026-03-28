@@ -950,11 +950,11 @@ pub fn compute_ext_input_hash_with_fs(
                 var_files.clone(),
             );
         }
-        // Include image_type as it determines output format (raw vs kab)
-        if let Some(image_type) = ext.get("image_type") {
+        // Include image config as it determines output format and kabtool args
+        if let Some(image) = ext.get("image") {
             hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{ext_name}.image_type")),
-                image_type.clone(),
+                serde_yaml::Value::String(format!("ext.{ext_name}.image")),
+                image.clone(),
             );
         }
     }

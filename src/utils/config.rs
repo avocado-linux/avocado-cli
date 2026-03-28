@@ -585,12 +585,22 @@ pub fn get_ext_var_files(ext_config: &serde_yaml::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Extract image_type from an extension config value.
-/// Returns None for raw (default) or Some("kab") for KAB-wrapped images.
-#[allow(dead_code)]
+/// Extract image type from extension config (image.type field).
+/// Returns None if no image config (defaults to raw).
 pub fn get_ext_image_type(ext_config: &serde_yaml::Value) -> Option<String> {
     ext_config
-        .get("image_type")
+        .get("image")
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract image args from extension config (image.args field).
+/// These are passed directly to kabtool (before -k and -z which are appended by CLI).
+pub fn get_ext_image_args(ext_config: &serde_yaml::Value) -> Option<String> {
+    ext_config
+        .get("image")
+        .and_then(|v| v.get("args"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }

@@ -380,28 +380,27 @@ impl ExtImageCommand {
             }
         }
 
-        // Resolve image_type: "raw" (default) or "kab" (KAB-wrapped signed image)
-        let image_type = ext_config
-            .get("image_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("raw");
+        // Resolve image type: "raw" (default) or "kab" (KAB-wrapped signed image)
+        let image_type = crate::utils::config::get_ext_image_type(&ext_config)
+            .unwrap_or_else(|| "raw".to_string());
+        let image_args = crate::utils::config::get_ext_image_args(&ext_config);
 
-        match image_type {
+        match image_type.as_str() {
             "raw" | "kab" => {}
             other => {
                 return Err(anyhow::anyhow!(
-                    "Extension '{}' has invalid image_type '{}'. Must be 'raw' or 'kab'.",
+                    "Extension '{}' has invalid image type '{}'. Must be 'raw' or 'kab'.",
                     self.extension,
                     other
                 ));
             }
         }
 
-        // If image_type is kab, validate keyset file from KAB_KEYSET_FILE env var
+        // If image type is kab, validate keyset file from KAB_KEYSET_FILE env var
         let kab_keyset_host_path = if image_type == "kab" {
             let keyset_path = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
                 anyhow::anyhow!(
-                    "Extension '{}' has image_type 'kab' but KAB_KEYSET_FILE environment variable is not set. \
+                    "Extension '{}' has image type 'kab' but KAB_KEYSET_FILE environment variable is not set. \
                      Set it to the path of your KAB signing keyset file.",
                     self.extension,
                 )
@@ -494,7 +493,8 @@ impl ExtImageCommand {
                 filesystem,
                 &var_files,
                 &effective_tui_context,
-                image_type,
+                &image_type,
+                image_args.as_deref(),
                 &kab_env_vars,
             )
             .await?;
@@ -674,6 +674,7 @@ impl ExtImageCommand {
         var_files: &[String],
         effective_tui_context: &Option<TuiContext>,
         image_type: &str,
+        image_args: Option<&str>,
         extra_env_vars: &Option<std::collections::HashMap<String, String>>,
     ) -> Result<bool> {
         // Create the build script
@@ -684,6 +685,7 @@ impl ExtImageCommand {
             filesystem,
             var_files,
             image_type,
+            image_args,
         );
 
         // Execute the build script in the SDK container
@@ -713,6 +715,7 @@ impl ExtImageCommand {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_build_script(
         &self,
         ext_version: &str,
@@ -721,6 +724,7 @@ impl ExtImageCommand {
         filesystem: &str,
         var_files: &[String],
         image_type: &str,
+        image_args: Option<&str>,
     ) -> String {
         // Build exclude flags for var_files patterns (these go on the var partition, not in the .raw image)
         let var_excludes = var_files
@@ -784,7 +788,10 @@ mksquashfs \
         };
 
         let kab_wrapping = if image_type == "kab" {
-            r#"
+            let kab_args = image_args
+                .unwrap_or(r#"-b -t kos.layer -v "$EXT_VERSION" --tag "$AVOCADO_TARGET""#);
+            format!(
+                r#"
 # --- KAB wrapping ---
 echo "Wrapping extension as KAB..."
 KAB_TMPDIR=$(mktemp -d)
@@ -795,7 +802,7 @@ cp "$OUTPUT_FILE" "$KAB_TMPDIR/layer.img"
 
 # Create descriptor.json with build metadata
 cat > "$KAB_TMPDIR/descriptor.json" << DESCEOF
-{"kos":{"build":{"source":"$EXT_NAME-$EXT_VERSION"}}}
+{{"kos":{{"build":{{"source":"$EXT_NAME-$EXT_VERSION"}}}}}}
 DESCEOF
 
 # Create zip archive (store mode — image is already compressed)
@@ -804,8 +811,7 @@ DESCEOF
 # Run kabtool to sign and package
 KAB_OUTPUT="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.kab"
 rm -f "$KAB_OUTPUT"
-kabtool -b -t kos.layer -v "$EXT_VERSION" \
-    --tag "$AVOCADO_TARGET" \
+kabtool {kab_args} \
     -k "$KAB_KEYSET_FILE" \
     -z "$KAB_TMPDIR/tmp.zip" "$KAB_TMPDIR/output.kab"
 cp "$KAB_TMPDIR/output.kab" "$KAB_OUTPUT"
@@ -818,8 +824,9 @@ trap - EXIT
 
 echo "Created KAB extension image: $KAB_OUTPUT"
 "#
+            )
         } else {
-            ""
+            String::new()
         };
 
         format!(
@@ -878,7 +885,7 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -901,7 +908,7 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_lz4_includes_compression() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-lz4", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-lz4", &[], "raw", None);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -920,7 +927,7 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_zst_includes_compression() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-zst", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-zst", &[], "raw", None);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -939,7 +946,7 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_uncompressed_no_z_flag() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -954,7 +961,7 @@ mod tests {
     #[test]
     fn test_create_build_script_squashfs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
 
         assert!(
             script.contains("mksquashfs"),
@@ -982,7 +989,7 @@ mod tests {
     fn test_create_build_script_defaults_to_squashfs() {
         let cmd = make_cmd("my-ext");
         // Passing "squashfs" simulates the default behavior
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
 
         assert!(
             script.contains("mksquashfs"),
@@ -993,7 +1000,7 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_default() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=0"),
@@ -1008,7 +1015,8 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_custom() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 1700000000, "erofs", &[], "raw");
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 1700000000, "erofs", &[], "raw", None);
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=1700000000"),
@@ -1023,7 +1031,7 @@ mod tests {
     #[test]
     fn test_create_build_script_extension_name_and_version() {
         let cmd = make_cmd("test-extension");
-        let script = cmd.create_build_script("2.3.4", "sysext", 0, "squashfs", &[], "raw");
+        let script = cmd.create_build_script("2.3.4", "sysext", 0, "squashfs", &[], "raw", None);
 
         assert!(
             script.contains("EXT_NAME=\"test-extension\""),
@@ -1038,7 +1046,7 @@ mod tests {
     #[test]
     fn test_create_build_script_output_path() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
 
         assert!(
             script.contains("OUTPUT_FILE=\"$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw\""),
@@ -1053,7 +1061,8 @@ mod tests {
             "var/lib/docker/**".to_string(),
             "var/lib/myapp/data".to_string(),
         ];
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &var_files, "raw");
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &var_files, "raw", None);
 
         assert!(
             script.contains("-e \"var/lib/docker\""),
@@ -1069,7 +1078,8 @@ mod tests {
     fn test_create_build_script_erofs_var_files_excludes() {
         let cmd = make_cmd("my-ext");
         let var_files = vec!["var/lib/docker/**".to_string()];
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &var_files, "raw");
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &var_files, "raw", None);
 
         assert!(
             script.contains("--exclude-path=var/lib/docker"),
@@ -1080,7 +1090,7 @@ mod tests {
     #[test]
     fn test_create_build_script_no_var_files_no_excludes() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
 
         assert!(
             !script.contains("-e \"var/"),
