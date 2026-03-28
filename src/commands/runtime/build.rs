@@ -1040,11 +1040,15 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                                 )
                             })?;
 
-                        let ext_suffix = ext_data
-                            .get("image_type")
-                            .and_then(|v| v.as_str())
-                            .map(|t| if t == "kab" { "kab" } else { "raw" })
-                            .unwrap_or("raw");
+                        let ext_suffix = crate::utils::config::get_ext_image_type(ext_data)
+                            .map(|t| {
+                                if t == "kab" {
+                                    "kab".to_string()
+                                } else {
+                                    "raw".to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "raw".to_string());
                         copy_commands.push(format!(
                             r#"
 if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
@@ -1121,13 +1125,12 @@ fi"#
                 } else {
                     (versioned_name.clone(), "0.0.0".to_string())
                 };
-                // Look up image_type from parsed config
+                // Look up image type from parsed config (image.type field)
                 let image_type = parsed
                     .get("extensions")
                     .and_then(|e| e.get(&name))
-                    .and_then(|ext| ext.get("image_type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("raw");
+                    .and_then(crate::utils::config::get_ext_image_type)
+                    .unwrap_or_else(|| "raw".to_string());
                 format!("{name}:{version}:{image_type}")
             })
             .collect();
