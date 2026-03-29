@@ -264,6 +264,112 @@ fn test_distro_config_loaded() {
 }
 
 #[test]
+#[serial]
+fn test_avocado_extensions_self_reference() {
+    env::set_var("AVOCADO_TARGET", "raspberrypi4");
+
+    let config_path = get_interpolation_test_config();
+    let content = fs::read_to_string(&config_path).unwrap();
+    let mut parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, Some("raspberrypi4"))
+        .unwrap();
+
+    let ext = parsed.get("extensions").unwrap();
+    let test_ext = ext.get("test-ext-with-ref").unwrap();
+    let image = test_ext.get("image").unwrap();
+    let args = image.get("args").unwrap().as_str().unwrap();
+
+    assert_eq!(args, "-b -v 3.2.1 --tag raspberrypi4");
+
+    env::remove_var("AVOCADO_TARGET");
+}
+
+#[test]
+fn test_avocado_extensions_version_inline() {
+    let mut config: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+extensions:
+  my-ext:
+    version: "2024.1.0"
+    image:
+      args: "--version {{ avocado.extensions.my-ext.version }}"
+"#,
+    )
+    .unwrap();
+
+    avocado_cli::utils::interpolation::interpolate_config(&mut config, None).unwrap();
+
+    let args = config
+        .get("extensions")
+        .unwrap()
+        .get("my-ext")
+        .unwrap()
+        .get("image")
+        .unwrap()
+        .get("args")
+        .unwrap()
+        .as_str()
+        .unwrap();
+
+    assert_eq!(args, "--version 2024.1.0");
+}
+
+#[test]
+fn test_avocado_extensions_cross_reference() {
+    let mut config: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+extensions:
+  provider-ext:
+    version: "5.0.0"
+  consumer-ext:
+    dep_version: "{{ avocado.extensions.provider-ext.version }}"
+"#,
+    )
+    .unwrap();
+
+    avocado_cli::utils::interpolation::interpolate_config(&mut config, None).unwrap();
+
+    let dep_ver = config
+        .get("extensions")
+        .unwrap()
+        .get("consumer-ext")
+        .unwrap()
+        .get("dep_version")
+        .unwrap()
+        .as_str()
+        .unwrap();
+
+    assert_eq!(dep_ver, "5.0.0");
+}
+
+#[test]
+fn test_avocado_extensions_missing_leaves_template() {
+    let mut config: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+extensions:
+  my-ext:
+    ref_field: "{{ avocado.extensions.nonexistent.version }}"
+"#,
+    )
+    .unwrap();
+
+    avocado_cli::utils::interpolation::interpolate_config(&mut config, None).unwrap();
+
+    let val = config
+        .get("extensions")
+        .unwrap()
+        .get("my-ext")
+        .unwrap()
+        .get("ref_field")
+        .unwrap()
+        .as_str()
+        .unwrap();
+
+    assert_eq!(val, "{{ avocado.extensions.nonexistent.version }}");
+}
+
+#[test]
 fn test_config_distro_interpolation_in_sdk() {
     let config_path = get_interpolation_test_config();
     let config = avocado_cli::utils::config::Config::load(&config_path).unwrap();

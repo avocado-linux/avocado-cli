@@ -7,6 +7,7 @@
 //! - `{{ avocado.distro.release }}` - Distro release (feed year) from main config
 //! - `{{ avocado.distro.version }}` - Alias for distro.release (backward compat)
 //! - `{{ avocado.distro.channel }}` - Distro channel from main config
+//! - `{{ avocado.extensions.<name>.<field> }}` - Value from the merged extensions section
 //!
 //! **Behavior:**
 //! - Returns None if value is not available (leaves template as-is)
@@ -195,6 +196,7 @@ pub fn resolve(
         ["target"] => resolve_target(root, context),
         ["distro", "release"] | ["distro", "version"] => resolve_distro_release(context),
         ["distro", "channel"] => resolve_distro_channel(context),
+        ["extensions", rest @ ..] => resolve_extensions(rest, root),
         _ => {
             // Other avocado keys are not yet supported, but don't error
             // Just leave the template as-is for future extension
@@ -261,6 +263,34 @@ fn resolve_distro_channel(context: Option<&AvocadoContext>) -> Result<Option<Str
     }
     // Not available - leave template as-is
     Ok(None)
+}
+
+/// Resolve a value from the merged extensions section.
+///
+/// Navigates `root["extensions"][path[0]][path[1]]...` and returns the scalar
+/// value as a string. Returns `Ok(None)` if any segment is missing or the leaf
+/// is a mapping/sequence (not meaningful for string interpolation).
+fn resolve_extensions(path: &[&str], root: &Value) -> Result<Option<String>> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+
+    let mut current = match root.get("extensions") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    for segment in path {
+        match current.get(*segment) {
+            Some(v) => current = v,
+            None => return Ok(None),
+        }
+    }
+
+    match current {
+        Value::Mapping(_) | Value::Sequence(_) => Ok(None),
+        _ => Ok(Some(yaml_value_to_string(current))),
+    }
 }
 
 #[cfg(test)]
@@ -425,5 +455,108 @@ distro:
         assert_eq!(ctx.target, Some("x86_64".to_string()));
         assert_eq!(ctx.distro_release, None);
         assert_eq!(ctx.distro_channel, None);
+    }
+
+    #[test]
+    fn test_resolve_extensions_version() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  avocado-ext-dev:
+    version: "2024.0.0"
+    source:
+      type: package
+"#,
+        );
+        let result = resolve(&["extensions", "avocado-ext-dev", "version"], &config, None).unwrap();
+        assert_eq!(result, Some("2024.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_extensions_nested_field() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  my-ext:
+    image:
+      type: kab
+"#,
+        );
+        let result = resolve(&["extensions", "my-ext", "image", "type"], &config, None).unwrap();
+        assert_eq!(result, Some("kab".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_extensions_missing_extension() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  some-ext:
+    version: "1.0"
+"#,
+        );
+        let result = resolve(&["extensions", "nonexistent", "version"], &config, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_extensions_missing_field() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  my-ext:
+    version: "1.0"
+"#,
+        );
+        let result = resolve(&["extensions", "my-ext", "nonexistent"], &config, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_extensions_no_extensions_section() {
+        let config = parse_yaml("{}");
+        let result = resolve(&["extensions", "any-ext", "version"], &config, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_extensions_number_value() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  my-ext:
+    version: 2024
+"#,
+        );
+        let result = resolve(&["extensions", "my-ext", "version"], &config, None).unwrap();
+        assert_eq!(result, Some("2024".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_extensions_mapping_returns_none() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  my-ext:
+    image:
+      type: kab
+      args: "-b"
+"#,
+        );
+        let result = resolve(&["extensions", "my-ext", "image"], &config, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_extensions_bare_keyword() {
+        let config = parse_yaml(
+            r#"
+extensions:
+  my-ext:
+    version: "1.0"
+"#,
+        );
+        let result = resolve(&["extensions"], &config, None).unwrap();
+        assert_eq!(result, None);
     }
 }

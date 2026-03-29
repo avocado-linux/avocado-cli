@@ -41,3 +41,8 @@ extensions:
     types:
       - sysext
     version: "{{ env.EXT_VERSION_ENV_VAR_INTERP }}"
+  test-ext-with-ref:
+    version: "3.2.1"
+    image:
+      type: kab
+      args: '-b -v {{ avocado.extensions.test-ext-with-ref.version }} --tag {{ avocado.target }}'

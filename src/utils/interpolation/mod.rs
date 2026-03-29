@@ -34,11 +34,13 @@
 //! target_pkg: "pkg-{{ avocado.target }}"
 //! distro_image: "sdk:{{ avocado.distro.channel }}"
 //! version_ref: "{{ avocado.distro.version }}"
+//! ext_ver: "{{ avocado.extensions.my-ext.version }}"
 //! ```
 //! - Provides access to computed values from the main config
 //! - `avocado.target` - Target architecture (CLI > env > config precedence)
 //! - `avocado.distro.version` - Distro version from the main config
 //! - `avocado.distro.channel` - Distro channel from the main config
+//! - `avocado.extensions.<name>.<field>` - Merged extension field value
 //! - Leaves template as-is if value unavailable
 //! - Never produces errors (CLI handles validation)
 //! - Ensures all configs use the same distro values from the main config
