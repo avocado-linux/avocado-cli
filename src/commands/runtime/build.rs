@@ -1155,6 +1155,7 @@ export AVOCADO_NS_UUID="{namespace_uuid}"
 export AVOCADO_RT_EXT_DIR="$RUNTIME_EXT_DIR"
 export AVOCADO_IMAGES_DIR="$IMAGES_DIR"
 export AVOCADO_MANIFEST_PATH="$MANIFEST_DIR/manifest.json"
+export AVOCADO_SPOT_HASHES_PATH="$MANIFEST_DIR/spot_hashes.json"
 export AVOCADO_BUILD_ID="$BUILD_ID"
 export AVOCADO_BUILT_AT="$BUILT_AT"
 export AVOCADO_RUNTIME_NAME="{runtime_name}"
@@ -1220,6 +1221,40 @@ for fname in os.listdir(images_dir):
         stale_path = os.path.join(images_dir, fname)
         os.remove(stale_path)
         print("  Removed stale image: " + fname)
+
+# Generate spot_hashes.json for fast integrity checking at merge time.
+# Hashes file_size (8 LE bytes) + first N bytes + last N bytes of each image.
+spot_check_bytes = int(os.environ.get("AVOCADO_SPOT_CHECK_BYTES", "4096"))
+spot_hashes_path = os.environ.get("AVOCADO_SPOT_HASHES_PATH", "")
+
+def compute_spot_hash(filepath, spot_size):
+    import struct
+    file_size = os.path.getsize(filepath)
+    h = hashlib.sha256()
+    h.update(struct.pack("<Q", file_size))
+    with open(filepath, "rb") as f:
+        if file_size == 0:
+            pass
+        elif file_size <= spot_size * 2:
+            h.update(f.read())
+        else:
+            h.update(f.read(spot_size))
+            f.seek(-spot_size, 2)
+            h.update(f.read(spot_size))
+    return h.hexdigest()
+
+if spot_hashes_path:
+    spot_hashes = {{}}
+    for ext in extensions:
+        suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
+        fname = ext["image_id"] + suffix
+        fpath = os.path.join(images_dir, fname)
+        if os.path.isfile(fpath):
+            spot_hashes[fname] = compute_spot_hash(fpath, spot_check_bytes)
+    cache = dict(version=1, spot_check_bytes=spot_check_bytes, hashes=spot_hashes)
+    with open(spot_hashes_path, "w") as f:
+        json.dump(cache, f, indent=2)
+    print("Created spot hash cache with " + str(len(spot_hashes)) + " image(s)")
 PYEOF
 
 ln -sfn "runtimes/$BUILD_ID" "$VAR_DIR/lib/avocado/active"
@@ -2327,6 +2362,11 @@ extensions:
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
         assert!(script.contains("$VAR_DIR/lib/avocado/active"));
+
+        // Spot hash cache should be generated
+        assert!(script.contains("AVOCADO_SPOT_HASHES_PATH"));
+        assert!(script.contains("spot_hashes.json"));
+        assert!(script.contains("compute_spot_hash"));
 
         assert!(script.contains("--subvol rw:lib/avocado "));
     }
