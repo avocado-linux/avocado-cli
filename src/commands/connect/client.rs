@@ -392,6 +392,9 @@ pub struct ArtifactParam {
     pub image_id: String,
     pub size_bytes: u64,
     pub sha256: String,
+    pub part_size: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub part_checksums: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,6 +412,7 @@ pub struct BlobParts {
 pub struct CompletedPart {
     pub part_number: u64,
     pub etag: String,
+    pub checksum_sha256: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +494,9 @@ pub struct ContainerArtifactInfo {
     pub name: String,
     pub size_bytes: u64,
     pub sha256: String,
+    /// Base64-encoded SHA-256 checksums per 50 MiB part, indexed by part number - 1.
+    #[serde(default)]
+    pub part_checksums: Vec<String>,
     /// Absolute path inside the container (e.g. /opt/_avocado/.../images/UUID.raw)
     pub container_path: String,
 }
@@ -1038,8 +1045,9 @@ impl ConnectClient {
         &self,
         presigned_url: &str,
         body: Vec<u8>,
+        checksum_sha256: &str,
     ) -> Result<String, UploadPartError> {
-        self.upload_part_with_progress(presigned_url, body, None)
+        self.upload_part_with_progress(presigned_url, body, checksum_sha256, None)
             .await
     }
 
@@ -1049,6 +1057,7 @@ impl ConnectClient {
         &self,
         presigned_url: &str,
         body: Vec<u8>,
+        checksum_sha256: &str,
         progress: Option<&indicatif::ProgressBar>,
     ) -> Result<String, UploadPartError> {
         let body_len = body.len();
@@ -1078,6 +1087,7 @@ impl ConnectClient {
             self.http
                 .put(presigned_url)
                 .header("content-length", body_len)
+                .header("x-amz-checksum-sha256", checksum_sha256)
                 .body(reqwest::Body::wrap_stream(stream))
                 .send()
                 .await
@@ -1087,6 +1097,7 @@ impl ConnectClient {
         } else {
             self.http
                 .put(presigned_url)
+                .header("x-amz-checksum-sha256", checksum_sha256)
                 .body(body)
                 .send()
                 .await
@@ -1894,6 +1905,51 @@ mod tests {
             "expected HttpError, got {err}"
         );
     }
+
+    // --- ArtifactParam serialization ---
+
+    #[test]
+    fn test_artifact_param_includes_part_checksums_when_present() {
+        let param = ArtifactParam {
+            image_id: "test-id".to_string(),
+            size_bytes: 1024,
+            sha256: "abc".to_string(),
+            part_size: 52_428_800,
+            part_checksums: vec!["checksum1==".to_string(), "checksum2==".to_string()],
+        };
+        let json = serde_json::to_value(&param).unwrap();
+        assert_eq!(json["part_checksums"].as_array().unwrap().len(), 2);
+        assert_eq!(json["part_size"], 52_428_800);
+    }
+
+    #[test]
+    fn test_artifact_param_omits_part_checksums_when_empty() {
+        let param = ArtifactParam {
+            image_id: "test-id".to_string(),
+            size_bytes: 1024,
+            sha256: "abc".to_string(),
+            part_size: 52_428_800,
+            part_checksums: vec![],
+        };
+        let json = serde_json::to_value(&param).unwrap();
+        assert!(json.get("part_checksums").is_none());
+        assert_eq!(json["part_size"], 52_428_800);
+    }
+
+    #[test]
+    fn test_completed_part_serializes_checksum() {
+        let part = CompletedPart {
+            part_number: 1,
+            etag: "\"abc\"".to_string(),
+            checksum_sha256: "base64hash==".to_string(),
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["checksum_sha256"], "base64hash==");
+        assert_eq!(json["part_number"], 1);
+        assert_eq!(json["etag"], "\"abc\"");
+    }
+
+    // --- classify_upload_part_error ---
 
     #[test]
     fn test_classify_preserves_body() {
