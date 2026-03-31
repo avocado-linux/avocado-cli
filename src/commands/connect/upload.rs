@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ struct ArtifactInfo {
     path: PathBuf,
     size_bytes: u64,
     sha256: String,
+    part_checksums: Vec<String>,
 }
 
 impl TaskPrerequisites for ConnectUploadCommand {
@@ -133,6 +135,8 @@ impl ConnectUploadCommand {
                         image_id: a.image_id.clone(),
                         size_bytes: a.size_bytes,
                         sha256: a.sha256.clone(),
+                        part_size: PART_SIZE,
+                        part_checksums: a.part_checksums.clone(),
                     })
                     .collect::<Vec<_>>(),
                 delegation.as_ref().map(|d| {
@@ -225,6 +229,8 @@ impl ConnectUploadCommand {
                         image_id: a.image_id.clone(),
                         size_bytes: a.size_bytes,
                         sha256: a.sha256.clone(),
+                        part_size: PART_SIZE,
+                        part_checksums: a.part_checksums.clone(),
                     })
                     .collect::<Vec<_>>(),
                 delegation_refs,
@@ -601,6 +607,18 @@ impl ConnectUploadCommand {
                         )
                     })?;
 
+                    let checksum = BASE64_STANDARD.encode(Sha256::digest(&buf));
+
+                    // Verify against pre-computed checksum from discovery
+                    if let Some(expected) = artifact.part_checksums.get((part.part_number - 1) as usize) {
+                        if checksum != *expected {
+                            anyhow::bail!(
+                                "Part {} of '{}' checksum mismatch (data changed since discovery)",
+                                part.part_number, artifact.name
+                            );
+                        }
+                    }
+
                     let permit = sem
                         .clone()
                         .acquire_owned()
@@ -623,7 +641,7 @@ impl ConnectUploadCommand {
                                 pb.set_position(pb.position().saturating_sub(cs));
                             }
                             match connect
-                                .upload_part_with_progress(&url, buf.clone(), Some(&pb))
+                                .upload_part_with_progress(&url, buf.clone(), &checksum, Some(&pb))
                                 .await
                             {
                                 Ok(e) => {
@@ -650,6 +668,7 @@ impl ConnectUploadCommand {
                         Ok(CompletedPart {
                             part_number: part_num,
                             etag: etag.unwrap(),
+                            checksum_sha256: checksum,
                         })
                     });
                     upload_handles.push(handle);
@@ -807,14 +826,15 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
             .with_context(|| format!("Failed to stat {}", path.display()))?
             .len();
 
-        let sha256 =
-            compute_sha256(&path).with_context(|| format!("Failed to hash {}", path.display()))?;
+        let (sha256, part_checksums) = compute_sha256_with_parts(&path)
+            .with_context(|| format!("Failed to hash {}", path.display()))?;
 
         artifacts.push(ArtifactInfo {
             image_id: image_id.to_string(),
             path,
             size_bytes,
             sha256,
+            part_checksums,
         });
     }
 
@@ -838,14 +858,15 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
             .with_context(|| format!("Failed to stat {}", path.display()))?
             .len();
 
-        let sha256 =
-            compute_sha256(&path).with_context(|| format!("Failed to hash {}", path.display()))?;
+        let (sha256, part_checksums) = compute_sha256_with_parts(&path)
+            .with_context(|| format!("Failed to hash {}", path.display()))?;
 
         artifacts.push(ArtifactInfo {
             image_id: image_id.to_string(),
             path,
             size_bytes,
             sha256,
+            part_checksums,
         });
     }
 
@@ -856,19 +877,33 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
     Ok(artifacts)
 }
 
-fn compute_sha256(path: &Path) -> Result<String> {
+/// Compute whole-file SHA-256 (hex) and per-part SHA-256 checksums (base64) in one pass.
+/// Parts are PART_SIZE (50 MiB) aligned, matching the API's multipart part size.
+fn compute_sha256_with_parts(path: &Path) -> Result<(String, Vec<String>)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut whole_hasher = Sha256::new();
+    let mut part_checksums = Vec::new();
+    let part_size = PART_SIZE as usize;
+
     loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
+        let mut buf = vec![0u8; part_size];
+        let mut read = 0;
+        while read < part_size {
+            let n = file.read(&mut buf[read..])?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        if read == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        let chunk = &buf[..read];
+        whole_hasher.update(chunk);
+        part_checksums.push(BASE64_STANDARD.encode(Sha256::digest(chunk)));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok((format!("{:x}", whole_hasher.finalize()), part_checksums))
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +989,19 @@ async fn upload_artifacts(
             let mut buf = vec![0u8; chunk_size];
             file.read_exact(&mut buf).await?;
 
+            let checksum = BASE64_STANDARD.encode(Sha256::digest(&buf));
+
+            // Verify against pre-computed checksum from discovery
+            if let Some(expected) = artifact.part_checksums.get((part.part_number - 1) as usize) {
+                if checksum != *expected {
+                    anyhow::bail!(
+                        "Part {} of '{}' checksum mismatch (data changed since discovery)",
+                        part.part_number,
+                        spec.image_id
+                    );
+                }
+            }
+
             // Retry up to 3 times for transient failures.
             // On URL expiry, refresh presigned URLs and retry immediately — no cap on refreshes
             // since fetching a new URL is safe (the S3 multipart upload_id does not expire).
@@ -971,7 +1019,10 @@ async fn upload_artifacts(
                         )
                     })?;
 
-                match connect.upload_part(&upload_url, buf.clone()).await {
+                match connect
+                    .upload_part(&upload_url, buf.clone(), &checksum)
+                    .await
+                {
                     Ok(e) => break e,
                     Err(UploadPartError::UrlExpired { .. }) => {
                         eprintln!(
@@ -1016,6 +1067,7 @@ async fn upload_artifacts(
             completed_parts.push(CompletedPart {
                 part_number: part.part_number,
                 etag,
+                checksum_sha256: checksum,
             });
 
             pb.set_position(std::cmp::min(offset + PART_SIZE, artifact.size_bytes));
@@ -1082,13 +1134,26 @@ while IFS=$'\t' read -r NAME IMAGE_ID; do
   fi
   SIZE=$(stat -c%s "$RAW_PATH")
   SHA=$(sha256sum "$RAW_PATH" | awk '{{print $1}}')
+
+  # Compute per-part SHA-256 checksums (base64-encoded, 50 MiB parts)
+  PART_SIZE=52428800
+  PART_CHECKSUMS="[]"
+  PART_INDEX=0
+  while [ "$((PART_INDEX * PART_SIZE))" -lt "$SIZE" ]; do
+    CHUNK_CS=$(dd if="$RAW_PATH" bs="$PART_SIZE" count=1 skip="$PART_INDEX" 2>/dev/null \
+      | openssl dgst -sha256 -binary | openssl base64 -A)
+    PART_CHECKSUMS=$(echo "$PART_CHECKSUMS" | jq --arg cs "$CHUNK_CS" '. + [$cs]')
+    PART_INDEX=$((PART_INDEX + 1))
+  done
+
   ARTIFACTS=$(echo "$ARTIFACTS" | jq \
     --arg id "$IMAGE_ID" \
     --arg name "$NAME" \
     --arg sz "$SIZE" \
     --arg sha "$SHA" \
     --arg p "$RAW_PATH" \
-    '. + [{{"image_id":$id,"name":$name,"size_bytes":($sz|tonumber),"sha256":$sha,"container_path":$p}}]')
+    --argjson pcs "$PART_CHECKSUMS" \
+    '. + [{{"image_id":$id,"name":$name,"size_bytes":($sz|tonumber),"sha256":$sha,"part_checksums":$pcs,"container_path":$p}}]')
 done <<< "$ARTIFACT_ENTRIES"
 
 if [ "$(echo "$ARTIFACTS" | jq 'length')" -eq 0 ]; then
@@ -1194,5 +1259,73 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{:.1} {}", size, UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_compute_sha256_with_parts_single_part() {
+        let mut f = NamedTempFile::new().unwrap();
+        let data = vec![0xABu8; 1024];
+        f.write_all(&data).unwrap();
+        f.flush().unwrap();
+
+        let (hex_hash, parts) = compute_sha256_with_parts(f.path()).unwrap();
+
+        // Single part for data smaller than PART_SIZE
+        assert_eq!(parts.len(), 1);
+        // Hex hash should be 64 chars
+        assert_eq!(hex_hash.len(), 64);
+        // Part checksum should be base64-encoded (44 chars for SHA-256)
+        assert_eq!(parts[0].len(), 44);
+    }
+
+    #[test]
+    fn test_compute_sha256_with_parts_multiple_parts() {
+        let mut f = NamedTempFile::new().unwrap();
+        // Write slightly more than one part (PART_SIZE + 1 byte)
+        let data = vec![0xCDu8; PART_SIZE as usize + 1];
+        f.write_all(&data).unwrap();
+        f.flush().unwrap();
+
+        let (hex_hash, parts) = compute_sha256_with_parts(f.path()).unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(hex_hash.len(), 64);
+        // The two parts should have different checksums (different data lengths)
+        assert_ne!(parts[0], parts[1]);
+    }
+
+    #[test]
+    fn test_compute_sha256_with_parts_whole_file_hash_matches() {
+        let mut f = NamedTempFile::new().unwrap();
+        let data = b"hello world checksum test";
+        f.write_all(data).unwrap();
+        f.flush().unwrap();
+
+        let (hex_hash, _parts) = compute_sha256_with_parts(f.path()).unwrap();
+
+        // Verify against independently computed hash
+        let expected = format!("{:x}", Sha256::digest(data));
+        assert_eq!(hex_hash, expected);
+    }
+
+    #[test]
+    fn test_compute_sha256_with_parts_part_checksum_matches_independent() {
+        let mut f = NamedTempFile::new().unwrap();
+        let data = vec![0x42u8; 512];
+        f.write_all(&data).unwrap();
+        f.flush().unwrap();
+
+        let (_hex_hash, parts) = compute_sha256_with_parts(f.path()).unwrap();
+
+        // Verify the part checksum matches an independently computed base64 SHA-256
+        let expected = BASE64_STANDARD.encode(Sha256::digest(&data));
+        assert_eq!(parts[0], expected);
     }
 }
