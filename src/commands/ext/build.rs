@@ -191,9 +191,9 @@ impl ExtBuildCommand {
             );
 
             if !validation.is_satisfied() {
-                validation
-                    .into_error(&format!("Cannot build extension '{}'", self.extension))
-                    .print_and_exit();
+                let err =
+                    validation.into_error(&format!("Cannot build extension '{}'", self.extension));
+                return Err(anyhow::anyhow!("{err}"));
             }
         }
 
