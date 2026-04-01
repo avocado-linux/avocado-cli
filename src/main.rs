@@ -45,6 +45,7 @@ use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
 use commands::initramfs::{InitramfsCleanCommand, InitramfsImageCommand, InitramfsInstallCommand};
 use commands::install::InstallCommand;
+use commands::load::LoadCommand;
 use commands::provision::ProvisionCommand;
 use commands::prune::PruneCommand;
 use commands::rootfs::{RootfsCleanCommand, RootfsImageCommand, RootfsInstallCommand};
@@ -53,6 +54,7 @@ use commands::runtime::{
     RuntimeDnfCommand, RuntimeInstallCommand, RuntimeListCommand, RuntimeProvisionCommand,
     RuntimeSignCommand,
 };
+use commands::save::SaveCommand;
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkPackageCommand, SdkRunCommand,
@@ -405,6 +407,45 @@ enum Commands {
         /// Perform a dry run without actually removing volumes
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Save the current build state to a compressed archive
+    Save {
+        /// Output file path (e.g. state.tar.gz)
+        #[arg(short, long)]
+        output: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker")]
+        container_tool: String,
+        /// Include the src_dir contents in the archive
+        #[arg(long)]
+        include_src: bool,
+    },
+    /// Load build state from a compressed archive
+    Load {
+        /// Input archive file path
+        #[arg(short, long)]
+        input: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker")]
+        container_tool: String,
+        /// Overwrite existing volume and config if present
+        #[arg(short, long)]
+        force: bool,
     },
     /// Unlock (remove lock entries for) sysroots to allow package updates
     Unlock {
@@ -1805,6 +1846,36 @@ async fn main() -> Result<()> {
         } => {
             let prune_cmd = PruneCommand::new(Some(container_tool), verbose, dry_run);
             prune_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Save {
+            output,
+            config,
+            verbose,
+            target,
+            container_tool,
+            include_src,
+        } => {
+            let save_cmd = SaveCommand::new(
+                output,
+                config,
+                target.or(cli.target),
+                verbose,
+                container_tool,
+                include_src,
+            );
+            save_cmd.execute().await?;
+            Ok(())
+        }
+        Commands::Load {
+            input,
+            config,
+            verbose,
+            container_tool,
+            force,
+        } => {
+            let load_cmd = LoadCommand::new(input, config, verbose, container_tool, force);
+            load_cmd.execute().await?;
             Ok(())
         }
         Commands::Unlock {
