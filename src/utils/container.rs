@@ -71,6 +71,91 @@ pub fn is_docker_desktop() -> bool {
     cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
+/// Ensure QEMU binfmt_misc is registered for cross-architecture container emulation.
+///
+/// When `--sdk-arch` specifies an architecture different from the host, Docker needs
+/// QEMU user-mode emulation via binfmt_misc to run the foreign-arch container.
+/// Docker Desktop (macOS/Windows) ships this pre-configured, but on Linux with
+/// Docker Engine the handlers must be registered explicitly.
+///
+/// This function checks `/proc/sys/fs/binfmt_misc/` for the required handler and,
+/// if missing, attempts to register it via the `tonistiigi/binfmt` image.
+pub async fn ensure_cross_arch_emulation(container_tool: &str, sdk_arch: &str) -> Result<()> {
+    let host_arch = std::env::consts::ARCH; // e.g. "x86_64", "aarch64"
+    let target_arch = match sdk_arch.to_lowercase().as_str() {
+        "aarch64" | "arm64" => "aarch64",
+        "x86-64" | "x86_64" | "amd64" => "x86_64",
+        _ => return Ok(()), // Unknown arch — let Docker handle (and fail) normally
+    };
+
+    // No emulation needed when host and target match
+    if host_arch == target_arch {
+        return Ok(());
+    }
+
+    // On Docker Desktop, QEMU is always available inside the Linux VM
+    if is_docker_desktop() {
+        return Ok(());
+    }
+
+    // Check if binfmt_misc handler is already registered
+    let binfmt_name = format!("qemu-{target_arch}");
+    let binfmt_path = format!("/proc/sys/fs/binfmt_misc/{binfmt_name}");
+    if Path::new(&binfmt_path).exists() {
+        return Ok(());
+    }
+
+    // Handler missing — try to register it
+    let docker_arch = match target_arch {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+
+    print_info(
+        &format!("Registering QEMU binfmt handler for {target_arch} emulation..."),
+        OutputLevel::Normal,
+    );
+
+    let output = AsyncCommand::new(container_tool)
+        .args([
+            "run",
+            "--privileged",
+            "--rm",
+            "tonistiigi/binfmt",
+            "--install",
+            docker_arch,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run binfmt registration container")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "Cross-architecture emulation requires QEMU binfmt_misc support, \
+             but no handler is registered for {target_arch}.\n\
+             Automatic registration failed. Please run manually:\n\n  \
+             {container_tool} run --privileged --rm tonistiigi/binfmt --install {docker_arch}\n\n\
+             Error: {stderr}"
+        ));
+    }
+
+    // Verify the handler is now present
+    if !Path::new(&binfmt_path).exists() {
+        return Err(anyhow::anyhow!(
+            "QEMU binfmt handler registration appeared to succeed but \
+             {binfmt_path} was not created.\n\
+             Please register manually:\n\n  \
+             {container_tool} run --privileged --rm tonistiigi/binfmt --install {docker_arch}\n"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Convert SDK arch specification to Docker platform format.
 ///
 /// # Arguments
@@ -404,6 +489,11 @@ impl SdkContainer {
         // Check if we should run on a remote host
         if let Some(ref runs_on) = config.runs_on {
             return self.run_in_container_remote(&config, runs_on).await;
+        }
+
+        // Ensure QEMU binfmt_misc is registered when cross-arch emulation is needed
+        if let Some(ref arch) = config.sdk_arch {
+            ensure_cross_arch_emulation(&self.container_tool, arch).await?;
         }
 
         // Get or create docker volume for persistent state
@@ -918,6 +1008,11 @@ impl SdkContainer {
 
     /// Run a command in the container and capture its output
     pub async fn run_in_container_with_output(&self, config: RunConfig) -> Result<Option<String>> {
+        // Ensure QEMU binfmt_misc is registered when cross-arch emulation is needed
+        if let Some(ref arch) = config.sdk_arch {
+            ensure_cross_arch_emulation(&self.container_tool, arch).await?;
+        }
+
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
