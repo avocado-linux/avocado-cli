@@ -61,11 +61,19 @@ jobs:
             suffix: .exe
 
     steps:
-      - name: install aws-lc-rs build pre-reqs for windows
-        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+      - name: Install build pre-reqs (Windows)
+        if: ${{ runner.os == 'Windows' }}
         run: |
-          choco install nasm -y
+          choco install nasm cmake -y
           echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install cmake (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: brew install cmake
+
+      - name: Install cmake (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo apt-get update && sudo apt-get install -y cmake
 
       - uses: actions/checkout@v4
 
