@@ -829,6 +829,260 @@ pub fn ensure_extension_overlay(
     Ok(default_overlay.to_string())
 }
 
+/// Remove the top-level `connect:` section from avocado.yaml.
+///
+/// Returns `true` if the section was found and removed.
+pub fn remove_connect_fields(config_path: &Path) -> Result<bool> {
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+    let (new_content, changed) = remove_connect_fields_in_yaml(&content);
+
+    if changed {
+        std::fs::write(config_path, &new_content)
+            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    }
+
+    Ok(changed)
+}
+
+/// Pure-function core for remove_connect_fields.
+fn remove_connect_fields_in_yaml(content: &str) -> (String, bool) {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Find connect: top-level key
+    let connect_line = lines.iter().enumerate().find(|(_, line)| {
+        let trimmed = line.trim();
+        trimmed.starts_with("connect:") && leading_spaces(line) == 0
+    });
+
+    let (idx, _) = match connect_line {
+        Some(pair) => pair,
+        None => return (content.to_string(), false),
+    };
+
+    // Find end of connect section (all indented children + trailing blanks)
+    let mut section_end = idx + 1;
+    for (i, line) in lines.iter().enumerate().skip(idx + 1) {
+        if line.trim().is_empty() || line.trim().starts_with('#') {
+            section_end = i + 1;
+            continue;
+        }
+        let indent = leading_spaces(line);
+        if indent == 0 {
+            break;
+        }
+        section_end = i + 1;
+    }
+
+    // Also consume blank lines immediately before connect:
+    let mut start = idx;
+    while start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+
+    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i >= start && i < section_end {
+            continue;
+        }
+        result_lines.push(line.to_string());
+    }
+
+    let mut out = result_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    (out, true)
+}
+
+/// Remove the `avocado-ext-connect-config` extension from avocado.yaml.
+///
+/// Removes the extension definition from the `extensions:` section and
+/// the `- avocado-ext-connect-config` entry from the specified runtime's
+/// `extensions:` list. Returns `true` if any changes were made.
+pub fn remove_connect_config_extension(config_path: &Path, runtime_name: &str) -> Result<bool> {
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+    let (new_content, changed) = remove_connect_config_extension_in_yaml(&content, runtime_name)?;
+
+    if changed {
+        std::fs::write(config_path, &new_content)
+            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    }
+
+    Ok(changed)
+}
+
+/// Pure-function core for remove_connect_config_extension.
+fn remove_connect_config_extension_in_yaml(
+    content: &str,
+    runtime_name: &str,
+) -> Result<(String, bool)> {
+    let mut result = content.to_string();
+    let mut changed = false;
+
+    let ext_name = "avocado-ext-connect-config";
+
+    // Step 1: Remove from runtime's extensions list
+    if has_runtime_extension_entry(&result, runtime_name, ext_name) {
+        result = remove_runtime_extension_entry(&result, runtime_name, ext_name)?;
+        changed = true;
+    }
+
+    // Step 2: Remove extension definition from extensions: section
+    if has_extension_definition(&result, ext_name) {
+        result = remove_extension_definition(&result, ext_name)?;
+        changed = true;
+    }
+
+    Ok((result, changed))
+}
+
+/// Remove an extension definition from the top-level `extensions:` section.
+fn remove_extension_definition(content: &str, ext_name: &str) -> Result<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let ext_section = find_top_level_key(&lines, "extensions")?;
+    let ext_indent = leading_spaces(lines[ext_section]);
+
+    // Find the named extension definition
+    let mut ext_line = None;
+    for (i, line) in lines.iter().enumerate().skip(ext_section + 1) {
+        if line.trim().is_empty() || line.trim().starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(line);
+        if indent <= ext_indent {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with(&format!("{ext_name}:"))
+            || trimmed.starts_with(&format!("\"{ext_name}\":"))
+        {
+            ext_line = Some(i);
+            break;
+        }
+    }
+
+    let ext_line = ext_line
+        .ok_or_else(|| anyhow::anyhow!("Extension '{ext_name}' not found in avocado.yaml"))?;
+    let ext_def_indent = leading_spaces(lines[ext_line]);
+
+    // Find end of this extension's block (all lines indented deeper)
+    let mut block_end = ext_line + 1;
+    for (i, line) in lines.iter().enumerate().skip(ext_line + 1) {
+        if line.trim().is_empty() || line.trim().starts_with('#') {
+            block_end = i + 1;
+            continue;
+        }
+        let indent = leading_spaces(line);
+        if indent <= ext_def_indent {
+            break;
+        }
+        block_end = i + 1;
+    }
+
+    // Consume blank lines before the extension definition
+    let mut start = ext_line;
+    while start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+
+    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i >= start && i < block_end {
+            continue;
+        }
+        result_lines.push(line.to_string());
+    }
+
+    let mut out = result_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Remove an extension entry from a runtime's `extensions:` list.
+fn remove_runtime_extension_entry(
+    content: &str,
+    runtime_name: &str,
+    ext_name: &str,
+) -> Result<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let rt_section = find_top_level_key(&lines, "runtimes")?;
+    let rt_indent = leading_spaces(lines[rt_section]);
+
+    // Find the named runtime
+    let mut runtime_line = None;
+    for (i, line) in lines.iter().enumerate().skip(rt_section + 1) {
+        if line.trim().is_empty() || line.trim().starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(line);
+        if indent <= rt_indent {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with(&format!("{runtime_name}:")) {
+            runtime_line = Some(i);
+            break;
+        }
+    }
+
+    let runtime_line = runtime_line
+        .ok_or_else(|| anyhow::anyhow!("Runtime '{runtime_name}' not found in avocado.yaml"))?;
+    let runtime_indent = leading_spaces(lines[runtime_line]);
+
+    // Find extensions: list within this runtime
+    let mut ext_list_line = None;
+    for (i, line) in lines.iter().enumerate().skip(runtime_line + 1) {
+        if line.trim().is_empty() || line.trim().starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(line);
+        if indent <= runtime_indent {
+            break;
+        }
+        if line.trim() == "extensions:" {
+            ext_list_line = Some(i);
+            break;
+        }
+    }
+
+    let ext_list_line = ext_list_line.ok_or_else(|| {
+        anyhow::anyhow!("No 'extensions:' list found in runtime '{runtime_name}'")
+    })?;
+    let list_indent = leading_spaces(lines[ext_list_line]);
+
+    // Find and remove the matching entry
+    let target = format!("- {ext_name}");
+    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    for (i, line) in lines.iter().enumerate() {
+        if i > ext_list_line {
+            let indent = leading_spaces(line);
+            if !line.trim().is_empty() && !line.trim().starts_with('#') && indent <= list_indent {
+                // Past the extensions list — just copy
+                result_lines.push(line.to_string());
+                continue;
+            }
+            if line.trim() == target {
+                continue; // skip this entry
+            }
+        }
+        result_lines.push(line.to_string());
+    }
+
+    let mut out = result_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Set connect fields (org, project, server_key) in avocado.yaml.
 ///
 /// If a `connect:` section already exists, updates fields in place.
@@ -1304,5 +1558,134 @@ extensions:
         // File should now contain overlay:
         let after = std::fs::read_to_string(tmp.path()).unwrap();
         assert!(after.contains("overlay: overlay"));
+    }
+
+    #[test]
+    fn test_remove_connect_fields_present() {
+        let config = r#"sdk:
+  image: docker.io/avocadolinux/sdk:latest
+
+connect:
+  org: 019d2097-a017-733e-a67f-edbafaa7eee9
+  project: 019d2097-a11a-798d-9a3e-e8c624495567
+  server_key: 463d217f9c292dc4d36cdc86d19a6e7074f7ca71e1a8bcf084d7a1c5df0f5e75
+"#;
+        let (result, changed) = remove_connect_fields_in_yaml(config);
+        assert!(changed);
+        assert!(!result.contains("connect:"));
+        assert!(!result.contains("server_key"));
+        assert!(result.contains("sdk:"));
+    }
+
+    #[test]
+    fn test_remove_connect_fields_absent() {
+        let config = r#"sdk:
+  image: docker.io/avocadolinux/sdk:latest
+"#;
+        let (result, changed) = remove_connect_fields_in_yaml(config);
+        assert!(!changed);
+        assert_eq!(result, config);
+    }
+
+    #[test]
+    fn test_remove_connect_fields_at_end_of_file() {
+        let config = r#"runtimes:
+  dev:
+    packages:
+      avocado-runtime: '*'
+
+connect:
+  org: abc
+  project: def
+  server_key: ghi
+"#;
+        let (result, changed) = remove_connect_fields_in_yaml(config);
+        assert!(changed);
+        assert!(!result.contains("connect:"));
+        assert!(result.contains("runtimes:"));
+        // Should not have excessive trailing whitespace
+        assert!(!result.ends_with("\n\n\n"));
+    }
+
+    #[test]
+    fn test_remove_connect_config_extension() {
+        let config = r#"runtimes:
+  dev:
+    extensions:
+      - avocado-ext-dev
+      - avocado-ext-connect-config
+      - avocado-ext-connect
+      - avocado-ext-tunnels
+    packages:
+      avocado-runtime: '*'
+
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: '*'
+
+  avocado-ext-connect-config:
+    types:
+      - confext
+    version: "0.1.0"
+    overlay: overlay
+
+  avocado-ext-connect:
+    source:
+      type: package
+      version: "*"
+
+  avocado-ext-tunnels:
+    source:
+      type: package
+      version: "*"
+"#;
+        let (result, changed) =
+            remove_connect_config_extension_in_yaml(config, "dev").unwrap();
+        assert!(changed);
+        // Extension definition removed
+        assert!(!result.contains("avocado-ext-connect-config"));
+        // Other extensions preserved
+        assert!(result.contains("avocado-ext-connect:"));
+        assert!(result.contains("avocado-ext-tunnels:"));
+        assert!(result.contains("avocado-ext-dev:"));
+        // Runtime list entry removed
+        assert!(!result.contains("- avocado-ext-connect-config"));
+        assert!(result.contains("- avocado-ext-connect"));
+        assert!(result.contains("- avocado-ext-tunnels"));
+    }
+
+    #[test]
+    fn test_remove_connect_config_extension_not_present() {
+        let config = r#"runtimes:
+  dev:
+    extensions:
+      - avocado-ext-dev
+      - avocado-ext-connect
+      - avocado-ext-tunnels
+    packages:
+      avocado-runtime: '*'
+
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: '*'
+
+  avocado-ext-connect:
+    source:
+      type: package
+      version: "*"
+
+  avocado-ext-tunnels:
+    source:
+      type: package
+      version: "*"
+"#;
+        let (result, changed) =
+            remove_connect_config_extension_in_yaml(config, "dev").unwrap();
+        assert!(!changed);
+        assert_eq!(result, config);
     }
 }

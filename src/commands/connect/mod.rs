@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod claim_tokens;
+pub mod clean;
 pub mod client;
 pub mod cohorts;
 pub mod deploy;

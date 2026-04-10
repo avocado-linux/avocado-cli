@@ -22,6 +22,7 @@ use commands::connect::deploy::ConnectDeployCommand;
 use commands::connect::devices::{
     ConnectDevicesCreateCommand, ConnectDevicesDeleteCommand, ConnectDevicesListCommand,
 };
+use commands::connect::clean::ConnectCleanCommand;
 use commands::connect::init::ConnectInitCommand;
 use commands::connect::keys::{
     ConnectKeysApproveCommand, ConnectKeysListCommand, ConnectKeysRegisterCommand,
@@ -508,6 +509,15 @@ enum ConnectCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+    },
+    /// Remove connect configuration (connect section, connect-config extension, and device config overlay)
+    Clean {
+        /// Runtime to remove connect-config extension from (default: dev)
+        #[arg(short, long, default_value = "dev")]
+        runtime: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
     },
     /// Manage organizations
     Orgs {
@@ -2707,6 +2717,14 @@ async fn main() -> Result<()> {
                     profile,
                 };
                 cmd.execute().await?;
+                Ok(())
+            }
+            ConnectCommands::Clean { runtime, config } => {
+                let cmd = ConnectCleanCommand {
+                    runtime,
+                    config_path: config,
+                };
+                cmd.execute()?;
                 Ok(())
             }
             ConnectCommands::Orgs { command } => match command {
