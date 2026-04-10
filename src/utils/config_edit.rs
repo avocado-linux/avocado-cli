@@ -1641,8 +1641,7 @@ extensions:
       type: package
       version: "*"
 "#;
-        let (result, changed) =
-            remove_connect_config_extension_in_yaml(config, "dev").unwrap();
+        let (result, changed) = remove_connect_config_extension_in_yaml(config, "dev").unwrap();
         assert!(changed);
         // Extension definition removed
         assert!(!result.contains("avocado-ext-connect-config"));
@@ -1683,8 +1682,7 @@ extensions:
       type: package
       version: "*"
 "#;
-        let (result, changed) =
-            remove_connect_config_extension_in_yaml(config, "dev").unwrap();
+        let (result, changed) = remove_connect_config_extension_in_yaml(config, "dev").unwrap();
         assert!(!changed);
         assert_eq!(result, config);
     }

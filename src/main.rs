@@ -15,6 +15,7 @@ use commands::connect::auth::{
 use commands::connect::claim_tokens::{
     ConnectClaimTokensCreateCommand, ConnectClaimTokensDeleteCommand, ConnectClaimTokensListCommand,
 };
+use commands::connect::clean::ConnectCleanCommand;
 use commands::connect::cohorts::{
     ConnectCohortsCreateCommand, ConnectCohortsDeleteCommand, ConnectCohortsListCommand,
 };
@@ -22,7 +23,6 @@ use commands::connect::deploy::ConnectDeployCommand;
 use commands::connect::devices::{
     ConnectDevicesCreateCommand, ConnectDevicesDeleteCommand, ConnectDevicesListCommand,
 };
-use commands::connect::clean::ConnectCleanCommand;
 use commands::connect::init::ConnectInitCommand;
 use commands::connect::keys::{
     ConnectKeysApproveCommand, ConnectKeysListCommand, ConnectKeysRegisterCommand,

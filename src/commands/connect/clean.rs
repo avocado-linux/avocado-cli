@@ -25,7 +25,10 @@ impl ConnectCleanCommand {
         // 1. Remove connect: section from avocado.yaml
         match config_edit::remove_connect_fields(config_path) {
             Ok(true) => {
-                print_success("Removed connect section from avocado.yaml.", OutputLevel::Normal);
+                print_success(
+                    "Removed connect section from avocado.yaml.",
+                    OutputLevel::Normal,
+                );
                 any_changes = true;
             }
             Ok(false) => {
