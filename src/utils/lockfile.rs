@@ -809,9 +809,8 @@ impl LockFile {
 /// Parse rpm -q output into a map of package names to versions
 /// Expected format: "NAME VERSION-RELEASE.ARCH" per line
 ///
-/// For SDK packages, we strip the architecture suffix to make the lock file portable
-/// across different host architectures (x86_64, aarch64, etc.)
-pub fn parse_rpm_query_output(output: &str, strip_arch: bool) -> HashMap<String, String> {
+/// Returns a map of package name -> full version string (including architecture suffix).
+pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
     let mut result = HashMap::new();
 
     for line in output.lines() {
@@ -842,19 +841,7 @@ pub fn parse_rpm_query_output(output: &str, strip_arch: bool) -> HashMap<String,
                 continue;
             }
 
-            let version_to_store = if strip_arch {
-                // Strip the architecture suffix (.ARCH) from the version
-                // Format: VERSION-RELEASE.ARCH -> VERSION-RELEASE
-                if let Some(idx) = version.rfind('.') {
-                    version[..idx].to_string()
-                } else {
-                    version.to_string()
-                }
-            } else {
-                version.to_string()
-            };
-
-            result.insert(name.to_string(), version_to_store);
+            result.insert(name.to_string(), version.to_string());
         }
     }
 
@@ -975,8 +962,7 @@ package-xyz is not installed
 wget 1.21-r0.core2_64
 "#;
 
-        // Test without stripping architecture
-        let result = parse_rpm_query_output(output, false);
+        let result = parse_rpm_query_output(output);
         assert_eq!(result.len(), 3);
         assert_eq!(result.get("curl"), Some(&"7.88.1-r0.core2_64".to_string()));
         assert_eq!(
@@ -985,16 +971,6 @@ wget 1.21-r0.core2_64
         );
         assert_eq!(result.get("wget"), Some(&"1.21-r0.core2_64".to_string()));
         assert_eq!(result.get("package-xyz"), None);
-
-        // Test with stripping architecture (for SDK packages)
-        let result_stripped = parse_rpm_query_output(output, true);
-        assert_eq!(result_stripped.len(), 3);
-        assert_eq!(result_stripped.get("curl"), Some(&"7.88.1-r0".to_string()));
-        assert_eq!(
-            result_stripped.get("openssl"),
-            Some(&"3.0.8-r0".to_string())
-        );
-        assert_eq!(result_stripped.get("wget"), Some(&"1.21-r0".to_string()));
     }
 
     #[test]
@@ -1281,24 +1257,22 @@ wget 1.21-r0.core2_64
     #[test]
     fn test_parse_rpm_query_output_edge_cases() {
         // Empty output
-        let result = parse_rpm_query_output("", false);
+        let result = parse_rpm_query_output("");
         assert!(result.is_empty());
 
         // Whitespace only
-        let result = parse_rpm_query_output("   \n  \n  ", false);
+        let result = parse_rpm_query_output("   \n  \n  ");
         assert!(result.is_empty());
 
         // Only "not installed" messages
-        let result = parse_rpm_query_output(
-            "package-a is not installed\npackage-b is not installed",
-            false,
-        );
+        let result =
+            parse_rpm_query_output("package-a is not installed\npackage-b is not installed");
         assert!(result.is_empty());
 
         // Mixed valid and invalid
         let output =
             "valid-pkg 1.0.0-r0.x86_64\nbad-pkg is not installed\nanother-pkg 2.0.0-r0.x86_64";
-        let result = parse_rpm_query_output(output, false);
+        let result = parse_rpm_query_output(output);
         assert_eq!(result.len(), 2);
         assert!(result.contains_key("valid-pkg"));
         assert!(result.contains_key("another-pkg"));
@@ -1318,7 +1292,7 @@ wget 1.21-r0.core2_64
 [WARNING] Warning message
 "#;
 
-        let result = parse_rpm_query_output(output, false);
+        let result = parse_rpm_query_output(output);
         assert_eq!(result.len(), 3);
         assert_eq!(result.get("curl"), Some(&"7.88.1-r0.core2_64".to_string()));
         assert_eq!(
@@ -1335,42 +1309,26 @@ wget 1.21-r0.core2_64
     }
 
     #[test]
-    fn test_parse_rpm_query_output_strips_arch_for_sdk() {
-        // Test SDK package output with architecture stripping
+    fn test_parse_rpm_query_output_preserves_full_version_for_sdk() {
+        // SDK package versions should be preserved in full (including architecture suffix)
+        // since SDK packages are already nested per host architecture in the lock file
         let output = r#"nativesdk-curl 7.88.1-r0.x86_64_avocadosdk
 nativesdk-openssl 3.0.8-r0.x86_64_avocadosdk
 avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 "#;
 
-        // With strip_arch=true (for SDK packages)
-        let result_stripped = parse_rpm_query_output(output, true);
-        assert_eq!(result_stripped.len(), 3);
+        let result = parse_rpm_query_output(output);
+        assert_eq!(result.len(), 3);
         assert_eq!(
-            result_stripped.get("nativesdk-curl"),
-            Some(&"7.88.1-r0".to_string())
-        );
-        assert_eq!(
-            result_stripped.get("nativesdk-openssl"),
-            Some(&"3.0.8-r0".to_string())
-        );
-        assert_eq!(
-            result_stripped.get("avocado-sdk-toolchain"),
-            Some(&"0.1.0-r0".to_string())
-        );
-
-        // With strip_arch=false (for non-SDK packages)
-        let result_full = parse_rpm_query_output(output, false);
-        assert_eq!(result_full.len(), 3);
-        assert_eq!(
-            result_full.get("nativesdk-curl"),
+            result.get("nativesdk-curl"),
             Some(&"7.88.1-r0.x86_64_avocadosdk".to_string())
         );
         assert_eq!(
-            result_full.get("nativesdk-openssl"),
+            result.get("nativesdk-openssl"),
             Some(&"3.0.8-r0.x86_64_avocadosdk".to_string())
         );
         assert_eq!(
-            result_full.get("avocado-sdk-toolchain"),
+            result.get("avocado-sdk-toolchain"),
             Some(&"0.1.0-r0.x86_64_avocadosdk".to_string())
         );
     }

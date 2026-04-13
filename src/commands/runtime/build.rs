@@ -1356,12 +1356,101 @@ echo "Provisioned update authority: metadata/root.json""#
             (None, false) => unreachable!("dev signing key should have been auto-generated above"),
         };
 
-        // Extension list from runtime config (used by var_files and docker priming)
+        // Extension list from runtime config (used by var_files, docker priming, and subvolumes)
         let ext_list: Vec<&str> = merged_runtime
             .get("extensions")
             .and_then(|e| e.as_sequence())
             .map(|seq| seq.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
+
+        // Resolve subvolumes from extensions + runtime config
+        let (resolved_subvolumes, subvol_warnings) =
+            crate::utils::config::resolve_subvolumes(&ext_list, parsed, &merged_runtime)?;
+
+        // Generate subvolume-related script sections
+        let subvol_warnings_section = if subvol_warnings.is_empty() {
+            String::new()
+        } else {
+            subvol_warnings
+                .iter()
+                .map(|w| format!("echo \"WARNING: {w}\""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Generate mkdir commands for subvolume paths
+        let subvol_mkdir_section = resolved_subvolumes
+            .iter()
+            .map(|s| format!("mkdir -p \"$VAR_DIR/{}\"", s.path))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Generate mkfs.btrfs --subvol flags
+        let subvol_flags: Vec<String> = resolved_subvolumes
+            .iter()
+            .map(|s| {
+                let mode = if s.writable { "rw" } else { "ro" };
+                format!("    --subvol {}:{}", mode, s.path)
+            })
+            .collect();
+
+        // Generate --inode-flags for nodatacow subvolumes
+        let nodatacow_flags: Vec<String> = resolved_subvolumes
+            .iter()
+            .filter(|s| s.nodatacow)
+            .map(|s| format!("    --inode-flags nodatacow:{}", s.path))
+            .collect();
+
+        let mkfs_flags = [subvol_flags, nodatacow_flags].concat().join(" \\\n");
+
+        // Generate post-creation section for compression and quotas
+        let needs_post_creation = resolved_subvolumes
+            .iter()
+            .any(|s| s.compression.is_some() || s.quota.is_some());
+
+        let post_creation_section = if needs_post_creation {
+            let mut commands = vec![
+                "# Post-creation: set per-subvolume compression and quotas".to_string(),
+                "LOOP_DEV=$(losetup --find --show \"$VAR_IMAGE\")".to_string(),
+                "mkdir -p /tmp/btrfs-var-setup".to_string(),
+                "mount -t btrfs \"$LOOP_DEV\" /tmp/btrfs-var-setup".to_string(),
+            ];
+
+            // Per-subvolume compression properties
+            for s in &resolved_subvolumes {
+                if let Some(ref comp) = s.compression {
+                    if comp != "no" {
+                        commands.push(format!(
+                            "btrfs property set /tmp/btrfs-var-setup/{} compression {}",
+                            s.path, comp
+                        ));
+                    }
+                }
+            }
+
+            // Quotas (only if any subvolume has a quota)
+            let has_quotas = resolved_subvolumes.iter().any(|s| s.quota.is_some());
+            if has_quotas {
+                commands.push("btrfs quota enable /tmp/btrfs-var-setup".to_string());
+                for s in &resolved_subvolumes {
+                    if let Some(ref quota) = s.quota {
+                        if quota != "none" {
+                            commands.push(format!(
+                                "btrfs qgroup limit {} /tmp/btrfs-var-setup/{}",
+                                quota, s.path
+                            ));
+                        }
+                    }
+                }
+            }
+
+            commands.push("umount /tmp/btrfs-var-setup".to_string());
+            commands.push("losetup -d \"$LOOP_DEV\"".to_string());
+            commands.push("echo \"Applied btrfs subvolume properties.\"".to_string());
+            commands.join("\n")
+        } else {
+            String::new()
+        };
 
         // Build var_files section: apply extension var_files to var staging in reverse order
         // (last in extensions list applied first = lowest priority, first applied last = wins conflicts)
@@ -1583,6 +1672,8 @@ RUNTIME_VERSION="{runtime_version}"
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/images"
 mkdir -p "$VAR_DIR/lib/avocado/runtimes"
+{subvol_mkdir_section}
+{subvol_warnings_section}
 
 OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
@@ -1634,10 +1725,12 @@ echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
 _PROGRESS_PID=$!
 
 mkfs.btrfs -r "$VAR_DIR" \
-    --subvol rw:lib/avocado \
+{mkfs_flags} \
     -f "$VAR_IMAGE"
 
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
+
+{post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
 FINAL_MB=$(( FINAL_SIZE / 1048576 ))
 echo ""
@@ -1742,6 +1835,10 @@ PYEOF
             copy_section = copy_section,
             rootfs_build_section = rootfs_build_section,
             initramfs_build_section = initramfs_build_section,
+            subvol_mkdir_section = subvol_mkdir_section,
+            subvol_warnings_section = subvol_warnings_section,
+            mkfs_flags = mkfs_flags,
+            post_creation_section = post_creation_section,
             var_files_section = var_files_section,
             runtime_var_files_section = runtime_var_files_section,
             manifest_section = manifest_section,

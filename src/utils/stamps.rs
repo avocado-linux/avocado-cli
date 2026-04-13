@@ -950,6 +950,13 @@ pub fn compute_ext_input_hash_with_fs(
                 var_files.clone(),
             );
         }
+        // Include subvolumes as they affect var image creation flags
+        if let Some(subvolumes) = ext.get("subvolumes") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.subvolumes")),
+                subvolumes.clone(),
+            );
+        }
         // Include image config as it determines output format and kabtool args
         if let Some(image) = ext.get("image") {
             hash_data.insert(
@@ -1069,6 +1076,14 @@ pub fn compute_runtime_input_hash(
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.var_files")),
             var_files.clone(),
+        );
+    }
+
+    // Include runtime-level var config (subvolumes, compression) if specified
+    if let Some(var) = merged_runtime.get("var") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.var")),
+            var.clone(),
         );
     }
 
@@ -2750,6 +2765,79 @@ var_files:
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
             "Adding var_files should change the runtime input hash"
+        );
+    }
+
+    #[test]
+    fn test_ext_input_hash_includes_subvolumes() {
+        let config_without: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    version: "1.0.0"
+    types: [sysext]
+    packages:
+      foo: "*"
+"#,
+        )
+        .unwrap();
+
+        let config_with: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    version: "1.0.0"
+    types: [sysext]
+    packages:
+      foo: "*"
+    subvolumes:
+      lib/docker:
+        nodatacow: true
+        quota: "10G"
+"#,
+        )
+        .unwrap();
+
+        let hash_without = compute_ext_input_hash(&config_without, "my-ext").unwrap();
+        let hash_with = compute_ext_input_hash(&config_with, "my-ext").unwrap();
+
+        assert_ne!(
+            hash_without.config_hash, hash_with.config_hash,
+            "Adding subvolumes should change the ext input hash"
+        );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_includes_var_config() {
+        let runtime_without: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+"#,
+        )
+        .unwrap();
+
+        let runtime_with: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+var:
+  compression: zstd
+  subvolumes:
+    lib/avocado:
+      quota: "500M"
+"#,
+        )
+        .unwrap();
+
+        let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let hash_without =
+            compute_runtime_input_hash(&runtime_without, "dev", &empty_parsed).unwrap();
+        let hash_with = compute_runtime_input_hash(&runtime_with, "dev", &empty_parsed).unwrap();
+
+        assert_ne!(
+            hash_without.config_hash, hash_with.config_hash,
+            "Adding var config should change the runtime input hash"
         );
     }
 }

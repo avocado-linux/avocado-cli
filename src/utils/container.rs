@@ -1215,9 +1215,7 @@ impl SdkContainer {
 
         match output {
             Some(output) => {
-                // For SDK sysroots, strip architecture from version string (but arch is tracked in sysroot key)
-                let strip_arch = matches!(sysroot, crate::utils::lockfile::SysrootType::Sdk(_));
-                let versions = crate::utils::lockfile::parse_rpm_query_output(&output, strip_arch);
+                let versions = crate::utils::lockfile::parse_rpm_query_output(&output);
                 if self.verbose {
                     print_info(
                         &format!(

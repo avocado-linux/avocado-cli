@@ -401,6 +401,8 @@ pub struct RuntimeConfig {
     /// Optional kernel configuration. When omitted, the avocado-runtime meta-package
     /// handles kernel provisioning via avocado-img-bootfiles (legacy behavior).
     pub kernel: Option<KernelConfig>,
+    /// Var partition configuration: default compression, subvolume definitions.
+    pub var: Option<VarConfig>,
 }
 
 /// SDK configuration section
@@ -569,6 +571,306 @@ pub struct DockerImageRef {
 pub struct VarFileMapping {
     pub source: String,
     pub dest: String,
+}
+
+/// Var partition configuration for a runtime.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct VarConfig {
+    /// Default compression for all subvolumes when not set per-subvolume.
+    /// Valid values: "no", "zstd", "zstd:3", "lzo", "zlib", "zlib:6", etc.
+    pub compression: Option<String>,
+    /// Subvolumes keyed by path relative to var root (e.g. "lib/mydata").
+    pub subvolumes: Option<HashMap<String, SubvolumeEntry>>,
+}
+
+/// A subvolume entry supporting shorthand and full forms.
+///
+/// Shorthand: `true` means rw with defaults, `false` means disabled.
+/// String shorthand: `"ro"` means read-only with defaults.
+/// Full form: a `SubvolumeConfig` object with all options.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SubvolumeEntry {
+    /// Shorthand: `true` = rw with defaults, `false` = disabled
+    Bool(bool),
+    /// Shorthand: "ro" = read-only with defaults
+    String(String),
+    /// Full configuration object
+    Full(SubvolumeConfig),
+}
+
+impl SubvolumeEntry {
+    /// Normalize any shorthand form into a full SubvolumeConfig.
+    pub fn to_config(&self) -> SubvolumeConfig {
+        match self {
+            SubvolumeEntry::Bool(true) => SubvolumeConfig {
+                writable: Some(true),
+                ..Default::default()
+            },
+            SubvolumeEntry::Bool(false) => SubvolumeConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            SubvolumeEntry::String(s) if s == "ro" => SubvolumeConfig {
+                writable: Some(false),
+                ..Default::default()
+            },
+            SubvolumeEntry::String(_) => SubvolumeConfig {
+                writable: Some(true),
+                ..Default::default()
+            },
+            SubvolumeEntry::Full(config) => config.clone(),
+        }
+    }
+}
+
+/// Full configuration for a single btrfs subvolume.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SubvolumeConfig {
+    /// Whether the subvolume is writable (default: true).
+    pub writable: Option<bool>,
+    /// Compression algorithm: "no", "zstd", "zstd:3", "lzo", "zlib:6", etc.
+    /// When not set, inherits from the runtime's `var.compression` or none.
+    pub compression: Option<String>,
+    /// Set NOCOW inode flag (default: false). Useful for databases, VM images.
+    pub nodatacow: Option<bool>,
+    /// Qgroup size limit, e.g. "500M", "5G", "none". Default: none.
+    pub quota: Option<String>,
+    /// Whether this subvolume is enabled (default: true).
+    /// Set to false to suppress an extension-declared subvolume from the runtime.
+    pub enabled: Option<bool>,
+}
+
+impl SubvolumeConfig {
+    /// Deep-merge another config on top of this one (other wins for set fields).
+    pub fn merge_over(&self, other: &SubvolumeConfig) -> SubvolumeConfig {
+        SubvolumeConfig {
+            writable: other.writable.or(self.writable),
+            compression: other.compression.clone().or(self.compression.clone()),
+            nodatacow: other.nodatacow.or(self.nodatacow),
+            quota: other.quota.clone().or(self.quota.clone()),
+            enabled: other.enabled.or(self.enabled),
+        }
+    }
+
+    /// Returns true if this subvolume is enabled (default: true).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Returns true if this subvolume is writable (default: true).
+    pub fn is_writable(&self) -> bool {
+        self.writable.unwrap_or(true)
+    }
+
+    /// Returns true if NOCOW is set.
+    pub fn is_nodatacow(&self) -> bool {
+        self.nodatacow.unwrap_or(false)
+    }
+}
+
+/// A fully resolved subvolume ready for mkfs.btrfs flag generation.
+#[derive(Debug, Clone)]
+pub struct ResolvedSubvolume {
+    pub path: String,
+    pub writable: bool,
+    pub compression: Option<String>,
+    pub nodatacow: bool,
+    pub quota: Option<String>,
+}
+
+/// Extract subvolumes map from an extension config value.
+/// Normalizes shorthand forms into SubvolumeConfig.
+/// Returns an empty HashMap if no subvolumes are configured.
+pub fn get_ext_subvolumes(ext_config: &serde_yaml::Value) -> HashMap<String, SubvolumeConfig> {
+    let Some(subvols) = ext_config.get("subvolumes").and_then(|v| v.as_mapping()) else {
+        return HashMap::new();
+    };
+    subvols
+        .iter()
+        .filter_map(|(key, value)| {
+            let path = key.as_str()?.to_string();
+            let entry: SubvolumeEntry = serde_yaml::from_value(value.clone()).ok()?;
+            Some((path, entry.to_config()))
+        })
+        .collect()
+}
+
+/// Extract var config from a runtime config value.
+/// Returns the default compression and subvolumes map from the runtime's `var` section.
+fn get_runtime_var_config(
+    merged_runtime: &serde_yaml::Value,
+) -> (Option<String>, HashMap<String, SubvolumeConfig>) {
+    let Some(var) = merged_runtime.get("var") else {
+        return (None, HashMap::new());
+    };
+    let default_compression = var
+        .get("compression")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let subvolumes = var
+        .get("subvolumes")
+        .and_then(|v| v.as_mapping())
+        .map(|mapping| {
+            mapping
+                .iter()
+                .filter_map(|(key, value)| {
+                    let path = key.as_str()?.to_string();
+                    let entry: SubvolumeEntry = serde_yaml::from_value(value.clone()).ok()?;
+                    Some((path, entry.to_config()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (default_compression, subvolumes)
+}
+
+/// Resolve subvolumes from extensions + runtime into a final list.
+///
+/// Returns `(resolved_subvolumes, warnings)`.
+///
+/// Merge order:
+/// 1. Built-in implicit `lib/avocado` (writable: true)
+/// 2. Extension subvolumes (first-listed extension wins on path conflicts)
+/// 3. Runtime `var.subvolumes` deep-merges on top (always wins)
+/// 4. Partition-level `var.compression` applied as default
+/// 5. `enabled: false` subvolumes filtered out
+///
+/// Warnings are emitted for:
+/// - Exact path conflicts between extensions (first wins, others skipped)
+/// - Nested subvolume paths (parent/child quota isolation)
+///   Paths explicitly declared in runtime `var.subvolumes` suppress warnings.
+pub fn resolve_subvolumes(
+    ext_list: &[&str],
+    parsed: &serde_yaml::Value,
+    merged_runtime: &serde_yaml::Value,
+) -> Result<(Vec<ResolvedSubvolume>, Vec<String>)> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Step 1: Start with the built-in implicit lib/avocado subvolume
+    let mut merged: HashMap<String, SubvolumeConfig> = HashMap::new();
+    merged.insert(
+        "lib/avocado".to_string(),
+        SubvolumeConfig {
+            writable: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // Track which extension claimed each path (for conflict warnings)
+    let mut path_owners: HashMap<String, String> = HashMap::new();
+    path_owners.insert("lib/avocado".to_string(), "(built-in)".to_string());
+
+    // Step 2: Collect from extensions in list order; first-listed wins
+    let (default_compression, runtime_subvolumes) = get_runtime_var_config(merged_runtime);
+    let runtime_paths: std::collections::HashSet<&String> = runtime_subvolumes.keys().collect();
+
+    for ext_name in ext_list {
+        let ext_subvols = parsed
+            .get("extensions")
+            .and_then(|e| e.get(*ext_name))
+            .map(get_ext_subvolumes)
+            .unwrap_or_default();
+
+        for (path, config) in ext_subvols {
+            if let Some(owner) = path_owners.get(&path) {
+                // Exact path conflict -- emit warning unless runtime resolves it
+                if !runtime_paths.contains(&path) {
+                    warnings.push(format!(
+                        "extensions '{}' and '{}' both declare subvolume '{}'; \
+                         using config from '{}' (listed first in runtime)",
+                        ext_name, owner, path, owner
+                    ));
+                }
+            } else {
+                // First extension to claim this path
+                if merged.contains_key(&path) {
+                    // Path exists from built-in -- extension overrides built-in defaults
+                    let existing = merged.get(&path).unwrap();
+                    merged.insert(path.clone(), existing.merge_over(&config));
+                } else {
+                    merged.insert(path.clone(), config);
+                }
+                path_owners.insert(path.clone(), ext_name.to_string());
+            }
+        }
+    }
+
+    // Step 3: Runtime var.subvolumes deep-merges on top (always wins)
+    for (path, runtime_config) in &runtime_subvolumes {
+        if let Some(existing) = merged.get(path) {
+            merged.insert(path.clone(), existing.merge_over(runtime_config));
+        } else {
+            merged.insert(path.clone(), runtime_config.clone());
+        }
+    }
+
+    // Step 4: Apply partition-level default compression
+    if let Some(ref default_comp) = default_compression {
+        for config in merged.values_mut() {
+            if config.compression.is_none() && config.is_enabled() {
+                config.compression = Some(default_comp.clone());
+            }
+        }
+    }
+
+    // Step 5: Check for nested path overlaps (warn about quota isolation)
+    let enabled_paths: Vec<String> = merged
+        .iter()
+        .filter(|(_, c)| c.is_enabled())
+        .map(|(p, _)| p.clone())
+        .collect();
+    for i in 0..enabled_paths.len() {
+        for j in (i + 1)..enabled_paths.len() {
+            let (a, b) = (&enabled_paths[i], &enabled_paths[j]);
+            let nested = if b.starts_with(&format!("{}/", a)) {
+                Some((a, b))
+            } else if a.starts_with(&format!("{}/", b)) {
+                Some((b, a))
+            } else {
+                None
+            };
+            if let Some((parent, child)) = nested {
+                // Suppress if runtime explicitly declared the child
+                if !runtime_paths.contains(child) {
+                    warnings.push(format!(
+                        "subvolume '{}' is nested inside '{}'; \
+                         quota on parent will not cover child subvolume",
+                        child, parent
+                    ));
+                }
+            }
+        }
+    }
+
+    // Step 6: Filter out disabled subvolumes and sort by path for deterministic output
+    let mut resolved: Vec<ResolvedSubvolume> = merged
+        .into_iter()
+        .filter(|(_, config)| config.is_enabled())
+        .map(|(path, config)| {
+            let writable = config.is_writable();
+            let nodatacow = config.is_nodatacow();
+            ResolvedSubvolume {
+                path,
+                writable,
+                compression: config.compression,
+                nodatacow,
+                quota: config.quota,
+            }
+        })
+        .collect();
+    resolved.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Validate: lib/avocado must not be disabled
+    if !resolved.iter().any(|s| s.path == "lib/avocado") {
+        return Err(anyhow::anyhow!(
+            "subvolume 'lib/avocado' cannot be disabled; it is required for manifest and images"
+        ));
+    }
+
+    Ok((resolved, warnings))
 }
 
 /// Extract var_files glob patterns from an extension config value.
@@ -1434,6 +1736,7 @@ impl Config {
                                 "stone_manifest",
                                 "signing",
                                 "var_files",
+                                "var",
                             ]
                             .contains(&key_str)
                             {
@@ -1483,6 +1786,7 @@ impl Config {
                                 "overlay",
                                 "var_files",
                                 "docker_images",
+                                "subvolumes",
                             ]
                             .contains(&key_str)
                             {
@@ -8269,5 +8573,408 @@ var_files:
         let yaml: serde_yaml::Value = serde_yaml::from_str("extensions: [base]").unwrap();
         let result = get_runtime_var_files(&yaml);
         assert!(result.is_empty());
+    }
+
+    // --- Subvolume tests ---
+
+    #[test]
+    fn test_subvolume_entry_bool_true() {
+        let entry: SubvolumeEntry = serde_yaml::from_str("true").unwrap();
+        let config = entry.to_config();
+        assert_eq!(config.writable, Some(true));
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_subvolume_entry_bool_false() {
+        let entry: SubvolumeEntry = serde_yaml::from_str("false").unwrap();
+        let config = entry.to_config();
+        assert_eq!(config.enabled, Some(false));
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn test_subvolume_entry_string_ro() {
+        let entry: SubvolumeEntry = serde_yaml::from_str("ro").unwrap();
+        let config = entry.to_config();
+        assert_eq!(config.writable, Some(false));
+        assert!(!config.is_writable());
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_subvolume_entry_full_form() {
+        let yaml = r#"
+writable: true
+compression: "zstd:3"
+nodatacow: true
+quota: "5G"
+"#;
+        let entry: SubvolumeEntry = serde_yaml::from_str(yaml).unwrap();
+        let config = entry.to_config();
+        assert_eq!(config.writable, Some(true));
+        assert_eq!(config.compression, Some("zstd:3".to_string()));
+        assert_eq!(config.nodatacow, Some(true));
+        assert_eq!(config.quota, Some("5G".to_string()));
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_subvolume_config_merge_over() {
+        let base = SubvolumeConfig {
+            writable: Some(true),
+            compression: Some("zstd".to_string()),
+            quota: Some("1G".to_string()),
+            ..Default::default()
+        };
+        let override_config = SubvolumeConfig {
+            quota: Some("5G".to_string()),
+            nodatacow: Some(true),
+            ..Default::default()
+        };
+        let merged = base.merge_over(&override_config);
+        assert_eq!(merged.writable, Some(true)); // kept from base
+        assert_eq!(merged.compression, Some("zstd".to_string())); // kept from base
+        assert_eq!(merged.quota, Some("5G".to_string())); // overridden
+        assert_eq!(merged.nodatacow, Some(true)); // new from override
+    }
+
+    #[test]
+    fn test_get_ext_subvolumes_parses_map() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+subvolumes:
+  lib/docker:
+    writable: true
+    nodatacow: true
+    quota: "10G"
+  lib/myapp/cache: true
+"#,
+        )
+        .unwrap();
+        let result = get_ext_subvolumes(&yaml);
+        assert_eq!(result.len(), 2);
+        let docker = result.get("lib/docker").unwrap();
+        assert_eq!(docker.writable, Some(true));
+        assert_eq!(docker.nodatacow, Some(true));
+        assert_eq!(docker.quota, Some("10G".to_string()));
+        let cache = result.get("lib/myapp/cache").unwrap();
+        assert_eq!(cache.writable, Some(true));
+    }
+
+    #[test]
+    fn test_get_ext_subvolumes_returns_empty_when_missing() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        let result = get_ext_subvolumes(&yaml);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_defaults_only() {
+        // No extensions, no runtime var config -> just lib/avocado
+        let parsed: serde_yaml::Value = serde_yaml::from_str("extensions: {}").unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str("extensions: []").unwrap();
+        let ext_list: Vec<&str> = vec![];
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, "lib/avocado");
+        assert!(resolved[0].writable);
+        assert!(resolved[0].compression.is_none());
+        assert!(!resolved[0].nodatacow);
+        assert!(resolved[0].quota.is_none());
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_extension_adds_subvolume() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    subvolumes:
+      lib/docker:
+        nodatacow: true
+        quota: "10G"
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str("extensions: [my-ext]").unwrap();
+        let ext_list = vec!["my-ext"];
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(resolved.len(), 2);
+        // Sorted by path: lib/avocado, lib/docker
+        assert_eq!(resolved[0].path, "lib/avocado");
+        assert_eq!(resolved[1].path, "lib/docker");
+        assert!(resolved[1].nodatacow);
+        assert_eq!(resolved[1].quota, Some("10G".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_runtime_overrides_extension() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    subvolumes:
+      lib/docker:
+        quota: "10G"
+        nodatacow: true
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [my-ext]
+var:
+  subvolumes:
+    lib/docker:
+      quota: "20G"
+"#,
+        )
+        .unwrap();
+        let ext_list = vec!["my-ext"];
+        let (resolved, _) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        let docker = resolved.iter().find(|s| s.path == "lib/docker").unwrap();
+        assert_eq!(docker.quota, Some("20G".to_string()));
+        assert!(docker.nodatacow); // preserved from extension
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_runtime_overrides_builtin() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str("extensions: {}").unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: []
+var:
+  subvolumes:
+    lib/avocado:
+      compression: "zstd:3"
+      quota: "500M"
+"#,
+        )
+        .unwrap();
+        let ext_list: Vec<&str> = vec![];
+        let (resolved, _) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        let avocado = resolved.iter().find(|s| s.path == "lib/avocado").unwrap();
+        assert_eq!(avocado.compression, Some("zstd:3".to_string()));
+        assert_eq!(avocado.quota, Some("500M".to_string()));
+        assert!(avocado.writable);
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_default_compression() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    subvolumes:
+      lib/data:
+        writable: true
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [my-ext]
+var:
+  compression: zstd
+"#,
+        )
+        .unwrap();
+        let ext_list = vec!["my-ext"];
+        let (resolved, _) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        // Both subvolumes should inherit the default compression
+        for s in &resolved {
+            assert_eq!(s.compression, Some("zstd".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_enabled_false_removes() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    subvolumes:
+      lib/cache: true
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [my-ext]
+var:
+  subvolumes:
+    lib/cache:
+      enabled: false
+"#,
+        )
+        .unwrap();
+        let ext_list = vec!["my-ext"];
+        let (resolved, _) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        assert!(!resolved.iter().any(|s| s.path == "lib/cache"));
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_lib_avocado_cannot_be_disabled() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str("extensions: {}").unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: []
+var:
+  subvolumes:
+    lib/avocado:
+      enabled: false
+"#,
+        )
+        .unwrap();
+        let ext_list: Vec<&str> = vec![];
+        let result = resolve_subvolumes(&ext_list, &parsed, &runtime);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("lib/avocado"));
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_exact_path_conflict_warns() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  ext-a:
+    subvolumes:
+      lib/docker:
+        quota: "10G"
+  ext-b:
+    subvolumes:
+      lib/docker:
+        quota: "5G"
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value =
+            serde_yaml::from_str("extensions: [ext-a, ext-b]").unwrap();
+        let ext_list = vec!["ext-a", "ext-b"];
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        // ext-a wins (first listed)
+        let docker = resolved.iter().find(|s| s.path == "lib/docker").unwrap();
+        assert_eq!(docker.quota, Some("10G".to_string()));
+        // Warning emitted for conflict
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ext-b"));
+        assert!(warnings[0].contains("ext-a"));
+        assert!(warnings[0].contains("lib/docker"));
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_exact_path_conflict_suppressed_by_runtime() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  ext-a:
+    subvolumes:
+      lib/docker:
+        quota: "10G"
+  ext-b:
+    subvolumes:
+      lib/docker:
+        quota: "5G"
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [ext-a, ext-b]
+var:
+  subvolumes:
+    lib/docker:
+      quota: "20G"
+"#,
+        )
+        .unwrap();
+        let ext_list = vec!["ext-a", "ext-b"];
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        // No warning since runtime resolves it
+        assert!(warnings.is_empty());
+        let docker = resolved.iter().find(|s| s.path == "lib/docker").unwrap();
+        assert_eq!(docker.quota, Some("20G".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_nested_path_warns() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  ext-a:
+    subvolumes:
+      lib/myapp: true
+  ext-b:
+    subvolumes:
+      lib/myapp/data:
+        quota: "2G"
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value =
+            serde_yaml::from_str("extensions: [ext-a, ext-b]").unwrap();
+        let ext_list = vec!["ext-a", "ext-b"];
+        let (_, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("nested"));
+        assert!(warnings[0].contains("lib/myapp/data"));
+        assert!(warnings[0].contains("lib/myapp"));
+    }
+
+    #[test]
+    fn test_resolve_subvolumes_nested_suppressed_when_child_disabled() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  ext-a:
+    subvolumes:
+      lib/myapp: true
+  ext-b:
+    subvolumes:
+      lib/myapp/data:
+        quota: "2G"
+"#,
+        )
+        .unwrap();
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions: [ext-a, ext-b]
+var:
+  subvolumes:
+    lib/myapp/data:
+      enabled: false
+"#,
+        )
+        .unwrap();
+        let ext_list = vec!["ext-a", "ext-b"];
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        // No nested warning since child is disabled (filtered before nesting check)
+        assert!(warnings.is_empty());
+        assert!(!resolved.iter().any(|s| s.path == "lib/myapp/data"));
+    }
+
+    #[test]
+    fn test_var_config_deserialization() {
+        let yaml = r#"
+compression: zstd
+subvolumes:
+  lib/avocado:
+    compression: "zstd:3"
+    quota: "500M"
+  lib/logs:
+    compression: "zlib:6"
+    quota: "1G"
+  lib/cache: true
+"#;
+        let config: VarConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.compression, Some("zstd".to_string()));
+        let subvolumes = config.subvolumes.unwrap();
+        assert_eq!(subvolumes.len(), 3);
+        let avocado = subvolumes.get("lib/avocado").unwrap().to_config();
+        assert_eq!(avocado.compression, Some("zstd:3".to_string()));
+        assert_eq!(avocado.quota, Some("500M".to_string()));
     }
 }
