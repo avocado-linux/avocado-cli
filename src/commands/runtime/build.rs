@@ -1386,12 +1386,12 @@ echo "Provisioned update authority: metadata/root.json""#
             .join("\n");
 
         // Generate mkfs.btrfs --subvol flags
+        // Always create as rw at mkfs time -- read-only subvolumes need properties
+        // set first (compression, etc.), then flipped to ro in the post-creation step.
+        let has_ro_subvolumes = resolved_subvolumes.iter().any(|s| !s.writable);
         let subvol_flags: Vec<String> = resolved_subvolumes
             .iter()
-            .map(|s| {
-                let mode = if s.writable { "rw" } else { "ro" };
-                format!("    --subvol {}:{}", mode, s.path)
-            })
+            .map(|s| format!("    --subvol rw:{}", s.path))
             .collect();
 
         let mkfs_flags = subvol_flags.join(" \\\n");
@@ -1415,9 +1415,10 @@ echo "Provisioned update authority: metadata/root.json""#
         //   nodatacow: chattr +C (requires e2fsprogs in SDK)
         //   compression: btrfs property set
         //   quotas: btrfs quota enable + btrfs qgroup limit
-        let needs_post_creation = resolved_subvolumes
-            .iter()
-            .any(|s| s.nodatacow || s.quota.is_some() || s.compression.is_some());
+        let needs_post_creation = has_ro_subvolumes
+            || resolved_subvolumes
+                .iter()
+                .any(|s| s.nodatacow || s.quota.is_some() || s.compression.is_some());
 
         let post_creation_section = if needs_post_creation {
             let mut commands = vec![
@@ -1468,6 +1469,16 @@ echo "Provisioned update authority: metadata/root.json""#
                             ));
                         }
                     }
+                }
+            }
+
+            // Flip read-only subvolumes to ro (created as rw so properties could be set first)
+            for s in &resolved_subvolumes {
+                if !s.writable {
+                    commands.push(format!(
+                        "btrfs property set /tmp/btrfs-var-setup/{} ro true",
+                        s.path
+                    ));
                 }
             }
 
