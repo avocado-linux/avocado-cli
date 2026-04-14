@@ -1432,14 +1432,8 @@ echo "Provisioned update authority: metadata/root.json""#
             // nodatacow via chattr +C (requires e2fsprogs in SDK)
             for s in &resolved_subvolumes {
                 if s.nodatacow {
-                    commands.push(format!(
-                        "chattr +C /tmp/btrfs-var-setup/{}",
-                        s.path
-                    ));
-                    commands.push(format!(
-                        "echo \"  {}: nodatacow\"",
-                        s.path
-                    ));
+                    commands.push(format!("chattr +C /tmp/btrfs-var-setup/{}", s.path));
+                    commands.push(format!("echo \"  {}: nodatacow\"", s.path));
                 }
             }
 
@@ -1456,10 +1450,7 @@ echo "Provisioned update authority: metadata/root.json""#
                             "btrfs property set /tmp/btrfs-var-setup/{} compression {}",
                             s.path, comp
                         ));
-                        commands.push(format!(
-                            "echo \"  {}: compression={}\"",
-                            s.path, comp
-                        ));
+                        commands.push(format!("echo \"  {}: compression={}\"", s.path, comp));
                     }
                 }
             }
@@ -1475,10 +1466,7 @@ echo "Provisioned update authority: metadata/root.json""#
                                 "btrfs qgroup limit {} /tmp/btrfs-var-setup/{}",
                                 quota, s.path
                             ));
-                            commands.push(format!(
-                                "echo \"  {}: quota={}\"",
-                                s.path, quota
-                            ));
+                            commands.push(format!("echo \"  {}: quota={}\"", s.path, quota));
                         }
                     }
                 }
@@ -1491,10 +1479,7 @@ echo "Provisioned update authority: metadata/root.json""#
                         "btrfs property set /tmp/btrfs-var-setup/{} ro true",
                         s.path
                     ));
-                    commands.push(format!(
-                        "echo \"  {}: read-only\"",
-                        s.path
-                    ));
+                    commands.push(format!("echo \"  {}: read-only\"", s.path));
                 }
             }
 
