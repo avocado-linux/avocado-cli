@@ -1423,6 +1423,7 @@ echo "Provisioned update authority: metadata/root.json""#
         let post_creation_section = if needs_post_creation {
             let mut commands = vec![
                 "# Post-creation: apply per-subvolume properties via loop mount".to_string(),
+                "echo \"Applying subvolume properties...\"".to_string(),
                 "LOOP_DEV=$(losetup --find --show \"$VAR_IMAGE\")".to_string(),
                 "mkdir -p /tmp/btrfs-var-setup".to_string(),
                 "mount -t btrfs \"$LOOP_DEV\" /tmp/btrfs-var-setup".to_string(),
@@ -1435,11 +1436,14 @@ echo "Provisioned update authority: metadata/root.json""#
                         "chattr +C /tmp/btrfs-var-setup/{}",
                         s.path
                     ));
+                    commands.push(format!(
+                        "echo \"  {}: nodatacow\"",
+                        s.path
+                    ));
                 }
             }
 
             // Per-subvolume compression properties
-            // (sets the property so future writes use this algorithm)
             // Skip subvolumes with nodatacow -- NOCOW and compression are mutually
             // exclusive on btrfs (COW is required for transparent compression).
             for s in &resolved_subvolumes {
@@ -1450,6 +1454,10 @@ echo "Provisioned update authority: metadata/root.json""#
                     if comp != "no" {
                         commands.push(format!(
                             "btrfs property set /tmp/btrfs-var-setup/{} compression {}",
+                            s.path, comp
+                        ));
+                        commands.push(format!(
+                            "echo \"  {}: compression={}\"",
                             s.path, comp
                         ));
                     }
@@ -1467,6 +1475,10 @@ echo "Provisioned update authority: metadata/root.json""#
                                 "btrfs qgroup limit {} /tmp/btrfs-var-setup/{}",
                                 quota, s.path
                             ));
+                            commands.push(format!(
+                                "echo \"  {}: quota={}\"",
+                                s.path, quota
+                            ));
                         }
                     }
                 }
@@ -1479,12 +1491,15 @@ echo "Provisioned update authority: metadata/root.json""#
                         "btrfs property set /tmp/btrfs-var-setup/{} ro true",
                         s.path
                     ));
+                    commands.push(format!(
+                        "echo \"  {}: read-only\"",
+                        s.path
+                    ));
                 }
             }
 
             commands.push("umount /tmp/btrfs-var-setup".to_string());
             commands.push("losetup -d \"$LOOP_DEV\"".to_string());
-            commands.push("echo \"Applied btrfs subvolume properties.\"".to_string());
             commands.join("\n")
         } else {
             String::new()
