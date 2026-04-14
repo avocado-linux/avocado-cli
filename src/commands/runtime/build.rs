@@ -1394,29 +1394,51 @@ echo "Provisioned update authority: metadata/root.json""#
             })
             .collect();
 
-        // Generate --inode-flags for nodatacow subvolumes
-        let nodatacow_flags: Vec<String> = resolved_subvolumes
-            .iter()
-            .filter(|s| s.nodatacow)
-            .map(|s| format!("    --inode-flags nodatacow:{}", s.path))
-            .collect();
+        let mkfs_flags = subvol_flags.join(" \\\n");
 
-        let mkfs_flags = [subvol_flags, nodatacow_flags].concat().join(" \\\n");
+        // Determine if we can use mkfs.btrfs --compress for a global default
+        // (applies compression at image creation time to all packed files)
+        let global_compress_flag = {
+            // Use the runtime-level var.compression as a global --compress flag
+            let var_compression = merged_runtime
+                .get("var")
+                .and_then(|v| v.get("compression"))
+                .and_then(|v| v.as_str());
+            match var_compression {
+                Some(c) if c != "no" => format!("    --compress {c}"),
+                _ => String::new(),
+            }
+        };
 
-        // Generate post-creation section for compression and quotas
+        // Generate post-creation section for nodatacow, per-subvolume compression, and quotas.
+        // These require loop-mounting the btrfs image:
+        //   nodatacow: chattr +C on the subvolume directory
+        //   compression: btrfs property set (for per-subvolume overrides beyond global --compress)
+        //   quotas: btrfs quota enable + btrfs qgroup limit
         let needs_post_creation = resolved_subvolumes
             .iter()
-            .any(|s| s.compression.is_some() || s.quota.is_some());
+            .any(|s| s.nodatacow || s.quota.is_some() || s.compression.is_some());
 
         let post_creation_section = if needs_post_creation {
             let mut commands = vec![
-                "# Post-creation: set per-subvolume compression and quotas".to_string(),
+                "# Post-creation: apply per-subvolume properties via loop mount".to_string(),
                 "LOOP_DEV=$(losetup --find --show \"$VAR_IMAGE\")".to_string(),
                 "mkdir -p /tmp/btrfs-var-setup".to_string(),
                 "mount -t btrfs \"$LOOP_DEV\" /tmp/btrfs-var-setup".to_string(),
             ];
 
+            // nodatacow via chattr +C
+            for s in &resolved_subvolumes {
+                if s.nodatacow {
+                    commands.push(format!(
+                        "chattr +C /tmp/btrfs-var-setup/{}",
+                        s.path
+                    ));
+                }
+            }
+
             // Per-subvolume compression properties
+            // (sets the property so future writes use this algorithm)
             for s in &resolved_subvolumes {
                 if let Some(ref comp) = s.compression {
                     if comp != "no" {
@@ -1428,7 +1450,7 @@ echo "Provisioned update authority: metadata/root.json""#
                 }
             }
 
-            // Quotas (only if any subvolume has a quota)
+            // Quotas
             let has_quotas = resolved_subvolumes.iter().any(|s| s.quota.is_some());
             if has_quotas {
                 commands.push("btrfs quota enable /tmp/btrfs-var-setup".to_string());
@@ -1726,7 +1748,7 @@ _PROGRESS_PID=$!
 
 mkfs.btrfs -r "$VAR_DIR" \
 {mkfs_flags} \
-    -f "$VAR_IMAGE"
+{global_compress_flag}    -f "$VAR_IMAGE"
 
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
 
@@ -1838,6 +1860,11 @@ PYEOF
             subvol_mkdir_section = subvol_mkdir_section,
             subvol_warnings_section = subvol_warnings_section,
             mkfs_flags = mkfs_flags,
+            global_compress_flag = if global_compress_flag.is_empty() {
+                "".to_string()
+            } else {
+                format!("{global_compress_flag} \\\n")
+            },
             post_creation_section = post_creation_section,
             var_files_section = var_files_section,
             runtime_var_files_section = runtime_var_files_section,
