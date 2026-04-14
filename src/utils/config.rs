@@ -808,9 +808,10 @@ pub fn resolve_subvolumes(
     }
 
     // Step 4: Apply partition-level default compression
+    // Skip subvolumes with nodatacow -- NOCOW and compression are mutually exclusive on btrfs.
     if let Some(ref default_comp) = default_compression {
         for config in merged.values_mut() {
-            if config.compression.is_none() && config.is_enabled() {
+            if config.compression.is_none() && config.is_enabled() && !config.is_nodatacow() {
                 config.compression = Some(default_comp.clone());
             }
         }

@@ -1412,8 +1412,8 @@ echo "Provisioned update authority: metadata/root.json""#
 
         // Generate post-creation section for nodatacow, per-subvolume compression, and quotas.
         // These require loop-mounting the btrfs image:
-        //   nodatacow: chattr +C on the subvolume directory
-        //   compression: btrfs property set (for per-subvolume overrides beyond global --compress)
+        //   nodatacow: chattr +C (requires e2fsprogs in SDK)
+        //   compression: btrfs property set
         //   quotas: btrfs quota enable + btrfs qgroup limit
         let needs_post_creation = resolved_subvolumes
             .iter()
@@ -1427,7 +1427,7 @@ echo "Provisioned update authority: metadata/root.json""#
                 "mount -t btrfs \"$LOOP_DEV\" /tmp/btrfs-var-setup".to_string(),
             ];
 
-            // nodatacow via chattr +C
+            // nodatacow via chattr +C (requires e2fsprogs in SDK)
             for s in &resolved_subvolumes {
                 if s.nodatacow {
                     commands.push(format!(
@@ -1439,7 +1439,12 @@ echo "Provisioned update authority: metadata/root.json""#
 
             // Per-subvolume compression properties
             // (sets the property so future writes use this algorithm)
+            // Skip subvolumes with nodatacow -- NOCOW and compression are mutually
+            // exclusive on btrfs (COW is required for transparent compression).
             for s in &resolved_subvolumes {
+                if s.nodatacow {
+                    continue;
+                }
                 if let Some(ref comp) = s.compression {
                     if comp != "no" {
                         commands.push(format!(
