@@ -8,9 +8,8 @@ use std::path::Path;
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const REPO_OWNER: &str = "avocado-linux";
-const REPO_NAME: &str = "avocado-os";
+const REPO_NAME: &str = "references";
 const REPO_BRANCH: &str = "main";
-const REFERENCES_PATH: &str = "references";
 
 /// GitHub API response structure for directory contents
 #[derive(serde::Deserialize, Debug)]
@@ -54,13 +53,13 @@ pub struct InitCommand {
     target: Option<String>,
     /// Directory to initialize (defaults to current directory)
     directory: Option<String>,
-    /// Reference example to download from avocado-os repository
+    /// Reference example to download from the references repository
     reference: Option<String>,
     /// Branch to fetch reference from (defaults to "main")
     reference_branch: Option<String>,
     /// Specific commit SHA to fetch reference from
     reference_commit: Option<String>,
-    /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/avocado-os")
+    /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/references")
     reference_repo: Option<String>,
 }
 
@@ -139,7 +138,7 @@ impl InitCommand {
         let owner = self.get_repo_owner();
         let name = self.get_repo_name();
         let git_ref = self.get_git_ref();
-        format!("{owner}/{name}/{git_ref}/{REFERENCES_PATH}")
+        format!("{owner}/{name}/{git_ref}")
     }
 
     /// Loads the configuration template for the specified target.
@@ -171,7 +170,7 @@ impl InitCommand {
         let name = self.get_repo_name();
         let git_ref = self.get_git_ref();
         let url = format!(
-            "{GITHUB_API_BASE}/repos/{owner}/{name}/contents/{REFERENCES_PATH}/{reference_name}?ref={git_ref}"
+            "{GITHUB_API_BASE}/repos/{owner}/{name}/contents/{reference_name}?ref={git_ref}"
         );
 
         let client = reqwest::Client::builder()
@@ -324,7 +323,7 @@ impl InitCommand {
         let name = self.get_repo_name();
         let git_ref = self.get_git_ref();
         let url = format!(
-            "{GITHUB_API_BASE}/repos/{owner}/{name}/contents/{REFERENCES_PATH}/{reference_name}/avocado.yaml?ref={git_ref}"
+            "{GITHUB_API_BASE}/repos/{owner}/{name}/contents/{reference_name}/avocado.yaml?ref={git_ref}"
         );
 
         let client = reqwest::Client::builder()
@@ -448,7 +447,7 @@ impl InitCommand {
     ///
     /// # Arguments
     /// * `reference_name` - The name of the reference folder
-    /// * `github_path` - The path within the repository (relative to references/)
+    /// * `github_path` - The path within the repository
     /// * `local_base_path` - The base local path to download to
     /// * `repo_owner` - The repository owner
     /// * `repo_name` - The repository name
@@ -469,7 +468,7 @@ impl InitCommand {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let url = format!(
-                "{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/contents/{REFERENCES_PATH}/{github_path}?ref={git_ref}"
+                "{GITHUB_API_BASE}/repos/{repo_owner}/{repo_name}/contents/{github_path}?ref={git_ref}"
             );
 
             let client = reqwest::Client::builder()
@@ -497,8 +496,6 @@ impl InitCommand {
             for item in contents {
                 let relative_path = item
                     .path
-                    .strip_prefix(&format!("{REFERENCES_PATH}/"))
-                    .unwrap_or(&item.path)
                     .strip_prefix(&format!("{reference_name}/"))
                     .unwrap_or(&item.path);
 
@@ -556,10 +553,9 @@ impl InitCommand {
                                 format!("Failed to create directory '{}'", local_path.display())
                             })?;
                             // Recursively download directory contents
-                            let sub_path = item.path.replace(&format!("{REFERENCES_PATH}/"), "");
                             Self::download_reference_contents(
                                 reference_name,
-                                &sub_path,
+                                &item.path,
                                 local_base_path,
                                 repo_owner,
                                 repo_name,
@@ -920,12 +916,11 @@ impl InitCommand {
             }
 
             // Fetch file modes for the reference directory to preserve execute permissions
-            let reference_path = format!("{REFERENCES_PATH}/{ref_name}");
             let file_modes = Self::fetch_file_modes(
                 self.get_repo_owner(),
                 self.get_repo_name(),
                 self.get_git_ref(),
-                &reference_path,
+                ref_name,
             )
             .await?;
 
@@ -1345,7 +1340,7 @@ mod tests {
         assert!(InitCommand::is_submodule(
             &submodule_as_file,
             "avocado-linux",
-            "avocado-os"
+            "references"
         ));
 
         // Test regular file (not a submodule)
@@ -1357,14 +1352,14 @@ mod tests {
             submodule_git_url: None,
             size: Some(100),
             git_url: Some(
-                "https://api.github.com/repos/avocado-linux/avocado-os/git/blobs/abc123"
+                "https://api.github.com/repos/avocado-linux/references/git/blobs/abc123"
                     .to_string(),
             ),
         };
         assert!(!InitCommand::is_submodule(
             &regular_file,
             "avocado-linux",
-            "avocado-os"
+            "references"
         ));
 
         // Test file in same repo (not a submodule even if size is 0)
@@ -1376,21 +1371,21 @@ mod tests {
             submodule_git_url: None,
             size: Some(0),
             git_url: Some(
-                "https://api.github.com/repos/avocado-linux/avocado-os/git/trees/abc123"
+                "https://api.github.com/repos/avocado-linux/references/git/trees/abc123"
                     .to_string(),
             ),
         };
         assert!(!InitCommand::is_submodule(
             &same_repo_file,
             "avocado-linux",
-            "avocado-os"
+            "references"
         ));
     }
 
     #[test]
     fn test_file_modes_lookup_uses_relative_path() {
         // Simulate how fetch_file_modes stores keys when called with
-        // path = "references/rubicon". It strips the prefix, so keys are relative.
+        // path = "rubicon". It strips the prefix, so keys are relative.
         let mut file_modes = HashMap::new();
         file_modes.insert(
             "overlay/usr/lib/rubicon/rubicon-usb-gadget-setup".to_string(),
@@ -1399,36 +1394,32 @@ mod tests {
         file_modes.insert("avocado.yaml".to_string(), "100644".to_string());
 
         // Simulate how download_reference_contents processes an item.
-        // item.path from GitHub API includes the full path:
-        let item_path = "references/rubicon/overlay/usr/lib/rubicon/rubicon-usb-gadget-setup";
+        // item.path from GitHub API includes the reference name prefix:
+        let item_path = "rubicon/overlay/usr/lib/rubicon/rubicon-usb-gadget-setup";
         let reference_name = "rubicon";
 
-        // This is how relative_path is computed (lines 498-503):
+        // This is how relative_path is computed:
         let relative_path = item_path
-            .strip_prefix(&format!("{REFERENCES_PATH}/"))
-            .unwrap_or(item_path)
             .strip_prefix(&format!("{reference_name}/"))
             .unwrap_or(item_path);
 
-        // The fix: lookup with relative_path MUST find the executable mode
+        // Lookup with relative_path MUST find the executable mode
         assert_eq!(
             file_modes.get(relative_path).map(|m| m.as_str()),
             Some("100755"),
             "file_modes.get(relative_path) should find the entry"
         );
 
-        // The old code used item.path directly - prove it was broken
+        // The full item.path should NOT match (it includes the reference name prefix)
         assert_eq!(
             file_modes.get(item_path).map(|m| m.as_str()),
             None,
-            "file_modes.get(item.path) should NOT find the entry (this was the bug)"
+            "file_modes.get(item.path) should NOT find the entry"
         );
 
         // Also verify a non-executable file
-        let item_path_yaml = "references/rubicon/avocado.yaml";
+        let item_path_yaml = "rubicon/avocado.yaml";
         let relative_path_yaml = item_path_yaml
-            .strip_prefix(&format!("{REFERENCES_PATH}/"))
-            .unwrap_or(item_path_yaml)
             .strip_prefix(&format!("{reference_name}/"))
             .unwrap_or(item_path_yaml);
 
