@@ -130,7 +130,7 @@ enum Commands {
         /// Target architecture (e.g., "qemux86-64")
         #[arg(long)]
         target: Option<String>,
-        /// Reference example to initialize from (downloads from avocado-os/references)
+        /// Reference example to initialize from (downloads from avocado-linux/references)
         #[arg(long)]
         reference: Option<String>,
         /// Branch to fetch reference from (defaults to "main")
@@ -139,7 +139,7 @@ enum Commands {
         /// Specific commit SHA to fetch reference from
         #[arg(long)]
         reference_commit: Option<String>,
-        /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/avocado-os")
+        /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/references")
         #[arg(long)]
         reference_repo: Option<String>,
     },
