@@ -385,6 +385,10 @@ pub struct RuntimeParams {
     pub content_key_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_keyid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockfile: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

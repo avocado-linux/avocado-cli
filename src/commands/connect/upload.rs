@@ -11,7 +11,7 @@ use crate::commands::connect::client::{
 };
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
-use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
@@ -269,6 +269,7 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
         let num_artifacts = artifacts.len();
+        let (config, lockfile) = self.read_config_and_lockfile()?;
         let create_req = CreateRuntimeRequest {
             runtime: RuntimeParams {
                 version,
@@ -279,12 +280,50 @@ impl ConnectUploadCommand {
                 delegated_targets_json: delegation.map(|(d, _, _)| d.clone()),
                 content_key_hex: delegation.map(|(_, k, _)| k.clone()),
                 content_keyid: delegation.map(|(_, _, kid)| kid.clone()),
+                config,
+                lockfile,
             },
         };
         let runtime = connect
             .create_runtime(&self.org, &self.project, &create_req)
             .await?;
         Ok((runtime, num_artifacts))
+    }
+
+    /// Read `avocado.yaml` (converted YAML→JSON) and `.avocado/lock.json`
+    /// (raw JSON) to ship alongside the runtime create request.
+    fn read_config_and_lockfile(
+        &self,
+    ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+        let yaml_content = std::fs::read_to_string(&self.config_path)
+            .with_context(|| format!("Failed to read {}", self.config_path))?;
+        let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_content)
+            .with_context(|| format!("Failed to parse {} as YAML", self.config_path))?;
+        let config_json = serde_json::to_value(yaml_value)
+            .with_context(|| format!("Failed to convert {} to JSON", self.config_path))?;
+
+        let project_root = Path::new(&self.config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let lockfile_path = project_root.join(".avocado").join("lock.json");
+        let lockfile_json = if lockfile_path.exists() {
+            let content = std::fs::read_to_string(&lockfile_path)
+                .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
+            let value: serde_json::Value = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", lockfile_path.display()))?;
+            Some(value)
+        } else {
+            print_warning(
+                &format!(
+                    "No lockfile found at {}; uploading without lockfile data.",
+                    lockfile_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+            None
+        };
+
+        Ok((Some(config_json), lockfile_json))
     }
 
     /// Handle the case where the runtime is already in draft status (full dedup).
