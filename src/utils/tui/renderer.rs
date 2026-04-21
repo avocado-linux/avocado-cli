@@ -191,13 +191,11 @@ impl TaskRenderer {
         if let Some(task) = state.iter_mut().find(|t| &t.id == id) {
             task.status = status;
             match status {
-                TaskStatus::Running => {
-                    // Only set started_at on the first Running transition —
-                    // subsequent calls (e.g. from multiple container runs
-                    // within the same task) must not reset the clock.
-                    if task.started_at.is_none() {
-                        task.started_at = Some(std::time::Instant::now());
-                    }
+                // Only set started_at on the first Running transition —
+                // subsequent calls (e.g. from multiple container runs
+                // within the same task) must not reset the clock.
+                TaskStatus::Running if task.started_at.is_none() => {
+                    task.started_at = Some(std::time::Instant::now());
                 }
                 TaskStatus::Success | TaskStatus::Failed | TaskStatus::Skipped => {
                     task.finished_at = Some(std::time::Instant::now());
