@@ -437,10 +437,8 @@ fn parse_disk_identifiers_from_plist(plist: &str) -> Vec<String> {
             in_device_id = true;
         } else if in_device_id {
             if let Some(value) = extract_plist_string_value(trimmed) {
-                if value.starts_with("disk") && is_whole_disk_id(&value) {
-                    if !ids.contains(&value) {
-                        ids.push(value);
-                    }
+                if value.starts_with("disk") && is_whole_disk_id(&value) && !ids.contains(&value) {
+                    ids.push(value);
                 }
             }
             in_device_id = false;
