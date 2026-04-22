@@ -37,6 +37,7 @@ use commands::connect::trust::{
     ConnectTrustPromoteRootCommand, ConnectTrustRotateServerKeyCommand, ConnectTrustStatusCommand,
 };
 use commands::connect::upload::ConnectUploadCommand;
+use commands::comp::{CompImageCommand, CompListCommand};
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
     ExtFetchCommand, ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
@@ -112,6 +113,11 @@ enum Commands {
     Ext {
         #[command(subcommand)]
         command: ExtCommands,
+    },
+    /// Component related commands (basefs / initramfs / kernel KABs)
+    Comp {
+        #[command(subcommand)]
+        command: CompCommands,
     },
     /// Rootfs sysroot and image commands
     Rootfs {
@@ -2362,6 +2368,33 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Comp { command } => match command {
+            CompCommands::List { config, target: _ } => {
+                let list_cmd = CompListCommand::new(config);
+                list_cmd.execute()?;
+                Ok(())
+            }
+            CompCommands::Image {
+                name,
+                config,
+                verbose,
+                target,
+                out_dir,
+                container_args,
+            } => {
+                let image_cmd = CompImageCommand::new(
+                    name,
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    container_args,
+                )
+                .with_output_dir(out_dir)
+                .with_sdk_arch(cli.sdk_arch.clone());
+                image_cmd.execute().await?;
+                Ok(())
+            }
+        },
         Commands::Rootfs { command } => match command {
             RootfsCommands::Install {
                 config,
@@ -3385,6 +3418,43 @@ enum ExtCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CompCommands {
+    /// List component names (with their role)
+    List {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+    },
+    /// Wrap an already-built component payload in a signed KAB.
+    ///
+    /// For role=basefs the payload is the rootfs erofs produced by
+    /// `avocado rootfs image`; for role=initramfs it's the cpio.zst from
+    /// `avocado initramfs image`. Requires KAB_KEYSET_FILE to be set.
+    Image {
+        /// Component name
+        name: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Output directory on host to copy the resulting KAB to
+        #[arg(long = "out")]
+        out_dir: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
     },
 }
 

@@ -1334,19 +1334,29 @@ for pair in ext_pairs:
 # Each component comes from the top-level `components:` section. We wrap the
 # role-appropriate source file in a KAB with kabtool using the user-supplied
 # args, then treat the resulting .kab as a content-addressed blob sibling to
-# extensions in images_dir. Kernel is not yet resolved (no path convention);
-# it will be wired up with `avocado comp build`.
+# extensions in images_dir.
 components = []
 comp_info_b64 = os.environ.get("AVOCADO_COMP_INFO_B64", "")
 comp_infos = json.loads(base64.b64decode(comp_info_b64).decode()) if comp_info_b64 else []
 
 def _source_for_role(role):
+    import glob as _glob
     if role == "basefs":
         return os.environ.get("AVOCADO_ROOTFS_IMAGE", "")
     if role == "initramfs":
         return os.environ.get("AVOCADO_INITRAMFS_IMAGE", "")
     if role == "kernel":
-        # Kernel path resolution belongs with `avocado comp build`; skip for now.
+        # Kernel binary lands in the rootfs sysroot via a kernel-image-*
+        # package (pulled in by avocado-runtime or declared directly under
+        # rootfs.packages). Matches the standalone `comp image` lookup.
+        prefix = os.environ.get("AVOCADO_PREFIX", "")
+        if not prefix:
+            return ""
+        for pat in ("Image", "Image-*", "Image.gz", "vmlinuz*", "zImage*"):
+            matches = sorted(_glob.glob(os.path.join(prefix, "rootfs/boot", pat)))
+            for m in matches:
+                if os.path.isfile(m):
+                    return m
         return ""
     return ""
 

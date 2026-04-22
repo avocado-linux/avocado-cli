@@ -1,5 +1,6 @@
 pub mod build;
 pub mod clean;
+pub mod comp;
 pub mod connect;
 pub mod ext;
 pub mod fetch;

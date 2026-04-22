@@ -38,6 +38,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 
     # Work on a copy so we don't mutate the shared sysroot used for extension priming
     ROOTFS_WORK="${{ROOTFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/rootfs-work}}"
+    mkdir -p "$(dirname "$ROOTFS_WORK")"
     rm -rf "$ROOTFS_WORK"
     cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
 

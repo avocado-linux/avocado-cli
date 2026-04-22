@@ -34,6 +34,7 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     echo "Building initramfs image from packages..."
 
     INITRAMFS_WORK="${{INITRAMFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/initramfs-work}}"
+    mkdir -p "$(dirname "$INITRAMFS_WORK")"
     rm -rf "$INITRAMFS_WORK"
     cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
 
