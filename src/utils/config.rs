@@ -908,6 +908,41 @@ pub fn get_ext_image_args(ext_config: &serde_yaml::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Role of a top-level `components.<name>` entry. Components describe
+/// pieces of the OS that aren't runtime extensions — the base rootfs, the
+/// kernel, the initramfs, and a catch-all for future types. They are
+/// emitted in the AMF alongside extensions so the initramfs can validate
+/// and apply them during boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentRole {
+    Basefs,
+    Initramfs,
+    Kernel,
+    Other,
+}
+
+/// Return the top-level `components:` mapping from a parsed config value,
+/// or None if the section is absent. Each entry is a free-form YAML value
+/// (accessed via `get_comp_role`, `get_ext_image_type`, `get_ext_image_args`).
+#[allow(dead_code)] // Used by planned `avocado comp build`; runtime build reads components directly from merged YAML.
+pub fn get_components(config_value: &serde_yaml::Value) -> Option<&serde_yaml::Mapping> {
+    config_value.get("components").and_then(|v| v.as_mapping())
+}
+
+/// Read a single component's `role:` field and map it to the typed enum.
+/// Returns None if `role:` is missing or isn't one of
+/// basefs / initramfs / kernel / other.
+pub fn get_comp_role(comp_config: &serde_yaml::Value) -> Option<ComponentRole> {
+    match comp_config.get("role")?.as_str()? {
+        "basefs" => Some(ComponentRole::Basefs),
+        "initramfs" => Some(ComponentRole::Initramfs),
+        "kernel" => Some(ComponentRole::Kernel),
+        "other" => Some(ComponentRole::Other),
+        _ => None,
+    }
+}
+
 /// Extract docker_images from a config value (extension or runtime).
 /// Returns an empty Vec if no docker_images are configured.
 pub fn get_docker_images(config: &serde_yaml::Value) -> Vec<DockerImageRef> {
@@ -4456,6 +4491,113 @@ sdk:
     fn test_load_nonexistent_config() {
         let result = Config::load("nonexistent.toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_components_section_parses_and_roles_map() {
+        let yaml = r#"
+components:
+  avocado-comp-rootfs:
+    role: basefs
+    image:
+      type: kab
+      args: "-b -t kos.layer.basefs"
+    packages:
+      avocado-pkg-rootfs: "*"
+  avocado-comp-initramfs:
+    role: initramfs
+    image:
+      type: kab
+      args: "-b -t kos.layer.initramfs"
+    packages:
+      avocado-pkg-initramfs: "*"
+  avocado-comp-kernel:
+    role: kernel
+    image:
+      type: kab
+      args: "-b -t kos.layer.kernel"
+    packages:
+      kernel-image-image: "*"
+  avocado-comp-future:
+    role: other
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let comps = get_components(&parsed).expect("components section present");
+        assert_eq!(comps.len(), 4);
+
+        let by_name = |name: &str| -> &serde_yaml::Value {
+            comps
+                .get(serde_yaml::Value::String(name.to_string()))
+                .unwrap_or_else(|| panic!("component {name} missing"))
+        };
+
+        assert_eq!(
+            get_comp_role(by_name("avocado-comp-rootfs")),
+            Some(ComponentRole::Basefs)
+        );
+        assert_eq!(
+            get_comp_role(by_name("avocado-comp-initramfs")),
+            Some(ComponentRole::Initramfs)
+        );
+        assert_eq!(
+            get_comp_role(by_name("avocado-comp-kernel")),
+            Some(ComponentRole::Kernel)
+        );
+        assert_eq!(
+            get_comp_role(by_name("avocado-comp-future")),
+            Some(ComponentRole::Other)
+        );
+
+        // image.type and image.args helpers already used by extensions work for
+        // components unchanged — the shape (image: {type, args}) is identical.
+        let kernel = by_name("avocado-comp-kernel");
+        assert_eq!(get_ext_image_type(kernel), Some("kab".to_string()));
+        assert_eq!(
+            get_ext_image_args(kernel),
+            Some("-b -t kos.layer.kernel".to_string())
+        );
+    }
+
+    #[test]
+    fn test_components_missing_section_returns_none() {
+        let yaml = r#"
+runtimes:
+  default:
+    target: qemux86-64
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(get_components(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_comp_role_invalid_value_returns_none() {
+        let yaml = r#"
+components:
+  bad-comp:
+    role: bogus
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let comps = get_components(&parsed).unwrap();
+        let bad = comps
+            .get(serde_yaml::Value::String("bad-comp".to_string()))
+            .unwrap();
+        assert_eq!(get_comp_role(bad), None);
+    }
+
+    #[test]
+    fn test_comp_role_missing_returns_none() {
+        let yaml = r#"
+components:
+  no-role-comp:
+    image:
+      type: kab
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let comps = get_components(&parsed).unwrap();
+        let entry = comps
+            .get(serde_yaml::Value::String("no-role-comp".to_string()))
+            .unwrap();
+        assert_eq!(get_comp_role(entry), None);
     }
 
     #[test]

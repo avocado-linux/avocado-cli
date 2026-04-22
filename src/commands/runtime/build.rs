@@ -457,6 +457,51 @@ impl RuntimeBuildCommand {
             }
         }
 
+        // If any component referenced by this runtime uses image.type: kab, the
+        // inline KAB wrapping step in the manifest generator needs to invoke
+        // kabtool inside the SDK container with the user's signing keyset.
+        // Bind-mount the host's KAB_KEYSET_FILE into /tmp/kab.keyset (matches
+        // what avocado ext build does in commands/ext/image.rs:468-480) and
+        // re-export the env var pointing at that path.
+        let kab_keyset_host_path: Option<String> = {
+            let runtime_comps: Vec<&str> = merged_runtime
+                .as_ref()
+                .and_then(|rt| rt.get("components"))
+                .and_then(|c| c.as_sequence())
+                .map(|seq| seq.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let any_kab_component = runtime_comps.iter().any(|comp_name| {
+                parsed
+                    .get("components")
+                    .and_then(|c| c.get(*comp_name))
+                    .and_then(crate::utils::config::get_ext_image_type)
+                    .map(|t| t == "kab")
+                    .unwrap_or(false)
+            });
+            if any_kab_component {
+                let path = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
+                    anyhow::anyhow!(
+                        "Runtime '{}' has components with image.type: kab but KAB_KEYSET_FILE is not set. \
+                         Export it to the path of your KAB signing keyset.",
+                        self.runtime_name,
+                    )
+                })?;
+                if !std::path::Path::new(&path).is_file() {
+                    return Err(anyhow::anyhow!(
+                        "KAB_KEYSET_FILE points to '{}' but the file does not exist.",
+                        path,
+                    ));
+                }
+                env_vars.insert(
+                    "KAB_KEYSET_FILE".to_string(),
+                    "/tmp/kab.keyset".to_string(),
+                );
+                Some(path)
+            } else {
+                None
+            }
+        };
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -464,7 +509,8 @@ impl RuntimeBuildCommand {
         };
 
         // If any extension in this runtime declares docker_images, add --privileged
-        // to container args so dockerd can run inside the SDK container (Docker-in-Docker)
+        // to container args so dockerd can run inside the SDK container (Docker-in-Docker).
+        // Also mount the KAB keyset read-only when components need KAB wrapping.
         let build_container_args = {
             let ext_list: Vec<&str> = merged_runtime
                 .as_ref()
@@ -481,14 +527,18 @@ impl RuntimeBuildCommand {
                     .unwrap_or(false)
             });
 
-            if has_docker_images {
-                let mut args = merged_container_args.clone().unwrap_or_default();
-                if !args.iter().any(|a| a == "--privileged") {
-                    args.push("--privileged".to_string());
-                }
-                Some(args)
+            let mut args = merged_container_args.clone().unwrap_or_default();
+            if has_docker_images && !args.iter().any(|a| a == "--privileged") {
+                args.push("--privileged".to_string());
+            }
+            if let Some(ref host_path) = kab_keyset_host_path {
+                args.push("-v".to_string());
+                args.push(format!("{host_path}:/tmp/kab.keyset:ro"));
+            }
+            if args.is_empty() {
+                None
             } else {
-                merged_container_args.clone()
+                Some(args)
             }
         };
 
@@ -988,6 +1038,23 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             }
         }
 
+        // Collect components referenced by this runtime. Same selection pattern
+        // as extensions: the top-level `components:` section is the catalog,
+        // and `runtimes.<name>.components:` is the per-runtime selection. A
+        // component defined at the top level but not listed under the runtime
+        // is silently skipped for this build.
+        let mut required_components: HashSet<String> = HashSet::new();
+        if let Some(components) = merged_runtime
+            .get("components")
+            .and_then(|c| c.as_sequence())
+        {
+            for comp in components {
+                if let Some(comp_name) = comp.as_str() {
+                    required_components.insert(comp_name.to_string());
+                }
+            }
+        }
+
         // Recursively discover all extension dependencies (including nested external extensions)
         let all_required_extensions =
             self.find_all_extension_dependencies(config, &required_extensions, target_arch)?;
@@ -1136,6 +1203,68 @@ fi"#
             .collect();
         let ext_info_str = ext_info_pairs.join(" ");
 
+        // Components descriptor — serialized and base64-encoded so the Python
+        // manifest generator can process it alongside extensions. Covers the
+        // top-level `components:` section introduced for kernel/initramfs/basefs
+        // KABs (see client-kondra/docs/kernel_amf.md). `other` role is
+        // intentionally skipped; it's reserved but not yet wired in.
+        #[derive(serde::Serialize)]
+        struct CompInfo {
+            role: String,
+            name: String,
+            version: String,
+            image_args: String,
+        }
+        let comp_infos: Vec<CompInfo> = parsed
+            .get("components")
+            .and_then(|v| v.as_mapping())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| {
+                        let name = k.as_str()?.to_string();
+                        // Only components explicitly listed under this runtime
+                        // (mirroring `runtimes.<name>.extensions`) flow into
+                        // the manifest. A component defined at the top level
+                        // but not selected is silently skipped.
+                        if !required_components.contains(&name) {
+                            return None;
+                        }
+                        let role = crate::utils::config::get_comp_role(v)?;
+                        let role_str = match role {
+                            crate::utils::config::ComponentRole::Basefs => "basefs",
+                            crate::utils::config::ComponentRole::Initramfs => "initramfs",
+                            crate::utils::config::ComponentRole::Kernel => "kernel",
+                            crate::utils::config::ComponentRole::Other => return None,
+                        };
+                        let image_type =
+                            crate::utils::config::get_ext_image_type(v).unwrap_or_default();
+                        if image_type != "kab" {
+                            // Only KAB-wrapped components flow into the AMF.
+                            return None;
+                        }
+                        let image_args =
+                            crate::utils::config::get_ext_image_args(v).unwrap_or_default();
+                        let version = v
+                            .get("version")
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| runtime_version.clone());
+                        Some(CompInfo {
+                            role: role_str.to_string(),
+                            name,
+                            version,
+                            image_args,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let comp_info_b64 = {
+            use base64::Engine;
+            let json = serde_json::to_string(&comp_infos).unwrap_or_else(|_| "[]".to_string());
+            base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+        };
+
         let namespace_uuid = crate::utils::update_repo::AVOCADO_IMAGE_NAMESPACE.to_string();
 
         let manifest_section = format!(
@@ -1161,10 +1290,12 @@ export AVOCADO_BUILT_AT="$BUILT_AT"
 export AVOCADO_RUNTIME_NAME="{runtime_name}"
 export AVOCADO_RUNTIME_VERSION="$RUNTIME_VERSION"
 export AVOCADO_EXT_PAIRS="{ext_info_str}"
+export AVOCADO_COMP_INFO_B64="{comp_info_b64}"
 
 echo "Computing content-addressable image IDs..."
+echo "Components selected for this runtime: $(echo "$AVOCADO_COMP_INFO_B64" | base64 -d 2>/dev/null || echo '(none)')"
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil
+import base64, json, hashlib, os, shutil, subprocess, tempfile, uuid, zipfile
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1199,23 +1330,91 @@ for pair in ext_pairs:
         entry["image_type"] = image_type
     extensions.append(entry)
 
+# --- Components (basefs, initramfs, kernel) ---
+# Each component comes from the top-level `components:` section. We wrap the
+# role-appropriate source file in a KAB with kabtool using the user-supplied
+# args, then treat the resulting .kab as a content-addressed blob sibling to
+# extensions in images_dir. Kernel is not yet resolved (no path convention);
+# it will be wired up with `avocado comp build`.
+components = []
+comp_info_b64 = os.environ.get("AVOCADO_COMP_INFO_B64", "")
+comp_infos = json.loads(base64.b64decode(comp_info_b64).decode()) if comp_info_b64 else []
+
+def _source_for_role(role):
+    if role == "basefs":
+        return os.environ.get("AVOCADO_ROOTFS_IMAGE", "")
+    if role == "initramfs":
+        return os.environ.get("AVOCADO_INITRAMFS_IMAGE", "")
+    if role == "kernel":
+        # Kernel path resolution belongs with `avocado comp build`; skip for now.
+        return ""
+    return ""
+
+keyset_file = os.environ.get("KAB_KEYSET_FILE", "")
+
+for ci in comp_infos:
+    role = ci["role"]
+    name = ci["name"]
+    version = ci["version"]
+    image_args = ci.get("image_args") or ""
+    src = _source_for_role(role)
+    if not src or not os.path.isfile(src):
+        print("WARNING: source for component '" + name + "' (role=" + role + ") not available — skipping")
+        continue
+    if not keyset_file:
+        print("WARNING: KAB_KEYSET_FILE unset — cannot build component '" + name + "' KAB")
+        continue
+    with tempfile.TemporaryDirectory() as tmp:
+        shutil.copy2(src, os.path.join(tmp, "layer.img"))
+        desc = {{"kos": {{"build": {{"source": name + "-" + version}}}}}}
+        with open(os.path.join(tmp, "descriptor.json"), "w") as f:
+            json.dump(desc, f)
+        zip_path = os.path.join(tmp, "tmp.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+            zf.write(os.path.join(tmp, "layer.img"), "layer.img")
+            zf.write(os.path.join(tmp, "descriptor.json"), "descriptor.json")
+        kab_path = os.path.join(tmp, "output.kab")
+        # image_args is passed verbatim through shlex so user-supplied flags
+        # (e.g. "-b -t kos.layer.basefs -v 1.0 --tag rpi4") land correctly on argv.
+        import shlex
+        cmd = ["kabtool"] + shlex.split(image_args) + ["-k", keyset_file, "-z", zip_path, kab_path]
+        subprocess.run(cmd, check=True)
+        with open(kab_path, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+        image_id = str(uuid.uuid5(namespace, sha256))
+        dest = os.path.join(images_dir, image_id + ".kab")
+        shutil.copy2(kab_path, dest)
+    print("  Component: " + name + "-" + version + ".kab (role=" + role + ") -> " + image_id + ".kab")
+    components.append(dict(
+        name=name,
+        version=version,
+        role=role,
+        image_id=image_id,
+        sha256=sha256,
+        image_type="kab",
+    ))
+
 manifest = dict(
     manifest_version=2,
     id=build_id,
     built_at=built_at,
     runtime=dict(name=runtime_name, version=runtime_version),
     extensions=extensions,
+    components=components,
 )
 
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
-print("Created runtime manifest with " + str(len(extensions)) + " extension(s)")
+print("Created runtime manifest with " + str(len(extensions)) + " extension(s), "
+      + str(len(components)) + " component(s)")
 
-# Clean up stale extension images (os_bundle cleanup happens after stone bundle)
+# Clean up stale extension / component images (os_bundle cleanup happens after stone bundle)
 current_image_files = set()
 for ext in extensions:
     suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
     current_image_files.add(ext["image_id"] + suffix)
+for comp in components:
+    current_image_files.add(comp["image_id"] + ".kab")
 for fname in os.listdir(images_dir):
     if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
@@ -1248,6 +1447,11 @@ if spot_hashes_path:
     for ext in extensions:
         suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
         fname = ext["image_id"] + suffix
+        fpath = os.path.join(images_dir, fname)
+        if os.path.isfile(fpath):
+            spot_hashes[fname] = compute_spot_hash(fpath, spot_check_bytes)
+    for comp in components:
+        fname = comp["image_id"] + ".kab"
         fpath = os.path.join(images_dir, fname)
         if os.path.isfile(fpath):
             spot_hashes[fname] = compute_spot_hash(fpath, spot_check_bytes)
@@ -2228,6 +2432,108 @@ runtimes:
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
         assert!(script.contains("stone bundle"));
         assert!(script.contains("mkfs.btrfs"));
+    }
+
+    #[test]
+    fn test_create_build_script_emits_listed_components() {
+        // Mirrors the client-kondra/avocado.yaml shape: top-level components
+        // catalog plus per-runtime selection. The generated script must carry
+        // an AVOCADO_COMP_INFO_B64 env var whose decoded JSON contains the
+        // three selected components — basefs / initramfs / kernel.
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - test-ext
+    components:
+      - avocado-comp-rootfs
+      - avocado-comp-initramfs
+      - avocado-comp-kernel
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+
+components:
+  avocado-comp-rootfs:
+    version: "2024.0.1"
+    role: basefs
+    image:
+      type: kab
+      args: "-b -t kos.layer.basefs -v 2024.0.1"
+  avocado-comp-initramfs:
+    version: "2024.0.1"
+    role: initramfs
+    image:
+      type: kab
+      args: "-b -t kos.layer.initramfs -v 2024.0.1"
+  avocado-comp-kernel:
+    version: "2024.0.1"
+    role: kernel
+    image:
+      type: kab
+      args: "-b -t kos.layer.kernel -v 2024.0.1"
+  avocado-comp-unused:
+    version: "2024.0.1"
+    role: basefs
+    image:
+      type: kab
+      args: "-b -t kos.layer.basefs -v 2024.0.1"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .unwrap();
+
+        // Find the base64 JSON, decode it, and verify shape.
+        let marker = "AVOCADO_COMP_INFO_B64=\"";
+        let start = script
+            .find(marker)
+            .expect("AVOCADO_COMP_INFO_B64 line missing from script");
+        let rest = &script[start + marker.len()..];
+        let end = rest.find('"').expect("unterminated b64 literal");
+        let b64 = &rest[..end];
+        use base64::Engine;
+        let json_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("invalid base64");
+        let json_str = String::from_utf8(json_bytes).unwrap();
+        let infos: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+
+        let names: Vec<&str> = infos
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"avocado-comp-rootfs"));
+        assert!(names.contains(&"avocado-comp-initramfs"));
+        assert!(names.contains(&"avocado-comp-kernel"));
+        assert!(!names.contains(&"avocado-comp-unused")); // not listed under runtime → skipped
+        assert_eq!(infos.len(), 3);
+
+        let roles: Vec<&str> = infos
+            .iter()
+            .map(|v| v["role"].as_str().unwrap())
+            .collect();
+        assert!(roles.contains(&"basefs"));
+        assert!(roles.contains(&"initramfs"));
+        assert!(roles.contains(&"kernel"));
     }
 
     #[test]
