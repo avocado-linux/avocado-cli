@@ -1255,6 +1255,12 @@ impl Config {
             }
         }
 
+        // Merge path-based component fragments. Mirrors extensions'
+        // `source: { type: path }` pattern at the `components.<name>` level
+        // so component configs can live alongside the code they ship (see
+        // client-kondra/components/avocado-comp-rootfs/avocado.yaml).
+        Self::merge_path_based_components(&mut main_config, path)?;
+
         // Apply interpolation to the composed model
         crate::utils::interpolation::interpolate_config(&mut main_config, target)
             .with_context(|| "Failed to interpolate composed configuration")?;
@@ -1271,6 +1277,96 @@ impl Config {
             config_path: config_path_str,
             extension_sources,
         })
+    }
+
+    /// Merge path-based component fragments into the main config.
+    ///
+    /// Scans `components.<name>` entries whose `source.type == "path"` and
+    /// reads `<path>/avocado.yaml` (resolved relative to the main config's
+    /// directory). The fragment's `components.<name>` subsection is then
+    /// deep-merged into the main config's `components.<name>`. Main config
+    /// values take precedence over fragment values on conflicts, matching
+    /// the extension fragment merge convention (`deep_merge_ext_section`).
+    ///
+    /// Other sections in the fragment (distro, supported_targets, etc.) are
+    /// ignored — only the matching component subsection is pulled in.
+    fn merge_path_based_components(
+        main_config: &mut serde_yaml::Value,
+        main_config_path: &Path,
+    ) -> Result<()> {
+        // Collect (name, source_path) first so we don't hold a borrow into
+        // main_config while mutating it later.
+        let refs: Vec<(String, String)> = main_config
+            .get("components")
+            .and_then(|c| c.as_mapping())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| {
+                        let name = k.as_str()?.to_string();
+                        let source = v.get("source")?;
+                        let source_type = source.get("type")?.as_str()?;
+                        if source_type != "path" {
+                            return None;
+                        }
+                        let path = source.get("path")?.as_str()?.to_string();
+                        Some((name, path))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let main_config_dir = main_config_path.parent().unwrap_or(Path::new("."));
+
+        for (comp_name, source_path) in refs {
+            let resolved_path = main_config_dir.join(&source_path).join("avocado.yaml");
+            if !resolved_path.exists() {
+                // Match extension behaviour: skip silently rather than erroring,
+                // so partially-fetched or optional fragments don't break builds.
+                continue;
+            }
+
+            let fragment_content = fs::read_to_string(&resolved_path).with_context(|| {
+                format!(
+                    "Failed to read component fragment: {}",
+                    resolved_path.display()
+                )
+            })?;
+            let fragment: serde_yaml::Value = serde_yaml::from_str(&fragment_content)
+                .with_context(|| {
+                    format!(
+                        "Failed to parse component fragment: {}",
+                        resolved_path.display()
+                    )
+                })?;
+
+            let fragment_comp = fragment
+                .get("components")
+                .and_then(|c| c.get(&serde_yaml::Value::String(comp_name.clone())))
+                .cloned();
+
+            let Some(fragment_comp) = fragment_comp else {
+                // Fragment didn't define components.<comp_name>; nothing to merge.
+                continue;
+            };
+
+            let main_components = main_config
+                .as_mapping_mut()
+                .and_then(|m| m.get_mut(serde_yaml::Value::String("components".to_string())))
+                .and_then(|c| c.as_mapping_mut());
+
+            if let Some(components_map) = main_components {
+                let key = serde_yaml::Value::String(comp_name.clone());
+                if let Some(main_comp) = components_map.get_mut(&key) {
+                    Self::deep_merge_ext_section(main_comp, &fragment_comp);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Merge installed remote extension configs into the main config
@@ -4598,6 +4694,136 @@ components:
             .get(serde_yaml::Value::String("no-role-comp".to_string()))
             .unwrap();
         assert_eq!(get_comp_role(entry), None);
+    }
+
+    #[test]
+    fn test_path_based_component_fragment_is_merged() {
+        // Mirrors client-kondra/components/avocado-comp-rootfs: the main
+        // config has just a `source: {type: path}` stub, and the fragment
+        // avocado.yaml defines the full component.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let frag_dir = root.join("components/avocado-comp-rootfs");
+        std::fs::create_dir_all(&frag_dir).unwrap();
+        let frag_yaml = r#"
+src_dir: .
+
+components:
+  avocado-comp-rootfs:
+    version: 2024.1.0
+    role: basefs
+    image:
+      type: kab
+      args: '-b -t kos.layer.basefs'
+    packages:
+      avocado-pkg-rootfs: '*'
+"#;
+        std::fs::write(frag_dir.join("avocado.yaml"), frag_yaml).unwrap();
+
+        let main_yaml = r#"
+default_target: raspberrypi4
+
+runtimes:
+  kos:
+    type: kos
+    components:
+      - avocado-comp-rootfs
+
+components:
+  avocado-comp-rootfs:
+    source:
+      type: path
+      path: components/avocado-comp-rootfs
+
+sdk:
+  image: test-image
+"#;
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        let comp = composed
+            .merged_value
+            .get("components")
+            .and_then(|c| c.get("avocado-comp-rootfs"))
+            .expect("component section merged");
+
+        assert_eq!(
+            get_comp_role(comp),
+            Some(ComponentRole::Basefs),
+            "role pulled from fragment"
+        );
+        assert_eq!(
+            comp.get("version").and_then(|v| v.as_str()),
+            Some("2024.1.0"),
+            "version pulled from fragment"
+        );
+        assert_eq!(
+            get_ext_image_type(comp),
+            Some("kab".to_string()),
+            "image.type pulled from fragment"
+        );
+        // The original `source` stub from main config is preserved (main wins
+        // on conflicts, fragment adds the rest).
+        assert!(comp.get("source").is_some(), "source stub retained");
+    }
+
+    #[test]
+    fn test_path_based_component_main_overrides_fragment() {
+        // Main config's explicit fields should override the fragment when
+        // both define the same key — matches how the ext fragment merger
+        // (`deep_merge_ext_section`) behaves.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let frag_dir = root.join("comp-frag");
+        std::fs::create_dir_all(&frag_dir).unwrap();
+        std::fs::write(
+            frag_dir.join("avocado.yaml"),
+            r#"
+components:
+  my-comp:
+    version: "0.0.1-from-fragment"
+    role: basefs
+"#,
+        )
+        .unwrap();
+
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(
+            &main_path,
+            r#"
+default_target: qemux86-64
+components:
+  my-comp:
+    version: "9.9.9-from-main"
+    source:
+      type: path
+      path: comp-frag
+sdk:
+  image: test-image
+"#,
+        )
+        .unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("qemux86-64")).unwrap();
+        let comp = composed
+            .merged_value
+            .get("components")
+            .and_then(|c| c.get("my-comp"))
+            .unwrap();
+
+        assert_eq!(
+            comp.get("version").and_then(|v| v.as_str()),
+            Some("9.9.9-from-main"),
+            "main wins on conflict"
+        );
+        assert_eq!(
+            get_comp_role(comp),
+            Some(ComponentRole::Basefs),
+            "fragment-only field filled in"
+        );
     }
 
     #[test]
