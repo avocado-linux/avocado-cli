@@ -457,12 +457,22 @@ impl RuntimeBuildCommand {
             }
         }
 
-        // If any component referenced by this runtime uses image.type: kab, the
-        // inline KAB wrapping step in the manifest generator needs to invoke
-        // kabtool inside the SDK container with the user's signing keyset.
-        // Bind-mount the host's KAB_KEYSET_FILE into /tmp/kab.keyset (matches
-        // what avocado ext build does in commands/ext/image.rs:468-480) and
-        // re-export the env var pointing at that path.
+        // Runtime type: `kos` triggers AMF signing with the same keyset that
+        // signs the component KABs. Any other value (or missing) skips signing
+        // and behaves exactly like before.
+        let is_kos_runtime = merged_runtime
+            .as_ref()
+            .and_then(|rt| rt.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("kos");
+
+        // If any component referenced by this runtime uses image.type: kab, OR
+        // this is a kos runtime (which signs the manifest itself), the inline
+        // build steps need access to the user's signing keyset inside the SDK
+        // container. Bind-mount the host's KAB_KEYSET_FILE into
+        // /tmp/kab.keyset (matches what avocado ext build does in
+        // commands/ext/image.rs:468-480) and re-export the env var pointing at
+        // that path.
         let kab_keyset_host_path: Option<String> = {
             let runtime_comps: Vec<&str> = merged_runtime
                 .as_ref()
@@ -478,12 +488,18 @@ impl RuntimeBuildCommand {
                     .map(|t| t == "kab")
                     .unwrap_or(false)
             });
-            if any_kab_component {
+            if any_kab_component || is_kos_runtime {
                 let path = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
+                    let reason = if is_kos_runtime {
+                        "is type=kos (AMF will be signed)"
+                    } else {
+                        "has components with image.type: kab"
+                    };
                     anyhow::anyhow!(
-                        "Runtime '{}' has components with image.type: kab but KAB_KEYSET_FILE is not set. \
+                        "Runtime '{}' {} but KAB_KEYSET_FILE is not set. \
                          Export it to the path of your KAB signing keyset.",
                         self.runtime_name,
+                        reason,
                     )
                 })?;
                 if !std::path::Path::new(&path).is_file() {
@@ -501,6 +517,22 @@ impl RuntimeBuildCommand {
                 None
             }
         };
+
+        // Flag the in-container signing block so it can distinguish
+        // "signing not applicable for this runtime" (non-kos) from
+        // "signing was desired but KAB_KEYSET_FILE was unset". Only kos
+        // runtimes get AVOCADO_AMF_SIGN=1; others skip the block silently.
+        if is_kos_runtime {
+            env_vars.insert("AVOCADO_AMF_SIGN".to_string(), "1".to_string());
+        } else if std::env::var("KAB_KEYSET_FILE").is_ok() {
+            print_info(
+                &format!(
+                    "KAB_KEYSET_FILE is set but runtime '{}' is not type=kos; AMF signing is disabled for this runtime.",
+                    self.runtime_name
+                ),
+                OutputLevel::Normal,
+            );
+        }
 
         let env_vars = if env_vars.is_empty() {
             None
@@ -1292,6 +1324,92 @@ export AVOCADO_RUNTIME_VERSION="$RUNTIME_VERSION"
 export AVOCADO_EXT_PAIRS="{ext_info_str}"
 export AVOCADO_COMP_INFO_B64="{comp_info_b64}"
 
+# sign_amf <manifest-path>: sign the AMF at the given path with the
+# KAB_KEYSET_FILE-pointed keyset. Idempotent: replaces any existing
+# meta.auth block. No-ops when AVOCADO_AMF_SIGN != "1" (non-kos runtimes)
+# or the keyset is unavailable. Called at two points in the build:
+#   1) right after the manifest is written (pre-mkfs.btrfs), so the
+#      signature travels with the btrfs image flashed to fresh devices;
+#   2) right after the os_bundle patch, so the var-staging copy used by
+#      Studio upload carries a valid signature for that mutated state.
+sign_amf() {{
+    AMF_SIGN_PATH="$1" python3 << 'PYEOF'
+import json, os, base64, tempfile, subprocess, shutil
+
+if os.environ.get("AVOCADO_AMF_SIGN") != "1":
+    # Non-kos runtime: AMF signing not applicable. Silent skip.
+    raise SystemExit(0)
+
+manifest_path = os.environ["AMF_SIGN_PATH"]
+keyset_path = os.environ.get("KAB_KEYSET_FILE", "")
+if not keyset_path or not os.path.isfile(keyset_path):
+    print("AMF signing: KAB_KEYSET_FILE unset or missing; emitting unsigned manifest.")
+    raise SystemExit(0)
+
+workdir = tempfile.mkdtemp(prefix="amf-sign-")
+try:
+    # kabtool -x writes privateKey.der + certPath.p7b into cwd.
+    subprocess.run(["kabtool", "-x", keyset_path], cwd=workdir, check=True)
+    key_path = os.path.join(workdir, "privateKey.der")
+    chain_path = os.path.join(workdir, "certPath.p7b")
+
+    # certPath.p7b is a raw "SEQUENCE OF Certificate" (Java PkiPath encoding,
+    # not a PKCS#7 SignedData — openssl pkcs7 can't read it). Split the outer
+    # SEQUENCE into individual DER certs. Order in PkiPath is root-adjacent
+    # first, leaf last; AMF convention places leaf first, so we reverse.
+    data = open(chain_path, "rb").read()
+    def _tl(buf, off):
+        tag, ln = buf[off], buf[off + 1]
+        if ln & 0x80:
+            n = ln & 0x7f
+            ln = int.from_bytes(buf[off + 2:off + 2 + n], "big")
+            return tag, ln, off + 2 + n
+        return tag, ln, off + 2
+    _, outer_len, body = _tl(data, 0)
+    certs_der = []
+    i = body
+    while i < body + outer_len:
+        _, clen, cbody = _tl(data, i)
+        certs_der.append(data[i:cbody + clen])
+        i = cbody + clen
+    if not certs_der:
+        raise RuntimeError("certPath.p7b contained no certificates")
+
+    # Canonical form = manifest JSON without the "meta" key, compact (no
+    # whitespace), insertion-order preserved. An on-device verifier strips
+    # meta, recomputes this canonical form, and checks signature against it.
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+    manifest.pop("meta", None)
+    canonical = json.dumps(manifest, separators=(",", ":"))
+    canon_path = os.path.join(workdir, "canonical.json")
+    with open(canon_path, "w") as f:
+        f.write(canonical)
+
+    # SHA256 + RSA PKCS#1 v1.5 (matches KAB signing).
+    sig_path = os.path.join(workdir, "sig.bin")
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", key_path,
+         "-out", sig_path, canon_path],
+        check=True,
+    )
+    sig_b64 = base64.b64encode(open(sig_path, "rb").read()).decode("ascii")
+    certs_b64 = [base64.b64encode(c).decode("ascii") for c in reversed(certs_der)]
+
+    manifest["meta"] = {{
+        "auth": {{
+            "signature": sig_b64,
+            "certificates": certs_b64,
+        }},
+    }}
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print("Signed AMF at " + manifest_path + ": leaf + " + str(len(certs_b64) - 1) + " intermediate cert(s).")
+finally:
+    shutil.rmtree(workdir, ignore_errors=True)
+PYEOF
+}}
+
 echo "Computing content-addressable image IDs..."
 echo "Components selected for this runtime: $(echo "$AVOCADO_COMP_INFO_B64" | base64 -d 2>/dev/null || echo '(none)')"
 python3 << 'PYEOF'
@@ -1470,6 +1588,10 @@ if spot_hashes_path:
         json.dump(cache, f, indent=2)
     print("Created spot hash cache with " + str(len(spot_hashes)) + " image(s)")
 PYEOF
+
+# Sign the just-written manifest BEFORE mkfs.btrfs runs so the btrfs image
+# that gets flashed onto fresh devices already contains the signature.
+sign_amf "$AVOCADO_MANIFEST_PATH"
 
 ln -sfn "runtimes/$BUILD_ID" "$VAR_DIR/lib/avocado/active"
 echo "Created runtime manifest: runtimes/$BUILD_ID/manifest.json"
@@ -2080,6 +2202,13 @@ for fname in os.listdir(images_dir):
         os.remove(os.path.join(images_dir, fname))
         print("  Removed stale image: " + fname)
 PYEOF
+
+# Re-sign the var-staging manifest after the os_bundle patch — the earlier
+# pre-mkfs.btrfs signature is now invalid for this mutated content. The
+# btrfs image flashed onto fresh devices already carries the pre-patch
+# signature; this second signature covers the var-staging manifest that
+# Studio upload / OTA publishing consumes.
+sign_amf "$AVOCADO_MANIFEST_PATH"
 "#,
             runtime_name = self.runtime_name,
             target_arch = target_arch,
@@ -2825,6 +2954,11 @@ extensions:
         assert!(script.contains("compute_spot_hash"));
 
         assert!(script.contains("--subvol rw:lib/avocado "));
+
+        // sign_amf helper is always emitted; runtime decides whether to sign
+        // by checking AVOCADO_AMF_SIGN at invocation time.
+        assert!(script.contains("sign_amf() {"));
+        assert!(script.contains("sign_amf \"$AVOCADO_MANIFEST_PATH\""));
     }
 
     #[test]

@@ -1261,6 +1261,11 @@ impl Config {
         // client-kondra/components/avocado-comp-rootfs/avocado.yaml).
         Self::merge_path_based_components(&mut main_config, path)?;
 
+        // Treat component-level `packages:` as an extension of the top-level
+        // image-section packages (rootfs for basefs/kernel, initramfs for
+        // initramfs), so authors declare each image's payload in one place.
+        Self::promote_component_packages_to_image_sections(&mut main_config);
+
         // Apply interpolation to the composed model
         crate::utils::interpolation::interpolate_config(&mut main_config, target)
             .with_context(|| "Failed to interpolate composed configuration")?;
@@ -1367,6 +1372,79 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Promote `packages:` declared on a component into the corresponding
+    /// top-level image section, so the dnf install that populates the
+    /// relevant sysroot picks them up.
+    ///
+    /// Role → destination mapping:
+    /// - `basefs` → `rootfs.packages`
+    /// - `kernel` → `rootfs.packages` (kernel-image-* lands in the rootfs
+    ///   sysroot; `avocado comp image` for role=kernel lifts `/boot/Image`
+    ///   from there)
+    /// - `initramfs` → `initramfs.packages`
+    /// - `other` → no promotion
+    ///
+    /// Without this, a user declaring packages on a component would have to
+    /// duplicate the list under the top-level rootfs/initramfs section —
+    /// which defeats the purpose of the component fragment owning the
+    /// image payload.
+    ///
+    /// Main-config packages win on conflicts (matches extension fragment
+    /// convention), so an explicit version pin in the top-level section
+    /// still overrides whatever the component declares.
+    fn promote_component_packages_to_image_sections(main_config: &mut serde_yaml::Value) {
+        // Collect (destination-section, package-map) pairs first to avoid
+        // overlapping borrows when mutating the top-level sections below.
+        let mut promotions: Vec<(&'static str, serde_yaml::Mapping)> = Vec::new();
+        if let Some(components) = main_config.get("components").and_then(|c| c.as_mapping()) {
+            for (_, comp) in components.iter() {
+                let dest = match get_comp_role(comp) {
+                    Some(ComponentRole::Basefs) | Some(ComponentRole::Kernel) => "rootfs",
+                    Some(ComponentRole::Initramfs) => "initramfs",
+                    _ => continue,
+                };
+                if let Some(pkgs) = comp.get("packages").and_then(|p| p.as_mapping()) {
+                    promotions.push((dest, pkgs.clone()));
+                }
+            }
+        }
+
+        if promotions.is_empty() {
+            return;
+        }
+
+        let root = match main_config.as_mapping_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        let packages_key = serde_yaml::Value::String("packages".to_string());
+
+        for (section_name, fragment_pkgs) in promotions {
+            let section_key = serde_yaml::Value::String(section_name.to_string());
+            let section_entry = root
+                .entry(section_key)
+                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            let section_map = match section_entry.as_mapping_mut() {
+                Some(m) => m,
+                None => continue,
+            };
+            let packages_entry = section_map
+                .entry(packages_key.clone())
+                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            let packages_map = match packages_entry.as_mapping_mut() {
+                Some(m) => m,
+                None => continue,
+            };
+
+            for (k, v) in fragment_pkgs {
+                // Main-config value wins on conflict.
+                if !packages_map.contains_key(&k) {
+                    packages_map.insert(k, v);
+                }
+            }
+        }
     }
 
     /// Merge installed remote extension configs into the main config
@@ -4824,6 +4902,191 @@ sdk:
             Some(ComponentRole::Basefs),
             "fragment-only field filled in"
         );
+    }
+
+    #[test]
+    fn test_basefs_component_packages_promote_to_rootfs() {
+        // With packages declared only on the basefs component (no top-level
+        // rootfs: section), `get_rootfs_packages()` should see them after
+        // load_composed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let main_yaml = r#"
+default_target: raspberrypi4
+
+runtimes:
+  kos:
+    type: kos
+    components:
+      - rootfs-comp
+
+components:
+  rootfs-comp:
+    role: basefs
+    packages:
+      avocado-pkg-rootfs: '*'
+      kos-boot: '*'
+      kos-certs: '*'
+
+sdk:
+  image: test-image
+"#;
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        let pkgs = composed.config.get_rootfs_packages();
+        assert!(pkgs.contains_key("avocado-pkg-rootfs"));
+        assert!(
+            pkgs.contains_key("kos-boot"),
+            "basefs component's kos-boot promoted into rootfs.packages"
+        );
+        assert!(
+            pkgs.contains_key("kos-certs"),
+            "basefs component's kos-certs promoted into rootfs.packages"
+        );
+    }
+
+    #[test]
+    fn test_basefs_component_packages_do_not_override_main_rootfs() {
+        // An explicit version pin in top-level rootfs.packages wins over the
+        // component's `*` — mirrors the main-wins rule used elsewhere.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let main_yaml = r#"
+default_target: raspberrypi4
+
+rootfs:
+  packages:
+    kos-boot: "=1.2.3"
+
+components:
+  rootfs-comp:
+    role: basefs
+    packages:
+      kos-boot: '*'
+      kos-certs: '*'
+
+sdk:
+  image: test-image
+"#;
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        let pkgs = composed.config.get_rootfs_packages();
+        assert_eq!(
+            pkgs.get("kos-boot").and_then(|v| v.as_str()),
+            Some("=1.2.3"),
+            "top-level pin wins over component's '*'"
+        );
+        assert!(
+            pkgs.contains_key("kos-certs"),
+            "non-conflicting component package still promoted"
+        );
+    }
+
+    #[test]
+    fn test_initramfs_component_packages_promote_to_initramfs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let main_yaml = r#"
+default_target: raspberrypi4
+
+components:
+  initramfs-comp:
+    role: initramfs
+    packages:
+      avocado-pkg-initramfs: '*'
+      kos-layer-initramfs: '*'
+
+sdk:
+  image: test-image
+"#;
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        let pkgs = composed.config.get_initramfs_packages();
+        assert!(pkgs.contains_key("avocado-pkg-initramfs"));
+        assert!(
+            pkgs.contains_key("kos-layer-initramfs"),
+            "initramfs component's package promoted into initramfs.packages"
+        );
+        // Must NOT leak into rootfs.packages.
+        assert!(!composed
+            .config
+            .get_rootfs_packages()
+            .contains_key("kos-layer-initramfs"));
+    }
+
+    #[test]
+    fn test_kernel_component_packages_promote_to_rootfs() {
+        // Kernel-image-* must land in the rootfs sysroot (role=kernel lifts
+        // /boot/Image from there at `comp image` time).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let main_yaml = r#"
+default_target: raspberrypi4
+
+components:
+  kernel-comp:
+    role: kernel
+    packages:
+      kernel-image-image: '*'
+
+sdk:
+  image: test-image
+"#;
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        let pkgs = composed.config.get_rootfs_packages();
+        assert!(
+            pkgs.contains_key("kernel-image-image"),
+            "kernel component's package promoted into rootfs.packages"
+        );
+        // Must NOT leak into initramfs.packages.
+        assert!(!composed
+            .config
+            .get_initramfs_packages()
+            .contains_key("kernel-image-image"));
+    }
+
+    #[test]
+    fn test_other_role_component_packages_not_promoted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let main_yaml = r#"
+default_target: raspberrypi4
+
+components:
+  other-comp:
+    role: other
+    packages:
+      some-other-pkg: '*'
+
+sdk:
+  image: test-image
+"#;
+        let main_path = root.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        assert!(!composed
+            .config
+            .get_rootfs_packages()
+            .contains_key("some-other-pkg"));
+        assert!(!composed
+            .config
+            .get_initramfs_packages()
+            .contains_key("some-other-pkg"));
     }
 
     #[test]
