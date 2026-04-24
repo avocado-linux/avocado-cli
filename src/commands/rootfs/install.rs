@@ -193,7 +193,32 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             None => name.to_string(),
         }
     };
-    let pkg_specs: Vec<String> = if packages.is_empty() {
+
+    // When the default meta-package is in the effective list and a kernel is
+    // pinned, auto-append the matching per-kernel module packagegroup so
+    // transitive module pulls land on the pinned kernel's modules instead of
+    // dnf's NVR tie-break. Users opt out implicitly by defining their own
+    // rootfs.packages: / initramfs.packages: without the default meta-package.
+    let has_default_pkg = packages.is_empty() || packages.contains_key(default_pkg);
+    let auto_module_pkg: Option<String> = match (resolved_kver.as_deref(), has_default_pkg) {
+        (Some(kver), true) => {
+            let name = match params.sysroot_type {
+                SysrootType::Rootfs => format!("packagegroup-avocado-rootfs-modules-{kver}"),
+                SysrootType::Initramfs => {
+                    format!("packagegroup-avocado-initramfs-modules-{kver}")
+                }
+                _ => unreachable!(),
+            };
+            print_info(
+                &format!("Auto-including {name} for pinned kernel {kver}"),
+                OutputLevel::Normal,
+            );
+            Some(name)
+        }
+        _ => None,
+    };
+
+    let mut pkg_specs: Vec<String> = if packages.is_empty() {
         vec![build_package_spec_with_lock(
             params.lock_file,
             params.target,
@@ -216,14 +241,26 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             })
             .collect()
     };
+    if let Some(ref name) = auto_module_pkg {
+        pkg_specs.push(build_package_spec_with_lock(
+            params.lock_file,
+            params.target,
+            &params.sysroot_type,
+            name,
+            "*",
+        ));
+    }
     let pkg = pkg_specs.join(" ");
 
     // Collect all package names for lock file queries
-    let all_package_names: Vec<String> = if packages.is_empty() {
+    let mut all_package_names: Vec<String> = if packages.is_empty() {
         vec![default_pkg.to_string()]
     } else {
         packages.keys().cloned().collect()
     };
+    if let Some(ref name) = auto_module_pkg {
+        all_package_names.push(name.clone());
+    }
 
     let yes = if params.force { "-y" } else { "" };
     let dnf_args_str = if let Some(args) = &params.dnf_args {
