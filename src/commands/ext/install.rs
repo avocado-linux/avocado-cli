@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
-use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
+use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
+use crate::utils::lockfile::{build_package_spec_with_lock_and_kernel, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
@@ -594,6 +595,31 @@ impl ExtInstallCommand {
         let dependencies = ext_config.as_ref().and_then(|ec| ec.get("packages"));
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
+            // Resolve (or reuse a pinned) KERNEL_VERSION for this extension
+            // before building package specs. Extensions inherit the top-level
+            // kernel.version (they're not runtime-scoped), so pass None for
+            // runtime_name.
+            let resolved_kver = {
+                let mut resolve_params = ResolveParams {
+                    container_helper,
+                    container_image,
+                    target,
+                    sysroot: sysroot.clone(),
+                    runtime_name: None,
+                    config,
+                    lock_file,
+                    repo_url: repo_url.map(|s| s.as_str()),
+                    repo_release: repo_release.map(|s| s.as_str()),
+                    merged_container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    runs_on_context,
+                    sdk_arch: self.sdk_arch.as_ref(),
+                    verbose: self.verbose,
+                    tui_context: effective_tui_context.clone(),
+                };
+                resolve_and_pin_kernel_version(&mut resolve_params).await?
+            };
+
             // Build list of packages to install and handle extension dependencies
             let mut packages = Vec::new();
             let mut package_names = Vec::new();
@@ -611,12 +637,13 @@ impl ExtInstallCommand {
                     // Simple string version: "package: version" or "package: '*'"
                     // These are always package repository dependencies
                     serde_yaml::Value::String(version) => {
-                        let package_spec = build_package_spec_with_lock(
+                        let package_spec = build_package_spec_with_lock_and_kernel(
                             lock_file,
                             target,
                             &sysroot,
                             package_name,
                             version,
+                            resolved_kver.as_deref(),
                         );
                         packages.push(package_spec);
                         package_names.push(package_name.to_string());
@@ -677,12 +704,13 @@ impl ExtInstallCommand {
                         // Check for explicit version in object format
                         // Format: { version: "1.0.0" }
                         if let Some(serde_yaml::Value::String(version)) = spec_map.get("version") {
-                            let package_spec = build_package_spec_with_lock(
+                            let package_spec = build_package_spec_with_lock_and_kernel(
                                 lock_file,
                                 target,
                                 &sysroot,
                                 package_name,
                                 version,
+                                resolved_kver.as_deref(),
                             );
                             packages.push(package_spec);
                             package_names.push(package_name.to_string());

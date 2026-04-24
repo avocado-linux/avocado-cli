@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
-use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
+use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
+use crate::utils::lockfile::{build_package_spec_with_lock_and_kernel, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
@@ -539,6 +540,30 @@ impl RuntimeInstallCommand {
             .and_then(|merged| merged.get("packages"));
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
+            // Resolve (or reuse a pinned) KERNEL_VERSION for this runtime
+            // before building package specs. Runtimes with kernel.compile set
+            // return None here and kernel-family names pass through unchanged.
+            let resolved_kver = {
+                let mut resolve_params = ResolveParams {
+                    container_helper,
+                    container_image,
+                    target: &target_arch,
+                    sysroot: sysroot.clone(),
+                    runtime_name: Some(runtime),
+                    config,
+                    lock_file,
+                    repo_url: repo_url.map(|s| s.as_str()),
+                    repo_release: repo_release.map(|s| s.as_str()),
+                    merged_container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    runs_on_context,
+                    sdk_arch: self.sdk_arch.as_ref(),
+                    verbose: self.verbose,
+                    tui_context: self.tui_context.clone(),
+                };
+                resolve_and_pin_kernel_version(&mut resolve_params).await?
+            };
+
             // Build list of packages to install
             // Note: Extensions are now listed in the separate `extensions` array,
             // so dependencies should only contain package references.
@@ -563,12 +588,13 @@ impl RuntimeInstallCommand {
                     "*".to_string()
                 };
 
-                let package_spec = build_package_spec_with_lock(
+                let package_spec = build_package_spec_with_lock_and_kernel(
                     lock_file,
                     &target_arch,
                     &sysroot,
                     package_name,
                     &config_version,
+                    resolved_kver.as_deref(),
                 );
                 packages.push(package_spec);
                 package_names.push(package_name.to_string());
@@ -580,12 +606,13 @@ impl RuntimeInstallCommand {
                 {
                     if let Some(ref kernel_package) = kernel_config.package {
                         let kernel_version = kernel_config.version.as_deref().unwrap_or("*");
-                        let package_spec = build_package_spec_with_lock(
+                        let package_spec = build_package_spec_with_lock_and_kernel(
                             lock_file,
                             &target_arch,
                             &sysroot,
                             kernel_package,
                             kernel_version,
+                            resolved_kver.as_deref(),
                         );
                         print_info(
                             &format!(

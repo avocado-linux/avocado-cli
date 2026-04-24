@@ -925,6 +925,38 @@ pub fn build_package_spec_with_lock(
     }
 }
 
+/// Build a package spec like [`build_package_spec_with_lock`], but if
+/// `kernel_version` is `Some` and `package_name` is in the kernel family
+/// (`kernel`, `kernel-*`, `nv-kernel-*`), first rewrite the name to include
+/// the `-<kernel_version>` suffix. Produces `kernel-module-host1x-5.15.185`
+/// instead of an unqualified `kernel-module-host1x` so dnf doesn't have to
+/// tie-break across co-resident kernels in a rolling feed.
+///
+/// When `kernel_version` is `None` this is a pure passthrough to
+/// [`build_package_spec_with_lock`] — used when the runtime builds its own
+/// kernel (`kernel.compile`) or when resolution hasn't been done yet.
+pub fn build_package_spec_with_lock_and_kernel(
+    lock_file: &LockFile,
+    target: &str,
+    sysroot: &SysrootType,
+    package_name: &str,
+    config_version: &str,
+    kernel_version: Option<&str>,
+) -> String {
+    let effective_name: String = match kernel_version {
+        Some(kver) if crate::utils::kernel_version::is_kernel_family(package_name) => {
+            let suffix = format!("-{kver}");
+            if package_name.ends_with(&suffix) {
+                package_name.to_string()
+            } else {
+                format!("{package_name}{suffix}")
+            }
+        }
+        _ => package_name.to_string(),
+    };
+    build_package_spec_with_lock(lock_file, target, sysroot, &effective_name, config_version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
