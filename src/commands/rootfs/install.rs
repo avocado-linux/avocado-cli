@@ -8,7 +8,8 @@ use std::sync::Arc;
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
-    lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
+    kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams},
+    lockfile::{build_package_spec_with_lock_and_kernel, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
     stamps::{
@@ -156,26 +157,53 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         _ => unreachable!(),
     };
 
+    // Resolve (or reuse a pinned) KERNEL_VERSION before building package specs
+    // so kernel/kernel-module-*/kernel-devsrc-* names get suffixed to exactly
+    // one kernel — avoiding dnf's virtual-provider tie-break picking
+    // cross-kernel when multiple kernels coexist in the feed.
+    let resolved_kver = {
+        let mut resolve_params = ResolveParams {
+            container_helper: params.container_helper,
+            container_image: params.container_image,
+            target: params.target,
+            sysroot: params.sysroot_type.clone(),
+            runtime_name: None,
+            config: params.config,
+            lock_file: params.lock_file,
+            repo_url: params.repo_url,
+            repo_release: params.repo_release,
+            merged_container_args: params.merged_container_args.clone(),
+            dnf_args: params.dnf_args.clone(),
+            runs_on_context: params.runs_on_context,
+            sdk_arch: params.sdk_arch,
+            verbose: params.verbose,
+            tui_context: params.tui_context.clone(),
+        };
+        resolve_and_pin_kernel_version(&mut resolve_params).await?
+    };
+
     // Build package specs for all configured packages
     let pkg_specs: Vec<String> = if packages.is_empty() {
-        vec![build_package_spec_with_lock(
+        vec![build_package_spec_with_lock_and_kernel(
             params.lock_file,
             params.target,
             &params.sysroot_type,
             default_pkg,
             "*",
+            resolved_kver.as_deref(),
         )]
     } else {
         packages
             .iter()
             .map(|(name, version)| {
                 let ver = version.as_str().unwrap_or("*");
-                build_package_spec_with_lock(
+                build_package_spec_with_lock_and_kernel(
                     params.lock_file,
                     params.target,
                     &params.sysroot_type,
                     name,
                     ver,
+                    resolved_kver.as_deref(),
                 )
             })
             .collect()
