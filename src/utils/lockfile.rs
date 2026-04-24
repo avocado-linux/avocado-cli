@@ -521,8 +521,11 @@ impl LockFile {
         lock_file
     }
 
-    /// Save lock file to disk using JSON Canonicalization Scheme (RFC 8785)
-    /// This ensures deterministic output with sorted keys and consistent formatting
+    /// Save lock file to disk as pretty-printed JSON with deterministically
+    /// sorted keys. Routing through `serde_json::Value` lands every map in
+    /// `serde_json::Map` (a `BTreeMap` without the `preserve_order` feature),
+    /// so key order is stable regardless of the `HashMap` insertion order in
+    /// the in-memory struct.
     pub fn save(&self, src_dir: &Path) -> Result<()> {
         let path = Self::get_path(src_dir);
 
@@ -533,9 +536,9 @@ impl LockFile {
             })?;
         }
 
-        // Use JSON Canonicalization Scheme for deterministic output
-        let content = serde_jcs::to_string(self)
-            .with_context(|| "Failed to serialize lock file using JCS")?;
+        let value = serde_json::to_value(self).with_context(|| "Failed to serialize lock file")?;
+        let content = serde_json::to_string_pretty(&value)
+            .with_context(|| "Failed to serialize lock file")?;
 
         // Add a newline at the end for better git diffs
         let content_with_newline = format!("{content}\n");
@@ -923,38 +926,6 @@ pub fn build_package_spec_with_lock(
         // No lock but config specifies a version
         format!("{package_name}-{config_version}")
     }
-}
-
-/// Build a package spec like [`build_package_spec_with_lock`], but if
-/// `kernel_version` is `Some` and `package_name` is in the kernel family
-/// (`kernel`, `kernel-*`, `nv-kernel-*`), first rewrite the name to include
-/// the `-<kernel_version>` suffix. Produces `kernel-module-host1x-5.15.185`
-/// instead of an unqualified `kernel-module-host1x` so dnf doesn't have to
-/// tie-break across co-resident kernels in a rolling feed.
-///
-/// When `kernel_version` is `None` this is a pure passthrough to
-/// [`build_package_spec_with_lock`] — used when the runtime builds its own
-/// kernel (`kernel.compile`) or when resolution hasn't been done yet.
-pub fn build_package_spec_with_lock_and_kernel(
-    lock_file: &LockFile,
-    target: &str,
-    sysroot: &SysrootType,
-    package_name: &str,
-    config_version: &str,
-    kernel_version: Option<&str>,
-) -> String {
-    let effective_name: String = match kernel_version {
-        Some(kver) if crate::utils::kernel_version::is_kernel_family(package_name) => {
-            let suffix = format!("-{kver}");
-            if package_name.ends_with(&suffix) {
-                package_name.to_string()
-            } else {
-                format!("{package_name}{suffix}")
-            }
-        }
-        _ => package_name.to_string(),
-    };
-    build_package_spec_with_lock(lock_file, target, sysroot, &effective_name, config_version)
 }
 
 #[cfg(test)]
@@ -1603,7 +1574,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     }
 
     #[test]
-    fn test_jcs_deterministic_output() {
+    fn test_save_is_pretty_and_deterministic() {
         use std::fs;
         use tempfile::TempDir;
 
@@ -1634,10 +1605,20 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         lock2.save(src_dir).unwrap();
         let content2 = fs::read_to_string(LockFile::get_path(src_dir)).unwrap();
 
-        // JCS ensures both produce identical output regardless of insertion order
         assert_eq!(
             content1, content2,
-            "JCS should produce identical output regardless of insertion order"
+            "save() should produce identical output regardless of insertion order"
+        );
+
+        // Pretty-printed output spans multiple lines with indentation so PR
+        // diffs stay readable.
+        assert!(
+            content1.contains("\n  "),
+            "lock file should be pretty-printed with indentation, got:\n{content1}"
+        );
+        assert!(
+            content1.lines().count() > 5,
+            "lock file should span multiple lines, got:\n{content1}"
         );
 
         // Verify keys are sorted (targets should be alphabetically ordered)

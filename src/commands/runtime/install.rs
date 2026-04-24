@@ -6,7 +6,8 @@ use std::sync::Arc;
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
-use crate::utils::lockfile::{build_package_spec_with_lock_and_kernel, LockFile, SysrootType};
+use crate::utils::kernel_version::substitute_kernel_version;
+use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
@@ -588,13 +589,16 @@ impl RuntimeInstallCommand {
                     "*".to_string()
                 };
 
-                let package_spec = build_package_spec_with_lock_and_kernel(
+                let resolved_name = match resolved_kver.as_deref() {
+                    Some(kver) => substitute_kernel_version(package_name, kver),
+                    None => package_name.to_string(),
+                };
+                let package_spec = build_package_spec_with_lock(
                     lock_file,
                     &target_arch,
                     &sysroot,
-                    package_name,
+                    &resolved_name,
                     &config_version,
-                    resolved_kver.as_deref(),
                 );
                 packages.push(package_spec);
                 package_names.push(package_name.to_string());
@@ -606,13 +610,16 @@ impl RuntimeInstallCommand {
                 {
                     if let Some(ref kernel_package) = kernel_config.package {
                         let kernel_version = kernel_config.version.as_deref().unwrap_or("*");
-                        let package_spec = build_package_spec_with_lock_and_kernel(
+                        let resolved_name = match resolved_kver.as_deref() {
+                            Some(kver) => substitute_kernel_version(kernel_package, kver),
+                            None => kernel_package.clone(),
+                        };
+                        let package_spec = build_package_spec_with_lock(
                             lock_file,
                             &target_arch,
                             &sysroot,
-                            kernel_package,
+                            &resolved_name,
                             kernel_version,
-                            resolved_kver.as_deref(),
                         );
                         print_info(
                             &format!(
