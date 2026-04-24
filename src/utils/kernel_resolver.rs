@@ -101,22 +101,24 @@ pub async fn resolve_and_pin_kernel_version(
     Ok(Some(picked))
 }
 
-/// Run `dnf repoquery --whatprovides kernel` inside the SDK container and
-/// parse the output into a list of KERNEL_VERSIONs (the part after the
+/// Run `dnf repoquery --whatprovides kernel-base` inside the SDK container
+/// and parse the output into a list of KERNEL_VERSIONs (the part after the
 /// `kernel-` prefix on each package name).
 async fn query_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
-    // `--whatprovides kernel` matches packages whose RPROVIDES include the
-    // unqualified virtual `kernel`; in practice this is the renamed
-    // `kernel-<KERNEL_VERSION>` package produced by kernel.bbclass.
+    // oe-core's kernel.bbclass renames the `${KERNEL_PACKAGE_NAME}-base`
+    // package to `${KERNEL_PACKAGE_NAME}-${KERNEL_VERSION_PKG_NAME}` and
+    // explicitly emits `RPROVIDES += "${KERNEL_PACKAGE_NAME}-base"` on it —
+    // so `--whatprovides kernel-base` is the exact virtual that resolves to
+    // the renamed base kernel RPM (one row per KERNEL_VERSION available in
+    // the feed). This avoids matching kernel-module-*, kernel-devsrc-*, or
+    // other sibling subpackages.
     //
-    // Exclude kernel subpackages by filtering with grep -v so we don't
-    // mis-parse names like `kernel-module-*` or `kernel-devsrc-*` as kernel
-    // versions. `2>/dev/null` suppresses the "Last metadata expiration" noise
-    // that dnf writes to stderr.
+    // `parse_kernel_names` below strips the `kernel-` prefix from each NAME
+    // to recover the KERNEL_VERSION string. `2>/dev/null` hides the "Last
+    // metadata expiration" noise dnf writes to stderr.
     let command = r#"
 set -euo pipefail
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides kernel --qf '%{NAME}\n' 2>/dev/null \
-    | awk '{ print }' \
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides kernel-base --qf '%{NAME}\n' 2>/dev/null \
     | sort -u
 "#
     .to_string();
