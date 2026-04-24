@@ -53,6 +53,10 @@ pub struct AvocadoContext {
     pub distro_release: Option<String>,
     /// Distro channel from the main config
     pub distro_channel: Option<String>,
+    /// Resolved kernel version for the current scope. Populated after kernel
+    /// version resolution runs; `None` before resolution (or when no kernel is
+    /// involved, e.g. SDK-host-only operations).
+    pub kernel_version: Option<String>,
 }
 
 impl AvocadoContext {
@@ -71,6 +75,7 @@ impl AvocadoContext {
             target: target.map(|s| s.to_string()),
             distro_release: None,
             distro_channel: None,
+            kernel_version: None,
         }
     }
 
@@ -93,6 +98,7 @@ impl AvocadoContext {
             target,
             distro_release,
             distro_channel,
+            kernel_version: None,
         }
     }
 
@@ -154,6 +160,7 @@ impl AvocadoContext {
             target,
             distro_release,
             distro_channel,
+            kernel_version: None,
         }
     }
 }
@@ -196,6 +203,7 @@ pub fn resolve(
         ["target"] => resolve_target(root, context),
         ["distro", "release"] | ["distro", "version"] => resolve_distro_release(context),
         ["distro", "channel"] => resolve_distro_channel(context),
+        ["kernel", "version"] => resolve_kernel_version(context),
         ["extensions", rest @ ..] => resolve_extensions(rest, root),
         _ => {
             // Other avocado keys are not yet supported, but don't error
@@ -203,6 +211,13 @@ pub fn resolve(
             Ok(None)
         }
     }
+}
+
+/// Resolve the kernel version from context. Returns `None` if the context
+/// doesn't yet have a resolved kernel version (e.g. the resolver hasn't run
+/// for this scope).
+fn resolve_kernel_version(context: Option<&AvocadoContext>) -> Result<Option<String>> {
+    Ok(context.and_then(|c| c.kernel_version.clone()))
 }
 
 /// Resolve the target architecture value.
@@ -355,6 +370,7 @@ mod tests {
             target: None,
             distro_release: Some("2024".to_string()),
             distro_channel: None,
+            kernel_version: None,
         };
         let result = resolve(&["distro", "release"], &config, Some(&ctx)).unwrap();
         assert_eq!(result, Some("2024".to_string()));
@@ -367,6 +383,7 @@ mod tests {
             target: None,
             distro_release: Some("2024".to_string()),
             distro_channel: None,
+            kernel_version: None,
         };
         // "distro.version" should resolve to the same value as "distro.release"
         let result = resolve(&["distro", "version"], &config, Some(&ctx)).unwrap();
@@ -380,6 +397,7 @@ mod tests {
             target: None,
             distro_release: None,
             distro_channel: Some("apollo-edge".to_string()),
+            kernel_version: None,
         };
         let result = resolve(&["distro", "channel"], &config, Some(&ctx)).unwrap();
         assert_eq!(result, Some("apollo-edge".to_string()));
