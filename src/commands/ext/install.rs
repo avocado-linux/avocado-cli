@@ -6,7 +6,8 @@ use std::sync::Arc;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
-use crate::utils::lockfile::{build_package_spec_with_lock_and_kernel, LockFile, SysrootType};
+use crate::utils::kernel_version::substitute_kernel_version;
+use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
@@ -632,18 +633,22 @@ impl ExtInstallCommand {
                     None => continue, // Skip if package name is not a string
                 };
 
+                let resolved_name = match resolved_kver.as_deref() {
+                    Some(kver) => substitute_kernel_version(package_name, kver),
+                    None => package_name.to_string(),
+                };
+
                 // Handle different dependency types based on value format
                 match version_spec {
                     // Simple string version: "package: version" or "package: '*'"
                     // These are always package repository dependencies
                     serde_yaml::Value::String(version) => {
-                        let package_spec = build_package_spec_with_lock_and_kernel(
+                        let package_spec = build_package_spec_with_lock(
                             lock_file,
                             target,
                             &sysroot,
-                            package_name,
+                            &resolved_name,
                             version,
-                            resolved_kver.as_deref(),
                         );
                         packages.push(package_spec);
                         package_names.push(package_name.to_string());
@@ -704,13 +709,12 @@ impl ExtInstallCommand {
                         // Check for explicit version in object format
                         // Format: { version: "1.0.0" }
                         if let Some(serde_yaml::Value::String(version)) = spec_map.get("version") {
-                            let package_spec = build_package_spec_with_lock_and_kernel(
+                            let package_spec = build_package_spec_with_lock(
                                 lock_file,
                                 target,
                                 &sysroot,
-                                package_name,
+                                &resolved_name,
                                 version,
-                                resolved_kver.as_deref(),
                             );
                             packages.push(package_spec);
                             package_names.push(package_name.to_string());

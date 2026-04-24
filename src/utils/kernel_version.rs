@@ -176,13 +176,23 @@ pub fn resolve_kernel_version(
         .to_string())
 }
 
-/// Names whose dnf resolution should be pinned to the selected kernel version.
-/// A package name matches the kernel family if it equals `kernel`, starts with
-/// `kernel-`, or starts with `nv-kernel-` (meta-tegra OOT shims). This matches
-/// `kernel`, `kernel-image`, `kernel-module-*`, `kernel-modules`, `kernel-dev`,
-/// `kernel-devsrc*`, `nv-kernel-module-*`.
-pub fn is_kernel_family(name: &str) -> bool {
-    name == "kernel" || name.starts_with("kernel-") || name.starts_with("nv-kernel-")
+/// Substitute the `{{ avocado.kernel.version }}` template in a string with
+/// the given kernel version. Supports the common whitespace variants users
+/// write in avocado.yaml. Strings without the template pass through unchanged.
+///
+/// This is the mechanism BSP yamls use to produce versioned kernel-family
+/// package names under Path B (e.g.
+/// `"kernel-module-host1x-{{ avocado.kernel.version }}"` becomes
+/// `"kernel-module-host1x-6.6.123-yocto-standard"`). Full config interpolation
+/// runs once at load time before the resolver knows the kernel version, so
+/// that pass leaves the template verbatim; the install flow applies this
+/// substitution after resolution just to package keys.
+pub fn substitute_kernel_version(input: &str, kernel_version: &str) -> String {
+    input
+        .replace("{{ avocado.kernel.version }}", kernel_version)
+        .replace("{{avocado.kernel.version}}", kernel_version)
+        .replace("{{ avocado.kernel.version}}", kernel_version)
+        .replace("{{avocado.kernel.version }}", kernel_version)
 }
 
 /// Compare two versions using a close approximation of RPM's `rpmvercmp`
@@ -493,18 +503,55 @@ mod tests {
         assert!(resolve_kernel_version(Some(&spec), &[]).is_err());
     }
 
-    // --- is_kernel_family --------------------------------------------------
+    // --- substitute_kernel_version -----------------------------------------
 
     #[test]
-    fn kernel_family_names() {
-        assert!(is_kernel_family("kernel"));
-        assert!(is_kernel_family("kernel-image"));
-        assert!(is_kernel_family("kernel-module-host1x"));
-        assert!(is_kernel_family("kernel-modules"));
-        assert!(is_kernel_family("kernel-devsrc"));
-        assert!(is_kernel_family("nv-kernel-module-host1x"));
-        assert!(!is_kernel_family("busybox"));
-        assert!(!is_kernel_family("kernellabs"));
+    fn substitute_replaces_template() {
+        let out = substitute_kernel_version(
+            "kernel-module-host1x-{{ avocado.kernel.version }}",
+            "6.6.123-yocto-standard",
+        );
+        assert_eq!(out, "kernel-module-host1x-6.6.123-yocto-standard");
     }
 
+    #[test]
+    fn substitute_handles_whitespace_variants() {
+        let kver = "6.6.123";
+        assert_eq!(
+            substitute_kernel_version("x-{{ avocado.kernel.version }}", kver),
+            "x-6.6.123"
+        );
+        assert_eq!(
+            substitute_kernel_version("x-{{avocado.kernel.version}}", kver),
+            "x-6.6.123"
+        );
+        assert_eq!(
+            substitute_kernel_version("x-{{ avocado.kernel.version}}", kver),
+            "x-6.6.123"
+        );
+        assert_eq!(
+            substitute_kernel_version("x-{{avocado.kernel.version }}", kver),
+            "x-6.6.123"
+        );
+    }
+
+    #[test]
+    fn substitute_passes_through_non_template_strings() {
+        assert_eq!(
+            substitute_kernel_version("kernel-module-host1x", "6.6.123"),
+            "kernel-module-host1x"
+        );
+        assert_eq!(substitute_kernel_version("busybox", "6.6.123"), "busybox");
+    }
+
+    #[test]
+    fn substitute_handles_multiple_occurrences() {
+        // Not a realistic avocado.yaml shape but the function shouldn't
+        // stop after the first match.
+        let out = substitute_kernel_version(
+            "a-{{ avocado.kernel.version }}-b-{{ avocado.kernel.version }}",
+            "6.6.123",
+        );
+        assert_eq!(out, "a-6.6.123-b-6.6.123");
+    }
 }

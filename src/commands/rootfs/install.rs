@@ -9,7 +9,8 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams},
-    lockfile::{build_package_spec_with_lock_and_kernel, LockFile, SysrootType},
+    kernel_version::substitute_kernel_version,
+    lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
     stamps::{
@@ -182,28 +183,35 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         resolve_and_pin_kernel_version(&mut resolve_params).await?
     };
 
-    // Build package specs for all configured packages
+    // Build package specs for all configured packages. When we have a
+    // resolved kernel version, substitute any `{{ avocado.kernel.version }}`
+    // templates in package keys so BSP yamls can produce fully-versioned
+    // kernel-family names without silent rewriting.
+    let resolve_name = |name: &str| -> String {
+        match resolved_kver.as_deref() {
+            Some(kver) => substitute_kernel_version(name, kver),
+            None => name.to_string(),
+        }
+    };
     let pkg_specs: Vec<String> = if packages.is_empty() {
-        vec![build_package_spec_with_lock_and_kernel(
+        vec![build_package_spec_with_lock(
             params.lock_file,
             params.target,
             &params.sysroot_type,
-            default_pkg,
+            &resolve_name(default_pkg),
             "*",
-            resolved_kver.as_deref(),
         )]
     } else {
         packages
             .iter()
             .map(|(name, version)| {
                 let ver = version.as_str().unwrap_or("*");
-                build_package_spec_with_lock_and_kernel(
+                build_package_spec_with_lock(
                     params.lock_file,
                     params.target,
                     &params.sysroot_type,
-                    name,
+                    &resolve_name(name),
                     ver,
-                    resolved_kver.as_deref(),
                 )
             })
             .collect()
