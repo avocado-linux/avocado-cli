@@ -11,6 +11,14 @@
 //!    kernel-family package names pass unchanged.
 //! 3. Otherwise compute the effective spec, run `dnf repoquery`, pick the
 //!    highest matching KERNEL_VERSION, and pin it in the lockfile.
+//!
+//! The repoquery result is memoized per-process keyed by
+//! `(target, repo_url)` — within a single `avocado …` invocation the
+//! available-kernel list cannot change, so the first sysroot pays the
+//! container/dnf cost and every subsequent sysroot resolution is O(µs).
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -79,8 +87,8 @@ pub async fn resolve_and_pin_kernel_version(
     //    means "latest").
     let spec = params.config.effective_kernel_spec(params.runtime_name)?;
 
-    // 4. Ask the repo what's available.
-    let available = query_available_kernel_versions(params).await?;
+    // 4. Ask the repo what's available (cached per-process).
+    let available = get_available_kernel_versions(params).await?;
 
     // 5. Pick the highest matching version.
     let picked = resolve_kernel_version(spec.as_ref(), &available)?;
@@ -101,25 +109,72 @@ pub async fn resolve_and_pin_kernel_version(
     Ok(Some(picked))
 }
 
-/// Run `dnf repoquery 'kernel-*'` inside the SDK container and parse the
-/// output into a list of KERNEL_VERSIONs (the part after the `kernel-`
-/// prefix on each package name).
+/// Cache key pairing target and repo URL — within a single process these
+/// uniquely identify the available-kernel list the resolver cares about.
+type KernelCacheKey = (String, String);
+
+/// Process-level cache type alias.
+type KernelVersionCache = Mutex<HashMap<KernelCacheKey, Vec<String>>>;
+
+/// Process-level cache of `(target, repo_url) -> available KERNEL_VERSIONs`.
+///
+/// Within one `avocado …` invocation the feed doesn't change, so the first
+/// caller pays the full `dnf repoquery` cost (container spin-up + metadata
+/// load + solv build, typically 10–20s on a cold cache) and every subsequent
+/// sysroot resolution hits this cache in microseconds.
+fn kernel_version_cache() -> &'static KernelVersionCache {
+    static CACHE: OnceLock<KernelVersionCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cached wrapper around [`query_available_kernel_versions`]. The key pairs
+/// target and repo URL so two avocado commands with different repo configs in
+/// the same process don't cross-pollinate.
+async fn get_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
+    let cache_key = (
+        params.target.to_string(),
+        params.repo_url.unwrap_or("").to_string(),
+    );
+
+    // Fast path: someone else already ran the query in this process.
+    if let Some(cached) = {
+        let guard = kernel_version_cache().lock().unwrap();
+        guard.get(&cache_key).cloned()
+    } {
+        return Ok(cached);
+    }
+
+    // Slow path: do the actual container repoquery (never hold the mutex
+    // across an await).
+    let versions = query_available_kernel_versions(params).await?;
+
+    kernel_version_cache()
+        .lock()
+        .unwrap()
+        .insert(cache_key, versions.clone());
+
+    Ok(versions)
+}
+
+/// Run `dnf repoquery --whatprovides 'avocado-kernel-*' --provides` inside the
+/// SDK container. The linux kernel bbappends in
+/// `meta-avocado-nvidia/recipes-kernel/linux/` emit
+/// `RPROVIDES += avocado-kernel-${KERNEL_VERSION}` on
+/// `${KERNEL_PACKAGE_NAME}-base`, so this query returns the full set of
+/// `avocado-kernel-<VERSION>` Provides across every base kernel in the feed —
+/// one per KERNEL_VERSION available.
 async fn query_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
-    // oe-core's kernel.bbclass renames `${KERNEL_PACKAGE_NAME}-base` to
-    // `${KERNEL_PACKAGE_NAME}-${KERNEL_VERSION_PKG_NAME}` but the only
-    // RPROVIDES it adds is the renamed name itself — there's no unqualified
-    // `kernel` or `kernel-base` virtual to query against. So we glob on
-    // NAME and let `parse_kernel_names` filter down to the base kernels by
-    // requiring the first post-prefix character to be a digit (KERNEL_VERSION
-    // always starts with the kernel series major, e.g. "5.15", "6.6"). That
-    // cleanly drops `kernel-module-*`, `kernel-devsrc-*`, `kernel-image-*`,
-    // etc., which all start with an alpha character after `kernel-`.
+    // `--provides` expands to a multi-line list of every provide on each
+    // matching package (not just the one that matched `--whatprovides`), so
+    // we still need to grep client-side for the `avocado-kernel-` prefix.
+    // Using `set -u` here would explode if DNF_SDK_HOST happens to be empty
+    // so the script stays permissive.
     //
     // `2>/dev/null` hides the "Last metadata expiration" noise dnf writes to
-    // stderr.
+    // stderr; real errors still surface via non-zero exit.
     let command = r#"
-set -euo pipefail
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery 'kernel-*' --qf '%{NAME}\n' 2>/dev/null \
+set -eo pipefail
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides 'avocado-kernel-*' --provides 2>/dev/null \
     | sort -u
 "#
     .to_string();
@@ -155,33 +210,31 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery 'kernel-*' --qf '%{NAME}\n' 2>
     };
 
     let raw = output.unwrap_or_default();
-    Ok(parse_kernel_names(&raw))
+    Ok(parse_avocado_kernel_provides(&raw))
 }
 
-/// Parse dnf repoquery output into KERNEL_VERSIONs. Each line is an RPM
-/// package NAME; keep only those that look like the renamed kernel base
-/// package (`kernel-<KERNEL_VERSION>`) and strip the prefix.
-fn parse_kernel_names(raw: &str) -> Vec<String> {
-    raw.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        // Drop subpackages that also provide 'kernel' transitively — we only
-        // want the base kernel RPM whose name structure is `kernel-<VERSION>`.
-        // Observed base kernels in feeds start with 'kernel-' followed by a
-        // digit (since KERNEL_VERSION starts with the kernel series number).
-        .filter_map(|line| {
-            let rest = line.strip_prefix("kernel-")?;
-            // First character of KERNEL_VERSION is a digit (e.g. "5.15", "6.6").
-            // This filters out `kernel-module-*`, `kernel-devsrc-*`,
-            // `kernel-image-*`, etc., which start with an alpha char after
-            // the `kernel-` prefix.
-            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                Some(rest.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
+/// Parse `dnf repoquery --provides` output into KERNEL_VERSIONs. Each line is
+/// a single Provide from a matching package; we keep only those that start
+/// with `avocado-kernel-` (our published contract) and strip that prefix. A
+/// trailing `= <EVR>` (emitted by older dnf versions for versioned provides)
+/// is also stripped.
+fn parse_avocado_kernel_provides(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("avocado-kernel-") else {
+            continue;
+        };
+        // Some dnf output formats appear as `avocado-kernel-6.6.123 = 6.6.123-r0`
+        // — the space-delimited tail is not part of the Provide name we care about.
+        let version = rest.split_whitespace().next().unwrap_or(rest);
+        if !version.is_empty() {
+            out.push(version.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -189,16 +242,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_kernel_names_ignores_subpackages() {
+    fn parse_avocado_kernel_provides_happy_path() {
         let raw = "\
-kernel-5.15.185-l4t-r36.5-1033.33
-kernel-module-host1x-5.15.185-l4t-r36.5-1033.33
-kernel-devsrc-5.15.185-l4t-r36.5-1033.33
-kernel-image-5.15.185-l4t-r36.5-1033.33
-kernel-6.6.123
-nv-kernel-module-host1x-5.15.185-l4t-r36.5-1033.33
+avocado-kernel-5.15.185-l4t-r36.5-1033.33
+avocado-kernel-6.6.123
 ";
-        let parsed = parse_kernel_names(raw);
+        let parsed = parse_avocado_kernel_provides(raw);
         assert_eq!(
             parsed,
             vec![
@@ -209,8 +258,43 @@ nv-kernel-module-host1x-5.15.185-l4t-r36.5-1033.33
     }
 
     #[test]
-    fn parse_kernel_names_empty_input() {
-        assert_eq!(parse_kernel_names(""), Vec::<String>::new());
-        assert_eq!(parse_kernel_names("\n\n"), Vec::<String>::new());
+    fn parse_avocado_kernel_provides_filters_non_matching_lines() {
+        // `dnf repoquery --provides` emits every Provide of every matching
+        // package, not just the one that matched `--whatprovides`. Filter to
+        // just our contract.
+        let raw = "\
+kernel-6.6.123-yocto-standard
+config(kernel-6.6.123-yocto-standard) = 6.6.123-r0
+avocado-kernel-6.6.123
+kernel-base = 6.6.123-r0
+";
+        let parsed = parse_avocado_kernel_provides(raw);
+        assert_eq!(parsed, vec!["6.6.123".to_string()]);
+    }
+
+    #[test]
+    fn parse_avocado_kernel_provides_handles_evr_suffix() {
+        // Some dnf output variants include `= <EVR>` after the provide name.
+        let raw = "avocado-kernel-6.6.123 = 6.6.123-r0.avocado_qemux86_64\n";
+        let parsed = parse_avocado_kernel_provides(raw);
+        assert_eq!(parsed, vec!["6.6.123".to_string()]);
+    }
+
+    #[test]
+    fn parse_avocado_kernel_provides_dedupes_across_packages() {
+        // Two kernel-base packages in different arches provide the same
+        // avocado-kernel name — collapse to one.
+        let raw = "\
+avocado-kernel-6.6.123
+avocado-kernel-6.6.123
+";
+        let parsed = parse_avocado_kernel_provides(raw);
+        assert_eq!(parsed, vec!["6.6.123".to_string()]);
+    }
+
+    #[test]
+    fn parse_avocado_kernel_provides_empty_input() {
+        assert_eq!(parse_avocado_kernel_provides(""), Vec::<String>::new());
+        assert_eq!(parse_avocado_kernel_provides("\n\n"), Vec::<String>::new());
     }
 }
