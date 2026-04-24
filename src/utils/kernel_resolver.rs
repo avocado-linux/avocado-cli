@@ -156,26 +156,36 @@ async fn get_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec
     Ok(versions)
 }
 
-/// Run `dnf repoquery --whatprovides 'avocado-kernel-*' --provides` inside the
-/// SDK container. The linux kernel bbappends in
-/// `meta-avocado-nvidia/recipes-kernel/linux/` emit
-/// `RPROVIDES += avocado-kernel-${KERNEL_VERSION}` on
-/// `${KERNEL_PACKAGE_NAME}-base`, so this query returns the full set of
-/// `avocado-kernel-<VERSION>` Provides across every base kernel in the feed —
-/// one per KERNEL_VERSION available.
+/// Enumerate available kernel versions from the feed. Runs two repoqueries in
+/// one container invocation and unions the results:
+///
+/// 1. **Primary — `--whatprovides 'avocado-kernel-*' --provides`.** The linux
+///    kernel bbappends in `meta-avocado-nvidia/recipes-kernel/linux/` emit
+///    `RPROVIDES += avocado-kernel-${KERNEL_VERSION}` on
+///    `${KERNEL_PACKAGE_NAME}-base`, a clean explicit contract.
+/// 2. **Fallback — `repoquery 'kernel-*' --qf '%{NAME}'`.** Catches kernels
+///    built before the `avocado-kernel-*` virtual landed: the renamed
+///    `kernel-<KERNEL_VERSION>` base package is still visible by NAME, and
+///    [`parse_kernel_names_and_provides`] filters to just the base kernels
+///    by requiring the first post-prefix char to be a digit.
+///
+/// Both outputs are written to the same stdout; the parser recognizes each
+/// format independently, so forward- and backward-built kernels compose in a
+/// single rolling feed without changes to either query.
 async fn query_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
-    // `--provides` expands to a multi-line list of every provide on each
-    // matching package (not just the one that matched `--whatprovides`), so
-    // we still need to grep client-side for the `avocado-kernel-` prefix.
-    // Using `set -u` here would explode if DNF_SDK_HOST happens to be empty
-    // so the script stays permissive.
+    // Two repoqueries share the warm DNF metadata cache inside one container
+    // invocation, so the second call is effectively free. `2>/dev/null` hides
+    // the "Last metadata expiration" noise; real errors still surface via
+    // non-zero exit on either line (pipefail).
     //
-    // `2>/dev/null` hides the "Last metadata expiration" noise dnf writes to
-    // stderr; real errors still surface via non-zero exit.
+    // `|| true` on each query keeps going if one returns no matches — both
+    // empty is legit on a fresh-cache container and the parser handles it.
     let command = r#"
 set -eo pipefail
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides 'avocado-kernel-*' --provides 2>/dev/null \
-    | sort -u
+{
+    $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides 'avocado-kernel-*' --provides 2>/dev/null || true
+    $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery 'kernel-*' --qf '%{NAME}\n' 2>/dev/null || true
+} | sort -u
 "#
     .to_string();
 
@@ -210,26 +220,47 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides 'avocado-kernel
     };
 
     let raw = output.unwrap_or_default();
-    Ok(parse_avocado_kernel_provides(&raw))
+    Ok(parse_kernel_names_and_provides(&raw))
 }
 
-/// Parse `dnf repoquery --provides` output into KERNEL_VERSIONs. Each line is
-/// a single Provide from a matching package; we keep only those that start
-/// with `avocado-kernel-` (our published contract) and strip that prefix. A
-/// trailing `= <EVR>` (emitted by older dnf versions for versioned provides)
-/// is also stripped.
-fn parse_avocado_kernel_provides(raw: &str) -> Vec<String> {
+/// Parse combined output of the two repoquery calls into a deduped list of
+/// KERNEL_VERSIONs. Handles two line shapes independently — either can
+/// appear (or neither, or both for the same version) and we union them.
+///
+/// 1. **`avocado-kernel-<VERSION>`** — an explicit Provide line emitted by
+///    the avocado kernel bbappends. May be followed by `= <EVR>` on some dnf
+///    versions; we strip anything after the first whitespace.
+/// 2. **`kernel-<VERSION>`** where VERSION starts with a digit — the renamed
+///    base kernel NAME from the fallback `'kernel-*'` query. The digit-prefix
+///    check filters out subpackages (`kernel-module-*`, `kernel-devsrc-*`,
+///    `kernel-image-*`, etc.) whose first post-prefix char is alpha.
+///
+/// Other lines from `--provides` (generated `config(...)`, file provides, the
+/// kernel-base's own name Provide, etc.) are ignored.
+fn parse_kernel_names_and_provides(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("avocado-kernel-") else {
+        if line.is_empty() {
             continue;
-        };
-        // Some dnf output formats appear as `avocado-kernel-6.6.123 = 6.6.123-r0`
-        // — the space-delimited tail is not part of the Provide name we care about.
-        let version = rest.split_whitespace().next().unwrap_or(rest);
-        if !version.is_empty() {
-            out.push(version.to_string());
+        }
+
+        if let Some(rest) = line.strip_prefix("avocado-kernel-") {
+            // Format 1: avocado-kernel-<VERSION> [= <EVR>]
+            let version = rest.split_whitespace().next().unwrap_or(rest);
+            if !version.is_empty() {
+                out.push(version.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("kernel-") {
+            // Format 2: kernel-<VERSION> NAME. KERNEL_VERSION always starts
+            // with a digit; subpackage names start with an alpha character
+            // after `kernel-` (module, modules, devsrc, image, dev, dbg, ...).
+            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                let version = rest.split_whitespace().next().unwrap_or(rest);
+                if !version.is_empty() {
+                    out.push(version.to_string());
+                }
+            }
         }
     }
     out.sort();
@@ -247,7 +278,7 @@ mod tests {
 avocado-kernel-5.15.185-l4t-r36.5-1033.33
 avocado-kernel-6.6.123
 ";
-        let parsed = parse_avocado_kernel_provides(raw);
+        let parsed = parse_kernel_names_and_provides(raw);
         assert_eq!(
             parsed,
             vec![
@@ -258,43 +289,84 @@ avocado-kernel-6.6.123
     }
 
     #[test]
-    fn parse_avocado_kernel_provides_filters_non_matching_lines() {
+    fn parse_filters_non_matching_lines() {
         // `dnf repoquery --provides` emits every Provide of every matching
-        // package, not just the one that matched `--whatprovides`. Filter to
-        // just our contract.
+        // package, not just the one that matched `--whatprovides`. Filter.
+        // Also note `config(...)` and `kernel-base = <EVR>` lines must be
+        // skipped — neither is a kernel version.
         let raw = "\
-kernel-6.6.123-yocto-standard
 config(kernel-6.6.123-yocto-standard) = 6.6.123-r0
 avocado-kernel-6.6.123
 kernel-base = 6.6.123-r0
 ";
-        let parsed = parse_avocado_kernel_provides(raw);
+        let parsed = parse_kernel_names_and_provides(raw);
         assert_eq!(parsed, vec!["6.6.123".to_string()]);
     }
 
     #[test]
-    fn parse_avocado_kernel_provides_handles_evr_suffix() {
-        // Some dnf output variants include `= <EVR>` after the provide name.
+    fn parse_handles_evr_suffix() {
         let raw = "avocado-kernel-6.6.123 = 6.6.123-r0.avocado_qemux86_64\n";
-        let parsed = parse_avocado_kernel_provides(raw);
+        let parsed = parse_kernel_names_and_provides(raw);
         assert_eq!(parsed, vec!["6.6.123".to_string()]);
     }
 
     #[test]
-    fn parse_avocado_kernel_provides_dedupes_across_packages() {
+    fn parse_dedupes_across_packages_and_queries() {
         // Two kernel-base packages in different arches provide the same
-        // avocado-kernel name — collapse to one.
+        // avocado-kernel name. And the same KERNEL_VERSION also appears in
+        // the fallback NAME query output — both queries use ${KERNEL_VERSION}
+        // identically, so for a kernel built with the new bbappend the two
+        // queries return the same string. Collapse to one.
         let raw = "\
-avocado-kernel-6.6.123
-avocado-kernel-6.6.123
+avocado-kernel-6.6.123-yocto-standard
+avocado-kernel-6.6.123-yocto-standard
+kernel-6.6.123-yocto-standard
 ";
-        let parsed = parse_avocado_kernel_provides(raw);
-        assert_eq!(parsed, vec!["6.6.123".to_string()]);
+        let parsed = parse_kernel_names_and_provides(raw);
+        assert_eq!(parsed, vec!["6.6.123-yocto-standard".to_string()]);
     }
 
     #[test]
-    fn parse_avocado_kernel_provides_empty_input() {
-        assert_eq!(parse_avocado_kernel_provides(""), Vec::<String>::new());
-        assert_eq!(parse_avocado_kernel_provides("\n\n"), Vec::<String>::new());
+    fn parse_falls_back_to_name_glob_for_kernels_without_virtual() {
+        // An older kernel in the feed that predates the avocado-kernel-*
+        // bbappend: only the NAME query surfaces it. Mix with a newer kernel
+        // that has both. Both should appear.
+        let raw = "\
+kernel-6.6.111-yocto-standard
+kernel-6.6.123-yocto-standard
+avocado-kernel-6.6.123-yocto-standard
+";
+        let parsed = parse_kernel_names_and_provides(raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "6.6.111-yocto-standard".to_string(),
+                "6.6.123-yocto-standard".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ignores_kernel_subpackages() {
+        // The fallback `kernel-*` glob picks up every kernel subpackage;
+        // the digit-prefix rule keeps only base kernels.
+        let raw = "\
+kernel-6.6.123-yocto-standard
+kernel-module-host1x-6.6.123-yocto-standard
+kernel-devsrc-6.6.123-yocto-standard
+kernel-image-6.6.123-yocto-standard
+kernel-dev
+";
+        let parsed = parse_kernel_names_and_provides(raw);
+        assert_eq!(parsed, vec!["6.6.123-yocto-standard".to_string()]);
+    }
+
+    #[test]
+    fn parse_empty_input() {
+        assert_eq!(parse_kernel_names_and_provides(""), Vec::<String>::new());
+        assert_eq!(
+            parse_kernel_names_and_provides("\n\n"),
+            Vec::<String>::new()
+        );
     }
 }
