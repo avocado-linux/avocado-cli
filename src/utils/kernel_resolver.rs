@@ -101,24 +101,25 @@ pub async fn resolve_and_pin_kernel_version(
     Ok(Some(picked))
 }
 
-/// Run `dnf repoquery --whatprovides kernel-base` inside the SDK container
-/// and parse the output into a list of KERNEL_VERSIONs (the part after the
-/// `kernel-` prefix on each package name).
+/// Run `dnf repoquery 'kernel-*'` inside the SDK container and parse the
+/// output into a list of KERNEL_VERSIONs (the part after the `kernel-`
+/// prefix on each package name).
 async fn query_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
-    // oe-core's kernel.bbclass renames the `${KERNEL_PACKAGE_NAME}-base`
-    // package to `${KERNEL_PACKAGE_NAME}-${KERNEL_VERSION_PKG_NAME}` and
-    // explicitly emits `RPROVIDES += "${KERNEL_PACKAGE_NAME}-base"` on it —
-    // so `--whatprovides kernel-base` is the exact virtual that resolves to
-    // the renamed base kernel RPM (one row per KERNEL_VERSION available in
-    // the feed). This avoids matching kernel-module-*, kernel-devsrc-*, or
-    // other sibling subpackages.
+    // oe-core's kernel.bbclass renames `${KERNEL_PACKAGE_NAME}-base` to
+    // `${KERNEL_PACKAGE_NAME}-${KERNEL_VERSION_PKG_NAME}` but the only
+    // RPROVIDES it adds is the renamed name itself — there's no unqualified
+    // `kernel` or `kernel-base` virtual to query against. So we glob on
+    // NAME and let `parse_kernel_names` filter down to the base kernels by
+    // requiring the first post-prefix character to be a digit (KERNEL_VERSION
+    // always starts with the kernel series major, e.g. "5.15", "6.6"). That
+    // cleanly drops `kernel-module-*`, `kernel-devsrc-*`, `kernel-image-*`,
+    // etc., which all start with an alpha character after `kernel-`.
     //
-    // `parse_kernel_names` below strips the `kernel-` prefix from each NAME
-    // to recover the KERNEL_VERSION string. `2>/dev/null` hides the "Last
-    // metadata expiration" noise dnf writes to stderr.
+    // `2>/dev/null` hides the "Last metadata expiration" noise dnf writes to
+    // stderr.
     let command = r#"
 set -euo pipefail
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides kernel-base --qf '%{NAME}\n' 2>/dev/null \
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery 'kernel-*' --qf '%{NAME}\n' 2>/dev/null \
     | sort -u
 "#
     .to_string();
