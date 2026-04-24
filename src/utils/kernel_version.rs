@@ -185,33 +185,6 @@ pub fn is_kernel_family(name: &str) -> bool {
     name == "kernel" || name.starts_with("kernel-") || name.starts_with("nv-kernel-")
 }
 
-/// Rewrite any kernel-family keys in `packages` to include the resolved kernel
-/// version suffix so dnf resolution is unambiguous when multiple kernels
-/// coexist in a rolling feed. Non-kernel-family keys pass through unchanged.
-///
-/// Names that already end with the exact `-<kernel_version>` suffix are left
-/// alone (prevents double-suffixing if a user explicitly writes the versioned
-/// name into their avocado.yaml).
-///
-/// Generic over the value type so this can be applied to any `HashMap<String, _>`
-/// representation of a packages section.
-pub fn rewrite_kernel_family_packages<V: Clone>(
-    packages: &std::collections::HashMap<String, V>,
-    kernel_version: &str,
-) -> std::collections::HashMap<String, V> {
-    let suffix = format!("-{kernel_version}");
-    let mut out = std::collections::HashMap::with_capacity(packages.len());
-    for (name, value) in packages {
-        let new_name = if is_kernel_family(name) && !name.ends_with(&suffix) {
-            format!("{name}{suffix}")
-        } else {
-            name.clone()
-        };
-        out.insert(new_name, value.clone());
-    }
-    out
-}
-
 /// Compare two versions using a close approximation of RPM's `rpmvercmp`
 /// algorithm: separate into runs of digits / runs of alphas split by
 /// non-alphanumeric characters, compare segment-by-segment with numeric runs
@@ -534,43 +507,4 @@ mod tests {
         assert!(!is_kernel_family("kernellabs"));
     }
 
-    // --- rewrite -----------------------------------------------------------
-
-    #[test]
-    fn rewrite_adds_suffix_to_kernel_family() {
-        let mut pkgs = std::collections::HashMap::new();
-        pkgs.insert("kernel-module-host1x".to_string(), "*".to_string());
-        pkgs.insert("kernel-devsrc".to_string(), "*".to_string());
-        pkgs.insert("busybox".to_string(), "*".to_string());
-        pkgs.insert(
-            "nv-kernel-module-watchdog-tegra-t18x".to_string(),
-            "*".to_string(),
-        );
-
-        let kver = "5.15.185-l4t-r36.5-1033.33";
-        let out = rewrite_kernel_family_packages(&pkgs, kver);
-
-        assert!(out.contains_key("kernel-module-host1x-5.15.185-l4t-r36.5-1033.33"));
-        assert!(out.contains_key("kernel-devsrc-5.15.185-l4t-r36.5-1033.33"));
-        assert!(out.contains_key("nv-kernel-module-watchdog-tegra-t18x-5.15.185-l4t-r36.5-1033.33"));
-        assert!(out.contains_key("busybox"));
-        assert_eq!(out.len(), 4);
-    }
-
-    #[test]
-    fn rewrite_does_not_double_suffix() {
-        let mut pkgs = std::collections::HashMap::new();
-        pkgs.insert(
-            "kernel-module-host1x-5.15.185-l4t-r36.5-1033.33".to_string(),
-            "*".to_string(),
-        );
-
-        let kver = "5.15.185-l4t-r36.5-1033.33";
-        let out = rewrite_kernel_family_packages(&pkgs, kver);
-
-        assert!(out.contains_key("kernel-module-host1x-5.15.185-l4t-r36.5-1033.33"));
-        assert!(!out.contains_key(&format!(
-            "kernel-module-host1x-5.15.185-l4t-r36.5-1033.33-{kver}"
-        )));
-    }
 }
