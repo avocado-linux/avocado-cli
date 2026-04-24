@@ -190,6 +190,7 @@ impl AvocadoContext {
 ///     target: None,
 ///     distro_release: Some("2024".to_string()),
 ///     distro_channel: Some("edge".to_string()),
+///     kernel_version: None,
 /// };
 /// let result = resolve(&["distro", "release"], &yaml, Some(&ctx)).unwrap();
 /// assert_eq!(result, Some("2024".to_string()));
