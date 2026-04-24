@@ -215,7 +215,24 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             );
             Some(name)
         }
-        _ => None,
+        (None, _) => {
+            print_info(
+                &format!(
+                    "Skipping kernel-modules packagegroup auto-append for {label}: no kernel version resolved"
+                ),
+                OutputLevel::Normal,
+            );
+            None
+        }
+        (_, false) => {
+            print_info(
+                &format!(
+                    "Skipping kernel-modules packagegroup auto-append for {label}: {default_pkg} not in packages list"
+                ),
+                OutputLevel::Normal,
+            );
+            None
+        }
     };
 
     let mut pkg_specs: Vec<String> = if packages.is_empty() {
