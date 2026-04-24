@@ -993,6 +993,22 @@ pub struct ConnectConfig {
     pub server_key: Option<String>,
 }
 
+/// Top-level kernel configuration. Applies to all runtimes/sysroots that don't
+/// set their own `kernel.version`. When absent, the resolver picks the
+/// highest-versioned kernel available in the repo.
+///
+/// Deliberately narrower than the runtime-level [`KernelConfig`] — only the
+/// version constraint lives here; `package` / `compile` / `install` stay
+/// per-runtime since they describe *what kernel a runtime ships*, whereas
+/// `version` describes *which kernel to pin from the repo*.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TopLevelKernelConfig {
+    /// Kernel version constraint. Accepts exact (`5.15.185-l4t-r36.5-1033.33`),
+    /// prefix glob (`5.15.*`, `6.6.*`), or dnf-style bounded (`>= 6.6`,
+    /// `>= 5.15, < 6`). See [crate::utils::kernel_version::KernelVersionSpec].
+    pub version: Option<String>,
+}
+
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -1018,6 +1034,9 @@ pub struct Config {
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
     pub signing_keys: Option<HashMap<String, String>>,
     pub connect: Option<ConnectConfig>,
+    /// Top-level kernel version constraint. When set, applies to any
+    /// runtime/sysroot that doesn't override with its own `kernel.version`.
+    pub kernel: Option<TopLevelKernelConfig>,
 }
 
 impl Config {
@@ -1027,6 +1046,58 @@ impl Config {
             crate::utils::version::check_cli_requirement(requirement)?;
         }
         Ok(())
+    }
+
+    /// Parse the effective kernel version spec for a given runtime, applying
+    /// precedence: `runtimes.<runtime_name>.kernel.version` overrides top-level
+    /// `kernel.version`. Returns `Ok(None)` when neither level sets a spec
+    /// (callers interpret `None` as "pick latest available in the repo").
+    ///
+    /// Passing `runtime_name = None` resolves only against the top-level spec,
+    /// which is the appropriate policy for non-runtime sysroots (rootfs,
+    /// initramfs, target-sysroot, extensions).
+    pub fn effective_kernel_spec(
+        &self,
+        runtime_name: Option<&str>,
+    ) -> Result<Option<crate::utils::kernel_version::KernelVersionSpec>> {
+        // 1. Runtime-level wins when present.
+        if let Some(name) = runtime_name {
+            if let Some(runtimes) = &self.runtimes {
+                if let Some(rt) = runtimes.get(name) {
+                    if let Some(kc) = &rt.kernel {
+                        if let Some(v) = &kc.version {
+                            return Ok(Some(
+                                crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fall through to top-level.
+        if let Some(top) = &self.kernel {
+            if let Some(v) = &top.version {
+                return Ok(Some(
+                    crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Returns true if the runtime's kernel is built from source via the SDK
+    /// compile section (runtime `kernel.compile` set). Such runtimes bypass
+    /// repo-based kernel version resolution — the KERNEL_VERSION comes from
+    /// what the compile step produced, not from a repo query.
+    pub fn runtime_kernel_is_compiled(&self, runtime_name: &str) -> bool {
+        self.runtimes
+            .as_ref()
+            .and_then(|rs| rs.get(runtime_name))
+            .and_then(|rt| rt.kernel.as_ref())
+            .map(|kc| kc.compile.is_some())
+            .unwrap_or(false)
     }
 
     /// Get merged configuration for any section type with target-specific overrides.
@@ -1269,6 +1340,7 @@ impl Config {
                 provision_profiles: None,
                 signing_keys: None,
                 connect: None,
+                kernel: None,
             });
 
         // Resolve target: CLI arg > env var > config default
@@ -8977,5 +9049,88 @@ subvolumes:
         let avocado = subvolumes.get("lib/avocado").unwrap().to_config();
         assert_eq!(avocado.compression, Some("zstd:3".to_string()));
         assert_eq!(avocado.quota, Some("500M".to_string()));
+    }
+
+    // --- kernel.version tests ---
+
+    #[test]
+    fn test_effective_kernel_spec_none_when_neither_set() {
+        let yaml = r#"
+runtimes:
+  dev: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap();
+        assert!(spec.is_none());
+    }
+
+    #[test]
+    fn test_effective_kernel_spec_top_level_applies() {
+        let yaml = r#"
+kernel:
+  version: "5.15.*"
+runtimes:
+  dev: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap().unwrap();
+        assert!(spec.matches("5.15.185-l4t-r36.5-1033.33"));
+        assert!(!spec.matches("6.6.123"));
+    }
+
+    #[test]
+    fn test_effective_kernel_spec_runtime_overrides_top_level() {
+        let yaml = r#"
+kernel:
+  version: "5.15.*"
+runtimes:
+  dev:
+    kernel:
+      package: kernel
+      version: ">= 6.6"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap().unwrap();
+        assert!(spec.matches("6.6.123"));
+        assert!(!spec.matches("5.15.185"));
+    }
+
+    #[test]
+    fn test_effective_kernel_spec_no_runtime_name_uses_top_level_only() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+runtimes:
+  dev:
+    kernel:
+      package: kernel
+      version: "5.15.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        // None runtime → top-level applies even though runtime has an override.
+        let spec = config.effective_kernel_spec(None).unwrap().unwrap();
+        assert!(spec.matches("6.6.123"));
+        assert!(!spec.matches("5.15.185"));
+    }
+
+    #[test]
+    fn test_runtime_kernel_is_compiled() {
+        let yaml = r#"
+runtimes:
+  custom:
+    kernel:
+      compile: mykernel
+      install: scripts/install.sh
+  normal:
+    kernel:
+      package: kernel
+      version: "*"
+  nokernel: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.runtime_kernel_is_compiled("custom"));
+        assert!(!config.runtime_kernel_is_compiled("normal"));
+        assert!(!config.runtime_kernel_is_compiled("nokernel"));
+        assert!(!config.runtime_kernel_is_compiled("missing"));
     }
 }

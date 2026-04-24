@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 /// Current lock file format version
 /// Version 3: Extensions now use ExtensionLock with optional source metadata and packages
-const LOCKFILE_VERSION: u32 = 3;
+/// Version 4: Adds per-sysroot `kernel-versions` map for pinned KERNEL_VERSION
+const LOCKFILE_VERSION: u32 = 4;
 
 /// Lock file name
 const LOCKFILE_NAME: &str = "lock.json";
@@ -88,6 +89,20 @@ impl SysrootType {
                 rpm_configdir: None,
                 root_path: Some(format!("$AVOCADO_PREFIX/runtimes/{name}")),
             },
+        }
+    }
+
+    /// Stable string key used to index into per-sysroot lockfile maps (e.g.
+    /// `kernel-versions`). Mirrors the naming convention already used in the
+    /// v1 → v3 migration.
+    pub fn lock_key(&self) -> String {
+        match self {
+            SysrootType::Sdk(arch) => format!("sdk/{arch}"),
+            SysrootType::Rootfs => "rootfs".to_string(),
+            SysrootType::Initramfs => "initramfs".to_string(),
+            SysrootType::TargetSysroot => "target-sysroot".to_string(),
+            SysrootType::Extension(name) => format!("extensions/{name}"),
+            SysrootType::Runtime(name) => format!("runtimes/{name}"),
         }
     }
 }
@@ -229,6 +244,19 @@ pub struct TargetLocks {
     /// Runtime packages keyed by runtime name
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub runtimes: NestedPackageVersions,
+
+    /// Resolved KERNEL_VERSION per sysroot, pinned at first install so that
+    /// subsequent installs against the same lockfile produce the same kernel
+    /// even if the feed gained newer kernels in the meantime. Keys use the
+    /// same naming convention as the v1→v3 migration: `"rootfs"`,
+    /// `"initramfs"`, `"runtimes/<name>"`, `"extensions/<name>"`,
+    /// `"target-sysroot"`.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        rename = "kernel-versions"
+    )]
+    pub kernel_versions: HashMap<String, String>,
 }
 
 /// Lock file structure for tracking installed package versions
@@ -267,8 +295,11 @@ impl LockFile {
     /// Load lock file from disk, or return a new one if it doesn't exist
     ///
     /// This function also handles migration from older lock file versions:
-    /// - Version 1 -> 3: SDK packages nested under arch key, extensions use ExtensionLock
-    /// - Version 2 -> 3: Extensions migrated from flat packages to ExtensionLock structure
+    /// - Version 1 -> 4: SDK packages nested under arch key, extensions use ExtensionLock,
+    ///   plus v3 → v4 (kernel-versions added)
+    /// - Version 2 -> 4: Extensions migrated from flat packages to ExtensionLock structure,
+    ///   plus v3 → v4 (kernel-versions added)
+    /// - Version 3 -> 4: Adds empty kernel-versions map; schema is otherwise compatible.
     pub fn load(src_dir: &Path) -> Result<Self> {
         let path = Self::get_path(src_dir);
 
@@ -279,16 +310,23 @@ impl LockFile {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
 
-        // First, try to parse as current (v3) format
-        if let Ok(lock_file) = serde_json::from_str::<LockFile>(&content) {
-            if lock_file.version >= LOCKFILE_VERSION {
-                if lock_file.version > LOCKFILE_VERSION {
-                    anyhow::bail!(
-                        "Lock file version {} is newer than supported version {}. Please upgrade avocado-cli.",
-                        lock_file.version,
-                        LOCKFILE_VERSION
-                    );
-                }
+        // First, try to parse as current (v4) format. The kernel_versions field
+        // uses `#[serde(default)]`, so v3 files parse successfully here and
+        // differ only in the `version` field (which we catch below).
+        if let Ok(mut lock_file) = serde_json::from_str::<LockFile>(&content) {
+            if lock_file.version > LOCKFILE_VERSION {
+                anyhow::bail!(
+                    "Lock file version {} is newer than supported version {}. Please upgrade avocado-cli.",
+                    lock_file.version,
+                    LOCKFILE_VERSION
+                );
+            }
+            if lock_file.version == LOCKFILE_VERSION {
+                return Ok(lock_file);
+            }
+            if lock_file.version == 3 {
+                // v3 → v4: purely additive; kernel_versions already empty via serde default.
+                lock_file.version = LOCKFILE_VERSION;
                 return Ok(lock_file);
             }
         }
@@ -550,6 +588,23 @@ impl LockFile {
                 .get(name)
                 .and_then(|pkgs| pkgs.get(package)),
         }
+    }
+
+    /// Get the pinned KERNEL_VERSION for a specific target and sysroot, if any.
+    pub fn get_kernel_version(&self, target: &str, sysroot: &SysrootType) -> Option<&String> {
+        self.targets
+            .get(target)?
+            .kernel_versions
+            .get(&sysroot.lock_key())
+    }
+
+    /// Pin the resolved KERNEL_VERSION for a specific target and sysroot.
+    pub fn set_kernel_version(&mut self, target: &str, sysroot: &SysrootType, kver: &str) {
+        self.targets
+            .entry(target.to_string())
+            .or_default()
+            .kernel_versions
+            .insert(sysroot.lock_key(), kver.to_string());
     }
 
     /// Set the locked version for a package in a specific target and sysroot
@@ -1425,7 +1480,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 
         // Verify JSON structure - SDK is nested under arch, extensions use ExtensionLock
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["version"], 3);
+        assert_eq!(parsed["version"], LOCKFILE_VERSION);
         // SDK packages nested under sdk -> {arch} -> {package}
         assert!(parsed["targets"]["qemux86-64"]["sdk"]["x86_64"]["curl"].is_string());
         // Extensions nested under extensions -> {name} -> packages -> {package}
@@ -1589,8 +1644,8 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         // Load the lock file - should trigger migration
         let lock = LockFile::load(src_dir).unwrap();
 
-        // Version should be updated to 3
-        assert_eq!(lock.version, 3);
+        // Version should be updated to the current version
+        assert_eq!(lock.version, LOCKFILE_VERSION);
 
         // Old "sdk" entries should be removed (we can't determine their host arch)
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
@@ -1658,11 +1713,11 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, v2_content).unwrap();
 
-        // Load the lock file - should trigger v2->v3 migration
+        // Load the lock file - should trigger v2 migration (to current version)
         let lock = LockFile::load(src_dir).unwrap();
 
-        // Version should be updated to 3
-        assert_eq!(lock.version, 3);
+        // Version should be updated to the current version
+        assert_eq!(lock.version, LOCKFILE_VERSION);
 
         // SDK should be preserved
         assert_eq!(

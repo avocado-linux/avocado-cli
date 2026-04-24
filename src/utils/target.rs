@@ -252,6 +252,7 @@ mod tests {
             connect: None,
             rootfs: None,
             initramfs: None,
+            kernel: None,
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
             connect: None,
             rootfs: None,
             initramfs: None,
+            kernel: None,
         }
     }
 
@@ -290,6 +292,7 @@ mod tests {
             connect: None,
             rootfs: None,
             initramfs: None,
+            kernel: None,
         }
     }
 
