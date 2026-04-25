@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
-use crate::utils::kernel_version::substitute_kernel_version;
+use crate::utils::kernel_version::resolve_kernel_family_name;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -582,7 +582,7 @@ impl ExtInstallCommand {
         // Get extension configuration from the composed/merged config
         // For remote extensions, this comes from the merged remote extension config
         // For local extensions, this comes from the main config's ext section
-        let ext_config = match ext_location {
+        let raw_ext_config = match ext_location {
             ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 parsed
@@ -592,35 +592,62 @@ impl ExtInstallCommand {
             }
         };
 
+        // Resolve the kernel version up-front when the extension declares
+        // overrides that depend on it OR has packages that could include
+        // kernel-family names. Skip the container roundtrip for trivial
+        // extensions (no packages, no overrides).
+        let has_overrides_or_packages = raw_ext_config.as_ref().is_some_and(|ec| {
+            ec.get("packages").is_some()
+                || ec.as_mapping().is_some_and(|m| {
+                    m.keys().any(|k| {
+                        k.as_str()
+                            .is_some_and(|s| s.starts_with("target-") || s.starts_with("kernel-"))
+                    })
+                })
+        });
+
+        let resolved_kver = if has_overrides_or_packages {
+            // Extensions inherit the top-level kernel.version (they're not
+            // runtime-scoped), so pass None for runtime_name.
+            let mut resolve_params = ResolveParams {
+                container_helper,
+                container_image,
+                target,
+                sysroot: sysroot.clone(),
+                runtime_name: None,
+                config,
+                lock_file,
+                repo_url: repo_url.map(|s| s.as_str()),
+                repo_release: repo_release.map(|s| s.as_str()),
+                merged_container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                runs_on_context,
+                sdk_arch: self.sdk_arch.as_ref(),
+                verbose: self.verbose,
+                tui_context: effective_tui_context.clone(),
+            };
+            resolve_and_pin_kernel_version(&mut resolve_params).await?
+        } else {
+            None
+        };
+
+        // Apply target/kernel sub-section overrides now that kver is known.
+        // Strips override sub-keys and merges matching ones into the parent
+        // so consumers below see a flat `packages: { ... }` map with
+        // kernel-conditional entries already folded in.
+        let ext_config = raw_ext_config.as_ref().map(|ec| {
+            config.resolve_overrides_in_value(
+                ec.clone(),
+                target,
+                resolved_kver.as_deref(),
+                &format!("extensions.{extension}"),
+            )
+        });
+
         // Install dependencies if they exist
         let dependencies = ext_config.as_ref().and_then(|ec| ec.get("packages"));
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
-            // Resolve (or reuse a pinned) KERNEL_VERSION for this extension
-            // before building package specs. Extensions inherit the top-level
-            // kernel.version (they're not runtime-scoped), so pass None for
-            // runtime_name.
-            let resolved_kver = {
-                let mut resolve_params = ResolveParams {
-                    container_helper,
-                    container_image,
-                    target,
-                    sysroot: sysroot.clone(),
-                    runtime_name: None,
-                    config,
-                    lock_file,
-                    repo_url: repo_url.map(|s| s.as_str()),
-                    repo_release: repo_release.map(|s| s.as_str()),
-                    merged_container_args: merged_container_args.clone(),
-                    dnf_args: self.dnf_args.clone(),
-                    runs_on_context,
-                    sdk_arch: self.sdk_arch.as_ref(),
-                    verbose: self.verbose,
-                    tui_context: effective_tui_context.clone(),
-                };
-                resolve_and_pin_kernel_version(&mut resolve_params).await?
-            };
-
             // Build list of packages to install and handle extension dependencies
             let mut packages = Vec::new();
             let mut package_names = Vec::new();
@@ -634,7 +661,7 @@ impl ExtInstallCommand {
                 };
 
                 let resolved_name = match resolved_kver.as_deref() {
-                    Some(kver) => substitute_kernel_version(package_name, kver),
+                    Some(kver) => resolve_kernel_family_name(package_name, kver),
                     None => package_name.to_string(),
                 };
 

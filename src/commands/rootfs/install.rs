@@ -9,7 +9,7 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams},
-    kernel_version::substitute_kernel_version,
+    kernel_version::resolve_kernel_family_name,
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -189,7 +189,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // kernel-family names without silent rewriting.
     let resolve_name = |name: &str| -> String {
         match resolved_kver.as_deref() {
-            Some(kver) => substitute_kernel_version(name, kver),
+            Some(kver) => resolve_kernel_family_name(name, kver),
             None => name.to_string(),
         }
     };
