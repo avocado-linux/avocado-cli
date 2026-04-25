@@ -7,6 +7,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::utils::kernel_version::KernelVersionSpec;
+use crate::utils::output::{print_warning, OutputLevel};
+
 /// Custom deserializer module for container_args
 mod container_args_deserializer {
     use serde::{Deserialize, Deserializer};
@@ -1131,31 +1134,21 @@ impl Config {
         crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
             .with_context(|| "Failed to interpolate configuration values")?;
 
-        // Get the base section
-        let base_section = self.get_nested_section(&parsed, section_path);
+        let base_section = match self.get_nested_section(&parsed, section_path) {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        };
 
-        // Get the target-specific section
-        let target_section_path = format!("{section_path}.{target}");
-        let target_section = self.get_nested_section(&parsed, &target_section_path);
-
-        // Merge the sections, but filter out target-specific keys from the base
-        match (base_section, target_section) {
-            (Some(base), Some(target_override)) => Ok(Some(
-                self.merge_values(base.clone(), target_override.clone()),
-            )),
-            (Some(base), None) => {
-                // Filter out target-specific subsections from base before returning
-                let supported_targets = self.get_supported_targets().unwrap_or_default();
-                let filtered_base =
-                    self.filter_target_subsections(base.clone(), &supported_targets);
-                if filtered_base.as_mapping().is_some_and(|t| t.is_empty()) {
-                    Ok(None)
-                } else {
-                    Ok(Some(filtered_base))
-                }
-            }
-            (None, Some(target_override)) => Ok(Some(target_override.clone())),
-            (None, None) => Ok(None),
+        // Apply target-merge and strip override sub-keys. kernel-merge is a
+        // no-op here — get_merged_section runs without a resolved kernel
+        // version. Install paths that need kernel-conditional packages call
+        // resolve_overrides_in_value directly with Some(kver) after the
+        // kernel resolver has run.
+        let merged = self.resolve_overrides_in_value(base_section, target, None, section_path);
+        if merged.as_mapping().is_some_and(|m| m.is_empty()) {
+            Ok(None)
+        } else {
+            Ok(Some(merged))
         }
     }
 
@@ -2411,19 +2404,144 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
-    /// Merge a target-specific override into a base config value
-    /// This filters out other target sections from the base and merges the override
+    /// Merge a target-specific override into a base config value.
+    ///
+    /// Callers in ext lifecycle commands (build/clean/image/package) discover
+    /// the override section themselves (often via `find_ext_in_mapping`) and
+    /// pass it in alongside the base. The dispatcher path is preferred for
+    /// new code (handles `target-<name>:` and `kernel-<spec>:` uniformly), but
+    /// keeping this helper lets the explicit-override flow stay terse.
+    ///
+    /// We still funnel the base through `resolve_overrides_in_value` first to
+    /// strip any sibling `target-<other>:` / `kernel-<spec>:` / legacy bare-
+    /// target keys so they don't leak as content. `resolved_kver: None` keeps
+    /// kernel overrides stripped without applying them — the install paths
+    /// re-apply with `Some(kver)` after kernel resolution.
     pub fn merge_target_override(
         &self,
         base: serde_yaml::Value,
         target_override: serde_yaml::Value,
-        _current_target: &str,
+        current_target: &str,
     ) -> serde_yaml::Value {
-        // Filter out target-specific subsections from base before merging
+        let cleaned = self.resolve_overrides_in_value(base, current_target, None, "<override>");
+        self.merge_values(cleaned, target_override)
+    }
+
+    /// Apply prefix-dispatched override sub-sections in `value`. Supports:
+    ///
+    /// - **`target-<name>:`** — merged when `<name>` equals `current_target`.
+    /// - **`kernel-<spec>:`** — merged when `<spec>` (a `KernelVersionSpec`)
+    ///   matches `resolved_kver`. Skipped silently when `resolved_kver` is `None`.
+    /// - **Bare `<target-name>:`** (legacy) — merged when the bare key matches
+    ///   `current_target` AND the key is a known supported target. Emits a
+    ///   deprecation warning naming the section path so users can migrate to
+    ///   the explicit `target-<name>:` form.
+    ///
+    /// All recognized override sub-keys (matching or not) are stripped from
+    /// the result so they never leak as package names or other section content.
+    /// Unrecognized sub-keys (anything that's not a target-, kernel-, or known
+    /// supported target name) pass through unchanged.
+    ///
+    /// Merge precedence (later overrides earlier when keys collide):
+    ///   1. Base section (the parent's own keys)
+    ///   2. Legacy bare-target match
+    ///   3. `target-<name>:` match
+    ///   4. `kernel-<spec>:` matches (in source order)
+    ///
+    /// `section_path` is for diagnostic context only.
+    pub fn resolve_overrides_in_value(
+        &self,
+        value: serde_yaml::Value,
+        current_target: &str,
+        resolved_kver: Option<&str>,
+        section_path: &str,
+    ) -> serde_yaml::Value {
+        let mut map = match value {
+            serde_yaml::Value::Mapping(m) => m,
+            other => return other,
+        };
+
         let supported_targets = self.get_supported_targets().unwrap_or_default();
-        let filtered_base = self.filter_target_subsections(base, &supported_targets);
-        // Merge the target override into the filtered base
-        self.merge_values(filtered_base, target_override)
+        let mut target_match: Option<serde_yaml::Value> = None;
+        let mut kernel_matches: Vec<serde_yaml::Value> = Vec::new();
+        let mut legacy_target_match: Option<serde_yaml::Value> = None;
+        let mut keys_to_remove: Vec<serde_yaml::Value> = Vec::new();
+
+        for (key, sub_value) in &map {
+            let key_str = match key.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if let Some(name) = key_str.strip_prefix("target-") {
+                keys_to_remove.push(key.clone());
+                if name == current_target {
+                    target_match = Some(sub_value.clone());
+                }
+                continue;
+            }
+
+            if let Some(spec_str) = key_str.strip_prefix("kernel-") {
+                keys_to_remove.push(key.clone());
+                if let Some(kver) = resolved_kver {
+                    match KernelVersionSpec::parse(spec_str) {
+                        Ok(spec) if spec.matches(kver) => {
+                            kernel_matches.push(sub_value.clone());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            print_warning(
+                                &format!(
+                                    "Invalid kernel spec 'kernel-{spec_str}' in {section_path}: {e}; \
+                                     skipping override"
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Legacy bare-target-name. Match if the bare key equals the
+            // current target — that's the override-detection signal users
+            // have always relied on, even when supported_targets isn't
+            // declared. For SIBLING targets (bare keys equal to OTHER
+            // declared targets), strip them so they don't leak as content.
+            // Bare keys that match neither current_target nor any declared
+            // target are left alone — they're presumed to be legitimate
+            // content (a package name, a regular config field, etc.).
+            if key_str == current_target {
+                keys_to_remove.push(key.clone());
+                print_warning(
+                    &format!(
+                        "Bare target sub-key '{key_str}' in {section_path} is deprecated; \
+                         use 'target-{key_str}:' instead"
+                    ),
+                    OutputLevel::Normal,
+                );
+                legacy_target_match = Some(sub_value.clone());
+            } else if supported_targets.iter().any(|t| t == key_str) {
+                // Sibling target — strip but don't merge.
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        for k in keys_to_remove {
+            map.remove(&k);
+        }
+
+        let mut merged = serde_yaml::Value::Mapping(map);
+        if let Some(v) = legacy_target_match {
+            merged = self.merge_values(merged, v);
+        }
+        if let Some(v) = target_match {
+            merged = self.merge_values(merged, v);
+        }
+        for v in kernel_matches {
+            merged = self.merge_values(merged, v);
+        }
+        merged
     }
 
     /// Get merged runtime configuration for a specific runtime and target

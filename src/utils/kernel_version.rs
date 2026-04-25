@@ -195,6 +195,42 @@ pub fn substitute_kernel_version(input: &str, kernel_version: &str) -> String {
         .replace("{{avocado.kernel.version }}", kernel_version)
 }
 
+/// Predicate: is `name` a kernel-family package whose unqualified form should
+/// be auto-suffixed with `-${KERNEL_VERSION}` to disambiguate against a
+/// multi-kernel feed?
+///
+/// Matches the families produced by Yocto's `kernel.bbclass` after Path B
+/// PKG renames (`kernel-${kver}`, `kernel-image-${kver}`, `kernel-module-*-
+/// ${kver}`, `kernel-devsrc-${kver}`, `kernel-vmlinux-${kver}`, etc.) plus
+/// NVIDIA's OOT shim convention (`nv-kernel-module-*-${kver}`).
+///
+/// The exact string `"kernel"` matches because Yocto renames the
+/// `kernel-base` package to `kernel-${kver}`; users may type bare `kernel`
+/// in a yaml and expect it to land on a versioned target.
+pub fn is_kernel_family_name(name: &str) -> bool {
+    name == "kernel" || name.starts_with("kernel-") || name.starts_with("nv-kernel-module-")
+}
+
+/// Resolve a package-name field for install. Combines:
+/// 1. `{{ avocado.kernel.version }}` template substitution (existing
+///    Path B behavior — opt-in fully-qualified names).
+/// 2. Auto-suffix `-${kver}` for unqualified kernel-family names so dnf
+///    resolves to the resolver-pinned kernel rather than NVR-tie-breaking
+///    across a multi-kernel feed.
+///
+/// Names that already end with `-${kver}` (because the user templated them
+/// explicitly or wrote the suffix by hand) pass through unchanged. Names
+/// outside the kernel family pass through unchanged.
+pub fn resolve_kernel_family_name(name: &str, kver: &str) -> String {
+    let substituted = substitute_kernel_version(name, kver);
+    let suffix = format!("-{kver}");
+    if is_kernel_family_name(&substituted) && !substituted.ends_with(&suffix) {
+        format!("{substituted}{suffix}")
+    } else {
+        substituted
+    }
+}
+
 /// Compare two versions using a close approximation of RPM's `rpmvercmp`
 /// algorithm: separate into runs of digits / runs of alphas split by
 /// non-alphanumeric characters, compare segment-by-segment with numeric runs
@@ -553,5 +589,81 @@ mod tests {
             "6.6.123",
         );
         assert_eq!(out, "a-6.6.123-b-6.6.123");
+    }
+
+    // --- is_kernel_family_name + resolve_kernel_family_name ----------------
+
+    #[test]
+    fn kernel_family_predicate_matches_yocto_packages() {
+        assert!(is_kernel_family_name("kernel"));
+        assert!(is_kernel_family_name("kernel-image"));
+        assert!(is_kernel_family_name("kernel-module-host1x"));
+        assert!(is_kernel_family_name("kernel-devsrc"));
+        assert!(is_kernel_family_name("kernel-vmlinux"));
+        assert!(is_kernel_family_name("nv-kernel-module-rtl8822ce"));
+    }
+
+    #[test]
+    fn kernel_family_predicate_rejects_non_kernel() {
+        assert!(!is_kernel_family_name("busybox"));
+        assert!(!is_kernel_family_name("linux-firmware-rtl8168"));
+        assert!(!is_kernel_family_name("tegra-redundant-boot-base"));
+        // "kernels" doesn't start with "kernel-"
+        assert!(!is_kernel_family_name("kernels"));
+        // Without the nv- prefix, even with kernel-module mid-string, it's
+        // not a known family pattern.
+        assert!(!is_kernel_family_name("foo-kernel-module-bar"));
+    }
+
+    #[test]
+    fn resolve_family_name_auto_suffixes_unqualified() {
+        let kver = "5.15.185-l4t-r36.5-1033.33";
+        assert_eq!(
+            resolve_kernel_family_name("kernel-module-host1x", kver),
+            "kernel-module-host1x-5.15.185-l4t-r36.5-1033.33"
+        );
+        assert_eq!(
+            resolve_kernel_family_name("nv-kernel-module-rtl8822ce", kver),
+            "nv-kernel-module-rtl8822ce-5.15.185-l4t-r36.5-1033.33"
+        );
+        assert_eq!(
+            resolve_kernel_family_name("kernel-devsrc", kver),
+            "kernel-devsrc-5.15.185-l4t-r36.5-1033.33"
+        );
+    }
+
+    #[test]
+    fn resolve_family_name_passes_through_already_suffixed() {
+        let kver = "5.15.185-l4t-r36.5-1033.33";
+        // User already wrote the suffix verbatim — don't double it.
+        assert_eq!(
+            resolve_kernel_family_name("kernel-module-host1x-5.15.185-l4t-r36.5-1033.33", kver),
+            "kernel-module-host1x-5.15.185-l4t-r36.5-1033.33"
+        );
+    }
+
+    #[test]
+    fn resolve_family_name_substitutes_then_suffixes() {
+        let kver = "5.15.185-l4t-r36.5-1033.33";
+        // Template substitution first; substituted name already ends with
+        // -${kver}, so no double-suffix.
+        assert_eq!(
+            resolve_kernel_family_name("kernel-module-host1x-{{ avocado.kernel.version }}", kver),
+            "kernel-module-host1x-5.15.185-l4t-r36.5-1033.33"
+        );
+    }
+
+    #[test]
+    fn resolve_family_name_passes_through_non_kernel() {
+        let kver = "6.6.123-yocto-standard";
+        assert_eq!(resolve_kernel_family_name("busybox", kver), "busybox");
+        assert_eq!(
+            resolve_kernel_family_name("linux-firmware-rtl8168", kver),
+            "linux-firmware-rtl8168"
+        );
+        assert_eq!(
+            resolve_kernel_family_name("tegra-redundant-boot-base", kver),
+            "tegra-redundant-boot-base"
+        );
     }
 }
