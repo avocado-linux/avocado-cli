@@ -35,16 +35,7 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
     INITRAMFS_WORK="${{INITRAMFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/initramfs-work}}"
     rm -rf "$INITRAMFS_WORK"
-
-    echo "[DEBUG] INITRAMFS_SYSROOT=$INITRAMFS_SYSROOT"
-    echo "[DEBUG] sysroot module count: $(find "$INITRAMFS_SYSROOT/usr/lib/modules" -name '*.ko' 2>/dev/null | wc -l)"
-    echo "[DEBUG] sysroot has nvme.ko: $(ls "$INITRAMFS_SYSROOT/usr/lib/modules"/*/kernel/drivers/nvme/host/nvme.ko 2>/dev/null || echo NO)"
-
     cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
-
-    echo "[DEBUG] INITRAMFS_WORK=$INITRAMFS_WORK"
-    echo "[DEBUG] work module count after cp: $(find "$INITRAMFS_WORK/usr/lib/modules" -name '*.ko' 2>/dev/null | wc -l)"
-    echo "[DEBUG] work has nvme.ko: $(ls "$INITRAMFS_WORK/usr/lib/modules"/*/kernel/drivers/nvme/host/nvme.ko 2>/dev/null || echo NO)"
 
     # Create usrmerge symlinks (Yocto image class does this, not any RPM package)
     ln -sfn usr/bin "$INITRAMFS_WORK/bin"
