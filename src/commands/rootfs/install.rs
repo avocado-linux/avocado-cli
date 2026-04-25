@@ -235,6 +235,30 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         }
     };
 
+    // Rootfs only: also auto-append the kernel-image meta so the kernel Image
+    // (e.g. /boot/Image-${KERNEL_VERSION}) lands in the sysroot. The provision
+    // step uses it to repack boot.img for tegraflash, so the booted kernel
+    // matches the resolver-pinned modules. The `kernel-image-${kver}` meta
+    // RDEPENDS on the Image-bearing sub-packages (kernel-image-image-${kver}
+    // and kernel-image-image.gz-${kver}); dnf pulls both. Initramfs doesn't
+    // need this — boot.img embeds the initramfs cpio, the kernel comes from
+    // the rootfs sysroot.
+    let auto_kernel_image_pkg: Option<String> = match (
+        resolved_kver.as_deref(),
+        has_default_pkg,
+        &params.sysroot_type,
+    ) {
+        (Some(kver), true, SysrootType::Rootfs) => {
+            let name = format!("kernel-image-{kver}");
+            print_info(
+                &format!("Auto-including {name} for pinned kernel {kver}"),
+                OutputLevel::Normal,
+            );
+            Some(name)
+        }
+        _ => None,
+    };
+
     let mut pkg_specs: Vec<String> = if packages.is_empty() {
         vec![build_package_spec_with_lock(
             params.lock_file,
@@ -267,6 +291,15 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             "*",
         ));
     }
+    if let Some(ref name) = auto_kernel_image_pkg {
+        pkg_specs.push(build_package_spec_with_lock(
+            params.lock_file,
+            params.target,
+            &params.sysroot_type,
+            name,
+            "*",
+        ));
+    }
     let pkg = pkg_specs.join(" ");
 
     // Collect all package names for lock file queries
@@ -276,6 +309,9 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         packages.keys().cloned().collect()
     };
     if let Some(ref name) = auto_module_pkg {
+        all_package_names.push(name.clone());
+    }
+    if let Some(ref name) = auto_kernel_image_pkg {
         all_package_names.push(name.clone());
     }
 

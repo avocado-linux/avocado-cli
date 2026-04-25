@@ -3,6 +3,7 @@ use crate::utils::signing_service::{generate_helper_script, SigningService, Sign
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{is_docker_desktop, RunConfig, SdkContainer},
+    lockfile::{LockFile, SysrootType},
     output::{print_info, print_success, OutputLevel},
     remote::{RemoteHost, SshClient},
     stamps::{
@@ -292,6 +293,26 @@ impl RuntimeProvisionCommand {
         // Set AVOCADO_DISTRO_VERSION if configured
         if let Some(distro_version) = config.get_distro_version() {
             env_vars.insert("AVOCADO_DISTRO_VERSION".to_string(), distro_version.clone());
+        }
+
+        // AVOCADO_PROVISION_KERNEL_IMAGE / _VERSION: when `avocado install` pinned
+        // a kernel for the rootfs sysroot, the kernel-image RPM auto-append
+        // (install.rs) put /boot/Image-${KERNEL_VERSION} into the rootfs sysroot.
+        // Surface the container-side path so provision scripts (e.g.
+        // stone-provision-tegraflash.sh) can repack boot.img with the resolver-
+        // pinned kernel instead of relying on the build-baked one.
+        if let Ok(src_dir) = std::env::current_dir() {
+            if let Ok(lock_file) = LockFile::load(&src_dir) {
+                if let Some(kver) = lock_file
+                    .get_kernel_version(&target_arch, &SysrootType::Rootfs)
+                    .cloned()
+                {
+                    let image_path =
+                        format!("/opt/_avocado/{target_arch}/rootfs/boot/Image-{kver}");
+                    env_vars.insert("AVOCADO_PROVISION_KERNEL_VERSION".to_string(), kver);
+                    env_vars.insert("AVOCADO_PROVISION_KERNEL_IMAGE".to_string(), image_path);
+                }
+            }
         }
 
         // Determine state file path and container location if a provision profile is set
