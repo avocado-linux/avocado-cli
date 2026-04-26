@@ -1197,6 +1197,12 @@ pub struct Config {
     pub distro: Option<DistroConfig>,
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
+    /// Default runtime name for commands that scope by runtime. Mirrors
+    /// `default_target` semantics: lowest-priority resolution path, used when
+    /// no `-r/--runtime` flag and no `AVOCADO_RUNTIME` env var are set. When
+    /// set, must reference a runtime defined in `runtimes:`; validated at
+    /// config-load.
+    pub default_runtime: Option<String>,
     pub sdk: Option<SdkConfig>,
     /// Top-level rootfs image configuration(s). Accepts either a singleton
     /// config object (today's grammar — synthesized as the implicit `default`
@@ -1541,6 +1547,7 @@ impl Config {
                 src_dir: None,
                 distro: None,
                 runtimes: None,
+                default_runtime: None,
                 sdk: None,
                 rootfs: None,
                 initramfs: None,
@@ -3014,11 +3021,42 @@ impl Config {
     /// Validate that every named ref in `runtimes.<r>.{kernel,rootfs,initramfs}`
     /// resolves to a definition in the corresponding top-level map.
     ///
+    /// Also verifies `default_runtime` (when set) references a defined runtime.
+    ///
     /// Run at config-load to catch typos before they surface as confusing
     /// downstream "no kernel pinned" / "no rootfs sysroot" errors. Inline
     /// runtime overrides and unset fields skip this check; only `Named(...)`
     /// refs are validated here.
     pub fn validate_runtime_refs(&self) -> Result<()> {
+        if let Some(default_rt) = self.default_runtime.as_deref() {
+            let defined = self
+                .runtimes
+                .as_ref()
+                .is_some_and(|m| m.contains_key(default_rt));
+            if !defined {
+                let available = self
+                    .runtimes
+                    .as_ref()
+                    .map(|m| {
+                        let mut names: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                        names.sort_unstable();
+                        names.join(", ")
+                    })
+                    .unwrap_or_default();
+                if available.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "`default_runtime: {default_rt}` is set but no `runtimes:` block is \
+                         defined in avocado.yaml"
+                    ));
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "`default_runtime: {default_rt}` does not match any defined runtime. \
+                         Available: {available}"
+                    ));
+                }
+            }
+        }
+
         let Some(runtimes) = self.runtimes.as_ref() else {
             return Ok(());
         };
