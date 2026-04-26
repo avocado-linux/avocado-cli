@@ -4,7 +4,7 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{is_docker_desktop, RunConfig, SdkContainer},
     lockfile::{LockFile, SysrootType},
-    output::{print_info, print_success, OutputLevel},
+    output::{print_info, print_success, print_warning, OutputLevel},
     remote::{RemoteHost, SshClient},
     stamps::{
         generate_batch_read_stamps_script, generate_write_stamp_script,
@@ -303,12 +303,38 @@ impl RuntimeProvisionCommand {
         // pinned kernel instead of relying on the build-baked one.
         if let Ok(src_dir) = std::env::current_dir() {
             if let Ok(lock_file) = LockFile::load(&src_dir) {
+                // Validate kernel consistency before provision. Any drift between
+                // rootfs/initramfs kvers, or a pinned kver without a populated
+                // kernel sysroot, surfaces here as a warning. Phase 5 promotes
+                // these to fatal once the v1 rootfs auto-append is removed.
+                if let Err(e) = lock_file.validate_kernel_consistency(&target_arch) {
+                    print_warning(
+                        &format!(
+                            "Kernel consistency warning before provision: {e} \
+                             (provision will continue; this becomes a hard error in a future release)"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+
                 if let Some(kver) = lock_file
                     .get_kernel_version(&target_arch, &SysrootType::Rootfs)
                     .cloned()
                 {
-                    let image_path =
-                        format!("/opt/_avocado/{target_arch}/rootfs/boot/Image-{kver}");
+                    // Prefer the content-addressed kernel sysroot when populated
+                    // (Phase 2c stages it from the rootfs install). The
+                    // `Image` symlink inside that directory points at
+                    // `Image-<kver>`. Fall back to the rootfs `/boot/Image-<kver>`
+                    // path for v4 lockfiles or if staging silently failed.
+                    let kernel_sysroot = SysrootType::Kernel(kver.clone());
+                    let kernel_sysroot_populated = lock_file
+                        .get_sysroot_versions(&target_arch, &kernel_sysroot)
+                        .is_some();
+                    let image_path = if kernel_sysroot_populated {
+                        format!("/opt/_avocado/{target_arch}/kernel/{kver}/Image")
+                    } else {
+                        format!("/opt/_avocado/{target_arch}/rootfs/boot/Image-{kver}")
+                    };
                     env_vars.insert("AVOCADO_PROVISION_KERNEL_VERSION".to_string(), kver);
                     env_vars.insert("AVOCADO_PROVISION_KERNEL_IMAGE".to_string(), image_path);
                 }
