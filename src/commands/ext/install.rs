@@ -545,9 +545,14 @@ impl ExtInstallCommand {
         // would otherwise leave no trace in the lockfile because the
         // package-version write only fires when packages get pinned. This
         // ensures `runtimes.<r>.extensions.<ext>` exists as a membership
-        // marker.
+        // marker. Save immediately so the membership persists even when
+        // the rest of install_single_extension takes the
+        // no-packages-skip-save path.
         if let Some(rt) = self.runtime.as_deref() {
             lock_file.record_runtime_extension_membership(target, rt, extension);
+            lock_file.save(src_dir).with_context(|| {
+                format!("Failed to record membership for extension '{extension}' in runtime '{rt}'")
+            })?;
         }
 
         // Detect package removals: compare current config packages with lock file.
