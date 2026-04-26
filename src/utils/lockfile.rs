@@ -676,6 +676,26 @@ impl LockFile {
             .insert(sysroot.lock_key(), kver.to_string());
     }
 
+    /// Read the boot record for a target. Returns the empty default
+    /// `BootRecord` (both fields `None`) when the target is unrecorded.
+    #[allow(dead_code)] // Consumed by deploy decision-tree (Phase 4+).
+    pub fn get_boot_record(&self, target: &str) -> BootRecord {
+        self.targets
+            .get(target)
+            .map(|t| t.boot.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record the boot kernel-version and active-runtime for a target.
+    /// Called by `provision`/`deploy` after a successful flash to capture
+    /// what's actually running on the device.
+    #[allow(dead_code)] // Consumed by provision/deploy wiring (Phase 4+).
+    pub fn set_boot_record(&mut self, target: &str, kernel_version: &str, active_runtime: &str) {
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+        target_locks.boot.kernel_version = Some(kernel_version.to_string());
+        target_locks.boot.active_runtime = Some(active_runtime.to_string());
+    }
+
     /// Set the locked version for a package in a specific target and sysroot
     #[allow(dead_code)]
     pub fn set_locked_version(
@@ -2145,6 +2165,28 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         );
         assert_eq!(boot.active_runtime.as_deref(), Some("prod"));
         assert_eq!(loaded.version, LOCKFILE_VERSION);
+    }
+
+    #[test]
+    fn test_boot_record_set_and_get() {
+        let mut lock = LockFile::new();
+        // No target yet — accessor returns empty.
+        let empty = lock.get_boot_record("icam-540");
+        assert!(empty.is_empty());
+
+        lock.set_boot_record("icam-540", "6.6.123-yocto-standard", "prod");
+        let recorded = lock.get_boot_record("icam-540");
+        assert_eq!(
+            recorded.kernel_version.as_deref(),
+            Some("6.6.123-yocto-standard")
+        );
+        assert_eq!(recorded.active_runtime.as_deref(), Some("prod"));
+
+        // Overwrite path.
+        lock.set_boot_record("icam-540", "5.15.185-l4t", "dev-l4t");
+        let recorded = lock.get_boot_record("icam-540");
+        assert_eq!(recorded.kernel_version.as_deref(), Some("5.15.185-l4t"));
+        assert_eq!(recorded.active_runtime.as_deref(), Some("dev-l4t"));
     }
 
     #[test]
