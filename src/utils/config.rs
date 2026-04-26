@@ -10,6 +10,134 @@ use std::path::{Path, PathBuf};
 use crate::utils::kernel_version::KernelVersionSpec;
 use crate::utils::output::{print_warning, OutputLevel};
 
+/// Shape-inferred deserializer for top-level fields that accept either a
+/// singleton config object (today's grammar) OR a map of `name → config`
+/// (the new named-reference grammar).
+///
+/// The detection rule: if any top-level key in the YAML mapping matches one
+/// of the inner config type's known field names, treat the whole mapping as
+/// a singleton and synthesize the implicit name `default`. Otherwise, treat
+/// it as a `name → config` map directly.
+///
+/// Mixing forms (some keys are field names, some are not) is a hard error —
+/// it almost always indicates a typo and silently dropping unknown keys
+/// would produce confusing partial-singleton state.
+mod named_or_single_deserializer {
+    use serde::de::{self, Deserializer};
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    pub fn deserialize<'de, D, T>(
+        deserializer: D,
+        field_names: &[&str],
+        kind_label: &str,
+    ) -> Result<Option<HashMap<String, T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: serde::de::DeserializeOwned,
+    {
+        let value: Option<serde_yaml::Value> = Option::deserialize(deserializer)?;
+        let Some(value) = value else { return Ok(None) };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let mapping = match &value {
+            serde_yaml::Value::Mapping(m) => m,
+            _ => {
+                return Err(de::Error::custom(format!(
+                    "{kind_label}: expected mapping or null"
+                )))
+            }
+        };
+
+        let known: std::collections::HashSet<&str> = field_names.iter().copied().collect();
+        let total = mapping.len();
+        let field_key_count = mapping
+            .iter()
+            .filter_map(|(k, _)| k.as_str())
+            .filter(|s| known.contains(s))
+            .count();
+
+        if field_key_count == 0 {
+            // Named-map form.
+            let named: HashMap<String, T> =
+                serde_yaml::from_value(value).map_err(de::Error::custom)?;
+            return Ok(Some(named));
+        }
+
+        if field_key_count != total {
+            return Err(de::Error::custom(format!(
+                "{kind_label}: cannot mix singleton form (with config field keys like `{}`) and \
+                 named-map form (with entry name keys); use one form consistently",
+                field_names.join("`, `")
+            )));
+        }
+
+        // Singleton form — wrap as the implicit `default` entry.
+        let single: T = serde_yaml::from_value(value).map_err(de::Error::custom)?;
+        let mut result = HashMap::new();
+        result.insert("default".to_string(), single);
+        Ok(Some(result))
+    }
+}
+
+/// Look up the implicit `default` entry in a named-map field, falling back
+/// to the sole entry when the map has exactly one (anonymous-singleton case
+/// where the deserializer happened to produce a non-`default`-keyed entry —
+/// rare, but lets old fixture-style configs round-trip cleanly).
+fn get_default_or_singleton<T>(map: Option<&HashMap<String, T>>) -> Option<&T> {
+    let map = map?;
+    if let Some(value) = map.get("default") {
+        return Some(value);
+    }
+    if map.len() == 1 {
+        return map.values().next();
+    }
+    None
+}
+
+/// Custom deserializer for top-level `kernel:` field.
+fn deserialize_kernels<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, KernelConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["package", "version", "compile", "install"],
+        "kernel",
+    )
+}
+
+/// Custom deserializer for top-level `rootfs:` field.
+fn deserialize_rootfs_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, ImageConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["packages", "dependencies", "filesystem"],
+        "rootfs",
+    )
+}
+
+/// Custom deserializer for top-level `initramfs:` field.
+fn deserialize_initramfs_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, ImageConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["packages", "dependencies", "filesystem"],
+        "initramfs",
+    )
+}
+
 /// Custom deserializer module for container_args
 mod container_args_deserializer {
     use serde::{Deserialize, Deserializer};
@@ -1008,12 +1136,17 @@ pub struct Config {
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
     pub sdk: Option<SdkConfig>,
-    /// Top-level rootfs image configuration. When absent, defaults to
-    /// `{ packages: { "avocado-pkg-rootfs": "*" } }`.
-    pub rootfs: Option<ImageConfig>,
-    /// Top-level initramfs image configuration. When absent, defaults to
+    /// Top-level rootfs image configuration(s). Accepts either a singleton
+    /// config object (today's grammar — synthesized as the implicit `default`
+    /// entry) or a `name → config` map (new named-reference grammar). When
+    /// absent, callers default to `{ packages: { "avocado-pkg-rootfs": "*" } }`.
+    #[serde(default, deserialize_with = "deserialize_rootfs_map")]
+    pub rootfs: Option<HashMap<String, ImageConfig>>,
+    /// Top-level initramfs image configuration(s). Same singleton-or-map
+    /// shape as `rootfs`. When absent, callers default to
     /// `{ packages: { "avocado-pkg-initramfs": "*" } }`.
-    pub initramfs: Option<ImageConfig>,
+    #[serde(default, deserialize_with = "deserialize_initramfs_map")]
+    pub initramfs: Option<HashMap<String, ImageConfig>>,
     #[serde(alias = "provision")]
     pub provision_profiles: Option<HashMap<String, ProvisionProfileConfig>>,
     /// Signing keys mapping friendly names to key IDs
@@ -1021,12 +1154,14 @@ pub struct Config {
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
     pub signing_keys: Option<HashMap<String, String>>,
     pub connect: Option<ConnectConfig>,
-    /// Top-level kernel definition. When set, applies to any runtime/sysroot
-    /// that doesn't override with its own `kernel:` block. Accepts the same
-    /// fields as a runtime-level kernel (`version`, `package`, `compile`,
-    /// `install`); a top-level config with only `version:` set acts as a
-    /// version constraint applied across runtimes that don't pin their own.
-    pub kernel: Option<KernelConfig>,
+    /// Top-level kernel definition(s). Accepts either a singleton `KernelConfig`
+    /// (today's grammar — synthesized as the implicit `default` entry) or a
+    /// `name → KernelConfig` map (new named-reference grammar). Applies to any
+    /// runtime/sysroot that doesn't override with its own `kernel:` block.
+    /// A top-level config with only `version:` set acts as a version constraint
+    /// applied across runtimes that don't pin their own.
+    #[serde(default, deserialize_with = "deserialize_kernels")]
+    pub kernel: Option<HashMap<String, KernelConfig>>,
 }
 
 impl Config {
@@ -1065,8 +1200,9 @@ impl Config {
             }
         }
 
-        // 2. Fall through to top-level.
-        if let Some(top) = &self.kernel {
+        // 2. Fall through to top-level (the `default` named entry, or the
+        //    sole entry when shape-inference produced one).
+        if let Some(top) = self.kernel_default() {
             if let Some(v) = &top.version {
                 return Ok(Some(
                     crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
@@ -2908,10 +3044,27 @@ impl Config {
             .unwrap_or(false) // Default to false (enable weak dependencies)
     }
 
+    /// Get the default rootfs definition from top-level config (entry named
+    /// `default`, or — when only one entry exists — that single entry).
+    /// Returns `None` when no rootfs is defined.
+    pub fn rootfs_default(&self) -> Option<&ImageConfig> {
+        get_default_or_singleton(self.rootfs.as_ref())
+    }
+
+    /// Get the default initramfs definition from top-level config.
+    pub fn initramfs_default(&self) -> Option<&ImageConfig> {
+        get_default_or_singleton(self.initramfs.as_ref())
+    }
+
+    /// Get the default kernel definition from top-level config.
+    pub fn kernel_default(&self) -> Option<&KernelConfig> {
+        get_default_or_singleton(self.kernel.as_ref())
+    }
+
     /// Get rootfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-rootfs": "*" }` when the section is absent.
     pub fn get_rootfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
-        if let Some(ref rootfs) = self.rootfs {
+        if let Some(rootfs) = self.rootfs_default() {
             if let Some(ref packages) = rootfs.packages {
                 return packages.clone();
             }
@@ -2927,7 +3080,7 @@ impl Config {
     /// Get initramfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-initramfs": "*" }` when the section is absent.
     pub fn get_initramfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
-        if let Some(ref initramfs) = self.initramfs {
+        if let Some(initramfs) = self.initramfs_default() {
             if let Some(ref packages) = initramfs.packages {
                 return packages.clone();
             }
@@ -2943,8 +3096,7 @@ impl Config {
     /// Get rootfs filesystem format from top-level config.
     /// Defaults to `"erofs-lz4"` when the section or field is absent.
     pub fn get_rootfs_filesystem(&self) -> String {
-        self.rootfs
-            .as_ref()
+        self.rootfs_default()
             .and_then(|r| r.filesystem.clone())
             .unwrap_or_else(|| "erofs-lz4".to_string())
     }
@@ -2952,8 +3104,7 @@ impl Config {
     /// Get initramfs filesystem format from top-level config.
     /// Defaults to `"cpio.zst"` when the section or field is absent.
     pub fn get_initramfs_filesystem(&self) -> String {
-        self.initramfs
-            .as_ref()
+        self.initramfs_default()
             .and_then(|i| i.filesystem.clone())
             .unwrap_or_else(|| "cpio.zst".to_string())
     }
@@ -9237,5 +9388,175 @@ runtimes:
         assert!(!config.runtime_kernel_is_compiled("normal"));
         assert!(!config.runtime_kernel_is_compiled("nokernel"));
         assert!(!config.runtime_kernel_is_compiled("missing"));
+    }
+
+    // --- named-or-singleton schema tests for kernel/rootfs/initramfs ---
+
+    #[test]
+    fn test_kernel_singleton_form_synthesizes_default_entry() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernels = config.kernel.as_ref().unwrap();
+        assert_eq!(kernels.len(), 1);
+        assert!(kernels.contains_key("default"));
+        assert_eq!(
+            kernels.get("default").unwrap().version.as_deref(),
+            Some("6.6.*")
+        );
+        assert_eq!(
+            config.kernel_default().unwrap().version.as_deref(),
+            Some("6.6.*")
+        );
+    }
+
+    #[test]
+    fn test_kernel_named_map_form() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    version: "6.6.*"
+  l4t-5-15:
+    version: "5.15.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernels = config.kernel.as_ref().unwrap();
+        assert_eq!(kernels.len(), 2);
+        assert!(kernels.contains_key("yocto-6-6"));
+        assert!(kernels.contains_key("l4t-5-15"));
+        assert_eq!(
+            kernels.get("yocto-6-6").unwrap().version.as_deref(),
+            Some("6.6.*")
+        );
+        // No `default` entry — `kernel_default` returns `None` for true multi-entry map.
+        assert!(config.kernel_default().is_none());
+    }
+
+    #[test]
+    fn test_kernel_named_map_form_with_full_definition() {
+        let yaml = r#"
+kernel:
+  custom:
+    compile: my-kernel-src
+    install: scripts/kernel-install.sh
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernels = config.kernel.as_ref().unwrap();
+        let custom = kernels.get("custom").unwrap();
+        assert_eq!(custom.compile.as_deref(), Some("my-kernel-src"));
+        assert_eq!(custom.install.as_deref(), Some("scripts/kernel-install.sh"));
+        // Single-entry map with non-`default` key falls back via `kernel_default`.
+        assert_eq!(
+            config.kernel_default().unwrap().compile.as_deref(),
+            Some("my-kernel-src")
+        );
+    }
+
+    #[test]
+    fn test_kernel_mixed_form_errors() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+  l4t-5-15:
+    version: "5.15.*"
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot mix singleton form")
+                && err.contains("named-map form")
+                && err.contains("kernel"),
+            "expected mixed-form error message; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_singleton_and_named_forms() {
+        // Singleton form (today's grammar)
+        let yaml_single = r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+  filesystem: erofs-lz4
+"#;
+        let config: Config = serde_yaml::from_str(yaml_single).unwrap();
+        assert!(config.rootfs.as_ref().unwrap().contains_key("default"));
+        let rfs = config.rootfs_default().unwrap();
+        assert_eq!(rfs.filesystem.as_deref(), Some("erofs-lz4"));
+        // Existing accessors keep working.
+        assert_eq!(config.get_rootfs_filesystem(), "erofs-lz4");
+
+        // Named-map form
+        let yaml_named = r#"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+    filesystem: erofs-lz4
+  minimal:
+    packages: { avocado-pkg-rootfs-minimal: "*" }
+    filesystem: erofs-zst
+"#;
+        let config: Config = serde_yaml::from_str(yaml_named).unwrap();
+        let rootfs_map = config.rootfs.as_ref().unwrap();
+        assert_eq!(rootfs_map.len(), 2);
+        assert_eq!(
+            rootfs_map.get("minimal").unwrap().filesystem.as_deref(),
+            Some("erofs-zst")
+        );
+        // `default` entry resolves via the accessor.
+        assert_eq!(
+            config.rootfs_default().unwrap().filesystem.as_deref(),
+            Some("erofs-lz4")
+        );
+    }
+
+    #[test]
+    fn test_initramfs_singleton_and_named_forms() {
+        // Singleton form
+        let yaml_single = r#"
+initramfs:
+  packages: { avocado-pkg-initramfs: "*" }
+  filesystem: cpio.zst
+"#;
+        let config: Config = serde_yaml::from_str(yaml_single).unwrap();
+        assert!(config.initramfs.as_ref().unwrap().contains_key("default"));
+        assert_eq!(config.get_initramfs_filesystem(), "cpio.zst");
+
+        // Named-map form
+        let yaml_named = r#"
+initramfs:
+  default:
+    packages: { avocado-pkg-initramfs: "*" }
+"#;
+        let config: Config = serde_yaml::from_str(yaml_named).unwrap();
+        assert!(config.initramfs.as_ref().unwrap().contains_key("default"));
+    }
+
+    #[test]
+    fn test_rootfs_mixed_form_errors() {
+        let yaml = r#"
+rootfs:
+  filesystem: erofs-lz4
+  minimal:
+    packages: { x: "*" }
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot mix") && err.contains("rootfs"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_kernel_absent_yields_none() {
+        let yaml = "runtimes: {}\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.kernel.is_none());
+        assert!(config.kernel_default().is_none());
     }
 }
