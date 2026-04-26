@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -71,11 +71,26 @@ impl ExtInstallCommand {
 
     /// Scope this install to a runtime. When set, extension package versions
     /// are also recorded under `runtimes.<r>.extensions.<ext>` in the lockfile
-    /// alongside the existing global `extensions.<ext>` entry — that's the
-    /// Phase 2d.3 dual-write. On-disk paths are unchanged for now.
+    /// alongside the existing global `extensions.<ext>` entry, AND the
+    /// container entrypoint flips `\$AVOCADO_EXT_SYSROOTS` to the runtime-
+    /// scoped path. A compat symlink at the legacy location keeps callers
+    /// that haven't been opted in yet (build, image, clean, runtime build,
+    /// fetch) reading the same content transparently.
     pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    /// Build the container `env_vars` map carrying `AVOCADO_RUNTIME` when a
+    /// runtime is in scope. The container entrypoint reads it to compute
+    /// `\$AVOCADO_EXT_SYSROOTS`. Returns `None` when no runtime is set so
+    /// `RunConfig` defaults preserve today's behavior.
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
     }
 
     /// Set the no_stamps flag
@@ -397,6 +412,7 @@ impl ExtInstallCommand {
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
                     tui_context: effective_tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
 
@@ -545,6 +561,7 @@ impl ExtInstallCommand {
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
             // Best-effort clean -- if sysroot doesn't exist, this is a no-op
@@ -569,6 +586,7 @@ impl ExtInstallCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             tui_context: effective_tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let sysroot_exists =
@@ -587,6 +605,7 @@ impl ExtInstallCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
             let success =
@@ -860,6 +879,7 @@ $DNF_SDK_HOST \
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
                     tui_context: effective_tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
                 let install_success =

@@ -1893,12 +1893,19 @@ export AVOCADO_SDK_ARCH="$(uname -m)"
 export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 # When the CLI passes AVOCADO_RUNTIME, scope the extension sysroot tree to
 # that runtime so kernel pin changes can produce fresh extension state per
-# runtime without leaking across them. Falls back to the legacy global path
-# when no runtime is in scope, preserving today's behavior for callers
-# that haven't been opted into runtime scoping yet.
+# runtime without leaking across them. Also maintain a compat symlink at
+# the legacy `$AVOCADO_PREFIX/extensions` location pointing to the runtime
+# tree, so ext-touching commands that haven't been wired to pass
+# AVOCADO_RUNTIME yet (build, image, clean, runtime build, fetch, hitl)
+# transparently resolve to the same content. The symlink is only created
+# when nothing already exists at the legacy path or when an existing
+# symlink is found — never clobbers a real directory.
 if [ -n "${{AVOCADO_RUNTIME:-}}" ]; then
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/runtimes/${{AVOCADO_RUNTIME}}/extensions"
     mkdir -p "${{AVOCADO_EXT_SYSROOTS}}"
+    if [ -L "${{AVOCADO_PREFIX}}/extensions" ] || [ ! -e "${{AVOCADO_PREFIX}}/extensions" ]; then
+        ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "${{AVOCADO_PREFIX}}/extensions"
+    fi
 else
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
 fi
@@ -2153,12 +2160,19 @@ export AVOCADO_SDK_ARCH="$(uname -m)"
 export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 # When the CLI passes AVOCADO_RUNTIME, scope the extension sysroot tree to
 # that runtime so kernel pin changes can produce fresh extension state per
-# runtime without leaking across them. Falls back to the legacy global path
-# when no runtime is in scope, preserving today's behavior for callers
-# that haven't been opted into runtime scoping yet.
+# runtime without leaking across them. Also maintain a compat symlink at
+# the legacy `$AVOCADO_PREFIX/extensions` location pointing to the runtime
+# tree, so ext-touching commands that haven't been wired to pass
+# AVOCADO_RUNTIME yet (build, image, clean, runtime build, fetch, hitl)
+# transparently resolve to the same content. The symlink is only created
+# when nothing already exists at the legacy path or when an existing
+# symlink is found — never clobbers a real directory.
 if [ -n "${{AVOCADO_RUNTIME:-}}" ]; then
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/runtimes/${{AVOCADO_RUNTIME}}/extensions"
     mkdir -p "${{AVOCADO_EXT_SYSROOTS}}"
+    if [ -L "${{AVOCADO_PREFIX}}/extensions" ] || [ ! -e "${{AVOCADO_PREFIX}}/extensions" ]; then
+        ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "${{AVOCADO_PREFIX}}/extensions"
+    fi
 else
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
 fi
