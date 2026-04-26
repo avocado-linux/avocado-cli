@@ -294,6 +294,15 @@ impl InstallCommand {
             let sdk_arch = self.sdk_arch.clone();
             let composed2 = Arc::clone(&composed);
             let renderer2 = renderer.clone();
+            // Phase 2d.3 dual-write: when the project has exactly one target-relevant
+            // runtime, ext installs can mirror their lockfile state under
+            // `runtimes.<r>.extensions.<ext>`. Multi-runtime projects skip the mirror
+            // for now (per-extension membership lookup lands in a follow-up commit).
+            let dual_write_runtime = if target_runtimes.len() == 1 {
+                target_runtimes.first().cloned()
+            } else {
+                None
+            };
 
             let sched_renderer = renderer
                 .clone()
@@ -313,6 +322,7 @@ impl InstallCommand {
                     let sdk_arch = sdk_arch.clone();
                     let composed = Arc::clone(&composed2);
                     let renderer = renderer2.clone();
+                    let dual_write_runtime = dual_write_runtime.clone();
 
                     Box::pin(async move {
                         let tui_ctx = renderer.as_ref().map(|r| TuiContext {
@@ -334,7 +344,8 @@ impl InstallCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
-                                .with_composed_config(composed);
+                                .with_composed_config(composed)
+                                .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
                                     cmd = cmd.with_tui_context(ctx);
                                 }
