@@ -3009,13 +3009,87 @@ impl Config {
             .with_context(|| "Failed to interpolate configuration values")?;
 
         // Deserialize to Config struct
-        let config: Config = serde_yaml::from_value(parsed)
+        let mut config: Config = serde_yaml::from_value(parsed)
             .with_context(|| "Failed to deserialize configuration after interpolation")?;
 
         config.validate_cli_requirement()?;
+        config.synthesize_implicit_default_runtime();
         config.validate_runtime_refs()?;
 
         Ok(config)
+    }
+
+    /// Synthesize an implicit `runtimes.default` entry when the project uses
+    /// only top-level singletons (`kernel:`, `rootfs:`, `initramfs:`) without
+    /// declaring any runtimes. Keeps today's zero-runtime projects working
+    /// after the runtime resolver becomes a load-bearing CLI primitive.
+    ///
+    /// Detection rule: `runtimes:` is missing or empty AND `default_target`
+    /// is set AND at least one top-level singleton (or named entry) exists.
+    /// The synthesized runtime references the top-level entries by their
+    /// `default` (or sole) name, so all of the existing accessor paths
+    /// continue to resolve.
+    ///
+    /// This is an in-memory transformation — the on-disk avocado.yaml is
+    /// unchanged.
+    fn synthesize_implicit_default_runtime(&mut self) {
+        let needs_default = self.runtimes.as_ref().is_none_or(|m| m.is_empty());
+        if !needs_default {
+            return;
+        }
+        let Some(target) = self.default_target.clone() else {
+            return;
+        };
+        let has_top_level = self.kernel_default().is_some()
+            || self.rootfs_default().is_some()
+            || self.initramfs_default().is_some();
+        if !has_top_level {
+            return;
+        }
+
+        let kernel_ref = self.kernel.as_ref().and_then(|m| {
+            if m.contains_key("default") {
+                Some(KernelRef::Named("default".to_string()))
+            } else if m.len() == 1 {
+                Some(KernelRef::Named(m.keys().next().unwrap().clone()))
+            } else {
+                None
+            }
+        });
+        let rootfs_ref = self.rootfs.as_ref().and_then(|m| {
+            if m.contains_key("default") {
+                Some(ImageRef::Named("default".to_string()))
+            } else if m.len() == 1 {
+                Some(ImageRef::Named(m.keys().next().unwrap().clone()))
+            } else {
+                None
+            }
+        });
+        let initramfs_ref = self.initramfs.as_ref().and_then(|m| {
+            if m.contains_key("default") {
+                Some(ImageRef::Named("default".to_string()))
+            } else if m.len() == 1 {
+                Some(ImageRef::Named(m.keys().next().unwrap().clone()))
+            } else {
+                None
+            }
+        });
+
+        let synth = RuntimeConfig {
+            target: Some(target),
+            version: None,
+            dependencies: None,
+            stone_include_paths: None,
+            stone_manifest: None,
+            signing: None,
+            kernel: kernel_ref,
+            rootfs: rootfs_ref,
+            initramfs: initramfs_ref,
+            var: None,
+        };
+        let mut map = self.runtimes.take().unwrap_or_default();
+        map.insert("default".to_string(), synth);
+        self.runtimes = Some(map);
     }
 
     /// Validate that every named ref in `runtimes.<r>.{kernel,rootfs,initramfs}`
@@ -9998,6 +10072,81 @@ runtimes:
                 && err.contains("no top-level"),
             "got: {err}"
         );
+    }
+
+    // --- Implicit default-runtime synthesis tests (Phase 1d) ---
+
+    #[test]
+    fn test_synthesize_implicit_default_runtime_when_zero_runtimes_and_singletons_present() {
+        let yaml = r#"
+default_target: qemux86-64
+kernel:
+  version: "6.6.*"
+rootfs:
+  packages: { avocado-pkg-rootfs: "*" }
+initramfs:
+  packages: { avocado-pkg-initramfs: "*" }
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let runtimes = config
+            .runtimes
+            .as_ref()
+            .expect("default runtime synthesized");
+        let default = runtimes.get("default").expect("default runtime present");
+        assert_eq!(default.target.as_deref(), Some("qemux86-64"));
+        assert!(matches!(
+            default.kernel.as_ref().unwrap(),
+            KernelRef::Named(name) if name == "default"
+        ));
+        assert!(matches!(
+            default.rootfs.as_ref().unwrap(),
+            ImageRef::Named(name) if name == "default"
+        ));
+        assert!(matches!(
+            default.initramfs.as_ref().unwrap(),
+            ImageRef::Named(name) if name == "default"
+        ));
+        // Resolver auto-resolves to the synthesized default.
+        let resolved = crate::utils::runtime::resolve_runtime(None, &config);
+        assert_eq!(resolved.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn test_no_synthesis_when_runtimes_block_present() {
+        let yaml = r#"
+default_target: qemux86-64
+kernel:
+  version: "6.6.*"
+runtimes:
+  prod:
+    target: qemux86-64
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let runtimes = config.runtimes.as_ref().unwrap();
+        assert_eq!(runtimes.len(), 1);
+        assert!(runtimes.contains_key("prod"));
+        assert!(!runtimes.contains_key("default"));
+    }
+
+    #[test]
+    fn test_no_synthesis_when_no_default_target() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        // Without default_target, we can't synthesize a target field — skip.
+        assert!(config.runtimes.is_none());
+    }
+
+    #[test]
+    fn test_no_synthesis_when_no_top_level_singletons() {
+        let yaml = r#"
+default_target: qemux86-64
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        // No top-level config to reference — synthesis is pointless.
+        assert!(config.runtimes.is_none());
     }
 
     #[test]
