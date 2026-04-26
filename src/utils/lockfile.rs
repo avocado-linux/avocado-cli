@@ -12,7 +12,11 @@ use std::path::{Path, PathBuf};
 /// Current lock file format version
 /// Version 3: Extensions now use ExtensionLock with optional source metadata and packages
 /// Version 4: Adds per-sysroot `kernel-versions` map for pinned KERNEL_VERSION
-const LOCKFILE_VERSION: u32 = 4;
+/// Version 5: Adds `kernels` map (per-target, content-addressed by KERNEL_VERSION)
+///            and `boot` record tracking the active flashed kernel-version /
+///            runtime. Both fields are additive — v4 lockfiles read as v5
+///            with empty `kernels` and no `boot`.
+const LOCKFILE_VERSION: u32 = 5;
 
 /// Lock file name
 const LOCKFILE_NAME: &str = "lock.json";
@@ -39,6 +43,12 @@ pub enum SysrootType {
     Extension(String),
     /// Runtime sysroot ($AVOCADO_PREFIX/runtimes/{name})
     Runtime(String),
+    /// Kernel sysroot ($AVOCADO_PREFIX/kernel/{KERNEL_VERSION}) — content-addressed.
+    /// Holds the kernel `Image` (and DTBs, in future) shared across runtimes
+    /// pinning the same KERNEL_VERSION. The bytes are a pure function of the
+    /// version, so two runtimes pinning the same kver share storage.
+    #[allow(dead_code)] // Constructed by per-runtime install path (Phase 2c+).
+    Kernel(String),
 }
 
 impl SysrootType {
@@ -89,6 +99,12 @@ impl SysrootType {
                 rpm_configdir: None,
                 root_path: Some(format!("$AVOCADO_PREFIX/runtimes/{name}")),
             },
+            SysrootType::Kernel(version) => RpmQueryConfig {
+                // Kernel sysroot: content-addressed under $AVOCADO_PREFIX/kernel/<kver>.
+                rpm_etcconfigdir: None,
+                rpm_configdir: None,
+                root_path: Some(format!("$AVOCADO_PREFIX/kernel/{version}")),
+            },
         }
     }
 
@@ -103,6 +119,7 @@ impl SysrootType {
             SysrootType::TargetSysroot => "target-sysroot".to_string(),
             SysrootType::Extension(name) => format!("extensions/{name}"),
             SysrootType::Runtime(name) => format!("runtimes/{name}"),
+            SysrootType::Kernel(version) => format!("kernels/{version}"),
         }
     }
 }
@@ -212,6 +229,37 @@ fn extensions_are_empty(extensions: &HashMap<String, ExtensionLock>) -> bool {
     extensions.is_empty() || extensions.values().all(|e| e.is_empty())
 }
 
+/// Authoritative record of what's flashed on the device for a given target.
+/// Written by `provision`/`deploy`; read by `deploy` to decide between a
+/// userspace push (kernel unchanged) and a full OS update (kernel changed).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BootRecord {
+    /// KERNEL_VERSION of the kernel currently flashed on the device.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "kernel-version"
+    )]
+    pub kernel_version: Option<String>,
+    /// Name of the runtime that drove the current boot kernel choice.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "active-runtime"
+    )]
+    pub active_runtime: Option<String>,
+}
+
+impl BootRecord {
+    pub fn is_empty(&self) -> bool {
+        self.kernel_version.is_none() && self.active_runtime.is_none()
+    }
+}
+
+fn boot_record_is_empty(b: &BootRecord) -> bool {
+    b.is_empty()
+}
+
 /// Lock data for a single target
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TargetLocks {
@@ -257,6 +305,18 @@ pub struct TargetLocks {
         rename = "kernel-versions"
     )]
     pub kernel_versions: HashMap<String, String>,
+
+    /// Per-kernel-sysroot package state. Keyed by KERNEL_VERSION; each entry
+    /// records the packages installed in `$AVOCADO_PREFIX/kernel/<kver>/`.
+    /// Content-addressed by version — multiple runtimes pinning the same
+    /// kver share a single sysroot and a single entry here.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub kernels: NestedPackageVersions,
+
+    /// Active boot record: which kernel is flashed and which runtime drove
+    /// that choice. Populated by `provision`/`deploy`.
+    #[serde(default, skip_serializing_if = "boot_record_is_empty")]
+    pub boot: BootRecord,
 }
 
 /// Lock file structure for tracking installed package versions
@@ -295,11 +355,13 @@ impl LockFile {
     /// Load lock file from disk, or return a new one if it doesn't exist
     ///
     /// This function also handles migration from older lock file versions:
-    /// - Version 1 -> 4: SDK packages nested under arch key, extensions use ExtensionLock,
-    ///   plus v3 → v4 (kernel-versions added)
-    /// - Version 2 -> 4: Extensions migrated from flat packages to ExtensionLock structure,
-    ///   plus v3 → v4 (kernel-versions added)
-    /// - Version 3 -> 4: Adds empty kernel-versions map; schema is otherwise compatible.
+    /// - Version 1 -> 5: SDK packages nested under arch key, extensions use ExtensionLock,
+    ///   plus v3 → v4 (kernel-versions added) and v4 → v5 (kernels map + boot record).
+    /// - Version 2 -> 5: Extensions migrated from flat packages to ExtensionLock structure,
+    ///   plus v3 → v4 → v5.
+    /// - Version 3 -> 5: Adds empty kernel-versions map (v3→v4) and empty kernels/boot
+    ///   (v4→v5); schema is otherwise compatible.
+    /// - Version 4 -> 5: Adds empty kernels map and empty boot record. Purely additive.
     pub fn load(src_dir: &Path) -> Result<Self> {
         let path = Self::get_path(src_dir);
 
@@ -310,9 +372,9 @@ impl LockFile {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
 
-        // First, try to parse as current (v4) format. The kernel_versions field
-        // uses `#[serde(default)]`, so v3 files parse successfully here and
-        // differ only in the `version` field (which we catch below).
+        // First, try to parse as current (v5) format. The new fields (`kernels`,
+        // `boot`) use `#[serde(default)]`, so v3 and v4 files parse successfully
+        // here and differ only in the `version` field (which we bump below).
         if let Ok(mut lock_file) = serde_json::from_str::<LockFile>(&content) {
             if lock_file.version > LOCKFILE_VERSION {
                 anyhow::bail!(
@@ -324,8 +386,8 @@ impl LockFile {
             if lock_file.version == LOCKFILE_VERSION {
                 return Ok(lock_file);
             }
-            if lock_file.version == 3 {
-                // v3 → v4: purely additive; kernel_versions already empty via serde default.
+            if lock_file.version == 3 || lock_file.version == 4 {
+                // v3 → v4 → v5: purely additive; new fields already default-empty via serde.
                 lock_file.version = LOCKFILE_VERSION;
                 return Ok(lock_file);
             }
@@ -590,6 +652,10 @@ impl LockFile {
                 .runtimes
                 .get(name)
                 .and_then(|pkgs| pkgs.get(package)),
+            SysrootType::Kernel(version) => target_locks
+                .kernels
+                .get(version)
+                .and_then(|pkgs| pkgs.get(package)),
         }
     }
 
@@ -634,6 +700,9 @@ impl LockFile {
                     .packages
             }
             SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
+            SysrootType::Kernel(version) => {
+                target_locks.kernels.entry(version.clone()).or_default()
+            }
         };
 
         packages.insert(package.to_string(), version.to_string());
@@ -661,6 +730,9 @@ impl LockFile {
                     .packages
             }
             SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
+            SysrootType::Kernel(version) => {
+                target_locks.kernels.entry(version.clone()).or_default()
+            }
         };
 
         for (package, version) in versions {
@@ -687,6 +759,7 @@ impl LockFile {
                 target_locks.extensions.get(name).map(|ext| &ext.packages)
             }
             SysrootType::Runtime(name) => target_locks.runtimes.get(name),
+            SysrootType::Kernel(version) => target_locks.kernels.get(version),
         };
 
         // Return None for empty collections (matches expected behavior)
@@ -703,6 +776,8 @@ impl LockFile {
                     && target_locks.target_sysroot.is_empty()
                     && extensions_are_empty(&target_locks.extensions)
                     && target_locks.runtimes.is_empty()
+                    && target_locks.kernels.is_empty()
+                    && target_locks.boot.is_empty()
             })
     }
 
@@ -799,6 +874,7 @@ impl LockFile {
                 .get_mut(name)
                 .map(|ext| &mut ext.packages),
             SysrootType::Runtime(name) => target_locks.runtimes.get_mut(name),
+            SysrootType::Kernel(version) => target_locks.kernels.get_mut(version),
         };
 
         if let Some(packages) = pkg_map {
@@ -2012,5 +2088,97 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let removed: Vec<String> = locked_names.difference(&config_packages).cloned().collect();
 
         assert!(removed.is_empty());
+    }
+
+    // --- v5 schema additions: kernel sysroot + boot record ---
+
+    #[test]
+    fn test_kernel_sysroot_lock_key_and_path() {
+        let s = SysrootType::Kernel("6.6.123-yocto-standard".to_string());
+        assert_eq!(s.lock_key(), "kernels/6.6.123-yocto-standard");
+        let cfg = s.get_rpm_query_config();
+        assert_eq!(
+            cfg.root_path.as_deref(),
+            Some("$AVOCADO_PREFIX/kernel/6.6.123-yocto-standard")
+        );
+    }
+
+    #[test]
+    fn test_kernel_sysroot_packages_round_trip() {
+        let mut lock = LockFile::new();
+        let s = SysrootType::Kernel("6.6.123-yocto-standard".to_string());
+        let mut versions = HashMap::new();
+        versions.insert("kernel-image".to_string(), "6.6.123-r0".to_string());
+        versions.insert("kernel-image-image".to_string(), "6.6.123-r0".to_string());
+        lock.update_sysroot_versions("icam-540", &s, versions);
+
+        // Read back
+        let versions = lock.get_sysroot_versions("icam-540", &s).unwrap();
+        assert_eq!(
+            versions.get("kernel-image").map(String::as_str),
+            Some("6.6.123-r0")
+        );
+        assert_eq!(
+            lock.get_locked_version("icam-540", &s, "kernel-image"),
+            Some(&"6.6.123-r0".to_string())
+        );
+        // Distinct from rootfs / extensions / runtimes — content-addressed bucket
+        let target = lock.targets.get("icam-540").unwrap();
+        assert_eq!(target.kernels.len(), 1);
+        assert!(target.rootfs.is_empty());
+    }
+
+    #[test]
+    fn test_boot_record_round_trip_through_save_load() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lock = LockFile::new();
+        let target_locks = lock.targets.entry("icam-540".to_string()).or_default();
+        target_locks.boot.kernel_version = Some("6.6.123-yocto-standard".to_string());
+        target_locks.boot.active_runtime = Some("prod".to_string());
+        lock.save(temp_dir.path()).unwrap();
+
+        let loaded = LockFile::load(temp_dir.path()).unwrap();
+        let boot = &loaded.targets.get("icam-540").unwrap().boot;
+        assert_eq!(
+            boot.kernel_version.as_deref(),
+            Some("6.6.123-yocto-standard")
+        );
+        assert_eq!(boot.active_runtime.as_deref(), Some("prod"));
+        assert_eq!(loaded.version, LOCKFILE_VERSION);
+    }
+
+    #[test]
+    fn test_v4_lockfile_loads_as_v5_with_empty_kernels_and_boot() {
+        // v4 lockfile (current production format pre-v5): version=4 + kernel-versions,
+        // no `kernels` or `boot` fields.
+        let v4_json = r#"{
+            "version": 4,
+            "targets": {
+                "icam-540": {
+                    "rootfs": { "avocado-pkg-rootfs": "1.0.0-r0" },
+                    "kernel-versions": { "rootfs": "6.6.123-yocto-standard" }
+                }
+            }
+        }"#;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_dir = temp_dir.path().join(LOCKFILE_DIR);
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::write(lock_dir.join(LOCKFILE_NAME), v4_json).unwrap();
+
+        let loaded = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(loaded.version, LOCKFILE_VERSION); // bumped to v5
+        let target = loaded.targets.get("icam-540").unwrap();
+        // Existing v4 state preserved.
+        assert_eq!(
+            target.rootfs.get("avocado-pkg-rootfs").map(String::as_str),
+            Some("1.0.0-r0")
+        );
+        assert_eq!(
+            target.kernel_versions.get("rootfs").map(String::as_str),
+            Some("6.6.123-yocto-standard")
+        );
+        // New v5 fields default to empty.
+        assert!(target.kernels.is_empty());
+        assert!(target.boot.is_empty());
     }
 }
