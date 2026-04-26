@@ -31,6 +31,14 @@ pub struct ExtInstallCommand {
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     pub tui_context: Option<TuiContext>,
+    /// Runtime to scope extension state to. When set, extension package
+    /// versions are mirrored into `lock.targets.<t>.runtimes.<r>.extensions.<ext>`
+    /// alongside the global `lock.targets.<t>.extensions.<ext>` entry that
+    /// today's flow populates. The on-disk extension sysroot path stays at
+    /// `$AVOCADO_EXT_SYSROOTS/<ext>` for now — Phase 2d follow-ups migrate
+    /// the on-disk layout once all ext command consumers (build, image,
+    /// clean, runtime build) accept a runtime parameter.
+    runtime: Option<String>,
 }
 
 impl ExtInstallCommand {
@@ -57,7 +65,17 @@ impl ExtInstallCommand {
             sdk_arch: None,
             composed_config: None,
             tui_context: None,
+            runtime: None,
         }
+    }
+
+    /// Scope this install to a runtime. When set, extension package versions
+    /// are also recorded under `runtimes.<r>.extensions.<ext>` in the lockfile
+    /// alongside the existing global `extensions.<ext>` entry — that's the
+    /// Phase 2d.3 dual-write. On-disk paths are unchanged for now.
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     /// Set the no_stamps flag
@@ -863,6 +881,22 @@ $DNF_SDK_HOST \
                         .await?;
 
                     if !installed_versions.is_empty() {
+                        // Phase 2d.3 dual-write: when a runtime is in scope,
+                        // mirror the same package versions to the runtime-
+                        // scoped lockfile location. Other ext commands still
+                        // read the global namespace — full migration of the
+                        // on-disk layout follows in subsequent commits.
+                        if let Some(rt) = self.runtime.as_deref() {
+                            let rt_sysroot = SysrootType::RuntimeExtension {
+                                runtime: rt.to_string(),
+                                extension: extension.to_string(),
+                            };
+                            lock_file.update_sysroot_versions(
+                                target,
+                                &rt_sysroot,
+                                installed_versions.clone(),
+                            );
+                        }
                         lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
                         if self.verbose {
                             print_info(
