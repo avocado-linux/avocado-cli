@@ -81,6 +81,34 @@ mod named_or_single_deserializer {
     }
 }
 
+/// Format a precise error message for an unresolved runtime ref. Lists the
+/// names that *are* defined in the top-level map so the user can spot typos.
+fn format_unresolved_ref_error<T>(
+    runtime_name: &str,
+    field: &str,
+    ref_name: &str,
+    map: Option<&HashMap<String, T>>,
+) -> String {
+    let available = map
+        .map(|m| {
+            let mut names: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            names.join(", ")
+        })
+        .unwrap_or_default();
+    if available.is_empty() {
+        format!(
+            "runtime '{runtime_name}' references {field} '{ref_name}', but no top-level \
+             `{field}:` map is defined in avocado.yaml"
+        )
+    } else {
+        format!(
+            "runtime '{runtime_name}' references {field} '{ref_name}', which is not defined \
+             in the top-level `{field}:` map. Available: {available}"
+        )
+    }
+}
+
 /// Look up the implicit `default` entry in a named-map field, falling back
 /// to the sole entry when the map has exactly one (anonymous-singleton case
 /// where the deserializer happened to produce a non-`default`-keyed entry —
@@ -2978,8 +3006,53 @@ impl Config {
             .with_context(|| "Failed to deserialize configuration after interpolation")?;
 
         config.validate_cli_requirement()?;
+        config.validate_runtime_refs()?;
 
         Ok(config)
+    }
+
+    /// Validate that every named ref in `runtimes.<r>.{kernel,rootfs,initramfs}`
+    /// resolves to a definition in the corresponding top-level map.
+    ///
+    /// Run at config-load to catch typos before they surface as confusing
+    /// downstream "no kernel pinned" / "no rootfs sysroot" errors. Inline
+    /// runtime overrides and unset fields skip this check; only `Named(...)`
+    /// refs are validated here.
+    pub fn validate_runtime_refs(&self) -> Result<()> {
+        let Some(runtimes) = self.runtimes.as_ref() else {
+            return Ok(());
+        };
+
+        for (rt_name, rt) in runtimes {
+            if let Some(KernelRef::Named(name)) = rt.kernel.as_ref() {
+                let map = self.kernel.as_ref();
+                if map.is_none_or(|m| !m.contains_key(name)) {
+                    return Err(anyhow::anyhow!(format_unresolved_ref_error(
+                        rt_name, "kernel", name, map,
+                    )));
+                }
+            }
+            if let Some(ImageRef::Named(name)) = rt.rootfs.as_ref() {
+                let map = self.rootfs.as_ref();
+                if map.is_none_or(|m| !m.contains_key(name)) {
+                    return Err(anyhow::anyhow!(format_unresolved_ref_error(
+                        rt_name, "rootfs", name, map,
+                    )));
+                }
+            }
+            if let Some(ImageRef::Named(name)) = rt.initramfs.as_ref() {
+                let map = self.initramfs.as_ref();
+                if map.is_none_or(|m| !m.contains_key(name)) {
+                    return Err(anyhow::anyhow!(format_unresolved_ref_error(
+                        rt_name,
+                        "initramfs",
+                        name,
+                        map,
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load configuration from a YAML string
@@ -9810,6 +9883,100 @@ runtimes:
             .to_string();
         assert!(
             err.contains("nonexistent") && err.contains("not defined"),
+            "got: {err}"
+        );
+    }
+
+    // --- validate_runtime_refs (Phase 0d) ---
+
+    #[test]
+    fn test_validate_runtime_refs_passes_for_resolved_named_refs() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+initramfs:
+  default:
+    packages: { avocado-pkg-initramfs: "*" }
+runtimes:
+  prod:
+    kernel: yocto-6-6
+    rootfs: default
+    initramfs: default
+"#;
+        Config::load_from_yaml_str(yaml).expect("validation should pass");
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_passes_for_inline_overrides() {
+        // Inline overrides aren't validated — only Named refs.
+        let yaml = r#"
+runtimes:
+  dev:
+    kernel:
+      package: kernel-image
+      version: "5.15.*"
+"#;
+        Config::load_from_yaml_str(yaml).expect("inline override must pass validation");
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_unresolved_kernel_ref() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+runtimes:
+  prod:
+    kernel: yocoto-6-6
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("'prod'")
+                && err.contains("kernel")
+                && err.contains("'yocoto-6-6'")
+                && err.contains("Available: yocto-6-6"),
+            "expected detailed unresolved-ref error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_named_ref_with_no_top_level_map() {
+        let yaml = r#"
+runtimes:
+  prod:
+    rootfs: default
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("'prod'")
+                && err.contains("rootfs")
+                && err.contains("'default'")
+                && err.contains("no top-level"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_unresolved_initramfs_ref() {
+        let yaml = r#"
+initramfs:
+  base:
+    packages: { avocado-pkg-initramfs: "*" }
+runtimes:
+  prod:
+    initramfs: nonexistent
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("initramfs")
+                && err.contains("nonexistent")
+                && err.contains("Available: base"),
             "got: {err}"
         );
     }
