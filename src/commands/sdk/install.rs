@@ -542,7 +542,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
         // Merge rootfs lock — both the package map and the per-sysroot kernel
-        // version pin the resolver wrote into the clone.
+        // version pin the resolver wrote into the clone. Also pull in the
+        // `kernels` entries staged from the rootfs install (Phase 2c) — they
+        // live on the clone too and would otherwise be dropped on the merge
+        // floor.
         if rootfs_result.is_ok() {
             if let Some(target_locks) = rootfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
@@ -554,6 +557,12 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     entry
                         .kernel_versions
                         .insert(SysrootType::Rootfs.lock_key(), kver.clone());
+                }
+                // Per-kernel sysroot package state (Phase 2c). The clone may
+                // hold one or more entries keyed by KERNEL_VERSION; merge
+                // each into the final lock.
+                for (kver, pkgs) in &target_locks.kernels {
+                    entry.kernels.insert(kver.clone(), pkgs.clone());
                 }
             }
         }

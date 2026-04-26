@@ -93,16 +93,16 @@ if [ ! -d "$ROOTFS_BOOT" ]; then
     echo "[ERROR] Rootfs sysroot has no /boot directory; cannot stage kernel sysroot for {kver}" >&2
     exit 1
 fi
-# Copy any Image-* files matching this kver. Glob may match Image-<kver> and
-# Image-<kver>.gz; both are valid boot artifacts.
+# Copy any kver-tagged Image files. Two naming conventions appear across
+# distros: `Image-<kver>(.gz)?` and `Image.gz-<kver>`. Match both.
 shopt -s nullglob
 matched=0
-for f in "$ROOTFS_BOOT"/Image-{kver}*; do
+for f in "$ROOTFS_BOOT"/Image-{kver}* "$ROOTFS_BOOT"/Image.gz-{kver}*; do
     cp -a "$f" "$KERNEL_DIR/"
     matched=$((matched+1))
 done
 if [ "$matched" -eq 0 ]; then
-    echo "[ERROR] Did not find Image-{kver}* in rootfs /boot; cannot stage kernel sysroot" >&2
+    echo "[ERROR] Did not find Image*-{kver}* in rootfs /boot; cannot stage kernel sysroot" >&2
     exit 1
 fi
 # Provide a stable name (`Image`) alongside the versioned file so consumers
