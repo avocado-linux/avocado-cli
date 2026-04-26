@@ -90,6 +90,16 @@ impl RuntimeBuildCommand {
         self
     }
 
+    /// Build a one-entry `env_vars` map carrying `AVOCADO_RUNTIME` for the
+    /// container entrypoint. The runtime name is intrinsic to this command
+    /// (every `runtime build` is for a specific runtime), so this is always
+    /// populated.
+    fn runtime_env_vars(&self) -> Option<std::collections::HashMap<String, String>> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("AVOCADO_RUNTIME".to_string(), self.runtime_name.clone());
+        Some(m)
+    }
+
     pub async fn execute(&mut self) -> Result<()> {
         // Create standalone TUI if not provided by parent orchestrator
         let name = self.runtime_name.clone();
@@ -243,6 +253,7 @@ impl RuntimeBuildCommand {
                 // runs_on handled by shared context
                 sdk_arch: self.sdk_arch.clone(),
                 tui_context: self.tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
 
@@ -351,6 +362,7 @@ impl RuntimeBuildCommand {
                     dnf_args: self.dnf_args.clone(),
                     sdk_arch: self.sdk_arch.clone(),
                     tui_context: self.tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
 
@@ -404,6 +416,12 @@ impl RuntimeBuildCommand {
 
         // Get stone include paths if configured
         let mut env_vars = std::collections::HashMap::new();
+
+        // AVOCADO_RUNTIME tells the container entrypoint to scope
+        // $AVOCADO_EXT_SYSROOTS to runtimes/<r>/extensions (and create the
+        // legacy compat symlink). Always set for runtime build since the
+        // runtime name is intrinsic.
+        env_vars.insert("AVOCADO_RUNTIME".to_string(), self.runtime_name.clone());
 
         // Set AVOCADO_EXT_LIST with versioned extension names
         if !resolved_extensions.is_empty() {
@@ -548,6 +566,7 @@ impl RuntimeBuildCommand {
                 // runs_on handled by shared context
                 sdk_arch: self.sdk_arch.clone(),
                 tui_context: self.tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
 
@@ -779,6 +798,7 @@ echo -n '}}'
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
             tui_context: self.tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let hash_output =
@@ -837,6 +857,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
             tui_context: self.tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         run_container_command(container_helper, copy_run_config, runs_on_context).await?;
@@ -885,6 +906,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
             tui_context: self.tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let hash_output =
@@ -940,6 +962,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             repo_url: repo_url.cloned(),
             repo_release: repo_release.cloned(),
             tui_context: self.tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         run_container_command(container_helper, copy_run_config, runs_on_context).await?;
@@ -2099,6 +2122,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             container_args,
             sdk_arch: self.sdk_arch.clone(),
             tui_context: self.tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
 
