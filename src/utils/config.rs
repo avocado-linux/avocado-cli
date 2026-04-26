@@ -996,22 +996,6 @@ pub struct ConnectConfig {
     pub server_key: Option<String>,
 }
 
-/// Top-level kernel configuration. Applies to all runtimes/sysroots that don't
-/// set their own `kernel.version`. When absent, the resolver picks the
-/// highest-versioned kernel available in the repo.
-///
-/// Deliberately narrower than the runtime-level [`KernelConfig`] — only the
-/// version constraint lives here; `package` / `compile` / `install` stay
-/// per-runtime since they describe *what kernel a runtime ships*, whereas
-/// `version` describes *which kernel to pin from the repo*.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct TopLevelKernelConfig {
-    /// Kernel version constraint. Accepts exact (`5.15.185-l4t-r36.5-1033.33`),
-    /// prefix glob (`5.15.*`, `6.6.*`), or dnf-style bounded (`>= 6.6`,
-    /// `>= 5.15, < 6`). See [crate::utils::kernel_version::KernelVersionSpec].
-    pub version: Option<String>,
-}
-
 /// Main configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -1037,9 +1021,12 @@ pub struct Config {
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
     pub signing_keys: Option<HashMap<String, String>>,
     pub connect: Option<ConnectConfig>,
-    /// Top-level kernel version constraint. When set, applies to any
-    /// runtime/sysroot that doesn't override with its own `kernel.version`.
-    pub kernel: Option<TopLevelKernelConfig>,
+    /// Top-level kernel definition. When set, applies to any runtime/sysroot
+    /// that doesn't override with its own `kernel:` block. Accepts the same
+    /// fields as a runtime-level kernel (`version`, `package`, `compile`,
+    /// `install`); a top-level config with only `version:` set acts as a
+    /// version constraint applied across runtimes that don't pin their own.
+    pub kernel: Option<KernelConfig>,
 }
 
 impl Config {
