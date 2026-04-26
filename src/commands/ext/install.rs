@@ -906,6 +906,7 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
+                            self.runtime_env_vars(),
                         )
                         .await?;
 

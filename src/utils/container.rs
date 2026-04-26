@@ -1171,6 +1171,7 @@ impl SdkContainer {
         container_args: Option<Vec<String>>,
         runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
         sdk_arch: Option<&String>,
+        env_vars: Option<std::collections::HashMap<String, String>>,
     ) -> Result<std::collections::HashMap<String, String>> {
         if packages.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -1202,6 +1203,7 @@ impl SdkContainer {
             repo_release,
             container_args,
             sdk_arch: sdk_arch.cloned(),
+            env_vars,
             ..Default::default()
         };
 
@@ -1903,8 +1905,30 @@ export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 if [ -n "${{AVOCADO_RUNTIME:-}}" ]; then
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/runtimes/${{AVOCADO_RUNTIME}}/extensions"
     mkdir -p "${{AVOCADO_EXT_SYSROOTS}}"
-    if [ -L "${{AVOCADO_PREFIX}}/extensions" ] || [ ! -e "${{AVOCADO_PREFIX}}/extensions" ]; then
-        ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "${{AVOCADO_PREFIX}}/extensions"
+    # Maintain a compat symlink at the legacy location pointing to the
+    # runtime-scoped tree. Replace an existing real directory only when it
+    # has no actual installed packages (just the rootfs rpm-db copies that
+    # `setup_command` populates). Refuses to clobber a directory that
+    # contains real package state — that would be data loss.
+    legacy_dir="${{AVOCADO_PREFIX}}/extensions"
+    if [ -L "$legacy_dir" ] || [ ! -e "$legacy_dir" ]; then
+        ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "$legacy_dir"
+    elif [ -d "$legacy_dir" ]; then
+        # Real directory: safe to replace if every per-ext rpm db is empty
+        # (no package install happened against the legacy path). Empty here
+        # means rpm -qa returns nothing for every per-ext sysroot.
+        all_empty=true
+        for ext_dir in "$legacy_dir"/*; do
+            [ -d "$ext_dir" ] || continue
+            if rpm --root="$ext_dir" -qa 2>/dev/null | grep -q '.'; then
+                all_empty=false
+                break
+            fi
+        done
+        if [ "$all_empty" = "true" ]; then
+            rm -rf "$legacy_dir"
+            ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "$legacy_dir"
+        fi
     fi
 else
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
@@ -2170,8 +2194,30 @@ export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
 if [ -n "${{AVOCADO_RUNTIME:-}}" ]; then
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/runtimes/${{AVOCADO_RUNTIME}}/extensions"
     mkdir -p "${{AVOCADO_EXT_SYSROOTS}}"
-    if [ -L "${{AVOCADO_PREFIX}}/extensions" ] || [ ! -e "${{AVOCADO_PREFIX}}/extensions" ]; then
-        ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "${{AVOCADO_PREFIX}}/extensions"
+    # Maintain a compat symlink at the legacy location pointing to the
+    # runtime-scoped tree. Replace an existing real directory only when it
+    # has no actual installed packages (just the rootfs rpm-db copies that
+    # `setup_command` populates). Refuses to clobber a directory that
+    # contains real package state — that would be data loss.
+    legacy_dir="${{AVOCADO_PREFIX}}/extensions"
+    if [ -L "$legacy_dir" ] || [ ! -e "$legacy_dir" ]; then
+        ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "$legacy_dir"
+    elif [ -d "$legacy_dir" ]; then
+        # Real directory: safe to replace if every per-ext rpm db is empty
+        # (no package install happened against the legacy path). Empty here
+        # means rpm -qa returns nothing for every per-ext sysroot.
+        all_empty=true
+        for ext_dir in "$legacy_dir"/*; do
+            [ -d "$ext_dir" ] || continue
+            if rpm --root="$ext_dir" -qa 2>/dev/null | grep -q '.'; then
+                all_empty=false
+                break
+            fi
+        done
+        if [ "$all_empty" = "true" ]; then
+            rm -rf "$legacy_dir"
+            ln -sfn "${{AVOCADO_EXT_SYSROOTS}}" "$legacy_dir"
+        fi
     fi
 else
     export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
