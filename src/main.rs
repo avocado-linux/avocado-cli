@@ -1457,6 +1457,19 @@ fn validate_runtime_required(config_path: &str, runtime: &str) -> Result<()> {
         .with_context(|| format!("Invalid runtime specified: '{runtime}'"))
 }
 
+/// Resolve a required runtime name from CLI arg, env var, config default, or
+/// sole-runtime auto-resolution.
+///
+/// Loads `Config` from the given path so the resolver can inspect
+/// `default_runtime` and `runtimes:`. When the resolved name comes from the
+/// CLI/env/config (not auto-resolution), validates that it matches a defined
+/// runtime — same check `validate_runtime_required` performed previously.
+fn resolve_runtime_at_path(config_path: &str, cli_runtime: Option<&str>) -> Result<String> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("Failed to load config: {config_path}"))?;
+    crate::utils::runtime::validate_and_log_runtime(cli_runtime, &config)
+}
+
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
 fn parse_env_vars(env_args: Option<&Vec<String>>) -> Option<HashMap<String, String>> {
     env_args.map(|args| {
@@ -1733,12 +1746,7 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
-            let runtime = name
-                .or(runtime)
-                .context("runtime name is required (provide as positional or -r/--runtime)")?;
-
-            // Validate runtime exists (required argument)
-            validate_runtime_required(&config, &runtime)?;
+            let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
                 ProvisionCommand::new(crate::commands::provision::ProvisionConfig {
@@ -1770,12 +1778,7 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
-            let runtime = name
-                .or(runtime)
-                .context("runtime name is required (provide as positional or -r/--runtime)")?;
-
-            // Validate runtime exists (required argument)
-            validate_runtime_required(&config, &runtime)?;
+            let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let deploy_cmd = RuntimeDeployCommand::new(
                 runtime,
@@ -1953,11 +1956,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let mut build_cmd = RuntimeBuildCommand::new(
                     runtime,
@@ -1986,11 +1986,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let mut provision_cmd = RuntimeProvisionCommand::new(
                     crate::commands::runtime::provision::RuntimeProvisionConfig {
@@ -2025,11 +2022,8 @@ async fn main() -> Result<()> {
                 runtime,
                 target: _,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let deps_cmd = RuntimeDepsCommand::new(config, runtime);
                 deps_cmd.execute()?;
@@ -2069,11 +2063,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let clean_cmd = RuntimeCleanCommand::new(
                     runtime,
@@ -2097,11 +2088,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let deploy_cmd = RuntimeDeployCommand::new(
                     runtime,
@@ -2126,11 +2114,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let sign_cmd = RuntimeSignCommand::new(
                     runtime,
