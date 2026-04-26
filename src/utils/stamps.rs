@@ -799,7 +799,12 @@ pub fn compute_hash(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     let result = hasher.finalize();
-    format!("sha256:{result:x}")
+    let mut hex = String::with_capacity(result.len() * 2);
+    for b in result.iter() {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("sha256:{hex}")
 }
 
 /// Compute hash of a YAML value (for config sections)
