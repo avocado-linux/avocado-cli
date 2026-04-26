@@ -53,6 +53,15 @@ pub enum SysrootType {
     /// version, so two runtimes pinning the same kver share storage.
     #[allow(dead_code)] // Constructed by per-runtime install path (Phase 2c+).
     Kernel(String),
+    /// Per-runtime extension sysroot
+    /// ($AVOCADO_PREFIX/runtimes/{runtime}/extensions/{ext}).
+    /// Replaces the global `Extension(name)` variant for runtime-scoped
+    /// extension sysroots — every extension owns the kernel it was built
+    /// against by living under its runtime's tree, so switching kernel
+    /// pins for a runtime cleanly invalidates that runtime's extensions
+    /// without affecting other runtimes.
+    #[allow(dead_code)] // Constructed by ext command rewiring (Phase 2d.3+).
+    RuntimeExtension { runtime: String, extension: String },
 }
 
 impl SysrootType {
@@ -109,6 +118,16 @@ impl SysrootType {
                 rpm_configdir: None,
                 root_path: Some(format!("$AVOCADO_PREFIX/kernel/{version}")),
             },
+            SysrootType::RuntimeExtension { runtime, extension } => RpmQueryConfig {
+                // Per-runtime extension sysroot: same ext-rpm-config-scripts
+                // story as global Extension(name), but the path lives under
+                // the owning runtime so the kernel pin scopes naturally.
+                rpm_etcconfigdir: None,
+                rpm_configdir: None,
+                root_path: Some(format!(
+                    "$AVOCADO_PREFIX/runtimes/{runtime}/extensions/{extension}"
+                )),
+            },
         }
     }
 
@@ -124,6 +143,9 @@ impl SysrootType {
             SysrootType::Extension(name) => format!("extensions/{name}"),
             SysrootType::Runtime(name) => format!("runtimes/{name}"),
             SysrootType::Kernel(version) => format!("kernels/{version}"),
+            SysrootType::RuntimeExtension { runtime, extension } => {
+                format!("runtimes/{runtime}/extensions/{extension}")
+            }
         }
     }
 }
@@ -752,6 +774,11 @@ impl LockFile {
                 .kernels
                 .get(version)
                 .and_then(|pkgs| pkgs.get(package)),
+            SysrootType::RuntimeExtension { runtime, extension } => target_locks
+                .runtimes
+                .get(runtime)
+                .and_then(|rt| rt.extensions.get(extension))
+                .and_then(|ext| ext.packages.get(package)),
         }
     }
 
@@ -889,6 +916,16 @@ impl LockFile {
             SysrootType::Kernel(version) => {
                 target_locks.kernels.entry(version.clone()).or_default()
             }
+            SysrootType::RuntimeExtension { runtime, extension } => {
+                &mut target_locks
+                    .runtimes
+                    .entry(runtime.clone())
+                    .or_default()
+                    .extensions
+                    .entry(extension.clone())
+                    .or_default()
+                    .packages
+            }
         };
 
         packages.insert(package.to_string(), version.to_string());
@@ -925,6 +962,16 @@ impl LockFile {
             SysrootType::Kernel(version) => {
                 target_locks.kernels.entry(version.clone()).or_default()
             }
+            SysrootType::RuntimeExtension { runtime, extension } => {
+                &mut target_locks
+                    .runtimes
+                    .entry(runtime.clone())
+                    .or_default()
+                    .extensions
+                    .entry(extension.clone())
+                    .or_default()
+                    .packages
+            }
         };
 
         for (package, version) in versions {
@@ -952,6 +999,11 @@ impl LockFile {
             }
             SysrootType::Runtime(name) => target_locks.runtimes.get(name).map(|rt| &rt.packages),
             SysrootType::Kernel(version) => target_locks.kernels.get(version),
+            SysrootType::RuntimeExtension { runtime, extension } => target_locks
+                .runtimes
+                .get(runtime)
+                .and_then(|rt| rt.extensions.get(extension))
+                .map(|ext| &ext.packages),
         };
 
         // Return None for empty collections (matches expected behavior)
@@ -1070,6 +1122,11 @@ impl LockFile {
                 .get_mut(name)
                 .map(|rt| &mut rt.packages),
             SysrootType::Kernel(version) => target_locks.kernels.get_mut(version),
+            SysrootType::RuntimeExtension { runtime, extension } => target_locks
+                .runtimes
+                .get_mut(runtime)
+                .and_then(|rt| rt.extensions.get_mut(extension))
+                .map(|ext| &mut ext.packages),
         };
 
         if let Some(packages) = pkg_map {
@@ -2286,6 +2343,44 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     }
 
     // --- v5 schema additions: kernel sysroot + boot record ---
+
+    #[test]
+    fn test_runtime_extension_sysroot_keys_paths_and_lockfile_path() {
+        let s = SysrootType::RuntimeExtension {
+            runtime: "prod".to_string(),
+            extension: "acme-nfs".to_string(),
+        };
+        assert_eq!(s.lock_key(), "runtimes/prod/extensions/acme-nfs");
+        let cfg = s.get_rpm_query_config();
+        assert_eq!(
+            cfg.root_path.as_deref(),
+            Some("$AVOCADO_PREFIX/runtimes/prod/extensions/acme-nfs")
+        );
+
+        // Round-trip lockfile state lives under runtimes.<r>.extensions.<ext>,
+        // not the global targets.<t>.extensions namespace.
+        let mut lock = LockFile::new();
+        let mut versions = HashMap::new();
+        versions.insert("nfs-utils".to_string(), "2.6.1-r0".to_string());
+        lock.update_sysroot_versions("icam-540", &s, versions);
+
+        let target = lock.targets.get("icam-540").unwrap();
+        // Global extensions map untouched.
+        assert!(target.extensions.is_empty());
+        // Runtime-scoped storage populated.
+        let prod = target.runtimes.get("prod").unwrap();
+        let ext = prod.extensions.get("acme-nfs").unwrap();
+        assert_eq!(
+            ext.packages.get("nfs-utils").map(String::as_str),
+            Some("2.6.1-r0")
+        );
+
+        // Read back through the accessor.
+        assert_eq!(
+            lock.get_locked_version("icam-540", &s, "nfs-utils"),
+            Some(&"2.6.1-r0".to_string())
+        );
+    }
 
     #[test]
     fn test_kernel_sysroot_lock_key_and_path() {
