@@ -1891,7 +1891,17 @@ if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEA
 export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
 export AVOCADO_SDK_ARCH="$(uname -m)"
 export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
-export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
+# When the CLI passes AVOCADO_RUNTIME, scope the extension sysroot tree to
+# that runtime so kernel pin changes can produce fresh extension state per
+# runtime without leaking across them. Falls back to the legacy global path
+# when no runtime is in scope, preserving today's behavior for callers
+# that haven't been opted into runtime scoping yet.
+if [ -n "${{AVOCADO_RUNTIME:-}}" ]; then
+    export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/runtimes/${{AVOCADO_RUNTIME}}/extensions"
+    mkdir -p "${{AVOCADO_EXT_SYSROOTS}}"
+else
+    export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
+fi
 export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
 export DNF_SDK_TARGET_PREFIX="${{AVOCADO_PREFIX}}/sdk/target-repoconf"
 export DNF_SDK_HOST="\
@@ -2141,7 +2151,17 @@ if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEA
 export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
 export AVOCADO_SDK_ARCH="$(uname -m)"
 export AVOCADO_SDK_PREFIX="${{AVOCADO_PREFIX}}/sdk/${{AVOCADO_SDK_ARCH}}"
-export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
+# When the CLI passes AVOCADO_RUNTIME, scope the extension sysroot tree to
+# that runtime so kernel pin changes can produce fresh extension state per
+# runtime without leaking across them. Falls back to the legacy global path
+# when no runtime is in scope, preserving today's behavior for callers
+# that haven't been opted into runtime scoping yet.
+if [ -n "${{AVOCADO_RUNTIME:-}}" ]; then
+    export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/runtimes/${{AVOCADO_RUNTIME}}/extensions"
+    mkdir -p "${{AVOCADO_EXT_SYSROOTS}}"
+else
+    export AVOCADO_EXT_SYSROOTS="${{AVOCADO_PREFIX}}/extensions"
+fi
 export DNF_SDK_HOST_PREFIX="${{AVOCADO_SDK_PREFIX}}"
 export DNF_SDK_TARGET_PREFIX="${{AVOCADO_PREFIX}}/sdk/target-repoconf"
 export DNF_SDK_HOST="\
