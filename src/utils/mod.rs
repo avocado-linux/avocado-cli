@@ -17,6 +17,7 @@ pub mod prerequisites;
 pub mod provision_result;
 pub mod remote;
 pub mod runs_on;
+pub mod runtime;
 pub mod scheduler;
 pub mod signing_keys;
 #[cfg(unix)]
