@@ -45,6 +45,124 @@ pub struct SysrootInstallParams<'a> {
     pub tui_context: Option<crate::utils::container::TuiContext>,
 }
 
+/// Stage the kernel `Image` from the rootfs sysroot into the per-target
+/// content-addressed kernel sysroot at `$AVOCADO_PREFIX/kernel/<kver>/`.
+///
+/// Phase 2 of the runtime-binding plan introduces the kernel sysroot as a
+/// stable, content-addressed location for boot artifacts that provision can
+/// read without going through the rootfs. Until Phase 5 drops the v1 rootfs
+/// auto-append entirely, the rootfs install still pulls `kernel-image-<kver>`
+/// to its sysroot; this staging step mirrors the resulting `Image` to the
+/// kernel sysroot so multiple runtimes pinning the same kver share one copy
+/// and provision has a kver-stable path to construct `boot.img` from.
+///
+/// Records the staged `kernel-image-<kver>` package version in
+/// `lock.kernels[<kver>]` so subsequent installs see the kernel sysroot as
+/// populated and `validate_kernel_consistency` (Phase 4) can assert the
+/// rootfs and kernel-sysroot agree on kver.
+#[allow(clippy::too_many_arguments)]
+async fn stage_kernel_sysroot_from_rootfs(
+    container_helper: &SdkContainer,
+    container_image: &str,
+    target: &str,
+    kver: &str,
+    rootfs_image_pkg_name: &str,
+    rootfs_image_pkg_version: &str,
+    lock_file: &mut LockFile,
+    src_dir: &Path,
+    repo_url: Option<&str>,
+    repo_release: Option<&str>,
+    merged_container_args: Option<Vec<String>>,
+    runs_on_context: Option<&RunsOnContext>,
+    sdk_arch: Option<&String>,
+    verbose: bool,
+    tui_context: Option<crate::utils::container::TuiContext>,
+) -> Result<()> {
+    // The rootfs auto-append landed `Image-<kver>` (and `Image-<kver>.gz`
+    // for kernels that ship a compressed variant) under
+    // `$AVOCADO_PREFIX/rootfs/boot/`. Mirror them into the kernel sysroot
+    // directory keyed by version. Use cp -a so any future `Image*` siblings
+    // (DTBs, multi-arch builds) get staged uniformly.
+    let stage_command = format!(
+        r#"
+set -e
+KERNEL_DIR="$AVOCADO_PREFIX/kernel/{kver}"
+mkdir -p "$KERNEL_DIR"
+ROOTFS_BOOT="$AVOCADO_PREFIX/rootfs/boot"
+if [ ! -d "$ROOTFS_BOOT" ]; then
+    echo "[ERROR] Rootfs sysroot has no /boot directory; cannot stage kernel sysroot for {kver}" >&2
+    exit 1
+fi
+# Copy any Image-* files matching this kver. Glob may match Image-<kver> and
+# Image-<kver>.gz; both are valid boot artifacts.
+shopt -s nullglob
+matched=0
+for f in "$ROOTFS_BOOT"/Image-{kver}*; do
+    cp -a "$f" "$KERNEL_DIR/"
+    matched=$((matched+1))
+done
+if [ "$matched" -eq 0 ]; then
+    echo "[ERROR] Did not find Image-{kver}* in rootfs /boot; cannot stage kernel sysroot" >&2
+    exit 1
+fi
+# Provide a stable name (`Image`) alongside the versioned file so consumers
+# don't need to know the kver to find the bootable artifact.
+if [ -f "$KERNEL_DIR/Image-{kver}" ] && [ ! -e "$KERNEL_DIR/Image" ]; then
+    ln -s "Image-{kver}" "$KERNEL_DIR/Image"
+fi
+"#
+    );
+
+    let stage_run_config = RunConfig {
+        container_image: container_image.to_string(),
+        target: target.to_string(),
+        command: stage_command,
+        verbose,
+        source_environment: true,
+        interactive: false,
+        repo_url: repo_url.map(|s| s.to_string()),
+        repo_release: repo_release.map(|s| s.to_string()),
+        container_args: merged_container_args.clone(),
+        sdk_arch: sdk_arch.cloned(),
+        tui_context,
+        ..Default::default()
+    };
+
+    let success = if let Some(context) = runs_on_context {
+        container_helper
+            .run_in_container_with_context(&stage_run_config, context)
+            .await?
+    } else {
+        container_helper.run_in_container(stage_run_config).await?
+    };
+
+    if !success {
+        return Err(anyhow::anyhow!(
+            "Failed to stage kernel sysroot for kernel-version '{kver}'"
+        ));
+    }
+
+    // Record the kernel-image package version in the kernel sysroot's
+    // lockfile entry. This makes the sysroot's contents reproducible and
+    // gives Phase 4's validate_kernel_consistency a hook to verify that
+    // rootfs and kernel sysroots agree on kver.
+    let mut versions = std::collections::HashMap::new();
+    versions.insert(
+        rootfs_image_pkg_name.to_string(),
+        rootfs_image_pkg_version.to_string(),
+    );
+    let kernel_sysroot = SysrootType::Kernel(kver.to_string());
+    lock_file.update_sysroot_versions(target, &kernel_sysroot, versions);
+    lock_file.save(src_dir)?;
+
+    print_success(
+        &format!("Staged kernel sysroot at $AVOCADO_PREFIX/kernel/{kver}."),
+        OutputLevel::Normal,
+    );
+
+    Ok(())
+}
+
 /// Detect package removals by comparing config packages against lock file.
 /// Returns true if the sysroot needs to be cleaned and reinstalled from scratch.
 fn detect_sysroot_package_removals(
@@ -404,6 +522,54 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 );
             }
             params.lock_file.save(params.src_dir)?;
+        }
+
+        // Stage the kernel sysroot from the rootfs (Phase 2c). Only when:
+        // - sysroot is rootfs (initramfs doesn't carry the kernel Image),
+        // - a kernel was resolved (no-op for non-kernel-pinned configs),
+        // - the auto-appended kernel-image package was actually pulled.
+        if matches!(params.sysroot_type, SysrootType::Rootfs) {
+            if let (Some(kver), Some(kernel_image_pkg)) =
+                (resolved_kver.as_deref(), auto_kernel_image_pkg.as_deref())
+            {
+                // We need the version of the kernel-image package that the
+                // resolver actually pinned. The lockfile was just updated
+                // above with the rootfs install's installed versions; pull
+                // it from there.
+                let pkg_version = params
+                    .lock_file
+                    .get_locked_version(params.target, &params.sysroot_type, kernel_image_pkg)
+                    .cloned()
+                    .unwrap_or_else(|| "*".to_string());
+
+                if let Err(e) = stage_kernel_sysroot_from_rootfs(
+                    params.container_helper,
+                    params.container_image,
+                    params.target,
+                    kver,
+                    kernel_image_pkg,
+                    &pkg_version,
+                    params.lock_file,
+                    params.src_dir,
+                    params.repo_url,
+                    params.repo_release,
+                    params.merged_container_args.clone(),
+                    params.runs_on_context,
+                    params.sdk_arch,
+                    params.verbose,
+                    params.tui_context.clone(),
+                )
+                .await
+                {
+                    print_error(
+                        &format!(
+                            "Kernel sysroot staging failed: {e}. \
+                             provision may fall back to reading the Image from the rootfs sysroot."
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
         }
 
         // Write install stamp (unless --no-stamps or no parsed config available)
