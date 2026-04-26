@@ -507,6 +507,15 @@ impl ExtInstallCommand {
     ) -> Result<bool> {
         let sysroot = SysrootType::Extension(extension.to_string());
 
+        // Record runtime → extension membership upfront when a runtime is in
+        // scope. Extensions without `packages:` (file-only / compile-only)
+        // would otherwise leave no trace in the lockfile because the
+        // dual-write only fires when packages get pinned. This ensures
+        // `runtimes.<r>.extensions.<ext>` exists as a membership marker.
+        if let Some(rt) = self.runtime.as_deref() {
+            lock_file.record_runtime_extension_membership(target, rt, extension);
+        }
+
         // Detect package removals: compare current config packages with lock file.
         // If packages were removed, we must clean the sysroot and reinstall from scratch
         // because DNF install is additive-only and cannot remove packages.
