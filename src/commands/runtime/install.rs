@@ -712,6 +712,8 @@ $DNF_SDK_HOST \
 
                 // Query installed versions and update lock file
                 if !package_names.is_empty() {
+                    let mut runtime_env_vars = std::collections::HashMap::new();
+                    runtime_env_vars.insert("AVOCADO_RUNTIME".to_string(), runtime.to_string());
                     let installed_versions = container_helper
                         .query_installed_packages(
                             &sysroot,
@@ -723,6 +725,7 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
+                            Some(runtime_env_vars),
                         )
                         .await?;
 

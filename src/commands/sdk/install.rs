@@ -610,6 +610,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         merged_container_args.cloned(),
                         runs_on_context,
                         self.sdk_arch.as_ref(),
+                        None,
                     )
                     .await?;
 
@@ -1726,6 +1727,7 @@ $DNF_SDK_HOST \
                     merged_container_args.cloned(),
                     runs_on_context,
                     self.sdk_arch.as_ref(),
+                    None,
                 )
                 .await?;
 

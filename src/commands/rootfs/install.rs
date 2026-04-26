@@ -506,6 +506,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 params.merged_container_args.clone(),
                 params.runs_on_context,
                 params.sdk_arch,
+                None,
             )
             .await?;
 
