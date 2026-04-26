@@ -213,9 +213,12 @@ impl UnlockCommand {
         }
 
         if unlocked_something {
-            // Save updated lock file
+            // Save updated lock file. `save_replacing` writes verbatim
+            // without merging from disk — required for unlock semantics
+            // since the regular `save` would re-add the cleared entries
+            // through merge.
             lock_file
-                .save(&src_dir)
+                .save_replacing(&src_dir)
                 .with_context(|| "Failed to save lock file")?;
 
             if self.verbose {

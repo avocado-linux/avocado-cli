@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Process-wide serialization gate for lockfile read-modify-write sequences.
+///
+/// Concurrent ext install / runtime install tasks each hold their own
+/// `LockFile` instance in memory. Without coordination, two tasks racing on
+/// `save()` would clobber each other's state — task A loads at T0,
+/// task B loads at T0, both modify their local copy, B saves last and
+/// wins, A's changes are gone.
+///
+/// `save()` acquires this mutex, reloads the on-disk state inside the
+/// critical section, **merges** with self (self wins for any key it
+/// touched; disk-only keys are preserved), and writes the merged result.
+/// All modifications by parallel callers thus accumulate without explicit
+/// coordination from the call sites.
+static LOCKFILE_SAVE_GATE: Mutex<()> = Mutex::new(());
 
 /// Current lock file format version
 /// Version 3: Extensions now use ExtensionLock with optional source metadata and packages
@@ -720,26 +736,132 @@ impl LockFile {
     /// so key order is stable regardless of the `HashMap` insertion order in
     /// the in-memory struct.
     pub fn save(&self, src_dir: &Path) -> Result<()> {
-        let path = Self::get_path(src_dir);
+        // Serialize all read-modify-write sequences across concurrent
+        // tasks. The mutex is briefly held — long enough to reload the
+        // on-disk state, merge in self's changes (self wins for any key
+        // it touched; disk-only keys preserved), and write the result.
+        let _guard = LOCKFILE_SAVE_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Ensure the .avocado directory exists
+        // Reload current disk state (if any) and merge self's changes on
+        // top so concurrent writers' updates accumulate instead of
+        // clobbering each other.
+        let path = Self::get_path(src_dir);
+        let to_write = if path.exists() {
+            let on_disk = Self::load(src_dir).context(
+                "Failed to reload lock file before merging — concurrent writer left disk in an unreadable state",
+            )?;
+            self.clone().merge_with(on_disk)
+        } else {
+            self.clone()
+        };
+
+        Self::write_to_disk(&to_write, src_dir)
+    }
+
+    /// Save without merging — write `self` verbatim, replacing any disk
+    /// state entirely. Use this when the caller needs deletion semantics
+    /// to take effect (e.g., `avocado unlock` clearing pinned versions);
+    /// the regular `save()` would re-read disk and re-add the cleared
+    /// entries through merge.
+    ///
+    /// Still serializes against the global save gate so it doesn't race
+    /// with concurrent merging writers.
+    pub fn save_replacing(&self, src_dir: &Path) -> Result<()> {
+        let _guard = LOCKFILE_SAVE_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::write_to_disk(self, src_dir)
+    }
+
+    /// Internal: serialize and write `lock` to the lockfile path under
+    /// `src_dir`. Caller is responsible for holding the save gate.
+    fn write_to_disk(lock: &Self, src_dir: &Path) -> Result<()> {
+        let path = Self::get_path(src_dir);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create lock file directory: {}", parent.display())
             })?;
         }
 
-        let value = serde_json::to_value(self).with_context(|| "Failed to serialize lock file")?;
+        let value = serde_json::to_value(lock).with_context(|| "Failed to serialize lock file")?;
         let content = serde_json::to_string_pretty(&value)
             .with_context(|| "Failed to serialize lock file")?;
-
-        // Add a newline at the end for better git diffs
         let content_with_newline = format!("{content}\n");
 
         fs::write(&path, content_with_newline)
             .with_context(|| format!("Failed to write lock file: {}", path.display()))?;
-
         Ok(())
+    }
+
+    /// Combine `self` with another `LockFile` so concurrent writers'
+    /// updates accumulate. **Self wins for any key it touched**; keys
+    /// only present in `other` are preserved. Used inside the
+    /// `LOCKFILE_SAVE_GATE` critical section to merge the saver's
+    /// in-memory state with the current disk state.
+    fn merge_with(mut self, other: Self) -> Self {
+        // Bump version to whichever is newer.
+        self.version = self.version.max(other.version);
+        if self.distro_release.is_none() {
+            self.distro_release = other.distro_release;
+        }
+
+        for (target_name, other_target) in other.targets {
+            let self_target = self.targets.entry(target_name).or_default();
+            // SDK packages — keyed by host arch, then package name.
+            for (arch, packages) in other_target.sdk {
+                let self_arch = self_target.sdk.entry(arch).or_default();
+                for (pkg, ver) in packages {
+                    self_arch.entry(pkg).or_insert(ver);
+                }
+            }
+            // Top-level package maps. or_insert preserves disk values for
+            // keys self didn't write, lets self's values win for keys it
+            // did.
+            for (k, v) in other_target.rootfs {
+                self_target.rootfs.entry(k).or_insert(v);
+            }
+            for (k, v) in other_target.initramfs {
+                self_target.initramfs.entry(k).or_insert(v);
+            }
+            for (k, v) in other_target.target_sysroot {
+                self_target.target_sysroot.entry(k).or_insert(v);
+            }
+            // Legacy global extensions namespace (deprecated; preserve).
+            for (name, ext_lock) in other_target.extensions {
+                self_target.extensions.entry(name).or_insert(ext_lock);
+            }
+            // Per-runtime state — recurse into RuntimeLock.
+            for (rt_name, other_rt) in other_target.runtimes {
+                let self_rt = self_target.runtimes.entry(rt_name).or_default();
+                for (k, v) in other_rt.packages {
+                    self_rt.packages.entry(k).or_insert(v);
+                }
+                for (ext_name, ext_lock) in other_rt.extensions {
+                    self_rt.extensions.entry(ext_name).or_insert(ext_lock);
+                }
+            }
+            // Pinned kernel-versions per sysroot.
+            for (k, v) in other_target.kernel_versions {
+                self_target.kernel_versions.entry(k).or_insert(v);
+            }
+            // Per-kernel-sysroot package state.
+            for (kver, packages) in other_target.kernels {
+                let self_kernel = self_target.kernels.entry(kver).or_default();
+                for (pkg, ver) in packages {
+                    self_kernel.entry(pkg).or_insert(ver);
+                }
+            }
+            // Boot record — adopt disk's value only when self has nothing.
+            if self_target.boot.kernel_version.is_none()
+                && other_target.boot.kernel_version.is_some()
+            {
+                self_target.boot = other_target.boot;
+            }
+        }
+
+        self
     }
 
     /// Check if the lock file's distro release matches the config's.
@@ -1936,6 +2058,82 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let lock: LockFile = Default::default();
         assert_eq!(lock.version, LOCKFILE_VERSION);
         assert!(lock.targets.is_empty());
+    }
+
+    #[test]
+    fn test_save_merges_with_existing_disk_state() {
+        // Concurrent writers race scenario: task A and task B both load the
+        // same disk state, modify their own copies (A updates ext-a, B
+        // updates ext-b), and call save in some order. Without merge, the
+        // second saver clobbers the first. With merge, both updates land.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Disk state (a previous save by some earlier task).
+        let mut initial = LockFile::new();
+        let target = "icam-540";
+        let mut a_packages = HashMap::new();
+        a_packages.insert("pkg-a".to_string(), "1.0".to_string());
+        initial.update_sysroot_versions(
+            target,
+            &SysrootType::RuntimeExtension {
+                runtime: "dev".to_string(),
+                extension: "ext-a".to_string(),
+            },
+            a_packages,
+        );
+        initial.save(temp_dir.path()).unwrap();
+
+        // Task A loads, modifies its own ext-a entry (no-op for this test;
+        // imagine it added another package).
+        let task_a = LockFile::load(temp_dir.path()).unwrap();
+
+        // Task B loads the same state independently.
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+        let mut b_packages = HashMap::new();
+        b_packages.insert("pkg-b".to_string(), "2.0".to_string());
+        task_b.update_sysroot_versions(
+            target,
+            &SysrootType::RuntimeExtension {
+                runtime: "dev".to_string(),
+                extension: "ext-b".to_string(),
+            },
+            b_packages,
+        );
+
+        // Task B saves first (its in-memory state has ext-a + ext-b).
+        task_b.save(temp_dir.path()).unwrap();
+
+        // Task A saves second (its in-memory state has ONLY ext-a — it
+        // wasn't aware of ext-b). Without merge, this would clobber B's
+        // ext-b. With merge, it preserves both.
+        task_a.save(temp_dir.path()).unwrap();
+
+        // Final disk state must contain BOTH ext-a and ext-b.
+        let final_state = LockFile::load(temp_dir.path()).unwrap();
+        let dev = final_state
+            .targets
+            .get(target)
+            .unwrap()
+            .runtimes
+            .get("dev")
+            .unwrap();
+        assert!(
+            dev.extensions.contains_key("ext-a"),
+            "ext-a (from disk) must survive task A's save"
+        );
+        assert!(
+            dev.extensions.contains_key("ext-b"),
+            "ext-b (from task B) must survive task A's later save (merge race-fix)"
+        );
+        assert_eq!(
+            dev.extensions
+                .get("ext-b")
+                .unwrap()
+                .packages
+                .get("pkg-b")
+                .map(String::as_str),
+            Some("2.0")
+        );
     }
 
     #[test]
