@@ -517,6 +517,31 @@ impl KernelConfig {
     }
 }
 
+/// A kernel reference on a runtime: either a name pointing at a top-level
+/// `kernel.<name>` definition, or an inline anonymous override.
+///
+/// Untagged deserialization: a YAML scalar string parses as `Named`, a YAML
+/// mapping parses as `Inline`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum KernelRef {
+    /// Reference to a named top-level kernel entry by name (e.g. `yocto-6-6`).
+    Named(String),
+    /// Inline kernel definition. Equivalent to today's `kernel: { ... }`
+    /// runtime-level syntax; treated as an anonymous override.
+    Inline(KernelConfig),
+}
+
+/// An image (rootfs/initramfs) reference on a runtime: either a named
+/// top-level entry or an inline anonymous override. Same untagged shape as
+/// [`KernelRef`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ImageRef {
+    Named(String),
+    Inline(ImageConfig),
+}
+
 /// Runtime configuration section
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -529,9 +554,18 @@ pub struct RuntimeConfig {
     pub stone_manifest: Option<String>,
     /// Signing configuration for this runtime
     pub signing: Option<SigningConfig>,
-    /// Optional kernel configuration. When omitted, the avocado-runtime meta-package
-    /// handles kernel provisioning via avocado-img-bootfiles (legacy behavior).
-    pub kernel: Option<KernelConfig>,
+    /// Kernel reference for this runtime. Accepts either a string ref to a
+    /// top-level `kernel.<name>` entry or an inline `KernelConfig` (today's
+    /// grammar). When omitted, the runtime falls back to the top-level
+    /// `default` kernel entry, or — when no top-level kernel is set — to the
+    /// avocado-runtime meta-package's legacy bootfiles behavior.
+    pub kernel: Option<KernelRef>,
+    /// Rootfs reference for this runtime. Same shape as `kernel`. When
+    /// omitted, the runtime uses the top-level `default` rootfs entry.
+    pub rootfs: Option<ImageRef>,
+    /// Initramfs reference for this runtime. Same shape as `kernel`. When
+    /// omitted, the runtime uses the top-level `default` initramfs entry.
+    pub initramfs: Option<ImageRef>,
     /// Var partition configuration: default compression, subvolume definitions.
     pub var: Option<VarConfig>,
 }
@@ -1185,17 +1219,13 @@ impl Config {
         &self,
         runtime_name: Option<&str>,
     ) -> Result<Option<crate::utils::kernel_version::KernelVersionSpec>> {
-        // 1. Runtime-level wins when present.
+        // 1. Runtime-level wins when present (resolves either named ref or inline override).
         if let Some(name) = runtime_name {
-            if let Some(runtimes) = &self.runtimes {
-                if let Some(rt) = runtimes.get(name) {
-                    if let Some(kc) = &rt.kernel {
-                        if let Some(v) = &kc.version {
-                            return Ok(Some(
-                                crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
-                            ));
-                        }
-                    }
+            if let Some(kc) = self.resolve_runtime_kernel(name) {
+                if let Some(v) = &kc.version {
+                    return Ok(Some(
+                        crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
+                    ));
                 }
             }
         }
@@ -1213,15 +1243,48 @@ impl Config {
         Ok(None)
     }
 
+    /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
+    /// following named refs to the top-level `kernel.<name>` map.
+    ///
+    /// Returns `None` when the runtime doesn't exist, has no `kernel:` field,
+    /// or the named ref doesn't resolve. (Phase 0e adds load-time validation
+    /// so unresolved named refs become hard errors before reaching this path.)
+    pub fn resolve_runtime_kernel(&self, runtime_name: &str) -> Option<&KernelConfig> {
+        let rt = self.runtimes.as_ref()?.get(runtime_name)?;
+        match rt.kernel.as_ref()? {
+            KernelRef::Inline(kc) => Some(kc),
+            KernelRef::Named(name) => self.kernel.as_ref()?.get(name),
+        }
+    }
+
+    /// Resolve a runtime's `rootfs:` field to a concrete [`ImageConfig`].
+    /// See [`Self::resolve_runtime_kernel`] for ref semantics.
+    #[allow(dead_code)] // Consumed by per-runtime layout work (Phase 1+).
+    pub fn resolve_runtime_rootfs(&self, runtime_name: &str) -> Option<&ImageConfig> {
+        let rt = self.runtimes.as_ref()?.get(runtime_name)?;
+        match rt.rootfs.as_ref()? {
+            ImageRef::Inline(c) => Some(c),
+            ImageRef::Named(name) => self.rootfs.as_ref()?.get(name),
+        }
+    }
+
+    /// Resolve a runtime's `initramfs:` field to a concrete [`ImageConfig`].
+    /// See [`Self::resolve_runtime_kernel`] for ref semantics.
+    #[allow(dead_code)] // Consumed by per-runtime layout work (Phase 1+).
+    pub fn resolve_runtime_initramfs(&self, runtime_name: &str) -> Option<&ImageConfig> {
+        let rt = self.runtimes.as_ref()?.get(runtime_name)?;
+        match rt.initramfs.as_ref()? {
+            ImageRef::Inline(c) => Some(c),
+            ImageRef::Named(name) => self.initramfs.as_ref()?.get(name),
+        }
+    }
+
     /// Returns true if the runtime's kernel is built from source via the SDK
     /// compile section (runtime `kernel.compile` set). Such runtimes bypass
     /// repo-based kernel version resolution — the KERNEL_VERSION comes from
     /// what the compile step produced, not from a repo query.
     pub fn runtime_kernel_is_compiled(&self, runtime_name: &str) -> bool {
-        self.runtimes
-            .as_ref()
-            .and_then(|rs| rs.get(runtime_name))
-            .and_then(|rt| rt.kernel.as_ref())
+        self.resolve_runtime_kernel(runtime_name)
             .map(|kc| kc.compile.is_some())
             .unwrap_or(false)
     }
@@ -2681,22 +2744,55 @@ impl Config {
 
     /// Extract and validate the kernel configuration from a merged runtime config value.
     ///
+    /// Accepts either form:
+    /// - **Inline mapping** (today's grammar): `kernel: { version: ..., package: ... }` —
+    ///   parsed directly as a [`KernelConfig`].
+    /// - **Named string ref** (new grammar): `kernel: yocto-6-6` — resolved against
+    ///   `top_level_kernels`, returning the named entry's [`KernelConfig`].
+    ///
+    /// `top_level_kernels` is the top-level `kernel:` map from [`Config`]
+    /// (`config.kernel.as_ref()`). Pass `None` when no top-level kernel map
+    /// exists; named refs error in that case.
+    ///
     /// Returns `None` if no kernel section is present (legacy behavior applies).
-    /// Returns an error if the kernel section is present but invalid.
+    /// Returns an error if the kernel section is present but invalid, or a
+    /// named ref doesn't resolve.
     pub fn get_kernel_config_from_runtime(
         merged_runtime: &serde_yaml::Value,
+        top_level_kernels: Option<&HashMap<String, KernelConfig>>,
     ) -> Result<Option<KernelConfig>> {
-        match merged_runtime.get("kernel") {
-            Some(kernel_val) if !kernel_val.is_null() => {
-                let kernel_config: KernelConfig = serde_yaml::from_value(kernel_val.clone())
-                    .context("Failed to parse kernel configuration")?;
-                kernel_config
-                    .validate()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(Some(kernel_config))
-            }
-            _ => Ok(None),
+        let Some(kernel_val) = merged_runtime.get("kernel") else {
+            return Ok(None);
+        };
+        if kernel_val.is_null() {
+            return Ok(None);
         }
+
+        // String ref → named lookup against top-level map.
+        if let Some(name) = kernel_val.as_str() {
+            let map = top_level_kernels.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime references kernel '{name}' by name, but no top-level \
+                     `kernel:` map is defined in avocado.yaml"
+                )
+            })?;
+            let kc = map.get(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime references kernel '{name}', which is not defined in \
+                     the top-level `kernel:` map"
+                )
+            })?;
+            kc.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(Some(kc.clone()));
+        }
+
+        // Inline mapping → parse as KernelConfig.
+        let kernel_config: KernelConfig = serde_yaml::from_value(kernel_val.clone())
+            .context("Failed to parse kernel configuration")?;
+        kernel_config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Some(kernel_config))
     }
 
     /// Get all runtime names defined in the configuration
@@ -8656,7 +8752,7 @@ packages:
         )
         .unwrap();
 
-        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_some());
         let kc = result.unwrap();
         assert_eq!(kc.package.as_deref(), Some("kernel-image"));
@@ -8675,7 +8771,7 @@ kernel:
         )
         .unwrap();
 
-        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_some());
         let kc = result.unwrap();
         assert!(kc.package.is_none());
@@ -8693,7 +8789,7 @@ packages:
         )
         .unwrap();
 
-        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -8717,10 +8813,14 @@ sdk:
         write!(temp_file, "{config_content}").unwrap();
 
         let config = Config::load(temp_file.path()).unwrap();
-        let runtimes = config.runtimes.unwrap();
+        let runtimes = config.runtimes.as_ref().unwrap();
         let dev = runtimes.get("dev").unwrap();
         assert!(dev.kernel.is_some());
-        let kc = dev.kernel.as_ref().unwrap();
+        // Inline grammar still parses as `KernelRef::Inline`.
+        let kc = match dev.kernel.as_ref().unwrap() {
+            KernelRef::Inline(c) => c,
+            KernelRef::Named(n) => panic!("expected inline kernel, got named ref '{n}'"),
+        };
         assert_eq!(kc.package.as_deref(), Some("kernel-image"));
         assert_eq!(kc.version.as_deref(), Some("*"));
     }
@@ -9558,5 +9658,159 @@ rootfs:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.kernel.is_none());
         assert!(config.kernel_default().is_none());
+    }
+
+    // --- runtime-level kernel/rootfs/initramfs reference enum tests ---
+
+    #[test]
+    fn test_runtime_kernel_named_ref_resolves_to_top_level_entry() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+runtimes:
+  prod:
+    kernel: yocto-6-6
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        // Resolve to the named entry's full KernelConfig.
+        let resolved = config.resolve_runtime_kernel("prod").unwrap();
+        assert_eq!(resolved.package.as_deref(), Some("kernel-image"));
+        assert_eq!(resolved.version.as_deref(), Some("6.6.*"));
+        // effective_kernel_spec follows the ref.
+        let spec = config.effective_kernel_spec(Some("prod")).unwrap().unwrap();
+        assert!(spec.matches("6.6.123"));
+    }
+
+    #[test]
+    fn test_runtime_kernel_inline_override_still_works() {
+        // Today's inline grammar continues to parse as KernelRef::Inline.
+        let yaml = r#"
+runtimes:
+  dev:
+    kernel:
+      package: kernel-image
+      version: "5.15.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve_runtime_kernel("dev").unwrap();
+        assert_eq!(resolved.version.as_deref(), Some("5.15.*"));
+    }
+
+    #[test]
+    fn test_runtime_named_ref_to_missing_entry_returns_none() {
+        // Phase 0e adds load-time validation. For now, unresolved refs read as None.
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+runtimes:
+  prod:
+    kernel: nonexistent
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.resolve_runtime_kernel("prod").is_none());
+    }
+
+    #[test]
+    fn test_runtime_rootfs_and_initramfs_named_refs() {
+        let yaml = r#"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+    filesystem: erofs-lz4
+  minimal:
+    packages: { avocado-pkg-rootfs-minimal: "*" }
+    filesystem: erofs-zst
+initramfs:
+  default:
+    packages: { avocado-pkg-initramfs: "*" }
+runtimes:
+  prod:
+    rootfs: default
+    initramfs: default
+  dev:
+    rootfs: minimal
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let prod_rfs = config.resolve_runtime_rootfs("prod").unwrap();
+        assert_eq!(prod_rfs.filesystem.as_deref(), Some("erofs-lz4"));
+        let dev_rfs = config.resolve_runtime_rootfs("dev").unwrap();
+        assert_eq!(dev_rfs.filesystem.as_deref(), Some("erofs-zst"));
+        let prod_initramfs = config.resolve_runtime_initramfs("prod").unwrap();
+        assert!(prod_initramfs.packages.is_some());
+        // Runtime without an initramfs ref returns None.
+        assert!(config.resolve_runtime_initramfs("dev").is_none());
+    }
+
+    #[test]
+    fn test_runtime_kernel_inline_with_compile_resolves() {
+        // SDK-compiled kernel via inline override still resolves correctly.
+        let yaml = r#"
+runtimes:
+  custom:
+    kernel:
+      compile: my-kernel-src
+      install: scripts/kernel-install.sh
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.runtime_kernel_is_compiled("custom"));
+        let resolved = config.resolve_runtime_kernel("custom").unwrap();
+        assert_eq!(resolved.compile.as_deref(), Some("my-kernel-src"));
+    }
+
+    #[test]
+    fn test_runtime_kernel_compile_via_named_ref() {
+        // SDK-compiled kernel via named top-level entry — the runtime references
+        // by name and inherits compile/install.
+        let yaml = r#"
+kernel:
+  custom-tegra:
+    compile: my-kernel-src
+    install: scripts/kernel-install.sh
+runtimes:
+  dev:
+    kernel: custom-tegra
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.runtime_kernel_is_compiled("dev"));
+        let resolved = config.resolve_runtime_kernel("dev").unwrap();
+        assert_eq!(resolved.compile.as_deref(), Some("my-kernel-src"));
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_named_ref() {
+        // String ref in merged runtime YAML resolves against passed-in kernels map.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("kernel: yocto-6-6\n").unwrap();
+        let mut kernels = HashMap::new();
+        kernels.insert(
+            "yocto-6-6".to_string(),
+            KernelConfig {
+                package: Some("kernel-image".to_string()),
+                version: Some("6.6.*".to_string()),
+                compile: None,
+                install: None,
+            },
+        );
+        let kc = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
+            .unwrap()
+            .unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("6.6.*"));
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_named_ref_unresolved_errors() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("kernel: nonexistent\n").unwrap();
+        let kernels: HashMap<String, KernelConfig> = HashMap::new();
+        let err = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nonexistent") && err.contains("not defined"),
+            "got: {err}"
+        );
     }
 }
