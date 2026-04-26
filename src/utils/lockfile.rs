@@ -255,6 +255,16 @@ fn extensions_are_empty(extensions: &HashMap<String, ExtensionLock>) -> bool {
     extensions.is_empty() || extensions.values().all(|e| e.is_empty())
 }
 
+/// Stricter empty check for runtime-scoped extensions: any entry — even one
+/// with no source metadata and no pinned packages — represents a membership
+/// declaration ("this extension belongs to this runtime"). Drop the map only
+/// when literally empty so the lockfile faithfully records membership for
+/// extensions that have no `packages:` to pin (e.g. file-only or
+/// compile-only extensions).
+fn runtime_extensions_are_empty(extensions: &HashMap<String, ExtensionLock>) -> bool {
+    extensions.is_empty()
+}
+
 /// Lock data for a single runtime — packages installed into its sysroot plus
 /// per-runtime extension state.
 ///
@@ -268,14 +278,17 @@ pub struct RuntimeLock {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub packages: PackageVersions,
     /// Extensions scoped to this runtime — each carries its own source
-    /// metadata and per-extension sysroot package state.
-    #[serde(default, skip_serializing_if = "extensions_are_empty")]
+    /// metadata and per-extension sysroot package state. Membership-only
+    /// entries (empty `ExtensionLock`) persist as `{}` so the lockfile
+    /// records that an extension belongs to this runtime even when nothing
+    /// is pinned.
+    #[serde(default, skip_serializing_if = "runtime_extensions_are_empty")]
     pub extensions: HashMap<String, ExtensionLock>,
 }
 
 impl RuntimeLock {
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty() && extensions_are_empty(&self.extensions)
+        self.packages.is_empty() && runtime_extensions_are_empty(&self.extensions)
     }
 }
 
@@ -807,6 +820,30 @@ impl LockFile {
             .get(target)
             .map(|t| t.boot.clone())
             .unwrap_or_default()
+    }
+
+    /// Record runtime → extension membership in the lockfile, creating an
+    /// empty `ExtensionLock` entry if none exists. No-op when an entry is
+    /// already present (preserves source metadata and pinned packages).
+    ///
+    /// Called at install time so `runtimes.<r>.extensions.<ext>` reflects
+    /// membership even for extensions with no `packages:` to pin (which
+    /// otherwise wouldn't get a lockfile entry through the dual-write
+    /// path).
+    pub fn record_runtime_extension_membership(
+        &mut self,
+        target: &str,
+        runtime: &str,
+        extension: &str,
+    ) {
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+        target_locks
+            .runtimes
+            .entry(runtime.to_string())
+            .or_default()
+            .extensions
+            .entry(extension.to_string())
+            .or_default();
     }
 
     /// Record the boot kernel-version and active-runtime for a target.
@@ -2343,6 +2380,65 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
     }
 
     // --- v5 schema additions: kernel sysroot + boot record ---
+
+    #[test]
+    fn test_record_runtime_extension_membership_persists_empty_entry() {
+        let mut lock = LockFile::new();
+        lock.record_runtime_extension_membership("icam-540", "dev", "config-only-ext");
+
+        // Membership entry exists in memory.
+        let target = lock.targets.get("icam-540").unwrap();
+        let dev = target.runtimes.get("dev").unwrap();
+        assert!(dev.extensions.contains_key("config-only-ext"));
+        assert!(dev.extensions.get("config-only-ext").unwrap().is_empty());
+
+        // Round-trip through serialization preserves the empty entry —
+        // the runtime_extensions_are_empty predicate keeps single-empty
+        // maps, so membership info doesn't get lost on save/load.
+        let temp_dir = tempfile::tempdir().unwrap();
+        lock.save(temp_dir.path()).unwrap();
+        let reloaded = LockFile::load(temp_dir.path()).unwrap();
+        let reloaded_target = reloaded.targets.get("icam-540").unwrap();
+        let reloaded_dev = reloaded_target.runtimes.get("dev").unwrap();
+        assert!(reloaded_dev.extensions.contains_key("config-only-ext"));
+        assert!(reloaded_dev
+            .extensions
+            .get("config-only-ext")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_record_runtime_extension_membership_idempotent_preserves_packages() {
+        let mut lock = LockFile::new();
+        // First populate the entry with real packages.
+        let mut versions = HashMap::new();
+        versions.insert("nfs-utils".to_string(), "2.6.1-r0".to_string());
+        lock.update_sysroot_versions(
+            "icam-540",
+            &SysrootType::RuntimeExtension {
+                runtime: "dev".to_string(),
+                extension: "acme-nfs".to_string(),
+            },
+            versions,
+        );
+
+        // Record membership again — should be a no-op, not clobber packages.
+        lock.record_runtime_extension_membership("icam-540", "dev", "acme-nfs");
+
+        let dev = lock
+            .targets
+            .get("icam-540")
+            .unwrap()
+            .runtimes
+            .get("dev")
+            .unwrap();
+        let ext = dev.extensions.get("acme-nfs").unwrap();
+        assert_eq!(
+            ext.packages.get("nfs-utils").map(String::as_str),
+            Some("2.6.1-r0")
+        );
+    }
 
     #[test]
     fn test_runtime_extension_sysroot_keys_paths_and_lockfile_path() {
