@@ -93,6 +93,23 @@ impl ExtInstallCommand {
         })
     }
 
+    /// Compute the [`SysrootType`] that this install should track in the
+    /// lockfile for a given extension. Prefers the runtime-scoped variant
+    /// (`runtimes.<r>.extensions.<ext>`) whenever a runtime is in scope —
+    /// avocado-cli fully owns the state volume, so there's no value in
+    /// dual-writing the legacy global namespace. Standalone callers
+    /// without a resolved runtime fall back to the legacy variant for
+    /// the deprecation window until orchestrators always pass one.
+    fn extension_sysroot(&self, extension: &str) -> SysrootType {
+        match self.runtime.as_deref() {
+            Some(rt) => SysrootType::RuntimeExtension {
+                runtime: rt.to_string(),
+                extension: extension.to_string(),
+            },
+            None => SysrootType::Extension(extension.to_string()),
+        }
+    }
+
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
@@ -454,7 +471,7 @@ impl ExtInstallCommand {
         target: &str,
         lock_file: &mut LockFile,
     ) -> bool {
-        let sysroot = SysrootType::Extension(extension.to_string());
+        let sysroot = self.extension_sysroot(extension);
         let locked_names = lock_file.get_locked_package_names(target, &sysroot);
 
         if locked_names.is_empty() {
@@ -521,13 +538,14 @@ impl ExtInstallCommand {
         runs_on_context: Option<&RunsOnContext>,
         effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
-        let sysroot = SysrootType::Extension(extension.to_string());
+        let sysroot = self.extension_sysroot(extension);
 
         // Record runtime → extension membership upfront when a runtime is in
         // scope. Extensions without `packages:` (file-only / compile-only)
         // would otherwise leave no trace in the lockfile because the
-        // dual-write only fires when packages get pinned. This ensures
-        // `runtimes.<r>.extensions.<ext>` exists as a membership marker.
+        // package-version write only fires when packages get pinned. This
+        // ensures `runtimes.<r>.extensions.<ext>` exists as a membership
+        // marker.
         if let Some(rt) = self.runtime.as_deref() {
             lock_file.record_runtime_extension_membership(target, rt, extension);
         }
@@ -911,22 +929,10 @@ $DNF_SDK_HOST \
                         .await?;
 
                     if !installed_versions.is_empty() {
-                        // Phase 2d.3 dual-write: when a runtime is in scope,
-                        // mirror the same package versions to the runtime-
-                        // scoped lockfile location. Other ext commands still
-                        // read the global namespace — full migration of the
-                        // on-disk layout follows in subsequent commits.
-                        if let Some(rt) = self.runtime.as_deref() {
-                            let rt_sysroot = SysrootType::RuntimeExtension {
-                                runtime: rt.to_string(),
-                                extension: extension.to_string(),
-                            };
-                            lock_file.update_sysroot_versions(
-                                target,
-                                &rt_sysroot,
-                                installed_versions.clone(),
-                            );
-                        }
+                        // Single-write to the sysroot computed by
+                        // `extension_sysroot()` — runtime-scoped when a
+                        // runtime is in scope, legacy global namespace
+                        // otherwise.
                         lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
                         if self.verbose {
                             print_info(
