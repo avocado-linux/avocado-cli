@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 ///            and `boot` record tracking the active flashed kernel-version /
 ///            runtime. Both fields are additive — v4 lockfiles read as v5
 ///            with empty `kernels` and no `boot`.
-const LOCKFILE_VERSION: u32 = 5;
+/// Version 6: `runtimes` value type changes from a flat package map to a
+///            `RuntimeLock` carrying both `packages` and per-runtime
+///            `extensions`. Migration from v5 wraps the old flat map as
+///            `{ packages: <old>, extensions: {} }`.
+const LOCKFILE_VERSION: u32 = 6;
 
 /// Lock file name
 const LOCKFILE_NAME: &str = "lock.json";
@@ -229,6 +233,34 @@ fn extensions_are_empty(extensions: &HashMap<String, ExtensionLock>) -> bool {
     extensions.is_empty() || extensions.values().all(|e| e.is_empty())
 }
 
+/// Lock data for a single runtime — packages installed into its sysroot plus
+/// per-runtime extension state.
+///
+/// Introduced in lockfile v6 as the structural anchor for moving extensions
+/// out of the global `targets.<t>.extensions` namespace into per-runtime
+/// scope. v5 lockfiles stored runtime state as a flat `name → packages`
+/// map; the v5→v6 migration wraps that as `{ packages: <old>, extensions: {} }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeLock {
+    /// Packages installed in the runtime's sysroot.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub packages: PackageVersions,
+    /// Extensions scoped to this runtime — each carries its own source
+    /// metadata and per-extension sysroot package state.
+    #[serde(default, skip_serializing_if = "extensions_are_empty")]
+    pub extensions: HashMap<String, ExtensionLock>,
+}
+
+impl RuntimeLock {
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty() && extensions_are_empty(&self.extensions)
+    }
+}
+
+fn runtimes_are_empty(runtimes: &HashMap<String, RuntimeLock>) -> bool {
+    runtimes.is_empty() || runtimes.values().all(|r| r.is_empty())
+}
+
 /// Authoritative record of what's flashed on the device for a given target.
 /// Written by `provision`/`deploy`; read by `deploy` to decide between a
 /// userspace push (kernel unchanged) and a full OS update (kernel changed).
@@ -289,9 +321,12 @@ pub struct TargetLocks {
     #[serde(default, skip_serializing_if = "extensions_are_empty")]
     pub extensions: HashMap<String, ExtensionLock>,
 
-    /// Runtime packages keyed by runtime name
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub runtimes: NestedPackageVersions,
+    /// Per-runtime lock state: packages installed in the runtime sysroot
+    /// plus extension state scoped to that runtime. Lockfile v6+ shape;
+    /// v5 lockfiles using a flat `name → packages` map are migrated at
+    /// load time.
+    #[serde(default, skip_serializing_if = "runtimes_are_empty")]
+    pub runtimes: HashMap<String, RuntimeLock>,
 
     /// Resolved KERNEL_VERSION per sysroot, pinned at first install so that
     /// subsequent installs against the same lockfile produce the same kernel
@@ -355,13 +390,16 @@ impl LockFile {
     /// Load lock file from disk, or return a new one if it doesn't exist
     ///
     /// This function also handles migration from older lock file versions:
-    /// - Version 1 -> 5: SDK packages nested under arch key, extensions use ExtensionLock,
-    ///   plus v3 → v4 (kernel-versions added) and v4 → v5 (kernels map + boot record).
-    /// - Version 2 -> 5: Extensions migrated from flat packages to ExtensionLock structure,
-    ///   plus v3 → v4 → v5.
-    /// - Version 3 -> 5: Adds empty kernel-versions map (v3→v4) and empty kernels/boot
-    ///   (v4→v5); schema is otherwise compatible.
-    /// - Version 4 -> 5: Adds empty kernels map and empty boot record. Purely additive.
+    /// - Version 1 -> 6: SDK packages nested under arch key, extensions use ExtensionLock,
+    ///   plus v3 → v4 (kernel-versions added), v4 → v5 (kernels map + boot record),
+    ///   v5 → v6 (per-runtime extensions).
+    /// - Version 2 -> 6: Extensions migrated from flat packages to ExtensionLock structure,
+    ///   plus v3 → v4 → v5 → v6.
+    /// - Version 3, 4 -> 6: Empty `kernel-versions`/`kernels`/`boot` defaults; schema
+    ///   is otherwise compatible.
+    /// - Version 5 -> 6: `runtimes` field reshapes from `name → packages` flat map to
+    ///   `name → { packages, extensions }`. Migration wraps each entry as
+    ///   `{ packages: <old>, extensions: {} }`.
     pub fn load(src_dir: &Path) -> Result<Self> {
         let path = Self::get_path(src_dir);
 
@@ -372,9 +410,11 @@ impl LockFile {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
 
-        // First, try to parse as current (v5) format. The new fields (`kernels`,
-        // `boot`) use `#[serde(default)]`, so v3 and v4 files parse successfully
-        // here and differ only in the `version` field (which we bump below).
+        // First, try to parse as current (v6) format. The new fields use
+        // `#[serde(default)]`, so v3/v4 files parse here and differ only in
+        // the `version` field (bumped below). v5 files have the old runtime
+        // shape and fail to parse, so they fall through to the explicit
+        // migration path.
         if let Ok(mut lock_file) = serde_json::from_str::<LockFile>(&content) {
             if lock_file.version > LOCKFILE_VERSION {
                 anyhow::bail!(
@@ -387,13 +427,14 @@ impl LockFile {
                 return Ok(lock_file);
             }
             if lock_file.version == 3 || lock_file.version == 4 {
-                // v3 → v4 → v5: purely additive; new fields already default-empty via serde.
+                // v3 → v4 → v5 → v6: empty runtimes maps parse equivalently;
+                // new fields default-empty via serde.
                 lock_file.version = LOCKFILE_VERSION;
                 return Ok(lock_file);
             }
         }
 
-        // Try to parse as older format and migrate
+        // Fall through: parse as JSON and migrate from older shapes.
         let old_lock: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
 
@@ -405,8 +446,53 @@ impl LockFile {
         match version {
             1 => Ok(Self::migrate_v1_to_v3(&old_lock)),
             2 => Ok(Self::migrate_v2_to_v3(&old_lock)),
+            5 => Ok(Self::migrate_v5_to_v6(&old_lock)),
             _ => anyhow::bail!("Unable to parse lock file format"),
         }
+    }
+
+    /// Migrate lock file from version 5 to version 6.
+    ///
+    /// v5 stored runtime state as `targets.<t>.runtimes.<name>: { pkg: ver }`.
+    /// v6 wraps it as `targets.<t>.runtimes.<name>: { packages: { pkg: ver }, extensions: {} }`.
+    /// All other v5 fields (kernels, boot, kernel-versions, etc.) carry forward
+    /// unchanged.
+    fn migrate_v5_to_v6(v5_lock: &serde_json::Value) -> LockFile {
+        // Strategy: clone the JSON, transform each target's `runtimes` field
+        // in place, then deserialize as a v6 LockFile.
+        let mut transformed = v5_lock.clone();
+        if let Some(targets) = transformed
+            .get_mut("targets")
+            .and_then(|t| t.as_object_mut())
+        {
+            for (_target_name, target_data) in targets.iter_mut() {
+                let Some(target_map) = target_data.as_object_mut() else {
+                    continue;
+                };
+                let Some(runtimes_val) = target_map.get_mut("runtimes") else {
+                    continue;
+                };
+                let Some(runtimes_map) = runtimes_val.as_object_mut() else {
+                    continue;
+                };
+                // Transform each entry from `pkgs` → `{ packages: pkgs, extensions: {} }`.
+                for (_name, value) in runtimes_map.iter_mut() {
+                    let old = std::mem::replace(value, serde_json::Value::Null);
+                    let mut wrapped = serde_json::Map::new();
+                    wrapped.insert("packages".to_string(), old);
+                    wrapped.insert(
+                        "extensions".to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                    *value = serde_json::Value::Object(wrapped);
+                }
+            }
+        }
+        if let Some(version_val) = transformed.get_mut("version") {
+            *version_val = serde_json::Value::Number(LOCKFILE_VERSION.into());
+        }
+
+        serde_json::from_value::<LockFile>(transformed).unwrap_or_else(|_| LockFile::new())
     }
 
     /// Migrate lock file from version 1 to version 3
@@ -456,9 +542,13 @@ impl LockFile {
                                 }
                                 _ if key.starts_with("runtimes/") => {
                                     if let Some(name) = key.strip_prefix("runtimes/") {
-                                        target_locks
-                                            .runtimes
-                                            .insert(name.to_string(), pkg_versions);
+                                        target_locks.runtimes.insert(
+                                            name.to_string(),
+                                            RuntimeLock {
+                                                packages: pkg_versions,
+                                                extensions: HashMap::new(),
+                                            },
+                                        );
                                     }
                                 }
                                 _ => {
@@ -572,7 +662,13 @@ impl LockFile {
                                         v.as_str().map(|s| (k.clone(), s.to_string()))
                                     })
                                     .collect();
-                                target_locks.runtimes.insert(name.clone(), pkg_versions);
+                                target_locks.runtimes.insert(
+                                    name.clone(),
+                                    RuntimeLock {
+                                        packages: pkg_versions,
+                                        extensions: HashMap::new(),
+                                    },
+                                );
                             }
                         }
                     }
@@ -651,7 +747,7 @@ impl LockFile {
             SysrootType::Runtime(name) => target_locks
                 .runtimes
                 .get(name)
-                .and_then(|pkgs| pkgs.get(package)),
+                .and_then(|rt| rt.packages.get(package)),
             SysrootType::Kernel(version) => target_locks
                 .kernels
                 .get(version)
@@ -783,7 +879,13 @@ impl LockFile {
                     .or_default()
                     .packages
             }
-            SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
+            SysrootType::Runtime(name) => {
+                &mut target_locks
+                    .runtimes
+                    .entry(name.clone())
+                    .or_default()
+                    .packages
+            }
             SysrootType::Kernel(version) => {
                 target_locks.kernels.entry(version.clone()).or_default()
             }
@@ -813,7 +915,13 @@ impl LockFile {
                     .or_default()
                     .packages
             }
-            SysrootType::Runtime(name) => target_locks.runtimes.entry(name.clone()).or_default(),
+            SysrootType::Runtime(name) => {
+                &mut target_locks
+                    .runtimes
+                    .entry(name.clone())
+                    .or_default()
+                    .packages
+            }
             SysrootType::Kernel(version) => {
                 target_locks.kernels.entry(version.clone()).or_default()
             }
@@ -842,7 +950,7 @@ impl LockFile {
             SysrootType::Extension(name) => {
                 target_locks.extensions.get(name).map(|ext| &ext.packages)
             }
-            SysrootType::Runtime(name) => target_locks.runtimes.get(name),
+            SysrootType::Runtime(name) => target_locks.runtimes.get(name).map(|rt| &rt.packages),
             SysrootType::Kernel(version) => target_locks.kernels.get(version),
         };
 
@@ -859,7 +967,7 @@ impl LockFile {
                     && target_locks.initramfs.is_empty()
                     && target_locks.target_sysroot.is_empty()
                     && extensions_are_empty(&target_locks.extensions)
-                    && target_locks.runtimes.is_empty()
+                    && runtimes_are_empty(&target_locks.runtimes)
                     && target_locks.kernels.is_empty()
                     && target_locks.boot.is_empty()
             })
@@ -957,7 +1065,10 @@ impl LockFile {
                 .extensions
                 .get_mut(name)
                 .map(|ext| &mut ext.packages),
-            SysrootType::Runtime(name) => target_locks.runtimes.get_mut(name),
+            SysrootType::Runtime(name) => target_locks
+                .runtimes
+                .get_mut(name)
+                .map(|rt| &mut rt.packages),
             SysrootType::Kernel(version) => target_locks.kernels.get_mut(version),
         };
 
@@ -2319,6 +2430,47 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let recorded = lock.get_boot_record("icam-540");
         assert_eq!(recorded.kernel_version.as_deref(), Some("5.15.185-l4t"));
         assert_eq!(recorded.active_runtime.as_deref(), Some("dev-l4t"));
+    }
+
+    #[test]
+    fn test_v5_to_v6_migration_wraps_runtimes_with_packages_field() {
+        // v5 stored runtimes as `name → packages` flat map; v6 wraps them as
+        // `name → { packages, extensions }`. Migration must reshape on load.
+        let v5_json = r#"{
+            "version": 5,
+            "targets": {
+                "icam-540": {
+                    "rootfs": { "avocado-pkg-rootfs": "1.0.0-r0" },
+                    "runtimes": {
+                        "dev": { "avocado-runtime": "2.0.0-r0", "vim": "9.0-r0" },
+                        "prod": { "avocado-runtime": "2.0.0-r0" }
+                    }
+                }
+            }
+        }"#;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_dir = temp_dir.path().join(LOCKFILE_DIR);
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::write(lock_dir.join(LOCKFILE_NAME), v5_json).unwrap();
+
+        let loaded = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(loaded.version, LOCKFILE_VERSION);
+        let target = loaded.targets.get("icam-540").unwrap();
+        assert_eq!(
+            target.rootfs.get("avocado-pkg-rootfs").map(String::as_str),
+            Some("1.0.0-r0")
+        );
+        let dev = target.runtimes.get("dev").unwrap();
+        assert_eq!(dev.packages.len(), 2);
+        assert_eq!(
+            dev.packages.get("avocado-runtime").map(String::as_str),
+            Some("2.0.0-r0")
+        );
+        assert_eq!(dev.packages.get("vim").map(String::as_str), Some("9.0-r0"));
+        assert!(dev.extensions.is_empty());
+        let prod = target.runtimes.get("prod").unwrap();
+        assert_eq!(prod.packages.len(), 1);
+        assert!(prod.extensions.is_empty());
     }
 
     #[test]
