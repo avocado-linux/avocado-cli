@@ -696,6 +696,70 @@ impl LockFile {
         target_locks.boot.active_runtime = Some(active_runtime.to_string());
     }
 
+    /// Verify that lockfile state for a given target represents a
+    /// kernel-consistent set of sysroots.
+    ///
+    /// Catches the cross-sysroot drift class structurally:
+    ///   * `rootfs` and `initramfs` must agree on KERNEL_VERSION (or both
+    ///     be unset). Disagreement means modules in the two sysroots target
+    ///     different kernels, which boots in a broken state.
+    ///   * If rootfs has a pinned KERNEL_VERSION, the corresponding kernel
+    ///     sysroot (`lock.kernels[<kver>]`) must be populated. This guards
+    ///     against the case where staging from rootfs to the kernel sysroot
+    ///     silently failed and provision would end up reading stale `Image`
+    ///     bytes.
+    ///
+    /// Designed to be wired in as a precondition before any state-mutating
+    /// action that depends on a coherent boot kernel — provision, deploy,
+    /// `ext build/image`. Failures abort with a specific message naming
+    /// the conflict.
+    ///
+    /// Returns `Ok(())` for a fresh lockfile (no kernel pins yet) — that's
+    /// the pre-first-install case where there's nothing to validate.
+    #[allow(dead_code)] // Consumed by per-command wiring (subsequent commits).
+    pub fn validate_kernel_consistency(&self, target: &str) -> Result<()> {
+        let Some(target_locks) = self.targets.get(target) else {
+            return Ok(());
+        };
+
+        let rootfs_kver = target_locks
+            .kernel_versions
+            .get(&SysrootType::Rootfs.lock_key());
+        let initramfs_kver = target_locks
+            .kernel_versions
+            .get(&SysrootType::Initramfs.lock_key());
+
+        if let (Some(rk), Some(ik)) = (rootfs_kver, initramfs_kver) {
+            if rk != ik {
+                anyhow::bail!(
+                    "Kernel version drift on target '{target}': rootfs is pinned to '{rk}' \
+                     but initramfs is pinned to '{ik}'. Modules in the two sysroots will not \
+                     match the running kernel. Run 'avocado clean -t {target}' and reinstall."
+                );
+            }
+        }
+
+        // The pinned kver (rootfs wins; initramfs is checked for agreement above).
+        let pinned_kver = rootfs_kver.or(initramfs_kver);
+        if let Some(kver) = pinned_kver {
+            // Kernel sysroot must be populated when rootfs has a pinned kver.
+            // An empty kernels[<kver>] entry is treated as not-populated.
+            let populated = target_locks
+                .kernels
+                .get(kver)
+                .is_some_and(|m| !m.is_empty());
+            if !populated {
+                anyhow::bail!(
+                    "Kernel sysroot at $AVOCADO_PREFIX/kernel/{kver} is not populated for \
+                     target '{target}', but rootfs is pinned to '{kver}'. \
+                     Re-run 'avocado rootfs install -t {target}' to stage the kernel sysroot."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Set the locked version for a package in a specific target and sysroot
     #[allow(dead_code)]
     pub fn set_locked_version(
@@ -2165,6 +2229,74 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         );
         assert_eq!(boot.active_runtime.as_deref(), Some("prod"));
         assert_eq!(loaded.version, LOCKFILE_VERSION);
+    }
+
+    // --- validate_kernel_consistency (Phase 4) ---
+
+    #[test]
+    fn test_validate_kernel_consistency_passes_when_unset() {
+        let lock = LockFile::new();
+        // Empty target: nothing to validate.
+        assert!(lock.validate_kernel_consistency("icam-540").is_ok());
+    }
+
+    #[test]
+    fn test_validate_kernel_consistency_passes_when_rootfs_initramfs_match_and_kernel_populated() {
+        let mut lock = LockFile::new();
+        lock.set_kernel_version("icam-540", &SysrootType::Rootfs, "6.6.123-yocto-standard");
+        lock.set_kernel_version(
+            "icam-540",
+            &SysrootType::Initramfs,
+            "6.6.123-yocto-standard",
+        );
+        // Populate the kernel sysroot entry so validation sees it as staged.
+        let mut versions = HashMap::new();
+        versions.insert(
+            "kernel-image-6.6.123-yocto-standard".to_string(),
+            "6.6.123-r0".to_string(),
+        );
+        lock.update_sysroot_versions(
+            "icam-540",
+            &SysrootType::Kernel("6.6.123-yocto-standard".to_string()),
+            versions,
+        );
+        assert!(lock.validate_kernel_consistency("icam-540").is_ok());
+    }
+
+    #[test]
+    fn test_validate_kernel_consistency_rejects_rootfs_initramfs_drift() {
+        let mut lock = LockFile::new();
+        lock.set_kernel_version("icam-540", &SysrootType::Rootfs, "6.6.123-yocto-standard");
+        lock.set_kernel_version(
+            "icam-540",
+            &SysrootType::Initramfs,
+            "5.15.185-l4t-r36.5-1033.33",
+        );
+        let err = lock
+            .validate_kernel_consistency("icam-540")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("drift")
+                && err.contains("6.6.123-yocto-standard")
+                && err.contains("5.15.185-l4t-r36.5-1033.33"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_kernel_consistency_rejects_unpopulated_kernel_sysroot() {
+        let mut lock = LockFile::new();
+        lock.set_kernel_version("icam-540", &SysrootType::Rootfs, "6.6.123-yocto-standard");
+        // No update_sysroot_versions on Kernel sysroot — entry absent.
+        let err = lock
+            .validate_kernel_consistency("icam-540")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not populated") && err.contains("6.6.123-yocto-standard"),
+            "got: {err}"
+        );
     }
 
     #[test]
