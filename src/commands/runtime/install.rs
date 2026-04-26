@@ -392,7 +392,9 @@ impl RuntimeInstallCommand {
 
         // Also include kernel package if specified
         if let Some(ref merged_val) = merged_runtime {
-            if let Ok(Some(kernel_config)) = Config::get_kernel_config_from_runtime(merged_val) {
+            if let Ok(Some(kernel_config)) =
+                Config::get_kernel_config_from_runtime(merged_val, config.kernel.as_ref())
+            {
                 if let Some(ref kernel_package) = kernel_config.package {
                     config_names.insert(kernel_package.clone());
                 }
@@ -606,7 +608,8 @@ impl RuntimeInstallCommand {
 
             // Add kernel package if specified in the runtime kernel config
             if let Some(ref merged_val) = merged_runtime {
-                if let Ok(Some(kernel_config)) = Config::get_kernel_config_from_runtime(merged_val)
+                if let Ok(Some(kernel_config)) =
+                    Config::get_kernel_config_from_runtime(merged_val, config.kernel.as_ref())
                 {
                     if let Some(ref kernel_package) = kernel_config.package {
                         let kernel_version = kernel_config.version.as_deref().unwrap_or("*");

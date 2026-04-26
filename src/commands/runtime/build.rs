@@ -284,9 +284,11 @@ impl RuntimeBuildCommand {
         // Check for kernel configuration in the merged runtime config
         let merged_runtime =
             config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?;
-        let kernel_config = merged_runtime
-            .as_ref()
-            .and_then(|v| Config::get_kernel_config_from_runtime(v).ok().flatten());
+        let kernel_config = merged_runtime.as_ref().and_then(|v| {
+            Config::get_kernel_config_from_runtime(v, config.kernel.as_ref())
+                .ok()
+                .flatten()
+        });
 
         // Handle kernel cross-compilation if kernel.compile is configured
         if let Some(ref kc) = kernel_config {
@@ -2386,7 +2388,8 @@ runtimes:
             .unwrap();
 
         let kernel_config =
-            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
+            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val, None)
+                .unwrap();
         assert!(kernel_config.is_some());
         let kc = kernel_config.unwrap();
         assert_eq!(kc.package.as_deref(), Some("kernel-image"));
@@ -2419,7 +2422,8 @@ runtimes:
             .unwrap();
 
         let kernel_config =
-            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
+            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val, None)
+                .unwrap();
         assert!(kernel_config.is_some());
         let kc = kernel_config.unwrap();
         assert!(kc.package.is_none());
@@ -2446,7 +2450,8 @@ runtimes:
             .unwrap();
 
         let kernel_config =
-            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val).unwrap();
+            crate::utils::config::Config::get_kernel_config_from_runtime(runtime_val, None)
+                .unwrap();
         assert!(kernel_config.is_none());
     }
 
