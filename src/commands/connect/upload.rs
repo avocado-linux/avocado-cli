@@ -903,7 +903,13 @@ fn compute_sha256_with_parts(path: &Path) -> Result<(String, Vec<String>)> {
         whole_hasher.update(chunk);
         part_checksums.push(BASE64_STANDARD.encode(Sha256::digest(chunk)));
     }
-    Ok((format!("{:x}", whole_hasher.finalize()), part_checksums))
+    let result = whole_hasher.finalize();
+    let mut hex = String::with_capacity(result.len() * 2);
+    for b in result.iter() {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok((hex, part_checksums))
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,7 +1317,12 @@ mod tests {
         let (hex_hash, _parts) = compute_sha256_with_parts(f.path()).unwrap();
 
         // Verify against independently computed hash
-        let expected = format!("{:x}", Sha256::digest(data));
+        let digest = Sha256::digest(data);
+        let mut expected = String::with_capacity(digest.len() * 2);
+        for b in digest.iter() {
+            use std::fmt::Write;
+            let _ = write!(expected, "{b:02x}");
+        }
         assert_eq!(hex_hash, expected);
     }
 
