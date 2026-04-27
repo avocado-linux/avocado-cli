@@ -985,7 +985,13 @@ pub fn compute_ext_input_hash_with_fs(
 }
 
 /// Compute input hash for rootfs install
-/// Includes: rootfs.packages
+/// Includes: rootfs.packages, top-level kernel config
+///
+/// The kernel block matters because rootfs install auto-appends
+/// `kernel-image-<kver>` and `packagegroup-avocado-rootfs-modules-<kver>`
+/// based on the resolved kernel version. Changing `kernel.version`
+/// changes what gets installed even though `rootfs.packages` is unchanged,
+/// so the stamp must invalidate when the kernel block changes.
 pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -998,12 +1004,23 @@ pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInpu
         }
     }
 
+    if let Some(kernel) = config.get("kernel") {
+        hash_data.insert(
+            serde_yaml::Value::String("kernel".to_string()),
+            kernel.clone(),
+        );
+    }
+
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }
 
 /// Compute input hash for initramfs install
-/// Includes: initramfs.packages
+/// Includes: initramfs.packages, top-level kernel config
+///
+/// Same rationale as `compute_rootfs_input_hash`: initramfs install
+/// auto-appends `packagegroup-avocado-initramfs-modules-<kver>` based
+/// on the resolved kernel version.
 pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -1014,6 +1031,13 @@ pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampI
                 packages.clone(),
             );
         }
+    }
+
+    if let Some(kernel) = config.get("kernel") {
+        hash_data.insert(
+            serde_yaml::Value::String("kernel".to_string()),
+            kernel.clone(),
+        );
     }
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
