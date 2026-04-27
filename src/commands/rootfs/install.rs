@@ -355,17 +355,29 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                         .ok();
                 }
 
-                // Wipe the lockfile state for this sysroot. Cleared up-front
-                // so a failed re-install can't leave a stale package map
-                // or kver entry pointing at a now-empty sysroot.
+                // Wipe the package state for this sysroot so a failed
+                // re-install can't leave a stale package map pointing at a
+                // now-empty sysroot.
                 match params.sysroot_type {
                     SysrootType::Rootfs => params.lock_file.clear_rootfs(params.target),
                     SysrootType::Initramfs => params.lock_file.clear_initramfs(params.target),
                     _ => {}
                 }
+                // Remove and immediately re-pin the new kver. Remove first so
+                // the entry is correct even if the install below fails (empty
+                // sysroot + correct kver = retry without re-clean). Re-pin
+                // so the sdk/install.rs merge site can see the new kver after
+                // a successful install — without it the `if let Some(kver)`
+                // check in that merge finds nothing and the old kver from the
+                // initial clone bleeds through into the saved lockfile.
                 params
                     .lock_file
                     .remove_kernel_version(params.target, &params.sysroot_type);
+                params.lock_file.set_kernel_version(
+                    params.target,
+                    &params.sysroot_type,
+                    new_kver,
+                );
             }
         }
     }
