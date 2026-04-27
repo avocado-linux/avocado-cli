@@ -144,6 +144,11 @@ impl RuntimeProvisionCommand {
 
             // Batch all stamp reads into a single container invocation for performance
             let batch_script = generate_batch_read_stamps_script(&required);
+            let mut early_env = HashMap::new();
+            early_env.insert(
+                "AVOCADO_RUNTIME".to_string(),
+                self.config.runtime_name.clone(),
+            );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target_arch.clone(),
@@ -154,6 +159,7 @@ impl RuntimeProvisionCommand {
                 runs_on: self.config.runs_on.clone(),
                 nfs_port: self.config.nfs_port,
                 sdk_arch: self.config.sdk_arch.clone(),
+                env_vars: Some(early_env),
                 ..Default::default()
             };
 
@@ -227,6 +233,15 @@ impl RuntimeProvisionCommand {
         // AVOCADO_RUNTIME_NAME - Runtime name (e.g., "dev")
         env_vars.insert(
             "AVOCADO_RUNTIME_NAME".to_string(),
+            self.config.runtime_name.clone(),
+        );
+
+        // AVOCADO_RUNTIME - Read by the container entrypoint to scope
+        // `$AVOCADO_EXT_SYSROOTS` to `runtimes/<r>/extensions`. Mirrors
+        // AVOCADO_RUNTIME_NAME for ergonomic consistency with other
+        // runtime-aware commands.
+        env_vars.insert(
+            "AVOCADO_RUNTIME".to_string(),
             self.config.runtime_name.clone(),
         );
 
@@ -1047,6 +1062,11 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
 "#
         );
 
+        let mut query_env = HashMap::new();
+        query_env.insert(
+            "AVOCADO_RUNTIME".to_string(),
+            self.config.runtime_name.clone(),
+        );
         let version_query_config = crate::utils::container::RunConfig {
             container_image: container_image.to_string(),
             target: target.to_string(),
@@ -1056,6 +1076,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             interactive: false,
             runs_on: self.config.runs_on.clone(),
             nfs_port: self.config.nfs_port,
+            env_vars: Some(query_env),
             ..Default::default()
         };
 
