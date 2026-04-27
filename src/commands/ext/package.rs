@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use std::fs;
@@ -27,6 +28,7 @@ pub struct ExtPackageCommand {
     #[allow(dead_code)]
     pub no_stamps: bool,
     pub sdk_arch: Option<String>,
+    pub runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -51,6 +53,7 @@ impl ExtPackageCommand {
             dnf_args,
             no_stamps: false,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
         }
     }
@@ -65,6 +68,20 @@ impl ExtPackageCommand {
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
         self
+    }
+
+    /// Set the runtime context. See [`super::build::ExtBuildCommand::with_runtime`].
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -694,6 +711,7 @@ rm -rf "$TMPDIR"
             container_args: merged_container_args,
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
 
