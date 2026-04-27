@@ -301,6 +301,71 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         resolve_and_pin_kernel_version(&mut resolve_params).await?
     };
 
+    // Detect kernel pin change vs lockfile. dnf install is additive, so if
+    // the resolved kver differs from what the lockfile recorded for this
+    // sysroot, a plain re-install would land the new kernel-image and
+    // module packagegroup *alongside* the prior pin's packages — leaving
+    // /lib/modules/<old-kver>/, the old kernel-image, and stale module
+    // packages in the sysroot. Force a clean+reinstall so the new pin is
+    // the only thing present.
+    if let Some(new_kver) = resolved_kver.as_deref() {
+        let prev_kver = params
+            .lock_file
+            .get_kernel_version(params.target, &params.sysroot_type)
+            .cloned();
+        if let Some(prev) = prev_kver {
+            if prev != new_kver {
+                print_info(
+                    &format!(
+                        "{label}: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+                    ),
+                    OutputLevel::Normal,
+                );
+
+                let clean_command = format!(r#"rm -rf "$AVOCADO_PREFIX/{sysroot_dir}""#);
+                let clean_config = RunConfig {
+                    container_image: params.container_image.to_string(),
+                    target: params.target.to_string(),
+                    command: clean_command,
+                    verbose: params.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: params.repo_url.map(|s| s.to_string()),
+                    repo_release: params.repo_release.map(|s| s.to_string()),
+                    container_args: params.merged_container_args.clone(),
+                    sdk_arch: params.sdk_arch.cloned(),
+                    tui_context: params.tui_context.clone(),
+                    ..Default::default()
+                };
+                if let Some(context) = params.runs_on_context {
+                    params
+                        .container_helper
+                        .run_in_container_with_context(&clean_config, context)
+                        .await
+                        .ok();
+                } else {
+                    params
+                        .container_helper
+                        .run_in_container(clean_config)
+                        .await
+                        .ok();
+                }
+
+                // Wipe the lockfile state for this sysroot. Cleared up-front
+                // so a failed re-install can't leave a stale package map
+                // or kver entry pointing at a now-empty sysroot.
+                match params.sysroot_type {
+                    SysrootType::Rootfs => params.lock_file.clear_rootfs(params.target),
+                    SysrootType::Initramfs => params.lock_file.clear_initramfs(params.target),
+                    _ => {}
+                }
+                params
+                    .lock_file
+                    .remove_kernel_version(params.target, &params.sysroot_type);
+            }
+        }
+    }
+
     // Build package specs for all configured packages. When we have a
     // resolved kernel version, substitute any `{{ avocado.kernel.version }}`
     // templates in package keys so BSP yamls can produce fully-versioned

@@ -1239,6 +1239,17 @@ impl LockFile {
         }
     }
 
+    /// Remove the pinned `KERNEL_VERSION` entry for a specific sysroot under
+    /// a target. Used after a kernel-pin-change clean+reinstall so a failed
+    /// re-install doesn't leave a stale kver entry pointing at an empty
+    /// sysroot. The next successful install rewrites the entry via
+    /// [`Self::set_kernel_version`].
+    pub fn remove_kernel_version(&mut self, target: &str, sysroot: &SysrootType) {
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.kernel_versions.remove(&sysroot.lock_key());
+        }
+    }
+
     /// Clear target-sysroot entries for a specific target
     pub fn clear_target_sysroot(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
@@ -2853,6 +2864,36 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let recorded = lock.get_boot_record("icam-540");
         assert_eq!(recorded.kernel_version.as_deref(), Some("5.15.185-l4t"));
         assert_eq!(recorded.active_runtime.as_deref(), Some("dev-l4t"));
+    }
+
+    #[test]
+    fn test_remove_kernel_version_clears_only_named_sysroot() {
+        let mut lock = LockFile::new();
+        lock.set_kernel_version("icam-540", &SysrootType::Rootfs, "6.6.123-yocto-standard");
+        lock.set_kernel_version(
+            "icam-540",
+            &SysrootType::Initramfs,
+            "6.6.123-yocto-standard",
+        );
+
+        lock.remove_kernel_version("icam-540", &SysrootType::Rootfs);
+
+        assert!(lock
+            .get_kernel_version("icam-540", &SysrootType::Rootfs)
+            .is_none());
+        // Sibling entries untouched.
+        assert_eq!(
+            lock.get_kernel_version("icam-540", &SysrootType::Initramfs)
+                .map(String::as_str),
+            Some("6.6.123-yocto-standard")
+        );
+    }
+
+    #[test]
+    fn test_remove_kernel_version_noop_when_target_missing() {
+        let mut lock = LockFile::new();
+        // Should not panic when target has no entry.
+        lock.remove_kernel_version("icam-540", &SysrootType::Rootfs);
     }
 
     #[test]
