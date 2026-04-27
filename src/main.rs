@@ -2215,6 +2215,7 @@ async fn main() -> Result<()> {
                 verbose,
                 extension,
                 target,
+                runtime,
                 ext_path,
                 src_path,
                 container_tool,
@@ -2222,6 +2223,7 @@ async fn main() -> Result<()> {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let checkout_cmd = ExtCheckoutCommand::new(
                     extension,
                     ext_path,
@@ -2232,7 +2234,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 checkout_cmd.execute().await?;
                 Ok(())
             }
@@ -2257,10 +2260,12 @@ async fn main() -> Result<()> {
                 verbose,
                 extension,
                 target,
+                runtime,
                 command,
                 container_args,
                 dnf_args,
             } => {
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let dnf_cmd = ExtDnfCommand::new(
                     config,
                     extension,
@@ -2270,7 +2275,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -2335,6 +2341,7 @@ async fn main() -> Result<()> {
                 name,
                 extension,
                 target,
+                runtime,
                 config,
                 verbose,
                 output_dir,
@@ -2344,6 +2351,7 @@ async fn main() -> Result<()> {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let package_cmd = ExtPackageCommand::new(
                     config,
                     extension,
@@ -2354,7 +2362,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 package_cmd.execute().await?;
                 Ok(())
             }
@@ -3277,6 +3286,10 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the dnf operation (scopes which extension
+        /// sysroot tree dnf operates on).
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// DNF command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -3331,6 +3344,10 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the checkout (selects which sysroot tree the
+        /// files come from).
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Path within the extension sysroot to checkout (e.g., /etc/config.json or /etc for directory)
         #[arg(long = "ext-path", required = true)]
         ext_path: String,
@@ -3387,6 +3404,9 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the package operation.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Output directory on host for the RPM package (relative or absolute path). If not specified, RPM stays in container at $AVOCADO_PREFIX/output/extensions
         #[arg(long = "out-dir")]
         output_dir: Option<String>,

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::process::Command as AsyncCommand;
@@ -22,6 +23,7 @@ pub struct ExtCheckoutCommand {
     target: Option<String>,
     no_stamps: bool,
     sdk_arch: Option<String>,
+    runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -46,6 +48,7 @@ impl ExtCheckoutCommand {
             target,
             no_stamps: false,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
         }
     }
@@ -60,6 +63,22 @@ impl ExtCheckoutCommand {
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
         self
+    }
+
+    /// Set the runtime context. When set, the checkout source path is
+    /// scoped under `runtimes/<r>/extensions/<ext>` instead of the legacy
+    /// per-target `extensions/<ext>` path.
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -108,6 +127,7 @@ impl ExtCheckoutCommand {
                     repo_release: config.get_sdk_repo_release(),
                     container_args: config.merge_sdk_container_args(None),
                     sdk_arch: self.sdk_arch.clone(),
+                    env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
 
@@ -149,9 +169,19 @@ impl ExtCheckoutCommand {
             );
         }
 
-        // Get target from config to determine the extension sysroot path
+        // Get target from config to determine the extension sysroot path.
+        // When a runtime is in scope, scope the path under
+        // runtimes/<r>/extensions/<ext>; otherwise fall back to the legacy
+        // per-target tree (kept reachable via the entrypoint compat
+        // symlink for callers that don't pass a runtime).
         let target = self.resolve_target(&cwd, &volume_state.volume_name).await?;
-        let ext_sysroot_path = format!("/opt/_avocado/{}/extensions/{}", target, self.extension);
+        let ext_sysroot_path = match self.runtime.as_deref() {
+            Some(rt) => format!(
+                "/opt/_avocado/{}/runtimes/{}/extensions/{}",
+                target, rt, self.extension
+            ),
+            None => format!("/opt/_avocado/{}/extensions/{}", target, self.extension),
+        };
         let full_ext_path = if self.ext_path.starts_with('/') {
             format!("{}{}", ext_sysroot_path, self.ext_path)
         } else {
