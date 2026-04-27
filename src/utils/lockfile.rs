@@ -802,9 +802,8 @@ impl LockFile {
         let content_with_newline = format!("{content}\n");
 
         let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, content_with_newline).with_context(|| {
-            format!("Failed to write lock file temp: {}", tmp_path.display())
-        })?;
+        fs::write(&tmp_path, content_with_newline)
+            .with_context(|| format!("Failed to write lock file temp: {}", tmp_path.display()))?;
         fs::rename(&tmp_path, &path).with_context(|| {
             format!(
                 "Failed to rename lock file temp into place: {} -> {}",
