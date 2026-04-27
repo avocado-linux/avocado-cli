@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::find_ext_in_mapping;
@@ -18,6 +19,10 @@ pub struct ExtCleanCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     sdk_arch: Option<String>,
+    /// Runtime context. When set, the clean operates against the runtime-
+    /// scoped extension sysroot tree via `AVOCADO_RUNTIME` in the
+    /// container env. When `None`, legacy per-target behavior.
+    runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -39,6 +44,7 @@ impl ExtCleanCommand {
             container_args,
             dnf_args,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
         }
     }
@@ -47,6 +53,20 @@ impl ExtCleanCommand {
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
         self
+    }
+
+    /// Set the runtime context. See [`super::build::ExtBuildCommand::with_runtime`].
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -207,6 +227,7 @@ impl ExtCleanCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
 
@@ -271,6 +292,7 @@ impl ExtCleanCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
 
@@ -410,6 +432,7 @@ rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
             ),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let success = container_helper.run_in_container(run_config).await?;

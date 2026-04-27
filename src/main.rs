@@ -2280,12 +2280,14 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                runtime,
                 container_args,
                 dnf_args,
             } => {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let clean_cmd = ExtCleanCommand::new(
                     extension,
                     config,
@@ -2294,7 +2296,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -3300,6 +3303,11 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the clean (resolves which extension sysroot
+        /// tree to operate on). Falls through to legacy per-target behavior
+        /// when no runtime resolves.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
