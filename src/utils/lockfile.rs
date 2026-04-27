@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -403,6 +403,14 @@ pub struct TargetLocks {
     /// that choice. Populated by `provision`/`deploy`.
     #[serde(default, skip_serializing_if = "boot_record_is_empty")]
     pub boot: BootRecord,
+
+    /// In-memory only: sysroot sections explicitly cleared during this process
+    /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
+    /// Not persisted. `merge_with` skips re-inserting disk packages for any
+    /// section named here, so a `save()` after a clean doesn't pull old
+    /// packages back from the on-disk lockfile.
+    #[serde(skip)]
+    pub cleared_sections: HashSet<String>,
 }
 
 /// Lock file structure for tracking installed package versions
@@ -830,12 +838,20 @@ impl LockFile {
             }
             // Top-level package maps. or_insert preserves disk values for
             // keys self didn't write, lets self's values win for keys it
-            // did.
-            for (k, v) in other_target.rootfs {
-                self_target.rootfs.entry(k).or_insert(v);
+            // did. Skip the merge entirely for sections that were explicitly
+            // cleared in self (kernel-pin-change clean): the cleared flag
+            // means "my version of this section is authoritative" — pulling
+            // in disk-only package keys (old kernel packages) would corrupt
+            // the sysroot's recorded state.
+            if !self_target.cleared_sections.contains("rootfs") {
+                for (k, v) in other_target.rootfs {
+                    self_target.rootfs.entry(k).or_insert(v);
+                }
             }
-            for (k, v) in other_target.initramfs {
-                self_target.initramfs.entry(k).or_insert(v);
+            if !self_target.cleared_sections.contains("initramfs") {
+                for (k, v) in other_target.initramfs {
+                    self_target.initramfs.entry(k).or_insert(v);
+                }
             }
             for (k, v) in other_target.target_sysroot {
                 self_target.target_sysroot.entry(k).or_insert(v);
@@ -1225,18 +1241,20 @@ impl LockFile {
         }
     }
 
-    /// Clear rootfs entries for a specific target
+    /// Clear rootfs entries for a specific target and mark the section as
+    /// explicitly cleared so `merge_with` doesn't re-insert disk packages.
     pub fn clear_rootfs(&mut self, target: &str) {
-        if let Some(target_locks) = self.targets.get_mut(target) {
-            target_locks.rootfs.clear();
-        }
+        let entry = self.targets.entry(target.to_string()).or_default();
+        entry.rootfs.clear();
+        entry.cleared_sections.insert("rootfs".to_string());
     }
 
-    /// Clear initramfs entries for a specific target
+    /// Clear initramfs entries for a specific target and mark the section as
+    /// explicitly cleared so `merge_with` doesn't re-insert disk packages.
     pub fn clear_initramfs(&mut self, target: &str) {
-        if let Some(target_locks) = self.targets.get_mut(target) {
-            target_locks.initramfs.clear();
-        }
+        let entry = self.targets.entry(target.to_string()).or_default();
+        entry.initramfs.clear();
+        entry.cleared_sections.insert("initramfs".to_string());
     }
 
     /// Remove the pinned `KERNEL_VERSION` entry for a specific sysroot under
