@@ -5,6 +5,63 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Parse the `overlay:` config value into `(dir, opaque)`.
+/// Accepts either a plain string (`"path/to/dir"`) or a mapping
+/// (`{ dir: "path/to/dir", mode: "opaque" | "merge" }`).
+fn parse_overlay_config(value: &serde_yaml::Value) -> (String, bool) {
+    if let Some(dir_str) = value.as_str() {
+        (dir_str.to_string(), false)
+    } else if let Some(table) = value.as_mapping() {
+        let dir = table
+            .get("dir")
+            .and_then(|d| d.as_str())
+            .unwrap_or("overlay")
+            .to_string();
+        let opaque = table
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "opaque")
+            .unwrap_or(false);
+        (dir, opaque)
+    } else {
+        ("overlay".to_string(), false)
+    }
+}
+
+/// Build the shell snippet that applies an overlay directory into a sysroot.
+/// `overlay_dir` is the path relative to `/opt/src` (the project root inside the container).
+/// `sysroot_dir` is the sysroot subdirectory name (e.g., "rootfs", "initramfs").
+fn build_overlay_script(overlay_dir: &str, opaque: bool, sysroot_dir: &str) -> String {
+    if opaque {
+        format!(
+            r#"
+# Apply overlay (opaque mode) — cp -r replaces directory contents
+if [ -d "/opt/src/{overlay_dir}" ]; then
+    echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot (opaque mode)"
+    cp -r "/opt/src/{overlay_dir}/." "$AVOCADO_PREFIX/{sysroot_dir}/"
+    chown -R root:root "$AVOCADO_PREFIX/{sysroot_dir}/"
+else
+    echo "Error: Overlay directory '{overlay_dir}' not found in /opt/src"
+    exit 1
+fi
+"#
+        )
+    } else {
+        format!(
+            r#"
+# Apply overlay (merge mode) — rsync -a adds/replaces files, preserving others
+if [ -d "/opt/src/{overlay_dir}" ]; then
+    echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot (merge mode)"
+    rsync -a --chown=root:root "/opt/src/{overlay_dir}/" "$AVOCADO_PREFIX/{sysroot_dir}/"
+else
+    echo "Error: Overlay directory '{overlay_dir}' not found in /opt/src"
+    exit 1
+fi
+"#
+        )
+    }
+}
+
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
@@ -521,6 +578,24 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         String::new()
     };
 
+    // Build optional overlay snippet — appended to the install command so it
+    // runs in the same container invocation immediately after DNF finishes.
+    let overlay_snippet = params
+        .parsed
+        .and_then(|parsed| {
+            let key = match params.sysroot_type {
+                SysrootType::Rootfs => "rootfs",
+                SysrootType::Initramfs => "initramfs",
+                _ => return None,
+            };
+            parsed.get(key)?.get("overlay")
+        })
+        .map(|v| {
+            let (dir, opaque) = parse_overlay_config(v);
+            build_overlay_script(&dir, opaque, sysroot_dir)
+        })
+        .unwrap_or_default();
+
     let command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
@@ -538,7 +613,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
-"#
+{overlay_snippet}"#
     );
 
     let mut run_config = RunConfig {
