@@ -282,8 +282,12 @@ async fn package_exists_in_target_repo(
     params: &SysrootInstallParams<'_>,
     package_name: &str,
 ) -> Result<bool> {
+    // Append '*' to force glob mode: without it DNF parses the versioned name
+    // (e.g. packagegroup-avocado-rootfs-modules-5.15.185-l4t-r36.5-1033.33)
+    // as a NEVRA spec and splits on dashes to find NAME-VERSION-RELEASE,
+    // causing a false-empty result even when the package is present.
     let command = format!(
-        "$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --qf '%{{NAME}}' {package_name} 2>/dev/null || true"
+        "$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --qf '%{{NAME}}' '{package_name}*' 2>/dev/null || true"
     );
     let run_config = RunConfig {
         container_image: params.container_image.to_string(),
