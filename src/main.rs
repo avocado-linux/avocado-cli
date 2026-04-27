@@ -2304,6 +2304,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                runtime,
                 out_dir,
                 container_args,
                 dnf_args,
@@ -2311,6 +2312,7 @@ async fn main() -> Result<()> {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let image_cmd = ExtImageCommand::new(
                     extension,
                     config,
@@ -2321,7 +2323,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_output_dir(out_dir);
+                .with_output_dir(out_dir)
+                .with_runtime(resolved_runtime);
                 image_cmd.execute().await?;
                 Ok(())
             }
@@ -3346,6 +3349,10 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime to image the extension under (kernel/rootfs context).
+        /// Same resolution rules as `ext build -r`.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Output directory on host to copy the resulting image to
         #[arg(long = "out")]
         out_dir: Option<String>,

@@ -352,7 +352,8 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
-                                .with_composed_config(composed);
+                                .with_composed_config(composed)
+                                .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
                                     cmd = cmd.with_tui_context(ctx);
                                 }
