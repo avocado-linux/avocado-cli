@@ -275,6 +275,47 @@ fn detect_sysroot_package_removals(
 /// - Forces clean reinstall when packages are removed (DNF is additive-only)
 /// - Tracks all installed packages in the lock file
 /// - Writes install stamps for staleness detection
+// Probe the target repo for `package_name` via repoquery (metadata-only, no
+// install). Returns true if the package exists; `|| true` prevents a non-zero
+// exit when absent — an empty result is the signal.
+async fn package_exists_in_target_repo(
+    params: &SysrootInstallParams<'_>,
+    package_name: &str,
+) -> Result<bool> {
+    let command = format!(
+        "$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --qf '%{{NAME}}' {package_name} 2>/dev/null || true"
+    );
+    let run_config = RunConfig {
+        container_image: params.container_image.to_string(),
+        target: params.target.to_string(),
+        command,
+        verbose: params.verbose,
+        source_environment: false,
+        interactive: false,
+        repo_url: params.repo_url.map(|s| s.to_string()),
+        repo_release: params.repo_release.map(|s| s.to_string()),
+        container_args: params.merged_container_args.clone(),
+        dnf_args: params.dnf_args.clone(),
+        sdk_arch: params.sdk_arch.cloned(),
+        tui_context: params.tui_context.clone(),
+        ..Default::default()
+    };
+    let output = if let Some(ctx) = params.runs_on_context {
+        params
+            .container_helper
+            .run_in_container_with_output_remote(&run_config, ctx)
+            .await
+            .context("failed to probe target repo for package existence")?
+    } else {
+        params
+            .container_helper
+            .run_in_container_with_output(run_config)
+            .await
+            .context("failed to probe target repo for package existence")?
+    };
+    Ok(output.map(|s| !s.trim().is_empty()).unwrap_or(false))
+}
+
 pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()> {
     let (label, sysroot_dir, default_pkg) = match params.sysroot_type {
         SysrootType::Rootfs => ("rootfs", "rootfs", "avocado-pkg-rootfs"),
@@ -463,11 +504,21 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                 }
                 _ => unreachable!(),
             };
-            print_info(
-                &format!("Auto-including {name} for pinned kernel {kver}"),
-                OutputLevel::Normal,
-            );
-            Some(name)
+            if package_exists_in_target_repo(params, &name).await? {
+                print_info(
+                    &format!("Auto-including {name} for pinned kernel {kver}"),
+                    OutputLevel::Normal,
+                );
+                Some(name)
+            } else {
+                print_info(
+                    &format!(
+                        "Skipping {name}: not found in feed (feed predates per-kernel module packagegroups)"
+                    ),
+                    OutputLevel::Normal,
+                );
+                None
+            }
         }
         (None, _) => {
             print_info(
