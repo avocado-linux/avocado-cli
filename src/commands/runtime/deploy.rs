@@ -180,10 +180,12 @@ impl RuntimeDeployCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
-        // Validate stamps before proceeding (unless --no-stamps)
+        // Validate stamps before proceeding (unless --no-stamps).
+        // Deploy needs the runtime to be built; provision is not required —
+        // deploy and provision are independent consumers of the build output.
         if !self.no_stamps {
             let required = vec![StampRequirement::new(
-                crate::utils::stamps::StampCommand::Provision,
+                crate::utils::stamps::StampCommand::Build,
                 crate::utils::stamps::StampComponent::Runtime,
                 Some(&self.runtime_name),
             )];
