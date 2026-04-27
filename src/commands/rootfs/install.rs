@@ -665,7 +665,7 @@ PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
+    {dnf_args_str} {yes} --setopt=install_weak_deps=False --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
 {overlay_snippet}"#
     );
 
