@@ -840,18 +840,40 @@ impl LockFile {
             for (k, v) in other_target.target_sysroot {
                 self_target.target_sysroot.entry(k).or_insert(v);
             }
-            // Legacy global extensions namespace (deprecated; preserve).
-            for (name, ext_lock) in other_target.extensions {
-                self_target.extensions.entry(name).or_insert(ext_lock);
+            // Legacy/global extensions namespace — still authoritative
+            // for fetched-extension source metadata. Recurse into the
+            // per-extension package map for the same reason as the
+            // per-runtime case below: stale empty markers must not
+            // shadow concurrent writers' packages.
+            for (ext_name, other_ext) in other_target.extensions {
+                let self_ext = self_target.extensions.entry(ext_name).or_default();
+                for (pkg, ver) in other_ext.packages {
+                    self_ext.packages.entry(pkg).or_insert(ver);
+                }
+                if self_ext.source.is_none() {
+                    self_ext.source = other_ext.source;
+                }
             }
-            // Per-runtime state — recurse into RuntimeLock.
+            // Per-runtime state — recurse into RuntimeLock. Crucially,
+            // recurse all the way down into per-extension package maps:
+            // a task's in-memory lockfile can hold a stale empty
+            // membership marker (`{}`) for a sibling extension it loaded
+            // before that sibling's task wrote packages. A whole-
+            // ExtensionLock-level or_insert would let that stale `{}`
+            // discard the sibling's freshly-saved packages on merge.
             for (rt_name, other_rt) in other_target.runtimes {
                 let self_rt = self_target.runtimes.entry(rt_name).or_default();
                 for (k, v) in other_rt.packages {
                     self_rt.packages.entry(k).or_insert(v);
                 }
-                for (ext_name, ext_lock) in other_rt.extensions {
-                    self_rt.extensions.entry(ext_name).or_insert(ext_lock);
+                for (ext_name, other_ext) in other_rt.extensions {
+                    let self_ext = self_rt.extensions.entry(ext_name).or_default();
+                    for (pkg, ver) in other_ext.packages {
+                        self_ext.packages.entry(pkg).or_insert(ver);
+                    }
+                    if self_ext.source.is_none() {
+                        self_ext.source = other_ext.source;
+                    }
                 }
             }
             // Pinned kernel-versions per sysroot.
