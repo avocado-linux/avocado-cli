@@ -777,6 +777,9 @@ impl LockFile {
 
     /// Internal: serialize and write `lock` to the lockfile path under
     /// `src_dir`. Caller is responsible for holding the save gate.
+    ///
+    /// Writes via temp-file + rename so concurrent readers (which are not
+    /// gated by `LOCKFILE_SAVE_GATE`) never observe a truncated file.
     fn write_to_disk(lock: &Self, src_dir: &Path) -> Result<()> {
         let path = Self::get_path(src_dir);
         if let Some(parent) = path.parent() {
@@ -790,8 +793,17 @@ impl LockFile {
             .with_context(|| "Failed to serialize lock file")?;
         let content_with_newline = format!("{content}\n");
 
-        fs::write(&path, content_with_newline)
-            .with_context(|| format!("Failed to write lock file: {}", path.display()))?;
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, content_with_newline).with_context(|| {
+            format!("Failed to write lock file temp: {}", tmp_path.display())
+        })?;
+        fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to rename lock file temp into place: {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
