@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
+use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
+use crate::utils::kernel_version::resolve_kernel_family_name;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -390,7 +392,9 @@ impl RuntimeInstallCommand {
 
         // Also include kernel package if specified
         if let Some(ref merged_val) = merged_runtime {
-            if let Ok(Some(kernel_config)) = Config::get_kernel_config_from_runtime(merged_val) {
+            if let Ok(Some(kernel_config)) =
+                Config::get_kernel_config_from_runtime(merged_val, config.kernel.as_ref())
+            {
                 if let Some(ref kernel_package) = kernel_config.package {
                     config_names.insert(kernel_package.clone());
                 }
@@ -539,6 +543,30 @@ impl RuntimeInstallCommand {
             .and_then(|merged| merged.get("packages"));
 
         if let Some(serde_yaml::Value::Mapping(deps_map)) = dependencies {
+            // Resolve (or reuse a pinned) KERNEL_VERSION for this runtime
+            // before building package specs. Runtimes with kernel.compile set
+            // return None here and kernel-family names pass through unchanged.
+            let resolved_kver = {
+                let mut resolve_params = ResolveParams {
+                    container_helper,
+                    container_image,
+                    target: &target_arch,
+                    sysroot: sysroot.clone(),
+                    runtime_name: Some(runtime),
+                    config,
+                    lock_file,
+                    repo_url: repo_url.map(|s| s.as_str()),
+                    repo_release: repo_release.map(|s| s.as_str()),
+                    merged_container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    runs_on_context,
+                    sdk_arch: self.sdk_arch.as_ref(),
+                    verbose: self.verbose,
+                    tui_context: self.tui_context.clone(),
+                };
+                resolve_and_pin_kernel_version(&mut resolve_params).await?
+            };
+
             // Build list of packages to install
             // Note: Extensions are now listed in the separate `extensions` array,
             // so dependencies should only contain package references.
@@ -563,11 +591,15 @@ impl RuntimeInstallCommand {
                     "*".to_string()
                 };
 
+                let resolved_name = match resolved_kver.as_deref() {
+                    Some(kver) => resolve_kernel_family_name(package_name, kver),
+                    None => package_name.to_string(),
+                };
                 let package_spec = build_package_spec_with_lock(
                     lock_file,
                     &target_arch,
                     &sysroot,
-                    package_name,
+                    &resolved_name,
                     &config_version,
                 );
                 packages.push(package_spec);
@@ -576,15 +608,20 @@ impl RuntimeInstallCommand {
 
             // Add kernel package if specified in the runtime kernel config
             if let Some(ref merged_val) = merged_runtime {
-                if let Ok(Some(kernel_config)) = Config::get_kernel_config_from_runtime(merged_val)
+                if let Ok(Some(kernel_config)) =
+                    Config::get_kernel_config_from_runtime(merged_val, config.kernel.as_ref())
                 {
                     if let Some(ref kernel_package) = kernel_config.package {
                         let kernel_version = kernel_config.version.as_deref().unwrap_or("*");
+                        let resolved_name = match resolved_kver.as_deref() {
+                            Some(kver) => resolve_kernel_family_name(kernel_package, kver),
+                            None => kernel_package.clone(),
+                        };
                         let package_spec = build_package_spec_with_lock(
                             lock_file,
                             &target_arch,
                             &sysroot,
-                            kernel_package,
+                            &resolved_name,
                             kernel_version,
                         );
                         print_info(
@@ -675,6 +712,8 @@ $DNF_SDK_HOST \
 
                 // Query installed versions and update lock file
                 if !package_names.is_empty() {
+                    let mut runtime_env_vars = std::collections::HashMap::new();
+                    runtime_env_vars.insert("AVOCADO_RUNTIME".to_string(), runtime.to_string());
                     let installed_versions = container_helper
                         .query_installed_packages(
                             &sysroot,
@@ -686,6 +725,7 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
+                            Some(runtime_env_vars),
                         )
                         .await?;
 

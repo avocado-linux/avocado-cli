@@ -286,6 +286,16 @@ impl BuildCommand {
             let sdk_arch = self.sdk_arch.clone();
             let composed2 = Arc::clone(&composed);
             let renderer2 = renderer.clone();
+            // When the project resolves to a single runtime, propagate it so
+            // ExtBuild/ExtImage land in the runtime-scoped sysroot tree and
+            // gate on membership/precondition checks. Multi-runtime builds
+            // run in legacy (per-target) mode for now — the scheduler graph
+            // is keyed by extension name, not (runtime, extension).
+            let dual_write_runtime = if runtimes_to_build.len() == 1 {
+                runtimes_to_build.first().cloned()
+            } else {
+                None
+            };
 
             let sched_renderer = renderer
                 .clone()
@@ -302,6 +312,7 @@ impl BuildCommand {
                     let sdk_arch = sdk_arch.clone();
                     let composed = Arc::clone(&composed2);
                     let renderer = renderer2.clone();
+                    let dual_write_runtime = dual_write_runtime.clone();
 
                     Box::pin(async move {
                         let tui_ctx = renderer.as_ref().map(|r| TuiContext {
@@ -322,7 +333,8 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
-                                .with_composed_config(composed);
+                                .with_composed_config(composed)
+                                .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
                                     cmd = cmd.with_tui_context(ctx);
                                 }
@@ -340,7 +352,8 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
-                                .with_composed_config(composed);
+                                .with_composed_config(composed)
+                                .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
                                     cmd = cmd.with_tui_context(ctx);
                                 }

@@ -3,7 +3,8 @@ use crate::utils::signing_service::{generate_helper_script, SigningService, Sign
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{is_docker_desktop, RunConfig, SdkContainer},
-    output::{print_info, print_success, OutputLevel},
+    lockfile::{LockFile, SysrootType},
+    output::{print_info, print_success, print_warning, OutputLevel},
     remote::{RemoteHost, SshClient},
     stamps::{
         generate_batch_read_stamps_script, generate_write_stamp_script,
@@ -143,6 +144,11 @@ impl RuntimeProvisionCommand {
 
             // Batch all stamp reads into a single container invocation for performance
             let batch_script = generate_batch_read_stamps_script(&required);
+            let mut early_env = HashMap::new();
+            early_env.insert(
+                "AVOCADO_RUNTIME".to_string(),
+                self.config.runtime_name.clone(),
+            );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target_arch.clone(),
@@ -153,6 +159,7 @@ impl RuntimeProvisionCommand {
                 runs_on: self.config.runs_on.clone(),
                 nfs_port: self.config.nfs_port,
                 sdk_arch: self.config.sdk_arch.clone(),
+                env_vars: Some(early_env),
                 ..Default::default()
             };
 
@@ -229,6 +236,15 @@ impl RuntimeProvisionCommand {
             self.config.runtime_name.clone(),
         );
 
+        // AVOCADO_RUNTIME - Read by the container entrypoint to scope
+        // `$AVOCADO_EXT_SYSROOTS` to `runtimes/<r>/extensions`. Mirrors
+        // AVOCADO_RUNTIME_NAME for ergonomic consistency with other
+        // runtime-aware commands.
+        env_vars.insert(
+            "AVOCADO_RUNTIME".to_string(),
+            self.config.runtime_name.clone(),
+        );
+
         // AVOCADO_RUNTIME_VERSION - Runtime version from distro.version (e.g., "0.1.0")
         if let Some(distro_version) = config.get_distro_version() {
             env_vars.insert(
@@ -292,6 +308,52 @@ impl RuntimeProvisionCommand {
         // Set AVOCADO_DISTRO_VERSION if configured
         if let Some(distro_version) = config.get_distro_version() {
             env_vars.insert("AVOCADO_DISTRO_VERSION".to_string(), distro_version.clone());
+        }
+
+        // AVOCADO_PROVISION_KERNEL_IMAGE / _VERSION: when `avocado install` pinned
+        // a kernel for the rootfs sysroot, the kernel-image RPM auto-append
+        // (install.rs) put /boot/Image-${KERNEL_VERSION} into the rootfs sysroot.
+        // Surface the container-side path so provision scripts (e.g.
+        // stone-provision-tegraflash.sh) can repack boot.img with the resolver-
+        // pinned kernel instead of relying on the build-baked one.
+        if let Ok(src_dir) = std::env::current_dir() {
+            if let Ok(lock_file) = LockFile::load(&src_dir) {
+                // Validate kernel consistency before provision. Any drift between
+                // rootfs/initramfs kvers, or a pinned kver without a populated
+                // kernel sysroot, surfaces here as a warning. Phase 5 promotes
+                // these to fatal once the v1 rootfs auto-append is removed.
+                if let Err(e) = lock_file.validate_kernel_consistency(&target_arch) {
+                    print_warning(
+                        &format!(
+                            "Kernel consistency warning before provision: {e} \
+                             (provision will continue; this becomes a hard error in a future release)"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+
+                if let Some(kver) = lock_file
+                    .get_kernel_version(&target_arch, &SysrootType::Rootfs)
+                    .cloned()
+                {
+                    // Prefer the content-addressed kernel sysroot when populated
+                    // (Phase 2c stages it from the rootfs install). The
+                    // `Image` symlink inside that directory points at
+                    // `Image-<kver>`. Fall back to the rootfs `/boot/Image-<kver>`
+                    // path for v4 lockfiles or if staging silently failed.
+                    let kernel_sysroot = SysrootType::Kernel(kver.clone());
+                    let kernel_sysroot_populated = lock_file
+                        .get_sysroot_versions(&target_arch, &kernel_sysroot)
+                        .is_some();
+                    let image_path = if kernel_sysroot_populated {
+                        format!("/opt/_avocado/{target_arch}/kernel/{kver}/Image")
+                    } else {
+                        format!("/opt/_avocado/{target_arch}/rootfs/boot/Image-{kver}")
+                    };
+                    env_vars.insert("AVOCADO_PROVISION_KERNEL_VERSION".to_string(), kver);
+                    env_vars.insert("AVOCADO_PROVISION_KERNEL_IMAGE".to_string(), image_path);
+                }
+            }
         }
 
         // Determine state file path and container location if a provision profile is set
@@ -1000,6 +1062,11 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
 "#
         );
 
+        let mut query_env = HashMap::new();
+        query_env.insert(
+            "AVOCADO_RUNTIME".to_string(),
+            self.config.runtime_name.clone(),
+        );
         let version_query_config = crate::utils::container::RunConfig {
             container_image: container_image.to_string(),
             target: target.to_string(),
@@ -1009,6 +1076,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             interactive: false,
             runs_on: self.config.runs_on.clone(),
             nfs_port: self.config.nfs_port,
+            env_vars: Some(query_env),
             ..Default::default()
         };
 

@@ -241,7 +241,14 @@ impl ExtFetchCommand {
                         OutputLevel::Normal,
                     );
 
-                    // Record source metadata in lock file for package-type extensions
+                    // Record source metadata in lock file for package-type
+                    // extensions. Source metadata is intentionally global —
+                    // it describes "where this package came from" /
+                    // "what version anchors the build config," which is
+                    // a property of the fetch, not of any runtime that
+                    // later builds a sysroot from it. Runtime-scoping
+                    // applies to the built sysroots downstream, not to
+                    // source descriptors.
                     if let ExtensionSource::Package {
                         version, package, ..
                     } = &effective_source

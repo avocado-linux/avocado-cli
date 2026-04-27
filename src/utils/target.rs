@@ -246,12 +246,14 @@ mod tests {
             src_dir: None,
             distro: None,
             runtimes: None,
+            default_runtime: None,
             sdk: None,
             provision_profiles: None,
             signing_keys: None,
             connect: None,
             rootfs: None,
             initramfs: None,
+            kernel: None,
         }
     }
 
@@ -265,12 +267,14 @@ mod tests {
             src_dir: None,
             distro: None,
             runtimes: None,
+            default_runtime: None,
             sdk: None,
             provision_profiles: None,
             signing_keys: None,
             connect: None,
             rootfs: None,
             initramfs: None,
+            kernel: None,
         }
     }
 
@@ -284,12 +288,14 @@ mod tests {
             src_dir: None,
             distro: None,
             runtimes: None,
+            default_runtime: None,
             sdk: None,
             provision_profiles: None,
             signing_keys: None,
             connect: None,
             rootfs: None,
             initramfs: None,
+            kernel: None,
         }
     }
 

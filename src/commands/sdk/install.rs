@@ -541,24 +541,44 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 entry.sdk = target_locks.sdk.clone();
             }
         }
-        // Merge rootfs lock
+        // Merge rootfs lock — both the package map and the per-sysroot kernel
+        // version pin the resolver wrote into the clone. Also pull in the
+        // `kernels` entries staged from the rootfs install (Phase 2c) — they
+        // live on the clone too and would otherwise be dropped on the merge
+        // floor.
         if rootfs_result.is_ok() {
             if let Some(target_locks) = rootfs_lock.targets.get(target) {
-                final_lock
-                    .targets
-                    .entry(target.to_string())
-                    .or_default()
-                    .rootfs = target_locks.rootfs.clone();
+                let entry = final_lock.targets.entry(target.to_string()).or_default();
+                entry.rootfs = target_locks.rootfs.clone();
+                if let Some(kver) = target_locks
+                    .kernel_versions
+                    .get(&SysrootType::Rootfs.lock_key())
+                {
+                    entry
+                        .kernel_versions
+                        .insert(SysrootType::Rootfs.lock_key(), kver.clone());
+                }
+                // Per-kernel sysroot package state (Phase 2c). The clone may
+                // hold one or more entries keyed by KERNEL_VERSION; merge
+                // each into the final lock.
+                for (kver, pkgs) in &target_locks.kernels {
+                    entry.kernels.insert(kver.clone(), pkgs.clone());
+                }
             }
         }
-        // Merge initramfs lock
+        // Merge initramfs lock.
         if initramfs_result.is_ok() {
             if let Some(target_locks) = initramfs_lock.targets.get(target) {
-                final_lock
-                    .targets
-                    .entry(target.to_string())
-                    .or_default()
-                    .initramfs = target_locks.initramfs.clone();
+                let entry = final_lock.targets.entry(target.to_string()).or_default();
+                entry.initramfs = target_locks.initramfs.clone();
+                if let Some(kver) = target_locks
+                    .kernel_versions
+                    .get(&SysrootType::Initramfs.lock_key())
+                {
+                    entry
+                        .kernel_versions
+                        .insert(SysrootType::Initramfs.lock_key(), kver.clone());
+                }
             }
         }
         // Merge target-dev lock
@@ -590,6 +610,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         merged_container_args.cloned(),
                         runs_on_context,
                         self.sdk_arch.as_ref(),
+                        None,
                     )
                     .await?;
 
@@ -1706,6 +1727,7 @@ $DNF_SDK_HOST \
                     merged_container_args.cloned(),
                     runs_on_context,
                     self.sdk_arch.as_ref(),
+                    None,
                 )
                 .await?;
 

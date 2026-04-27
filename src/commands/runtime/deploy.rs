@@ -1,7 +1,8 @@
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
-    output::{print_info, print_success, OutputLevel},
+    lockfile::LockFile,
+    output::{print_info, print_success, print_warning, OutputLevel},
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
     target::resolve_target_required,
     update_repo::{self, HashCollectionOutput},
@@ -158,13 +159,33 @@ impl RuntimeDeployCommand {
 
         let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
+        // Validate kernel consistency before deploy. Same non-fatal warning
+        // policy as provision: surfaces drift early but allows deploy to
+        // continue while v1 rootfs auto-append is still active. Phase 5
+        // promotes to fatal after the auto-append is removed.
+        if let Ok(src_dir) = std::env::current_dir() {
+            if let Ok(lock_file) = LockFile::load(&src_dir) {
+                if let Err(e) = lock_file.validate_kernel_consistency(&target_arch) {
+                    print_warning(
+                        &format!(
+                            "Kernel consistency warning before deploy: {e} \
+                             (deploy will continue; this becomes a hard error in a future release)"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
-        // Validate stamps before proceeding (unless --no-stamps)
+        // Validate stamps before proceeding (unless --no-stamps).
+        // Deploy needs the runtime to be built; provision is not required —
+        // deploy and provision are independent consumers of the build output.
         if !self.no_stamps {
             let required = vec![StampRequirement::new(
-                crate::utils::stamps::StampCommand::Provision,
+                crate::utils::stamps::StampCommand::Build,
                 crate::utils::stamps::StampComponent::Runtime,
                 Some(&self.runtime_name),
             )];

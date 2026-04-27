@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
@@ -15,6 +16,7 @@ pub struct ExtDnfCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     sdk_arch: Option<String>,
+    runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -38,6 +40,7 @@ impl ExtDnfCommand {
             container_args,
             dnf_args,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
         }
     }
@@ -46,6 +49,20 @@ impl ExtDnfCommand {
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
         self
+    }
+
+    /// Set the runtime context. See [`super::build::ExtBuildCommand::with_runtime`].
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -212,6 +229,7 @@ impl ExtDnfCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let dir_exists = container_helper.run_in_container(config).await?;
@@ -264,6 +282,7 @@ impl ExtDnfCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let setup_success = container_helper.run_in_container(config).await?;
@@ -316,6 +335,7 @@ impl ExtDnfCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let success = container_helper.run_in_container(config).await?;

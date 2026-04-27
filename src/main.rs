@@ -1457,6 +1457,19 @@ fn validate_runtime_required(config_path: &str, runtime: &str) -> Result<()> {
         .with_context(|| format!("Invalid runtime specified: '{runtime}'"))
 }
 
+/// Resolve a required runtime name from CLI arg, env var, config default, or
+/// sole-runtime auto-resolution.
+///
+/// Loads `Config` from the given path so the resolver can inspect
+/// `default_runtime` and `runtimes:`. When the resolved name comes from the
+/// CLI/env/config (not auto-resolution), validates that it matches a defined
+/// runtime — same check `validate_runtime_required` performed previously.
+fn resolve_runtime_at_path(config_path: &str, cli_runtime: Option<&str>) -> Result<String> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("Failed to load config: {config_path}"))?;
+    crate::utils::runtime::validate_and_log_runtime(cli_runtime, &config)
+}
+
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
 fn parse_env_vars(env_args: Option<&Vec<String>>) -> Option<HashMap<String, String>> {
     env_args.map(|args| {
@@ -1733,12 +1746,7 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
-            let runtime = name
-                .or(runtime)
-                .context("runtime name is required (provide as positional or -r/--runtime)")?;
-
-            // Validate runtime exists (required argument)
-            validate_runtime_required(&config, &runtime)?;
+            let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
                 ProvisionCommand::new(crate::commands::provision::ProvisionConfig {
@@ -1770,12 +1778,7 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
         } => {
-            let runtime = name
-                .or(runtime)
-                .context("runtime name is required (provide as positional or -r/--runtime)")?;
-
-            // Validate runtime exists (required argument)
-            validate_runtime_required(&config, &runtime)?;
+            let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let deploy_cmd = RuntimeDeployCommand::new(
                 runtime,
@@ -1953,11 +1956,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let mut build_cmd = RuntimeBuildCommand::new(
                     runtime,
@@ -1986,11 +1986,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let mut provision_cmd = RuntimeProvisionCommand::new(
                     crate::commands::runtime::provision::RuntimeProvisionConfig {
@@ -2025,11 +2022,8 @@ async fn main() -> Result<()> {
                 runtime,
                 target: _,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let deps_cmd = RuntimeDepsCommand::new(config, runtime);
                 deps_cmd.execute()?;
@@ -2069,11 +2063,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let clean_cmd = RuntimeCleanCommand::new(
                     runtime,
@@ -2097,11 +2088,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let deploy_cmd = RuntimeDeployCommand::new(
                     runtime,
@@ -2126,11 +2114,8 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
-                let runtime = name
-                    .or(runtime)
-                    .context("runtime name is required (provide as positional or -r/--runtime)")?;
-                // Validate runtime exists (required argument)
-                validate_runtime_required(&config, &runtime)?;
+                let runtime =
+                    resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
                 let sign_cmd = RuntimeSignCommand::new(
                     runtime,
@@ -2198,12 +2183,17 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                runtime,
                 container_args,
                 dnf_args,
             } => {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                // Resolve runtime when caller asked for it (or env / default
+                // runtime would resolve). Fall through to None for projects
+                // without runtimes so legacy per-target builds keep working.
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let build_cmd = ExtBuildCommand::new(
                     extension,
                     config,
@@ -2214,7 +2204,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 build_cmd.execute().await?;
                 Ok(())
             }
@@ -2224,6 +2215,7 @@ async fn main() -> Result<()> {
                 verbose,
                 extension,
                 target,
+                runtime,
                 ext_path,
                 src_path,
                 container_tool,
@@ -2231,6 +2223,7 @@ async fn main() -> Result<()> {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let checkout_cmd = ExtCheckoutCommand::new(
                     extension,
                     ext_path,
@@ -2241,7 +2234,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target),
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 checkout_cmd.execute().await?;
                 Ok(())
             }
@@ -2266,10 +2260,12 @@ async fn main() -> Result<()> {
                 verbose,
                 extension,
                 target,
+                runtime,
                 command,
                 container_args,
                 dnf_args,
             } => {
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let dnf_cmd = ExtDnfCommand::new(
                     config,
                     extension,
@@ -2279,7 +2275,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 dnf_cmd.execute().await?;
                 Ok(())
             }
@@ -2289,12 +2286,14 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                runtime,
                 container_args,
                 dnf_args,
             } => {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let clean_cmd = ExtCleanCommand::new(
                     extension,
                     config,
@@ -2303,7 +2302,8 @@ async fn main() -> Result<()> {
                     container_args,
                     dnf_args,
                 )
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -2313,6 +2313,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                runtime,
                 out_dir,
                 container_args,
                 dnf_args,
@@ -2320,6 +2321,7 @@ async fn main() -> Result<()> {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let image_cmd = ExtImageCommand::new(
                     extension,
                     config,
@@ -2330,7 +2332,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_output_dir(out_dir);
+                .with_output_dir(out_dir)
+                .with_runtime(resolved_runtime);
                 image_cmd.execute().await?;
                 Ok(())
             }
@@ -2338,6 +2341,7 @@ async fn main() -> Result<()> {
                 name,
                 extension,
                 target,
+                runtime,
                 config,
                 verbose,
                 output_dir,
@@ -2347,6 +2351,7 @@ async fn main() -> Result<()> {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let package_cmd = ExtPackageCommand::new(
                     config,
                     extension,
@@ -2357,7 +2362,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 package_cmd.execute().await?;
                 Ok(())
             }
@@ -3231,6 +3237,11 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime to build the extension against (kernel/rootfs context).
+        /// Required when the project has multiple runtimes. Resolves from
+        /// AVOCADO_RUNTIME / default_runtime / sole-runtime when omitted.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -3275,6 +3286,10 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the dnf operation (scopes which extension
+        /// sysroot tree dnf operates on).
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// DNF command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -3301,6 +3316,11 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the clean (resolves which extension sysroot
+        /// tree to operate on). Falls through to legacy per-target behavior
+        /// when no runtime resolves.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -3324,6 +3344,10 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the checkout (selects which sysroot tree the
+        /// files come from).
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Path within the extension sysroot to checkout (e.g., /etc/config.json or /etc for directory)
         #[arg(long = "ext-path", required = true)]
         ext_path: String,
@@ -3350,6 +3374,10 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime to image the extension under (kernel/rootfs context).
+        /// Same resolution rules as `ext build -r`.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Output directory on host to copy the resulting image to
         #[arg(long = "out")]
         out_dir: Option<String>,
@@ -3376,6 +3404,9 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime context for the package operation.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Output directory on host for the RPM package (relative or absolute path). If not specified, RPM stays in container at $AVOCADO_PREFIX/output/extensions
         #[arg(long = "out-dir")]
         output_dir: Option<String>,

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
+use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
+use crate::utils::kernel_version::resolve_kernel_family_name;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -29,6 +31,14 @@ pub struct ExtInstallCommand {
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     pub tui_context: Option<TuiContext>,
+    /// Runtime to scope extension state to. When set, extension package
+    /// versions are mirrored into `lock.targets.<t>.runtimes.<r>.extensions.<ext>`
+    /// alongside the global `lock.targets.<t>.extensions.<ext>` entry that
+    /// today's flow populates. The on-disk extension sysroot path stays at
+    /// `$AVOCADO_EXT_SYSROOTS/<ext>` for now — Phase 2d follow-ups migrate
+    /// the on-disk layout once all ext command consumers (build, image,
+    /// clean, runtime build) accept a runtime parameter.
+    runtime: Option<String>,
 }
 
 impl ExtInstallCommand {
@@ -55,6 +65,48 @@ impl ExtInstallCommand {
             sdk_arch: None,
             composed_config: None,
             tui_context: None,
+            runtime: None,
+        }
+    }
+
+    /// Scope this install to a runtime. When set, extension package versions
+    /// are also recorded under `runtimes.<r>.extensions.<ext>` in the lockfile
+    /// alongside the existing global `extensions.<ext>` entry, AND the
+    /// container entrypoint flips `\$AVOCADO_EXT_SYSROOTS` to the runtime-
+    /// scoped path. A compat symlink at the legacy location keeps callers
+    /// that haven't been opted in yet (build, image, clean, runtime build,
+    /// fetch) reading the same content transparently.
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Build the container `env_vars` map carrying `AVOCADO_RUNTIME` when a
+    /// runtime is in scope. The container entrypoint reads it to compute
+    /// `\$AVOCADO_EXT_SYSROOTS`. Returns `None` when no runtime is set so
+    /// `RunConfig` defaults preserve today's behavior.
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
+    }
+
+    /// Compute the [`SysrootType`] that this install should track in the
+    /// lockfile for a given extension. Prefers the runtime-scoped variant
+    /// (`runtimes.<r>.extensions.<ext>`) whenever a runtime is in scope —
+    /// avocado-cli fully owns the state volume, so there's no value in
+    /// dual-writing the legacy global namespace. Standalone callers
+    /// without a resolved runtime fall back to the legacy variant for
+    /// the deprecation window until orchestrators always pass one.
+    fn extension_sysroot(&self, extension: &str) -> SysrootType {
+        match self.runtime.as_deref() {
+            Some(rt) => SysrootType::RuntimeExtension {
+                runtime: rt.to_string(),
+                extension: extension.to_string(),
+            },
+            None => SysrootType::Extension(extension.to_string()),
         }
     }
 
@@ -377,6 +429,7 @@ impl ExtInstallCommand {
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
                     tui_context: effective_tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
 
@@ -418,7 +471,7 @@ impl ExtInstallCommand {
         target: &str,
         lock_file: &mut LockFile,
     ) -> bool {
-        let sysroot = SysrootType::Extension(extension.to_string());
+        let sysroot = self.extension_sysroot(extension);
         let locked_names = lock_file.get_locked_package_names(target, &sysroot);
 
         if locked_names.is_empty() {
@@ -485,7 +538,22 @@ impl ExtInstallCommand {
         runs_on_context: Option<&RunsOnContext>,
         effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
-        let sysroot = SysrootType::Extension(extension.to_string());
+        let sysroot = self.extension_sysroot(extension);
+
+        // Record runtime → extension membership upfront when a runtime is in
+        // scope. Extensions without `packages:` (file-only / compile-only)
+        // would otherwise leave no trace in the lockfile because the
+        // package-version write only fires when packages get pinned. This
+        // ensures `runtimes.<r>.extensions.<ext>` exists as a membership
+        // marker. Save immediately so the membership persists even when
+        // the rest of install_single_extension takes the
+        // no-packages-skip-save path.
+        if let Some(rt) = self.runtime.as_deref() {
+            lock_file.record_runtime_extension_membership(target, rt, extension);
+            lock_file.save(src_dir).with_context(|| {
+                format!("Failed to record membership for extension '{extension}' in runtime '{rt}'")
+            })?;
+        }
 
         // Detect package removals: compare current config packages with lock file.
         // If packages were removed, we must clean the sysroot and reinstall from scratch
@@ -516,6 +584,7 @@ impl ExtInstallCommand {
                 dnf_args: self.dnf_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
             // Best-effort clean -- if sysroot doesn't exist, this is a no-op
@@ -540,6 +609,7 @@ impl ExtInstallCommand {
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             tui_context: effective_tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let sysroot_exists =
@@ -558,6 +628,7 @@ impl ExtInstallCommand {
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
             let success =
@@ -580,7 +651,7 @@ impl ExtInstallCommand {
         // Get extension configuration from the composed/merged config
         // For remote extensions, this comes from the merged remote extension config
         // For local extensions, this comes from the main config's ext section
-        let ext_config = match ext_location {
+        let raw_ext_config = match ext_location {
             ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => {
                 // Use the already-merged config from `parsed` which contains remote extension configs
                 parsed
@@ -589,6 +660,58 @@ impl ExtInstallCommand {
                     .cloned()
             }
         };
+
+        // Resolve the kernel version up-front when the extension declares
+        // overrides that depend on it OR has packages that could include
+        // kernel-family names. Skip the container roundtrip for trivial
+        // extensions (no packages, no overrides).
+        let has_overrides_or_packages = raw_ext_config.as_ref().is_some_and(|ec| {
+            ec.get("packages").is_some()
+                || ec.as_mapping().is_some_and(|m| {
+                    m.keys().any(|k| {
+                        k.as_str()
+                            .is_some_and(|s| s.starts_with("target-") || s.starts_with("kernel-"))
+                    })
+                })
+        });
+
+        let resolved_kver = if has_overrides_or_packages {
+            // Extensions inherit the top-level kernel.version (they're not
+            // runtime-scoped), so pass None for runtime_name.
+            let mut resolve_params = ResolveParams {
+                container_helper,
+                container_image,
+                target,
+                sysroot: sysroot.clone(),
+                runtime_name: None,
+                config,
+                lock_file,
+                repo_url: repo_url.map(|s| s.as_str()),
+                repo_release: repo_release.map(|s| s.as_str()),
+                merged_container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                runs_on_context,
+                sdk_arch: self.sdk_arch.as_ref(),
+                verbose: self.verbose,
+                tui_context: effective_tui_context.clone(),
+            };
+            resolve_and_pin_kernel_version(&mut resolve_params).await?
+        } else {
+            None
+        };
+
+        // Apply target/kernel sub-section overrides now that kver is known.
+        // Strips override sub-keys and merges matching ones into the parent
+        // so consumers below see a flat `packages: { ... }` map with
+        // kernel-conditional entries already folded in.
+        let ext_config = raw_ext_config.as_ref().map(|ec| {
+            config.resolve_overrides_in_value(
+                ec.clone(),
+                target,
+                resolved_kver.as_deref(),
+                &format!("extensions.{extension}"),
+            )
+        });
 
         // Install dependencies if they exist
         let dependencies = ext_config.as_ref().and_then(|ec| ec.get("packages"));
@@ -606,6 +729,11 @@ impl ExtInstallCommand {
                     None => continue, // Skip if package name is not a string
                 };
 
+                let resolved_name = match resolved_kver.as_deref() {
+                    Some(kver) => resolve_kernel_family_name(package_name, kver),
+                    None => package_name.to_string(),
+                };
+
                 // Handle different dependency types based on value format
                 match version_spec {
                     // Simple string version: "package: version" or "package: '*'"
@@ -615,7 +743,7 @@ impl ExtInstallCommand {
                             lock_file,
                             target,
                             &sysroot,
-                            package_name,
+                            &resolved_name,
                             version,
                         );
                         packages.push(package_spec);
@@ -681,7 +809,7 @@ impl ExtInstallCommand {
                                 lock_file,
                                 target,
                                 &sysroot,
-                                package_name,
+                                &resolved_name,
                                 version,
                             );
                             packages.push(package_spec);
@@ -774,6 +902,7 @@ $DNF_SDK_HOST \
                     // runs_on handled by shared context
                     sdk_arch: self.sdk_arch.clone(),
                     tui_context: effective_tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
                 let install_success =
@@ -800,10 +929,15 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
+                            self.runtime_env_vars(),
                         )
                         .await?;
 
                     if !installed_versions.is_empty() {
+                        // Single-write to the sysroot computed by
+                        // `extension_sysroot()` — runtime-scoped when a
+                        // runtime is in scope, legacy global namespace
+                        // otherwise.
                         lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
                         if self.verbose {
                             print_info(

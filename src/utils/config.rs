@@ -7,6 +7,165 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::utils::kernel_version::KernelVersionSpec;
+use crate::utils::output::{print_warning, OutputLevel};
+
+/// Shape-inferred deserializer for top-level fields that accept either a
+/// singleton config object (today's grammar) OR a map of `name → config`
+/// (the new named-reference grammar).
+///
+/// The detection rule: if any top-level key in the YAML mapping matches one
+/// of the inner config type's known field names, treat the whole mapping as
+/// a singleton and synthesize the implicit name `default`. Otherwise, treat
+/// it as a `name → config` map directly.
+///
+/// Mixing forms (some keys are field names, some are not) is a hard error —
+/// it almost always indicates a typo and silently dropping unknown keys
+/// would produce confusing partial-singleton state.
+mod named_or_single_deserializer {
+    use serde::de::{self, Deserializer};
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    pub fn deserialize<'de, D, T>(
+        deserializer: D,
+        field_names: &[&str],
+        kind_label: &str,
+    ) -> Result<Option<HashMap<String, T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: serde::de::DeserializeOwned,
+    {
+        let value: Option<serde_yaml::Value> = Option::deserialize(deserializer)?;
+        let Some(value) = value else { return Ok(None) };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let mapping = match &value {
+            serde_yaml::Value::Mapping(m) => m,
+            _ => {
+                return Err(de::Error::custom(format!(
+                    "{kind_label}: expected mapping or null"
+                )))
+            }
+        };
+
+        let known: std::collections::HashSet<&str> = field_names.iter().copied().collect();
+        let total = mapping.len();
+        let field_key_count = mapping
+            .iter()
+            .filter_map(|(k, _)| k.as_str())
+            .filter(|s| known.contains(s))
+            .count();
+
+        if field_key_count == 0 {
+            // Named-map form.
+            let named: HashMap<String, T> =
+                serde_yaml::from_value(value).map_err(de::Error::custom)?;
+            return Ok(Some(named));
+        }
+
+        if field_key_count != total {
+            return Err(de::Error::custom(format!(
+                "{kind_label}: cannot mix singleton form (with config field keys like `{}`) and \
+                 named-map form (with entry name keys); use one form consistently",
+                field_names.join("`, `")
+            )));
+        }
+
+        // Singleton form — wrap as the implicit `default` entry.
+        let single: T = serde_yaml::from_value(value).map_err(de::Error::custom)?;
+        let mut result = HashMap::new();
+        result.insert("default".to_string(), single);
+        Ok(Some(result))
+    }
+}
+
+/// Format a precise error message for an unresolved runtime ref. Lists the
+/// names that *are* defined in the top-level map so the user can spot typos.
+fn format_unresolved_ref_error<T>(
+    runtime_name: &str,
+    field: &str,
+    ref_name: &str,
+    map: Option<&HashMap<String, T>>,
+) -> String {
+    let available = map
+        .map(|m| {
+            let mut names: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            names.join(", ")
+        })
+        .unwrap_or_default();
+    if available.is_empty() {
+        format!(
+            "runtime '{runtime_name}' references {field} '{ref_name}', but no top-level \
+             `{field}:` map is defined in avocado.yaml"
+        )
+    } else {
+        format!(
+            "runtime '{runtime_name}' references {field} '{ref_name}', which is not defined \
+             in the top-level `{field}:` map. Available: {available}"
+        )
+    }
+}
+
+/// Look up the implicit `default` entry in a named-map field, falling back
+/// to the sole entry when the map has exactly one (anonymous-singleton case
+/// where the deserializer happened to produce a non-`default`-keyed entry —
+/// rare, but lets old fixture-style configs round-trip cleanly).
+fn get_default_or_singleton<T>(map: Option<&HashMap<String, T>>) -> Option<&T> {
+    let map = map?;
+    if let Some(value) = map.get("default") {
+        return Some(value);
+    }
+    if map.len() == 1 {
+        return map.values().next();
+    }
+    None
+}
+
+/// Custom deserializer for top-level `kernel:` field.
+fn deserialize_kernels<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, KernelConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["package", "version", "compile", "install"],
+        "kernel",
+    )
+}
+
+/// Custom deserializer for top-level `rootfs:` field.
+fn deserialize_rootfs_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, ImageConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["packages", "dependencies", "filesystem"],
+        "rootfs",
+    )
+}
+
+/// Custom deserializer for top-level `initramfs:` field.
+fn deserialize_initramfs_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, ImageConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["packages", "dependencies", "filesystem"],
+        "initramfs",
+    )
+}
+
 /// Custom deserializer module for container_args
 mod container_args_deserializer {
     use serde::{Deserialize, Deserializer};
@@ -386,6 +545,31 @@ impl KernelConfig {
     }
 }
 
+/// A kernel reference on a runtime: either a name pointing at a top-level
+/// `kernel.<name>` definition, or an inline anonymous override.
+///
+/// Untagged deserialization: a YAML scalar string parses as `Named`, a YAML
+/// mapping parses as `Inline`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum KernelRef {
+    /// Reference to a named top-level kernel entry by name (e.g. `yocto-6-6`).
+    Named(String),
+    /// Inline kernel definition. Equivalent to today's `kernel: { ... }`
+    /// runtime-level syntax; treated as an anonymous override.
+    Inline(KernelConfig),
+}
+
+/// An image (rootfs/initramfs) reference on a runtime: either a named
+/// top-level entry or an inline anonymous override. Same untagged shape as
+/// [`KernelRef`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ImageRef {
+    Named(String),
+    Inline(ImageConfig),
+}
+
 /// Runtime configuration section
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -398,9 +582,18 @@ pub struct RuntimeConfig {
     pub stone_manifest: Option<String>,
     /// Signing configuration for this runtime
     pub signing: Option<SigningConfig>,
-    /// Optional kernel configuration. When omitted, the avocado-runtime meta-package
-    /// handles kernel provisioning via avocado-img-bootfiles (legacy behavior).
-    pub kernel: Option<KernelConfig>,
+    /// Kernel reference for this runtime. Accepts either a string ref to a
+    /// top-level `kernel.<name>` entry or an inline `KernelConfig` (today's
+    /// grammar). When omitted, the runtime falls back to the top-level
+    /// `default` kernel entry, or — when no top-level kernel is set — to the
+    /// avocado-runtime meta-package's legacy bootfiles behavior.
+    pub kernel: Option<KernelRef>,
+    /// Rootfs reference for this runtime. Same shape as `kernel`. When
+    /// omitted, the runtime uses the top-level `default` rootfs entry.
+    pub rootfs: Option<ImageRef>,
+    /// Initramfs reference for this runtime. Same shape as `kernel`. When
+    /// omitted, the runtime uses the top-level `default` initramfs entry.
+    pub initramfs: Option<ImageRef>,
     /// Var partition configuration: default compression, subvolume definitions.
     pub var: Option<VarConfig>,
 }
@@ -484,6 +677,17 @@ pub struct ImageConfig {
     /// Filesystem format for the image (e.g., "erofs-zst", "erofs-lz4", "cpio", "cpio.zst").
     /// Defaults depend on context: rootfs defaults to "erofs-lz4", initramfs to "cpio.zst".
     pub filesystem: Option<String>,
+    /// Optional overlay to merge into the sysroot after package installation.
+    ///
+    /// Short form (merge mode): `overlay: "path/to/dir"`
+    /// Long form: `overlay: { dir: "path/to/dir", mode: "merge" | "opaque" }`
+    ///
+    /// Merge mode (default): `rsync -a` — adds/replaces files, leaves unrelated files alone.
+    /// Opaque mode: `cp -r` — fully replaces directory contents.
+    /// Path is relative to the project root (src_dir), resolved as `/opt/src/<path>` inside
+    /// the SDK container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<serde_yaml::Value>,
 }
 
 /// Provision profile configuration
@@ -1004,13 +1208,24 @@ pub struct Config {
     pub distro: Option<DistroConfig>,
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
+    /// Default runtime name for commands that scope by runtime. Mirrors
+    /// `default_target` semantics: lowest-priority resolution path, used when
+    /// no `-r/--runtime` flag and no `AVOCADO_RUNTIME` env var are set. When
+    /// set, must reference a runtime defined in `runtimes:`; validated at
+    /// config-load.
+    pub default_runtime: Option<String>,
     pub sdk: Option<SdkConfig>,
-    /// Top-level rootfs image configuration. When absent, defaults to
-    /// `{ packages: { "avocado-pkg-rootfs": "*" } }`.
-    pub rootfs: Option<ImageConfig>,
-    /// Top-level initramfs image configuration. When absent, defaults to
+    /// Top-level rootfs image configuration(s). Accepts either a singleton
+    /// config object (today's grammar — synthesized as the implicit `default`
+    /// entry) or a `name → config` map (new named-reference grammar). When
+    /// absent, callers default to `{ packages: { "avocado-pkg-rootfs": "*" } }`.
+    #[serde(default, deserialize_with = "deserialize_rootfs_map")]
+    pub rootfs: Option<HashMap<String, ImageConfig>>,
+    /// Top-level initramfs image configuration(s). Same singleton-or-map
+    /// shape as `rootfs`. When absent, callers default to
     /// `{ packages: { "avocado-pkg-initramfs": "*" } }`.
-    pub initramfs: Option<ImageConfig>,
+    #[serde(default, deserialize_with = "deserialize_initramfs_map")]
+    pub initramfs: Option<HashMap<String, ImageConfig>>,
     #[serde(alias = "provision")]
     pub provision_profiles: Option<HashMap<String, ProvisionProfileConfig>>,
     /// Signing keys mapping friendly names to key IDs
@@ -1018,6 +1233,14 @@ pub struct Config {
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
     pub signing_keys: Option<HashMap<String, String>>,
     pub connect: Option<ConnectConfig>,
+    /// Top-level kernel definition(s). Accepts either a singleton `KernelConfig`
+    /// (today's grammar — synthesized as the implicit `default` entry) or a
+    /// `name → KernelConfig` map (new named-reference grammar). Applies to any
+    /// runtime/sysroot that doesn't override with its own `kernel:` block.
+    /// A top-level config with only `version:` set acts as a version constraint
+    /// applied across runtimes that don't pin their own.
+    #[serde(default, deserialize_with = "deserialize_kernels")]
+    pub kernel: Option<HashMap<String, KernelConfig>>,
 }
 
 impl Config {
@@ -1027,6 +1250,88 @@ impl Config {
             crate::utils::version::check_cli_requirement(requirement)?;
         }
         Ok(())
+    }
+
+    /// Parse the effective kernel version spec for a given runtime, applying
+    /// precedence: `runtimes.<runtime_name>.kernel.version` overrides top-level
+    /// `kernel.version`. Returns `Ok(None)` when neither level sets a spec
+    /// (callers interpret `None` as "pick latest available in the repo").
+    ///
+    /// Passing `runtime_name = None` resolves only against the top-level spec,
+    /// which is the appropriate policy for non-runtime sysroots (rootfs,
+    /// initramfs, target-sysroot, extensions).
+    pub fn effective_kernel_spec(
+        &self,
+        runtime_name: Option<&str>,
+    ) -> Result<Option<crate::utils::kernel_version::KernelVersionSpec>> {
+        // 1. Runtime-level wins when present (resolves either named ref or inline override).
+        if let Some(name) = runtime_name {
+            if let Some(kc) = self.resolve_runtime_kernel(name) {
+                if let Some(v) = &kc.version {
+                    return Ok(Some(
+                        crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
+                    ));
+                }
+            }
+        }
+
+        // 2. Fall through to top-level (the `default` named entry, or the
+        //    sole entry when shape-inference produced one).
+        if let Some(top) = self.kernel_default() {
+            if let Some(v) = &top.version {
+                return Ok(Some(
+                    crate::utils::kernel_version::KernelVersionSpec::parse(v)?,
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
+    /// following named refs to the top-level `kernel.<name>` map.
+    ///
+    /// Returns `None` when the runtime doesn't exist, has no `kernel:` field,
+    /// or the named ref doesn't resolve. (Phase 0e adds load-time validation
+    /// so unresolved named refs become hard errors before reaching this path.)
+    pub fn resolve_runtime_kernel(&self, runtime_name: &str) -> Option<&KernelConfig> {
+        let rt = self.runtimes.as_ref()?.get(runtime_name)?;
+        match rt.kernel.as_ref()? {
+            KernelRef::Inline(kc) => Some(kc),
+            KernelRef::Named(name) => self.kernel.as_ref()?.get(name),
+        }
+    }
+
+    /// Resolve a runtime's `rootfs:` field to a concrete [`ImageConfig`].
+    /// See [`Self::resolve_runtime_kernel`] for ref semantics.
+    #[allow(dead_code)] // Consumed by per-runtime layout work (Phase 1+).
+    pub fn resolve_runtime_rootfs(&self, runtime_name: &str) -> Option<&ImageConfig> {
+        let rt = self.runtimes.as_ref()?.get(runtime_name)?;
+        match rt.rootfs.as_ref()? {
+            ImageRef::Inline(c) => Some(c),
+            ImageRef::Named(name) => self.rootfs.as_ref()?.get(name),
+        }
+    }
+
+    /// Resolve a runtime's `initramfs:` field to a concrete [`ImageConfig`].
+    /// See [`Self::resolve_runtime_kernel`] for ref semantics.
+    #[allow(dead_code)] // Consumed by per-runtime layout work (Phase 1+).
+    pub fn resolve_runtime_initramfs(&self, runtime_name: &str) -> Option<&ImageConfig> {
+        let rt = self.runtimes.as_ref()?.get(runtime_name)?;
+        match rt.initramfs.as_ref()? {
+            ImageRef::Inline(c) => Some(c),
+            ImageRef::Named(name) => self.initramfs.as_ref()?.get(name),
+        }
+    }
+
+    /// Returns true if the runtime's kernel is built from source via the SDK
+    /// compile section (runtime `kernel.compile` set). Such runtimes bypass
+    /// repo-based kernel version resolution — the KERNEL_VERSION comes from
+    /// what the compile step produced, not from a repo query.
+    pub fn runtime_kernel_is_compiled(&self, runtime_name: &str) -> bool {
+        self.resolve_runtime_kernel(runtime_name)
+            .map(|kc| kc.compile.is_some())
+            .unwrap_or(false)
     }
 
     /// Get merged configuration for any section type with target-specific overrides.
@@ -1060,31 +1365,21 @@ impl Config {
         crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
             .with_context(|| "Failed to interpolate configuration values")?;
 
-        // Get the base section
-        let base_section = self.get_nested_section(&parsed, section_path);
+        let base_section = match self.get_nested_section(&parsed, section_path) {
+            Some(v) => v.clone(),
+            None => return Ok(None),
+        };
 
-        // Get the target-specific section
-        let target_section_path = format!("{section_path}.{target}");
-        let target_section = self.get_nested_section(&parsed, &target_section_path);
-
-        // Merge the sections, but filter out target-specific keys from the base
-        match (base_section, target_section) {
-            (Some(base), Some(target_override)) => Ok(Some(
-                self.merge_values(base.clone(), target_override.clone()),
-            )),
-            (Some(base), None) => {
-                // Filter out target-specific subsections from base before returning
-                let supported_targets = self.get_supported_targets().unwrap_or_default();
-                let filtered_base =
-                    self.filter_target_subsections(base.clone(), &supported_targets);
-                if filtered_base.as_mapping().is_some_and(|t| t.is_empty()) {
-                    Ok(None)
-                } else {
-                    Ok(Some(filtered_base))
-                }
-            }
-            (None, Some(target_override)) => Ok(Some(target_override.clone())),
-            (None, None) => Ok(None),
+        // Apply target-merge and strip override sub-keys. kernel-merge is a
+        // no-op here — get_merged_section runs without a resolved kernel
+        // version. Install paths that need kernel-conditional packages call
+        // resolve_overrides_in_value directly with Some(kver) after the
+        // kernel resolver has run.
+        let merged = self.resolve_overrides_in_value(base_section, target, None, section_path);
+        if merged.as_mapping().is_some_and(|m| m.is_empty()) {
+            Ok(None)
+        } else {
+            Ok(Some(merged))
         }
     }
 
@@ -1263,12 +1558,14 @@ impl Config {
                 src_dir: None,
                 distro: None,
                 runtimes: None,
+                default_runtime: None,
                 sdk: None,
                 rootfs: None,
                 initramfs: None,
                 provision_profiles: None,
                 signing_keys: None,
                 connect: None,
+                kernel: None,
             });
 
         // Resolve target: CLI arg > env var > config default
@@ -2339,19 +2636,144 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
-    /// Merge a target-specific override into a base config value
-    /// This filters out other target sections from the base and merges the override
+    /// Merge a target-specific override into a base config value.
+    ///
+    /// Callers in ext lifecycle commands (build/clean/image/package) discover
+    /// the override section themselves (often via `find_ext_in_mapping`) and
+    /// pass it in alongside the base. The dispatcher path is preferred for
+    /// new code (handles `target-<name>:` and `kernel-<spec>:` uniformly), but
+    /// keeping this helper lets the explicit-override flow stay terse.
+    ///
+    /// We still funnel the base through `resolve_overrides_in_value` first to
+    /// strip any sibling `target-<other>:` / `kernel-<spec>:` / legacy bare-
+    /// target keys so they don't leak as content. `resolved_kver: None` keeps
+    /// kernel overrides stripped without applying them — the install paths
+    /// re-apply with `Some(kver)` after kernel resolution.
     pub fn merge_target_override(
         &self,
         base: serde_yaml::Value,
         target_override: serde_yaml::Value,
-        _current_target: &str,
+        current_target: &str,
     ) -> serde_yaml::Value {
-        // Filter out target-specific subsections from base before merging
+        let cleaned = self.resolve_overrides_in_value(base, current_target, None, "<override>");
+        self.merge_values(cleaned, target_override)
+    }
+
+    /// Apply prefix-dispatched override sub-sections in `value`. Supports:
+    ///
+    /// - **`target-<name>:`** — merged when `<name>` equals `current_target`.
+    /// - **`kernel-<spec>:`** — merged when `<spec>` (a `KernelVersionSpec`)
+    ///   matches `resolved_kver`. Skipped silently when `resolved_kver` is `None`.
+    /// - **Bare `<target-name>:`** (legacy) — merged when the bare key matches
+    ///   `current_target` AND the key is a known supported target. Emits a
+    ///   deprecation warning naming the section path so users can migrate to
+    ///   the explicit `target-<name>:` form.
+    ///
+    /// All recognized override sub-keys (matching or not) are stripped from
+    /// the result so they never leak as package names or other section content.
+    /// Unrecognized sub-keys (anything that's not a target-, kernel-, or known
+    /// supported target name) pass through unchanged.
+    ///
+    /// Merge precedence (later overrides earlier when keys collide):
+    ///   1. Base section (the parent's own keys)
+    ///   2. Legacy bare-target match
+    ///   3. `target-<name>:` match
+    ///   4. `kernel-<spec>:` matches (in source order)
+    ///
+    /// `section_path` is for diagnostic context only.
+    pub fn resolve_overrides_in_value(
+        &self,
+        value: serde_yaml::Value,
+        current_target: &str,
+        resolved_kver: Option<&str>,
+        section_path: &str,
+    ) -> serde_yaml::Value {
+        let mut map = match value {
+            serde_yaml::Value::Mapping(m) => m,
+            other => return other,
+        };
+
         let supported_targets = self.get_supported_targets().unwrap_or_default();
-        let filtered_base = self.filter_target_subsections(base, &supported_targets);
-        // Merge the target override into the filtered base
-        self.merge_values(filtered_base, target_override)
+        let mut target_match: Option<serde_yaml::Value> = None;
+        let mut kernel_matches: Vec<serde_yaml::Value> = Vec::new();
+        let mut legacy_target_match: Option<serde_yaml::Value> = None;
+        let mut keys_to_remove: Vec<serde_yaml::Value> = Vec::new();
+
+        for (key, sub_value) in &map {
+            let key_str = match key.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if let Some(name) = key_str.strip_prefix("target-") {
+                keys_to_remove.push(key.clone());
+                if name == current_target {
+                    target_match = Some(sub_value.clone());
+                }
+                continue;
+            }
+
+            if let Some(spec_str) = key_str.strip_prefix("kernel-") {
+                keys_to_remove.push(key.clone());
+                if let Some(kver) = resolved_kver {
+                    match KernelVersionSpec::parse(spec_str) {
+                        Ok(spec) if spec.matches(kver) => {
+                            kernel_matches.push(sub_value.clone());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            print_warning(
+                                &format!(
+                                    "Invalid kernel spec 'kernel-{spec_str}' in {section_path}: {e}; \
+                                     skipping override"
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Legacy bare-target-name. Match if the bare key equals the
+            // current target — that's the override-detection signal users
+            // have always relied on, even when supported_targets isn't
+            // declared. For SIBLING targets (bare keys equal to OTHER
+            // declared targets), strip them so they don't leak as content.
+            // Bare keys that match neither current_target nor any declared
+            // target are left alone — they're presumed to be legitimate
+            // content (a package name, a regular config field, etc.).
+            if key_str == current_target {
+                keys_to_remove.push(key.clone());
+                print_warning(
+                    &format!(
+                        "Bare target sub-key '{key_str}' in {section_path} is deprecated; \
+                         use 'target-{key_str}:' instead"
+                    ),
+                    OutputLevel::Normal,
+                );
+                legacy_target_match = Some(sub_value.clone());
+            } else if supported_targets.iter().any(|t| t == key_str) {
+                // Sibling target — strip but don't merge.
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        for k in keys_to_remove {
+            map.remove(&k);
+        }
+
+        let mut merged = serde_yaml::Value::Mapping(map);
+        if let Some(v) = legacy_target_match {
+            merged = self.merge_values(merged, v);
+        }
+        if let Some(v) = target_match {
+            merged = self.merge_values(merged, v);
+        }
+        for v in kernel_matches {
+            merged = self.merge_values(merged, v);
+        }
+        merged
     }
 
     /// Get merged runtime configuration for a specific runtime and target
@@ -2368,22 +2790,55 @@ impl Config {
 
     /// Extract and validate the kernel configuration from a merged runtime config value.
     ///
+    /// Accepts either form:
+    /// - **Inline mapping** (today's grammar): `kernel: { version: ..., package: ... }` —
+    ///   parsed directly as a [`KernelConfig`].
+    /// - **Named string ref** (new grammar): `kernel: yocto-6-6` — resolved against
+    ///   `top_level_kernels`, returning the named entry's [`KernelConfig`].
+    ///
+    /// `top_level_kernels` is the top-level `kernel:` map from [`Config`]
+    /// (`config.kernel.as_ref()`). Pass `None` when no top-level kernel map
+    /// exists; named refs error in that case.
+    ///
     /// Returns `None` if no kernel section is present (legacy behavior applies).
-    /// Returns an error if the kernel section is present but invalid.
+    /// Returns an error if the kernel section is present but invalid, or a
+    /// named ref doesn't resolve.
     pub fn get_kernel_config_from_runtime(
         merged_runtime: &serde_yaml::Value,
+        top_level_kernels: Option<&HashMap<String, KernelConfig>>,
     ) -> Result<Option<KernelConfig>> {
-        match merged_runtime.get("kernel") {
-            Some(kernel_val) if !kernel_val.is_null() => {
-                let kernel_config: KernelConfig = serde_yaml::from_value(kernel_val.clone())
-                    .context("Failed to parse kernel configuration")?;
-                kernel_config
-                    .validate()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(Some(kernel_config))
-            }
-            _ => Ok(None),
+        let Some(kernel_val) = merged_runtime.get("kernel") else {
+            return Ok(None);
+        };
+        if kernel_val.is_null() {
+            return Ok(None);
         }
+
+        // String ref → named lookup against top-level map.
+        if let Some(name) = kernel_val.as_str() {
+            let map = top_level_kernels.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime references kernel '{name}' by name, but no top-level \
+                     `kernel:` map is defined in avocado.yaml"
+                )
+            })?;
+            let kc = map.get(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime references kernel '{name}', which is not defined in \
+                     the top-level `kernel:` map"
+                )
+            })?;
+            kc.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(Some(kc.clone()));
+        }
+
+        // Inline mapping → parse as KernelConfig.
+        let kernel_config: KernelConfig = serde_yaml::from_value(kernel_val.clone())
+            .context("Failed to parse kernel configuration")?;
+        kernel_config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Some(kernel_config))
     }
 
     /// Get all runtime names defined in the configuration
@@ -2565,12 +3020,162 @@ impl Config {
             .with_context(|| "Failed to interpolate configuration values")?;
 
         // Deserialize to Config struct
-        let config: Config = serde_yaml::from_value(parsed)
+        let mut config: Config = serde_yaml::from_value(parsed)
             .with_context(|| "Failed to deserialize configuration after interpolation")?;
 
         config.validate_cli_requirement()?;
+        config.synthesize_implicit_default_runtime();
+        config.validate_runtime_refs()?;
 
         Ok(config)
+    }
+
+    /// Synthesize an implicit `runtimes.default` entry when the project uses
+    /// only top-level singletons (`kernel:`, `rootfs:`, `initramfs:`) without
+    /// declaring any runtimes. Keeps today's zero-runtime projects working
+    /// after the runtime resolver becomes a load-bearing CLI primitive.
+    ///
+    /// Detection rule: `runtimes:` is missing or empty AND `default_target`
+    /// is set AND at least one top-level singleton (or named entry) exists.
+    /// The synthesized runtime references the top-level entries by their
+    /// `default` (or sole) name, so all of the existing accessor paths
+    /// continue to resolve.
+    ///
+    /// This is an in-memory transformation — the on-disk avocado.yaml is
+    /// unchanged.
+    fn synthesize_implicit_default_runtime(&mut self) {
+        let needs_default = self.runtimes.as_ref().is_none_or(|m| m.is_empty());
+        if !needs_default {
+            return;
+        }
+        let Some(target) = self.default_target.clone() else {
+            return;
+        };
+        let has_top_level = self.kernel_default().is_some()
+            || self.rootfs_default().is_some()
+            || self.initramfs_default().is_some();
+        if !has_top_level {
+            return;
+        }
+
+        let kernel_ref = self.kernel.as_ref().and_then(|m| {
+            if m.contains_key("default") {
+                Some(KernelRef::Named("default".to_string()))
+            } else if m.len() == 1 {
+                Some(KernelRef::Named(m.keys().next().unwrap().clone()))
+            } else {
+                None
+            }
+        });
+        let rootfs_ref = self.rootfs.as_ref().and_then(|m| {
+            if m.contains_key("default") {
+                Some(ImageRef::Named("default".to_string()))
+            } else if m.len() == 1 {
+                Some(ImageRef::Named(m.keys().next().unwrap().clone()))
+            } else {
+                None
+            }
+        });
+        let initramfs_ref = self.initramfs.as_ref().and_then(|m| {
+            if m.contains_key("default") {
+                Some(ImageRef::Named("default".to_string()))
+            } else if m.len() == 1 {
+                Some(ImageRef::Named(m.keys().next().unwrap().clone()))
+            } else {
+                None
+            }
+        });
+
+        let synth = RuntimeConfig {
+            target: Some(target),
+            version: None,
+            dependencies: None,
+            stone_include_paths: None,
+            stone_manifest: None,
+            signing: None,
+            kernel: kernel_ref,
+            rootfs: rootfs_ref,
+            initramfs: initramfs_ref,
+            var: None,
+        };
+        let mut map = self.runtimes.take().unwrap_or_default();
+        map.insert("default".to_string(), synth);
+        self.runtimes = Some(map);
+    }
+
+    /// Validate that every named ref in `runtimes.<r>.{kernel,rootfs,initramfs}`
+    /// resolves to a definition in the corresponding top-level map.
+    ///
+    /// Also verifies `default_runtime` (when set) references a defined runtime.
+    ///
+    /// Run at config-load to catch typos before they surface as confusing
+    /// downstream "no kernel pinned" / "no rootfs sysroot" errors. Inline
+    /// runtime overrides and unset fields skip this check; only `Named(...)`
+    /// refs are validated here.
+    pub fn validate_runtime_refs(&self) -> Result<()> {
+        if let Some(default_rt) = self.default_runtime.as_deref() {
+            let defined = self
+                .runtimes
+                .as_ref()
+                .is_some_and(|m| m.contains_key(default_rt));
+            if !defined {
+                let available = self
+                    .runtimes
+                    .as_ref()
+                    .map(|m| {
+                        let mut names: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                        names.sort_unstable();
+                        names.join(", ")
+                    })
+                    .unwrap_or_default();
+                if available.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "`default_runtime: {default_rt}` is set but no `runtimes:` block is \
+                         defined in avocado.yaml"
+                    ));
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "`default_runtime: {default_rt}` does not match any defined runtime. \
+                         Available: {available}"
+                    ));
+                }
+            }
+        }
+
+        let Some(runtimes) = self.runtimes.as_ref() else {
+            return Ok(());
+        };
+
+        for (rt_name, rt) in runtimes {
+            if let Some(KernelRef::Named(name)) = rt.kernel.as_ref() {
+                let map = self.kernel.as_ref();
+                if map.is_none_or(|m| !m.contains_key(name)) {
+                    return Err(anyhow::anyhow!(format_unresolved_ref_error(
+                        rt_name, "kernel", name, map,
+                    )));
+                }
+            }
+            if let Some(ImageRef::Named(name)) = rt.rootfs.as_ref() {
+                let map = self.rootfs.as_ref();
+                if map.is_none_or(|m| !m.contains_key(name)) {
+                    return Err(anyhow::anyhow!(format_unresolved_ref_error(
+                        rt_name, "rootfs", name, map,
+                    )));
+                }
+            }
+            if let Some(ImageRef::Named(name)) = rt.initramfs.as_ref() {
+                let map = self.initramfs.as_ref();
+                if map.is_none_or(|m| !m.contains_key(name)) {
+                    return Err(anyhow::anyhow!(format_unresolved_ref_error(
+                        rt_name,
+                        "initramfs",
+                        name,
+                        map,
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load configuration from a YAML string
@@ -2731,10 +3336,27 @@ impl Config {
             .unwrap_or(false) // Default to false (enable weak dependencies)
     }
 
+    /// Get the default rootfs definition from top-level config (entry named
+    /// `default`, or — when only one entry exists — that single entry).
+    /// Returns `None` when no rootfs is defined.
+    pub fn rootfs_default(&self) -> Option<&ImageConfig> {
+        get_default_or_singleton(self.rootfs.as_ref())
+    }
+
+    /// Get the default initramfs definition from top-level config.
+    pub fn initramfs_default(&self) -> Option<&ImageConfig> {
+        get_default_or_singleton(self.initramfs.as_ref())
+    }
+
+    /// Get the default kernel definition from top-level config.
+    pub fn kernel_default(&self) -> Option<&KernelConfig> {
+        get_default_or_singleton(self.kernel.as_ref())
+    }
+
     /// Get rootfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-rootfs": "*" }` when the section is absent.
     pub fn get_rootfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
-        if let Some(ref rootfs) = self.rootfs {
+        if let Some(rootfs) = self.rootfs_default() {
             if let Some(ref packages) = rootfs.packages {
                 return packages.clone();
             }
@@ -2750,7 +3372,7 @@ impl Config {
     /// Get initramfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-initramfs": "*" }` when the section is absent.
     pub fn get_initramfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
-        if let Some(ref initramfs) = self.initramfs {
+        if let Some(initramfs) = self.initramfs_default() {
             if let Some(ref packages) = initramfs.packages {
                 return packages.clone();
             }
@@ -2766,8 +3388,7 @@ impl Config {
     /// Get rootfs filesystem format from top-level config.
     /// Defaults to `"erofs-lz4"` when the section or field is absent.
     pub fn get_rootfs_filesystem(&self) -> String {
-        self.rootfs
-            .as_ref()
+        self.rootfs_default()
             .and_then(|r| r.filesystem.clone())
             .unwrap_or_else(|| "erofs-lz4".to_string())
     }
@@ -2775,8 +3396,7 @@ impl Config {
     /// Get initramfs filesystem format from top-level config.
     /// Defaults to `"cpio.zst"` when the section or field is absent.
     pub fn get_initramfs_filesystem(&self) -> String {
-        self.initramfs
-            .as_ref()
+        self.initramfs_default()
             .and_then(|i| i.filesystem.clone())
             .unwrap_or_else(|| "cpio.zst".to_string())
     }
@@ -8328,7 +8948,7 @@ packages:
         )
         .unwrap();
 
-        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_some());
         let kc = result.unwrap();
         assert_eq!(kc.package.as_deref(), Some("kernel-image"));
@@ -8347,7 +8967,7 @@ kernel:
         )
         .unwrap();
 
-        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_some());
         let kc = result.unwrap();
         assert!(kc.package.is_none());
@@ -8365,7 +8985,7 @@ packages:
         )
         .unwrap();
 
-        let result = Config::get_kernel_config_from_runtime(&yaml).unwrap();
+        let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -8389,10 +9009,14 @@ sdk:
         write!(temp_file, "{config_content}").unwrap();
 
         let config = Config::load(temp_file.path()).unwrap();
-        let runtimes = config.runtimes.unwrap();
+        let runtimes = config.runtimes.as_ref().unwrap();
         let dev = runtimes.get("dev").unwrap();
         assert!(dev.kernel.is_some());
-        let kc = dev.kernel.as_ref().unwrap();
+        // Inline grammar still parses as `KernelRef::Inline`.
+        let kc = match dev.kernel.as_ref().unwrap() {
+            KernelRef::Inline(c) => c,
+            KernelRef::Named(n) => panic!("expected inline kernel, got named ref '{n}'"),
+        };
         assert_eq!(kc.package.as_deref(), Some("kernel-image"));
         assert_eq!(kc.version.as_deref(), Some("*"));
     }
@@ -8977,5 +9601,581 @@ subvolumes:
         let avocado = subvolumes.get("lib/avocado").unwrap().to_config();
         assert_eq!(avocado.compression, Some("zstd:3".to_string()));
         assert_eq!(avocado.quota, Some("500M".to_string()));
+    }
+
+    // --- kernel.version tests ---
+
+    #[test]
+    fn test_effective_kernel_spec_none_when_neither_set() {
+        let yaml = r#"
+runtimes:
+  dev: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap();
+        assert!(spec.is_none());
+    }
+
+    #[test]
+    fn test_effective_kernel_spec_top_level_applies() {
+        let yaml = r#"
+kernel:
+  version: "5.15.*"
+runtimes:
+  dev: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap().unwrap();
+        assert!(spec.matches("5.15.185-l4t-r36.5-1033.33"));
+        assert!(!spec.matches("6.6.123"));
+    }
+
+    #[test]
+    fn test_effective_kernel_spec_runtime_overrides_top_level() {
+        let yaml = r#"
+kernel:
+  version: "5.15.*"
+runtimes:
+  dev:
+    kernel:
+      package: kernel
+      version: ">= 6.6"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap().unwrap();
+        assert!(spec.matches("6.6.123"));
+        assert!(!spec.matches("5.15.185"));
+    }
+
+    #[test]
+    fn test_effective_kernel_spec_no_runtime_name_uses_top_level_only() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+runtimes:
+  dev:
+    kernel:
+      package: kernel
+      version: "5.15.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        // None runtime → top-level applies even though runtime has an override.
+        let spec = config.effective_kernel_spec(None).unwrap().unwrap();
+        assert!(spec.matches("6.6.123"));
+        assert!(!spec.matches("5.15.185"));
+    }
+
+    #[test]
+    fn test_runtime_kernel_is_compiled() {
+        let yaml = r#"
+runtimes:
+  custom:
+    kernel:
+      compile: mykernel
+      install: scripts/install.sh
+  normal:
+    kernel:
+      package: kernel
+      version: "*"
+  nokernel: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.runtime_kernel_is_compiled("custom"));
+        assert!(!config.runtime_kernel_is_compiled("normal"));
+        assert!(!config.runtime_kernel_is_compiled("nokernel"));
+        assert!(!config.runtime_kernel_is_compiled("missing"));
+    }
+
+    // --- named-or-singleton schema tests for kernel/rootfs/initramfs ---
+
+    #[test]
+    fn test_kernel_singleton_form_synthesizes_default_entry() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernels = config.kernel.as_ref().unwrap();
+        assert_eq!(kernels.len(), 1);
+        assert!(kernels.contains_key("default"));
+        assert_eq!(
+            kernels.get("default").unwrap().version.as_deref(),
+            Some("6.6.*")
+        );
+        assert_eq!(
+            config.kernel_default().unwrap().version.as_deref(),
+            Some("6.6.*")
+        );
+    }
+
+    #[test]
+    fn test_kernel_named_map_form() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    version: "6.6.*"
+  l4t-5-15:
+    version: "5.15.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernels = config.kernel.as_ref().unwrap();
+        assert_eq!(kernels.len(), 2);
+        assert!(kernels.contains_key("yocto-6-6"));
+        assert!(kernels.contains_key("l4t-5-15"));
+        assert_eq!(
+            kernels.get("yocto-6-6").unwrap().version.as_deref(),
+            Some("6.6.*")
+        );
+        // No `default` entry — `kernel_default` returns `None` for true multi-entry map.
+        assert!(config.kernel_default().is_none());
+    }
+
+    #[test]
+    fn test_kernel_named_map_form_with_full_definition() {
+        let yaml = r#"
+kernel:
+  custom:
+    compile: my-kernel-src
+    install: scripts/kernel-install.sh
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernels = config.kernel.as_ref().unwrap();
+        let custom = kernels.get("custom").unwrap();
+        assert_eq!(custom.compile.as_deref(), Some("my-kernel-src"));
+        assert_eq!(custom.install.as_deref(), Some("scripts/kernel-install.sh"));
+        // Single-entry map with non-`default` key falls back via `kernel_default`.
+        assert_eq!(
+            config.kernel_default().unwrap().compile.as_deref(),
+            Some("my-kernel-src")
+        );
+    }
+
+    #[test]
+    fn test_kernel_mixed_form_errors() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+  l4t-5-15:
+    version: "5.15.*"
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot mix singleton form")
+                && err.contains("named-map form")
+                && err.contains("kernel"),
+            "expected mixed-form error message; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_singleton_and_named_forms() {
+        // Singleton form (today's grammar)
+        let yaml_single = r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+  filesystem: erofs-lz4
+"#;
+        let config: Config = serde_yaml::from_str(yaml_single).unwrap();
+        assert!(config.rootfs.as_ref().unwrap().contains_key("default"));
+        let rfs = config.rootfs_default().unwrap();
+        assert_eq!(rfs.filesystem.as_deref(), Some("erofs-lz4"));
+        // Existing accessors keep working.
+        assert_eq!(config.get_rootfs_filesystem(), "erofs-lz4");
+
+        // Named-map form
+        let yaml_named = r#"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+    filesystem: erofs-lz4
+  minimal:
+    packages: { avocado-pkg-rootfs-minimal: "*" }
+    filesystem: erofs-zst
+"#;
+        let config: Config = serde_yaml::from_str(yaml_named).unwrap();
+        let rootfs_map = config.rootfs.as_ref().unwrap();
+        assert_eq!(rootfs_map.len(), 2);
+        assert_eq!(
+            rootfs_map.get("minimal").unwrap().filesystem.as_deref(),
+            Some("erofs-zst")
+        );
+        // `default` entry resolves via the accessor.
+        assert_eq!(
+            config.rootfs_default().unwrap().filesystem.as_deref(),
+            Some("erofs-lz4")
+        );
+    }
+
+    #[test]
+    fn test_initramfs_singleton_and_named_forms() {
+        // Singleton form
+        let yaml_single = r#"
+initramfs:
+  packages: { avocado-pkg-initramfs: "*" }
+  filesystem: cpio.zst
+"#;
+        let config: Config = serde_yaml::from_str(yaml_single).unwrap();
+        assert!(config.initramfs.as_ref().unwrap().contains_key("default"));
+        assert_eq!(config.get_initramfs_filesystem(), "cpio.zst");
+
+        // Named-map form
+        let yaml_named = r#"
+initramfs:
+  default:
+    packages: { avocado-pkg-initramfs: "*" }
+"#;
+        let config: Config = serde_yaml::from_str(yaml_named).unwrap();
+        assert!(config.initramfs.as_ref().unwrap().contains_key("default"));
+    }
+
+    #[test]
+    fn test_rootfs_mixed_form_errors() {
+        let yaml = r#"
+rootfs:
+  filesystem: erofs-lz4
+  minimal:
+    packages: { x: "*" }
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot mix") && err.contains("rootfs"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_kernel_absent_yields_none() {
+        let yaml = "runtimes: {}\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.kernel.is_none());
+        assert!(config.kernel_default().is_none());
+    }
+
+    // --- runtime-level kernel/rootfs/initramfs reference enum tests ---
+
+    #[test]
+    fn test_runtime_kernel_named_ref_resolves_to_top_level_entry() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+runtimes:
+  prod:
+    kernel: yocto-6-6
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        // Resolve to the named entry's full KernelConfig.
+        let resolved = config.resolve_runtime_kernel("prod").unwrap();
+        assert_eq!(resolved.package.as_deref(), Some("kernel-image"));
+        assert_eq!(resolved.version.as_deref(), Some("6.6.*"));
+        // effective_kernel_spec follows the ref.
+        let spec = config.effective_kernel_spec(Some("prod")).unwrap().unwrap();
+        assert!(spec.matches("6.6.123"));
+    }
+
+    #[test]
+    fn test_runtime_kernel_inline_override_still_works() {
+        // Today's inline grammar continues to parse as KernelRef::Inline.
+        let yaml = r#"
+runtimes:
+  dev:
+    kernel:
+      package: kernel-image
+      version: "5.15.*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let resolved = config.resolve_runtime_kernel("dev").unwrap();
+        assert_eq!(resolved.version.as_deref(), Some("5.15.*"));
+    }
+
+    #[test]
+    fn test_runtime_named_ref_to_missing_entry_returns_none() {
+        // Phase 0e adds load-time validation. For now, unresolved refs read as None.
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+runtimes:
+  prod:
+    kernel: nonexistent
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.resolve_runtime_kernel("prod").is_none());
+    }
+
+    #[test]
+    fn test_runtime_rootfs_and_initramfs_named_refs() {
+        let yaml = r#"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+    filesystem: erofs-lz4
+  minimal:
+    packages: { avocado-pkg-rootfs-minimal: "*" }
+    filesystem: erofs-zst
+initramfs:
+  default:
+    packages: { avocado-pkg-initramfs: "*" }
+runtimes:
+  prod:
+    rootfs: default
+    initramfs: default
+  dev:
+    rootfs: minimal
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let prod_rfs = config.resolve_runtime_rootfs("prod").unwrap();
+        assert_eq!(prod_rfs.filesystem.as_deref(), Some("erofs-lz4"));
+        let dev_rfs = config.resolve_runtime_rootfs("dev").unwrap();
+        assert_eq!(dev_rfs.filesystem.as_deref(), Some("erofs-zst"));
+        let prod_initramfs = config.resolve_runtime_initramfs("prod").unwrap();
+        assert!(prod_initramfs.packages.is_some());
+        // Runtime without an initramfs ref returns None.
+        assert!(config.resolve_runtime_initramfs("dev").is_none());
+    }
+
+    #[test]
+    fn test_runtime_kernel_inline_with_compile_resolves() {
+        // SDK-compiled kernel via inline override still resolves correctly.
+        let yaml = r#"
+runtimes:
+  custom:
+    kernel:
+      compile: my-kernel-src
+      install: scripts/kernel-install.sh
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.runtime_kernel_is_compiled("custom"));
+        let resolved = config.resolve_runtime_kernel("custom").unwrap();
+        assert_eq!(resolved.compile.as_deref(), Some("my-kernel-src"));
+    }
+
+    #[test]
+    fn test_runtime_kernel_compile_via_named_ref() {
+        // SDK-compiled kernel via named top-level entry — the runtime references
+        // by name and inherits compile/install.
+        let yaml = r#"
+kernel:
+  custom-tegra:
+    compile: my-kernel-src
+    install: scripts/kernel-install.sh
+runtimes:
+  dev:
+    kernel: custom-tegra
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.runtime_kernel_is_compiled("dev"));
+        let resolved = config.resolve_runtime_kernel("dev").unwrap();
+        assert_eq!(resolved.compile.as_deref(), Some("my-kernel-src"));
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_named_ref() {
+        // String ref in merged runtime YAML resolves against passed-in kernels map.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("kernel: yocto-6-6\n").unwrap();
+        let mut kernels = HashMap::new();
+        kernels.insert(
+            "yocto-6-6".to_string(),
+            KernelConfig {
+                package: Some("kernel-image".to_string()),
+                version: Some("6.6.*".to_string()),
+                compile: None,
+                install: None,
+            },
+        );
+        let kc = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
+            .unwrap()
+            .unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("6.6.*"));
+    }
+
+    #[test]
+    fn test_get_kernel_config_from_runtime_named_ref_unresolved_errors() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("kernel: nonexistent\n").unwrap();
+        let kernels: HashMap<String, KernelConfig> = HashMap::new();
+        let err = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nonexistent") && err.contains("not defined"),
+            "got: {err}"
+        );
+    }
+
+    // --- validate_runtime_refs (Phase 0d) ---
+
+    #[test]
+    fn test_validate_runtime_refs_passes_for_resolved_named_refs() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+initramfs:
+  default:
+    packages: { avocado-pkg-initramfs: "*" }
+runtimes:
+  prod:
+    kernel: yocto-6-6
+    rootfs: default
+    initramfs: default
+"#;
+        Config::load_from_yaml_str(yaml).expect("validation should pass");
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_passes_for_inline_overrides() {
+        // Inline overrides aren't validated — only Named refs.
+        let yaml = r#"
+runtimes:
+  dev:
+    kernel:
+      package: kernel-image
+      version: "5.15.*"
+"#;
+        Config::load_from_yaml_str(yaml).expect("inline override must pass validation");
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_unresolved_kernel_ref() {
+        let yaml = r#"
+kernel:
+  yocto-6-6:
+    package: kernel-image
+    version: "6.6.*"
+runtimes:
+  prod:
+    kernel: yocoto-6-6
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("'prod'")
+                && err.contains("kernel")
+                && err.contains("'yocoto-6-6'")
+                && err.contains("Available: yocto-6-6"),
+            "expected detailed unresolved-ref error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_named_ref_with_no_top_level_map() {
+        let yaml = r#"
+runtimes:
+  prod:
+    rootfs: default
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("'prod'")
+                && err.contains("rootfs")
+                && err.contains("'default'")
+                && err.contains("no top-level"),
+            "got: {err}"
+        );
+    }
+
+    // --- Implicit default-runtime synthesis tests (Phase 1d) ---
+
+    #[test]
+    fn test_synthesize_implicit_default_runtime_when_zero_runtimes_and_singletons_present() {
+        let yaml = r#"
+default_target: qemux86-64
+kernel:
+  version: "6.6.*"
+rootfs:
+  packages: { avocado-pkg-rootfs: "*" }
+initramfs:
+  packages: { avocado-pkg-initramfs: "*" }
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let runtimes = config
+            .runtimes
+            .as_ref()
+            .expect("default runtime synthesized");
+        let default = runtimes.get("default").expect("default runtime present");
+        assert_eq!(default.target.as_deref(), Some("qemux86-64"));
+        assert!(matches!(
+            default.kernel.as_ref().unwrap(),
+            KernelRef::Named(name) if name == "default"
+        ));
+        assert!(matches!(
+            default.rootfs.as_ref().unwrap(),
+            ImageRef::Named(name) if name == "default"
+        ));
+        assert!(matches!(
+            default.initramfs.as_ref().unwrap(),
+            ImageRef::Named(name) if name == "default"
+        ));
+        // Resolver auto-resolves to the synthesized default.
+        let resolved = crate::utils::runtime::resolve_runtime(None, &config);
+        assert_eq!(resolved.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn test_no_synthesis_when_runtimes_block_present() {
+        let yaml = r#"
+default_target: qemux86-64
+kernel:
+  version: "6.6.*"
+runtimes:
+  prod:
+    target: qemux86-64
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let runtimes = config.runtimes.as_ref().unwrap();
+        assert_eq!(runtimes.len(), 1);
+        assert!(runtimes.contains_key("prod"));
+        assert!(!runtimes.contains_key("default"));
+    }
+
+    #[test]
+    fn test_no_synthesis_when_no_default_target() {
+        let yaml = r#"
+kernel:
+  version: "6.6.*"
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        // Without default_target, we can't synthesize a target field — skip.
+        assert!(config.runtimes.is_none());
+    }
+
+    #[test]
+    fn test_no_synthesis_when_no_top_level_singletons() {
+        let yaml = r#"
+default_target: qemux86-64
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        // No top-level config to reference — synthesis is pointless.
+        assert!(config.runtimes.is_none());
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_unresolved_initramfs_ref() {
+        let yaml = r#"
+initramfs:
+  base:
+    packages: { avocado-pkg-initramfs: "*" }
+runtimes:
+  prod:
+    initramfs: nonexistent
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("initramfs")
+                && err.contains("nonexistent")
+                && err.contains("Available: base"),
+            "got: {err}"
+        );
     }
 }
