@@ -2183,12 +2183,17 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                runtime,
                 container_args,
                 dnf_args,
             } => {
                 let extension = name.or(extension).context(
                     "extension name is required (provide as positional or -e/--extension)",
                 )?;
+                // Resolve runtime when caller asked for it (or env / default
+                // runtime would resolve). Fall through to None for projects
+                // without runtimes so legacy per-target builds keep working.
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let build_cmd = ExtBuildCommand::new(
                     extension,
                     config,
@@ -2199,7 +2204,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 build_cmd.execute().await?;
                 Ok(())
             }
@@ -3216,6 +3222,11 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime to build the extension against (kernel/rootfs context).
+        /// Required when the project has multiple runtimes. Resolves from
+        /// AVOCADO_RUNTIME / default_runtime / sole-runtime when omitted.
+        #[arg(short = 'r', long)]
+        runtime: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

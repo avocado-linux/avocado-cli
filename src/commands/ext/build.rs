@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::find_ext_in_mapping;
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
-use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::lockfile::LockFile;
+use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
 use crate::utils::stamps::{
     compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
     resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
@@ -38,6 +40,12 @@ pub struct ExtBuildCommand {
     pub runs_on: Option<String>,
     pub nfs_port: Option<u16>,
     pub sdk_arch: Option<String>,
+    /// Runtime context for this build. When set, the build operates against
+    /// the runtime's per-runtime extension sysroot path (via `AVOCADO_RUNTIME`
+    /// in the container env) and gates on runtime membership + populated
+    /// rootfs/kernel sysroots. When `None`, falls back to the legacy
+    /// per-target build path.
+    pub runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     pub tui_context: Option<TuiContext>,
@@ -63,6 +71,7 @@ impl ExtBuildCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
             tui_context: None,
         }
@@ -72,6 +81,28 @@ impl ExtBuildCommand {
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
         self
+    }
+
+    /// Set the runtime context. When `Some(rt)`, the build runs against the
+    /// runtime's per-runtime extension sysroot tree (via `AVOCADO_RUNTIME`
+    /// in the container env) and gates on runtime-membership and populated
+    /// rootfs/kernel sysroots. When `None`, legacy per-target behavior is
+    /// used (callers that haven't been opted in yet).
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Build the container `env_vars` map carrying `AVOCADO_RUNTIME` when a
+    /// runtime is in scope. The container entrypoint reads it to scope
+    /// `$AVOCADO_EXT_SYSROOTS` to the runtime tree. Returns `None` when no
+    /// runtime is set so `RunConfig` defaults preserve today's behavior.
+    fn runtime_env_vars(&self) -> Option<HashMap<String, String>> {
+        self.runtime.as_ref().map(|rt| {
+            let mut m = HashMap::new();
+            m.insert("AVOCADO_RUNTIME".to_string(), rt.clone());
+            m
+        })
     }
 
     /// Set remote execution options
@@ -136,6 +167,61 @@ impl ExtBuildCommand {
         let repo_release = config.get_sdk_repo_release();
         let target = resolve_target_required(self.target.as_deref(), config)?;
 
+        // Runtime-bound preconditions. Skipped when no runtime is in scope
+        // (legacy per-target builds keep working unchanged).
+        if let Some(runtime_name) = self.runtime.as_deref() {
+            // Membership: <ext> must appear in runtimes.<r>.extensions: [...]
+            let ext_deps = config.get_runtime_extension_dependencies_detailed(
+                runtime_name,
+                &target,
+                &self.config_path,
+            )?;
+            let is_member = ext_deps.iter().any(|d| d.name() == self.extension);
+            if !is_member {
+                return Err(anyhow::anyhow!(
+                    "Extension '{}' is not a member of runtime '{}'. \
+                     Add it to runtimes.{}.extensions in {}.",
+                    self.extension,
+                    runtime_name,
+                    runtime_name,
+                    self.config_path,
+                ));
+            }
+
+            // Sysroot precondition: rootfs (and kernel sysroot, if a kernel
+            // version is pinned) must already be populated by a prior
+            // `avocado install`/`runtime install`. The lockfile is the host-
+            // side source of truth here — the actual sysroots live in the
+            // docker volume and aren't directly inspectable from the host.
+            let lock_src_dir = std::path::Path::new(&self.config_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let lock_file = LockFile::load(lock_src_dir)
+                .with_context(|| "Failed to load lock file for sysroot precondition check")?;
+            if let Some(target_locks) = lock_file.targets.get(&target) {
+                if target_locks.rootfs.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Rootfs sysroot for target '{}' is not populated. \
+                         Run 'avocado install' (or 'avocado runtime install -r {}') first.",
+                        target,
+                        runtime_name,
+                    ));
+                }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "No lockfile state for target '{}'. \
+                     Run 'avocado install' (or 'avocado runtime install -r {}') first.",
+                    target,
+                    runtime_name,
+                ));
+            }
+
+            // Kernel-consistency check (warning for now; promoted to fatal in Phase 5).
+            if let Err(e) = lock_file.validate_kernel_consistency(&target) {
+                print_warning(&format!("{e}"), OutputLevel::Normal);
+            }
+        }
+
         // Get SDK configuration from interpolated config
         let container_image = config
             .get_sdk_image()
@@ -171,6 +257,7 @@ impl ExtBuildCommand {
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
 
@@ -595,6 +682,7 @@ impl ExtBuildCommand {
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
 
@@ -676,6 +764,7 @@ impl ExtBuildCommand {
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
             tui_context: effective_tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -748,6 +837,7 @@ impl ExtBuildCommand {
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
             tui_context: effective_tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
         let result = container_helper.run_in_container(config).await?;
@@ -1748,6 +1838,7 @@ echo "Set proper permissions on authentication files""#,
                 runs_on: self.runs_on.clone(),
                 nfs_port: self.nfs_port,
                 tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
                 ..Default::default()
             };
 
