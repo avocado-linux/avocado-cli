@@ -75,17 +75,44 @@ pub async fn resolve_and_pin_kernel_version(
         }
     }
 
-    // 2. Lockfile already pinned for this sysroot — honor it.
+    // 2. Compute the effective spec (runtime-level overrides top-level;
+    //    absent means "latest"). Done before the lockfile-pin check so we
+    //    can validate that any existing pin still satisfies the user's
+    //    current spec — if they changed `kernel.version`, the prior pin
+    //    may no longer match and must be re-resolved.
+    let spec = params.config.effective_kernel_spec(params.runtime_name)?;
+
+    // 3. Lockfile already pinned for this sysroot — honor it ONLY if the
+    //    pinned version still satisfies the configured spec. cargo/npm
+    //    semantics: a lock pin holds across runs for reproducibility, but
+    //    a spec change that invalidates the pin must trigger re-resolve.
     if let Some(existing) = params
         .lock_file
         .get_kernel_version(params.target, &params.sysroot)
     {
-        return Ok(Some(existing.clone()));
+        let still_matches = match spec.as_ref() {
+            // No spec configured ⇒ "latest" — any existing pin is acceptable.
+            None => true,
+            Some(s) => s.matches(existing),
+        };
+        if still_matches {
+            return Ok(Some(existing.clone()));
+        }
+        if params.verbose {
+            print_info(
+                &format!(
+                    "Lockfile-pinned kernel '{existing}' no longer satisfies the configured \
+                     kernel spec; re-resolving (sysroot: {})",
+                    params.sysroot.lock_key()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+        // Fall through; we'll overwrite the pin below with a freshly-
+        // resolved version. The caller (rootfs/initramfs install) will
+        // separately detect that the kver changed and trigger a
+        // clean+reinstall of the sysroot.
     }
-
-    // 3. Compute effective spec (runtime-level overrides top-level; absent
-    //    means "latest").
-    let spec = params.config.effective_kernel_spec(params.runtime_name)?;
 
     // 4. Ask the repo what's available (cached per-process).
     let available = get_available_kernel_versions(params).await?;
