@@ -280,6 +280,14 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // so kernel/kernel-module-*/kernel-devsrc-* names get suffixed to exactly
     // one kernel — avoiding dnf's virtual-provider tie-break picking
     // cross-kernel when multiple kernels coexist in the feed.
+    // Snapshot the previously-pinned kver BEFORE the resolver runs — the
+    // resolver overwrites the lockfile pin in-place when it re-resolves,
+    // so reading after would just give us back what it just wrote.
+    let prev_pinned_kver = params
+        .lock_file
+        .get_kernel_version(params.target, &params.sysroot_type)
+        .cloned();
+
     let resolved_kver = {
         let mut resolve_params = ResolveParams {
             container_helper: params.container_helper,
@@ -309,11 +317,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // packages in the sysroot. Force a clean+reinstall so the new pin is
     // the only thing present.
     if let Some(new_kver) = resolved_kver.as_deref() {
-        let prev_kver = params
-            .lock_file
-            .get_kernel_version(params.target, &params.sysroot_type)
-            .cloned();
-        if let Some(prev) = prev_kver {
+        if let Some(prev) = prev_pinned_kver {
             if prev != new_kver {
                 print_info(
                     &format!(
