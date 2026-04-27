@@ -677,6 +677,17 @@ pub struct ImageConfig {
     /// Filesystem format for the image (e.g., "erofs-zst", "erofs-lz4", "cpio", "cpio.zst").
     /// Defaults depend on context: rootfs defaults to "erofs-lz4", initramfs to "cpio.zst".
     pub filesystem: Option<String>,
+    /// Optional overlay to merge into the sysroot after package installation.
+    ///
+    /// Short form (merge mode): `overlay: "path/to/dir"`
+    /// Long form: `overlay: { dir: "path/to/dir", mode: "merge" | "opaque" }`
+    ///
+    /// Merge mode (default): `rsync -a` — adds/replaces files, leaves unrelated files alone.
+    /// Opaque mode: `cp -r` — fully replaces directory contents.
+    /// Path is relative to the project root (src_dir), resolved as `/opt/src/<path>` inside
+    /// the SDK container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<serde_yaml::Value>,
 }
 
 /// Provision profile configuration

@@ -1002,6 +1002,12 @@ pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInpu
                 packages.clone(),
             );
         }
+        if let Some(overlay) = rootfs.get("overlay") {
+            hash_data.insert(
+                serde_yaml::Value::String("rootfs.overlay".to_string()),
+                overlay.clone(),
+            );
+        }
     }
 
     if let Some(kernel) = config.get("kernel") {
@@ -1029,6 +1035,12 @@ pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampI
             hash_data.insert(
                 serde_yaml::Value::String("initramfs.packages".to_string()),
                 packages.clone(),
+            );
+        }
+        if let Some(overlay) = initramfs.get("overlay") {
+            hash_data.insert(
+                serde_yaml::Value::String("initramfs.overlay".to_string()),
+                overlay.clone(),
             );
         }
     }
