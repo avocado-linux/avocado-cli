@@ -430,11 +430,9 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                 params
                     .lock_file
                     .remove_kernel_version(params.target, &params.sysroot_type);
-                params.lock_file.set_kernel_version(
-                    params.target,
-                    &params.sysroot_type,
-                    new_kver,
-                );
+                params
+                    .lock_file
+                    .set_kernel_version(params.target, &params.sysroot_type, new_kver);
             }
         }
     }
