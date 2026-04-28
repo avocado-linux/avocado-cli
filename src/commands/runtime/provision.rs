@@ -338,9 +338,11 @@ impl RuntimeProvisionCommand {
                 {
                     // Prefer the content-addressed kernel sysroot when populated
                     // (Phase 2c stages it from the rootfs install). The
-                    // `Image` symlink inside that directory points at
-                    // `Image-<kver>`. Fall back to the rootfs `/boot/Image-<kver>`
-                    // path for v4 lockfiles or if staging silently failed.
+                    // `Image` symlink inside that directory points at the
+                    // arch-appropriate image (`Image-<kver>` on ARM64,
+                    // `bzImage-<kver>` on x86-64). Fall back to the rootfs
+                    // `/boot/Image-<kver>` path for v4 lockfiles or if staging
+                    // silently failed.
                     let kernel_sysroot = SysrootType::Kernel(kver.clone());
                     let kernel_sysroot_populated = lock_file
                         .get_sysroot_versions(&target_arch, &kernel_sysroot)

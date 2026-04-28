@@ -145,27 +145,38 @@ async fn stage_kernel_sysroot_from_rootfs(
 set -e
 KERNEL_DIR="$AVOCADO_PREFIX/kernel/{kver}"
 mkdir -p "$KERNEL_DIR"
-ROOTFS_BOOT="$AVOCADO_PREFIX/rootfs/boot"
-if [ ! -d "$ROOTFS_BOOT" ]; then
+ROOTFS_ROOT="$AVOCADO_PREFIX/rootfs"
+if [ ! -d "$ROOTFS_ROOT/boot" ]; then
     echo "[ERROR] Rootfs sysroot has no /boot directory; cannot stage kernel sysroot for {kver}" >&2
     exit 1
 fi
-# Copy any kver-tagged Image files. Two naming conventions appear across
-# distros: `Image-<kver>(.gz)?` and `Image.gz-<kver>`. Match both.
-shopt -s nullglob
-matched=0
-for f in "$ROOTFS_BOOT"/Image-{kver}* "$ROOTFS_BOOT"/Image.gz-{kver}*; do
-    cp -a "$f" "$KERNEL_DIR/"
-    matched=$((matched+1))
-done
-if [ "$matched" -eq 0 ]; then
-    echo "[ERROR] Did not find Image*-{kver}* in rootfs /boot; cannot stage kernel sysroot" >&2
+# Locate bootable kernel images by their versioned filename suffix rather than
+# by enumerating KERNEL_IMAGETYPE names. Any file in /boot named *-{kver} or
+# *-{kver}.gz that isn't a known non-bootable kernel-base artifact qualifies.
+# (The RPM sysroot db is not queryable here — packages installed via dnf
+# --installroot are not tracked in the sysroot's own rpmdb.)
+mapfile -t boot_files < <(
+    find "$ROOTFS_ROOT/boot" -maxdepth 1 -type f \
+        \( -name "*-{kver}" -o -name "*-{kver}.gz" \) \
+        ! -name "System.map-*" ! -name "config-*" \
+    | sort
+)
+if [ "${{#boot_files[@]}}" -eq 0 ]; then
+    echo "[ERROR] No bootable kernel image found for {kver} in rootfs /boot" >&2
     exit 1
 fi
-# Provide a stable name (`Image`) alongside the versioned file so consumers
-# don't need to know the kver to find the bootable artifact.
-if [ -f "$KERNEL_DIR/Image-{kver}" ] && [ ! -e "$KERNEL_DIR/Image" ]; then
-    ln -s "Image-{kver}" "$KERNEL_DIR/Image"
+for abs_path in "${{boot_files[@]}}"; do
+    cp -a "$abs_path" "$KERNEL_DIR/"
+done
+# Stable 'Image' symlink — prefer uncompressed over .gz so consumers can use
+# it directly without decompression.
+for abs_path in "${{boot_files[@]}}"; do
+    [[ "$abs_path" == *.gz ]] && continue
+    ln -s "$(basename "$abs_path")" "$KERNEL_DIR/Image"
+    break
+done
+if [ ! -e "$KERNEL_DIR/Image" ]; then
+    ln -s "$(basename "${{boot_files[0]}}")" "$KERNEL_DIR/Image"
 fi
 "#
     );
