@@ -304,17 +304,29 @@ fn build_save_archive(
         let entry_size = entry.header().size().unwrap_or(0);
 
         let mut new_header = entry.header().clone();
-
         let entry_type = entry.header().entry_type();
-        // Re-prefix hardlink targets so they resolve correctly in the archive
-        if entry_type.is_hard_link() {
-            if let Ok(Some(link_name)) = entry.header().link_name() {
-                let new_link = PathBuf::from(format!("{ARCHIVE_PREFIX}/volume")).join(link_name);
-                new_header.set_link_name(&new_link)?;
-            }
-        }
 
-        if entry_type.is_dir() || entry_type.is_symlink() || entry_type.is_hard_link() {
+        if entry_type.is_hard_link() {
+            // Hardlink targets reference other entries in the archive — re-prefix so
+            // they resolve to the new path layout. Use `Entry::link_name()` to read
+            // through any GNU/PAX long-name extensions, and `Builder::append_link`
+            // to write through them (re-prefixing can push targets past the 100-byte
+            // header field).
+            let original_link = entry
+                .link_name()?
+                .ok_or_else(|| anyhow::anyhow!("hardlink entry missing link target"))?;
+            let new_link =
+                PathBuf::from(format!("{ARCHIVE_PREFIX}/volume")).join(original_link.as_ref());
+            tar.append_link(&mut new_header, &new_path, &new_link)?;
+        } else if entry_type.is_symlink() {
+            // Symlink targets are filesystem paths (not archive paths), so we don't
+            // re-prefix them. Still use `append_link` to preserve any long-name
+            // encoding through the proper API.
+            let original_link = entry
+                .link_name()?
+                .ok_or_else(|| anyhow::anyhow!("symlink entry missing link target"))?;
+            tar.append_link(&mut new_header, &new_path, original_link.as_ref())?;
+        } else if entry_type.is_dir() {
             tar.append_data(&mut new_header, &new_path, std::io::empty())?;
         } else {
             tar.append_data(&mut new_header, &new_path, &mut entry)?;
