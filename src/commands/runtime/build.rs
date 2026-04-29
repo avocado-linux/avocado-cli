@@ -477,6 +477,44 @@ impl RuntimeBuildCommand {
             }
         }
 
+        // If any of rootfs / initramfs / kernel declares image.type=kab,
+        // the kab-wrap step inside the runtime build container needs
+        // kabtool's signing keyset. Mirror ext/image.rs's plumbing:
+        // validate KAB_KEYSET_FILE on the host, bind-mount it into the
+        // container at /tmp/kab.keyset, and set the env var inside.
+        let kab_keyset_host_path: Option<String> = {
+            let any_kab = ["rootfs", "initramfs", "kernel"].iter().any(|k| {
+                parsed
+                    .get(*k)
+                    .and_then(crate::utils::config::get_ext_image_type)
+                    .as_deref()
+                    == Some("kab")
+            });
+            if any_kab {
+                let keyset_path = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
+                    anyhow::anyhow!(
+                        "Runtime '{}' has `image: {{ type: kab }}` on rootfs, initramfs, or kernel, \
+                         but the KAB_KEYSET_FILE environment variable is not set. \
+                         Set it to the path of your KAB signing keyset file.",
+                        self.runtime_name,
+                    )
+                })?;
+                if !std::path::Path::new(&keyset_path).is_file() {
+                    return Err(anyhow::anyhow!(
+                        "KAB_KEYSET_FILE points to '{}' but the file does not exist.",
+                        keyset_path,
+                    ));
+                }
+                env_vars.insert(
+                    "KAB_KEYSET_FILE".to_string(),
+                    "/tmp/kab.keyset".to_string(),
+                );
+                Some(keyset_path)
+            } else {
+                None
+            }
+        };
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -501,11 +539,18 @@ impl RuntimeBuildCommand {
                     .unwrap_or(false)
             });
 
-            if has_docker_images {
-                let mut args = merged_container_args.clone().unwrap_or_default();
-                if !args.iter().any(|a| a == "--privileged") {
-                    args.push("--privileged".to_string());
-                }
+            let mut args = merged_container_args.clone().unwrap_or_default();
+            let mut modified = false;
+            if has_docker_images && !args.iter().any(|a| a == "--privileged") {
+                args.push("--privileged".to_string());
+                modified = true;
+            }
+            if let Some(ref keyset_path) = kab_keyset_host_path {
+                args.push("-v".to_string());
+                args.push(format!("{keyset_path}:/tmp/kab.keyset:ro"));
+                modified = true;
+            }
+            if modified {
                 Some(args)
             } else {
                 merged_container_args.clone()
@@ -1161,6 +1206,66 @@ fi"#
             .collect();
         let ext_info_str = ext_info_pairs.join(" ");
 
+        // Resolve `image:` config for rootfs / initramfs / kernel. Same
+        // dynamic accessors as extensions — the helpers don't care about
+        // the parent yaml node's identity.
+        let resolve_img =
+            |yaml_key: &str| -> (String, Option<String>) {
+                let node = parsed.get(yaml_key);
+                let t = node
+                    .and_then(crate::utils::config::get_ext_image_type)
+                    .unwrap_or_else(|| "raw".to_string());
+                let a = node.and_then(crate::utils::config::get_ext_image_args);
+                (t, a)
+            };
+        let (rootfs_image_type, rootfs_image_args) = resolve_img("rootfs");
+        let (initramfs_image_type, initramfs_image_args) = resolve_img("initramfs");
+        let (kernel_image_type, kernel_image_args) = resolve_img("kernel");
+
+        // Default kabtool args mirror ext/image.rs:879. Used when the
+        // config provides `image: { type: kab }` without an explicit `args`.
+        let default_kab_args =
+            r#"-b -t kos.layer -v "$AVOCADO_RUNTIME_VERSION" --tag "$AVOCADO_TARGET""#;
+
+        // Shell snippet that wraps a single artifact into a signed KAB.
+        // No-op when image_type != "kab". Reads $AVOCADO_<NAME>_IMAGE,
+        // wraps to $OUTPUT_DIR/<basename>.kab, and re-exports the same
+        // env var to the wrapped path so the manifest block reads the
+        // KAB (not the raw image).
+        let wrap_section = |label: &str, env_var: &str, image_type: &str, image_args: &Option<String>| -> String {
+            if image_type != "kab" {
+                return String::new();
+            }
+            let kab_args = image_args.as_deref().unwrap_or(default_kab_args);
+            format!(
+                r#"
+# --- KAB wrap: {label} ---
+if [ -n "${env_var}" ] && [ -f "${env_var}" ]; then
+    echo "Wrapping {label} as KAB..."
+    KAB_TMPDIR=$(mktemp -d)
+    cp "${env_var}" "$KAB_TMPDIR/layer.img"
+    cat > "$KAB_TMPDIR/descriptor.json" << DESCEOF
+{{"kos":{{"build":{{"source":"{label}-$AVOCADO_RUNTIME_VERSION"}}}}}}
+DESCEOF
+    (cd "$KAB_TMPDIR" && zip -Z store tmp.zip layer.img descriptor.json)
+    KAB_OUTPUT="$OUTPUT_DIR/$(basename "${env_var}").kab"
+    rm -f "$KAB_OUTPUT"
+    kabtool {kab_args} \
+        -k "$KAB_KEYSET_FILE" \
+        -z "$KAB_TMPDIR/tmp.zip" "$KAB_TMPDIR/output.kab"
+    cp "$KAB_TMPDIR/output.kab" "$KAB_OUTPUT"
+    rm -rf "$KAB_TMPDIR"
+    export {env_var}="$KAB_OUTPUT"
+    echo "Wrapped {label} -> $KAB_OUTPUT"
+fi
+"#
+            )
+        };
+
+        let rootfs_kab_wrap = wrap_section("rootfs", "AVOCADO_ROOTFS_IMAGE", &rootfs_image_type, &rootfs_image_args);
+        let initramfs_kab_wrap = wrap_section("initramfs", "AVOCADO_INITRAMFS_IMAGE", &initramfs_image_type, &initramfs_image_args);
+        let kernel_kab_wrap = wrap_section("kernel", "AVOCADO_KERNEL_IMAGE", &kernel_image_type, &kernel_image_args);
+
         let namespace_uuid = crate::utils::update_repo::AVOCADO_IMAGE_NAMESPACE.to_string();
 
         let manifest_section = format!(
@@ -1186,10 +1291,13 @@ export AVOCADO_BUILT_AT="$BUILT_AT"
 export AVOCADO_RUNTIME_NAME="{runtime_name}"
 export AVOCADO_RUNTIME_VERSION="$RUNTIME_VERSION"
 export AVOCADO_EXT_PAIRS="{ext_info_str}"
+export AVOCADO_ROOTFS_IMAGE_TYPE="{rootfs_image_type}"
+export AVOCADO_INITRAMFS_IMAGE_TYPE="{initramfs_image_type}"
+export AVOCADO_KERNEL_IMAGE_TYPE="{kernel_image_type}"
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil, glob
+import json, hashlib, uuid, os, shutil
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1226,18 +1334,23 @@ for pair in ext_pairs:
 
 # rootfs / initramfs / kernel entries. Same content-addressing pattern
 # as extensions: sha256 of the on-disk image -> UUIDv5 image_id, copied
-# into images_dir as <image_id>.raw. Skipped when the corresponding
-# image isn't built (e.g. no rootfs / no initramfs / no kernel staged).
-def add_image_entry(img_path, version):
+# into images_dir. Suffix follows image_type: ".kab" when the artifact
+# was wrapped + signed by kabtool earlier in the build, ".raw"
+# otherwise. Skipped when the corresponding image isn't built.
+def add_image_entry(img_path, version, image_type):
     if not (img_path and os.path.isfile(img_path)):
         return None
     with open(img_path, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
     image_id = str(uuid.uuid5(namespace, sha256))
-    dest = os.path.join(images_dir, image_id + ".raw")
+    suffix = ".kab" if image_type == "kab" else ".raw"
+    dest = os.path.join(images_dir, image_id + suffix)
     shutil.copy2(img_path, dest)
-    print("  Image: " + os.path.basename(img_path) + " -> " + image_id + ".raw")
-    return dict(version=version, image_id=image_id, sha256=sha256)
+    print("  Image: " + os.path.basename(img_path) + " -> " + image_id + suffix)
+    entry = dict(version=version, image_id=image_id, sha256=sha256)
+    if image_type == "kab":
+        entry["image_type"] = "kab"
+    return entry
 
 # rootfs, initramfs, and kernel all ship from the same avocado distro
 # release, so VERSION_ID is identical between their os-release files.
@@ -1252,18 +1365,26 @@ if os.path.isfile(os_release_path):
                 version_id = line.strip().split("=", 1)[1].strip('"').strip("'")
                 break
 
-# rootfs / initramfs paths come from env vars exported by their build
-# sub-scripts. The kernel image isn't a runtime-build artifact — it's
-# staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
-# Glob expects exactly one match (single kernel per OS release).
-kernel_matches = glob.glob(os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "kernel", "*", "Image"))
-if len(kernel_matches) > 1:
-    print("WARNING: multiple kernel images found, skipping kernel manifest block: " + repr(kernel_matches))
-kernel_path = kernel_matches[0] if len(kernel_matches) == 1 else ""
-
-rootfs_entry = add_image_entry(os.environ.get("AVOCADO_ROOTFS_IMAGE", ""), version_id)
-initramfs_entry = add_image_entry(os.environ.get("AVOCADO_INITRAMFS_IMAGE", ""), version_id)
-kernel_entry = add_image_entry(kernel_path, version_id)
+# All three image paths arrive via env vars set by shell (rootfs /
+# initramfs by their build sub-scripts; kernel by a shell-side glob
+# of $AVOCADO_PREFIX/kernel/*/Image). When `image.type: kab` is set
+# in the runtime config, an earlier shell section has already
+# rewritten the env var to point at the wrapped .kab.
+rootfs_entry = add_image_entry(
+    os.environ.get("AVOCADO_ROOTFS_IMAGE", ""),
+    version_id,
+    os.environ.get("AVOCADO_ROOTFS_IMAGE_TYPE", "raw"),
+)
+initramfs_entry = add_image_entry(
+    os.environ.get("AVOCADO_INITRAMFS_IMAGE", ""),
+    version_id,
+    os.environ.get("AVOCADO_INITRAMFS_IMAGE_TYPE", "raw"),
+)
+kernel_entry = add_image_entry(
+    os.environ.get("AVOCADO_KERNEL_IMAGE", ""),
+    version_id,
+    os.environ.get("AVOCADO_KERNEL_IMAGE_TYPE", "raw"),
+)
 
 manifest = dict(
     manifest_version=2,
@@ -1288,12 +1409,10 @@ current_image_files = set()
 for ext in extensions:
     suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
     current_image_files.add(ext["image_id"] + suffix)
-if rootfs_entry:
-    current_image_files.add(rootfs_entry["image_id"] + ".raw")
-if initramfs_entry:
-    current_image_files.add(initramfs_entry["image_id"] + ".raw")
-if kernel_entry:
-    current_image_files.add(kernel_entry["image_id"] + ".raw")
+for entry in (rootfs_entry, initramfs_entry, kernel_entry):
+    if entry:
+        sfx = ".kab" if entry.get("image_type") == "kab" else ".raw"
+        current_image_files.add(entry["image_id"] + sfx)
 for fname in os.listdir(images_dir):
     if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
@@ -1339,6 +1458,9 @@ ln -sfn "runtimes/$BUILD_ID" "$VAR_DIR/lib/avocado/active"
 echo "Created runtime manifest: runtimes/$BUILD_ID/manifest.json"
 echo "Set active runtime -> runtimes/$BUILD_ID""#,
             runtime_name = self.runtime_name,
+            rootfs_image_type = rootfs_image_type,
+            initramfs_image_type = initramfs_image_type,
+            kernel_image_type = kernel_image_type,
         );
 
         // Generate update authority (root.json) for verified updates.
@@ -1810,6 +1932,33 @@ echo "Copying required extension images to runtime-specific directory..."
 {rootfs_build_section}
 {initramfs_build_section}
 
+# Resolve kernel image staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
+# Done in shell so the optional KAB wrap below can rewrite the env var
+# uniformly across rootfs / initramfs / kernel.
+KERNEL_IMAGE_GLOB=$(ls "$AVOCADO_PREFIX"/kernel/*/Image 2>/dev/null | head -1)
+if [ -n "$KERNEL_IMAGE_GLOB" ]; then
+    export AVOCADO_KERNEL_IMAGE="$KERNEL_IMAGE_GLOB"
+fi
+
+# Read VERSION_ID from rootfs os-release for use as a stable version
+# identifier in kab-wrap args (matches the version field that the AMF
+# manifest will carry for rootfs/initramfs/kernel entries — i.e.
+# whatever ends up in `manifest.<X>.version` is what the kab's signed
+# -v value will be, so users can write
+#   args: '-b -t kos.layer.kernel -v "$AVOCADO_OS_VERSION_ID" ...'
+# without risk of drift between the kab and the manifest entry).
+AVOCADO_OS_VERSION_ID=""
+if [ -f "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" ]; then
+    AVOCADO_OS_VERSION_ID=$(grep '^VERSION_ID=' "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
+        | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+fi
+export AVOCADO_OS_VERSION_ID
+
+# Optional KAB wrapping for rootfs / initramfs / kernel. Each block is
+# emitted only when the corresponding `image.type: kab` is set in the
+# config. Each rewrites $AVOCADO_<NAME>_IMAGE in place to point at the
+# wrapped .kab so the manifest section reads the wrapped artifact.
+{rootfs_kab_wrap}{initramfs_kab_wrap}{kernel_kab_wrap}
 # Assemble var partition content and build var image
 {var_files_section}
 {runtime_var_files_section}
@@ -1941,7 +2090,8 @@ for ext in manifest.get("extensions", []):
 for key in ("rootfs", "initramfs", "kernel"):
     block = manifest.get(key)
     if block:
-        current_image_files.add(block["image_id"] + ".raw")
+        sfx = ".kab" if block.get("image_type") == "kab" else ".raw"
+        current_image_files.add(block["image_id"] + sfx)
 current_image_files.add(aos_image_id + ".raw")
 for fname in os.listdir(images_dir):
     if fname.endswith(".raw") and fname not in current_image_files:
@@ -1955,6 +2105,9 @@ PYEOF
             copy_section = copy_section,
             rootfs_build_section = rootfs_build_section,
             initramfs_build_section = initramfs_build_section,
+            rootfs_kab_wrap = rootfs_kab_wrap,
+            initramfs_kab_wrap = initramfs_kab_wrap,
+            kernel_kab_wrap = kernel_kab_wrap,
             subvol_mkdir_section = subvol_mkdir_section,
             subvol_warnings_section = subvol_warnings_section,
             mkfs_flags = mkfs_flags,
@@ -2587,15 +2740,29 @@ extensions:
 
         // rootfs / initramfs / kernel blocks: same content-addressing as
         // extensions, sourced from $AVOCADO_ROOTFS_IMAGE,
-        // $AVOCADO_INITRAMFS_IMAGE, and $AVOCADO_PREFIX/kernel/*/Image.
+        // $AVOCADO_INITRAMFS_IMAGE, and $AVOCADO_KERNEL_IMAGE (the
+        // last one is set by a shell-side glob of
+        // $AVOCADO_PREFIX/kernel/*/Image).
         assert!(script.contains("AVOCADO_ROOTFS_IMAGE"));
         assert!(script.contains("AVOCADO_INITRAMFS_IMAGE"));
-        assert!(script.contains("\"kernel\", \"*\", \"Image\""));
+        assert!(script.contains("AVOCADO_KERNEL_IMAGE"));
+        assert!(script.contains("\"$AVOCADO_PREFIX\"/kernel/*/Image"));
         assert!(script.contains("manifest[\"rootfs\"] = rootfs_entry"));
         assert!(script.contains("manifest[\"initramfs\"] = initramfs_entry"));
         assert!(script.contains("manifest[\"kernel\"] = kernel_entry"));
         // VERSION_ID is sourced from rootfs os-release; shared by all three.
         assert!(script.contains("VERSION_ID="));
+        // image_type defaults to "raw" when the config has no `image:` block.
+        assert!(script.contains("AVOCADO_ROOTFS_IMAGE_TYPE=\"raw\""));
+        assert!(script.contains("AVOCADO_INITRAMFS_IMAGE_TYPE=\"raw\""));
+        assert!(script.contains("AVOCADO_KERNEL_IMAGE_TYPE=\"raw\""));
+        // No KAB wrap section emitted when image.type is absent.
+        assert!(!script.contains("KAB wrap: rootfs"));
+        // VERSION_ID export is unconditional — users may reference
+        // $AVOCADO_OS_VERSION_ID in kab args even when no wrap is
+        // configured, and downstream code can rely on it being set.
+        assert!(script.contains("AVOCADO_OS_VERSION_ID=$(grep '^VERSION_ID='"));
+        assert!(script.contains("export AVOCADO_OS_VERSION_ID"));
 
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
@@ -2607,6 +2774,71 @@ extensions:
         assert!(script.contains("compute_spot_hash"));
 
         assert!(script.contains("--subvol rw:lib/avocado "));
+    }
+
+    /// When a top-level `rootfs:` (or initramfs / kernel) declares
+    /// `image: { type: kab, args: '...' }`, the build script must emit
+    /// the kabtool wrap snippet, re-export $AVOCADO_<name>_IMAGE, and
+    /// pass the type to the manifest Python block. Other artifacts
+    /// without the `image:` block stay as raw.
+    #[test]
+    fn test_create_build_script_wraps_rootfs_as_kab() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+distro:
+  version: "0.1.0"
+
+rootfs:
+  image:
+    type: kab
+    args: '-b -t kos.layer.basefs -v 2024.1.0 --tag raspberrypi4'
+  packages:
+    avocado-pkg-rootfs: '*'
+
+runtimes:
+  test-runtime:
+    target: "raspberrypi4"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("raspberrypi4".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd.create_build_script(&config, &parsed, "raspberrypi4", &[]).unwrap();
+
+        // Wrap section emitted only for rootfs.
+        assert!(script.contains("KAB wrap: rootfs"));
+        assert!(!script.contains("KAB wrap: initramfs"));
+        assert!(!script.contains("KAB wrap: kernel"));
+
+        // User-provided kabtool args interpolated verbatim.
+        assert!(script.contains("kabtool -b -t kos.layer.basefs -v 2024.1.0 --tag raspberrypi4"));
+
+        // Image-type env var reflects the config.
+        assert!(script.contains("AVOCADO_ROOTFS_IMAGE_TYPE=\"kab\""));
+        assert!(script.contains("AVOCADO_INITRAMFS_IMAGE_TYPE=\"raw\""));
+        assert!(script.contains("AVOCADO_KERNEL_IMAGE_TYPE=\"raw\""));
+
+        // Re-export of $AVOCADO_ROOTFS_IMAGE so the manifest block sees
+        // the wrapped artifact.
+        assert!(script.contains("export AVOCADO_ROOTFS_IMAGE=\"$KAB_OUTPUT\""));
+
+        // $AVOCADO_OS_VERSION_ID is exported regardless of wrap config so
+        // operators can reference it in their kab args without
+        // worrying about ordering or visibility across image blocks.
+        assert!(script.contains("export AVOCADO_OS_VERSION_ID"));
     }
 
     #[test]

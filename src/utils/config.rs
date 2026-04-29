@@ -133,7 +133,7 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["package", "version", "compile", "install"],
+        &["package", "version", "compile", "install", "image"],
         "kernel",
     )
 }
@@ -147,7 +147,7 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["packages", "dependencies", "filesystem", "overlay"],
+        &["packages", "dependencies", "filesystem", "overlay", "image"],
         "rootfs",
     )
 }
@@ -161,7 +161,7 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["packages", "dependencies", "filesystem", "overlay"],
+        &["packages", "dependencies", "filesystem", "overlay", "image"],
         "initramfs",
     )
 }
@@ -519,6 +519,12 @@ pub struct KernelConfig {
     pub compile: Option<String>,
     /// Install script path (copies kernel artifacts to runtime build dir). Required when `compile` is set.
     pub install: Option<String>,
+    /// Optional KAB-wrapper config. Same shape as the `image:` block on
+    /// extensions and on rootfs/initramfs. When `type: kab` is set, the
+    /// staged kernel `Image` is wrapped + signed via kabtool before it
+    /// lands in the manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<serde_yaml::Value>,
 }
 
 impl KernelConfig {
@@ -688,6 +694,16 @@ pub struct ImageConfig {
     /// the SDK container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<serde_yaml::Value>,
+    /// Optional KAB-wrapper config. Same shape as the `image:` block on
+    /// extensions:
+    ///   image:
+    ///     type: kab               # "kab" wraps the produced image with
+    ///                             # kabtool; absent / "raw" keeps the
+    ///                             # raw artifact.
+    ///     args: "-b -t kos.layer.basefs -v <ver> --tag <target>"
+    /// Read dynamically via `get_ext_image_type` / `get_ext_image_args`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<serde_yaml::Value>,
 }
 
 /// Provision profile configuration
@@ -8885,6 +8901,7 @@ sdk:
             version: Some("*".to_string()),
             compile: None,
             install: None,
+            image: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -8896,6 +8913,7 @@ sdk:
             version: None,
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
+            image: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -8907,6 +8925,7 @@ sdk:
             version: Some("*".to_string()),
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
+            image: None,
         };
         assert!(kc.validate().is_err());
     }
@@ -8918,6 +8937,7 @@ sdk:
             version: None,
             compile: Some("kernel-build".to_string()),
             install: None,
+            image: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("'compile' requires 'install'"));
@@ -8930,6 +8950,7 @@ sdk:
             version: None,
             compile: None,
             install: None,
+            image: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("either 'package' or 'compile'"));
@@ -10060,6 +10081,7 @@ runtimes:
                 version: Some("6.6.*".to_string()),
                 compile: None,
                 install: None,
+                image: None,
             },
         );
         let kc = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
