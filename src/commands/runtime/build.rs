@@ -477,11 +477,24 @@ impl RuntimeBuildCommand {
             }
         }
 
-        // If any of rootfs / initramfs / kernel declares image.type=kab,
-        // the kab-wrap step inside the runtime build container needs
-        // kabtool's signing keyset. Mirror ext/image.rs's plumbing:
-        // validate KAB_KEYSET_FILE on the host, bind-mount it into the
-        // container at /tmp/kab.keyset, and set the env var inside.
+        // Runtime type: `kos` triggers AMF signing with the same keyset
+        // that signs the component KABs. Anything else (or missing)
+        // skips signing and behaves exactly like before.
+        let is_kos_runtime = merged_runtime
+            .as_ref()
+            .and_then(|rt| rt.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("kos");
+
+        // The runtime build container needs access to the KAB signing
+        // keyset when EITHER of these is true:
+        //   1. rootfs / initramfs / kernel has `image.type: kab` — kabtool
+        //      wraps the artifact during the build.
+        //   2. The runtime is `type: kos` — the manifest itself gets signed
+        //      with the same keyset right after it's written.
+        // Mirror ext/image.rs's plumbing: validate KAB_KEYSET_FILE on the
+        // host, bind-mount it into the container at /tmp/kab.keyset, and
+        // set the env var inside.
         let kab_keyset_host_path: Option<String> = {
             let any_kab = ["rootfs", "initramfs", "kernel"].iter().any(|k| {
                 parsed
@@ -490,13 +503,18 @@ impl RuntimeBuildCommand {
                     .as_deref()
                     == Some("kab")
             });
-            if any_kab {
+            if any_kab || is_kos_runtime {
+                let reason = if is_kos_runtime {
+                    "is `type: kos` (AMF will be signed)"
+                } else {
+                    "has `image: { type: kab }` on rootfs, initramfs, or kernel"
+                };
                 let keyset_path = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
                     anyhow::anyhow!(
-                        "Runtime '{}' has `image: {{ type: kab }}` on rootfs, initramfs, or kernel, \
-                         but the KAB_KEYSET_FILE environment variable is not set. \
+                        "Runtime '{}' {} but the KAB_KEYSET_FILE environment variable is not set. \
                          Set it to the path of your KAB signing keyset file.",
                         self.runtime_name,
+                        reason,
                     )
                 })?;
                 if !std::path::Path::new(&keyset_path).is_file() {
@@ -505,15 +523,27 @@ impl RuntimeBuildCommand {
                         keyset_path,
                     ));
                 }
-                env_vars.insert(
-                    "KAB_KEYSET_FILE".to_string(),
-                    "/tmp/kab.keyset".to_string(),
-                );
+                env_vars.insert("KAB_KEYSET_FILE".to_string(), "/tmp/kab.keyset".to_string());
                 Some(keyset_path)
             } else {
                 None
             }
         };
+
+        // The in-container sign_amf shell helper checks
+        // $AVOCADO_AMF_SIGN. Only kos runtimes set it; everyone else
+        // treats sign_amf as a no-op.
+        if is_kos_runtime {
+            env_vars.insert("AVOCADO_AMF_SIGN".to_string(), "1".to_string());
+        } else if std::env::var("KAB_KEYSET_FILE").is_ok() {
+            print_info(
+                &format!(
+                    "KAB_KEYSET_FILE is set but runtime '{}' is not `type: kos`; AMF signing is disabled for this runtime.",
+                    self.runtime_name
+                ),
+                OutputLevel::Normal,
+            );
+        }
 
         let env_vars = if env_vars.is_empty() {
             None
@@ -1209,15 +1239,14 @@ fi"#
         // Resolve `image:` config for rootfs / initramfs / kernel. Same
         // dynamic accessors as extensions — the helpers don't care about
         // the parent yaml node's identity.
-        let resolve_img =
-            |yaml_key: &str| -> (String, Option<String>) {
-                let node = parsed.get(yaml_key);
-                let t = node
-                    .and_then(crate::utils::config::get_ext_image_type)
-                    .unwrap_or_else(|| "raw".to_string());
-                let a = node.and_then(crate::utils::config::get_ext_image_args);
-                (t, a)
-            };
+        let resolve_img = |yaml_key: &str| -> (String, Option<String>) {
+            let node = parsed.get(yaml_key);
+            let t = node
+                .and_then(crate::utils::config::get_ext_image_type)
+                .unwrap_or_else(|| "raw".to_string());
+            let a = node.and_then(crate::utils::config::get_ext_image_args);
+            (t, a)
+        };
         let (rootfs_image_type, rootfs_image_args) = resolve_img("rootfs");
         let (initramfs_image_type, initramfs_image_args) = resolve_img("initramfs");
         let (kernel_image_type, kernel_image_args) = resolve_img("kernel");
@@ -1232,13 +1261,14 @@ fi"#
         // wraps to $OUTPUT_DIR/<basename>.kab, and re-exports the same
         // env var to the wrapped path so the manifest block reads the
         // KAB (not the raw image).
-        let wrap_section = |label: &str, env_var: &str, image_type: &str, image_args: &Option<String>| -> String {
-            if image_type != "kab" {
-                return String::new();
-            }
-            let kab_args = image_args.as_deref().unwrap_or(default_kab_args);
-            format!(
-                r#"
+        let wrap_section =
+            |label: &str, env_var: &str, image_type: &str, image_args: &Option<String>| -> String {
+                if image_type != "kab" {
+                    return String::new();
+                }
+                let kab_args = image_args.as_deref().unwrap_or(default_kab_args);
+                format!(
+                    r#"
 # --- KAB wrap: {label} ---
 if [ -n "${env_var}" ] && [ -f "${env_var}" ]; then
     echo "Wrapping {label} as KAB..."
@@ -1259,12 +1289,27 @@ DESCEOF
     echo "Wrapped {label} -> $KAB_OUTPUT"
 fi
 "#
-            )
-        };
+                )
+            };
 
-        let rootfs_kab_wrap = wrap_section("rootfs", "AVOCADO_ROOTFS_IMAGE", &rootfs_image_type, &rootfs_image_args);
-        let initramfs_kab_wrap = wrap_section("initramfs", "AVOCADO_INITRAMFS_IMAGE", &initramfs_image_type, &initramfs_image_args);
-        let kernel_kab_wrap = wrap_section("kernel", "AVOCADO_KERNEL_IMAGE", &kernel_image_type, &kernel_image_args);
+        let rootfs_kab_wrap = wrap_section(
+            "rootfs",
+            "AVOCADO_ROOTFS_IMAGE",
+            &rootfs_image_type,
+            &rootfs_image_args,
+        );
+        let initramfs_kab_wrap = wrap_section(
+            "initramfs",
+            "AVOCADO_INITRAMFS_IMAGE",
+            &initramfs_image_type,
+            &initramfs_image_args,
+        );
+        let kernel_kab_wrap = wrap_section(
+            "kernel",
+            "AVOCADO_KERNEL_IMAGE",
+            &kernel_image_type,
+            &kernel_image_args,
+        );
 
         let namespace_uuid = crate::utils::update_repo::AVOCADO_IMAGE_NAMESPACE.to_string();
 
@@ -1294,6 +1339,92 @@ export AVOCADO_EXT_PAIRS="{ext_info_str}"
 export AVOCADO_ROOTFS_IMAGE_TYPE="{rootfs_image_type}"
 export AVOCADO_INITRAMFS_IMAGE_TYPE="{initramfs_image_type}"
 export AVOCADO_KERNEL_IMAGE_TYPE="{kernel_image_type}"
+
+# sign_amf <manifest-path>: sign the AMF at the given path with the
+# KAB_KEYSET_FILE-pointed keyset. Idempotent — replaces any existing
+# meta.auth block. No-ops when AVOCADO_AMF_SIGN != "1" (non-kos
+# runtimes) or the keyset is unavailable. Called twice: once after the
+# manifest is written (so the btrfs image flashed onto fresh devices
+# carries a signature), and again after the os_bundle patch (so the
+# var-staging copy used for OTA upload covers the mutated state).
+sign_amf() {{
+    AMF_SIGN_PATH="$1" python3 << 'SIGNEOF'
+import json, os, base64, tempfile, subprocess, shutil
+
+if os.environ.get("AVOCADO_AMF_SIGN") != "1":
+    raise SystemExit(0)
+
+manifest_path = os.environ["AMF_SIGN_PATH"]
+keyset_path = os.environ.get("KAB_KEYSET_FILE", "")
+if not keyset_path or not os.path.isfile(keyset_path):
+    print("AMF signing: KAB_KEYSET_FILE unset or missing; emitting unsigned manifest.")
+    raise SystemExit(0)
+
+workdir = tempfile.mkdtemp(prefix="amf-sign-")
+try:
+    # kabtool -x writes privateKey.der + certPath.p7b into cwd.
+    subprocess.run(["kabtool", "-x", keyset_path], cwd=workdir, check=True)
+    key_path = os.path.join(workdir, "privateKey.der")
+    chain_path = os.path.join(workdir, "certPath.p7b")
+
+    # certPath.p7b is a Java PkiPath SEQUENCE OF Certificate, NOT a
+    # PKCS#7 SignedData (so openssl pkcs7 cannot read it). Split the
+    # outer SEQUENCE into individual DER certs. PkiPath order is
+    # root-adjacent first, leaf last; AMF convention places leaf first,
+    # so we reverse.
+    data = open(chain_path, "rb").read()
+    def _tl(buf, off):
+        tag, ln = buf[off], buf[off + 1]
+        if ln & 0x80:
+            n = ln & 0x7f
+            ln = int.from_bytes(buf[off + 2:off + 2 + n], "big")
+            return tag, ln, off + 2 + n
+        return tag, ln, off + 2
+    _, outer_len, body = _tl(data, 0)
+    certs_der = []
+    i = body
+    while i < body + outer_len:
+        _, clen, cbody = _tl(data, i)
+        certs_der.append(data[i:cbody + clen])
+        i = cbody + clen
+    if not certs_der:
+        raise RuntimeError("certPath.p7b contained no certificates")
+
+    # Canonical form = manifest JSON without the "meta" key, compact (no
+    # whitespace), insertion-order preserved. An on-device verifier
+    # strips meta, recomputes this canonical form, and checks the
+    # signature against it.
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+    manifest.pop("meta", None)
+    canonical = json.dumps(manifest, separators=(",", ":"))
+    canon_path = os.path.join(workdir, "canonical.json")
+    with open(canon_path, "w") as f:
+        f.write(canonical)
+
+    # SHA256 + RSA PKCS#1 v1.5 — matches KAB signing.
+    sig_path = os.path.join(workdir, "sig.bin")
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", key_path,
+         "-out", sig_path, canon_path],
+        check=True,
+    )
+    sig_b64 = base64.b64encode(open(sig_path, "rb").read()).decode("ascii")
+    certs_b64 = [base64.b64encode(c).decode("ascii") for c in reversed(certs_der)]
+
+    manifest["meta"] = {{
+        "auth": {{
+            "signature": sig_b64,
+            "certificates": certs_b64,
+        }},
+    }}
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print("Signed AMF at " + manifest_path + ": leaf + " + str(len(certs_b64) - 1) + " intermediate cert(s).")
+finally:
+    shutil.rmtree(workdir, ignore_errors=True)
+SIGNEOF
+}}
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
@@ -1453,6 +1584,11 @@ if spot_hashes_path:
         json.dump(cache, f, indent=2)
     print("Created spot hash cache with " + str(len(spot_hashes)) + " image(s)")
 PYEOF
+
+# Sign the just-written manifest BEFORE mkfs.btrfs runs so the btrfs
+# image flashed onto fresh devices already contains the signature.
+# Skipped (no-op) when this isn't a `type: kos` runtime.
+sign_amf "$AVOCADO_MANIFEST_PATH"
 
 ln -sfn "runtimes/$BUILD_ID" "$VAR_DIR/lib/avocado/active"
 echo "Created runtime manifest: runtimes/$BUILD_ID/manifest.json"
@@ -2098,6 +2234,13 @@ for fname in os.listdir(images_dir):
         os.remove(os.path.join(images_dir, fname))
         print("  Removed stale image: " + fname)
 PYEOF
+
+# Re-sign the var-staging manifest after the os_bundle patch — the
+# earlier pre-mkfs.btrfs signature is now invalid for this mutated
+# content. The btrfs image flashed onto fresh devices already carries
+# the pre-patch signature; this second signature covers the
+# var-staging manifest that OTA upload / Studio publishing consumes.
+sign_amf "$AVOCADO_MANIFEST_PATH"
 "#,
             runtime_name = self.runtime_name,
             target_arch = target_arch,
@@ -2764,6 +2907,13 @@ extensions:
         assert!(script.contains("AVOCADO_OS_VERSION_ID=$(grep '^VERSION_ID='"));
         assert!(script.contains("export AVOCADO_OS_VERSION_ID"));
 
+        // sign_amf helper is always emitted; whether it actually signs
+        // is decided at runtime by AVOCADO_AMF_SIGN. This test runtime
+        // is not type=kos, so the env var won't be set and sign_amf
+        // will be a no-op.
+        assert!(script.contains("sign_amf() {"));
+        assert!(script.contains("sign_amf \"$AVOCADO_MANIFEST_PATH\""));
+
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
         assert!(script.contains("$VAR_DIR/lib/avocado/active"));
@@ -2816,7 +2966,9 @@ runtimes:
             None,
         );
         let config = Config::load(&cmd.config_path).unwrap();
-        let script = cmd.create_build_script(&config, &parsed, "raspberrypi4", &[]).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "raspberrypi4", &[])
+            .unwrap();
 
         // Wrap section emitted only for rootfs.
         assert!(script.contains("KAB wrap: rootfs"));
