@@ -147,7 +147,7 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["packages", "dependencies", "filesystem"],
+        &["packages", "dependencies", "filesystem", "overlay"],
         "rootfs",
     )
 }
@@ -161,7 +161,7 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["packages", "dependencies", "filesystem"],
+        &["packages", "dependencies", "filesystem", "overlay"],
         "initramfs",
     )
 }
@@ -9845,6 +9845,78 @@ rootfs:
         assert!(
             err.contains("cannot mix") && err.contains("rootfs"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_singleton_with_overlay_only() {
+        // `overlay` alone must be recognized as a singleton field, not a named entry.
+        let yaml = r#"
+rootfs:
+  overlay: "overlays/dev"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.rootfs.as_ref().unwrap().contains_key("default"));
+        let rfs = config.rootfs_default().unwrap();
+        assert_eq!(
+            rfs.overlay.as_ref().and_then(|v| v.as_str()),
+            Some("overlays/dev")
+        );
+    }
+
+    #[test]
+    fn test_rootfs_singleton_with_overlay_and_packages() {
+        // Mixing `overlay` with other singleton fields must not trigger the
+        // "cannot mix singleton form and named-map form" error.
+        let yaml = r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+  filesystem: erofs-lz4
+  overlay:
+    dir: "overlays/dev"
+    mode: opaque
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let rfs = config.rootfs_default().unwrap();
+        assert_eq!(rfs.filesystem.as_deref(), Some("erofs-lz4"));
+        let overlay = rfs.overlay.as_ref().unwrap();
+        assert_eq!(
+            overlay.get("dir").and_then(|v| v.as_str()),
+            Some("overlays/dev")
+        );
+        assert_eq!(overlay.get("mode").and_then(|v| v.as_str()), Some("opaque"));
+    }
+
+    #[test]
+    fn test_initramfs_singleton_with_overlay_only() {
+        let yaml = r#"
+initramfs:
+  overlay: "overlays/initramfs"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.initramfs.as_ref().unwrap().contains_key("default"));
+        let ifs = config.initramfs_default().unwrap();
+        assert_eq!(
+            ifs.overlay.as_ref().and_then(|v| v.as_str()),
+            Some("overlays/initramfs")
+        );
+    }
+
+    #[test]
+    fn test_initramfs_singleton_with_overlay_and_packages() {
+        let yaml = r#"
+initramfs:
+  packages: { avocado-pkg-initramfs: "*" }
+  filesystem: cpio.zst
+  overlay: "overlays/initramfs"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let ifs = config.initramfs_default().unwrap();
+        assert_eq!(ifs.filesystem.as_deref(), Some("cpio.zst"));
+        assert_eq!(
+            ifs.overlay.as_ref().and_then(|v| v.as_str()),
+            Some("overlays/initramfs")
         );
     }
 
