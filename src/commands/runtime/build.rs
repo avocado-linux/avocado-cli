@@ -1189,7 +1189,7 @@ export AVOCADO_EXT_PAIRS="{ext_info_str}"
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil
+import json, hashlib, uuid, os, shutil, glob
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1224,12 +1224,11 @@ for pair in ext_pairs:
         entry["image_type"] = image_type
     extensions.append(entry)
 
-# rootfs / initramfs entries. Same content-addressing pattern as
-# extensions: sha256 of the on-disk image -> UUIDv5 image_id, copied
+# rootfs / initramfs / kernel entries. Same content-addressing pattern
+# as extensions: sha256 of the on-disk image -> UUIDv5 image_id, copied
 # into images_dir as <image_id>.raw. Skipped when the corresponding
-# image isn't built (no rootfs / no initramfs in the runtime config).
-def add_image_entry(env_var, version):
-    img_path = os.environ.get(env_var, "")
+# image isn't built (e.g. no rootfs / no initramfs / no kernel staged).
+def add_image_entry(img_path, version):
     if not (img_path and os.path.isfile(img_path)):
         return None
     with open(img_path, "rb") as f:
@@ -1240,10 +1239,10 @@ def add_image_entry(env_var, version):
     print("  Image: " + os.path.basename(img_path) + " -> " + image_id + ".raw")
     return dict(version=version, image_id=image_id, sha256=sha256)
 
-# Both rootfs and initramfs ship from the same avocado distro release,
-# so VERSION_ID is identical between their os-release files. Read once
-# from the rootfs os-release (already present and used by the os_bundle
-# patch later in the build).
+# rootfs, initramfs, and kernel all ship from the same avocado distro
+# release, so VERSION_ID is identical between their os-release files.
+# Read once from the rootfs os-release (already present and used by the
+# os_bundle patch later in the build). Apply to all three.
 version_id = ""
 os_release_path = os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "rootfs/usr/lib/os-release")
 if os.path.isfile(os_release_path):
@@ -1253,8 +1252,18 @@ if os.path.isfile(os_release_path):
                 version_id = line.strip().split("=", 1)[1].strip('"').strip("'")
                 break
 
-rootfs_entry = add_image_entry("AVOCADO_ROOTFS_IMAGE", version_id)
-initramfs_entry = add_image_entry("AVOCADO_INITRAMFS_IMAGE", version_id)
+# rootfs / initramfs paths come from env vars exported by their build
+# sub-scripts. The kernel image isn't a runtime-build artifact — it's
+# staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
+# Glob expects exactly one match (single kernel per OS release).
+kernel_matches = glob.glob(os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "kernel", "*", "Image"))
+if len(kernel_matches) > 1:
+    print("WARNING: multiple kernel images found, skipping kernel manifest block: " + repr(kernel_matches))
+kernel_path = kernel_matches[0] if len(kernel_matches) == 1 else ""
+
+rootfs_entry = add_image_entry(os.environ.get("AVOCADO_ROOTFS_IMAGE", ""), version_id)
+initramfs_entry = add_image_entry(os.environ.get("AVOCADO_INITRAMFS_IMAGE", ""), version_id)
+kernel_entry = add_image_entry(kernel_path, version_id)
 
 manifest = dict(
     manifest_version=2,
@@ -1266,6 +1275,8 @@ if rootfs_entry:
     manifest["rootfs"] = rootfs_entry
 if initramfs_entry:
     manifest["initramfs"] = initramfs_entry
+if kernel_entry:
+    manifest["kernel"] = kernel_entry
 manifest["extensions"] = extensions
 
 with open(manifest_path, "w") as f:
@@ -1281,6 +1292,8 @@ if rootfs_entry:
     current_image_files.add(rootfs_entry["image_id"] + ".raw")
 if initramfs_entry:
     current_image_files.add(initramfs_entry["image_id"] + ".raw")
+if kernel_entry:
+    current_image_files.add(kernel_entry["image_id"] + ".raw")
 for fname in os.listdir(images_dir):
     if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
@@ -1925,7 +1938,7 @@ print("Patched manifest with os_bundle reference.")
 current_image_files = set()
 for ext in manifest.get("extensions", []):
     current_image_files.add(ext["image_id"] + ".raw")
-for key in ("rootfs", "initramfs"):
+for key in ("rootfs", "initramfs", "kernel"):
     block = manifest.get(key)
     if block:
         current_image_files.add(block["image_id"] + ".raw")
@@ -2572,13 +2585,16 @@ extensions:
         assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
 
-        // rootfs / initramfs blocks: same content-addressing as extensions,
-        // sourced from $AVOCADO_ROOTFS_IMAGE / $AVOCADO_INITRAMFS_IMAGE.
+        // rootfs / initramfs / kernel blocks: same content-addressing as
+        // extensions, sourced from $AVOCADO_ROOTFS_IMAGE,
+        // $AVOCADO_INITRAMFS_IMAGE, and $AVOCADO_PREFIX/kernel/*/Image.
         assert!(script.contains("AVOCADO_ROOTFS_IMAGE"));
         assert!(script.contains("AVOCADO_INITRAMFS_IMAGE"));
+        assert!(script.contains("\"kernel\", \"*\", \"Image\""));
         assert!(script.contains("manifest[\"rootfs\"] = rootfs_entry"));
         assert!(script.contains("manifest[\"initramfs\"] = initramfs_entry"));
-        // VERSION_ID is sourced from rootfs os-release.
+        assert!(script.contains("manifest[\"kernel\"] = kernel_entry"));
+        // VERSION_ID is sourced from rootfs os-release; shared by all three.
         assert!(script.contains("VERSION_ID="));
 
         // Active symlink should be created
