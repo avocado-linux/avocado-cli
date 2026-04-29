@@ -31,11 +31,20 @@ fn parse_overlay_config(value: &serde_yaml::Value) -> (String, bool) {
 /// Build the shell snippet that applies an overlay directory into a sysroot.
 /// `overlay_dir` is the path relative to `/opt/src` (the project root inside the container).
 /// `sysroot_dir` is the sysroot subdirectory name (e.g., "rootfs", "initramfs").
+///
+/// The snippet sources the SDK's `environment-setup` to put SDK-provided tools
+/// (notably `rsync`) on `PATH`. The enclosing install command runs with
+/// `source_environment: false` to keep DNF's environment minimal, so the
+/// overlay step has to source the env itself.
 fn build_overlay_script(overlay_dir: &str, opaque: bool, sysroot_dir: &str) -> String {
+    let env_source = r#"if [ -f "${AVOCADO_SDK_PREFIX}/environment-setup" ]; then
+    . "${AVOCADO_SDK_PREFIX}/environment-setup"
+fi"#;
     if opaque {
         format!(
             r#"
 # Apply overlay (opaque mode) — cp -r replaces directory contents
+{env_source}
 if [ -d "/opt/src/{overlay_dir}" ]; then
     echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot (opaque mode)"
     cp -r "/opt/src/{overlay_dir}/." "$AVOCADO_PREFIX/{sysroot_dir}/"
@@ -50,6 +59,7 @@ fi
         format!(
             r#"
 # Apply overlay (merge mode) — rsync -a adds/replaces files, preserving others
+{env_source}
 if [ -d "/opt/src/{overlay_dir}" ]; then
     echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot (merge mode)"
     rsync -a --chown=root:root "/opt/src/{overlay_dir}/" "$AVOCADO_PREFIX/{sysroot_dir}/"
@@ -987,5 +997,57 @@ impl RootfsInstallCommand {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_overlay_script;
+
+    #[test]
+    fn overlay_script_sources_sdk_environment_in_merge_mode() {
+        // Merge mode uses rsync, which is provided by the SDK toolchain. The
+        // enclosing install command runs without sourcing the SDK env, so the
+        // overlay snippet must source `environment-setup` itself or rsync will
+        // not be on PATH.
+        let script = build_overlay_script("overlays/dev", false, "initramfs");
+        assert!(
+            script.contains(r#". "${AVOCADO_SDK_PREFIX}/environment-setup""#),
+            "merge-mode overlay script must source the SDK environment-setup; got:\n{script}"
+        );
+        assert!(script.contains("rsync -a --chown=root:root"));
+        assert!(script.contains("(merge mode)"));
+    }
+
+    #[test]
+    fn overlay_script_sources_sdk_environment_in_opaque_mode() {
+        // Opaque mode uses cp, which is universally available, but we still
+        // source the env for symmetry and to keep PATH consistent with any
+        // future tools used here.
+        let script = build_overlay_script("overlays/dev", true, "rootfs");
+        assert!(
+            script.contains(r#". "${AVOCADO_SDK_PREFIX}/environment-setup""#),
+            "opaque-mode overlay script must source the SDK environment-setup; got:\n{script}"
+        );
+        assert!(script.contains("cp -r"));
+        assert!(script.contains("(opaque mode)"));
+    }
+
+    #[test]
+    fn overlay_script_sources_sdk_environment_for_all_sysroots_and_modes() {
+        // Cover the full {rootfs, initramfs} × {merge, opaque} matrix to make
+        // it unambiguous that the env-source line is present regardless of
+        // which sysroot or mode is in use.
+        for sysroot_dir in ["rootfs", "initramfs"] {
+            for opaque in [false, true] {
+                let script = build_overlay_script("overlays/dev", opaque, sysroot_dir);
+                assert!(
+                    script.contains(r#". "${AVOCADO_SDK_PREFIX}/environment-setup""#),
+                    "overlay script for sysroot={sysroot_dir} opaque={opaque} must source \
+                     the SDK environment-setup; got:\n{script}"
+                );
+                assert!(script.contains(&format!(" to {sysroot_dir} sysroot ")));
+            }
+        }
     }
 }
