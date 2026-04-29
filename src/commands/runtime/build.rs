@@ -1224,13 +1224,49 @@ for pair in ext_pairs:
         entry["image_type"] = image_type
     extensions.append(entry)
 
+# rootfs / initramfs entries. Same content-addressing pattern as
+# extensions: sha256 of the on-disk image -> UUIDv5 image_id, copied
+# into images_dir as <image_id>.raw. Skipped when the corresponding
+# image isn't built (no rootfs / no initramfs in the runtime config).
+def add_image_entry(env_var, version):
+    img_path = os.environ.get(env_var, "")
+    if not (img_path and os.path.isfile(img_path)):
+        return None
+    with open(img_path, "rb") as f:
+        sha256 = hashlib.sha256(f.read()).hexdigest()
+    image_id = str(uuid.uuid5(namespace, sha256))
+    dest = os.path.join(images_dir, image_id + ".raw")
+    shutil.copy2(img_path, dest)
+    print("  Image: " + os.path.basename(img_path) + " -> " + image_id + ".raw")
+    return dict(version=version, image_id=image_id, sha256=sha256)
+
+# Both rootfs and initramfs ship from the same avocado distro release,
+# so VERSION_ID is identical between their os-release files. Read once
+# from the rootfs os-release (already present and used by the os_bundle
+# patch later in the build).
+version_id = ""
+os_release_path = os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "rootfs/usr/lib/os-release")
+if os.path.isfile(os_release_path):
+    with open(os_release_path) as f:
+        for line in f:
+            if line.startswith("VERSION_ID="):
+                version_id = line.strip().split("=", 1)[1].strip('"').strip("'")
+                break
+
+rootfs_entry = add_image_entry("AVOCADO_ROOTFS_IMAGE", version_id)
+initramfs_entry = add_image_entry("AVOCADO_INITRAMFS_IMAGE", version_id)
+
 manifest = dict(
     manifest_version=2,
     id=build_id,
     built_at=built_at,
     runtime=dict(name=runtime_name, version=runtime_version),
-    extensions=extensions,
 )
+if rootfs_entry:
+    manifest["rootfs"] = rootfs_entry
+if initramfs_entry:
+    manifest["initramfs"] = initramfs_entry
+manifest["extensions"] = extensions
 
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
@@ -1241,6 +1277,10 @@ current_image_files = set()
 for ext in extensions:
     suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
     current_image_files.add(ext["image_id"] + suffix)
+if rootfs_entry:
+    current_image_files.add(rootfs_entry["image_id"] + ".raw")
+if initramfs_entry:
+    current_image_files.add(initramfs_entry["image_id"] + ".raw")
 for fname in os.listdir(images_dir):
     if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
@@ -1885,6 +1925,10 @@ print("Patched manifest with os_bundle reference.")
 current_image_files = set()
 for ext in manifest.get("extensions", []):
     current_image_files.add(ext["image_id"] + ".raw")
+for key in ("rootfs", "initramfs"):
+    block = manifest.get(key)
+    if block:
+        current_image_files.add(block["image_id"] + ".raw")
 current_image_files.add(aos_image_id + ".raw")
 for fname in os.listdir(images_dir):
     if fname.endswith(".raw") and fname not in current_image_files:
@@ -2527,6 +2571,15 @@ extensions:
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
+
+        // rootfs / initramfs blocks: same content-addressing as extensions,
+        // sourced from $AVOCADO_ROOTFS_IMAGE / $AVOCADO_INITRAMFS_IMAGE.
+        assert!(script.contains("AVOCADO_ROOTFS_IMAGE"));
+        assert!(script.contains("AVOCADO_INITRAMFS_IMAGE"));
+        assert!(script.contains("manifest[\"rootfs\"] = rootfs_entry"));
+        assert!(script.contains("manifest[\"initramfs\"] = initramfs_entry"));
+        // VERSION_ID is sourced from rootfs os-release.
+        assert!(script.contains("VERSION_ID="));
 
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
