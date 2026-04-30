@@ -1431,10 +1431,15 @@ impl Config {
         let mut extension_sources: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        // Load main config content (raw, no interpolation yet)
+        // Load main config content. Interpolation runs immediately so every
+        // downstream consumer (extension discovery, source parsing, external
+        // config refs) operates on a fully-resolved tree. A second pass is
+        // applied below after merging external configs so any templates those
+        // configs introduce are also resolved.
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let mut main_config = Self::parse_config_value(&config_path_str, &content)?;
+        let mut main_config =
+            Self::parse_config_value_with_interpolation(&config_path_str, &content, target)?;
 
         // Record extensions from the main config
         if let Some(ext_section) = main_config.get("extensions").and_then(|e| e.as_mapping()) {
@@ -1583,9 +1588,10 @@ impl Config {
             }
         };
 
-        // Discover remote extensions from the main config (with target interpolation)
-        let remote_extensions =
-            Self::discover_remote_extensions_from_value(main_config, Some(&resolved_target))?;
+        // Discover remote extensions from the main config. The caller must have
+        // already interpolated `main_config` so extension names and source fields
+        // (url, ref, sparse_checkout, ...) are fully resolved.
+        let remote_extensions = Self::discover_remote_extensions_from_value(main_config)?;
 
         if remote_extensions.is_empty() {
             return Ok(extension_sources);
@@ -3732,7 +3738,11 @@ impl Config {
     /// Parse the source field from an extension configuration
     ///
     /// Returns Some(ExtensionSource) if the extension has a source field,
-    /// None if it's a local extension (no source field)
+    /// None if it's a local extension (no source field).
+    ///
+    /// `ext_config` must already be interpolated. Templates inside source
+    /// fields (e.g. `url`, `ref`, `sparse_checkout`, `version`, `path`,
+    /// `include`) are deserialized verbatim — they are not resolved here.
     pub fn parse_extension_source(
         ext_name: &str,
         ext_config: &serde_yaml::Value,
@@ -3765,35 +3775,29 @@ impl Config {
     ) -> Result<Vec<(String, ExtensionSource)>> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {config_path}"))?;
-        let parsed = Self::parse_config_value(config_path, &content)?;
+        let parsed = Self::parse_config_value_with_interpolation(config_path, &content, target)?;
 
-        Self::discover_remote_extensions_from_value(&parsed, target)
+        Self::discover_remote_extensions_from_value(&parsed)
     }
 
-    /// Discover remote extensions from a parsed config value
+    /// Discover remote extensions from a parsed config value.
     ///
-    /// If `target` is provided, extension names containing `{{ avocado.target }}`
-    /// will be interpolated with the target value.
+    /// The caller is responsible for ensuring `parsed` has already been
+    /// interpolated (e.g. via `parse_config_value_with_interpolation` or
+    /// `interpolation::interpolate_config`). All template strings inside
+    /// extension names and source blocks must be resolved before this runs;
+    /// otherwise they will be passed verbatim into `ExtensionSource` fields
+    /// like `Git.url` and `Git.sparse_checkout`.
     pub fn discover_remote_extensions_from_value(
         parsed: &serde_yaml::Value,
-        target: Option<&str>,
     ) -> Result<Vec<(String, ExtensionSource)>> {
-        use crate::utils::interpolation::interpolate_name;
-
         let mut remote_extensions = Vec::new();
 
         if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_name_key, ext_config) in ext_section {
-                if let Some(raw_ext_name) = ext_name_key.as_str() {
-                    // Interpolate extension name if target is provided
-                    let ext_name = if let Some(t) = target {
-                        interpolate_name(raw_ext_name, t)
-                    } else {
-                        raw_ext_name.to_string()
-                    };
-
-                    if let Some(source) = Self::parse_extension_source(&ext_name, ext_config)? {
-                        remote_extensions.push((ext_name, source));
+                if let Some(ext_name) = ext_name_key.as_str() {
+                    if let Some(source) = Self::parse_extension_source(ext_name, ext_config)? {
+                        remote_extensions.push((ext_name.to_string(), source));
                     }
                 }
             }
@@ -3912,21 +3916,17 @@ impl Config {
         extension_name: &str,
         target: &str,
     ) -> Result<Option<ExtensionLocation>> {
-        use crate::utils::interpolation::interpolate_name;
-
         let content = std::fs::read_to_string(config_path)?;
-        let parsed = Self::parse_config_value(config_path, &content)?;
+        let parsed =
+            Self::parse_config_value_with_interpolation(config_path, &content, Some(target))?;
 
-        // First check if it's defined in the ext section
-        // Need to iterate and interpolate keys since they may contain templates like {{ avocado.target }}
+        // First check if it's defined in the ext section.
+        // Keys are already interpolated by parse_config_value_with_interpolation.
         if let Some(ext_section) = parsed.get("extensions") {
             if let Some(ext_map) = ext_section.as_mapping() {
                 for (ext_key, ext_config) in ext_map {
-                    if let Some(raw_name) = ext_key.as_str() {
-                        // Interpolate the extension name with the target
-                        let interpolated_name = interpolate_name(raw_name, target);
-                        if interpolated_name == extension_name {
-                            // Check if this is a remote extension (has source: field)
+                    if let Some(name) = ext_key.as_str() {
+                        if name == extension_name {
                             if let Some(source) =
                                 Self::parse_extension_source(extension_name, ext_config)?
                             {
@@ -3935,7 +3935,6 @@ impl Config {
                                     source,
                                 }));
                             }
-                            // Otherwise it's a local extension
                             return Ok(Some(ExtensionLocation::Local {
                                 name: extension_name.to_string(),
                                 config_path: config_path.to_string(),
@@ -3952,25 +3951,20 @@ impl Config {
         if let Some(runtime_section) = runtime_section {
             for (runtime_name_key, _) in runtime_section {
                 if let Some(runtime_name) = runtime_name_key.as_str() {
-                    // Get merged runtime config for this target
                     let merged_runtime =
                         self.get_merged_runtime_config(runtime_name, target, config_path)?;
                     if let Some(merged_value) = merged_runtime {
-                        // Check the new `extensions` array format
                         if let Some(extensions) =
                             merged_value.get("extensions").and_then(|e| e.as_sequence())
                         {
                             for ext in extensions {
                                 if let Some(ext_name) = ext.as_str() {
                                     if ext_name == extension_name {
-                                        // Found in extensions array - now find its definition in ext section
                                         if let Some(ext_section) = parsed.get("extensions") {
                                             if let Some(ext_map) = ext_section.as_mapping() {
                                                 for (ext_key, ext_config) in ext_map {
-                                                    if let Some(raw_name) = ext_key.as_str() {
-                                                        let interpolated =
-                                                            interpolate_name(raw_name, target);
-                                                        if interpolated == extension_name {
+                                                    if let Some(name) = ext_key.as_str() {
+                                                        if name == extension_name {
                                                             if let Some(source) =
                                                                 Self::parse_extension_source(
                                                                     extension_name,
@@ -10249,5 +10243,56 @@ runtimes:
                 && err.contains("Available: base"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_discover_remote_extensions_interpolates_source_block() {
+        // Regression: templates inside `source` (url, ref, sparse_checkout)
+        // were previously left literal because `discover_remote_extensions`
+        // only interpolated the extension name.
+        let yaml = r#"
+default_target: imx8mp-evk
+distro:
+  channel: apollo-edge
+extensions:
+  avocado-bsp-{{ avocado.target }}:
+    source:
+      type: git
+      url: https://example.com/{{ avocado.distro.channel }}/avocado-os
+      ref: "branch-{{ avocado.target }}"
+      sparse_checkout:
+        - bsp/{{ avocado.target }}
+        - shared/{{ avocado.distro.channel }}
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{yaml}").unwrap();
+        let path = temp_file.path().to_str().unwrap();
+
+        let remote = Config::discover_remote_extensions(path, Some("imx8mp-evk")).unwrap();
+        assert_eq!(remote.len(), 1);
+        let (name, source) = &remote[0];
+        assert_eq!(name, "avocado-bsp-imx8mp-evk");
+        match source {
+            ExtensionSource::Git {
+                url,
+                git_ref,
+                sparse_checkout,
+                ..
+            } => {
+                assert_eq!(url, "https://example.com/apollo-edge/avocado-os");
+                assert_eq!(git_ref.as_deref(), Some("branch-imx8mp-evk"));
+                assert_eq!(
+                    sparse_checkout.as_deref(),
+                    Some(
+                        &[
+                            "bsp/imx8mp-evk".to_string(),
+                            "shared/apollo-edge".to_string()
+                        ][..]
+                    )
+                );
+            }
+            other => panic!("expected Git source, got {other:?}"),
+        }
     }
 }
