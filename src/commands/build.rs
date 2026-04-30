@@ -515,8 +515,6 @@ impl BuildCommand {
         runtimes: &[String],
         target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
-        use crate::utils::interpolation::interpolate_name;
-
         let mut required_extensions = HashSet::new();
         let _visited = HashSet::<String>::new(); // For cycle detection
 
@@ -525,20 +523,17 @@ impl BuildCommand {
             return Ok(vec![]);
         }
 
-        // Build a map of interpolated ext names to their source config
-        // This is needed because ext section keys may contain templates like {{ avocado.target }}
+        // `parsed` comes from the composed config and is already fully interpolated,
+        // so extension keys and their `source` blocks are resolved.
         let mut ext_sources: std::collections::HashMap<String, Option<ExtensionSource>> =
             std::collections::HashMap::new();
         if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_key, ext_config) in ext_section {
-                if let Some(raw_name) = ext_key.as_str() {
-                    // Interpolate the extension name with the target
-                    let interpolated_name = interpolate_name(raw_name, target);
-                    // Use parse_extension_source which properly deserializes the source field
-                    let source = Config::parse_extension_source(&interpolated_name, ext_config)
+                if let Some(name) = ext_key.as_str() {
+                    let source = Config::parse_extension_source(name, ext_config)
                         .ok()
                         .flatten();
-                    ext_sources.insert(interpolated_name, source);
+                    ext_sources.insert(name.to_string(), source);
                 }
             }
         }
@@ -767,7 +762,7 @@ impl BuildCommand {
             OutputLevel::Normal,
         );
         let required_extensions =
-            self.find_extensions_for_runtime(config, parsed, &runtime_config, target)?;
+            self.find_extensions_for_runtime(config, parsed, &runtime_config)?;
 
         // Note: SDK compile sections are now compiled on-demand when extensions are built
         // This prevents duplicate compilation when sdk.compile sections are also extension dependencies
@@ -909,27 +904,21 @@ impl BuildCommand {
         config: &Config,
         parsed: &serde_yaml::Value,
         runtime_config: &serde_yaml::Value,
-        target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
-        use crate::utils::interpolation::interpolate_name;
-
         let mut required_extensions = HashSet::new();
         let mut visited = HashSet::new();
 
-        // Build a map of interpolated ext names to their source config
-        // This is needed because ext section keys may contain templates like {{ avocado.target }}
+        // `parsed` comes from the composed config and is already fully interpolated,
+        // so extension keys and their `source` blocks are resolved.
         let mut ext_sources: std::collections::HashMap<String, Option<ExtensionSource>> =
             std::collections::HashMap::new();
         if let Some(ext_section) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_key, ext_config) in ext_section {
-                if let Some(raw_name) = ext_key.as_str() {
-                    // Interpolate the extension name with the target
-                    let interpolated_name = interpolate_name(raw_name, target);
-                    // Use parse_extension_source which properly deserializes the source field
-                    let source = Config::parse_extension_source(&interpolated_name, ext_config)
+                if let Some(name) = ext_key.as_str() {
+                    let source = Config::parse_extension_source(name, ext_config)
                         .ok()
                         .flatten();
-                    ext_sources.insert(interpolated_name, source);
+                    ext_sources.insert(name.to_string(), source);
                 }
             }
         }
