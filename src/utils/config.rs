@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -3734,70 +3734,162 @@ impl Config {
         }
     }
 
-    /// Get stone include paths for a runtime and convert them to container paths
-    /// Returns a space-separated string of absolute paths from the container's perspective
-    /// (e.g., "/opt/src/path1 /opt/src/path2")
+    /// Get stone include paths for a runtime and convert them to container paths.
+    ///
+    /// Returns a space-separated string of paths from the container's
+    /// perspective. The composed list is built from two origins, in this
+    /// priority order (earlier entries win on stone's first-hit search):
+    ///
+    /// 1. **Runtime-level** `runtimes.<name>.stone_include_paths` — paths
+    ///    declared by the consumer's own avocado.yaml. Resolved relative to
+    ///    the consumer's src_dir and emitted as `/opt/src/<path>`.
+    /// 2. **Per-extension** `extensions.<ext>.stone_include_paths`, walked
+    ///    in the order extensions appear in the runtime's `extensions: [...]`
+    ///    array. Each path is emitted *scoped to that extension's location*:
+    ///    - **Local / inline** extensions (defined in the consumer's own
+    ///      avocado.yaml) emit `/opt/src/<path>` — same project as the
+    ///      consumer.
+    ///    - **Remote** extensions (Package / Git / Path source, fetched
+    ///      into the SDK at `$AVOCADO_PREFIX/includes/<ext-name>/`) emit
+    ///      `$AVOCADO_PREFIX/includes/<ext-name>/<path>`. This is the same
+    ///      scoping rule the existing `overlay:` field uses, so an
+    ///      extension's relative path always resolves to the extension's
+    ///      own working tree, never to a coincidentally-named directory in
+    ///      the consumer's project.
+    ///
+    /// Absolute paths are emitted verbatim regardless of origin.
+    /// Duplicates are de-duplicated, preserving the highest-priority
+    /// occurrence.
     pub fn get_stone_include_paths_for_runtime<P: AsRef<Path>>(
         &self,
         runtime_name: &str,
         target: &str,
         config_path: P,
     ) -> Result<Option<String>> {
-        // Get merged runtime config to include target-specific overrides
         let config_path_str = config_path
             .as_ref()
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in config path"))?;
         let merged_runtime =
             self.get_merged_runtime_config(runtime_name, target, config_path_str)?;
+        let Some(merged_runtime) = merged_runtime else {
+            return Ok(None);
+        };
 
-        // Extract stone_include_paths and convert to owned Vec<String>
-        let stone_paths: Option<Vec<String>> = merged_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.get("stone_include_paths"))
-            .and_then(|paths| paths.as_sequence())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>()
-            });
+        // Resolve the consumer project's src_dir once for the /opt/src/ path
+        // emission used by both runtime-level entries and local-extension
+        // entries.
+        let consumer_src_dir = self.get_resolved_src_dir(&config_path).unwrap_or_else(|| {
+            config_path
+                .as_ref()
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
 
-        if let Some(paths) = stone_paths {
-            if paths.is_empty() {
-                return Ok(None);
+        // Helper: convert a path declared against the consumer project's
+        // src_dir into a /opt/src/<...> container path. Mirrors the legacy
+        // resolution behavior so existing runtime-level paths stay byte-
+        // identical to the previous CLI output.
+        let to_consumer_opt_src = |path: &str| -> String {
+            if Path::new(path).is_absolute() {
+                return path.to_string();
             }
+            let resolved = self.resolve_path_relative_to_src_dir(&config_path, path);
+            if let Ok(relative) = resolved.strip_prefix(&consumer_src_dir) {
+                format!("/opt/src/{}", relative.display())
+            } else {
+                format!("/opt/src/{path}")
+            }
+        };
 
-            // Get the resolved src_dir (or config directory if src_dir not set)
-            let src_dir = self.get_resolved_src_dir(&config_path).unwrap_or_else(|| {
-                config_path
-                    .as_ref()
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .to_path_buf()
-            });
+        // Helper: convert a path declared by a remote extension into a
+        // $AVOCADO_PREFIX/includes/<ext-name>/<path> container path. Absolute
+        // paths pass through. The extension's working tree is fetched into
+        // $AVOCADO_PREFIX/includes/<ext-name>/ at SDK preparation time, so
+        // any relative path the extension declares resolves there — not to
+        // /opt/src, which is the consumer's project.
+        let to_remote_extension_path = |ext_name: &str, path: &str| -> String {
+            if Path::new(path).is_absolute() {
+                return path.to_string();
+            }
+            format!("$AVOCADO_PREFIX/includes/{ext_name}/{path}")
+        };
 
-            // Convert each path to a container path
-            let container_paths: Vec<String> = paths
-                .iter()
-                .map(|path| {
-                    // Resolve the path relative to src_dir
-                    let resolved = self.resolve_path_relative_to_src_dir(&config_path, path);
+        let mut composed: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let push_unique =
+            |composed: &mut Vec<String>, seen: &mut HashSet<String>, value: String| {
+                if seen.insert(value.clone()) {
+                    composed.push(value);
+                }
+            };
 
-                    // Convert to container path by replacing src_dir with /opt/src
-                    // The resolved path should be under src_dir
-                    if let Ok(relative) = resolved.strip_prefix(&src_dir) {
-                        format!("/opt/src/{}", relative.display())
-                    } else {
-                        // If not under src_dir, just append to /opt/src
-                        format!("/opt/src/{path}")
+        // 1. Runtime-level paths (highest priority).
+        if let Some(arr) = merged_runtime
+            .get("stone_include_paths")
+            .and_then(|v| v.as_sequence())
+        {
+            for v in arr {
+                if let Some(path) = v.as_str() {
+                    push_unique(&mut composed, &mut seen, to_consumer_opt_src(path));
+                }
+            }
+        }
+
+        // 2. Per-extension paths, in the order extensions appear in the
+        //    runtime's `extensions: [...]` array. Each extension's
+        //    stone_include_paths is read from its merged config (so target-
+        //    specific overrides inside the extension definition apply), and
+        //    each path is emitted scoped to that extension's location.
+        if let Some(extensions) = merged_runtime
+            .get("extensions")
+            .and_then(|v| v.as_sequence())
+        {
+            for ext_val in extensions {
+                let Some(ext_name) = ext_val.as_str() else {
+                    continue;
+                };
+
+                let ext_config = self.get_merged_ext_config(ext_name, target, config_path_str)?;
+                let Some(ext_config) = ext_config else {
+                    continue;
+                };
+                let Some(arr) = ext_config
+                    .get("stone_include_paths")
+                    .and_then(|v| v.as_sequence())
+                else {
+                    continue;
+                };
+
+                let ext_location =
+                    self.find_extension_in_dependency_tree(config_path_str, ext_name, target)?;
+                let is_remote = matches!(ext_location, Some(ExtensionLocation::Remote { .. }));
+
+                for v in arr {
+                    if let Some(path) = v.as_str() {
+                        let container_path = if is_remote {
+                            to_remote_extension_path(ext_name, path)
+                        } else {
+                            // Local / inline extension: defined in the
+                            // consumer's own avocado.yaml, so its relative
+                            // paths resolve against the consumer src_dir
+                            // exactly like a runtime-level entry. Same
+                            // fallback applies when the extension isn't
+                            // discoverable via find_extension_in_dependency_tree
+                            // (treat as local for the conservative case).
+                            to_consumer_opt_src(path)
+                        };
+                        push_unique(&mut composed, &mut seen, container_path);
                     }
-                })
-                .collect();
+                }
+            }
+        }
 
-            Ok(Some(container_paths.join(" ")))
-        } else {
+        if composed.is_empty() {
             Ok(None)
+        } else {
+            Ok(Some(composed.join(" ")))
         }
     }
 
@@ -7819,6 +7911,314 @@ runtimes:
 
         // Empty array should return None
         assert!(stone_paths.is_none());
+    }
+
+    #[test]
+    fn test_stone_include_paths_inline_extension_resolves_to_opt_src() {
+        // Inline extension (defined in the consumer's own avocado.yaml) is
+        // a Local extension. Its relative paths emit /opt/src/<path>, same
+        // as the consumer's runtime-level entries.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    extensions: [my-inline-ext]
+
+extensions:
+  my-inline-ext:
+    version: "1.0.0"
+    stone_include_paths: ["bsp/inline/stone"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap();
+        assert_eq!(stone_paths.unwrap(), "/opt/src/bsp/inline/stone");
+    }
+
+    #[test]
+    fn test_stone_include_paths_remote_extension_resolves_to_includes_dir() {
+        // Load-bearing scoping test. A remote extension's relative
+        // stone_include_paths must emit $AVOCADO_PREFIX/includes/<ext>/<path>,
+        // NEVER /opt/src/<path>. The consumer's project src_dir is
+        // unrelated to the extension's working tree.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    extensions: [avocado-bsp-icam-540]
+
+extensions:
+  avocado-bsp-icam-540:
+    version: "1.0.0"
+    source:
+      type: "package"
+      version: "*"
+    stone_include_paths: ["stone"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap();
+        assert_eq!(
+            stone_paths.unwrap(),
+            "$AVOCADO_PREFIX/includes/avocado-bsp-icam-540/stone"
+        );
+    }
+
+    #[test]
+    fn test_stone_include_paths_remote_extension_does_not_collide_with_consumer_dir() {
+        // Guards the silent "wrong stone dir matched" failure mode: a
+        // remote extension declaring `stone_include_paths: [stone]` must
+        // resolve to its own $AVOCADO_PREFIX/includes/<ext>/stone even
+        // when the consumer happens to have a `stone` directory of its
+        // own that the consumer's runtime also references.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    stone_include_paths: ["stone"]
+    extensions: [avocado-bsp-foo]
+
+extensions:
+  avocado-bsp-foo:
+    version: "1.0.0"
+    source:
+      type: "git"
+      url: "https://example.com/foo.git"
+    stone_include_paths: ["stone"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+
+        // The consumer's `stone` resolves to /opt/src/stone (highest
+        // priority). The extension's `stone` is distinct: it's
+        // $AVOCADO_PREFIX/includes/avocado-bsp-foo/stone. Both must appear.
+        assert!(
+            stone_paths.contains("/opt/src/stone"),
+            "consumer runtime stone path missing: {stone_paths}"
+        );
+        assert!(
+            stone_paths.contains("$AVOCADO_PREFIX/includes/avocado-bsp-foo/stone"),
+            "remote extension stone path missing: {stone_paths}"
+        );
+        // /opt/src/stone must come first (runtime priority).
+        let consumer_idx = stone_paths.find("/opt/src/stone").unwrap();
+        let remote_idx = stone_paths
+            .find("$AVOCADO_PREFIX/includes/avocado-bsp-foo/stone")
+            .unwrap();
+        assert!(
+            consumer_idx < remote_idx,
+            "runtime path must precede remote extension path: {stone_paths}"
+        );
+    }
+
+    #[test]
+    fn test_stone_include_paths_multiple_extensions_in_array_order() {
+        // `extensions: [a, b, c]` with each contributing a distinct stone
+        // path: composed list preserves array order. Earlier entries win
+        // on stone's first-hit search semantics.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    extensions: [ext-a, ext-b, ext-c]
+
+extensions:
+  ext-a:
+    version: "1.0.0"
+    source:
+      type: "package"
+      version: "*"
+    stone_include_paths: ["stone-a"]
+  ext-b:
+    version: "1.0.0"
+    source:
+      type: "package"
+      version: "*"
+    stone_include_paths: ["stone-b"]
+  ext-c:
+    version: "1.0.0"
+    source:
+      type: "package"
+      version: "*"
+    stone_include_paths: ["stone-c"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            stone_paths,
+            "$AVOCADO_PREFIX/includes/ext-a/stone-a \
+$AVOCADO_PREFIX/includes/ext-b/stone-b \
+$AVOCADO_PREFIX/includes/ext-c/stone-c"
+        );
+    }
+
+    #[test]
+    fn test_stone_include_paths_runtime_first_then_extension() {
+        // Both runtime and extension declare paths. The runtime path comes
+        // first (highest priority), then the extension path.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    stone_include_paths: ["consumer-stone"]
+    extensions: [avocado-bsp-foo]
+
+extensions:
+  avocado-bsp-foo:
+    version: "1.0.0"
+    source:
+      type: "package"
+      version: "*"
+    stone_include_paths: ["ext-stone"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stone_paths,
+            "/opt/src/consumer-stone $AVOCADO_PREFIX/includes/avocado-bsp-foo/ext-stone"
+        );
+    }
+
+    #[test]
+    fn test_stone_include_paths_dedup_preserves_first_occurrence() {
+        // Same literal path declared by both runtime and an extension: it
+        // appears once at the highest-priority (runtime) position.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    stone_include_paths: ["/abs/shared"]
+    extensions: [my-ext]
+
+extensions:
+  my-ext:
+    version: "1.0.0"
+    stone_include_paths: ["/abs/shared"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stone_paths, "/abs/shared");
+    }
+
+    #[test]
+    fn test_stone_include_paths_absolute_path_passes_through() {
+        // Absolute paths are emitted verbatim regardless of origin.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    stone_include_paths: ["/abs/runtime"]
+    extensions: [my-ext]
+
+extensions:
+  my-ext:
+    version: "1.0.0"
+    source:
+      type: "package"
+      version: "*"
+    stone_include_paths: ["/abs/extension"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stone_paths, "/abs/runtime /abs/extension");
+    }
+
+    #[test]
+    fn test_stone_include_paths_extension_only_no_runtime() {
+        // Runtime declares no stone_include_paths but enables an extension
+        // that does. Composed list contains just the extension path.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  dev:
+    target: "x86_64"
+    extensions: [my-ext]
+
+extensions:
+  my-ext:
+    version: "1.0.0"
+    stone_include_paths: ["bsp/my-ext/stone"]
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+
+        let config = Config::load(temp_file.path()).unwrap();
+        let stone_paths = config
+            .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+        // Inline (no `source:`) extension → /opt/src/<path>.
+        assert_eq!(stone_paths, "/opt/src/bsp/my-ext/stone");
     }
 
     #[test]
