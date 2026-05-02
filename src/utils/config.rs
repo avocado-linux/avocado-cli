@@ -3750,12 +3750,15 @@ impl Config {
     ///      avocado.yaml) emit `/opt/src/<path>` — same project as the
     ///      consumer.
     ///    - **Remote** extensions (Package / Git / Path source, fetched
-    ///      into the SDK at `$AVOCADO_PREFIX/includes/<ext-name>/`) emit
-    ///      `$AVOCADO_PREFIX/includes/<ext-name>/<path>`. This is the same
-    ///      scoping rule the existing `overlay:` field uses, so an
-    ///      extension's relative path always resolves to the extension's
-    ///      own working tree, never to a coincidentally-named directory in
-    ///      the consumer's project.
+    ///      into the SDK at `/opt/_avocado/<target>/includes/<ext-name>/`)
+    ///      emit `/opt/_avocado/<target>/includes/<ext-name>/<path>`. This
+    ///      is the same scoping rule the existing `overlay:` field uses,
+    ///      so an extension's relative path always resolves to the
+    ///      extension's own working tree, never to a coincidentally-named
+    ///      directory in the consumer's project. (Absolute path rather
+    ///      than `$AVOCADO_PREFIX/...` because the recipe scripts that
+    ///      consume `AVOCADO_STONE_INCLUDE_PATHS` don't re-expand shell
+    ///      variables embedded in env var values.)
     ///
     /// Absolute paths are emitted verbatim regardless of origin.
     /// Duplicates are de-duplicated, preserving the highest-priority
@@ -3803,20 +3806,32 @@ impl Config {
             }
         };
 
-        // Helper: convert a path declared by a remote extension into a
-        // $AVOCADO_PREFIX/includes/<ext-name>/<path> container path. Absolute
-        // paths pass through. The extension's working tree is fetched into
-        // $AVOCADO_PREFIX/includes/<ext-name>/ at SDK preparation time, so
-        // any relative path the extension declares resolves there — not to
-        // /opt/src, which is the consumer's project.
+        // Helper: convert a path declared by a remote extension into the
+        // absolute container path under /opt/_avocado/<target>/includes/.
+        //
+        // Why absolute and not "$AVOCADO_PREFIX/...": this string ends up
+        // as an entry inside the AVOCADO_STONE_INCLUDE_PATHS env var. The
+        // recipe scripts iterate that var with `for path in
+        // $AVOCADO_STONE_INCLUDE_PATHS` — bash does NOT perform variable
+        // expansion on the contents of an env var value, so a literal
+        // "$AVOCADO_PREFIX" survives unchanged into stone's `-i` flag and
+        // resolves to a non-existent path. The SDK convention is
+        // `/opt/_avocado/<MACHINE_SHORT_NAME>/`, where MACHINE_SHORT_NAME
+        // is the target name (set by meta-avocado/conf/distro/avocado.inc
+        // as `MACHINE - "avocado-"`), so we emit that path directly.
+        //
+        // Extension working trees are bind-mounted/fetched into
+        // /opt/_avocado/<target>/includes/<ext-name>/ at SDK prep time —
+        // any relative path the extension declares resolves there, not to
+        // /opt/src (the consumer's project).
         let to_remote_extension_path = |ext_name: &str, path: &str| -> String {
             if Path::new(path).is_absolute() {
                 return path.to_string();
             }
-            format!("$AVOCADO_PREFIX/includes/{ext_name}/{path}")
+            format!("/opt/_avocado/{target}/includes/{ext_name}/{path}")
         };
 
-        let mut composed: Vec<String> = Vec::new();
+        let mut composed_paths: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let push_unique =
             |composed: &mut Vec<String>, seen: &mut HashSet<String>, value: String| {
@@ -3832,39 +3847,81 @@ impl Config {
         {
             for v in arr {
                 if let Some(path) = v.as_str() {
-                    push_unique(&mut composed, &mut seen, to_consumer_opt_src(path));
+                    push_unique(&mut composed_paths, &mut seen, to_consumer_opt_src(path));
                 }
             }
         }
 
         // 2. Per-extension paths, in the order extensions appear in the
-        //    runtime's `extensions: [...]` array. Each extension's
-        //    stone_include_paths is read from its merged config (so target-
-        //    specific overrides inside the extension definition apply), and
-        //    each path is emitted scoped to that extension's location.
+        //    runtime's `extensions: [...]` array.
+        //
+        //    Critical: read extension content from the **composed** merged
+        //    value, not the raw on-disk consumer config. Remote extensions
+        //    (`source: { type: path | git | package, ... }`) only have their
+        //    `source:` block in the consumer's yaml; their actual fields —
+        //    including their own `stone_include_paths` — live in the fetched
+        //    extension's avocado.yaml and are merged into `merged_value`
+        //    during `load_composed`. Reading from `get_merged_ext_config`
+        //    here would silently drop those entries.
         if let Some(extensions) = merged_runtime
             .get("extensions")
             .and_then(|v| v.as_sequence())
         {
+            // Lazily load the composed config — only if the runtime
+            // actually references at least one extension. Skips the load
+            // entirely for runtime-only configurations.
+            let composed = Self::load_composed(config_path.as_ref(), Some(target))
+                .with_context(|| format!("Failed to load composed config: {config_path_str}"))?;
+
             for ext_val in extensions {
                 let Some(ext_name) = ext_val.as_str() else {
                     continue;
                 };
 
-                let ext_config = self.get_merged_ext_config(ext_name, target, config_path_str)?;
-                let Some(ext_config) = ext_config else {
+                // Look up the extension's content in the composed merged
+                // value. Handles template keys like
+                // `avocado-bsp-{{ avocado.target }}` via the same direct-
+                // then-interpolated pattern used by `find_ext_in_mapping`
+                // in commands/ext/mod.rs.
+                let Some(ext_value) = composed.merged_value.get("extensions").and_then(|exts| {
+                    exts.get(ext_name).or_else(|| {
+                        use crate::utils::interpolation::interpolate_name;
+                        exts.as_mapping().and_then(|m| {
+                            m.iter().find_map(|(k, v)| {
+                                let key_str = k.as_str()?;
+                                if key_str.contains("{{")
+                                    && interpolate_name(key_str, target) == ext_name
+                                {
+                                    Some(v)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                }) else {
                     continue;
                 };
-                let Some(arr) = ext_config
+
+                let Some(arr) = ext_value
                     .get("stone_include_paths")
                     .and_then(|v| v.as_sequence())
                 else {
                     continue;
                 };
 
-                let ext_location =
-                    self.find_extension_in_dependency_tree(config_path_str, ext_name, target)?;
-                let is_remote = matches!(ext_location, Some(ExtensionLocation::Remote { .. }));
+                // Determine local vs remote by the presence of a `source:`
+                // field on the extension. Remote extensions (path / git /
+                // package source) are installed under
+                // $AVOCADO_PREFIX/includes/<ext-name>/ at SDK preparation
+                // time — relative paths the extension declares must
+                // resolve there, never against the consumer project's
+                // src_dir. Inline extensions have no `source:` and live in
+                // the consumer's own avocado.yaml, so /opt/src/<path>
+                // applies. (Using the merged_value field avoids depending
+                // on extension_sources being populated, which only happens
+                // after `avocado ext install` for some sources.)
+                let is_remote = ext_value.get("source").is_some();
 
                 for v in arr {
                     if let Some(path) = v.as_str() {
@@ -3874,22 +3931,19 @@ impl Config {
                             // Local / inline extension: defined in the
                             // consumer's own avocado.yaml, so its relative
                             // paths resolve against the consumer src_dir
-                            // exactly like a runtime-level entry. Same
-                            // fallback applies when the extension isn't
-                            // discoverable via find_extension_in_dependency_tree
-                            // (treat as local for the conservative case).
+                            // exactly like a runtime-level entry.
                             to_consumer_opt_src(path)
                         };
-                        push_unique(&mut composed, &mut seen, container_path);
+                        push_unique(&mut composed_paths, &mut seen, container_path);
                     }
                 }
             }
         }
 
-        if composed.is_empty() {
+        if composed_paths.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(composed.join(" ")))
+            Ok(Some(composed_paths.join(" ")))
         }
     }
 
@@ -7946,9 +8000,10 @@ extensions:
     #[test]
     fn test_stone_include_paths_remote_extension_resolves_to_includes_dir() {
         // Load-bearing scoping test. A remote extension's relative
-        // stone_include_paths must emit $AVOCADO_PREFIX/includes/<ext>/<path>,
-        // NEVER /opt/src/<path>. The consumer's project src_dir is
-        // unrelated to the extension's working tree.
+        // stone_include_paths must emit
+        // /opt/_avocado/<target>/includes/<ext>/<path>, NEVER /opt/src/<path>.
+        // The consumer's project src_dir is unrelated to the extension's
+        // working tree.
         let config_content = r#"
 sdk:
   image: "docker.io/avocadolinux/sdk:latest"
@@ -7976,7 +8031,7 @@ extensions:
             .unwrap();
         assert_eq!(
             stone_paths.unwrap(),
-            "$AVOCADO_PREFIX/includes/avocado-bsp-icam-540/stone"
+            "/opt/_avocado/x86_64/includes/avocado-bsp-icam-540/stone"
         );
     }
 
@@ -7984,9 +8039,9 @@ extensions:
     fn test_stone_include_paths_remote_extension_does_not_collide_with_consumer_dir() {
         // Guards the silent "wrong stone dir matched" failure mode: a
         // remote extension declaring `stone_include_paths: [stone]` must
-        // resolve to its own $AVOCADO_PREFIX/includes/<ext>/stone even
-        // when the consumer happens to have a `stone` directory of its
-        // own that the consumer's runtime also references.
+        // resolve to its own /opt/_avocado/<target>/includes/<ext>/stone
+        // even when the consumer happens to have a `stone` directory of
+        // its own that the consumer's runtime also references.
         let config_content = r#"
 sdk:
   image: "docker.io/avocadolinux/sdk:latest"
@@ -8016,20 +8071,21 @@ extensions:
             .unwrap();
 
         // The consumer's `stone` resolves to /opt/src/stone (highest
-        // priority). The extension's `stone` is distinct: it's
-        // $AVOCADO_PREFIX/includes/avocado-bsp-foo/stone. Both must appear.
+        // priority). The extension's `stone` is distinct:
+        // /opt/_avocado/x86_64/includes/avocado-bsp-foo/stone. Both
+        // must appear.
         assert!(
             stone_paths.contains("/opt/src/stone"),
             "consumer runtime stone path missing: {stone_paths}"
         );
         assert!(
-            stone_paths.contains("$AVOCADO_PREFIX/includes/avocado-bsp-foo/stone"),
+            stone_paths.contains("/opt/_avocado/x86_64/includes/avocado-bsp-foo/stone"),
             "remote extension stone path missing: {stone_paths}"
         );
         // /opt/src/stone must come first (runtime priority).
         let consumer_idx = stone_paths.find("/opt/src/stone").unwrap();
         let remote_idx = stone_paths
-            .find("$AVOCADO_PREFIX/includes/avocado-bsp-foo/stone")
+            .find("/opt/_avocado/x86_64/includes/avocado-bsp-foo/stone")
             .unwrap();
         assert!(
             consumer_idx < remote_idx,
@@ -8083,9 +8139,9 @@ extensions:
 
         assert_eq!(
             stone_paths,
-            "$AVOCADO_PREFIX/includes/ext-a/stone-a \
-$AVOCADO_PREFIX/includes/ext-b/stone-b \
-$AVOCADO_PREFIX/includes/ext-c/stone-c"
+            "/opt/_avocado/x86_64/includes/ext-a/stone-a \
+/opt/_avocado/x86_64/includes/ext-b/stone-b \
+/opt/_avocado/x86_64/includes/ext-c/stone-c"
         );
     }
 
@@ -8122,7 +8178,7 @@ extensions:
             .unwrap();
         assert_eq!(
             stone_paths,
-            "/opt/src/consumer-stone $AVOCADO_PREFIX/includes/avocado-bsp-foo/ext-stone"
+            "/opt/src/consumer-stone /opt/_avocado/x86_64/includes/avocado-bsp-foo/ext-stone"
         );
     }
 
