@@ -215,6 +215,7 @@ mod tests {
             cli_requirement: None,
             source_date_epoch: None,
             default_target: None,
+            default_target_board: None,
             supported_targets: None,
             src_dir: None,
             distro: None,

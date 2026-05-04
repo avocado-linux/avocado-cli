@@ -148,6 +148,83 @@ runtimes:
     assert_eq!(target, "{{ avocado.target }}");
 }
 
+#[test]
+#[serial]
+fn test_avocado_target_board_from_env() {
+    env::remove_var("AVOCADO_TARGET");
+    env::set_var("AVOCADO_TARGET_BOARD", "imx8mp-evk-rev3");
+
+    let test_yaml = r#"
+default_target: imx8mp-evk
+default_target_board: config-board
+runtimes:
+  dev:
+    image: "ghcr.io/avocado/{{ avocado.target.board }}"
+"#;
+    let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+
+    let dev = parsed
+        .get("runtimes")
+        .and_then(|r| r.get("dev"))
+        .and_then(|d| d.get("image"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(dev, "ghcr.io/avocado/imx8mp-evk-rev3");
+
+    env::remove_var("AVOCADO_TARGET_BOARD");
+}
+
+#[test]
+#[serial]
+fn test_avocado_target_board_from_config() {
+    env::remove_var("AVOCADO_TARGET");
+    env::remove_var("AVOCADO_TARGET_BOARD");
+
+    let test_yaml = r#"
+default_target: imx8mp-evk
+default_target_board: imx8mp-evk-rev3
+runtimes:
+  dev:
+    image: "ghcr.io/avocado/{{ avocado.target.board }}"
+"#;
+    let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+
+    let dev = parsed
+        .get("runtimes")
+        .and_then(|r| r.get("dev"))
+        .and_then(|d| d.get("image"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(dev, "ghcr.io/avocado/imx8mp-evk-rev3");
+}
+
+#[test]
+#[serial]
+fn test_avocado_target_board_defaults_to_target() {
+    env::remove_var("AVOCADO_TARGET");
+    env::remove_var("AVOCADO_TARGET_BOARD");
+
+    // No board source set anywhere; expect target value to flow through.
+    let test_yaml = r#"
+default_target: imx8mp-evk
+runtimes:
+  dev:
+    image: "ghcr.io/avocado/{{ avocado.target.board }}"
+"#;
+    let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+
+    let dev = parsed
+        .get("runtimes")
+        .and_then(|r| r.get("dev"))
+        .and_then(|d| d.get("image"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(dev, "ghcr.io/avocado/imx8mp-evk");
+}
+
 /// Helper to get the full error chain as a string for assertions.
 fn error_chain_string(err: &anyhow::Error) -> String {
     err.chain()

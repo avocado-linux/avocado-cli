@@ -49,6 +49,10 @@ fn yaml_value_to_string(v: &Value) -> String {
 pub struct AvocadoContext {
     /// Target architecture (CLI > env > config precedence)
     pub target: Option<String>,
+    /// Optional board variant within a target. `None` here means the resolver
+    /// will fall back to `target` at lookup time, so `{{ avocado.target.board }}`
+    /// equals `{{ avocado.target }}` by default. Precedence: env > config.
+    pub target_board: Option<String>,
     /// Distro release (feed year) from the main config
     pub distro_release: Option<String>,
     /// Distro channel from the main config
@@ -73,6 +77,7 @@ impl AvocadoContext {
     pub fn with_target(target: Option<&str>) -> Self {
         Self {
             target: target.map(|s| s.to_string()),
+            target_board: None,
             distro_release: None,
             distro_channel: None,
             kernel_version: None,
@@ -91,11 +96,17 @@ impl AvocadoContext {
         // Resolve target with precedence: CLI > env > config
         let target = Self::resolve_target_value(root, cli_target);
 
+        // Resolve target_board with precedence: env > config. Stored as None
+        // when neither is set so the resolver can fall back to `target` at
+        // lookup time.
+        let target_board = Self::resolve_target_board_value(root);
+
         // Extract distro values from the main config
         let (distro_release, distro_channel) = Self::extract_distro_values(root);
 
         Self {
             target,
+            target_board,
             distro_release,
             distro_channel,
             kernel_version: None,
@@ -118,6 +129,23 @@ impl AvocadoContext {
         if let Some(default_target) = root.get("default_target") {
             if let Some(target_str) = default_target.as_str() {
                 return Some(target_str.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Resolve the target board value. Precedence: env `AVOCADO_TARGET_BOARD`
+    /// then config `default_target_board`. Returns `None` when neither is set;
+    /// the resolver then falls back to the resolved target.
+    fn resolve_target_board_value(root: &Value) -> Option<String> {
+        if let Ok(board) = env::var("AVOCADO_TARGET_BOARD") {
+            return Some(board);
+        }
+
+        if let Some(board) = root.get("default_target_board") {
+            if let Some(board_str) = board.as_str() {
+                return Some(board_str.to_string());
             }
         }
 
@@ -153,11 +181,13 @@ impl AvocadoContext {
     #[allow(dead_code)]
     pub fn with_values(
         target: Option<String>,
+        target_board: Option<String>,
         distro_release: Option<String>,
         distro_channel: Option<String>,
     ) -> Self {
         Self {
             target,
+            target_board,
             distro_release,
             distro_channel,
             kernel_version: None,
@@ -188,6 +218,7 @@ impl AvocadoContext {
 /// // With distro context
 /// let ctx = AvocadoContext {
 ///     target: None,
+///     target_board: None,
 ///     distro_release: Some("2024".to_string()),
 ///     distro_channel: Some("edge".to_string()),
 ///     kernel_version: None,
@@ -202,6 +233,7 @@ pub fn resolve(
 ) -> Result<Option<String>> {
     match path {
         ["target"] => resolve_target(root, context),
+        ["target", "board"] => resolve_target_board(root, context),
         ["distro", "release"] | ["distro", "version"] => resolve_distro_release(context),
         ["distro", "channel"] => resolve_distro_channel(context),
         ["kernel", "version"] => resolve_kernel_version(context),
@@ -250,6 +282,35 @@ fn resolve_target(root: &Value, context: Option<&AvocadoContext>) -> Result<Opti
     // Target not available - leave template as-is
     // CLI will handle validation later
     Ok(None)
+}
+
+/// Resolve the target board.
+///
+/// Precedence:
+/// 1. Context `target_board` (populated from env or config at context creation)
+/// 2. Environment variable `AVOCADO_TARGET_BOARD`
+/// 3. Config `default_target_board` (from root)
+/// 4. Fallback to the resolved target — `{{ avocado.target.board }}` defaults
+///    to whatever `{{ avocado.target }}` would resolve to when no board is
+///    explicitly set.
+fn resolve_target_board(root: &Value, context: Option<&AvocadoContext>) -> Result<Option<String>> {
+    if let Some(ctx) = context {
+        if let Some(ref board) = ctx.target_board {
+            return Ok(Some(board.clone()));
+        }
+    }
+
+    if let Ok(board) = env::var("AVOCADO_TARGET_BOARD") {
+        return Ok(Some(board));
+    }
+
+    if let Some(default_board) = root.get("default_target_board") {
+        if let Some(board_str) = default_board.as_str() {
+            return Ok(Some(board_str.to_string()));
+        }
+    }
+
+    resolve_target(root, context)
 }
 
 /// Resolve the distro release from the avocado context.
@@ -357,6 +418,91 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_resolve_target_board_from_context() {
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml("default_target_board: config-board");
+        let ctx = AvocadoContext {
+            target: Some("imx8mp-evk".to_string()),
+            target_board: Some("ctx-board".to_string()),
+            distro_release: None,
+            distro_channel: None,
+            kernel_version: None,
+        };
+        let result = resolve(&["target", "board"], &config, Some(&ctx)).unwrap();
+        assert_eq!(result, Some("ctx-board".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_from_env() {
+        env::remove_var("AVOCADO_TARGET");
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        let config = parse_yaml("default_target_board: config-board");
+        let result = resolve(&["target", "board"], &config, None).unwrap();
+        assert_eq!(result, Some("env-board".to_string()));
+        env::remove_var("AVOCADO_TARGET_BOARD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_from_config() {
+        env::remove_var("AVOCADO_TARGET");
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml("default_target_board: config-board");
+        let result = resolve(&["target", "board"], &config, None).unwrap();
+        assert_eq!(result, Some("config-board".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_falls_back_to_context_target() {
+        // No board source set anywhere; context has a target. The board should
+        // resolve to whatever the target resolves to.
+        env::remove_var("AVOCADO_TARGET");
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml("{}");
+        let ctx = AvocadoContext::with_target(Some("imx8mp-evk"));
+        let result = resolve(&["target", "board"], &config, Some(&ctx)).unwrap();
+        assert_eq!(result, Some("imx8mp-evk".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_falls_back_to_env_target() {
+        // Neither AVOCADO_TARGET_BOARD nor default_target_board set; the board
+        // should fall through to AVOCADO_TARGET.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::set_var("AVOCADO_TARGET", "env-target");
+        let config = parse_yaml("{}");
+        let result = resolve(&["target", "board"], &config, None).unwrap();
+        assert_eq!(result, Some("env-target".to_string()));
+        env::remove_var("AVOCADO_TARGET");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_falls_back_to_default_target() {
+        // No board sources, no env target — falls back to default_target.
+        env::remove_var("AVOCADO_TARGET");
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml("default_target: config-target");
+        let result = resolve(&["target", "board"], &config, None).unwrap();
+        assert_eq!(result, Some("config-target".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_unavailable() {
+        env::remove_var("AVOCADO_TARGET");
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml("{}");
+        let result = resolve(&["target", "board"], &config, None).unwrap();
+        // No target either — leave template as-is.
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn test_resolve_unknown_path() {
         let config = parse_yaml("{}");
         let result = resolve(&["unknown"], &config, None).unwrap();
@@ -369,6 +515,7 @@ mod tests {
         let config = parse_yaml("{}");
         let ctx = AvocadoContext {
             target: None,
+            target_board: None,
             distro_release: Some("2024".to_string()),
             distro_channel: None,
             kernel_version: None,
@@ -382,6 +529,7 @@ mod tests {
         let config = parse_yaml("{}");
         let ctx = AvocadoContext {
             target: None,
+            target_board: None,
             distro_release: Some("2024".to_string()),
             distro_channel: None,
             kernel_version: None,
@@ -396,6 +544,7 @@ mod tests {
         let config = parse_yaml("{}");
         let ctx = AvocadoContext {
             target: None,
+            target_board: None,
             distro_release: None,
             distro_channel: Some("apollo-edge".to_string()),
             kernel_version: None,
@@ -474,6 +623,48 @@ distro:
         assert_eq!(ctx.target, Some("x86_64".to_string()));
         assert_eq!(ctx.distro_release, None);
         assert_eq!(ctx.distro_channel, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_from_main_config_with_target_board() {
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: imx8mp-evk-rev3
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target, Some("imx8mp-evk".to_string()));
+        assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_env_overrides_config() {
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: config-board
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("env-board".to_string()));
+        env::remove_var("AVOCADO_TARGET_BOARD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_unset_is_none() {
+        // When neither env nor config sets the board, the context stores None.
+        // The resolver — not the context — handles fallback to target.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        let config = parse_yaml("default_target: imx8mp-evk");
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target, Some("imx8mp-evk".to_string()));
+        assert_eq!(ctx.target_board, None);
     }
 
     #[test]

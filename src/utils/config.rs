@@ -1219,6 +1219,10 @@ pub struct Config {
     pub cli_requirement: Option<String>,
     pub source_date_epoch: Option<u64>,
     pub default_target: Option<String>,
+    /// Optional board variant within a target. Lowest-priority resolution path
+    /// for `{{ avocado.target.board }}`; overridden by `AVOCADO_TARGET_BOARD`.
+    /// Falls back to the resolved target when unset.
+    pub default_target_board: Option<String>,
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
     pub distro: Option<DistroConfig>,
@@ -1705,6 +1709,7 @@ impl Config {
                 cli_requirement: None,
                 source_date_epoch: None,
                 default_target: None,
+                default_target_board: None,
                 supported_targets: None,
                 src_dir: None,
                 distro: None,
@@ -5814,6 +5819,40 @@ runtimes:
         // Test that empty string is preserved
         assert_eq!(config.default_target, Some("".to_string()));
         assert_eq!(config.get_default_target(), Some(&"".to_string()));
+    }
+
+    #[test]
+    fn test_default_target_board_field() {
+        let config_content = r#"
+default_target: "imx8mp-evk"
+default_target_board: "imx8mp-evk-rev3"
+
+runtimes:
+  dev:
+    target: "imx8mp-evk"
+    image: "avocadolinux/runtime:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+        assert_eq!(
+            config.default_target_board,
+            Some("imx8mp-evk-rev3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_default_target_board_field() {
+        let config_content = r#"
+default_target: "imx8mp-evk"
+
+runtimes:
+  dev:
+    target: "imx8mp-evk"
+    image: "avocadolinux/runtime:apollo-edge"
+"#;
+
+        let config = Config::load_from_str(config_content).unwrap();
+        assert_eq!(config.default_target_board, None);
     }
 
     #[test]
