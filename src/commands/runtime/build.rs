@@ -1526,7 +1526,7 @@ SIGNEOF
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil
+import json, hashlib, uuid, os, shutil, struct
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1540,6 +1540,36 @@ ext_pairs_str = os.environ.get("AVOCADO_EXT_PAIRS", "")
 
 # kos runtimes get extra fields for now
 kos_amf = os.environ.get("AVOCADO_AMF_KOS") == "1"
+
+# Drift-detect minihash carried per-component on kos AMFs. The leading
+# digit identifies the protocol version so consumers can refuse hashes
+# they don't know how to recompute.
+#
+# Protocol 1 mini_hash implementation:
+#     head = file[0 .. min(BLOCK, size)]
+#     tail = file[size - min(BLOCK, size) .. size]   # overlaps head when size <= BLOCK
+#     size32 = (size & 0xFFFFFFFF) as little-endian 4 bytes
+#     digest = SHA256(head || tail || size32)
+#     mini_hash = "1" + hex(digest)
+#
+MINI_HASH_PROTO = "1"
+MINI_HASH_BLOCK = 4096
+def mini_hash(filepath):
+    file_size = os.path.getsize(filepath)
+    n = min(MINI_HASH_BLOCK, file_size)
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        if n > 0:
+            head = f.read(n)
+            h.update(head)
+            # When file_size <= BLOCK, tail starts at 0 and is identical
+            # to head — the reference impl hashes the body twice in that
+            # regime; we match that exactly.
+            f.seek(file_size - n)
+            tail = f.read(n)
+            h.update(tail)
+    h.update(struct.pack("<I", file_size & 0xFFFFFFFF))
+    return MINI_HASH_PROTO + h.hexdigest()
 
 ext_pairs = ext_pairs_str.split() if ext_pairs_str else []
 
@@ -1565,6 +1595,7 @@ for pair in ext_pairs:
         entry["image_type"] = image_type
     if kos_amf:
         entry["size"] = size
+        entry["mini_hash"] = mini_hash(img_file)
     extensions.append(entry)
 
 # rootfs / initramfs / kernel entries. Same content-addressing pattern
@@ -1588,6 +1619,7 @@ def add_image_entry(img_path, version, image_type):
         entry["image_type"] = "kab"
     if kos_amf:
         entry["size"] = size
+        entry["mini_hash"] = mini_hash(img_path)
     return entry
 
 # rootfs, initramfs, and kernel all ship from the same avocado distro
@@ -3107,10 +3139,15 @@ extensions:
         assert!(script.contains("sign_amf() {"));
         assert!(script.contains("sign_amf \"$AVOCADO_MANIFEST_PATH\""));
 
-        // The kos-only manifest fields (size, etc) are gated on the
-        // same flag, read inside the python block.
+        // The kos-only manifest fields (size, mini_hash, ...) are
+        // gated on the same flag, read inside the python block.
         assert!(script.contains("kos_amf = os.environ.get(\"AVOCADO_AMF_KOS\") == \"1\""));
         assert!(script.contains("entry[\"size\"] = size"));
+        assert!(script.contains("entry[\"mini_hash\"] = mini_hash("));
+        // Protocol-tagged minihash helper is defined once near the top
+        // of the python block and reused for every component.
+        assert!(script.contains("MINI_HASH_PROTO = \"1\""));
+        assert!(script.contains("MINI_HASH_BLOCK = 4096"));
 
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
