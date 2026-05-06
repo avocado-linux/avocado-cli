@@ -1431,11 +1431,12 @@ export AVOCADO_KERNEL_IMAGE_TYPE="{kernel_image_type}"
 
 # sign_amf <manifest-path>: sign the AMF at the given path with the
 # KAB_KEYSET_FILE-pointed keyset. Idempotent — replaces any existing
-# meta.auth block. No-ops when AVOCADO_AMF_KOS != "1" (non-kos
-# runtimes) or the keyset is unavailable. Called twice: once after the
-# manifest is written (so the btrfs image flashed onto fresh devices
-# carries a signature), and again after the os_bundle patch (so the
-# var-staging copy used for OTA upload covers the mutated state).
+# kos.auth block, preserving every other kos.* field. No-ops when
+# AVOCADO_AMF_KOS != "1" (non-kos runtimes) or the keyset is
+# unavailable. Called twice: once after the manifest is written (so
+# the btrfs image flashed onto fresh devices carries a signature), and
+# again after the os_bundle patch (so the var-staging copy used for
+# OTA upload covers the mutated state).
 sign_amf() {{
     AMF_SIGN_PATH="$1" python3 << 'SIGNEOF'
 import json, os, base64, tempfile, subprocess, shutil
@@ -1479,14 +1480,22 @@ try:
     if not certs_der:
         raise RuntimeError("certPath.p7b contained no certificates")
 
-    # Canonical form = manifest JSON without the "meta" key, compact (no
-    # whitespace), insertion-order preserved. An on-device verifier
-    # strips meta, recomputes this canonical form, and checks the
-    # signature against it.
+    # Canonical form = manifest JSON with kos.auth removed; the "kos"
+    # object itself is preserved (possibly empty) so the verifier and
+    # signer compute identical bytes. Compact, insertion-order
+    # preserved. An on-device verifier reproduces this form by stripping
+    # kos.auth and recomputing the same bytes.
     with open(manifest_path, "r") as f:
         manifest = json.load(f)
-    manifest.pop("meta", None)
-    canonical = json.dumps(manifest, separators=(",", ":"))
+    # Materialize "kos" so the canonical shape matches what the verifier
+    # sees after stripping kos.auth from a signed manifest, even when no
+    # other kos.* fields exist yet.
+    manifest.setdefault("kos", {{}})
+    canonical_manifest = dict(manifest)
+    canonical_manifest["kos"] = {{
+        kk: vv for kk, vv in manifest["kos"].items() if kk != "auth"
+    }}
+    canonical = json.dumps(canonical_manifest, separators=(",", ":"))
     canon_path = os.path.join(workdir, "canonical.json")
     with open(canon_path, "w") as f:
         f.write(canonical)
@@ -1501,11 +1510,11 @@ try:
     sig_b64 = base64.b64encode(open(sig_path, "rb").read()).decode("ascii")
     certs_b64 = [base64.b64encode(c).decode("ascii") for c in reversed(certs_der)]
 
-    manifest["meta"] = {{
-        "auth": {{
-            "signature": sig_b64,
-            "certificates": certs_b64,
-        }},
+    # Mutate kos in place so any other kos.* fields the build set
+    # earlier are preserved.
+    manifest["kos"]["auth"] = {{
+        "signature": sig_b64,
+        "certificates": certs_b64,
     }}
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
