@@ -620,10 +620,10 @@ impl RuntimeBuildCommand {
         };
 
         // The in-container sign_amf shell helper checks
-        // $AVOCADO_AMF_SIGN. Only kos runtimes set it; everyone else
+        // $AVOCADO_AMF_KOS. Only kos runtimes set it; everyone else
         // treats sign_amf as a no-op.
         if is_kos_runtime {
-            env_vars.insert("AVOCADO_AMF_SIGN".to_string(), "1".to_string());
+            env_vars.insert("AVOCADO_AMF_KOS".to_string(), "1".to_string());
         } else if std::env::var("KAB_KEYSET_FILE").is_ok() {
             print_info(
                 &format!(
@@ -1431,7 +1431,7 @@ export AVOCADO_KERNEL_IMAGE_TYPE="{kernel_image_type}"
 
 # sign_amf <manifest-path>: sign the AMF at the given path with the
 # KAB_KEYSET_FILE-pointed keyset. Idempotent — replaces any existing
-# meta.auth block. No-ops when AVOCADO_AMF_SIGN != "1" (non-kos
+# meta.auth block. No-ops when AVOCADO_AMF_KOS != "1" (non-kos
 # runtimes) or the keyset is unavailable. Called twice: once after the
 # manifest is written (so the btrfs image flashed onto fresh devices
 # carries a signature), and again after the os_bundle patch (so the
@@ -1440,7 +1440,7 @@ sign_amf() {{
     AMF_SIGN_PATH="$1" python3 << 'SIGNEOF'
 import json, os, base64, tempfile, subprocess, shutil
 
-if os.environ.get("AVOCADO_AMF_SIGN") != "1":
+if os.environ.get("AVOCADO_AMF_KOS") != "1":
     raise SystemExit(0)
 
 manifest_path = os.environ["AMF_SIGN_PATH"]
@@ -1529,6 +1529,9 @@ runtime_name = os.environ["AVOCADO_RUNTIME_NAME"]
 runtime_version = os.environ["AVOCADO_RUNTIME_VERSION"]
 ext_pairs_str = os.environ.get("AVOCADO_EXT_PAIRS", "")
 
+# kos runtimes get extra fields for now
+kos_amf = os.environ.get("AVOCADO_AMF_KOS") == "1"
+
 ext_pairs = ext_pairs_str.split() if ext_pairs_str else []
 
 extensions = []
@@ -1543,6 +1546,7 @@ for pair in ext_pairs:
         continue
     with open(img_file, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
+    size = os.path.getsize(img_file)
     image_id = str(uuid.uuid5(namespace, sha256))
     dest = os.path.join(images_dir, image_id + ext_suffix)
     shutil.copy2(img_file, dest)
@@ -1550,6 +1554,8 @@ for pair in ext_pairs:
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
     if image_type != "raw":
         entry["image_type"] = image_type
+    if kos_amf:
+        entry["size"] = size
     extensions.append(entry)
 
 # rootfs / initramfs / kernel entries. Same content-addressing pattern
@@ -1562,6 +1568,7 @@ def add_image_entry(img_path, version, image_type):
         return None
     with open(img_path, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
+    size = os.path.getsize(img_path)
     image_id = str(uuid.uuid5(namespace, sha256))
     suffix = ".kab" if image_type == "kab" else ".raw"
     dest = os.path.join(images_dir, image_id + suffix)
@@ -1570,6 +1577,8 @@ def add_image_entry(img_path, version, image_type):
     entry = dict(version=version, image_id=image_id, sha256=sha256)
     if image_type == "kab":
         entry["image_type"] = "kab"
+    if kos_amf:
+        entry["size"] = size
     return entry
 
 # rootfs, initramfs, and kernel all ship from the same avocado distro
@@ -3083,11 +3092,16 @@ extensions:
         assert!(script.contains("export AVOCADO_OS_VERSION_ID"));
 
         // sign_amf helper is always emitted; whether it actually signs
-        // is decided at runtime by AVOCADO_AMF_SIGN. This test runtime
+        // is decided at runtime by AVOCADO_AMF_KOS. This test runtime
         // is not type=kos, so the env var won't be set and sign_amf
         // will be a no-op.
         assert!(script.contains("sign_amf() {"));
         assert!(script.contains("sign_amf \"$AVOCADO_MANIFEST_PATH\""));
+
+        // The kos-only manifest fields (size, etc) are gated on the
+        // same flag, read inside the python block.
+        assert!(script.contains("kos_amf = os.environ.get(\"AVOCADO_AMF_KOS\") == \"1\""));
+        assert!(script.contains("entry[\"size\"] = size"));
 
         // Active symlink should be created
         assert!(script.contains("ln -sfn \"runtimes/"));
