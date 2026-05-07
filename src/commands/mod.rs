@@ -7,6 +7,7 @@ pub mod hitl;
 pub mod init;
 pub mod initramfs;
 pub mod install;
+pub mod kernel;
 pub mod load;
 pub mod provision;
 pub mod prune;

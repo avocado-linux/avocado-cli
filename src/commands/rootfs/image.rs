@@ -1,11 +1,15 @@
 //! Rootfs image build command and shared build script generation.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::utils::{
-    config::Config,
+    config::{get_ext_image_args, get_ext_image_type, Config},
     container::{RunConfig, SdkContainer},
+    host_copy::copy_volume_path_to_host,
+    kab_wrap::generate_kab_wrap_script,
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
     target::resolve_target_required,
@@ -38,6 +42,9 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 
     # Work on a copy so we don't mutate the shared sysroot used for extension priming
     ROOTFS_WORK="${{ROOTFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/rootfs-work}}"
+    # Standalone rootfs builds (no runtime build before this) leave the
+    # parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
+    mkdir -p "$(dirname "$ROOTFS_WORK")"
     rm -rf "$ROOTFS_WORK"
     cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
 
@@ -213,23 +220,88 @@ impl RootfsImageCommand {
         let rootfs_filesystem = config.get_rootfs_filesystem();
         let build_section = generate_rootfs_build_script(NAMESPACE_UUID, &rootfs_filesystem);
 
-        // Wrap the build script with variable setup for standalone execution
-        let out_dir_setup = if let Some(ref out) = self.out_dir {
-            format!(r#"OUTPUT_DIR="{out}""#)
+        // If the avocado.yaml asks for a kab-wrapped rootfs, validate the
+        // keyset on the host, append the wrap step to the script, and
+        // bind-mount the keyset into the container at /tmp/kab.keyset.
+        // Same plumbing as runtime/build.rs.
+        let rootfs_node = composed.merged_value.get("rootfs");
+        let image_type = rootfs_node
+            .and_then(get_ext_image_type)
+            .unwrap_or_else(|| "raw".to_string());
+        let image_args = rootfs_node.and_then(get_ext_image_args);
+        let wrap_kab = image_type == "kab";
+
+        let kab_keyset_host_path: Option<String> = if wrap_kab {
+            let p = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
+                anyhow::anyhow!(
+                    "rootfs.image.type is `kab` but KAB_KEYSET_FILE is not set. \
+                     Set it to the path of your KAB signing keyset."
+                )
+            })?;
+            if !std::path::Path::new(&p).is_file() {
+                return Err(anyhow::anyhow!(
+                    "KAB_KEYSET_FILE points to '{}' but the file does not exist.",
+                    p
+                ));
+            }
+            Some(p)
         } else {
-            r#"OUTPUT_DIR="$AVOCADO_PREFIX/output/images""#.to_string()
+            None
         };
 
+        let wrap_section = if wrap_kab {
+            let args = image_args
+                .as_deref()
+                .context("rootfs.image.type is `kab` but rootfs.image.args is missing")?;
+            generate_kab_wrap_script("rootfs", "AVOCADO_ROOTFS_IMAGE", args, "$RUNTIME_VERSION")
+        } else {
+            String::new()
+        };
+
+        // Always produce inside the SDK volume; the user-facing --out
+        // is treated as a host destination and gets `docker cp`'d to
+        // after the container exits. This lets standalone callers see
+        // the artifact on the host rather than leaving it stranded in
+        // the container's overlay (the prior behavior).
+        let internal_output_dir = "$AVOCADO_PREFIX/output/images";
+
+        // After the rootfs build, expose AVOCADO_OS_VERSION_ID so kab
+        // args can interpolate it (e.g. `-v "$AVOCADO_OS_VERSION_ID"`).
+        // Runtime build does the same exact thing — keep the recipe
+        // identical so callers can use the same args either way.
         let script = format!(
             r#"set -euo pipefail
 TARGET_ARCH="{target_arch}"
 RUNTIME_NAME="${{AVOCADO_RUNTIME_NAME:-standalone}}"
 RUNTIME_VERSION="${{AVOCADO_RUNTIME_VERSION:-0.0.0}}"
-{out_dir_setup}
+OUTPUT_DIR="{internal_output_dir}"
 mkdir -p "$OUTPUT_DIR"
 {build_section}
+AVOCADO_OS_VERSION_ID=""
+if [ -f "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" ]; then
+    AVOCADO_OS_VERSION_ID=$(grep '^VERSION_ID=' "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
+        | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+fi
+export AVOCADO_OS_VERSION_ID
+{wrap_section}
 "#
         );
+
+        let mut env_vars: HashMap<String, String> = HashMap::new();
+        if wrap_kab {
+            env_vars.insert("KAB_KEYSET_FILE".to_string(), "/tmp/kab.keyset".to_string());
+        }
+
+        // Bind-mount the keyset into the container as a single -v arg
+        // appended to whatever the user / config already has.
+        let container_args_with_keyset = if let Some(ref host_path) = kab_keyset_host_path {
+            let mut args = merged_container_args.clone().unwrap_or_default();
+            args.push("-v".to_string());
+            args.push(format!("{host_path}:/tmp/kab.keyset:ro"));
+            Some(args)
+        } else {
+            merged_container_args.clone()
+        };
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
@@ -240,9 +312,14 @@ mkdir -p "$OUTPUT_DIR"
             interactive: false,
             repo_url: repo_url.clone(),
             repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
+            container_args: container_args_with_keyset,
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
+            env_vars: if env_vars.is_empty() {
+                None
+            } else {
+                Some(env_vars)
+            },
             ..Default::default()
         };
 
@@ -265,11 +342,60 @@ mkdir -p "$OUTPUT_DIR"
         }
 
         let success = result?;
-        if success {
-            print_success("Built rootfs image.", OutputLevel::Normal);
-        } else {
+        if !success {
             return Err(anyhow::anyhow!("Failed to build rootfs image."));
         }
+
+        // Copy outputs to host if --out was given. The SDK volume is
+        // shared with `avocado ext image` & friends — same naming.
+        if let Some(ref out_dir) = self.out_dir {
+            let cwd = std::env::current_dir().context("Failed to get current directory")?;
+            let volume_manager =
+                crate::utils::volume::VolumeManager::new("docker".to_string(), self.verbose);
+            let volume_state = volume_manager
+                .get_or_create_volume(&cwd)
+                .await
+                .context("Failed to resolve SDK volume for host copy")?;
+            let volume_name = &volume_state.volume_name;
+
+            let host_dir = if out_dir.starts_with('/') {
+                PathBuf::from(out_dir)
+            } else {
+                cwd.join(out_dir)
+            };
+            std::fs::create_dir_all(&host_dir)
+                .with_context(|| format!("Failed to mkdir -p {}", host_dir.display()))?;
+
+            // Filenames are deterministic from filesystem + target.
+            // The volume layout is /opt/_avocado/<target>/output/images/...
+            // ($AVOCADO_PREFIX = /opt/_avocado/<target>).
+            //
+            // When the kab wrap is configured, the kab is the final
+            // artifact — the raw fs image is just an intermediate that
+            // stays inside the volume. Only copy the kab in that case.
+            let raw_filename = format!("avocado-image-rootfs-{target_arch}.{rootfs_filesystem}");
+            let (host_filename, container_path) = if wrap_kab {
+                let kab_filename = format!("{raw_filename}.kab");
+                (
+                    kab_filename.clone(),
+                    format!("/opt/_avocado/{target_arch}/output/images/{kab_filename}"),
+                )
+            } else {
+                (
+                    raw_filename.clone(),
+                    format!("/opt/_avocado/{target_arch}/output/images/{raw_filename}"),
+                )
+            };
+            copy_volume_path_to_host(volume_name, &container_path, &host_dir.join(&host_filename))
+                .await
+                .with_context(|| format!("Failed to copy {host_filename} to host"))?;
+            print_info(
+                &format!("Copied {} to {}", host_filename, host_dir.display()),
+                OutputLevel::Normal,
+            );
+        }
+
+        print_success("Built rootfs image.", OutputLevel::Normal);
 
         Ok(())
     }

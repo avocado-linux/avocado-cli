@@ -179,14 +179,15 @@ for abs_path in "${{boot_files[@]}}"; do
     cp -a "$abs_path" "$KERNEL_DIR/"
 done
 # Stable 'Image' symlink — prefer uncompressed over .gz so consumers can use
-# it directly without decompression.
+# it directly without decompression. -sfn replaces a stale symlink in place
+# on rerun without erroring on "File exists".
 for abs_path in "${{boot_files[@]}}"; do
     [[ "$abs_path" == *.gz ]] && continue
-    ln -s "$(basename "$abs_path")" "$KERNEL_DIR/Image"
+    ln -sfn "$(basename "$abs_path")" "$KERNEL_DIR/Image"
     break
 done
 if [ ! -e "$KERNEL_DIR/Image" ]; then
-    ln -s "$(basename "${{boot_files[0]}}")" "$KERNEL_DIR/Image"
+    ln -sfn "$(basename "${{boot_files[0]}}")" "$KERNEL_DIR/Image"
 fi
 "#
     );

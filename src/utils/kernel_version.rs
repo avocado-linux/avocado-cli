@@ -554,5 +554,4 @@ mod tests {
         );
         assert_eq!(out, "a-6.6.123-b-6.6.123");
     }
-
 }

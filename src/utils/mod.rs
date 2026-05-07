@@ -4,9 +4,11 @@ pub mod container;
 #[cfg(target_os = "macos")]
 pub mod disk_writer;
 pub mod ext_fetch;
+pub mod host_copy;
 pub mod image_signing;
 pub mod interpolation;
 pub mod jcs;
+pub mod kab_wrap;
 pub mod kernel_resolver;
 pub mod kernel_version;
 pub mod lockfile;

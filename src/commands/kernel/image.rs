@@ -1,4 +1,19 @@
-//! Initramfs image build command and shared build script generation.
+//! Kernel image build command.
+//!
+//! Unlike rootfs / initramfs there is no filesystem to assemble — the
+//! kernel binary is just a file dropped into the rootfs sysroot by the
+//! `kernel-image-*` package. This command:
+//!
+//!   1. Locates the uncompressed kernel binary under
+//!      `$AVOCADO_PREFIX/rootfs/boot/` (preferring `Image-<kver>` over
+//!      compressed `*.gz`, skipping the metadata `System.map-*` and
+//!      `config-*` siblings).
+//!   2. When `kernel.image.type: kab` is set in avocado.yaml, wraps it
+//!      into a signed `.kab` using the SDK's `kabtool` — same recipe
+//!      `runtime build` uses, via the shared helper in `utils::kab_wrap`.
+//!   3. `docker cp`s the produced artifact (the `.kab` when wrapping,
+//!      otherwise the raw kernel binary) to the host directory passed
+//!      via `--out`.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -15,133 +30,29 @@ use crate::utils::{
     target::resolve_target_required,
 };
 
-use crate::commands::rootfs::image::NAMESPACE_UUID;
-
-/// Generate the shell script fragment that builds an initramfs image from the shared sysroot.
-///
-/// The generated script expects these shell variables to be set:
-/// - `$AVOCADO_PREFIX` — SDK prefix (container volume)
-/// - `$OUTPUT_DIR` — directory for output image
-/// - `$TARGET_ARCH` — target architecture string
-/// - `$RUNTIME_NAME` — runtime name (for work dir path)
-///
-/// Exports on success:
-/// - `$AVOCADO_INITRAMFS_IMAGE` — path to built image
-/// - `$AVOCADO_INITRAMFS_FILESYSTEM` — filesystem format used
-/// - `$AVOCADO_INITRAMFS_BUILD_ID` — deterministic build ID
-pub fn generate_initramfs_build_script(namespace_uuid: &str, initramfs_filesystem: &str) -> String {
-    format!(
-        r#"
-# Build initramfs image from shared sysroot
-INITRAMFS_SYSROOT="$AVOCADO_PREFIX/initramfs"
-if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
-    echo "Building initramfs image from packages..."
-
-    INITRAMFS_WORK="${{INITRAMFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/initramfs-work}}"
-    # Standalone initramfs builds (no runtime build before this) leave
-    # the parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
-    mkdir -p "$(dirname "$INITRAMFS_WORK")"
-    rm -rf "$INITRAMFS_WORK"
-    cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
-
-    # Create usrmerge symlinks (Yocto image class does this, not any RPM package)
-    ln -sfn usr/bin "$INITRAMFS_WORK/bin"
-    ln -sfn usr/sbin "$INITRAMFS_WORK/sbin"
-    ln -sfn usr/lib "$INITRAMFS_WORK/lib"
-
-    # Post-processing (matches Yocto avocado-image-initramfs.bb)
-    rm -rf "$INITRAMFS_WORK/media" "$INITRAMFS_WORK/mnt" "$INITRAMFS_WORK/srv"
-    rm -rf "$INITRAMFS_WORK/boot/"*
-    mkdir -p "$INITRAMFS_WORK/sysroot"
-    mkdir -p "$INITRAMFS_WORK/opt"
-
-    # Compute deterministic build ID for initramfs
-    INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | sort)
-    INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
-    INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH'))")
-
-    # Inject identity into initrd-release and os-release-initrd
-    if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
-        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/initrd-release"
-    fi
-    if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
-        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
-    fi
-
-    # Create /init symlink so the kernel can find the init process in the initramfs.
-    # (matches OE IMAGE_CMD:cpio in image_types.bbclass — creates /init -> /sbin/init)
-    if [ ! -L "$INITRAMFS_WORK/init" ] && [ ! -e "$INITRAMFS_WORK/init" ]; then
-        if [ -L "$INITRAMFS_WORK/sbin/init" ] || [ -e "$INITRAMFS_WORK/sbin/init" ]; then
-            ln -sf /sbin/init "$INITRAMFS_WORK/init"
-            echo "Created /init -> /sbin/init symlink"
-        else
-            echo "WARNING: /sbin/init not found in initramfs — kernel may not find init"
-        fi
-    fi
-
-    # Build initramfs image using configured filesystem format
-    INITRAMFS_FS="{initramfs_filesystem}"
-    INITRAMFS_OUTPUT="$OUTPUT_DIR/avocado-image-initramfs-$TARGET_ARCH.$INITRAMFS_FS"
-    echo "Building initramfs image: $INITRAMFS_FS"
-    case "$INITRAMFS_FS" in
-        cpio)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet > "$INITRAMFS_OUTPUT")
-            ;;
-        cpio.zst)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | zstd -3 -f -o "$INITRAMFS_OUTPUT")
-            ;;
-        cpio.lz4)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | lz4 -l -f - "$INITRAMFS_OUTPUT")
-            ;;
-        cpio.gz)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | gzip -9 > "$INITRAMFS_OUTPUT")
-            ;;
-        *)
-            echo "ERROR: unsupported initramfs filesystem format: $INITRAMFS_FS"
-            exit 1
-            ;;
-    esac
-
-    rm -rf "$INITRAMFS_WORK"
-    export AVOCADO_INITRAMFS_IMAGE="$INITRAMFS_OUTPUT"
-    export AVOCADO_INITRAMFS_FILESYSTEM="$INITRAMFS_FS"
-    export AVOCADO_INITRAMFS_BUILD_ID="$INITRAMFS_BUILD_ID"
-    echo "Built initramfs: $INITRAMFS_OUTPUT"
-else
-    echo "No initramfs sysroot found — skipping initramfs image build."
-fi"#,
-        namespace_uuid = namespace_uuid,
-        initramfs_filesystem = initramfs_filesystem,
-    )
-}
-
-/// Implementation of the 'initramfs image' command.
-pub struct InitramfsImageCommand {
+pub struct KernelImageCommand {
     config_path: String,
     verbose: bool,
     target: Option<String>,
     container_args: Option<Vec<String>>,
-    dnf_args: Option<Vec<String>>,
     sdk_arch: Option<String>,
     runs_on: Option<String>,
     nfs_port: Option<u16>,
     out_dir: Option<String>,
 }
 
-impl InitramfsImageCommand {
+impl KernelImageCommand {
     pub fn new(
         config_path: String,
         verbose: bool,
         target: Option<String>,
         container_args: Option<Vec<String>>,
-        dnf_args: Option<Vec<String>>,
     ) -> Self {
         Self {
             config_path,
             verbose,
             target,
             container_args,
-            dnf_args,
             sdk_arch: None,
             runs_on: None,
             nfs_port: None,
@@ -193,24 +104,19 @@ impl InitramfsImageCommand {
             None
         };
 
-        print_info("Building initramfs image.", OutputLevel::Normal);
+        print_info("Building kernel image.", OutputLevel::Normal);
 
-        let initramfs_filesystem = config.get_initramfs_filesystem();
-        let build_section = generate_initramfs_build_script(NAMESPACE_UUID, &initramfs_filesystem);
-
-        // Same kab-wrap pipeline as rootfs/image.rs — see comments
-        // there for the design rationale.
-        let initramfs_node = composed.merged_value.get("initramfs");
-        let image_type = initramfs_node
+        let kernel_node = composed.merged_value.get("kernel");
+        let image_type = kernel_node
             .and_then(get_ext_image_type)
             .unwrap_or_else(|| "raw".to_string());
-        let image_args = initramfs_node.and_then(get_ext_image_args);
+        let image_args = kernel_node.and_then(get_ext_image_args);
         let wrap_kab = image_type == "kab";
 
         let kab_keyset_host_path: Option<String> = if wrap_kab {
             let p = std::env::var("KAB_KEYSET_FILE").map_err(|_| {
                 anyhow::anyhow!(
-                    "initramfs.image.type is `kab` but KAB_KEYSET_FILE is not set. \
+                    "kernel.image.type is `kab` but KAB_KEYSET_FILE is not set. \
                      Set it to the path of your KAB signing keyset."
                 )
             })?;
@@ -228,18 +134,42 @@ impl InitramfsImageCommand {
         let wrap_section = if wrap_kab {
             let args = image_args
                 .as_deref()
-                .context("initramfs.image.type is `kab` but initramfs.image.args is missing")?;
-            generate_kab_wrap_script(
-                "initramfs",
-                "AVOCADO_INITRAMFS_IMAGE",
-                args,
-                "$RUNTIME_VERSION",
-            )
+                .context("kernel.image.type is `kab` but kernel.image.args is missing")?;
+            generate_kab_wrap_script("kernel", "AVOCADO_KERNEL_IMAGE", args, "$RUNTIME_VERSION")
         } else {
             String::new()
         };
 
+        // Locate the uncompressed kernel binary in the rootfs sysroot
+        // boot directory and copy it into $OUTPUT_DIR. Skip System.map /
+        // config metadata + .gz variants. Mirrors how runtime/build.rs
+        // computes AVOCADO_KERNEL_IMAGE for the wrap step.
         let internal_output_dir = "$AVOCADO_PREFIX/output/images";
+        let locate_section = r#"
+ROOTFS_BOOT="$AVOCADO_PREFIX/rootfs/boot"
+if [ ! -d "$ROOTFS_BOOT" ]; then
+    echo "ERROR: rootfs sysroot has no /boot — run 'avocado rootfs install' first" >&2
+    exit 1
+fi
+KERNEL_SRC=""
+for f in "$ROOTFS_BOOT"/Image "$ROOTFS_BOOT"/Image-*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+        *.gz|*/System.map-*|*/config-*) continue ;;
+    esac
+    KERNEL_SRC="$f"
+    break
+done
+if [ -z "$KERNEL_SRC" ]; then
+    echo "ERROR: no uncompressed kernel image found in $ROOTFS_BOOT" >&2
+    exit 1
+fi
+KERNEL_BASENAME=$(basename "$KERNEL_SRC")
+AVOCADO_KERNEL_IMAGE="$OUTPUT_DIR/$KERNEL_BASENAME"
+cp -f "$KERNEL_SRC" "$AVOCADO_KERNEL_IMAGE"
+export AVOCADO_KERNEL_IMAGE
+echo "Staged kernel image: $AVOCADO_KERNEL_IMAGE"
+"#;
 
         let script = format!(
             r#"set -euo pipefail
@@ -248,7 +178,7 @@ RUNTIME_NAME="${{AVOCADO_RUNTIME_NAME:-standalone}}"
 RUNTIME_VERSION="${{AVOCADO_RUNTIME_VERSION:-0.0.0}}"
 OUTPUT_DIR="{internal_output_dir}"
 mkdir -p "$OUTPUT_DIR"
-{build_section}
+{locate_section}
 AVOCADO_OS_VERSION_ID=""
 if [ -f "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" ]; then
     AVOCADO_OS_VERSION_ID=$(grep '^VERSION_ID=' "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
@@ -256,6 +186,7 @@ if [ -f "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" ]; then
 fi
 export AVOCADO_OS_VERSION_ID
 {wrap_section}
+echo "KERNEL_BASENAME=$KERNEL_BASENAME" > "$OUTPUT_DIR/.kernel-basename"
 "#
         );
 
@@ -283,7 +214,6 @@ export AVOCADO_OS_VERSION_ID
             repo_url: repo_url.clone(),
             repo_release: repo_release.clone(),
             container_args: container_args_with_keyset,
-            dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
             env_vars: if env_vars.is_empty() {
                 None
@@ -312,7 +242,7 @@ export AVOCADO_OS_VERSION_ID
 
         let success = result?;
         if !success {
-            return Err(anyhow::anyhow!("Failed to build initramfs image."));
+            return Err(anyhow::anyhow!("Failed to build kernel image."));
         }
 
         if let Some(ref out_dir) = self.out_dir {
@@ -333,21 +263,33 @@ export AVOCADO_OS_VERSION_ID
             std::fs::create_dir_all(&host_dir)
                 .with_context(|| format!("Failed to mkdir -p {}", host_dir.display()))?;
 
-            // /opt/_avocado/<target>/output/images/avocado-image-initramfs-<target>.<fs>
+            // Read the kernel basename the in-container script wrote.
+            let basename_marker =
+                format!("/opt/_avocado/{target_arch}/output/images/.kernel-basename");
+            let basename_local = host_dir.join(".kernel-basename");
+            copy_volume_path_to_host(volume_name, &basename_marker, &basename_local)
+                .await
+                .context("Failed to read kernel basename marker")?;
+            let kernel_basename = std::fs::read_to_string(&basename_local)
+                .context("Failed to read kernel basename marker file")?
+                .trim()
+                .strip_prefix("KERNEL_BASENAME=")
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow::anyhow!("Kernel basename marker has unexpected shape"))?;
+            let _ = std::fs::remove_file(&basename_local);
+
             // When wrapping, the kab is the final artifact — skip the
-            // raw cpio (it's intermediate and stays in the volume).
-            let raw_filename =
-                format!("avocado-image-initramfs-{target_arch}.{initramfs_filesystem}");
+            // raw kernel binary (intermediate, stays in the volume).
             let (host_filename, container_path) = if wrap_kab {
-                let kab_filename = format!("{raw_filename}.kab");
+                let kab_filename = format!("{kernel_basename}.kab");
                 (
                     kab_filename.clone(),
                     format!("/opt/_avocado/{target_arch}/output/images/{kab_filename}"),
                 )
             } else {
                 (
-                    raw_filename.clone(),
-                    format!("/opt/_avocado/{target_arch}/output/images/{raw_filename}"),
+                    kernel_basename.clone(),
+                    format!("/opt/_avocado/{target_arch}/output/images/{kernel_basename}"),
                 )
             };
             copy_volume_path_to_host(volume_name, &container_path, &host_dir.join(&host_filename))
@@ -359,7 +301,7 @@ export AVOCADO_OS_VERSION_ID
             );
         }
 
-        print_success("Built initramfs image.", OutputLevel::Normal);
+        print_success("Built kernel image.", OutputLevel::Normal);
         Ok(())
     }
 }

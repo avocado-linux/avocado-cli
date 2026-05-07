@@ -51,6 +51,7 @@ use commands::hitl::HitlServerCommand;
 use commands::init::InitCommand;
 use commands::initramfs::{InitramfsCleanCommand, InitramfsImageCommand, InitramfsInstallCommand};
 use commands::install::InstallCommand;
+use commands::kernel::KernelImageCommand;
 use commands::load::LoadCommand;
 use commands::provision::ProvisionCommand;
 use commands::prune::PruneCommand;
@@ -127,6 +128,11 @@ enum Commands {
     Initramfs {
         #[command(subcommand)]
         command: InitramfsCommands,
+    },
+    /// Kernel image commands
+    Kernel {
+        #[command(subcommand)]
+        command: KernelCommands,
     },
     /// Initialize a new avocado project
     Init {
@@ -2625,6 +2631,27 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Kernel { command } => match command {
+            KernelCommands::Image {
+                config,
+                verbose,
+                target,
+                out_dir,
+                container_args,
+            } => {
+                let image_cmd = KernelImageCommand::new(
+                    config,
+                    verbose,
+                    target.or(cli.target.clone()),
+                    container_args,
+                )
+                .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_output_dir(out_dir);
+                image_cmd.execute().await?;
+                Ok(())
+            }
+        },
         Commands::Hitl { command } => match command {
             HitlCommands::Server {
                 config_path,
@@ -3747,6 +3774,30 @@ enum InitramfsCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KernelCommands {
+    /// Wrap the rootfs sysroot's kernel binary into a signed kos.layer.kernel KAB.
+    /// Requires `avocado rootfs install` to have run first (the kernel-image-*
+    /// package lands the binary in the rootfs sysroot's /boot dir).
+    Image {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Output directory on host for the resulting image
+        #[arg(long = "out")]
+        out_dir: Option<String>,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
     },
 }
 

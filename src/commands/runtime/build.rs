@@ -1345,39 +1345,20 @@ fi"#
         let default_kab_args =
             r#"-b -t kos.layer -v "$AVOCADO_RUNTIME_VERSION" --tag "$AVOCADO_TARGET""#;
 
-        // Shell snippet that wraps a single artifact into a signed KAB.
-        // No-op when image_type != "kab". Reads $AVOCADO_<NAME>_IMAGE,
-        // wraps to $OUTPUT_DIR/<basename>.kab, and re-exports the same
-        // env var to the wrapped path so the manifest block reads the
-        // KAB (not the raw image).
+        // No-op when image_type != "kab"; otherwise produce the shared
+        // wrap fragment and let it default to `default_kab_args` when
+        // the config didn't supply explicit args.
         let wrap_section =
             |label: &str, env_var: &str, image_type: &str, image_args: &Option<String>| -> String {
                 if image_type != "kab" {
                     return String::new();
                 }
-                let kab_args = image_args.as_deref().unwrap_or(default_kab_args);
-                format!(
-                    r#"
-# --- KAB wrap: {label} ---
-if [ -n "${env_var}" ] && [ -f "${env_var}" ]; then
-    echo "Wrapping {label} as KAB..."
-    KAB_TMPDIR=$(mktemp -d)
-    cp "${env_var}" "$KAB_TMPDIR/layer.img"
-    cat > "$KAB_TMPDIR/descriptor.json" << DESCEOF
-{{"kos":{{"build":{{"source":"{label}-$AVOCADO_RUNTIME_VERSION"}}}}}}
-DESCEOF
-    (cd "$KAB_TMPDIR" && zip -Z store tmp.zip layer.img descriptor.json)
-    KAB_OUTPUT="$OUTPUT_DIR/$(basename "${env_var}").kab"
-    rm -f "$KAB_OUTPUT"
-    kabtool {kab_args} \
-        -k "$KAB_KEYSET_FILE" \
-        -z "$KAB_TMPDIR/tmp.zip" "$KAB_TMPDIR/output.kab"
-    cp "$KAB_TMPDIR/output.kab" "$KAB_OUTPUT"
-    rm -rf "$KAB_TMPDIR"
-    export {env_var}="$KAB_OUTPUT"
-    echo "Wrapped {label} -> $KAB_OUTPUT"
-fi
-"#
+                let args = image_args.as_deref().unwrap_or(default_kab_args);
+                crate::utils::kab_wrap::generate_kab_wrap_script(
+                    label,
+                    env_var,
+                    args,
+                    "$AVOCADO_RUNTIME_VERSION",
                 )
             };
 
