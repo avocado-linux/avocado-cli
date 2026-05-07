@@ -4,6 +4,7 @@ pub mod clean;
 pub mod client;
 pub mod cohorts;
 pub mod deploy;
+pub mod device_reclaim;
 pub mod devices;
 pub mod init;
 pub mod keys;

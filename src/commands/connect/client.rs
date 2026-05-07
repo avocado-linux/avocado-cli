@@ -223,6 +223,41 @@ pub struct DeviceInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ReclaimRequestDevice {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub identifier: String,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ReclaimRequest {
+    pub id: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub device: Option<ReclaimRequestDevice>,
+    pub status: String,
+    #[serde(default)]
+    pub requested_fingerprint: Option<String>,
+    #[serde(default)]
+    pub requested_at: Option<String>,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub request_ip: Option<String>,
+    #[serde(default)]
+    pub request_user_agent: Option<String>,
+    #[serde(default)]
+    pub denied_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CohortInfo {
     pub id: String,
     pub name: String,
@@ -893,6 +928,122 @@ impl ConnectClient {
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
             anyhow::bail!("Failed to delete device (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// List device reclaim requests for an organization, optionally filtered by status.
+    pub async fn list_reclaim_requests(
+        &self,
+        org: &str,
+        status: Option<&str>,
+        device_id: Option<&str>,
+    ) -> Result<Vec<ReclaimRequest>> {
+        let mut url = format!("{}/api/orgs/{}/reclaim-requests", self.api_url, org);
+
+        // Manual query-string construction — safe here because both filter
+        // values are validated at the clap layer before reaching this method:
+        //   * `status` is a `ReclaimStatusFilter::as_str()` mapping (always a
+        //     known short lowercase ASCII identifier).
+        //   * `device_id` passed clap's `parse_uuid` value_parser, which
+        //     accepts only canonical-hyphenated UUID strings (`Uuid::parse_str`).
+        // Neither shape can contain `&`, `?`, `#`, `=`, or `%`, so URL
+        // encoding is unnecessary. The server still validates both
+        // independently as defense-in-depth.
+        let mut sep = '?';
+        if let Some(s) = status {
+            url.push_str(&format!("{sep}status={s}"));
+            sep = '&';
+        }
+        if let Some(d) = device_id {
+            url.push_str(&format!("{sep}device_id={d}"));
+        }
+
+        let res = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to list reclaim requests")?;
+
+        let http_status = res.status();
+        if !http_status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            let msg = format_reclaim_error(http_status, &body);
+            anyhow::bail!("Failed to list reclaim requests: {msg}");
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let data = body
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let requests: Vec<ReclaimRequest> = serde_json::from_value(data)?;
+        Ok(requests)
+    }
+
+    /// Approve a pending reclaim request.
+    pub async fn approve_reclaim_request(&self, org: &str, id: &str) -> Result<ReclaimRequest> {
+        let url = format!(
+            "{}/api/orgs/{}/reclaim-requests/{}/approve",
+            self.api_url, org, id
+        );
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to approve reclaim request")?;
+
+        parse_reclaim_response(res, "approve").await
+    }
+
+    /// Deny a pending reclaim request, with an optional reason.
+    pub async fn deny_reclaim_request(
+        &self,
+        org: &str,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<ReclaimRequest> {
+        let url = format!(
+            "{}/api/orgs/{}/reclaim-requests/{}/deny",
+            self.api_url, org, id
+        );
+
+        let mut req = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token));
+        if let Some(r) = reason {
+            req = req.json(&serde_json::json!({ "reason": r }));
+        }
+
+        let res = req.send().await.context("Failed to deny reclaim request")?;
+
+        parse_reclaim_response(res, "deny").await
+    }
+
+    /// Delete a denied reclaim request.
+    pub async fn delete_reclaim_request(&self, org: &str, id: &str) -> Result<()> {
+        let url = format!("{}/api/orgs/{}/reclaim-requests/{}", self.api_url, org, id);
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .context("Failed to delete reclaim request")?;
+
+        let http_status = res.status();
+        if !http_status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            let msg = format_reclaim_error(http_status, &body);
+            anyhow::bail!("{msg}");
         }
 
         Ok(())
@@ -1747,10 +1898,143 @@ impl ConnectClient {
     }
 }
 
+/// Parse a reclaim approve/deny response, mapping known 422 error codes to
+/// readable messages and returning the updated request on success.
+async fn parse_reclaim_response(res: reqwest::Response, action: &str) -> Result<ReclaimRequest> {
+    let http_status = res.status();
+    if !http_status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        let msg = format_reclaim_error(http_status, &body);
+        anyhow::bail!("Failed to {action} reclaim request: {msg}");
+    }
+
+    let body: serde_json::Value = res.json().await?;
+    let data = body.get("data").cloned().context("Response missing data")?;
+    let request: ReclaimRequest = serde_json::from_value(data)?;
+    Ok(request)
+}
+
+/// Map known reclaim API error codes to readable messages, falling back to
+/// the raw HTTP status + body for anything we don't recognize.
+fn format_reclaim_error(http_status: reqwest::StatusCode, body: &str) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let error_code = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str());
+
+    match (http_status.as_u16(), error_code) {
+        (422, Some("not_pending")) => {
+            "request is not pending (already approved, denied, completed, or expired)".to_string()
+        }
+        (422, Some("not_denied")) => "only denied reclaim requests can be deleted".to_string(),
+        (422, Some("claim_token_unavailable")) => {
+            "the originating claim token is no longer available".to_string()
+        }
+        (422, Some("expired_token")) => "the originating claim token has expired".to_string(),
+        (422, Some("invalid_token")) => {
+            "the originating claim token is no longer valid".to_string()
+        }
+        (422, Some("invalid_device_id")) => {
+            "--device-id must be a valid UUID".to_string()
+        }
+        (401, _) => "not authenticated (run 'avocado connect auth login')".to_string(),
+        (403, _) => "not authorized for this organization (your CLI token is scoped to a different org — check 'avocado connect auth status' or run 'avocado connect auth login' for the right org)".to_string(),
+        (404, _) => "reclaim request not found".to_string(),
+        _ => format!("HTTP {http_status}: {body}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn format_reclaim_error_maps_known_422_codes() {
+        let cases = [
+            ("not_pending", "request is not pending"),
+            ("not_denied", "only denied reclaim requests can be deleted"),
+            (
+                "claim_token_unavailable",
+                "the originating claim token is no longer available",
+            ),
+            ("expired_token", "the originating claim token has expired"),
+            (
+                "invalid_token",
+                "the originating claim token is no longer valid",
+            ),
+        ];
+        for (code, expected_substring) in cases {
+            let body = format!(r#"{{"error":"{code}","message":"unused"}}"#);
+            let msg = format_reclaim_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY, &body);
+            assert!(
+                msg.contains(expected_substring),
+                "code {code}: expected '{expected_substring}' in '{msg}'"
+            );
+            // Should not include raw HTTP status when we recognize the code.
+            assert!(
+                !msg.contains("HTTP 422"),
+                "should not leak HTTP status for {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_reclaim_error_maps_404_to_not_found() {
+        let msg = format_reclaim_error(reqwest::StatusCode::NOT_FOUND, "{}");
+        assert_eq!(msg, "reclaim request not found");
+    }
+
+    #[test]
+    fn format_reclaim_error_maps_422_invalid_device_id() {
+        let body = r#"{"error":"invalid_device_id","message":"device_id must be a valid UUID."}"#;
+        let msg = format_reclaim_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY, body);
+        assert!(msg.contains("--device-id must be a valid UUID"));
+        assert!(!msg.contains("HTTP 422"), "should not leak HTTP status");
+    }
+
+    #[test]
+    fn format_reclaim_error_maps_403_to_org_scope_error() {
+        let body = r#"{"error":"forbidden","message":"Token is not scoped to this organization"}"#;
+        let msg = format_reclaim_error(reqwest::StatusCode::FORBIDDEN, body);
+        assert!(msg.contains("not authorized for this organization"));
+        assert!(msg.contains("scoped to a different org"));
+        assert!(!msg.contains("HTTP 403"), "should not leak HTTP status");
+        assert!(
+            !msg.contains("Token is not scoped"),
+            "should not leak raw API message"
+        );
+    }
+
+    #[test]
+    fn format_reclaim_error_maps_401_to_auth_error() {
+        let msg = format_reclaim_error(reqwest::StatusCode::UNAUTHORIZED, "{}");
+        assert!(msg.contains("not authenticated"));
+        assert!(msg.contains("avocado connect auth login"));
+    }
+
+    #[test]
+    fn format_reclaim_error_falls_back_to_raw_for_unknown_status() {
+        let msg = format_reclaim_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert!(msg.contains("HTTP 500"));
+        assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn format_reclaim_error_falls_back_to_raw_for_unknown_422_code() {
+        let body = r#"{"error":"unrecognized_code"}"#;
+        let msg = format_reclaim_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY, body);
+        assert!(msg.contains("HTTP 422"));
+        assert!(msg.contains("unrecognized_code"));
+    }
+
+    #[test]
+    fn format_reclaim_error_handles_non_json_body() {
+        let msg = format_reclaim_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY, "not json");
+        assert!(msg.contains("HTTP 422"));
+        assert!(msg.contains("not json"));
+    }
 
     #[test]
     fn test_trust_status_data_deserializes_all_fields() {

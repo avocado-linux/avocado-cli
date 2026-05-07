@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 mod commands;
 mod utils;
@@ -20,6 +21,10 @@ use commands::connect::cohorts::{
     ConnectCohortsCreateCommand, ConnectCohortsDeleteCommand, ConnectCohortsListCommand,
 };
 use commands::connect::deploy::ConnectDeployCommand;
+use commands::connect::device_reclaim::{
+    ConnectDeviceReclaimApproveCommand, ConnectDeviceReclaimDeleteCommand,
+    ConnectDeviceReclaimDenyCommand, ConnectDeviceReclaimListCommand,
+};
 use commands::connect::devices::{
     ConnectDevicesCreateCommand, ConnectDevicesDeleteCommand, ConnectDevicesListCommand,
 };
@@ -858,6 +863,132 @@ enum ConnectDevicesCommands {
         /// Device ID to delete
         #[arg(long)]
         id: String,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Manage admin-approved device reclaim requests
+    Reclaim {
+        #[command(subcommand)]
+        command: ConnectDeviceReclaimCommands,
+    },
+}
+
+/// Status filter accepted by the reclaim list / count endpoints.
+///
+/// Variants are validated at clap parse time (clearer help text, fail-fast
+/// on bad input) rather than via a runtime check inside the command. The
+/// `as_str` mapping is the over-the-wire form sent to the server.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum ReclaimStatusFilter {
+    Pending,
+    Approved,
+    Completed,
+    Denied,
+    Expired,
+    All,
+}
+
+impl ReclaimStatusFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Completed => "completed",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Validate `--device-id` as a UUID at clap parse time.
+///
+/// Without this, malformed input would silently flow into URL string
+/// construction (potential query-param injection) and only fail later
+/// at the server's 422. Failing at the CLI boundary gives clearer UX
+/// and removes the URL-injection vector by construction. Returns the
+/// canonical hyphenated form so the URL builder downstream can rely on
+/// a UUID-shaped string.
+fn parse_uuid(s: &str) -> Result<String, String> {
+    Uuid::parse_str(s)
+        .map(|u| u.hyphenated().to_string())
+        .map_err(|e| format!("'{s}' is not a valid UUID: {e}"))
+}
+
+#[derive(Subcommand)]
+enum ConnectDeviceReclaimCommands {
+    /// List reclaim requests (defaults to pending)
+    List {
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Filter by status
+        #[arg(long, value_enum, default_value_t = ReclaimStatusFilter::Pending)]
+        status: ReclaimStatusFilter,
+        /// Filter to a single device by id. Returns at most one row when combined
+        /// with --status pending (the partial unique index allows one pending
+        /// reclaim per device).
+        #[arg(long = "device-id", value_parser = parse_uuid)]
+        device_id: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Approve a pending reclaim request
+    Approve {
+        /// Reclaim request ID
+        id: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Deny a pending reclaim request
+    Deny {
+        /// Reclaim request ID
+        id: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Reason for denial (max 1024 chars). If omitted, prompts interactively. Pass --reason "" to skip.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Delete a denied reclaim request (recovery for typo'd denies)
+    Delete {
+        /// Reclaim request ID
+        id: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
@@ -2837,6 +2968,78 @@ async fn main() -> Result<()> {
                     cmd.execute().await?;
                     Ok(())
                 }
+                ConnectDevicesCommands::Reclaim { command } => match command {
+                    ConnectDeviceReclaimCommands::List {
+                        org,
+                        status,
+                        device_id,
+                        config,
+                        profile,
+                    } => {
+                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let cmd = ConnectDeviceReclaimListCommand {
+                            org: resolved_org,
+                            status: status.as_str().to_string(),
+                            device_id,
+                            profile,
+                        };
+                        cmd.execute().await?;
+                        Ok(())
+                    }
+                    ConnectDeviceReclaimCommands::Approve {
+                        id,
+                        org,
+                        yes,
+                        config,
+                        profile,
+                    } => {
+                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let cmd = ConnectDeviceReclaimApproveCommand {
+                            org: resolved_org,
+                            id,
+                            yes,
+                            profile,
+                        };
+                        cmd.execute().await?;
+                        Ok(())
+                    }
+                    ConnectDeviceReclaimCommands::Deny {
+                        id,
+                        org,
+                        reason,
+                        yes,
+                        config,
+                        profile,
+                    } => {
+                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let cmd = ConnectDeviceReclaimDenyCommand {
+                            org: resolved_org,
+                            id,
+                            reason,
+                            yes,
+                            profile,
+                        };
+                        cmd.execute().await?;
+                        Ok(())
+                    }
+                    ConnectDeviceReclaimCommands::Delete {
+                        id,
+                        org,
+                        yes,
+                        config,
+                        profile,
+                    } => {
+                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let cmd = ConnectDeviceReclaimDeleteCommand {
+                            org: resolved_org,
+                            id,
+                            yes,
+                            profile,
+                        };
+                        cmd.execute().await?;
+                        Ok(())
+                    }
+                },
             },
             ConnectCommands::Cohorts { command } => match command {
                 ConnectCohortsCommands::List {
