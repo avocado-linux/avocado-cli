@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
-use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
-use crate::utils::kernel_version::resolve_kernel_family_name;
+use crate::utils::kernel_resolver::{
+    off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams,
+};
+use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -547,7 +549,10 @@ impl RuntimeInstallCommand {
             // Resolve (or reuse a pinned) KERNEL_VERSION for this runtime
             // before building package specs. Runtimes with kernel.compile set
             // return None here and kernel-family names pass through unchanged.
-            let resolved_kver = {
+            // Also compute dnf --exclude flags for off-kernel packages while
+            // the resolver's params are in scope, so the install transaction
+            // can't pick a wrong-kernel candidate via an unqualified Provides.
+            let (resolved_kver, off_kernel_excludes) = {
                 let mut resolve_params = ResolveParams {
                     container_helper,
                     container_image,
@@ -565,7 +570,12 @@ impl RuntimeInstallCommand {
                     verbose: self.verbose,
                     tui_context: self.tui_context.clone(),
                 };
-                resolve_and_pin_kernel_version(&mut resolve_params).await?
+                let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
+                let excludes = match kver.as_deref() {
+                    Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
+                    None => Vec::new(),
+                };
+                (kver, excludes)
             };
 
             // Build list of packages to install
@@ -601,7 +611,7 @@ impl RuntimeInstallCommand {
                 };
 
                 let resolved_name = match resolved_kver.as_deref() {
-                    Some(kver) => resolve_kernel_family_name(package_name, kver),
+                    Some(kver) => substitute_kernel_version(package_name, kver),
                     None => package_name.to_string(),
                 };
                 let package_spec = build_package_spec_with_lock(
@@ -623,7 +633,7 @@ impl RuntimeInstallCommand {
                     if let Some(ref kernel_package) = kernel_config.package {
                         let kernel_version = kernel_config.version.as_deref().unwrap_or("*");
                         let resolved_name = match resolved_kver.as_deref() {
-                            Some(kver) => resolve_kernel_family_name(kernel_package, kver),
+                            Some(kver) => substitute_kernel_version(kernel_package, kver),
                             None => kernel_package.clone(),
                         };
                         let package_spec = build_package_spec_with_lock(
@@ -660,6 +670,11 @@ impl RuntimeInstallCommand {
                 } else {
                     String::new()
                 };
+                let exclude_str = if off_kernel_excludes.is_empty() {
+                    String::new()
+                } else {
+                    off_kernel_excludes.join(" ")
+                };
 
                 let dnf_command = format!(
                     r#"\
@@ -671,10 +686,12 @@ $DNF_SDK_HOST \
     --installroot={installroot_path} \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
+    {} \
     install \
     {} \
     {}"#,
                     dnf_args_str,
+                    exclude_str,
                     yes,
                     packages.join(" ")
                 );

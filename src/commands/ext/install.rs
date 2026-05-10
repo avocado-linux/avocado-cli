@@ -8,7 +8,7 @@ use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::kernel_resolver::{
     off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams,
 };
-use crate::utils::kernel_version::resolve_kernel_family_name;
+use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
@@ -743,7 +743,7 @@ impl ExtInstallCommand {
                 };
 
                 let resolved_name = match resolved_kver.as_deref() {
-                    Some(kver) => resolve_kernel_family_name(package_name, kver),
+                    Some(kver) => substitute_kernel_version(package_name, kver),
                     None => package_name.to_string(),
                 };
 

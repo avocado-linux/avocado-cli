@@ -181,10 +181,17 @@ pub async fn off_kernel_dnf_excludes(
     let mut excludes = Vec::new();
     for kver in available.iter().filter(|k| k.as_str() != resolved_kver) {
         // Single-quote the glob so the host shell doesn't expand it before dnf
-        // sees it. Both the renamed kernel-module-* and the nv-* OOT shim
-        // namespace are blocked.
-        excludes.push(format!("--exclude='kernel-*-{kver}*'"));
-        excludes.push(format!("--exclude='nv-kernel-module-*-{kver}*'"));
+        // sees it.
+        //
+        // The pattern is `kernel-*${kver}*` (no dash before ${kver}) so it
+        // matches both the renamed kernel-base shell (`kernel-${kver}`, which
+        // has no separator before the version) AND subpackages like
+        // `kernel-image-${kver}` / `kernel-module-X-${kver}`. The earlier
+        // `kernel-*-${kver}*` pattern required a dash and silently let the
+        // base shell slip through, leaving an orphaned off-kernel `kernel-`
+        // package in the sysroot's rpmdb after every cross-kernel install.
+        excludes.push(format!("--exclude='kernel-*{kver}*'"));
+        excludes.push(format!("--exclude='nv-kernel-module-*{kver}*'"));
     }
     Ok(excludes)
 }

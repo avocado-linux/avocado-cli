@@ -75,8 +75,8 @@ fi
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
-    kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams},
-    kernel_version::resolve_kernel_family_name,
+    kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
+    kernel_version::substitute_kernel_version,
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -411,7 +411,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         .get_kernel_version(params.target, &params.sysroot_type)
         .cloned();
 
-    let resolved_kver = {
+    let (resolved_kver, off_kernel_excludes) = {
         let mut resolve_params = ResolveParams {
             container_helper: params.container_helper,
             container_image: params.container_image,
@@ -429,7 +429,12 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             verbose: params.verbose,
             tui_context: params.tui_context.clone(),
         };
-        resolve_and_pin_kernel_version(&mut resolve_params).await?
+        let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
+        let excludes = match kver.as_deref() {
+            Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
+            None => Vec::new(),
+        };
+        (kver, excludes)
     };
 
     // Detect kernel pin change vs lockfile. dnf install is additive, so if
@@ -509,7 +514,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // kernel-family names without silent rewriting.
     let resolve_name = |name: &str| -> String {
         match resolved_kver.as_deref() {
-            Some(kver) => resolve_kernel_family_name(name, kver),
+            Some(kver) => substitute_kernel_version(name, kver),
             None => name.to_string(),
         }
     };
@@ -670,6 +675,12 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         })
         .unwrap_or_default();
 
+    let exclude_str = if off_kernel_excludes.is_empty() {
+        String::new()
+    } else {
+        off_kernel_excludes.join(" ")
+    };
+
     let command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
@@ -686,7 +697,7 @@ PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
+    {dnf_args_str} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
 {overlay_snippet}"#
     );
 
