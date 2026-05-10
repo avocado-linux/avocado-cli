@@ -384,8 +384,9 @@ impl RuntimeInstallCommand {
             .and_then(|deps| deps.as_mapping())
             .map(|deps_map| {
                 deps_map
-                    .keys()
-                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                    .iter()
+                    .filter(|(_, v)| !is_sdk_compile_entry(v))
+                    .filter_map(|(k, _)| k.as_str().map(|s| s.to_string()))
                     .collect()
             })
             .unwrap_or_default();
@@ -579,6 +580,14 @@ impl RuntimeInstallCommand {
                     None => continue, // Skip if package name is not a string
                 };
 
+                // Sdk-compile entries are not DNF packages — they're handled
+                // by `runtime build` (mirroring the kernel.compile/install
+                // hook). Skip them here so DNF doesn't try to resolve a feed
+                // package by the same name.
+                if is_sdk_compile_entry(version_spec) {
+                    continue;
+                }
+
                 let config_version = if let Some(version) = version_spec.as_str() {
                     version.to_string()
                 } else if let serde_yaml::Value::Mapping(spec_map) = version_spec {
@@ -764,6 +773,25 @@ $DNF_SDK_HOST \
     }
 }
 
+/// True when a `runtime.packages.<name>` value is an sdk-compile entry —
+/// a mapping with both `compile` and `install` (matches the extension
+/// `packages.<dep>.{compile,install}` form). These are not DNF packages
+/// and are handled by `runtime build`, not `runtime install`.
+pub(crate) fn is_sdk_compile_entry(value: &serde_yaml::Value) -> bool {
+    let serde_yaml::Value::Mapping(m) = value else {
+        return false;
+    };
+    let has_compile = m
+        .get(serde_yaml::Value::String("compile".to_string()))
+        .and_then(|v| v.as_str())
+        .is_some();
+    let has_install = m
+        .get(serde_yaml::Value::String("install".to_string()))
+        .and_then(|v| v.as_str())
+        .is_some();
+    has_compile && has_install
+}
+
 /// Helper function to run a container command, using shared context if available
 async fn run_container_command(
     container_helper: &SdkContainer,
@@ -789,6 +817,26 @@ mod tests {
         let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_is_sdk_compile_entry() {
+        let yes: serde_yaml::Value =
+            serde_yaml::from_str("compile: uboot\ninstall: install.sh\n").unwrap();
+        assert!(is_sdk_compile_entry(&yes));
+
+        let only_compile: serde_yaml::Value = serde_yaml::from_str("compile: uboot\n").unwrap();
+        assert!(!is_sdk_compile_entry(&only_compile));
+
+        let only_install: serde_yaml::Value =
+            serde_yaml::from_str("install: install.sh\n").unwrap();
+        assert!(!is_sdk_compile_entry(&only_install));
+
+        let versioned: serde_yaml::Value = serde_yaml::from_str("version: '1.2.3'\n").unwrap();
+        assert!(!is_sdk_compile_entry(&versioned));
+
+        let plain: serde_yaml::Value = serde_yaml::Value::String("*".to_string());
+        assert!(!is_sdk_compile_entry(&plain));
     }
 
     #[test]

@@ -389,6 +389,95 @@ impl RuntimeBuildCommand {
             }
         }
 
+        // Handle sdk-compile entries declared under runtimes.<name>.packages.
+        // Mirrors the extension `packages.<dep>.{compile,install}` form: each
+        // entry runs the named sdk.compile section, then runs an install
+        // script with $AVOCADO_RUNTIME_BUILD_DIR + $AVOCADO_BUILD_DIR set so
+        // it can drop artifacts (e.g. a custom u-boot bundle) into the
+        // runtime build dir, overriding upstream-installed artifacts.
+        if let Some(merged) = merged_runtime.as_ref() {
+            let compile_entries = collect_runtime_compile_entries(merged);
+            for entry in &compile_entries {
+                print_info(
+                    &format!(
+                        "Compiling '{}' via sdk.compile.{} for runtime '{}'",
+                        entry.name, entry.compile_section, self.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+
+                let compile_command = SdkCompileCommand::new(
+                    self.config_path.clone(),
+                    self.verbose,
+                    vec![entry.compile_section.clone()],
+                    Some(target_arch.to_string()),
+                    self.container_args.clone(),
+                    self.dnf_args.clone(),
+                )
+                .with_sdk_arch(self.sdk_arch.clone());
+
+                compile_command.execute().await.with_context(|| {
+                    format!(
+                        "Failed to compile sdk section '{}' for runtime package '{}'",
+                        entry.compile_section, entry.name
+                    )
+                })?;
+
+                let runtime_build_dir = format!(
+                    "/opt/_avocado/{}/runtimes/{}",
+                    target_arch, self.runtime_name
+                );
+                let install_cmd = format!(
+                    r#"mkdir -p "{runtime_build_dir}" && if [ -f '{install_script}' ]; then echo 'Running install script: {install_script}'; export AVOCADO_RUNTIME_BUILD_DIR="{runtime_build_dir}"; export AVOCADO_BUILD_DIR="$AVOCADO_SDK_PREFIX/build/{compile_section}"; bash '{install_script}'; else echo 'Install script {install_script} not found.'; ls -la; exit 1; fi"#,
+                    install_script = entry.install_script,
+                    compile_section = entry.compile_section,
+                );
+
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target_arch.to_string(),
+                    command: install_cmd,
+                    verbose: self.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    tui_context: self.tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
+                    ..Default::default()
+                };
+
+                let install_result =
+                    run_container_command(container_helper, run_config, runs_on_context)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to run install script for runtime package '{}'",
+                                entry.name
+                            )
+                        })?;
+
+                if !install_result {
+                    return Err(anyhow::anyhow!(
+                        "Install script '{}' failed for runtime package '{}'",
+                        entry.install_script,
+                        entry.name
+                    ));
+                }
+
+                print_success(
+                    &format!(
+                        "Compiled and installed '{}' for runtime '{}'",
+                        entry.name, self.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
         // Collect extensions with versions for AVOCADO_EXT_LIST
         // This ensures the build scripts know exactly which extension versions to use
         let resolved_extensions = self
@@ -2507,6 +2596,47 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
     }
 }
 
+/// One sdk-compile entry under `runtimes.<n>.packages.<name>` of the form
+/// `{ compile: <section>, install: <script> }` (mirrors the extension
+/// `packages.<dep>.{compile,install}` form). Each entry runs the named
+/// `sdk.compile` section then runs an install script with
+/// `$AVOCADO_RUNTIME_BUILD_DIR` and `$AVOCADO_BUILD_DIR` set so the script
+/// can drop artifacts into the runtime build dir.
+#[derive(Debug, Clone)]
+struct RuntimeCompileEntry {
+    name: String,
+    compile_section: String,
+    install_script: String,
+}
+
+/// Walk `runtimes.<n>.packages` and pull out the sdk-compile entries.
+/// Order is the YAML iteration order so users can reason about staging
+/// order (e.g. ATF before u-boot).
+fn collect_runtime_compile_entries(merged_runtime: &serde_yaml::Value) -> Vec<RuntimeCompileEntry> {
+    let Some(packages) = merged_runtime.get("packages").and_then(|v| v.as_mapping()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, v) in packages {
+        let Some(name) = k.as_str() else { continue };
+        let Some(map) = v.as_mapping() else { continue };
+        let compile = map
+            .get(serde_yaml::Value::String("compile".to_string()))
+            .and_then(|v| v.as_str());
+        let install = map
+            .get(serde_yaml::Value::String("install".to_string()))
+            .and_then(|v| v.as_str());
+        if let (Some(compile_section), Some(install_script)) = (compile, install) {
+            out.push(RuntimeCompileEntry {
+                name: name.to_string(),
+                compile_section: compile_section.to_string(),
+                install_script: install_script.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// Helper function to run a container command, using shared context if available
 async fn run_container_command(
     container_helper: &SdkContainer,
@@ -2548,6 +2678,51 @@ mod tests {
         let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_collect_runtime_compile_entries_picks_compile_install_pairs() {
+        let merged: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: '*'
+  uboot:
+    compile: uboot
+    install: uboot-install.sh
+  some-pkg:
+    version: '1.2.3'
+"#,
+        )
+        .unwrap();
+
+        let entries = collect_runtime_compile_entries(&merged);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "uboot");
+        assert_eq!(entries[0].compile_section, "uboot");
+        assert_eq!(entries[0].install_script, "uboot-install.sh");
+    }
+
+    #[test]
+    fn test_collect_runtime_compile_entries_ignores_partial_specs() {
+        // A mapping with only `compile` (no `install`) is not a sdk-compile
+        // entry — it falls through to DNF as a `*`-versioned package.
+        let merged: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  bare-compile:
+    compile: foo
+  bare-install:
+    install: foo.sh
+"#,
+        )
+        .unwrap();
+        assert!(collect_runtime_compile_entries(&merged).is_empty());
+    }
+
+    #[test]
+    fn test_collect_runtime_compile_entries_no_packages() {
+        let merged: serde_yaml::Value = serde_yaml::from_str("extensions: []\n").unwrap();
+        assert!(collect_runtime_compile_entries(&merged).is_empty());
     }
 
     #[test]
