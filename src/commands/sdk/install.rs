@@ -9,6 +9,7 @@ use crate::commands::rootfs::install::{install_sysroot, SysrootInstallParams};
 use crate::utils::{
     config::{find_active_compile_sections, find_active_extensions, ComposedConfig, Config},
     container::{normalize_sdk_arch, RunConfig, SdkContainer, TuiContext},
+    kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
     runs_on::RunsOnContext,
@@ -216,7 +217,7 @@ impl SdkInstallCommand {
             .await;
 
         // On bootstrap failure, teardown and return early
-        let bootstrap = match bootstrap_result {
+        let mut bootstrap = match bootstrap_result {
             Ok(b) => b,
             Err(e) => {
                 if let Some(ref mut context) = runs_on_context {
@@ -228,6 +229,39 @@ impl SdkInstallCommand {
                     }
                 }
                 return Err(e);
+            }
+        };
+
+        // Resolve the kernel for the target-sysroot install and compute
+        // off-kernel `--exclude` flags before the parallel phase. The
+        // compile-time deps that land in target-sysroot can transitively
+        // recommend unqualified `kernel-module-X` virtuals, so without this
+        // dnf can pick an off-kernel candidate (we observed 6 netfilter
+        // modules + the kernel-base shell from the wrong kernel sneaking
+        // into target-sysroot on a 5.15 install). Same helper / cached
+        // repoquery as the other install paths.
+        let off_kernel_excludes = {
+            let mut resolve_params = ResolveParams {
+                container_helper: &container_helper,
+                container_image,
+                target: &target,
+                sysroot: SysrootType::TargetSysroot,
+                runtime_name: None,
+                config: &bootstrap.composed.config,
+                lock_file: &mut bootstrap.lock_file,
+                repo_url: repo_url.as_deref(),
+                repo_release: repo_release.as_deref(),
+                merged_container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                runs_on_context: runs_on_context.as_ref(),
+                sdk_arch: self.sdk_arch.as_ref(),
+                verbose: self.verbose,
+                tui_context: self.tui_context.clone(),
+            };
+            let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
+            match kver.as_deref() {
+                Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
+                None => Vec::new(),
             }
         };
 
@@ -243,6 +277,7 @@ impl SdkInstallCommand {
                 merged_container_args.as_ref(),
                 runs_on_context.as_ref(),
                 &target,
+                &off_kernel_excludes,
             )
             .await;
 
@@ -277,6 +312,7 @@ impl SdkInstallCommand {
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
         target: &str,
+        off_kernel_excludes: &[String],
     ) -> Result<()> {
         let composed = &bootstrap.composed;
         let config = &composed.config;
@@ -319,6 +355,11 @@ impl SdkInstallCommand {
             } else {
                 String::new()
             };
+            let exclude_str = if off_kernel_excludes.is_empty() {
+                String::new()
+            } else {
+                off_kernel_excludes.join(" ")
+            };
             let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
             let target_sysroot_config_version = "*";
             let target_sysroot_pkg = build_package_spec_with_lock(
@@ -335,10 +376,11 @@ unset RPM_CONFIGDIR
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
-    {} {} --installroot ${{AVOCADO_PREFIX}}/sdk/target-sysroot \
+    {} {} {} --installroot ${{AVOCADO_PREFIX}}/sdk/target-sysroot \
     install {} {}
 "#,
                 dnf_args_str,
+                exclude_str,
                 yes,
                 target_sysroot_pkg,
                 all_compile_packages.join(" ")
