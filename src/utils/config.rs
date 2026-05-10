@@ -580,6 +580,11 @@ pub enum ImageRef {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub target: Option<String>,
+    /// Optional board variant within `target`. Surfaces through
+    /// `{{ avocado.target.board }}` interpolation when this runtime is the
+    /// resolved one; falls back to top-level `default_target_board`, then to
+    /// the resolved target.
+    pub target_board: Option<String>,
     /// Optional human-readable version label for this runtime (e.g. "1.0.0").
     /// When omitted, a short UUID is generated at build time.
     pub version: Option<String>,
@@ -3245,6 +3250,7 @@ impl Config {
 
         let synth = RuntimeConfig {
             target: Some(target),
+            target_board: None,
             version: None,
             dependencies: None,
             stone_include_paths: None,

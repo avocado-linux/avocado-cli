@@ -4,6 +4,8 @@
 //!
 //! **Available values:**
 //! - `{{ avocado.target }}` - Resolved target architecture
+//! - `{{ avocado.target.board }}` - Resolved target board (falls back to target)
+//! - `{{ avocado.runtime }}` - Resolved runtime name (env → default_runtime → sole)
 //! - `{{ avocado.distro.release }}` - Distro release (feed year) from main config
 //! - `{{ avocado.distro.version }}` - Alias for distro.release (backward compat)
 //! - `{{ avocado.distro.channel }}` - Distro channel from main config
@@ -51,8 +53,14 @@ pub struct AvocadoContext {
     pub target: Option<String>,
     /// Optional board variant within a target. `None` here means the resolver
     /// will fall back to `target` at lookup time, so `{{ avocado.target.board }}`
-    /// equals `{{ avocado.target }}` by default. Precedence: env > config.
+    /// equals `{{ avocado.target }}` by default. Precedence:
+    /// env > resolved-runtime's `target_board` > top-level `default_target_board`.
     pub target_board: Option<String>,
+    /// Resolved runtime name. Precedence: env `AVOCADO_RUNTIME` >
+    /// `default_runtime` > sole runtime when exactly one is defined. `None`
+    /// when no runtime can be resolved (e.g. multiple runtimes with no
+    /// `default_runtime` set). Surfaces through `{{ avocado.runtime }}`.
+    pub runtime: Option<String>,
     /// Distro release (feed year) from the main config
     pub distro_release: Option<String>,
     /// Distro channel from the main config
@@ -78,6 +86,7 @@ impl AvocadoContext {
         Self {
             target: target.map(|s| s.to_string()),
             target_board: None,
+            runtime: None,
             distro_release: None,
             distro_channel: None,
             kernel_version: None,
@@ -96,10 +105,15 @@ impl AvocadoContext {
         // Resolve target with precedence: CLI > env > config
         let target = Self::resolve_target_value(root, cli_target);
 
-        // Resolve target_board with precedence: env > config. Stored as None
-        // when neither is set so the resolver can fall back to `target` at
+        // Resolve runtime once and reuse for target_board lookup. Precedence:
+        // env > default_runtime > sole-runtime auto-resolve.
+        let runtime = Self::resolve_runtime_name(root);
+
+        // Resolve target_board with precedence: env > resolved-runtime's
+        // `target_board` > top-level `default_target_board`. Stored as None
+        // when none are set so the resolver can fall back to `target` at
         // lookup time.
-        let target_board = Self::resolve_target_board_value(root);
+        let target_board = Self::resolve_target_board_value(root, runtime.as_deref());
 
         // Extract distro values from the main config
         let (distro_release, distro_channel) = Self::extract_distro_values(root);
@@ -107,6 +121,7 @@ impl AvocadoContext {
         Self {
             target,
             target_board,
+            runtime,
             distro_release,
             distro_channel,
             kernel_version: None,
@@ -135,18 +150,64 @@ impl AvocadoContext {
         None
     }
 
-    /// Resolve the target board value. Precedence: env `AVOCADO_TARGET_BOARD`
-    /// then config `default_target_board`. Returns `None` when neither is set;
-    /// the resolver then falls back to the resolved target.
-    fn resolve_target_board_value(root: &Value) -> Option<String> {
+    /// Resolve the target board value. Precedence: env `AVOCADO_TARGET_BOARD`,
+    /// then the resolved runtime's `target_board`, then config
+    /// `default_target_board`. Returns `None` when none are set; the resolver
+    /// then falls back to the resolved target.
+    ///
+    /// `runtime_name` is the pre-resolved runtime (see
+    /// [`Self::resolve_runtime_name`]); when `None`, the per-runtime
+    /// `target_board` lookup is skipped.
+    fn resolve_target_board_value(root: &Value, runtime_name: Option<&str>) -> Option<String> {
         if let Ok(board) = env::var("AVOCADO_TARGET_BOARD") {
             return Some(board);
+        }
+
+        if let Some(name) = runtime_name {
+            if let Some(board) = root
+                .get("runtimes")
+                .and_then(|v| v.get(name))
+                .and_then(|v| v.get("target_board"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(board.to_string());
+            }
         }
 
         if let Some(board) = root.get("default_target_board") {
             if let Some(board_str) = board.as_str() {
                 return Some(board_str.to_string());
             }
+        }
+
+        None
+    }
+
+    /// Resolve the active runtime name from raw YAML. Precedence:
+    /// 1. env `AVOCADO_RUNTIME`
+    /// 2. `default_runtime`
+    /// 3. Sole runtime (when exactly one is defined under `runtimes:`)
+    ///
+    /// Mirrors [`crate::utils::runtime::resolve_runtime_with_source`] but
+    /// operates on the raw YAML (interpolation runs before deserialization).
+    fn resolve_runtime_name(root: &Value) -> Option<String> {
+        if let Ok(name) = env::var("AVOCADO_RUNTIME") {
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+
+        if let Some(name) = root.get("default_runtime").and_then(|v| v.as_str()) {
+            return Some(name.to_string());
+        }
+
+        let runtimes = root.get("runtimes")?.as_mapping()?;
+        if runtimes.len() == 1 {
+            return runtimes
+                .keys()
+                .next()
+                .and_then(|k| k.as_str())
+                .map(|s| s.to_string());
         }
 
         None
@@ -182,12 +243,14 @@ impl AvocadoContext {
     pub fn with_values(
         target: Option<String>,
         target_board: Option<String>,
+        runtime: Option<String>,
         distro_release: Option<String>,
         distro_channel: Option<String>,
     ) -> Self {
         Self {
             target,
             target_board,
+            runtime,
             distro_release,
             distro_channel,
             kernel_version: None,
@@ -219,6 +282,7 @@ impl AvocadoContext {
 /// let ctx = AvocadoContext {
 ///     target: None,
 ///     target_board: None,
+///     runtime: None,
 ///     distro_release: Some("2024".to_string()),
 ///     distro_channel: Some("edge".to_string()),
 ///     kernel_version: None,
@@ -234,6 +298,7 @@ pub fn resolve(
     match path {
         ["target"] => resolve_target(root, context),
         ["target", "board"] => resolve_target_board(root, context),
+        ["runtime"] => resolve_runtime(root, context),
         ["distro", "release"] | ["distro", "version"] => resolve_distro_release(context),
         ["distro", "channel"] => resolve_distro_channel(context),
         ["kernel", "version"] => resolve_kernel_version(context),
@@ -244,6 +309,20 @@ pub fn resolve(
             Ok(None)
         }
     }
+}
+
+/// Resolve the active runtime name. Precedence:
+/// 1. Context `runtime` (pre-resolved at context creation)
+/// 2. Direct lookup against `root` using the same precedence
+///    ([`AvocadoContext::resolve_runtime_name`])
+fn resolve_runtime(root: &Value, context: Option<&AvocadoContext>) -> Result<Option<String>> {
+    if let Some(ctx) = context {
+        if let Some(ref name) = ctx.runtime {
+            return Ok(Some(name.clone()));
+        }
+    }
+
+    Ok(AvocadoContext::resolve_runtime_name(root))
 }
 
 /// Resolve the kernel version from context. Returns `None` if the context
@@ -425,6 +504,7 @@ mod tests {
         let ctx = AvocadoContext {
             target: Some("imx8mp-evk".to_string()),
             target_board: Some("ctx-board".to_string()),
+            runtime: None,
             distro_release: None,
             distro_channel: None,
             kernel_version: None,
@@ -516,6 +596,7 @@ mod tests {
         let ctx = AvocadoContext {
             target: None,
             target_board: None,
+            runtime: None,
             distro_release: Some("2024".to_string()),
             distro_channel: None,
             kernel_version: None,
@@ -530,6 +611,7 @@ mod tests {
         let ctx = AvocadoContext {
             target: None,
             target_board: None,
+            runtime: None,
             distro_release: Some("2024".to_string()),
             distro_channel: None,
             kernel_version: None,
@@ -545,6 +627,7 @@ mod tests {
         let ctx = AvocadoContext {
             target: None,
             target_board: None,
+            runtime: None,
             distro_release: None,
             distro_channel: Some("apollo-edge".to_string()),
             kernel_version: None,
@@ -665,6 +748,235 @@ default_target_board: config-board
         let ctx = AvocadoContext::from_main_config(&config, None);
         assert_eq!(ctx.target, Some("imx8mp-evk".to_string()));
         assert_eq!(ctx.target_board, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_from_default_runtime() {
+        // `default_runtime` selects the runtime whose `target_board` is used.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_runtime: rev3
+runtimes:
+  rev3:
+    target: imx8mp-evk
+    target_board: imx8mp-evk-rev3
+  rev1:
+    target: imx8mp-evk
+    target_board: imx8mp-evk-rev1
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_from_sole_runtime() {
+        // No `default_runtime`, but exactly one runtime is defined — it auto-resolves.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+runtimes:
+  only:
+    target: imx8mp-evk
+    target_board: imx8mp-evk-rev3
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_runtime_overrides_default_target_board() {
+        // Per-runtime `target_board` wins over top-level `default_target_board`.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: top-level-board
+default_runtime: rev3
+runtimes:
+  rev3:
+    target: imx8mp-evk
+    target_board: imx8mp-evk-rev3
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_env_runtime_selects_runtime() {
+        // `AVOCADO_RUNTIME` selects which runtime's `target_board` is used.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::set_var("AVOCADO_RUNTIME", "rev1");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_runtime: rev3
+runtimes:
+  rev3:
+    target_board: imx8mp-evk-rev3
+  rev1:
+    target_board: imx8mp-evk-rev1
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("imx8mp-evk-rev1".to_string()));
+        env::remove_var("AVOCADO_RUNTIME");
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_env_overrides_runtime() {
+        // `AVOCADO_TARGET_BOARD` env wins over per-runtime `target_board`.
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_runtime: rev3
+runtimes:
+  rev3:
+    target_board: imx8mp-evk-rev3
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("env-board".to_string()));
+        env::remove_var("AVOCADO_TARGET_BOARD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_falls_back_to_default_when_runtime_lacks_field() {
+        // Resolved runtime has no `target_board` — falls through to top-level.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: top-level-board
+default_runtime: rev3
+runtimes:
+  rev3:
+    target: imx8mp-evk
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("top-level-board".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_from_context() {
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml("default_runtime: cfg-rt");
+        let ctx = AvocadoContext {
+            target: None,
+            target_board: None,
+            runtime: Some("ctx-rt".to_string()),
+            distro_release: None,
+            distro_channel: None,
+            kernel_version: None,
+        };
+        let result = resolve(&["runtime"], &config, Some(&ctx)).unwrap();
+        assert_eq!(result, Some("ctx-rt".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_from_env() {
+        env::set_var("AVOCADO_RUNTIME", "env-rt");
+        let config = parse_yaml("default_runtime: cfg-rt");
+        let result = resolve(&["runtime"], &config, None).unwrap();
+        assert_eq!(result, Some("env-rt".to_string()));
+        env::remove_var("AVOCADO_RUNTIME");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_from_default() {
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml("default_runtime: cfg-rt");
+        let result = resolve(&["runtime"], &config, None).unwrap();
+        assert_eq!(result, Some("cfg-rt".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_from_sole() {
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+runtimes:
+  only:
+    target: imx8mp-evk
+"#,
+        );
+        let result = resolve(&["runtime"], &config, None).unwrap();
+        assert_eq!(result, Some("only".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_unavailable_when_ambiguous() {
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+runtimes:
+  rev3: {}
+  rev1: {}
+"#,
+        );
+        let result = resolve(&["runtime"], &config, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_runtime_populated_from_default() {
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_runtime: rev3
+runtimes:
+  rev3:
+    target: imx8mp-evk
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.runtime, Some("rev3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_avocado_context_target_board_skipped_when_multiple_runtimes_no_default() {
+        // Multiple runtimes with no `default_runtime` and no `AVOCADO_RUNTIME`:
+        // can't pick one, so per-runtime `target_board` is not consulted.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        env::remove_var("AVOCADO_RUNTIME");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: top-level-board
+runtimes:
+  rev3:
+    target_board: imx8mp-evk-rev3
+  rev1:
+    target_board: imx8mp-evk-rev1
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None);
+        assert_eq!(ctx.target_board, Some("top-level-board".to_string()));
     }
 
     #[test]

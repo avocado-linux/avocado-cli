@@ -236,6 +236,7 @@ mod tests {
             name.to_string(),
             RuntimeConfig {
                 target: None,
+                target_board: None,
                 version: None,
                 dependencies: None,
                 stone_include_paths: None,
