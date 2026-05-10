@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
-use crate::utils::kernel_resolver::{resolve_and_pin_kernel_version, ResolveParams};
+use crate::utils::kernel_resolver::{
+    off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams,
+};
 use crate::utils::kernel_version::resolve_kernel_family_name;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
@@ -675,7 +677,13 @@ impl ExtInstallCommand {
                 })
         });
 
-        let resolved_kver = if has_overrides_or_packages {
+        // Resolve the kernel version AND, while the resolver still has its
+        // ResolveParams in scope, compute dnf --exclude flags for every other
+        // kernel in the feed. Excludes block transitive RDEPENDS/RRECOMMENDS
+        // from resolving unqualified `kernel-module-X` virtuals against an
+        // off-kernel package — the same pattern that leaks 5.15 modules into
+        // a 6.6-pinned extension via k3s-server's iptables/conntrack chain.
+        let (resolved_kver, off_kernel_excludes) = if has_overrides_or_packages {
             // Extensions inherit the top-level kernel.version (they're not
             // runtime-scoped), so pass None for runtime_name.
             let mut resolve_params = ResolveParams {
@@ -695,9 +703,14 @@ impl ExtInstallCommand {
                 verbose: self.verbose,
                 tui_context: effective_tui_context.clone(),
             };
-            resolve_and_pin_kernel_version(&mut resolve_params).await?
+            let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
+            let excludes = match kver.as_deref() {
+                Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
+                None => Vec::new(),
+            };
+            (kver, excludes)
         } else {
-            None
+            (None, Vec::new())
         };
 
         // Apply target/kernel sub-section overrides now that kver is known.
@@ -858,6 +871,11 @@ impl ExtInstallCommand {
                 } else {
                     String::new()
                 };
+                let exclude_str = if off_kernel_excludes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {} ", off_kernel_excludes.join(" "))
+                };
                 let command = format!(
                     r#"
 RPM_NO_CHROOT_FOR_SCRIPTS=1 \
@@ -871,6 +889,7 @@ $DNF_SDK_HOST \
     --installroot={} \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} \
+    {} \
     install \
     {} \
     {}
@@ -878,6 +897,7 @@ $DNF_SDK_HOST \
                     installroot,
                     installroot,
                     dnf_args_str,
+                    exclude_str,
                     yes,
                     packages.join(" ")
                 );

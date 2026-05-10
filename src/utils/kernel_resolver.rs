@@ -154,6 +154,41 @@ fn kernel_version_cache() -> &'static KernelVersionCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Build dnf `--exclude` flags that block every kernel-family package belonging
+/// to a kernel *other* than `resolved_kver` from being selected during install.
+///
+/// In a multi-kernel feed, packages emitted by Yocto's kernel.bbclass and the
+/// nvidia OOT shim publish unqualified Provides like `kernel-module-X` and
+/// `nv-kernel-module-X` alongside their fully-qualified
+/// `kernel-module-X-${kver}` name. Transitive RDEPENDS or RRECOMMENDS chains
+/// can resolve those unqualified names against any kernel's package; libsolv
+/// tie-breaks among providers in ways that aren't always EVR-monotonic, so a
+/// 5.15-only candidate can win even when the lockfile pins 6.6.
+///
+/// Adding `--exclude='kernel-*-${other_kver}*'` (and the `nv-kernel-module-*`
+/// variant) for every other-kernel kver in the feed makes those candidates
+/// invisible to the solver — leaving the on-kernel package as the only viable
+/// provider, or the recommend as unsatisfiable (which is the right outcome for
+/// a feature that isn't shipped on the chosen kernel).
+///
+/// Cheap because it reuses [`get_available_kernel_versions`]'s cache; the
+/// repoquery only runs the first time the resolver is asked.
+pub async fn off_kernel_dnf_excludes(
+    params: &ResolveParams<'_>,
+    resolved_kver: &str,
+) -> Result<Vec<String>> {
+    let available = get_available_kernel_versions(params).await?;
+    let mut excludes = Vec::new();
+    for kver in available.iter().filter(|k| k.as_str() != resolved_kver) {
+        // Single-quote the glob so the host shell doesn't expand it before dnf
+        // sees it. Both the renamed kernel-module-* and the nv-* OOT shim
+        // namespace are blocked.
+        excludes.push(format!("--exclude='kernel-*-{kver}*'"));
+        excludes.push(format!("--exclude='nv-kernel-module-*-{kver}*'"));
+    }
+    Ok(excludes)
+}
+
 /// Cached wrapper around [`query_available_kernel_versions`]. The key pairs
 /// target and repo URL so two avocado commands with different repo configs in
 /// the same process don't cross-pollinate.
