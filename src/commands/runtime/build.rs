@@ -1,6 +1,7 @@
 use crate::commands::initramfs::image::generate_initramfs_build_script;
 use crate::commands::rootfs::image::{generate_rootfs_build_script, NAMESPACE_UUID};
 use crate::commands::sdk::SdkCompileCommand;
+use crate::utils::config::get_post_install;
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer, TuiContext},
@@ -2173,18 +2174,28 @@ echo "Docker image priming complete.""#,
             }
         };
 
-        let rootfs_build_section =
-            generate_rootfs_build_script(NAMESPACE_UUID, &config.get_rootfs_filesystem());
+        let rootfs_post_install = get_post_install(parsed.get("rootfs"));
+        let rootfs_build_section = generate_rootfs_build_script(
+            NAMESPACE_UUID,
+            &config.get_rootfs_filesystem(),
+            rootfs_post_install.as_deref(),
+        );
 
-        let initramfs_build_section =
-            generate_initramfs_build_script(NAMESPACE_UUID, &config.get_initramfs_filesystem());
+        let initramfs_post_install = get_post_install(parsed.get("initramfs"));
+        let initramfs_build_section = generate_initramfs_build_script(
+            NAMESPACE_UUID,
+            &config.get_initramfs_filesystem(),
+            initramfs_post_install.as_deref(),
+        );
 
         let script = format!(
             r#"
-# Set common variables
-RUNTIME_NAME="{runtime_name}"
-TARGET_ARCH="{target_arch}"
-RUNTIME_VERSION="{runtime_version}"
+# Set common variables. `export`ed so any post_install script (which we
+# invoke as a child `bash` process from the build_section below)
+# inherits them.
+export RUNTIME_NAME="{runtime_name}"
+export TARGET_ARCH="{target_arch}"
+export RUNTIME_VERSION="{runtime_version}"
 
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/images"
@@ -2192,7 +2203,7 @@ mkdir -p "$VAR_DIR/lib/avocado/runtimes"
 {subvol_mkdir_section}
 {subvol_warnings_section}
 
-OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
+export OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 mkdir -p $OUTPUT_DIR
 
 # Create runtime-specific extensions directory (staging area for image ID computation)

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::utils::{
-    config::{get_ext_image_args, get_ext_image_type, Config},
+    config::{get_ext_image_args, get_ext_image_type, get_post_install, Config},
     container::{RunConfig, SdkContainer},
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
@@ -17,6 +17,79 @@ use crate::utils::{
 
 /// Namespace UUID for deterministic OS build ID generation (shared with runtime build).
 pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+/// Default post-install commands for the rootfs build. Run on the work
+/// directory (`$ROOTFS_WORK`) after package install + overlay, before
+/// the identity stamp and `mkfs.erofs`. These mirror what Yocto's
+/// `ROOTFS_POSTPROCESS_COMMAND` + `image.bbclass` would do, in the
+/// minimum form needed for a bootable avocado rootfs.
+///
+/// Used as a fallback only when the user does NOT define `pre_install`
+/// or `post_install` in the rootfs config. If the user defines either,
+/// they take full control and this default list is skipped entirely.
+pub const DEFAULT_ROOTFS_POST_INSTALL: &[&str] = &[
+    // usrmerge symlinks (Yocto image class does this, not any RPM package).
+    "ln -sfn usr/bin \"$ROOTFS_WORK/bin\"",
+    "ln -sfn usr/sbin \"$ROOTFS_WORK/sbin\"",
+    "ln -sfn usr/lib \"$ROOTFS_WORK/lib\"",
+    // Strip dirs that Yocto's avocado-image-rootfs.bb also stripped.
+    "rm -rf \"$ROOTFS_WORK/media\" \"$ROOTFS_WORK/mnt\" \"$ROOTFS_WORK/srv\"",
+    "rm -rf \"$ROOTFS_WORK/boot/\"*",
+    "mkdir -p \"$ROOTFS_WORK/opt\"",
+    // Empty /etc/machine-id for stateless systemd on read-only rootfs.
+    "touch \"$ROOTFS_WORK/etc/machine-id\"",
+    // systemd preset-all (matches image.bbclass systemd_preset_all).
+    "if [ -e \"$ROOTFS_WORK/usr/lib/systemd/systemd\" ]; then \
+\"$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl\" --root=\"$ROOTFS_WORK\" \
+--preset-mode=enable-only preset-all 2>/dev/null || true; \
+echo \"Applied systemd presets\"; fi",
+    // ld.so.cache generation (matches Yocto ldconfig-native).
+    "/usr/sbin/ldconfig -r \"$ROOTFS_WORK\" -c new -X 2>/dev/null || true",
+    "echo \"Generated ld.so.cache\"",
+];
+
+/// Render a list of user-supplied shell commands as an indented block,
+/// preceded by a one-line "Running … hooks" echo for log clarity. Empty
+/// input returns an empty string so the surrounding script stays clean.
+pub fn render_hook_block(name: &str, hooks: &[String]) -> String {
+    if hooks.is_empty() {
+        return String::new();
+    }
+    let header = format!(
+        "    echo \"Running {} hooks ({} command(s))...\"",
+        name,
+        hooks.len()
+    );
+    let body = hooks
+        .iter()
+        .map(|h| format!("    {h}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{header}\n{body}")
+}
+
+/// Resolve a user-provided `post_install` script path into the shell
+/// command(s) to splice into the build script.
+///
+/// - `Some(path)` → emit one guarded `bash /opt/src/<path>` invocation.
+///   Defaults are skipped — the script takes full responsibility for
+///   all post-install transformations. Mirrors the pattern upstream's
+///   runtime `post_build` uses.
+/// - `None` → fall back to `defaults`.
+pub fn resolve_install_hooks(post_install_script: Option<&str>, defaults: &[&str]) -> Vec<String> {
+    match post_install_script {
+        Some(path) => vec![format!(
+            "if [ -f '/opt/src/{path}' ]; then \
+echo 'Running post_install script: {path}'; \
+bash '/opt/src/{path}'; \
+else \
+echo 'post_install script /opt/src/{path} not found.'; \
+exit 1; \
+fi"
+        )],
+        None => defaults.iter().map(|s| s.to_string()).collect(),
+    }
+}
 
 /// Generate the shell script fragment that builds a rootfs image from the shared sysroot.
 ///
@@ -32,50 +105,41 @@ pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 /// - `$AVOCADO_ROOTFS_IMAGE` — path to built image
 /// - `$AVOCADO_ROOTFS_FILESYSTEM` — filesystem format used
 /// - `$AVOCADO_OS_BUILD_ID` — deterministic build ID
-pub fn generate_rootfs_build_script(namespace_uuid: &str, rootfs_filesystem: &str) -> String {
+///
+/// `post_install` is a project-relative script path (resolved against
+/// `/opt/src` inside the SDK container). When set, the build splices
+/// one guarded `bash /opt/src/<path>` invocation in place of the
+/// default post-install commands. When `None`, the defaults run
+/// (usrmerge symlinks, /mnt /media /srv cleanup, /etc/machine-id,
+/// systemd preset, ld.so.cache — see `DEFAULT_ROOTFS_POST_INSTALL`).
+///
+/// Identity stamping (build_id + os-release injection) and `mkfs.erofs`
+/// are always run as internal mechanics.
+pub fn generate_rootfs_build_script(
+    namespace_uuid: &str,
+    rootfs_filesystem: &str,
+    post_install: Option<&str>,
+) -> String {
+    let post = resolve_install_hooks(post_install, DEFAULT_ROOTFS_POST_INSTALL);
+    let post_install_block = render_hook_block("post_install", &post);
     format!(
         r#"
-# Build rootfs image from shared sysroot
-ROOTFS_SYSROOT="$AVOCADO_PREFIX/rootfs"
+# Build rootfs image from shared sysroot.
+# These vars are `export`ed so the post_install script (which we invoke
+# as a child `bash` process) inherits them.
+export ROOTFS_SYSROOT="$AVOCADO_PREFIX/rootfs"
 if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     echo "Building rootfs image from packages..."
 
     # Work on a copy so we don't mutate the shared sysroot used for extension priming
-    ROOTFS_WORK="${{ROOTFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/rootfs-work}}"
+    export ROOTFS_WORK="${{ROOTFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/rootfs-work}}"
     # Standalone rootfs builds (no runtime build before this) leave the
     # parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
     mkdir -p "$(dirname "$ROOTFS_WORK")"
     rm -rf "$ROOTFS_WORK"
     cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
 
-    # Create usrmerge symlinks (Yocto image class does this, not any RPM package)
-    ln -sfn usr/bin "$ROOTFS_WORK/bin"
-    ln -sfn usr/sbin "$ROOTFS_WORK/sbin"
-    ln -sfn usr/lib "$ROOTFS_WORK/lib"
-
-    # Post-processing (matches Yocto avocado-image-rootfs.bb)
-    rm -rf "$ROOTFS_WORK/media" "$ROOTFS_WORK/mnt" "$ROOTFS_WORK/srv"
-    rm -rf "$ROOTFS_WORK/boot/"*
-    mkdir -p "$ROOTFS_WORK/opt"
-
-    # Create empty /etc/machine-id for stateless systemd on read-only rootfs.
-    # systemd will bind-mount a transient machine-id at boot.
-    # (matches OE read_only_rootfs_hook in rootfs-postcommands.bbclass)
-    touch "$ROOTFS_WORK/etc/machine-id"
-
-    # Enable systemd service units via preset files.
-    # (matches OE systemd_preset_all in image.bbclass)
-    if [ -e "$ROOTFS_WORK/usr/lib/systemd/systemd" ]; then
-        "$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl" --root="$ROOTFS_WORK" --preset-mode=enable-only preset-all 2>/dev/null || true
-        echo "Applied systemd presets"
-    fi
-
-    # Generate ld.so.cache so the read-only rootfs has a working linker cache.
-    # Uses the container's host-native ldconfig with -r (chroot flag).
-    # ldconfig -r does chroot() but continues as the host binary — no binfmt needed.
-    # This matches Yocto's ldconfig-native approach.
-    /usr/sbin/ldconfig -r "$ROOTFS_WORK" -c new -X 2>/dev/null || true
-    echo "Generated ld.so.cache"
+{post_install_block}
 
     # Compute deterministic AVOCADO_OS_BUILD_ID from installed packages
     PKG_NEVRA=$(rpm --dbpath /var/lib/rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | sort)
@@ -134,6 +198,7 @@ else
 fi"#,
         namespace_uuid = namespace_uuid,
         rootfs_filesystem = rootfs_filesystem,
+        post_install_block = post_install_block,
     )
 }
 
@@ -218,13 +283,18 @@ impl RootfsImageCommand {
         print_info("Building rootfs image.", OutputLevel::Normal);
 
         let rootfs_filesystem = config.get_rootfs_filesystem();
-        let build_section = generate_rootfs_build_script(NAMESPACE_UUID, &rootfs_filesystem);
+        let rootfs_node = composed.merged_value.get("rootfs");
+        let post_install = get_post_install(rootfs_node);
+        let build_section = generate_rootfs_build_script(
+            NAMESPACE_UUID,
+            &rootfs_filesystem,
+            post_install.as_deref(),
+        );
 
         // If the avocado.yaml asks for a kab-wrapped rootfs, validate the
         // keyset on the host, append the wrap step to the script, and
         // bind-mount the keyset into the container at /tmp/kab.keyset.
         // Same plumbing as runtime/build.rs.
-        let rootfs_node = composed.merged_value.get("rootfs");
         let image_type = rootfs_node
             .and_then(get_ext_image_type)
             .unwrap_or_else(|| "raw".to_string());
@@ -271,10 +341,10 @@ impl RootfsImageCommand {
         // identical so callers can use the same args either way.
         let script = format!(
             r#"set -euo pipefail
-TARGET_ARCH="{target_arch}"
-RUNTIME_NAME="${{AVOCADO_RUNTIME_NAME:-standalone}}"
-RUNTIME_VERSION="${{AVOCADO_RUNTIME_VERSION:-0.0.0}}"
-OUTPUT_DIR="{internal_output_dir}"
+export TARGET_ARCH="{target_arch}"
+export RUNTIME_NAME="${{AVOCADO_RUNTIME_NAME:-standalone}}"
+export RUNTIME_VERSION="${{AVOCADO_RUNTIME_VERSION:-0.0.0}}"
+export OUTPUT_DIR="{internal_output_dir}"
 mkdir -p "$OUTPUT_DIR"
 {build_section}
 AVOCADO_OS_VERSION_ID=""

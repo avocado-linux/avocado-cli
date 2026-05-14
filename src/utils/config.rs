@@ -147,7 +147,14 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["packages", "dependencies", "filesystem", "overlay", "image"],
+        &[
+            "packages",
+            "dependencies",
+            "filesystem",
+            "overlay",
+            "image",
+            "post_install",
+        ],
         "rootfs",
     )
 }
@@ -161,7 +168,14 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["packages", "dependencies", "filesystem", "overlay", "image"],
+        &[
+            "packages",
+            "dependencies",
+            "filesystem",
+            "overlay",
+            "image",
+            "post_install",
+        ],
         "initramfs",
     )
 }
@@ -569,11 +583,17 @@ pub enum KernelRef {
 /// An image (rootfs/initramfs) reference on a runtime: either a named
 /// top-level entry or an inline anonymous override. Same untagged shape as
 /// [`KernelRef`].
+///
+/// `Inline` is boxed because `ImageConfig` is significantly larger than
+/// `String` and clippy's `large_enum_variant` lint otherwise flags the
+/// size disparity. The indirection is free for the `Named` path (no
+/// allocation) and adds one heap deref to the inline path (negligible
+/// vs the work of building an image).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ImageRef {
     Named(String),
-    Inline(ImageConfig),
+    Inline(Box<ImageConfig>),
 }
 
 /// Runtime configuration section
@@ -709,6 +729,23 @@ pub struct ImageConfig {
     /// Read dynamically via `get_ext_image_type` / `get_ext_image_args`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<serde_yaml::Value>,
+    /// Post-install hook for the rootfs/initramfs work directory. Path
+    /// to a script (relative to `/opt/src`, the project root inside the
+    /// SDK container). Mirrors upstream's `post_build:` shape.
+    ///
+    /// Runs after package install + overlay, before `mkfs` (Yocto
+    /// analogue: `ROOTFS_POSTPROCESS_COMMAND`). The script gets
+    /// `$ROOTFS_WORK` / `$INITRAMFS_WORK`, `$ROOTFS_SYSROOT`,
+    /// `$AVOCADO_PREFIX`, `$AVOCADO_SDK_PREFIX`, `$RUNTIME_NAME`,
+    /// `$RUNTIME_VERSION`, `$TARGET_ARCH` available. `set -euo
+    /// pipefail` is in effect — script failure aborts the build.
+    ///
+    /// Override semantics: if set, the built-in default commands
+    /// (usrmerge symlinks, /etc/machine-id, systemd preset, ldconfig,
+    /// etc.) are NOT run — the script is fully responsible. If absent,
+    /// the defaults run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_install: Option<String>,
 }
 
 /// Provision profile configuration
@@ -1133,6 +1170,18 @@ pub fn get_ext_image_args(ext_config: &serde_yaml::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract the `post_install:` script path for a rootfs/initramfs
+/// config node. The value is a path relative to `/opt/src` (the
+/// project root inside the SDK container). Returns `None` when the
+/// key is absent or the value is not a scalar string, in which case
+/// the caller falls back to defaults.
+pub fn get_post_install(config_node: Option<&serde_yaml::Value>) -> Option<String> {
+    config_node
+        .and_then(|n| n.get("post_install"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
 /// Extract docker_images from a config value (extension or runtime).
 /// Returns an empty Vec if no docker_images are configured.
 pub fn get_docker_images(config: &serde_yaml::Value) -> Vec<DockerImageRef> {
@@ -1333,7 +1382,7 @@ impl Config {
     pub fn resolve_runtime_rootfs(&self, runtime_name: &str) -> Option<&ImageConfig> {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.rootfs.as_ref()? {
-            ImageRef::Inline(c) => Some(c),
+            ImageRef::Inline(c) => Some(c.as_ref()),
             ImageRef::Named(name) => self.rootfs.as_ref()?.get(name),
         }
     }
@@ -1344,7 +1393,7 @@ impl Config {
     pub fn resolve_runtime_initramfs(&self, runtime_name: &str) -> Option<&ImageConfig> {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.initramfs.as_ref()? {
-            ImageRef::Inline(c) => Some(c),
+            ImageRef::Inline(c) => Some(c.as_ref()),
             ImageRef::Named(name) => self.initramfs.as_ref()?.get(name),
         }
     }
