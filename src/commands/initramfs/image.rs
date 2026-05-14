@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::utils::{
-    config::{get_ext_image_args, get_ext_image_type, Config},
+    config::{get_ext_image_args, get_ext_image_type, get_post_install, Config},
     container::{RunConfig, SdkContainer},
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
@@ -15,7 +15,33 @@ use crate::utils::{
     target::resolve_target_required,
 };
 
-use crate::commands::rootfs::image::NAMESPACE_UUID;
+use crate::commands::rootfs::image::{render_hook_block, resolve_install_hooks, NAMESPACE_UUID};
+
+/// Default post-install commands for the initramfs build. Same shape as
+/// `DEFAULT_ROOTFS_POST_INSTALL` but for `$INITRAMFS_WORK`, plus the
+/// `/init` symlink the kernel needs to find the init binary.
+///
+/// Used as a fallback only when the user does NOT define `pre_install`
+/// or `post_install` in the initramfs config. If the user defines
+/// either, they take full control and this default list is skipped.
+pub const DEFAULT_INITRAMFS_POST_INSTALL: &[&str] = &[
+    // usrmerge symlinks.
+    "ln -sfn usr/bin \"$INITRAMFS_WORK/bin\"",
+    "ln -sfn usr/sbin \"$INITRAMFS_WORK/sbin\"",
+    "ln -sfn usr/lib \"$INITRAMFS_WORK/lib\"",
+    // Strip dirs that Yocto's avocado-image-initramfs.bb also stripped.
+    "rm -rf \"$INITRAMFS_WORK/media\" \"$INITRAMFS_WORK/mnt\" \"$INITRAMFS_WORK/srv\"",
+    "rm -rf \"$INITRAMFS_WORK/boot/\"*",
+    "mkdir -p \"$INITRAMFS_WORK/sysroot\"",
+    "mkdir -p \"$INITRAMFS_WORK/opt\"",
+    // /init symlink so the kernel can find the init process.
+    // (matches OE IMAGE_CMD:cpio in image_types.bbclass)
+    "if [ ! -L \"$INITRAMFS_WORK/init\" ] && [ ! -e \"$INITRAMFS_WORK/init\" ]; then \
+if [ -L \"$INITRAMFS_WORK/sbin/init\" ] || [ -e \"$INITRAMFS_WORK/sbin/init\" ]; then \
+ln -sf /sbin/init \"$INITRAMFS_WORK/init\"; \
+echo \"Created /init -> /sbin/init symlink\"; \
+else echo \"WARNING: /sbin/init not found in initramfs — kernel may not find init\"; fi; fi",
+];
 
 /// Generate the shell script fragment that builds an initramfs image from the shared sysroot.
 ///
@@ -29,31 +55,33 @@ use crate::commands::rootfs::image::NAMESPACE_UUID;
 /// - `$AVOCADO_INITRAMFS_IMAGE` — path to built image
 /// - `$AVOCADO_INITRAMFS_FILESYSTEM` — filesystem format used
 /// - `$AVOCADO_INITRAMFS_BUILD_ID` — deterministic build ID
-pub fn generate_initramfs_build_script(namespace_uuid: &str, initramfs_filesystem: &str) -> String {
+///
+/// `post_install` hook semantics are identical to
+/// `generate_rootfs_build_script` — see that function's docs.
+pub fn generate_initramfs_build_script(
+    namespace_uuid: &str,
+    initramfs_filesystem: &str,
+    post_install: Option<&str>,
+) -> String {
+    let post = resolve_install_hooks(post_install, DEFAULT_INITRAMFS_POST_INSTALL);
+    let post_install_block = render_hook_block("post_install", &post);
     format!(
         r#"
-# Build initramfs image from shared sysroot
-INITRAMFS_SYSROOT="$AVOCADO_PREFIX/initramfs"
+# Build initramfs image from shared sysroot.
+# These vars are `export`ed so the post_install script (which we invoke
+# as a child `bash` process) inherits them.
+export INITRAMFS_SYSROOT="$AVOCADO_PREFIX/initramfs"
 if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     echo "Building initramfs image from packages..."
 
-    INITRAMFS_WORK="${{INITRAMFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/initramfs-work}}"
+    export INITRAMFS_WORK="${{INITRAMFS_WORK_DIR:-$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/initramfs-work}}"
     # Standalone initramfs builds (no runtime build before this) leave
     # the parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
     mkdir -p "$(dirname "$INITRAMFS_WORK")"
     rm -rf "$INITRAMFS_WORK"
     cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
 
-    # Create usrmerge symlinks (Yocto image class does this, not any RPM package)
-    ln -sfn usr/bin "$INITRAMFS_WORK/bin"
-    ln -sfn usr/sbin "$INITRAMFS_WORK/sbin"
-    ln -sfn usr/lib "$INITRAMFS_WORK/lib"
-
-    # Post-processing (matches Yocto avocado-image-initramfs.bb)
-    rm -rf "$INITRAMFS_WORK/media" "$INITRAMFS_WORK/mnt" "$INITRAMFS_WORK/srv"
-    rm -rf "$INITRAMFS_WORK/boot/"*
-    mkdir -p "$INITRAMFS_WORK/sysroot"
-    mkdir -p "$INITRAMFS_WORK/opt"
+{post_install_block}
 
     # Compute deterministic build ID for initramfs
     INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | sort)
@@ -66,17 +94,6 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     fi
     if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
         echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
-    fi
-
-    # Create /init symlink so the kernel can find the init process in the initramfs.
-    # (matches OE IMAGE_CMD:cpio in image_types.bbclass — creates /init -> /sbin/init)
-    if [ ! -L "$INITRAMFS_WORK/init" ] && [ ! -e "$INITRAMFS_WORK/init" ]; then
-        if [ -L "$INITRAMFS_WORK/sbin/init" ] || [ -e "$INITRAMFS_WORK/sbin/init" ]; then
-            ln -sf /sbin/init "$INITRAMFS_WORK/init"
-            echo "Created /init -> /sbin/init symlink"
-        else
-            echo "WARNING: /sbin/init not found in initramfs — kernel may not find init"
-        fi
     fi
 
     # Build initramfs image using configured filesystem format
@@ -112,6 +129,7 @@ else
 fi"#,
         namespace_uuid = namespace_uuid,
         initramfs_filesystem = initramfs_filesystem,
+        post_install_block = post_install_block,
     )
 }
 
@@ -196,11 +214,16 @@ impl InitramfsImageCommand {
         print_info("Building initramfs image.", OutputLevel::Normal);
 
         let initramfs_filesystem = config.get_initramfs_filesystem();
-        let build_section = generate_initramfs_build_script(NAMESPACE_UUID, &initramfs_filesystem);
+        let initramfs_node = composed.merged_value.get("initramfs");
+        let post_install = get_post_install(initramfs_node);
+        let build_section = generate_initramfs_build_script(
+            NAMESPACE_UUID,
+            &initramfs_filesystem,
+            post_install.as_deref(),
+        );
 
         // Same kab-wrap pipeline as rootfs/image.rs — see comments
         // there for the design rationale.
-        let initramfs_node = composed.merged_value.get("initramfs");
         let image_type = initramfs_node
             .and_then(get_ext_image_type)
             .unwrap_or_else(|| "raw".to_string());
@@ -243,10 +266,10 @@ impl InitramfsImageCommand {
 
         let script = format!(
             r#"set -euo pipefail
-TARGET_ARCH="{target_arch}"
-RUNTIME_NAME="${{AVOCADO_RUNTIME_NAME:-standalone}}"
-RUNTIME_VERSION="${{AVOCADO_RUNTIME_VERSION:-0.0.0}}"
-OUTPUT_DIR="{internal_output_dir}"
+export TARGET_ARCH="{target_arch}"
+export RUNTIME_NAME="${{AVOCADO_RUNTIME_NAME:-standalone}}"
+export RUNTIME_VERSION="${{AVOCADO_RUNTIME_VERSION:-0.0.0}}"
+export OUTPUT_DIR="{internal_output_dir}"
 mkdir -p "$OUTPUT_DIR"
 {build_section}
 AVOCADO_OS_VERSION_ID=""
