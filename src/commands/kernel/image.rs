@@ -267,9 +267,14 @@ echo "KERNEL_BASENAME=$KERNEL_BASENAME" > "$OUTPUT_DIR/.kernel-basename"
             let basename_marker =
                 format!("/opt/_avocado/{target_arch}/output/images/.kernel-basename");
             let basename_local = host_dir.join(".kernel-basename");
-            copy_volume_path_to_host(volume_name, &basename_marker, &basename_local)
-                .await
-                .context("Failed to read kernel basename marker")?;
+            copy_volume_path_to_host(
+                &container_helper.container_tool,
+                volume_name,
+                &basename_marker,
+                &basename_local,
+            )
+            .await
+            .context("Failed to read kernel basename marker")?;
             let kernel_basename = std::fs::read_to_string(&basename_local)
                 .context("Failed to read kernel basename marker file")?
                 .trim()
@@ -292,9 +297,14 @@ echo "KERNEL_BASENAME=$KERNEL_BASENAME" > "$OUTPUT_DIR/.kernel-basename"
                     format!("/opt/_avocado/{target_arch}/output/images/{kernel_basename}"),
                 )
             };
-            copy_volume_path_to_host(volume_name, &container_path, &host_dir.join(&host_filename))
-                .await
-                .with_context(|| format!("Failed to copy {host_filename} to host"))?;
+            copy_volume_path_to_host(
+                &container_helper.container_tool,
+                volume_name,
+                &container_path,
+                &host_dir.join(&host_filename),
+            )
+            .await
+            .with_context(|| format!("Failed to copy {host_filename} to host"))?;
             print_info(
                 &format!("Copied {} to {}", host_filename, host_dir.display()),
                 OutputLevel::Normal,

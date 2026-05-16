@@ -594,10 +594,13 @@ impl ExtImageCommand {
             // Copy image to host if --out specified
             if let Some(output_dir) = &self.output_dir {
                 let cwd = std::env::current_dir().context("Failed to get current directory")?;
-                let volume_manager =
-                    crate::utils::volume::VolumeManager::new("docker".to_string(), self.verbose);
+                let volume_manager = crate::utils::volume::VolumeManager::new(
+                    container_helper.container_tool.clone(),
+                    self.verbose,
+                );
                 let volume_state = volume_manager.get_or_create_volume(&cwd).await?;
                 self.copy_image_to_host(
+                    &container_helper.container_tool,
                     &volume_state.volume_name,
                     &container_image_path,
                     output_dir,
@@ -679,6 +682,7 @@ impl ExtImageCommand {
 
     async fn copy_image_to_host(
         &self,
+        container_tool: &str,
         volume_name: &str,
         container_image_path: &str,
         output_dir: &str,
@@ -699,18 +703,18 @@ impl ExtImageCommand {
         };
         std::fs::create_dir_all(&host_output_dir)?;
 
-        let temp_container_id = self.create_temp_container(volume_name).await?;
+        let temp_container_id = self.create_temp_container(container_tool, volume_name).await?;
 
         let docker_cp_source = format!("{temp_container_id}:{container_image_path}");
         let docker_cp_dest = host_output_dir.join(image_filename);
 
-        let output = tokio::process::Command::new("docker")
+        let output = tokio::process::Command::new(container_tool)
             .args(["cp", &docker_cp_source, docker_cp_dest.to_str().unwrap()])
             .output()
             .await
             .context("Failed to run docker cp")?;
 
-        let _ = tokio::process::Command::new("docker")
+        let _ = tokio::process::Command::new(container_tool)
             .args(["rm", "-f", &temp_container_id])
             .output()
             .await;
@@ -723,8 +727,12 @@ impl ExtImageCommand {
         Ok(())
     }
 
-    async fn create_temp_container(&self, volume_name: &str) -> Result<String> {
-        let output = tokio::process::Command::new("docker")
+    async fn create_temp_container(
+        &self,
+        container_tool: &str,
+        volume_name: &str,
+    ) -> Result<String> {
+        let output = tokio::process::Command::new(container_tool)
             .args([
                 "create",
                 "--rm",

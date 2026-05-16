@@ -730,6 +730,7 @@ rm -rf "$TMPDIR"
         // If --out is specified, copy the RPM to the host
         if let Some(output_dir) = &self.output_dir {
             self.copy_rpm_to_host(
+                &container_helper.container_tool,
                 &volume_state.volume_name,
                 &container_rpm_path,
                 output_dir,
@@ -758,9 +759,10 @@ rm -rf "$TMPDIR"
         }
     }
 
-    /// Copy the RPM from the container to the host using docker cp
+    /// Copy the RPM from the container to the host using `<container_tool> cp`.
     async fn copy_rpm_to_host(
         &self,
+        container_tool: &str,
         volume_name: &str,
         container_rpm_path: &str,
         output_dir: &str,
@@ -775,7 +777,7 @@ rm -rf "$TMPDIR"
         }
 
         // Create a temporary container to access the volume (following checkout pattern)
-        let temp_container_id = self.create_temp_container(volume_name).await?;
+        let temp_container_id = self.create_temp_container(container_tool, volume_name).await?;
 
         // Determine the output path on host
         let host_output_dir = if output_dir.starts_with('/') {
@@ -803,7 +805,7 @@ rm -rf "$TMPDIR"
         }
 
         // Use tokio::process::Command directly like checkout does
-        let copy_output = tokio::process::Command::new("docker")
+        let copy_output = tokio::process::Command::new(container_tool)
             .arg("cp")
             .arg(&docker_cp_source)
             .arg(&docker_cp_dest)
@@ -812,7 +814,7 @@ rm -rf "$TMPDIR"
             .context("Failed to execute docker cp")?;
 
         // Clean up temporary container
-        let _ = tokio::process::Command::new("docker")
+        let _ = tokio::process::Command::new(container_tool)
             .arg("rm")
             .arg("-f")
             .arg(&temp_container_id)
@@ -835,8 +837,12 @@ rm -rf "$TMPDIR"
     }
 
     /// Create a temporary container to access the volume (following checkout pattern)
-    async fn create_temp_container(&self, volume_name: &str) -> Result<String> {
-        let output = tokio::process::Command::new("docker")
+    async fn create_temp_container(
+        &self,
+        container_tool: &str,
+        volume_name: &str,
+    ) -> Result<String> {
+        let output = tokio::process::Command::new(container_tool)
             .arg("create")
             .arg("-v")
             .arg(format!("{volume_name}:/opt/_avocado:ro"))

@@ -386,9 +386,14 @@ export AVOCADO_OS_VERSION_ID
                     format!("/opt/_avocado/{target_arch}/output/images/{raw_filename}"),
                 )
             };
-            copy_volume_path_to_host(volume_name, &container_path, &host_dir.join(&host_filename))
-                .await
-                .with_context(|| format!("Failed to copy {host_filename} to host"))?;
+            copy_volume_path_to_host(
+                &container_helper.container_tool,
+                volume_name,
+                &container_path,
+                &host_dir.join(&host_filename),
+            )
+            .await
+            .with_context(|| format!("Failed to copy {host_filename} to host"))?;
             print_info(
                 &format!("Copied {} to {}", host_filename, host_dir.display()),
                 OutputLevel::Normal,
