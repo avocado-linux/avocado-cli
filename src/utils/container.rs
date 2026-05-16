@@ -71,6 +71,54 @@ pub fn is_docker_desktop() -> bool {
     cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
+/// True iff `DOCKER_HOST` points at the avocado-vm's forwarded socket
+/// (set up by `utils::vm::route`). When this is true, `docker run` is
+/// going to execute inside the VM, so VM-local paths like
+/// `/run/avocado-agent.sock` are reachable for bind-mounts even though
+/// they don't exist on the host's filesystem.
+pub fn is_vm_routing_active() -> bool {
+    let host = match std::env::var("DOCKER_HOST") {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let paths = match crate::utils::vm::state::VmPaths::resolve() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    host == format!("unix://{}", paths.docker_socket().display())
+}
+
+/// When `DOCKER_HOST` is the avocado-vm's forwarded socket (set by
+/// `utils::vm::route`), bind mounts in `docker run` resolve inside the VM,
+/// not on the host. Translate host paths under the recorded workspace root
+/// to their `/run/workspace/…` in-VM equivalent. Pass-through if VM routing
+/// isn't active or the path lies outside the workspace.
+///
+/// Used for every `-v <host>:/container` argument we generate.
+fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
+    let host = match std::env::var("DOCKER_HOST") {
+        Ok(h) => h,
+        Err(_) => return src_path.to_path_buf(),
+    };
+    let paths = match crate::utils::vm::state::VmPaths::resolve() {
+        Ok(p) => p,
+        Err(_) => return src_path.to_path_buf(),
+    };
+    // VM routing is in effect iff DOCKER_HOST is our forwarded local socket.
+    let expected = format!("unix://{}", paths.docker_socket().display());
+    if host != expected {
+        return src_path.to_path_buf();
+    }
+    let workspace = match crate::utils::vm::share::read_recorded_workspace(&paths) {
+        Ok(Some(w)) => w,
+        _ => return src_path.to_path_buf(),
+    };
+    match crate::utils::vm::share::translate_to_vm(src_path, &workspace) {
+        Ok(p) => p,
+        Err(_) => src_path.to_path_buf(),
+    }
+}
+
 /// Ensure QEMU binfmt_misc is registered for cross-architecture container emulation.
 ///
 /// When `--sdk-arch` specifies an architecture different from the host, Docker needs
@@ -871,15 +919,41 @@ impl SdkContainer {
         // Source is mounted to /mnt/src, then bindfs remounts it to /opt/src with permission translation
         container_cmd.push("-v".to_string());
         let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
-        container_cmd.push(format!("{}:/mnt/src:rw", src_path.display()));
+        // Every host-path bind goes through translate_bind_for_vm: when VM
+        // routing is active it rewrites the host path to its in-VM
+        // /run/workspace/<rel> equivalent; otherwise it's a pass-through.
+        let mount_source = translate_bind_for_vm(src_path);
+        container_cmd.push(format!("{}:/mnt/src:rw", mount_source.display()));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+
+        // Mount avocado-vm-agent's Unix socket so the provisioning script
+        // can request real USB disconnect/reconnect cycles
+        // (`request_twiddle`) instead of toggling
+        // `/sys/bus/usb/.../authorized` (a no-op through vhci_hcd).
+        //
+        // The socket lives inside the avocado-vm. Two paths reach it:
+        //   • Mac/host running `avocado sdk run` against the
+        //     VM-forwarded docker — socket isn't on the Mac filesystem
+        //     but IS on the VM filesystem where dockerd actually creates
+        //     the container. Detect via `is_vm_routing_active()`.
+        //   • Running inside the VM directly — socket is a local file.
+        //
+        // No `translate_bind_for_vm` here: this is a VM-native path on
+        // both sides of the docker bind-mount.
+        if is_vm_routing_active() || std::path::Path::new("/run/avocado-agent.sock").exists() {
+            container_cmd.push("-v".to_string());
+            container_cmd.push("/run/avocado-agent.sock:/run/avocado-agent.sock".to_string());
+        }
 
         // Mount signing socket directory if provided
         if let Some(socket_path) = &config.signing_socket_path {
             if let Some(socket_dir) = socket_path.parent() {
                 container_cmd.push("-v".to_string());
-                container_cmd.push(format!("{}:/run/avocado:rw", socket_dir.display()));
+                container_cmd.push(format!(
+                    "{}:/run/avocado:rw",
+                    translate_bind_for_vm(socket_dir).display()
+                ));
             }
         }
 
@@ -888,7 +962,7 @@ impl SdkContainer {
             container_cmd.push("-v".to_string());
             container_cmd.push(format!(
                 "{}:/usr/local/bin/avocado-sign-request:ro",
-                helper_script_path.display()
+                translate_bind_for_vm(helper_script_path).display()
             ));
         }
 
@@ -899,7 +973,7 @@ impl SdkContainer {
                     container_cmd.push("-v".to_string());
                     container_cmd.push(format!(
                         "{}:/opt/signing-keys:ro",
-                        signing_keys_dir.display()
+                        translate_bind_for_vm(&signing_keys_dir).display()
                     ));
                     // Return environment variable so container knows where keys are mounted
                     Some("/opt/signing-keys".to_string())
@@ -917,7 +991,11 @@ impl SdkContainer {
         if let Some(ref ext_mounts) = config.ext_path_mounts {
             for (ext_name, host_path) in ext_mounts {
                 container_cmd.push("-v".to_string());
-                container_cmd.push(format!("{}:/mnt/ext/{}:rw", host_path.display(), ext_name));
+                container_cmd.push(format!(
+                    "{}:/mnt/ext/{}:rw",
+                    translate_bind_for_vm(host_path).display(),
+                    ext_name
+                ));
                 ext_path_names.push(ext_name.clone());
 
                 if self.verbose {
@@ -1691,10 +1769,14 @@ impl SdkContainer {
         // Add security options based on host security module (SELinux/AppArmor)
         add_security_opts(&mut container_cmd);
 
-        // Volume mounts: docker volume for persistent state, bind mount for source
+        // Volume mounts: docker volume for persistent state, bind mount for source.
+        // Host path is translated to /run/workspace/<rel> when VM routing is on.
         container_cmd.push("-v".to_string());
         let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
-        container_cmd.push(format!("{}:/mnt/src:rw", src_path.display()));
+        container_cmd.push(format!(
+            "{}:/mnt/src:rw",
+            translate_bind_for_vm(src_path).display()
+        ));
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 

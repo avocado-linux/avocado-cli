@@ -261,6 +261,32 @@ impl RuntimeProvisionCommand {
             usb_passthrough.to_string(),
         );
 
+        // When the container is running inside the avocado-vm (driven by
+        // Avocado.app on macOS), expose the in-VM agent's Unix socket so
+        // provisioning scripts that need a real disconnect/reconnect
+        // cycle (Jetson stage transitions, e.g.) can request it instead
+        // of the Linux `authorized=0` trick — which is a no-op through
+        // vhci_hcd.
+        //
+        // The socket itself is created by avocado-vm-agent in the VM at
+        // /run/avocado-agent.sock; we bind-mount it into the container
+        // in `build_container_command` below. The env var presence is
+        // what the script keys off; absence means "fall back to the
+        // generic sysfs path."
+        // Same two-path detection as the bind-mount in container.rs:
+        // either VM routing is active (we're on the Mac driving the VM's
+        // dockerd via the forwarded socket — agent sock lives in the VM)
+        // or the socket is locally present (we're already inside the
+        // avocado-vm).
+        if crate::utils::container::is_vm_routing_active()
+            || std::path::Path::new("/run/avocado-agent.sock").exists()
+        {
+            env_vars.insert(
+                "AVOCADO_AGENT_SOCK".to_string(),
+                "/run/avocado-agent.sock".to_string(),
+            );
+        }
+
         // Set AVOCADO_PROVISION_OUT if --out is specified
         // On Docker Desktop, auto-set a default output path so provisioning scripts
         // can produce disk images for host-side burning when device access is unavailable.

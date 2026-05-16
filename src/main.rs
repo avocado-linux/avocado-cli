@@ -105,6 +105,12 @@ struct Cli {
     /// Disable TUI output (use legacy sequential output with inherited stdio)
     #[arg(long, global = true)]
     no_tui: bool,
+
+    /// On macOS/Windows, don't auto-start the avocado-vm; talk to the local docker daemon directly.
+    /// (Equivalent to `AVOCADO_VM_AUTO_START=0`.)
+    #[arg(long, global = true)]
+    no_vm_auto_start: bool,
+
 }
 
 #[derive(Subcommand)]
@@ -163,6 +169,11 @@ enum Commands {
     Hitl {
         #[command(subcommand)]
         command: HitlCommands,
+    },
+    /// Manage the local avocado-vm helper VM (macOS / Windows dev hosts).
+    Vm {
+        #[command(subcommand)]
+        command: VmCommands,
     },
     /// Clean the avocado project by removing docker volumes and state files
     Clean {
@@ -1642,6 +1653,31 @@ fn build_env_vars(
     }
 }
 
+/// Whether the subcommand spawns docker (and therefore wants VM routing on
+/// non-Linux hosts). Conservative allowlist: only commands that we know
+/// shell out to docker are included. `Init` doesn't. `Vm` operates on the
+/// VM itself. `Upgrade`/`Save`/`Load` etc. don't touch docker.
+fn needs_vm_routing(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Build { .. }
+            | Commands::Provision { .. }
+            | Commands::Install { .. }
+            | Commands::Uninstall { .. }
+            | Commands::Sdk { .. }
+            | Commands::Ext { .. }
+            | Commands::Rootfs { .. }
+            | Commands::Initramfs { .. }
+            | Commands::Kernel { .. }
+            | Commands::Runtime { .. }
+            | Commands::Hitl { .. }
+            | Commands::Prune { .. }
+            | Commands::Clean { .. }
+            | Commands::Sign { .. }
+            | Commands::Deploy { .. }
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1657,6 +1693,28 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // On macOS/Windows hosts, transparently route docker through the local
+    // avocado-vm helper if running (or auto-startable). Skipped for commands
+    // that don't talk to docker (Init, Upgrade, Vm itself) or when the user
+    // opted out via --no-vm-auto-start / AVOCADO_VM_AUTO_START=0 / --runs-on.
+    // The mode return value used to gate the in-process USB matchmaker;
+    // since USB passthrough now flows through Avocado.app's IOUSBHost +
+    // vhci_hcd bridge instead, we only care about the side-effect of
+    // setting DOCKER_HOST for downstream `docker` invocations.
+    if needs_vm_routing(&cli.command) {
+        if let Err(e) = utils::vm::route::ensure_routed_for_process(
+            cli.no_vm_auto_start,
+            cli.runs_on.is_some(),
+        )
+        .await
+        {
+            utils::output::print_warning(
+                &format!("VM routing unavailable: {e:#}; falling back to local docker."),
+                utils::output::OutputLevel::Normal,
+            );
+        }
+    }
 
     let result = match cli.command {
         Commands::Init {
@@ -2650,6 +2708,53 @@ async fn main() -> Result<()> {
                 .with_output_dir(out_dir);
                 image_cmd.execute().await?;
                 Ok(())
+            }
+        },
+        Commands::Vm { command } => match command {
+            VmCommands::Start {
+                vm_source,
+                memory_mib,
+                cpus,
+                ssh_port,
+                cmdline_extra,
+                workspace,
+                var_size,
+                watch,
+                foreground,
+            } => {
+                let cmd = commands::vm::start::StartCommand {
+                    vm_source,
+                    memory_mib,
+                    cpus,
+                    ssh_port,
+                    cmdline_extra,
+                    workspace,
+                    var_size,
+                    watch,
+                    foreground,
+                };
+                cmd.execute().await
+            }
+            VmCommands::Stop { force } => {
+                commands::vm::stop::StopCommand { force }.execute().await
+            }
+            VmCommands::Status => commands::vm::status::StatusCommand.execute().await,
+            VmCommands::Shell { command } => {
+                commands::vm::shell::ShellCommand { command }.execute().await
+            }
+            VmCommands::Logs { follow } => {
+                commands::vm::logs::LogsCommand { follow }.execute().await
+            }
+            VmCommands::Rebuild {
+                vm_source,
+                reset_data,
+            } => {
+                commands::vm::rebuild::RebuildCommand {
+                    vm_source,
+                    reset_data,
+                }
+                .execute()
+                .await
             }
         },
         Commands::Hitl { command } => match command {
@@ -3798,6 +3903,74 @@ enum KernelCommands {
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmCommands {
+    /// Boot the avocado-vm (no-op if already running).
+    Start {
+        /// Directory containing `direct` profile output (manifest.json + artifacts).
+        /// Falls back to $AVOCADO_VM_DIR if unset.
+        #[arg(long)]
+        vm_source: Option<std::path::PathBuf>,
+        /// Memory in MiB.
+        #[arg(long, default_value_t = 4096)]
+        memory_mib: u32,
+        /// vCPU count.
+        #[arg(long, default_value_t = 4)]
+        cpus: u32,
+        /// Bind SSH on this host port (default: pick a free high port).
+        #[arg(long)]
+        ssh_port: Option<u16>,
+        /// Extra kernel cmdline appended to the manifest's default.
+        #[arg(long)]
+        cmdline_extra: Option<String>,
+        /// Host directory exposed to the VM as a 9p workspace (mounted at
+        /// /mnt/workspace in the guest). Defaults to $AVOCADO_VM_WORKSPACE or $HOME.
+        /// Every project the CLI operates on must live under this path.
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        /// Persistent /var disk size (e.g. "50G", "100G"). Growable on each
+        /// start; shrink requires `vm rebuild --reset-data`. The file is
+        /// sparse, so the on-disk footprint only grows as data is written.
+        /// Default 50G — comfortable for SDK image + several container images.
+        #[arg(long)]
+        var_size: Option<String>,
+        /// Tail the serial log live while waiting for boot-sync. On failure,
+        /// the tail of the log is printed automatically even without this flag.
+        #[arg(short = 'w', long)]
+        watch: bool,
+        /// Stay in the foreground (does not yet implement live serial; placeholder).
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the avocado-vm (graceful; falls back to SIGKILL with --force).
+    Stop {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show running state + manifest metadata.
+    Status,
+    /// Open an SSH session into the running avocado-vm.
+    Shell {
+        /// Optional command + args to run instead of an interactive shell.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Print (or tail with -f) the QEMU serial console log.
+    Logs {
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Re-record the manifest from a fresh --vm-source. Preserves data disk
+    /// unless --reset-data is given. VM must be stopped first.
+    Rebuild {
+        /// Falls back to $AVOCADO_VM_DIR if unset.
+        #[arg(long)]
+        vm_source: Option<std::path::PathBuf>,
+        #[arg(long)]
+        reset_data: bool,
     },
 }
 

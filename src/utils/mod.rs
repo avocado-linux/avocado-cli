@@ -31,4 +31,5 @@ pub mod update_check;
 pub mod update_repo;
 pub mod update_signing;
 pub mod version;
+pub mod vm;
 pub mod volume;

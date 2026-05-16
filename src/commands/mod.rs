@@ -19,3 +19,4 @@ pub mod sign;
 pub mod signing_keys;
 pub mod unlock;
 pub mod upgrade;
+pub mod vm;
