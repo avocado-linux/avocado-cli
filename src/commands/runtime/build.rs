@@ -1971,7 +1971,7 @@ echo "Provisioned update authority: metadata/root.json""#
 if [ -d "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}" ]; then
     echo "  Applying var files from extension '{ext_name}': {clean_pattern}/"
     mkdir -p "$VAR_DIR/{dest}"
-    rsync -a "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}/" "$VAR_DIR/{dest}/"
+    cp -a "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}/." "$VAR_DIR/{dest}/"
 elif [ -f "$AVOCADO_EXT_SYSROOTS/{ext_name}/{clean_pattern}" ]; then
     echo "  Applying var file from extension '{ext_name}': {clean_pattern}"
     mkdir -p "$(dirname "$VAR_DIR/{dest}")"
@@ -2005,7 +2005,7 @@ fi"#
                             r#"
 if [ -e "/opt/src/{source}" ]; then
     mkdir -p "$VAR_DIR/{dest}"
-    rsync -a "/opt/src/{source}" "$VAR_DIR/{dest}"
+    cp -a "/opt/src/{source}" "$VAR_DIR/{dest}"
     echo "  Copied runtime var_files: {source} -> {dest}"
 else
     echo "WARNING: runtime var_files source not found: /opt/src/{source}"
