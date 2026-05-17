@@ -1,21 +1,68 @@
 use std::collections::HashMap;
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use clap::ValueEnum;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::commands::connect::client::{self, ConnectClient, ConnectConfig, Profile, ProfileUser};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 
+/// Output format selector. Used by the three `connect auth` subcommands.
+/// Human is the default and matches the prose output users have today;
+/// Json switches each command to machine-readable output (single JSON
+/// object for status/logout, NDJSON for the interactive login flow).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+impl OutputFormat {
+    pub fn is_json(self) -> bool {
+        matches!(self, OutputFormat::Json)
+    }
+}
+
+/// Print one JSON value followed by a newline and flush stdout. Used for
+/// NDJSON event emission during the interactive login flow so consumers
+/// can react line-by-line. Flush is important because stdout is
+/// line-buffered when attached to a TTY but block-buffered when piped to
+/// another process — and the macOS app pipes us.
+fn emit_json_event(value: &serde_json::Value) {
+    let line = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+/// Print one JSON object as the entire stdout output of a single-shot
+/// command (status, logout). Same flush semantics as `emit_json_event`.
+fn emit_json_object(value: &serde_json::Value) {
+    let line = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
 pub struct ConnectAuthLoginCommand {
     pub url: String,
     pub profile: Option<String>,
     pub token: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectAuthLoginCommand {
-    pub fn new(url: Option<String>, profile: Option<String>, token: Option<String>) -> Self {
+    pub fn new(
+        url: Option<String>,
+        profile: Option<String>,
+        token: Option<String>,
+        output: OutputFormat,
+    ) -> Self {
         let url = url
             .or_else(|| std::env::var("AVOCADO_CONNECT_URL").ok())
             .unwrap_or_else(|| "https://connect.peridio.com".to_string());
@@ -23,17 +70,31 @@ impl ConnectAuthLoginCommand {
             url,
             profile,
             token,
+            output,
         }
     }
 
     pub async fn execute(&self) -> Result<()> {
-        print_info(&format!("Logging in to {}", self.url), OutputLevel::Normal);
+        if !self.output.is_json() {
+            print_info(&format!("Logging in to {}", self.url), OutputLevel::Normal);
+        }
 
-        if let Some(ref token) = self.token {
+        let result = if let Some(ref token) = self.token {
             self.login_with_token(token).await
         } else {
             self.login_with_browser().await
+        };
+
+        if let Err(ref e) = result {
+            if self.output.is_json() {
+                emit_json_event(&serde_json::json!({
+                    "event": "error",
+                    "message": e.to_string(),
+                }));
+            }
         }
+
+        result
     }
 
     /// Browser-based login: print URL, wait for callback, exchange code for token.
@@ -49,15 +110,22 @@ impl ConnectAuthLoginCommand {
 
         let login_url = format!("{}/cli/login?port={}&state={}", self.url, port, state);
 
-        println!();
-        println!("  Open this URL in your browser to log in:");
-        println!();
-        println!("  {login_url}");
-        println!();
-        print_info(
-            "Waiting for authentication... (link expires in 5 minutes)",
-            OutputLevel::Normal,
-        );
+        if self.output.is_json() {
+            emit_json_event(&serde_json::json!({
+                "event": "login_url",
+                "url": login_url,
+            }));
+        } else {
+            println!();
+            println!("  Open this URL in your browser to log in:");
+            println!();
+            println!("  {login_url}");
+            println!();
+            print_info(
+                "Waiting for authentication... (link expires in 5 minutes)",
+                OutputLevel::Normal,
+            );
+        }
 
         // Wait for the browser to redirect to our local server
         let (code, received_state, mut stream) = wait_for_callback(&listener).await?;
@@ -133,12 +201,19 @@ impl ConnectAuthLoginCommand {
         };
         let temp_client = ConnectClient::from_profile(&temp_profile)?;
         let (final_token, organization_id) = match temp_client.get_me_full().await {
-            Ok(me) => provision_org_token(&temp_client, &me, token, &token_name).await?,
+            Ok(me) => provision_org_token(&temp_client, &me, token, &token_name, self.output).await?,
             Err(e) => {
-                print_info(
-                    &format!("Warning: could not fetch org info ({e}); saving unscoped profile."),
-                    OutputLevel::Normal,
-                );
+                if self.output.is_json() {
+                    emit_json_event(&serde_json::json!({
+                        "event": "info",
+                        "message": format!("Warning: could not fetch org info ({e}); saving unscoped profile."),
+                    }));
+                } else {
+                    print_info(
+                        &format!("Warning: could not fetch org info ({e}); saving unscoped profile."),
+                        OutputLevel::Normal,
+                    );
+                }
                 (token.to_string(), None)
             }
         };
@@ -156,7 +231,9 @@ impl ConnectAuthLoginCommand {
 
     /// Token-based login: validate the provided token and save it.
     async fn login_with_token(&self, token: &str) -> Result<()> {
-        print_info("Validating token...", OutputLevel::Normal);
+        if !self.output.is_json() {
+            print_info("Validating token...", OutputLevel::Normal);
+        }
 
         let profile_name = self.profile.as_deref().unwrap_or("default");
 
@@ -184,7 +261,7 @@ impl ConnectAuthLoginCommand {
             .context("token validation failed — is the token valid?")?;
 
         let (final_token, organization_id) =
-            provision_org_token(&temp_client, &me, token, &token_name).await?;
+            provision_org_token(&temp_client, &me, token, &token_name, self.output).await?;
 
         self.save_profile(
             profile_name,
@@ -241,12 +318,33 @@ impl ConnectAuthLoginCommand {
             format!("Created new profile '{profile_name}'")
         };
 
-        print_success(
-            &format!("Logged in as {name} ({email}) at {}\n  {action}", self.url),
-            OutputLevel::Normal,
-        );
+        if self.output.is_json() {
+            emit_json_event(&serde_json::json!({
+                "event": "complete",
+                "profile_name": profile_name,
+                "user": { "email": email, "name": name },
+                "api_url": self.url,
+                "organization_id": organization_id_for_event(&cfg, profile_name),
+            }));
+        } else {
+            print_success(
+                &format!("Logged in as {name} ({email}) at {}\n  {action}", self.url),
+                OutputLevel::Normal,
+            );
+        }
         Ok(())
     }
+}
+
+/// Pull the saved organization_id out of the persisted config for use in
+/// the `complete` JSON event. We could thread it down as a parameter, but
+/// reading it back from the (just-saved) config keeps `save_profile`'s
+/// signature simple and makes it obvious the JSON event matches what's on
+/// disk.
+fn organization_id_for_event(cfg: &ConnectConfig, profile_name: &str) -> Option<String> {
+    cfg.profiles
+        .get(profile_name)
+        .and_then(|p| p.organization_id.clone())
 }
 
 /// Generate a random state string for CSRF protection.
@@ -359,6 +457,7 @@ async fn provision_org_token(
     me: &crate::commands::connect::client::MeFullResponse,
     original_token: &str,
     token_name: &str,
+    output: OutputFormat,
 ) -> Result<(String, Option<String>)> {
     // Already org-scoped?
     if let Some(ref token_info) = me.token {
@@ -369,18 +468,22 @@ async fn provision_org_token(
 
     // Unscoped — try to create an org-scoped token for the first org.
     if let Some(org) = me.organizations.first() {
-        print_info(
-            &format!("Creating org-scoped token for '{}'...", org.name),
-            OutputLevel::Normal,
-        );
+        let msg = format!("Creating org-scoped token for '{}'...", org.name);
+        if output.is_json() {
+            emit_json_event(&serde_json::json!({"event": "info", "message": msg}));
+        } else {
+            print_info(&msg, OutputLevel::Normal);
+        }
         match client.create_org_token(&org.id, token_name).await {
             Ok((new_token, org_id)) => return Ok((new_token, Some(org_id))),
             Err(e) => {
                 // Non-fatal: fall back to unscoped token with a warning.
-                print_info(
-                    &format!("Warning: could not create org-scoped token: {e}"),
-                    OutputLevel::Normal,
-                );
+                let warn = format!("Warning: could not create org-scoped token: {e}");
+                if output.is_json() {
+                    emit_json_event(&serde_json::json!({"event": "info", "message": warn}));
+                } else {
+                    print_info(&warn, OutputLevel::Normal);
+                }
             }
         }
     }
@@ -390,6 +493,7 @@ async fn provision_org_token(
 
 pub struct ConnectAuthLogoutCommand {
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectAuthLogoutCommand {
@@ -402,7 +506,17 @@ impl ConnectAuthLogoutCommand {
 
                 if !cfg.remove_profile(&profile_name) {
                     let available: Vec<&str> = cfg.profiles.keys().map(|s| s.as_str()).collect();
-                    if available.is_empty() {
+                    if self.output.is_json() {
+                        emit_json_object(&serde_json::json!({
+                            "logged_out": false,
+                            "profile_name": profile_name,
+                            "reason": if available.is_empty() {
+                                "no profiles configured".to_string()
+                            } else {
+                                format!("profile not found (available: {})", available.join(", "))
+                            },
+                        }));
+                    } else if available.is_empty() {
                         print_info("No profiles configured.", OutputLevel::Normal);
                     } else {
                         print_error(
@@ -423,13 +537,27 @@ impl ConnectAuthLogoutCommand {
                     client::save_config(&cfg)?;
                 }
 
-                print_success(
-                    &format!("Logged out of profile '{profile_name}'. Credentials removed."),
-                    OutputLevel::Normal,
-                );
+                if self.output.is_json() {
+                    emit_json_object(&serde_json::json!({
+                        "logged_out": true,
+                        "profile_name": profile_name,
+                    }));
+                } else {
+                    print_success(
+                        &format!("Logged out of profile '{profile_name}'. Credentials removed."),
+                        OutputLevel::Normal,
+                    );
+                }
             }
             None => {
-                print_info("Not logged in.", OutputLevel::Normal);
+                if self.output.is_json() {
+                    emit_json_object(&serde_json::json!({
+                        "logged_out": false,
+                        "reason": "not logged in",
+                    }));
+                } else {
+                    print_info("Not logged in.", OutputLevel::Normal);
+                }
             }
         }
         Ok(())
@@ -438,10 +566,15 @@ impl ConnectAuthLogoutCommand {
 
 pub struct ConnectAuthStatusCommand {
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectAuthStatusCommand {
     pub async fn execute(&self) -> Result<()> {
+        if self.output.is_json() {
+            return self.execute_json().await;
+        }
+
         match client::load_config()? {
             Some(cfg) => {
                 let (profile_name, profile) =
@@ -505,6 +638,67 @@ impl ConnectAuthStatusCommand {
                 println!("Run 'avocado connect auth login' to authenticate.");
             }
         }
+        Ok(())
+    }
+
+    /// JSON branch — emits a single JSON object on stdout. No prose, no
+    /// stderr noise, no ANSI. Network calls are best-effort: if `/api/me`
+    /// fails we still emit a logged-in object with `token_valid: false`
+    /// so callers can distinguish "creds on disk but server rejected
+    /// them" from "no creds at all".
+    async fn execute_json(&self) -> Result<()> {
+        let Some(cfg) = client::load_config()? else {
+            emit_json_object(&serde_json::json!({ "logged_in": false }));
+            return Ok(());
+        };
+
+        let (profile_name, profile) = match cfg.resolve_profile(self.profile.as_deref(), None) {
+            Ok(p) => p,
+            Err(e) => {
+                emit_json_object(&serde_json::json!({
+                    "logged_in": false,
+                    "reason": e.to_string(),
+                }));
+                return Ok(());
+            }
+        };
+
+        let mut payload = serde_json::json!({
+            "logged_in": true,
+            "profile_name": profile_name,
+            "user": { "email": profile.user.email, "name": profile.user.name },
+            "api_url": profile.api_url,
+            "created_at": profile.created_at,
+            "organization_id": profile.organization_id,
+            "token_valid": serde_json::Value::Null,
+            "organizations": serde_json::Value::Array(vec![]),
+        });
+
+        if let Ok(client) = ConnectClient::from_profile(profile) {
+            match client.get_me_full().await {
+                Ok(me) => {
+                    payload["token_valid"] = serde_json::Value::Bool(true);
+                    let orgs: Vec<serde_json::Value> = me
+                        .organizations
+                        .iter()
+                        .map(|o| {
+                            serde_json::json!({
+                                "id": o.id,
+                                "name": o.name,
+                                "role": o.role,
+                            })
+                        })
+                        .collect();
+                    payload["organizations"] = serde_json::Value::Array(orgs);
+                }
+                Err(e) => {
+                    payload["token_valid"] = serde_json::Value::Bool(false);
+                    payload["token_error"] = serde_json::Value::String(e.to_string());
+                }
+            }
+        }
+
+        emit_json_object(&payload);
         Ok(())
     }
 }

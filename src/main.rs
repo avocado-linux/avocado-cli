@@ -11,7 +11,7 @@ use utils::config::Config;
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::connect::auth::{
-    ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand,
+    ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand, OutputFormat,
 };
 use commands::connect::claim_tokens::{
     ConnectClaimTokensCreateCommand, ConnectClaimTokensDeleteCommand, ConnectClaimTokensListCommand,
@@ -1156,18 +1156,27 @@ enum ConnectAuthCommands {
         /// Use an existing API token instead of browser login
         #[arg(long)]
         token: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Logout from the Connect platform
     Logout {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Show current auth status
     Status {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
 }
 
@@ -2953,18 +2962,19 @@ async fn main() -> Result<()> {
                     url,
                     profile,
                     token,
+                    output,
                 } => {
-                    let cmd = ConnectAuthLoginCommand::new(url, profile, token);
+                    let cmd = ConnectAuthLoginCommand::new(url, profile, token, output);
                     cmd.execute().await?;
                     Ok(())
                 }
-                ConnectAuthCommands::Logout { profile } => {
-                    let cmd = ConnectAuthLogoutCommand { profile };
+                ConnectAuthCommands::Logout { profile, output } => {
+                    let cmd = ConnectAuthLogoutCommand { profile, output };
                     cmd.execute().await?;
                     Ok(())
                 }
-                ConnectAuthCommands::Status { profile } => {
-                    let cmd = ConnectAuthStatusCommand { profile };
+                ConnectAuthCommands::Status { profile, output } => {
+                    let cmd = ConnectAuthStatusCommand { profile, output };
                     cmd.execute().await?;
                     Ok(())
                 }
