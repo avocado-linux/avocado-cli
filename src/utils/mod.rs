@@ -32,6 +32,8 @@ pub mod tui;
 pub mod update_check;
 pub mod update_repo;
 pub mod update_signing;
+pub mod user_config;
 pub mod version;
 pub mod vm;
+pub mod vm_update_check;
 pub mod volume;

@@ -19,6 +19,7 @@
 //! - [`lifecycle`] — high-level `start` / `stop` / `status`.
 
 pub mod boot_sync;
+pub mod channel;
 #[cfg(target_os = "macos")]
 pub mod client;
 pub mod forward;
@@ -30,4 +31,5 @@ pub mod qmp;
 pub mod route;
 pub mod share;
 pub mod ssh;
+pub mod staging;
 pub mod state;
