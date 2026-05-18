@@ -2291,6 +2291,7 @@ stone bundle \
     $STONE_INITRD_FLAG \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
+    --partition-size "var=$FINAL_SIZE" \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
 
