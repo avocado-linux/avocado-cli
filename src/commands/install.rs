@@ -10,7 +10,7 @@ use crate::commands::{
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::TuiContext,
-    output::{print_error, print_info, print_success, should_use_tui, OutputLevel},
+    output::{print_error, print_info, print_success, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
     target::validate_and_log_target,
     tui::{TaskId, TaskRenderer, TaskStatus},
@@ -147,23 +147,29 @@ impl InstallCommand {
         // Create a single TUI renderer for the entire install flow.
         // Register SDK + sysroot tasks upfront (we know these from config).
         // Ext/runtime tasks are added after config reload.
-        // Only use TUI when --force is set (dnf gets --assumeyes, so no
-        // prompts).  Without --force, dnf may ask for confirmation and the
-        // user needs to see and respond to the output directly.
-        let renderer = if should_use_tui() && !self.verbose && self.force {
-            let r = Arc::new(TaskRenderer::new(false));
-            r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
-            r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
-            r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
-            r.register_task(TaskId::InitramfsInstall, "initramfs install".to_string());
-            // target-dev install is registered dynamically by sdk/install.rs
-            // after fetching extensions and discovering compile sections
-            crate::utils::tui::set_active_renderer(&r);
-            r.start();
-            Some(r)
-        } else {
-            None
-        };
+        // Create a renderer when either:
+        //   • TUI mode is on (interactive terminal + --force so dnf gets
+        //     --assumeyes), so the user sees a live checklist; or
+        //   • JSON output mode is on, so the renderer's state-mutators
+        //     emit NDJSON `step` events for the desktop app's step list.
+        //
+        // In JSON mode the renderer is in Passthrough mode and doesn't
+        // paint anything to stderr — its hooks only fire the JSON sink.
+        let renderer =
+            if crate::utils::output::should_create_renderer() && !self.verbose && self.force {
+                let r = Arc::new(TaskRenderer::new(false));
+                r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+                r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+                r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+                r.register_task(TaskId::InitramfsInstall, "initramfs install".to_string());
+                // target-dev install is registered dynamically by sdk/install.rs
+                // after fetching extensions and discovering compile sections
+                crate::utils::tui::set_active_renderer(&r);
+                r.start();
+                Some(r)
+            } else {
+                None
+            };
 
         // 1. Install SDK dependencies
         if let Some(ref r) = renderer {

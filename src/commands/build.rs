@@ -12,7 +12,7 @@ use crate::commands::{
 use crate::utils::{
     config::{ComposedConfig, Config, ExtensionSource},
     container::{SdkContainer, TuiContext},
-    output::{print_error, print_info, print_success, should_use_tui, OutputLevel},
+    output::{print_error, print_info, print_success, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
     tui::{TaskId, TaskRenderer, TaskStatus},
 };
@@ -214,8 +214,11 @@ impl BuildCommand {
             }
         }
 
-        // Set up TUI renderer if applicable
-        let renderer = if should_use_tui() && !self.verbose {
+        // Create a renderer when either TUI mode is on OR JSON output
+        // mode is on. In JSON mode the renderer's state-mutators emit
+        // NDJSON `step` events for desktop-app consumers; the renderer
+        // itself stays silent on stderr.
+        let renderer = if crate::utils::output::should_create_renderer() && !self.verbose {
             let r = Arc::new(TaskRenderer::new(false));
             // Register tasks in execution order: all builds, then all images,
             // then all runtimes — so the checklist matches the dependency flow.

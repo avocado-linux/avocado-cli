@@ -18,8 +18,13 @@ pub enum OutputLevel {
 /// When a TUI renderer is active, info/success/warning/plain messages are
 /// suppressed — the TUI task status lines are the progress indicator.
 /// Errors always print (via `print_above`) so they're visible immediately.
+///
+/// Also returns true when JSON output mode is active: prose would interleave
+/// with the NDJSON event stream and confuse consumers, so we treat JSON
+/// mode the same as "TUI on" for prose-suppression purposes.
 pub fn tui_is_active() -> bool {
     crate::utils::tui::get_active_renderer().is_some()
+        || crate::utils::output_format::is_json_output_active()
 }
 
 /// Print an error message to stderr with red color.
@@ -85,11 +90,24 @@ pub fn flush_stderr() {
     let _ = io::stderr().flush();
 }
 
-/// Check if TUI mode should be used (TTY + no CI + no explicit opt-out).
+/// Check if TUI mode should be used (TTY + no CI + no explicit opt-out
+/// + no active JSON output mode).
 pub fn should_use_tui() -> bool {
-    io::stderr().is_terminal()
+    !crate::utils::output_format::is_json_output_active()
+        && io::stderr().is_terminal()
         && std::env::var("AVOCADO_NO_TUI").is_err()
         && std::env::var("CI").is_err()
+}
+
+/// Whether the orchestrator should construct a `TaskRenderer` for this
+/// run. Distinct from `should_use_tui()` — JSON mode wants a renderer
+/// so `register_task` / `set_status` calls fire (which our JSON sink
+/// taps into for the desktop app's step list), but doesn't want the
+/// renderer to paint a TUI to the terminal. The renderer's own mode
+/// (Tui vs Passthrough) plus a JSON-mode check inside its mutators
+/// handle the "no painting" half.
+pub fn should_create_renderer() -> bool {
+    should_use_tui() || crate::utils::output_format::is_json_output_active()
 }
 
 /// Wrap a message in dim ANSI formatting.

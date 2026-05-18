@@ -896,16 +896,23 @@ impl SdkContainer {
         //
         // For TUI installs (--force): skip both — output is piped and
         // captured by the renderer.
+        //
+        // For JSON output mode (desktop app driver): there's no human
+        // at the keyboard. Skip -t (the app's stdin is a Pipe, not a
+        // TTY) and skip -i too — dnf prompts would deadlock against
+        // an empty stdin. Treat JSON mode as the same constraint set
+        // as TUI mode.
         let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
-        if config.interactive {
+        let json_active = crate::utils::output_format::is_json_output_active();
+        if config.interactive && !json_active {
             // Explicit interactive mode (e.g. avocado shell): full -it
             container_cmd.push("-i".to_string());
             container_cmd.push("-t".to_string());
-        } else if config.tui_context.is_none() && !global_tui_active {
+        } else if config.tui_context.is_none() && !global_tui_active && !json_active {
             // Non-TUI mode: keep stdin open for prompts, no PTY
             container_cmd.push("-i".to_string());
         }
-        // TUI mode: no -i, no -t (output is piped)
+        // TUI mode / JSON mode: no -i, no -t (output is piped)
 
         // Add FUSE device and capability for bindfs support
         container_cmd.push("--device".to_string());

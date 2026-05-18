@@ -4,7 +4,11 @@ use std::fs;
 use std::include_str;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::utils::output_format::{
+    emit_json_event, is_json_output_active, JsonOutputGuard, OutputFormat,
+};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const REPO_OWNER: &str = "avocado-linux";
@@ -61,18 +65,15 @@ pub struct InitCommand {
     reference_commit: Option<String>,
     /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/references")
     reference_repo: Option<String>,
+    /// Project name. When set, the project is created at
+    /// `<directory>/<name>/` rather than `<directory>/`.
+    name: Option<String>,
+    /// Output format (human prose vs NDJSON for the desktop app).
+    output: OutputFormat,
 }
 
 impl InitCommand {
     /// Creates a new InitCommand instance.
-    ///
-    /// # Arguments
-    /// * `target` - Optional target architecture string
-    /// * `directory` - Optional directory path to initialize
-    /// * `reference` - Optional reference example name to download
-    /// * `reference_branch` - Optional branch to fetch reference from
-    /// * `reference_commit` - Optional specific commit SHA to fetch reference from
-    /// * `reference_repo` - Optional repository to fetch reference from (format: "owner/repo")
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         target: Option<String>,
@@ -81,6 +82,8 @@ impl InitCommand {
         reference_branch: Option<String>,
         reference_commit: Option<String>,
         reference_repo: Option<String>,
+        name: Option<String>,
+        output: OutputFormat,
     ) -> Self {
         Self {
             target,
@@ -89,6 +92,35 @@ impl InitCommand {
             reference_branch,
             reference_commit,
             reference_repo,
+            name,
+            output,
+        }
+    }
+
+    /// Resolve the on-disk destination directory. When `--name` is
+    /// supplied the project lives at `<directory>/<name>/`; otherwise
+    /// it lives at `<directory>/` to preserve the long-standing
+    /// behavior of callers that don't yet pass `--name`.
+    fn destination(&self) -> PathBuf {
+        let base = self.directory.as_deref().unwrap_or(".");
+        match &self.name {
+            Some(n) if !n.is_empty() => Path::new(base).join(n),
+            _ => PathBuf::from(base),
+        }
+    }
+
+    /// Print a human-readable status message OR emit a JSON info event,
+    /// depending on the configured output mode. The desktop app
+    /// surfaces the JSON form in its events log; humans see prose.
+    fn emit_info(&self, message: impl AsRef<str>) {
+        let message = message.as_ref();
+        if self.output.is_json() {
+            emit_json_event(&serde_json::json!({
+                "event": "info",
+                "message": message,
+            }));
+        } else {
+            println!("{message}");
         }
     }
 
@@ -517,7 +549,9 @@ impl InitCommand {
                     };
 
                     if let Some((sub_owner, sub_repo, sha)) = submodule_info {
-                        println!("  Downloading submodule {relative_path} from {sub_owner}/{sub_repo}@{sha}...");
+                        if !is_json_output_active() {
+                            println!("  Downloading submodule {relative_path} from {sub_owner}/{sub_repo}@{sha}...");
+                        }
                         fs::create_dir_all(&local_path).with_context(|| {
                             format!("Failed to create directory '{}'", local_path.display())
                         })?;
@@ -529,7 +563,7 @@ impl InitCommand {
                             &local_path,
                         )
                         .await?;
-                    } else {
+                    } else if !is_json_output_active() {
                         println!(
                             "  Warning: Submodule '{relative_path}' missing required info, skipping"
                         );
@@ -538,7 +572,9 @@ impl InitCommand {
                     match item.item_type.as_str() {
                         "file" => {
                             if let Some(ref download_url) = item.download_url {
-                                println!("  Downloading {relative_path}...");
+                                if !is_json_output_active() {
+                                    println!("  Downloading {relative_path}...");
+                                }
                                 // Check if this file should be executable based on its mode
                                 let is_executable = file_modes
                                     .get(relative_path)
@@ -738,7 +774,9 @@ impl InitCommand {
                     };
 
                     if let Some((sub_owner, sub_repo, sha)) = submodule_info {
-                        println!("    Downloading nested submodule {item_name} from {sub_owner}/{sub_repo}@{sha}...");
+                        if !is_json_output_active() {
+                            println!("    Downloading nested submodule {item_name} from {sub_owner}/{sub_repo}@{sha}...");
+                        }
                         fs::create_dir_all(&item_local_path).with_context(|| {
                             format!("Failed to create directory '{}'", item_local_path.display())
                         })?;
@@ -800,7 +838,7 @@ impl InitCommand {
     /// # Returns
     /// * `Ok(())` if successful
     /// * `Err` if the file cannot be written
-    fn create_gitignore(directory: &str) -> Result<()> {
+    fn create_gitignore(&self, directory: &str) -> Result<()> {
         let gitignore_path = Path::new(directory).join(".gitignore");
 
         // Don't overwrite existing .gitignore files
@@ -822,7 +860,7 @@ impl InitCommand {
                 fs::write(&gitignore_path, updated_content)
                     .with_context(|| format!("Failed to update '{}'", gitignore_path.display()))?;
 
-                println!("✓ Updated .gitignore to ignore .avocado-state files.");
+                self.emit_info("✓ Updated .gitignore to ignore .avocado-state files.");
             }
 
             return Ok(());
@@ -838,7 +876,7 @@ impl InitCommand {
             )
         })?;
 
-        println!("✓ Created .gitignore file.");
+        self.emit_info("✓ Created .gitignore file.");
 
         Ok(())
     }
@@ -857,7 +895,33 @@ impl InitCommand {
     /// * The reference doesn't exist (when using --reference)
     /// * There was an error downloading reference contents
     pub async fn execute(&self) -> Result<()> {
-        let directory = self.directory.as_deref().unwrap_or(".");
+        // Flip the process-wide JSON flag for the lifetime of this call
+        // so static helpers (the recursive directory downloader) can
+        // suppress their progress println!s without us threading a
+        // formatter through their signatures.
+        let _json_guard = if self.output.is_json() {
+            Some(JsonOutputGuard::enable())
+        } else {
+            None
+        };
+        // The desktop app wants any error visible as a structured event,
+        // not just propagated through the anyhow chain. Wrap the real
+        // body so we can serialize the failure before re-raising.
+        let result = self.execute_inner().await;
+        if let Err(ref e) = result {
+            if self.output.is_json() {
+                emit_json_event(&serde_json::json!({
+                    "event": "error",
+                    "message": e.to_string(),
+                }));
+            }
+        }
+        result
+    }
+
+    async fn execute_inner(&self) -> Result<()> {
+        let destination = self.destination();
+        let destination_str = destination.display().to_string();
 
         // Validate mutually exclusive options
         if self.reference_branch.is_some() && self.reference_commit.is_some() {
@@ -866,27 +930,29 @@ impl InitCommand {
             );
         }
 
-        // Validate and create directory if it doesn't exist
-        if !Path::new(directory).exists() {
-            fs::create_dir_all(directory)
-                .with_context(|| format!("Failed to create directory '{directory}'"))?;
+        // Create the destination dir if it doesn't exist. With --name
+        // this is the new subdir; without --name it's the bare directory
+        // (matching the historical behavior).
+        if !destination.exists() {
+            fs::create_dir_all(&destination)
+                .with_context(|| format!("Failed to create directory '{destination_str}'"))?;
         }
 
         // If reference is specified, download the reference project
         if let Some(ref_name) = &self.reference {
             let reference_source = self.get_reference_source();
-            println!("Initializing from reference '{ref_name}'...");
+            self.emit_info(format!("Initializing from reference '{ref_name}'..."));
 
             // Print source info if using non-default values
             if self.reference_repo.is_some()
                 || self.reference_branch.is_some()
                 || self.reference_commit.is_some()
             {
-                println!("Using source: {reference_source}");
+                self.emit_info(format!("Using source: {reference_source}"));
             }
 
             // Check if reference exists
-            println!("Checking if reference '{ref_name}' exists...");
+            self.emit_info(format!("Checking if reference '{ref_name}' exists..."));
             if !self.reference_exists(ref_name).await? {
                 anyhow::bail!(
                     "Reference '{ref_name}' not found in {reference_source}. \
@@ -899,7 +965,9 @@ impl InitCommand {
 
             // If both reference and target are specified, validate target support
             if let Some(target) = &self.target {
-                println!("Validating target '{target}' is supported by reference '{ref_name}'...");
+                self.emit_info(format!(
+                    "Validating target '{target}' is supported by reference '{ref_name}'..."
+                ));
 
                 // Download and parse the reference's avocado.yaml
                 let toml_content = self.download_reference_config(ref_name).await?;
@@ -912,7 +980,9 @@ impl InitCommand {
                     );
                 }
 
-                println!("✓ Target '{target}' is supported by reference '{ref_name}'.");
+                self.emit_info(format!(
+                    "✓ Target '{target}' is supported by reference '{ref_name}'."
+                ));
             }
 
             // Fetch file modes for the reference directory to preserve execute permissions
@@ -925,11 +995,11 @@ impl InitCommand {
             .await?;
 
             // Download all contents from the reference
-            println!("Downloading reference contents...");
+            self.emit_info("Downloading reference contents...");
             Self::download_reference_contents(
                 ref_name,
                 ref_name,
-                Path::new(directory),
+                &destination,
                 self.get_repo_owner(),
                 self.get_repo_name(),
                 self.get_git_ref(),
@@ -939,21 +1009,23 @@ impl InitCommand {
 
             // If a target was specified, update the default_target in the downloaded avocado.yaml
             if let Some(target) = &self.target {
-                let toml_path = Path::new(directory).join("avocado.yaml");
+                let toml_path = destination.join("avocado.yaml");
                 if toml_path.exists() {
-                    println!("Updating default_target to '{target}'...");
+                    self.emit_info(format!("Updating default_target to '{target}'..."));
                     Self::update_default_target(&toml_path, target)?;
-                    println!("✓ Updated default_target to '{target}'.");
+                    self.emit_info(format!("✓ Updated default_target to '{target}'."));
                 }
             }
 
-            println!(
-                "✓ Successfully initialized project from reference '{ref_name}' in '{}'.",
-                Path::new(directory)
-                    .canonicalize()
-                    .unwrap_or_else(|_| Path::new(directory).to_path_buf())
-                    .display()
-            );
+            let canonical = destination
+                .canonicalize()
+                .unwrap_or_else(|_| destination.clone());
+            if !self.output.is_json() {
+                println!(
+                    "✓ Successfully initialized project from reference '{ref_name}' in '{}'.",
+                    canonical.display()
+                );
+            }
         } else {
             // Original behavior: create avocado.yaml from template
             let target = self
@@ -962,7 +1034,7 @@ impl InitCommand {
                 .unwrap_or_else(|| Self::get_default_target());
 
             // Create the avocado.yaml file path
-            let toml_path = Path::new(directory).join("avocado.yaml");
+            let toml_path = destination.join("avocado.yaml");
 
             // Check if configuration file already exists
             if toml_path.exists() {
@@ -983,17 +1055,41 @@ impl InitCommand {
                 )
             })?;
 
-            println!(
-                "✓ Created config at {}.",
-                toml_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| toml_path.to_path_buf())
-                    .display()
-            );
+            let canonical_toml = toml_path
+                .canonicalize()
+                .unwrap_or_else(|_| toml_path.clone());
+            if !self.output.is_json() {
+                println!("✓ Created config at {}.", canonical_toml.display());
+            }
         }
 
         // Create .gitignore file (for both reference and non-reference paths)
-        Self::create_gitignore(directory)?;
+        self.create_gitignore(&destination.display().to_string())?;
+
+        // Final JSON event so consumers know we're done. Carries
+        // enough metadata for the app to navigate into the project
+        // without a follow-up call.
+        if self.output.is_json() {
+            let canonical = destination
+                .canonicalize()
+                .unwrap_or_else(|_| destination.clone());
+            let inferred_name = self
+                .name
+                .clone()
+                .or_else(|| self.reference.clone())
+                .or_else(|| {
+                    canonical
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                });
+            emit_json_event(&serde_json::json!({
+                "event": "complete",
+                "destination": canonical.display().to_string(),
+                "name": inferred_name,
+                "reference": self.reference.clone(),
+            }));
+        }
 
         Ok(())
     }
@@ -1011,7 +1107,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -1055,6 +1160,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            OutputFormat::Human,
         );
         let result = init_cmd.execute().await;
 
@@ -1074,7 +1181,16 @@ mod tests {
         // Create existing file
         fs::write(&config_path, "existing content").unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
         let result = init_cmd.execute().await;
 
         assert!(result.is_err());
@@ -1088,8 +1204,16 @@ mod tests {
         let new_dir_path = temp_dir.path().join("new_project");
         let new_dir_str = new_dir_path.to_str().unwrap();
 
-        let init_cmd =
-            InitCommand::new(None, Some(new_dir_str.to_string()), None, None, None, None);
+        let init_cmd = InitCommand::new(
+            None,
+            Some(new_dir_str.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -1104,7 +1228,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -1125,7 +1258,16 @@ mod tests {
         // Create existing .gitignore with some content
         fs::write(&gitignore_path, "*.log\n").unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -1144,7 +1286,16 @@ mod tests {
         // Create existing .gitignore with .avocado-state already in it
         fs::write(&gitignore_path, "*.log\n.avocado-state\n").unwrap();
 
-        let init_cmd = InitCommand::new(None, Some(temp_path.to_string()), None, None, None, None);
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
         let result = init_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -1220,6 +1371,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                OutputFormat::Human,
             );
             let result = init_cmd.execute().await;
 

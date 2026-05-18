@@ -58,7 +58,11 @@ pub fn create_standalone_tui(
     label: &str,
     verbose: bool,
 ) -> Option<(TuiContext, Arc<TaskRenderer>)> {
-    if verbose || !crate::utils::output::should_use_tui() {
+    // JSON output mode wants the renderer's lifecycle hooks to fire
+    // (they emit NDJSON `step` events) but no terminal painting. The
+    // renderer's RenderMode + the JSON-active checks inside its
+    // mutators handle the "no painting" half.
+    if verbose || !crate::utils::output::should_create_renderer() {
         return None;
     }
 

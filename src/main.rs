@@ -10,6 +10,7 @@ use utils::config::Config;
 
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
+use commands::config_show::ConfigShowCommand;
 use commands::connect::auth::{
     ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand, OutputFormat,
 };
@@ -110,7 +111,6 @@ struct Cli {
     /// (Equivalent to `AVOCADO_VM_AUTO_START=0`.)
     #[arg(long, global = true)]
     no_vm_auto_start: bool,
-
 }
 
 #[derive(Subcommand)]
@@ -142,7 +142,10 @@ enum Commands {
     },
     /// Initialize a new avocado project
     Init {
-        /// Directory to initialize (defaults to current directory)
+        /// Directory to initialize (defaults to current directory). When
+        /// `--name` is also given, the project is created at
+        /// <directory>/<name>/ instead of being written directly into
+        /// <directory>.
         directory: Option<String>,
         /// Target architecture (e.g., "qemux86-64")
         #[arg(long)]
@@ -159,6 +162,15 @@ enum Commands {
         /// Repository to fetch reference from (format: "owner/repo", defaults to "avocado-linux/references")
         #[arg(long)]
         reference_repo: Option<String>,
+        /// Name for the new project. When provided, the project is
+        /// created in `<directory>/<name>/`. Defaults to the reference
+        /// name when initializing from a reference, or to the
+        /// destination directory name otherwise.
+        #[arg(long)]
+        name: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Runtime management commands
     Runtime {
@@ -174,6 +186,11 @@ enum Commands {
     Vm {
         #[command(subcommand)]
         command: VmCommands,
+    },
+    /// Project configuration introspection (read-only).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
     },
     /// Clean the avocado project by removing docker volumes and state files
     Clean {
@@ -241,6 +258,9 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Output format. JSON skips TUI rendering and emits NDJSON events.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Remove packages from an extension, runtime, or SDK and update avocado.yaml
     Uninstall {
@@ -304,6 +324,9 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Output format. JSON skips TUI rendering and emits NDJSON events.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Fetch and refresh repository metadata for sysroots
     Fetch {
@@ -363,6 +386,9 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Output format. JSON skips TUI rendering and emits NDJSON events.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Deploy a runtime to a device (shortcut for 'runtime deploy')
     Deploy {
@@ -1144,6 +1170,19 @@ enum ConnectClaimTokensCommands {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommands {
+    /// Show the parsed avocado.yaml in a stable JSON or YAML-ish summary.
+    Show {
+        /// Path to avocado.yaml (defaults to ./avocado.yaml)
+        #[arg(short = 'c', long, default_value = "./avocado.yaml")]
+        config: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConnectAuthCommands {
     /// Login to the Connect platform
     Login {
@@ -1644,6 +1683,38 @@ fn parse_env_vars(env_args: Option<&Vec<String>>) -> Option<HashMap<String, Stri
     })
 }
 
+/// Enable JSON output mode for the lifetime of the returned guard and
+/// emit a `start` event so the desktop app can attach to the run.
+///
+/// Returns `None` in human mode (no guard, no event). The caller binds
+/// the result to a `let _x = ...` so it lives to the end of the
+/// dispatch arm; on drop, the guard clears the global flag.
+///
+/// Note: this does NOT emit a terminal `complete` / `error` event —
+/// the desktop app derives success/failure from the subprocess exit
+/// status. Emitting a final event would require wrapping each command
+/// in a try-finally pattern across the existing flat dispatch; using
+/// exit status is sufficient for the UI today and we can layer in a
+/// completion event later if needed.
+fn run_with_json_lifecycle(
+    output: OutputFormat,
+    action: &'static str,
+    target: Option<&str>,
+    runtime: Option<&str>,
+) -> Option<crate::utils::output_format::JsonOutputGuard> {
+    if !output.is_json() {
+        return None;
+    }
+    let guard = crate::utils::output_format::JsonOutputGuard::enable();
+    crate::utils::output_format::emit_json_event(&serde_json::json!({
+        "event": "start",
+        "action": action,
+        "target": target,
+        "runtime": runtime,
+    }));
+    Some(guard)
+}
+
 /// Combine provision profile and env vars into a single HashMap
 fn build_env_vars(
     provision_profile: Option<&String>,
@@ -1712,11 +1783,9 @@ async fn main() -> Result<()> {
     // vhci_hcd bridge instead, we only care about the side-effect of
     // setting DOCKER_HOST for downstream `docker` invocations.
     if needs_vm_routing(&cli.command) {
-        if let Err(e) = utils::vm::route::ensure_routed_for_process(
-            cli.no_vm_auto_start,
-            cli.runs_on.is_some(),
-        )
-        .await
+        if let Err(e) =
+            utils::vm::route::ensure_routed_for_process(cli.no_vm_auto_start, cli.runs_on.is_some())
+                .await
         {
             utils::output::print_warning(
                 &format!("VM routing unavailable: {e:#}; falling back to local docker."),
@@ -1733,6 +1802,8 @@ async fn main() -> Result<()> {
             reference_branch,
             reference_commit,
             reference_repo,
+            name,
+            output,
         } => {
             let init_cmd = InitCommand::new(
                 target.or(cli.target),
@@ -1741,6 +1812,8 @@ async fn main() -> Result<()> {
                 reference_branch,
                 reference_commit,
                 reference_repo,
+                name,
+                output,
             );
             init_cmd.execute().await?;
             Ok(())
@@ -1778,7 +1851,16 @@ async fn main() -> Result<()> {
             target,
             container_args,
             dnf_args,
+            output,
         } => {
+            let _json_guard =
+                run_with_json_lifecycle(output, "install", target.as_deref(), runtime.as_deref());
+            // JSON output implies no human at the keyboard — auto-enable
+            // --force so dnf gets -y and container starts without -it.
+            // Without this, `docker run -it` fails ("cannot attach stdin
+            // to a TTY-enabled container") and dnf hangs waiting for
+            // confirmation.
+            let force = force || output.is_json();
             if packages.is_empty() {
                 // No packages specified: sync all from config (original behavior)
                 validate_runtime_if_provided(&config, runtime.as_ref())?;
@@ -1888,7 +1970,10 @@ async fn main() -> Result<()> {
             target,
             container_args,
             dnf_args,
+            output,
         } => {
+            let _json_guard =
+                run_with_json_lifecycle(output, "build", target.as_deref(), runtime.as_deref());
             // Validate runtime exists if provided
             validate_runtime_if_provided(&config, runtime.as_ref())?;
 
@@ -1949,7 +2034,17 @@ async fn main() -> Result<()> {
             out,
             container_args,
             dnf_args,
+            output,
         } => {
+            let _json_guard = run_with_json_lifecycle(
+                output,
+                "provision",
+                target.as_deref(),
+                name.as_deref().or(runtime.as_deref()),
+            );
+            // JSON output implies no human at the keyboard — auto-enable
+            // --force (see `Install` arm above for rationale).
+            let force = force || output.is_json();
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -2719,6 +2814,16 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Config { command } => match command {
+            ConfigCommands::Show { config, output } => {
+                let cmd = ConfigShowCommand {
+                    config_path: config,
+                    output,
+                };
+                cmd.execute().await?;
+                Ok(())
+            }
+        },
         Commands::Vm { command } => match command {
             VmCommands::Start {
                 vm_source,
@@ -2744,12 +2849,12 @@ async fn main() -> Result<()> {
                 };
                 cmd.execute().await
             }
-            VmCommands::Stop { force } => {
-                commands::vm::stop::StopCommand { force }.execute().await
-            }
+            VmCommands::Stop { force } => commands::vm::stop::StopCommand { force }.execute().await,
             VmCommands::Status => commands::vm::status::StatusCommand.execute().await,
             VmCommands::Shell { command } => {
-                commands::vm::shell::ShellCommand { command }.execute().await
+                commands::vm::shell::ShellCommand { command }
+                    .execute()
+                    .await
             }
             VmCommands::Logs { follow } => {
                 commands::vm::logs::LogsCommand { follow }.execute().await

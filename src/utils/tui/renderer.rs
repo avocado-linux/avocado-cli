@@ -163,7 +163,15 @@ impl TaskRenderer {
         if state.iter().any(|t| t.id == id) {
             return;
         }
+        let id_str = id.to_string();
+        let label_clone = label.clone();
         state.push(TaskState::new(id, label));
+        drop(state);
+        emit_json_task_event(&serde_json::json!({
+            "event": "task_registered",
+            "name": id_str,
+            "label": label_clone,
+        }));
     }
 
     /// Append a new line of output to a task. Output is captured silently —
@@ -171,9 +179,16 @@ impl TaskRenderer {
     pub fn append_output(&self, id: &TaskId, line: String) {
         let mut state = self.state.lock().unwrap();
         if let Some(task) = state.iter_mut().find(|t| &t.id == id) {
-            task.append_line(line);
+            task.append_line(line.clone());
         }
-        // No notify — we don't redraw for output, only for status changes.
+        drop(state);
+        // No TUI notify — we don't redraw for output, only for status changes.
+        // In JSON mode, this is what feeds the app's output console.
+        emit_json_task_event(&serde_json::json!({
+            "event": "output",
+            "name": id.to_string(),
+            "line": line,
+        }));
     }
 
     /// Replace the last line of output (progress bar / carriage-return updates).
@@ -181,8 +196,18 @@ impl TaskRenderer {
     pub fn replace_last_output(&self, id: &TaskId, line: String) {
         let mut state = self.state.lock().unwrap();
         if let Some(task) = state.iter_mut().find(|t| &t.id == id) {
-            task.replace_last_line(line);
+            task.replace_last_line(line.clone());
         }
+        drop(state);
+        // For JSON consumers, treat replace as another output event — a
+        // carriage-return progress bar emits one event per repaint, which
+        // is fine; the UI can choose to show only the most recent line.
+        emit_json_task_event(&serde_json::json!({
+            "event": "output",
+            "name": id.to_string(),
+            "line": line,
+            "replace": true,
+        }));
     }
 
     /// Update a task's status.
@@ -205,9 +230,21 @@ impl TaskRenderer {
         }
         drop(state);
 
-        if self.mode == RenderMode::Passthrough {
+        // JSON consumers want every state transition. Passthrough rendering
+        // is skipped in JSON mode because should_use_tui() returns false
+        // for JSON, and the command wrapper doesn't create a renderer at
+        // all — but if someone DID call set_status while JSON is active
+        // we still emit a step event for them.
+        if self.mode == RenderMode::Passthrough
+            && !crate::utils::output_format::is_json_output_active()
+        {
             self.passthrough_status(id, status);
         }
+        emit_json_task_event(&serde_json::json!({
+            "event": "step",
+            "name": id.to_string(),
+            "status": status_str(status),
+        }));
 
         self.notify.notify_one();
     }
@@ -230,8 +267,14 @@ impl TaskRenderer {
     pub fn set_error(&self, id: &TaskId, message: String) {
         let mut state = self.state.lock().unwrap();
         if let Some(task) = state.iter_mut().find(|t| &t.id == id) {
-            task.error_message = Some(message);
+            task.error_message = Some(message.clone());
         }
+        drop(state);
+        emit_json_task_event(&serde_json::json!({
+            "event": "step_error",
+            "name": id.to_string(),
+            "message": message,
+        }));
     }
 
     // ------------------------------------------------------------------
@@ -706,6 +749,29 @@ fn extract_progress(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Lowercase, stable string for `TaskStatus`. Used in JSON events so the
+/// wire format stays consistent regardless of how the human-facing
+/// rendering labels things later.
+fn status_str(s: TaskStatus) -> &'static str {
+    match s {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::Success => "success",
+        TaskStatus::Failed => "failed",
+        TaskStatus::WaitingForInput => "waiting_for_input",
+        TaskStatus::Skipped => "skipped",
+    }
+}
+
+/// Emit an NDJSON event to stdout iff JSON output mode is active.
+/// No-op otherwise — TaskRenderer callsites can call this
+/// unconditionally and pay only an atomic load when JSON is off.
+fn emit_json_task_event(value: &serde_json::Value) {
+    if crate::utils::output_format::is_json_output_active() {
+        crate::utils::output_format::emit_json_event(value);
+    }
 }
 
 /// Find the best line to show as the peek from the ring buffer.
