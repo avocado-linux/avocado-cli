@@ -6,6 +6,7 @@ pub mod disk_writer;
 pub mod ext_fetch;
 pub mod host_copy;
 pub mod image_signing;
+pub mod install_method;
 pub mod interpolation;
 pub mod jcs;
 pub mod kab_wrap;

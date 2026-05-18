@@ -3635,10 +3635,17 @@ async fn main() -> Result<()> {
         if let Ok(Ok(Some(version))) =
             tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
         {
+            let upgrade_hint = match utils::install_method::current_install_method() {
+                utils::install_method::InstallMethod::Homebrew => {
+                    "Run 'avocado upgrade' or 'brew upgrade avocado-cli' to update."
+                }
+                _ => "Run 'avocado upgrade' to update.",
+            };
             eprintln!(
-                "\n\x1b[93m[UPDATE]\x1b[0m avocado {} is available (you have {}).\n         Run 'avocado upgrade' to update.",
+                "\n\x1b[93m[UPDATE]\x1b[0m avocado {} is available (you have {}).\n         {}",
                 version,
-                env!("CARGO_PKG_VERSION")
+                env!("CARGO_PKG_VERSION"),
+                upgrade_hint
             );
         }
     }

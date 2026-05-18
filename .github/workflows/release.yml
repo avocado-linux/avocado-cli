@@ -150,7 +150,141 @@ jobs:
           mv ./target/${{ matrix.target }}/release/avocado${{ matrix.suffix }} ./avocado${{ matrix.suffix }}
           tar -czf avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz ./avocado${{ matrix.suffix }}
 
+      - name: Compute SHA256
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          shasum -a 256 avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz \
+            > avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz.sha256
+
+      - name: Compute SHA256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $file = "avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz"
+          $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLower()
+          "$hash  $file" | Out-File -FilePath "$file.sha256" -Encoding ascii -NoNewline
+
       - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
-          files: avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz
+          files: |
+            avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz
+            avocado-${{ github.ref_name }}_${{ matrix.target }}.tar.gz.sha256
+
+  sha256sums:
+    permissions:
+      contents: write
+    name: Aggregate SHA256SUMS
+    runs-on: ubuntu-latest
+    needs: [release]
+    steps:
+      - name: Download per-tarball SHA256 files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p sums
+          cd sums
+          gh release download ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --pattern '*.sha256'
+
+      - name: Concatenate into SHA256SUMS
+        run: |
+          cat sums/*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS
+
+  bump-homebrew-tap:
+    name: Bump Homebrew tap formula
+    runs-on: ubuntu-latest
+    needs: [sha256sums]
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Download per-tarball SHA256 files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p sums
+          cd sums
+          gh release download ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --pattern '*.sha256'
+
+      - name: Extract SHA256s into env vars
+        run: |
+          TAG="${{ github.ref_name }}"
+          extract() {
+            local target="$1"
+            local file="sums/avocado-${TAG}_${target}.tar.gz.sha256"
+            if [ ! -f "$file" ]; then
+              echo "Missing SHA256 file for ${target}: $file" >&2
+              exit 1
+            fi
+            awk '{print $1}' "$file"
+          }
+          {
+            echo "SHA_MACOS_ARM64=$(extract aarch64-apple-darwin)"
+            echo "SHA_MACOS_X86_64=$(extract x86_64-apple-darwin)"
+            echo "SHA_LINUX_ARM64=$(extract aarch64-unknown-linux-musl)"
+            echo "SHA_LINUX_X86_64=$(extract x86_64-unknown-linux-gnu)"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: avocado-linux/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Rewrite formula
+        working-directory: homebrew-tap
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          path = "Formula/avocado-cli.rb"
+          with open(path) as f:
+              src = f.read()
+          tag = os.environ["TAG"]
+          src = re.sub(r'version "[^"]+"', f'version "{tag}"', src, count=1)
+          mapping = [
+              ("aarch64-apple-darwin",         os.environ["SHA_MACOS_ARM64"]),
+              ("x86_64-apple-darwin",          os.environ["SHA_MACOS_X86_64"]),
+              ("aarch64-unknown-linux-musl",   os.environ["SHA_LINUX_ARM64"]),
+              ("x86_64-unknown-linux-gnu",     os.environ["SHA_LINUX_X86_64"]),
+          ]
+          for target, sha in mapping:
+              pattern = re.compile(
+                  r'(url\s+"[^"]*' + re.escape(target) + r'\.tar\.gz"\s*\n\s*sha256\s+")[0-9a-f]+(")',
+                  re.MULTILINE,
+              )
+              new_src, n = pattern.subn(r'\g<1>' + sha + r'\g<2>', src)
+              if n != 1:
+                  print(f"Failed to substitute sha256 for {target} (matches: {n})", file=sys.stderr)
+                  sys.exit(1)
+              src = new_src
+          with open(path, "w") as f:
+              f.write(src)
+          PY
+          cat Formula/avocado-cli.rb
+
+      - name: Commit and push
+        working-directory: homebrew-tap
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name "avocado-release-bot"
+          git config user.email "release-bot@avocadolinux.org"
+          if git diff --quiet; then
+            echo "Formula already up to date for ${TAG}; nothing to commit."
+            exit 0
+          fi
+          git add Formula/avocado-cli.rb
+          git commit -m "avocado-cli ${TAG}"
+          git push

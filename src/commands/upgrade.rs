@@ -15,6 +15,8 @@ use reqwest::ClientBuilder;
 use serde::Deserialize;
 use tar::Archive;
 
+use crate::utils::install_method::{detect_install_method, InstallMethod};
+
 #[derive(Deserialize, Debug)]
 struct GithubAssetResponse {
     browser_download_url: String,
@@ -92,6 +94,8 @@ impl UpgradeCommand {
         let current_cli_executable =
             env::current_exe().map_err(|_| "Can't retrieve the current cli directory")?;
 
+        let install_method = detect_install_method(&current_cli_executable);
+
         if let Err(err) = rename(update_file, &current_cli_executable) {
             if err.kind() == ErrorKind::PermissionDenied {
                 return Err(format!(
@@ -106,6 +110,12 @@ impl UpgradeCommand {
         }
 
         println!("CLI upgraded successfully ({})", github_response.tag_name);
+
+        if install_method == InstallMethod::Homebrew {
+            println!(
+                "Note: Homebrew install detected. Run `brew upgrade avocado-cli` to keep Homebrew in sync (next `brew upgrade` will otherwise reset this binary to the formula version)."
+            );
+        }
 
         Ok(())
     }
