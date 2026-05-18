@@ -97,7 +97,10 @@ impl StagingDir {
             .context("writing .was-running marker")
     }
 
-    /// Read the marker. `false` if the file is missing.
+    /// Read the marker. `false` if the file is missing. Consumed by a
+    /// crash-resume retry to recover the restart intent set by the
+    /// original (interrupted) operation.
+    #[allow(dead_code)]
     pub fn was_running(&self) -> bool {
         fs::read_to_string(self.root.join(".was-running"))
             .map(|s| s.trim() == "1")

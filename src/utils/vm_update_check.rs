@@ -42,7 +42,9 @@ struct UpdateCache {
 pub struct UpdateAvailable {
     pub pointer: ChannelPointer,
     /// The local version we compared against; `None` when there's no
-    /// installed manifest yet (first-run case).
+    /// installed manifest yet (first-run case). Carried for callers
+    /// that want to format a "X → Y" diff message.
+    #[allow(dead_code)]
     pub installed_version: Option<String>,
 }
 
