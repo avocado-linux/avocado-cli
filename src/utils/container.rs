@@ -88,6 +88,43 @@ pub fn is_vm_routing_active() -> bool {
     host == format!("unix://{}", paths.docker_socket().display())
 }
 
+/// When docker is going to execute inside the avocado-vm, ensure the
+/// 9p workspace share is actually mounted in the guest before we issue
+/// any bind mounts. Lazy on purpose: we only pay the SSH probe right
+/// before container start, and only when VM routing is active. The
+/// SSH-driven mount (`share::ensure_mounted_in_guest`) is idempotent,
+/// so cycles of "already mounted → no-op" are cheap.
+///
+/// Failure is non-fatal: we warn and let the container start proceed.
+/// Without the mount, `/opt/src` will be empty inside the container —
+/// the surface error (compile script not found, bind mount source
+/// missing, etc.) is loud enough that the user can tell what's wrong.
+async fn ensure_workspace_mounted_if_routed() {
+    if !is_vm_routing_active() {
+        return;
+    }
+    let paths = match crate::utils::vm::state::VmPaths::resolve() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let Some(port) = crate::utils::vm::state::read_ssh_port(&paths)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let target = crate::utils::vm::ssh::SshTarget::local(&paths, port);
+    if let Err(e) = crate::utils::vm::share::ensure_mounted_in_guest(&target).await {
+        crate::utils::output::print_warning(
+            &format!(
+                "could not mount workspace 9p share inside the avocado-vm: {e:#}. \
+                 Project bind mounts will be empty. Try `avocado vm stop && avocado vm start`."
+            ),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+}
+
 /// When `DOCKER_HOST` is the avocado-vm's forwarded socket (set by
 /// `utils::vm::route`), bind mounts in `docker run` resolve inside the VM,
 /// not on the host. Translate host paths under the recorded workspace root
@@ -543,6 +580,15 @@ impl SdkContainer {
         if let Some(ref arch) = config.sdk_arch {
             ensure_cross_arch_emulation(&self.container_tool, arch).await?;
         }
+
+        // If docker is routed through the avocado-vm, the 9p workspace
+        // share has to be mounted inside the guest before we issue a
+        // bind mount under the workspace root — otherwise the container
+        // sees empty tmpfs. `avocado vm start` (CLI) mounts during boot,
+        // but when Avocado.app launches QEMU directly the mount step
+        // is skipped. Call it just-in-time here; the SSH probe + mount
+        // is idempotent (no-op when already mounted).
+        ensure_workspace_mounted_if_routed().await;
 
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
