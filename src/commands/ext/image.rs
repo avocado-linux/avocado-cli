@@ -703,7 +703,9 @@ impl ExtImageCommand {
         };
         std::fs::create_dir_all(&host_output_dir)?;
 
-        let temp_container_id = self.create_temp_container(container_tool, volume_name).await?;
+        let temp_container_id = self
+            .create_temp_container(container_tool, volume_name)
+            .await?;
 
         let docker_cp_source = format!("{temp_container_id}:{container_image_path}");
         let docker_cp_dest = host_output_dir.join(image_filename);

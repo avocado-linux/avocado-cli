@@ -2166,9 +2166,9 @@ mod tests {
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
-        assert!(script.contains(
-            "cp -a \"/opt/src/peridio/.\" \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""
-        ));
+        assert!(
+            script.contains("cp -a \"/opt/src/peridio/.\" \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\"")
+        );
         assert!(script.contains("chown -R root:root \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
         assert!(script.contains("exit 1"));
@@ -2208,9 +2208,9 @@ mod tests {
         assert!(script.contains("# Merge overlay directory into extension sysroot"));
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
-        assert!(script.contains(
-            "cp -a \"/opt/src/peridio/.\" \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""
-        ));
+        assert!(
+            script.contains("cp -a \"/opt/src/peridio/.\" \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\"")
+        );
         assert!(script.contains("chown -R root:root \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
         assert!(script.contains("exit 1"));

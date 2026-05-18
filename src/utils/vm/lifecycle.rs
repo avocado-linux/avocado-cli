@@ -64,9 +64,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // Reject if already running.
     if let Some(pid) = state::read_pid(&paths)? {
         if state::pid_alive(pid) {
-            bail!(
-                "avocado-vm already running (pid {pid}); use `avocado vm stop` first"
-            );
+            bail!("avocado-vm already running (pid {pid}); use `avocado vm stop` first");
         }
         // Stale pidfile — clean it up.
         state::cleanup_transient(&paths);
@@ -93,7 +91,10 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
 
     // Record the artifact dir so Avocado.app (which inherits a sanitized
     // env from LaunchServices on macOS) can find it without AVOCADO_VM_DIR.
-    let _ = std::fs::write(paths.artifact_dir_file(), artifact_dir.display().to_string());
+    let _ = std::fs::write(
+        paths.artifact_dir_file(),
+        artifact_dir.display().to_string(),
+    );
 
     qemu::ensure_qemu_available(&manifest)?;
     ensure_ssh_key(&paths)?;
@@ -107,10 +108,8 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // Grow the var.btrfs file (sparse) to the user-requested size, if
     // larger than current. The matching `btrfs filesystem resize max` runs
     // inside the VM after boot.
-    let var_target_bytes = parse_size(
-        opts.var_size.as_deref().unwrap_or(DEFAULT_VAR_SIZE),
-    )
-    .context("invalid --var-size")?;
+    let var_target_bytes = parse_size(opts.var_size.as_deref().unwrap_or(DEFAULT_VAR_SIZE))
+        .context("invalid --var-size")?;
     grow_var_file(&paths, var_target_bytes)?;
 
     let workspace = super::share::resolve_workspace(opts.workspace.as_deref())?;
@@ -180,10 +179,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // Grow /var inside the VM to fill the resized block device. Idempotent
     // — no-op if /var is already at the device's max size. Non-fatal so a
     // btrfs hiccup doesn't tear down the VM.
-    if let Err(e) = target
-        .exec("btrfs filesystem resize max /var")
-        .await
-    {
+    if let Err(e) = target.exec("btrfs filesystem resize max /var").await {
         crate::utils::output::print_warning(
             &format!(
                 "btrfs resize on /var failed: {e:#}. /var size = {} bytes on host but the FS inside may not reflect that yet.",
@@ -354,7 +350,8 @@ fn parse_size(s: &str) -> Result<u64> {
         "T" | "TB" | "TIB" => 1u64 << 40,
         other => bail!("unknown size suffix {other:?} in {s:?}"),
     };
-    n.checked_mul(mult).ok_or_else(|| anyhow::anyhow!("size {s} overflows u64"))
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("size {s} overflows u64"))
 }
 
 /// Grow `var.btrfs` (sparse) up to `target_bytes` if it's smaller. Shrinking
@@ -440,10 +437,8 @@ fn ensure_ssh_key(paths: &VmPaths) -> Result<()> {
 
 fn write_secret(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
-    let mut tmp = tempfile::NamedTempFile::new_in(
-        path.parent().context("ssh key parent")?,
-    )
-    .context("temp file for ssh key")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("ssh key parent")?)
+        .context("temp file for ssh key")?;
     tmp.write_all(content.as_bytes())
         .context("write ssh key tmp")?;
     tmp.flush().context("flush ssh key tmp")?;
@@ -519,7 +514,7 @@ fn openssh_private_pem(kp: &ed25519_compact::KeyPair) -> String {
     write_ssh_string(&mut privblock, b"avocado-vm");
     // Padding to multiple of 8 (cipher block size for "none")
     let mut pad_byte: u8 = 1;
-    while privblock.len() % 8 != 0 {
+    while !privblock.len().is_multiple_of(8) {
         privblock.push(pad_byte);
         pad_byte += 1;
     }
@@ -582,7 +577,9 @@ async fn delegate_start_to_app(
         "cpus": cpus,
         "ssh_port": ssh_port,
     });
-    let _ = client.request("vm.start", params).context("vm.start dispatch")?;
+    let _ = client
+        .request("vm.start", params)
+        .context("vm.start dispatch")?;
 
     // Block until the app reports running (or errors). The app's own
     // monitor + pidfile sync gives us the authoritative pid.

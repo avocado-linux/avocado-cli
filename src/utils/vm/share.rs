@@ -40,8 +40,8 @@ pub fn resolve_workspace(override_value: Option<&Path>) -> Result<PathBuf> {
     if let Ok(env) = std::env::var("AVOCADO_VM_WORKSPACE") {
         return canonicalize_existing(Path::new(&env));
     }
-    let dirs = directories::BaseDirs::new()
-        .context("could not determine $HOME for default workspace")?;
+    let dirs =
+        directories::BaseDirs::new().context("could not determine $HOME for default workspace")?;
     Ok(dirs.home_dir().to_path_buf())
 }
 
@@ -58,9 +58,8 @@ fn canonicalize_existing(p: &Path) -> Result<PathBuf> {
 pub fn record_workspace(paths: &VmPaths, root: &Path) -> Result<()> {
     paths.ensure()?;
     let target = paths.root.join(WORKSPACE_FILE);
-    std::fs::write(&target, root.display().to_string()).with_context(|| {
-        format!("recording workspace root at {}", target.display())
-    })?;
+    std::fs::write(&target, root.display().to_string())
+        .with_context(|| format!("recording workspace root at {}", target.display()))?;
     Ok(())
 }
 

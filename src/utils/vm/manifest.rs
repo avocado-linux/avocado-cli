@@ -61,7 +61,10 @@ impl Manifest {
         let m: Self = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse manifest at {}", path.display()))?;
         if m.format != "avocado-direct" {
-            bail!("manifest format is '{}', expected 'avocado-direct'", m.format);
+            bail!(
+                "manifest format is '{}', expected 'avocado-direct'",
+                m.format
+            );
         }
         if m.format_version != 1 {
             bail!(
@@ -105,12 +108,13 @@ impl Manifest {
 
 fn sha256_file(path: &Path) -> Result<String> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f.read(&mut buf).with_context(|| format!("reading {}", path.display()))?;
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
         if n == 0 {
             break;
         }

@@ -86,9 +86,8 @@ pub async fn ensure_routed_for_process(
         // Manifest-staleness check: warn if the user's AVOCADO_VM_DIR points
         // at a newer manifest than the one we recorded at start time.
         warn_if_stale(&paths);
-        state::read_ssh_port(&paths)?.ok_or_else(|| {
-            anyhow::anyhow!("avocado-vm is running but ssh-port file is missing")
-        })?
+        state::read_ssh_port(&paths)?
+            .ok_or_else(|| anyhow::anyhow!("avocado-vm is running but ssh-port file is missing"))?
     } else {
         // 2. Auto-start path.
         let Some(vm_source) = vm_source_from_env() else {

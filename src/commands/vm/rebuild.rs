@@ -57,10 +57,11 @@ impl RebuildCommand {
                 ("var.btrfs", paths.var_disk()),
             ] {
                 if path.exists() {
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("removing {label}"))?;
+                    std::fs::remove_file(&path).with_context(|| format!("removing {label}"))?;
                     print_info(
-                        &format!("Removed {label} (will be re-seeded from the artifact on next start)."),
+                        &format!(
+                            "Removed {label} (will be re-seeded from the artifact on next start)."
+                        ),
                         OutputLevel::Normal,
                     );
                 }

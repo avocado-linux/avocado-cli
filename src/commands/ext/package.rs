@@ -777,7 +777,9 @@ rm -rf "$TMPDIR"
         }
 
         // Create a temporary container to access the volume (following checkout pattern)
-        let temp_container_id = self.create_temp_container(container_tool, volume_name).await?;
+        let temp_container_id = self
+            .create_temp_container(container_tool, volume_name)
+            .await?;
 
         // Determine the output path on host
         let host_output_dir = if output_dir.starts_with('/') {

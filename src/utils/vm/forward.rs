@@ -60,11 +60,7 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
         "-p",
         &ssh_port.to_string(),
         "-L",
-        &format!(
-            "{}:{}",
-            local.display(),
-            REMOTE_DOCKER_SOCK
-        ),
+        &format!("{}:{}", local.display(), REMOTE_DOCKER_SOCK),
         "root@127.0.0.1",
     ]);
     cmd.stdin(Stdio::null());

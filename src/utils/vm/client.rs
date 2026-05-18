@@ -12,8 +12,9 @@
 //!   Request:  `{"method": "...", "params": {...}, "id": <any>}\n`
 //!   Response: `{"result": {...}, "id": <any>}\n`  or
 //!             `{"error": "...",   "id": <any>}\n`
-
-#![cfg(target_os = "macos")]
+//!
+//! Module-level `#[cfg(target_os = "macos")]` lives on the `pub mod`
+//! declaration in `super::mod.rs`; we don't repeat it here.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -41,8 +42,8 @@ impl Client {
     /// [`Self::connect_or_launch`] for the user-facing path.
     pub fn connect() -> Result<Self> {
         let path = Self::socket_path()?;
-        let stream = UnixStream::connect(&path)
-            .with_context(|| format!("connect to {}", path.display()))?;
+        let stream =
+            UnixStream::connect(&path).with_context(|| format!("connect to {}", path.display()))?;
         // Snug, not heroic — these requests are tiny and the app responds
         // synchronously. `vm.wait_ready` is the only long-runner and it sets
         // its own per-request timeout via the `timeout_sec` param.
@@ -86,9 +87,8 @@ impl Client {
         }
         candidates.push(PathBuf::from("/Applications/Avocado.app"));
         if let Some(crate_parent) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
-            candidates.push(crate_parent.join(
-                "avocado-vm/macos/build/Build/Products/Debug/Avocado.app",
-            ));
+            candidates
+                .push(crate_parent.join("avocado-vm/macos/build/Build/Products/Debug/Avocado.app"));
         }
         let app = candidates.iter().find(|p| p.exists()).cloned()
             .with_context(|| format!(

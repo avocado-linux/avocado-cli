@@ -82,8 +82,15 @@ impl StartCommand {
         if result.is_err() && !self.watch {
             if let Ok(paths) = VmPaths::resolve() {
                 if let Ok(content) = std::fs::read_to_string(paths.serial_log()) {
-                    let tail: String = content.lines().rev().take(40).collect::<Vec<_>>()
-                        .into_iter().rev().collect::<Vec<_>>().join("\n");
+                    let tail: String = content
+                        .lines()
+                        .rev()
+                        .take(40)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     eprintln!("\n--- last 40 lines of serial log ---\n{tail}\n--- end ---\n");
                 }
             }

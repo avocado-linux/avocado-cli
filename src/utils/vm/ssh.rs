@@ -67,10 +67,7 @@ impl SshTarget {
         cmd.args(self.base_args());
         cmd.arg(command);
         cmd.stdin(Stdio::null());
-        let out = cmd
-            .output()
-            .await
-            .context("failed to spawn ssh")?;
+        let out = cmd.output().await.context("failed to spawn ssh")?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
@@ -83,7 +80,10 @@ impl SshTarget {
     }
 
     /// Drop the user into an interactive shell. Returns when ssh exits.
-    pub async fn interactive(&self, command: Option<&[String]>) -> Result<std::process::ExitStatus> {
+    pub async fn interactive(
+        &self,
+        command: Option<&[String]>,
+    ) -> Result<std::process::ExitStatus> {
         let mut cmd = AsyncCommand::new("ssh");
         cmd.args(self.base_args());
         if let Some(extra) = command {

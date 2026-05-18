@@ -158,7 +158,9 @@ mod tests {
             line.clear();
             rh.read_line(&mut line).await.unwrap();
             assert!(line.contains("\"query-status\""));
-            wh.write_all(b"{\"return\":{\"running\":true}}\n").await.unwrap();
+            wh.write_all(b"{\"return\":{\"running\":true}}\n")
+                .await
+                .unwrap();
         })
         .await;
 

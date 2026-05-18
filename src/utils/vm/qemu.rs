@@ -219,11 +219,7 @@ pub fn build_qemu_args(
 /// Spawn QEMU detached from the controlling terminal. Returns the child pid.
 /// The child writes its own pidfile thanks to `-pidfile`; we also capture
 /// the spawn-time pid so the caller can `kill` it directly if needed.
-pub async fn spawn_detached(
-    manifest: &Manifest,
-    paths: &VmPaths,
-    cfg: &QemuConfig,
-) -> Result<u32> {
+pub async fn spawn_detached(manifest: &Manifest, paths: &VmPaths, cfg: &QemuConfig) -> Result<u32> {
     let bin = qemu_binary_for(manifest)?;
     let args = build_qemu_args(manifest, paths, cfg)?;
 
@@ -261,9 +257,7 @@ pub fn ensure_qemu_available(manifest: &Manifest) -> Result<()> {
     let bin = qemu_binary_for(manifest)?;
     // Cross-platform `which`: scan `$PATH`.
     if which_on_path(bin).is_none() {
-        bail!(
-            "{bin} not found in $PATH; install QEMU (e.g. `brew install qemu` on macOS)"
-        );
+        bail!("{bin} not found in $PATH; install QEMU (e.g. `brew install qemu` on macOS)");
     }
     Ok(())
 }

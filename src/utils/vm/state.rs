@@ -128,8 +128,8 @@ pub fn read_ssh_port(paths: &VmPaths) -> Result<Option<u16>> {
     if !p.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&p)
-        .with_context(|| format!("failed to read {}", p.display()))?;
+    let raw =
+        std::fs::read_to_string(&p).with_context(|| format!("failed to read {}", p.display()))?;
     let port: u16 = raw
         .trim()
         .parse()
@@ -155,8 +155,8 @@ pub fn read_pid(paths: &VmPaths) -> Result<Option<u32>> {
     if !p.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&p)
-        .with_context(|| format!("failed to read {}", p.display()))?;
+    let raw =
+        std::fs::read_to_string(&p).with_context(|| format!("failed to read {}", p.display()))?;
     let pid: u32 = raw
         .trim()
         .parse()

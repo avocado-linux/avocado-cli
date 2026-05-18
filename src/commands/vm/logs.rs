@@ -29,8 +29,7 @@ impl LogsCommand {
                 .context("failed to spawn `tail`")?;
             std::process::exit(status.code().unwrap_or(0));
         } else {
-            let content =
-                std::fs::read_to_string(&log).context("read serial log")?;
+            let content = std::fs::read_to_string(&log).context("read serial log")?;
             print!("{content}");
             Ok(())
         }
