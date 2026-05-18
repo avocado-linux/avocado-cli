@@ -2894,6 +2894,21 @@ async fn main() -> Result<()> {
                 .execute()
                 .await
             }
+            VmCommands::Update {
+                channel,
+                check,
+                yes,
+                output,
+            } => {
+                commands::vm::update::UpdateCommand {
+                    channel,
+                    check_only: check,
+                    assume_yes: yes,
+                    output,
+                }
+                .execute()
+                .await
+            }
         },
         Commands::Hitl { command } => match command {
             HitlCommands::Server {
@@ -4119,6 +4134,24 @@ enum VmCommands {
         vm_source: Option<std::path::PathBuf>,
         #[arg(long)]
         reset_data: bool,
+    },
+    /// Check for and apply VM image updates from the release channel.
+    /// Stops + restarts the VM if it was running. Preserves the existing
+    /// `var` partition; use `vm reset-var` to wipe state.
+    Update {
+        /// Channel name (default: `~/.avocado/config.yaml [vm].channel`,
+        /// or `stable` if unset).
+        #[arg(long)]
+        channel: Option<String>,
+        /// Print availability + exit without downloading.
+        #[arg(long)]
+        check: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Output format (human prose or single JSON object).
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
 }
 

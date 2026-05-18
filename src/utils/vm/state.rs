@@ -41,6 +41,19 @@ impl VmPaths {
     pub fn manifest(&self) -> PathBuf {
         self.root.join("manifest.json")
     }
+    /// Managed install directory — where `avocado vm update` writes
+    /// downloaded artifacts. Distinct from a developer-supplied
+    /// `--vm-source` (which the CLI never modifies).
+    pub fn install_dir(&self) -> PathBuf {
+        self.root.join("install")
+    }
+    /// Manifest for the managed install (separate from
+    /// [`Self::manifest`], which is the copy used by the most recent
+    /// `vm start` regardless of whether it came from a dev artifact
+    /// dir or the managed install).
+    pub fn install_manifest(&self) -> PathBuf {
+        self.install_dir().join("manifest.json")
+    }
     /// Reserved for future artifact caching under ~/.avocado/vm/.
     #[allow(dead_code)]
     pub fn rootfs(&self) -> PathBuf {
