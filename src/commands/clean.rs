@@ -122,13 +122,15 @@ impl CleanCommand {
             anyhow::bail!("Directory '{}' does not exist", directory_path.display());
         }
 
-        // Clean docker volume if requested
+        // Clean docker volume if requested. The `.avocado-state` file
+        // is the only thing pinning the docker volume name, so we
+        // pair its removal with volume removal — `--skip-volumes`
+        // means "leave both alone" so unlock-/stamps-only invocations
+        // don't orphan the volume by deleting its name reference.
         if self.volumes {
             self.clean_volume(&directory_path).await?;
+            self.clean_state_file(&directory_path)?;
         }
-
-        // Clean state file
-        self.clean_state_file(&directory_path)?;
 
         // Clean stamp files if requested
         if self.stamps {
@@ -361,18 +363,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clean_state_file() {
+    async fn test_clean_volumes_path_skips_when_no_state_file() {
+        // With volumes enabled but no .avocado-state present, both
+        // the volume cleanup and the paired state-file removal must
+        // be silent no-ops (no docker required).
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
 
-        // Create a .avocado-state file
-        let state_file = temp_path.join(".avocado-state");
-        fs::write(&state_file, "test state").unwrap();
+        let clean_cmd = CleanCommand::new(
+            Some(temp_path.to_str().unwrap().to_string()),
+            true,
+            None,
+            false,
+        );
+        let result = clean_cmd.execute().await;
 
-        // Verify it exists before cleaning
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_clean_skip_volumes_keeps_state_file() {
+        // `--skip-volumes` means "leave both the volume and its
+        // state-file pointer alone" — stamps-/unlock-only invocations
+        // shouldn't orphan the docker volume.
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let state_file = temp_path.join(".avocado-state");
+        fs::write(&state_file, "{}").unwrap();
         assert!(state_file.exists());
 
-        // Execute clean command
         let clean_cmd = CleanCommand::new(
             Some(temp_path.to_str().unwrap().to_string()),
             false,
@@ -382,6 +402,6 @@ mod tests {
         let result = clean_cmd.execute().await;
 
         assert!(result.is_ok());
-        assert!(!state_file.exists());
+        assert!(state_file.exists());
     }
 }
