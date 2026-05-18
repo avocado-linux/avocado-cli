@@ -6,6 +6,7 @@
 
 pub mod logs;
 pub mod rebuild;
+pub mod reset;
 pub mod shell;
 pub mod start;
 pub mod status;

@@ -2909,6 +2909,11 @@ async fn main() -> Result<()> {
                 .execute()
                 .await
             }
+            VmCommands::Reset { yes } => {
+                commands::vm::reset::ResetCommand { assume_yes: yes }
+                    .execute()
+                    .await
+            }
         },
         Commands::Hitl { command } => match command {
             HitlCommands::Server {
@@ -4135,9 +4140,18 @@ enum VmCommands {
         #[arg(long)]
         reset_data: bool,
     },
+    /// Wipe the persistent `var.btrfs` and re-seed from the installed
+    /// var artifact. Use this when you want a clean /var (Docker
+    /// volumes, container caches, project work in /data, etc.).
+    /// Doesn't change the VM image version — see `vm update` for that.
+    Reset {
+        /// Skip the interactive confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Check for and apply VM image updates from the release channel.
     /// Stops + restarts the VM if it was running. Preserves the existing
-    /// `var` partition; use `vm reset-var` to wipe state.
+    /// `var` partition; use `vm reset` to wipe state.
     Update {
         /// Channel name (default: `~/.avocado/config.yaml [vm].channel`,
         /// or `stable` if unset).
