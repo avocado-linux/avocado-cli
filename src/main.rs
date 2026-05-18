@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -300,6 +300,15 @@ enum Commands {
         /// Controls what version to upgrade to. If not specified, the latest version will be used.
         #[arg(long)]
         version: Option<String>,
+    },
+    /// Generate a shell completion script.
+    ///
+    /// Example: `avocado completion bash > /etc/bash_completion.d/avocado`
+    /// (or for zsh, write to a file named `_avocado` on your `$fpath`).
+    Completion {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Build all components (SDK compile, extensions, and runtime images)
     Build {
@@ -1776,8 +1785,11 @@ async fn main() -> Result<()> {
         std::env::set_var("AVOCADO_NO_TUI", "1");
     }
 
-    let is_upgrade = matches!(cli.command, Commands::Upgrade { .. });
-    let update_handle = if !is_upgrade {
+    let skip_update_check = matches!(
+        cli.command,
+        Commands::Upgrade { .. } | Commands::Completion { .. }
+    );
+    let update_handle = if !skip_update_check {
         Some(tokio::spawn(utils::update_check::check_for_update()))
     } else {
         None
@@ -2029,6 +2041,11 @@ async fn main() -> Result<()> {
         Commands::Upgrade { version } => {
             let cmd = UpgradeCommand { version };
             cmd.run().await?;
+            Ok(())
+        }
+        Commands::Completion { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "avocado", &mut std::io::stdout());
             Ok(())
         }
         Commands::Provision {
