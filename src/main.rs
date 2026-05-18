@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 mod commands;
+mod completion;
 mod utils;
 
 use utils::config::Config;
@@ -301,10 +302,18 @@ enum Commands {
         #[arg(long)]
         version: Option<String>,
     },
-    /// Generate a shell completion script.
+    /// Generate a shell completion registration script.
     ///
-    /// Example: `avocado completion bash > /etc/bash_completion.d/avocado`
-    /// (or for zsh, write to a file named `_avocado` on your `$fpath`).
+    /// The output is a small wrapper that, when sourced, makes the shell
+    /// call `avocado` itself for each TAB press. That round-trip lets
+    /// completions stay live for values that depend on the local
+    /// `avocado.yaml` (extension/runtime/target names) and the user's
+    /// signing-key registry.
+    ///
+    /// Install:
+    ///   bash: `avocado completion bash > /etc/bash_completion.d/avocado`
+    ///         (or add `source <(avocado completion bash)` to ~/.bashrc)
+    ///   zsh:  add `source <(avocado completion zsh)` to ~/.zshrc
     Completion {
         /// Shell to generate completions for
         #[arg(value_enum)]
@@ -762,7 +771,7 @@ enum ConnectKeysCommands {
         #[arg(long = "type")]
         key_type: String,
         /// Name of the local signing key (from 'avocado signing-keys list')
-        #[arg(long)]
+        #[arg(long, add = clap_complete::engine::ArgValueCompleter::new(completion::signing_keys))]
         key: String,
         /// Organization ID (or set connect.org in avocado.yaml)
         #[arg(long)]
@@ -1267,6 +1276,7 @@ enum SigningKeysCommands {
     /// Remove a signing key
     Remove {
         /// Name or key ID of the key to remove
+        #[arg(add = clap_complete::engine::ArgValueCompleter::new(completion::signing_keys))]
         name: String,
         /// Delete hardware key from device (requires confirmation)
         #[arg(long)]
@@ -1755,6 +1765,35 @@ fn build_env_vars(
 /// non-Linux hosts). Conservative allowlist: only commands that we know
 /// shell out to docker are included. `Init` doesn't. `Vm` operates on the
 /// VM itself. `Upgrade`/`Save`/`Load` etc. don't touch docker.
+/// Walk the clap command tree and attach dynamic completers to args by id.
+///
+/// We match on the field name (which is the arg id for clap-derive), so
+/// every `extension: Option<String>` field in every subcommand automatically
+/// gets the same completer with no per-site `#[arg(add = ...)]` attribute.
+/// Args whose id is something else (`name`, `key`, etc.) need explicit wiring
+/// at the call site — done where it's worth doing.
+fn attach_completers(mut cmd: clap::Command) -> clap::Command {
+    use clap_complete::engine::ArgValueCompleter;
+    cmd = cmd.mut_args(|a| match a.get_id().as_str() {
+        "extension" => a.add(ArgValueCompleter::new(completion::extensions)),
+        "runtime" => a.add(ArgValueCompleter::new(completion::runtimes)),
+        "target" => a.add(ArgValueCompleter::new(completion::targets)),
+        _ => a,
+    });
+    let subcommand_names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    for name in subcommand_names {
+        cmd = cmd.mut_subcommand(name, attach_completers);
+    }
+    cmd
+}
+
+fn cli_command_with_completers() -> clap::Command {
+    attach_completers(Cli::command())
+}
+
 fn needs_vm_routing(cmd: &Commands) -> bool {
     matches!(
         cmd,
@@ -1778,6 +1817,13 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Intercept tab-completion requests before any other work. The
+    // `COMPLETE` env var is set by the wrapper script that
+    // `avocado completion <shell>` installs; when present, this call
+    // writes candidates to stdout and exits. When absent, it returns
+    // immediately and we fall through to normal CLI dispatch.
+    clap_complete::CompleteEnv::with_factory(cli_command_with_completers).complete();
+
     let cli = Cli::parse();
 
     // Set AVOCADO_NO_TUI env var so all should_use_tui() calls respect --no-tui
@@ -2044,8 +2090,26 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Completion { shell } => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "avocado", &mut std::io::stdout());
+            // Emit the thin registration wrapper for the requested shell.
+            // The wrapper re-invokes `avocado` with `COMPLETE=<shell>` on every
+            // TAB press; the call at the top of main() intercepts and serves
+            // candidates. This keeps the installed shell script tiny and lets
+            // dynamic completers stay live without a regeneration step.
+            use clap_complete::env::Shells;
+            let shell_name = shell.to_string();
+            let shells = Shells::builtins();
+            let Some(completer) = shells.completer(&shell_name) else {
+                anyhow::bail!("unsupported shell: {shell_name}");
+            };
+            completer
+                .write_registration(
+                    "COMPLETE",
+                    "avocado",
+                    "avocado",
+                    "avocado",
+                    &mut std::io::stdout(),
+                )
+                .context("failed to write completion registration")?;
             Ok(())
         }
         Commands::Provision {
