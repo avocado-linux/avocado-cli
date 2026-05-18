@@ -15,8 +15,8 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serde_json::json;
-use std::collections::BTreeMap;
+use serde_json::{json, Value as JsonValue};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tokio::process::Command as AsyncCommand;
 
@@ -128,14 +128,25 @@ impl ProfilesListCommand {
         }
 
         if self.output.is_json() {
+            // The provision section is the source of truth for both
+            // env blocks and field metadata. We resolve each profile's
+            // enabled fields by walking the env blocks it references
+            // and pulling the matching entries from `provision.fields`.
+            let provision = manifest.provision.as_ref();
             emit_json_object(&json!({
                 "available": true,
                 "target": target,
                 "default": default,
-                "profiles": profiles.iter().map(|(name, p)| json!({
-                    "name": name,
-                    "script": p.script,
-                })).collect::<Vec<_>>(),
+                "profiles": profiles.iter().map(|(name, p)| {
+                    let fields = provision
+                        .map(|prov| resolve_profile_fields(prov, p))
+                        .unwrap_or_default();
+                    json!({
+                        "name": name,
+                        "script": p.script,
+                        "fields": fields,
+                    })
+                }).collect::<Vec<_>>(),
             }));
         } else {
             println!("Target: {target}");
@@ -253,9 +264,202 @@ struct RuntimeSection {
 #[derive(Debug, Deserialize)]
 struct ProvisionSection {
     profiles: BTreeMap<String, ProfileEntry>,
+    /// Named env blocks. Values may contain `${VAR}` placeholders that
+    /// reference entries in `fields`. Profiles select which blocks to
+    /// activate via their own `envs` list.
+    #[serde(default)]
+    envs: BTreeMap<String, BTreeMap<String, String>>,
+    /// Field metadata describing the variables that may appear in the
+    /// env blocks above. Keyed by variable name (matches `${VAR}`).
+    #[serde(default)]
+    fields: BTreeMap<String, ProvisionField>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProfileEntry {
     script: Option<String>,
+    /// Names of env blocks (from `provision.envs`) this profile
+    /// enables. Inline blocks aren't surfaced for form rendering —
+    /// they have no field metadata to drive UI.
+    #[serde(default)]
+    envs: Vec<JsonValue>,
+}
+
+/// Mirrors the stone manifest's `provision.fields.<name>` entries.
+/// `default` is intentionally `JsonValue` so the type-specific shape
+/// (bool / string / number) round-trips to the desktop without us
+/// re-encoding it.
+#[derive(Debug, Deserialize)]
+struct ProvisionField {
+    #[serde(rename = "type")]
+    field_type: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    default: Option<JsonValue>,
+}
+
+/// Walk a profile's env-block references and return the field
+/// metadata for every `${VAR}` placeholder it resolves to. Inline env
+/// blocks (objects directly in the profile's `envs` list rather than
+/// named string references) are intentionally ignored — they don't
+/// participate in the form-rendering flow because they have no
+/// declared field metadata.
+///
+/// The returned list is stable: fields appear in the order they're
+/// first encountered while walking the named env blocks, with
+/// duplicates suppressed.
+fn resolve_profile_fields(prov: &ProvisionSection, profile: &ProfileEntry) -> Vec<JsonValue> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<JsonValue> = Vec::new();
+
+    for env_ref in &profile.envs {
+        let JsonValue::String(block_name) = env_ref else {
+            continue;
+        };
+        let Some(block) = prov.envs.get(block_name) else {
+            continue;
+        };
+        for value in block.values() {
+            for var in extract_placeholders(value) {
+                if !seen.insert(var.clone()) {
+                    continue;
+                }
+                if let Some(field) = prov.fields.get(&var) {
+                    out.push(json!({
+                        "name": var,
+                        "type": field.field_type,
+                        "label": field.label,
+                        "description": field.description,
+                        "required": field.required,
+                        "default": field.default,
+                    }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract `${VAR}` placeholders from a string. Supports multiple
+/// placeholders per value; ignores `$VAR` (no braces) and `$$` escapes
+/// since the manifest convention is to always use `${...}`.
+fn extract_placeholders(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'{' {
+            if let Some(end) = s[i + 2..].find('}') {
+                let var = &s[i + 2..i + 2 + end];
+                if !var.is_empty() {
+                    out.push(var.to_string());
+                }
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_placeholders() {
+        assert_eq!(extract_placeholders("${FOO}"), vec!["FOO"]);
+        assert_eq!(extract_placeholders("${A}/${B}"), vec!["A", "B"]);
+        assert_eq!(extract_placeholders("plain"), Vec::<String>::new());
+        assert_eq!(extract_placeholders("$FOO"), Vec::<String>::new());
+        assert_eq!(extract_placeholders("${}"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn resolves_profile_fields_via_named_env_block() {
+        let raw = r#"{
+            "profiles": {
+                "tegraflash": { "script": "x.sh", "envs": ["flash_options"] }
+            },
+            "envs": {
+                "flash_options": {
+                    "ERASE_NVME": "${ERASE_NVME}",
+                    "BOARDCTL_TARGET": "${BOARDCTL_TARGET}"
+                }
+            },
+            "fields": {
+                "ERASE_NVME": { "type": "boolean", "label": "Erase NVMe", "default": false },
+                "BOARDCTL_TARGET": { "type": "string", "required": true }
+            }
+        }"#;
+        let prov: ProvisionSection = serde_json::from_str(raw).unwrap();
+        let profile = prov.profiles.get("tegraflash").unwrap();
+        let fields = resolve_profile_fields(&prov, profile);
+        assert_eq!(fields.len(), 2);
+        let names: Vec<_> = fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"ERASE_NVME"));
+        assert!(names.contains(&"BOARDCTL_TARGET"));
+    }
+
+    #[test]
+    fn resolves_jetson_flash_options_with_full_field_metadata() {
+        // Matches the shape we'll see from a real Jetson stone manifest:
+        // one named env block referencing five fields, mixed bool/string,
+        // mixed required/default. The resolved list should round-trip
+        // every field's metadata and serialize stable JSON the desktop
+        // can decode without further parsing.
+        let raw = r#"{
+            "profiles": {
+                "tegraflash": {"script":"x.sh","envs":["flash_options"]}
+            },
+            "envs": {
+                "flash_options": {
+                    "ERASE_NVME": "${ERASE_NVME}",
+                    "ERASE_EMMC": "${ERASE_EMMC}",
+                    "ERASE_ONLY": "${ERASE_ONLY}",
+                    "BOARDCTL_TARGET": "${BOARDCTL_TARGET}",
+                    "BOARDCTL_SERIAL": "${BOARDCTL_SERIAL}"
+                }
+            },
+            "fields": {
+                "ERASE_NVME": {"type":"boolean","label":"Erase NVMe","required":false,"default":false},
+                "ERASE_EMMC": {"type":"boolean","label":"Erase eMMC","required":false,"default":false},
+                "ERASE_ONLY": {"type":"boolean","label":"Erase only","required":false,"default":false},
+                "BOARDCTL_TARGET": {"type":"string","label":"boardctl target","required":false},
+                "BOARDCTL_SERIAL": {"type":"string","label":"boardctl serial","required":false}
+            }
+        }"#;
+        let prov: ProvisionSection = serde_json::from_str(raw).unwrap();
+        let profile = prov.profiles.get("tegraflash").unwrap();
+        let fields = resolve_profile_fields(&prov, profile);
+        assert_eq!(fields.len(), 5);
+        let by_name: std::collections::BTreeMap<&str, &JsonValue> = fields
+            .iter()
+            .map(|f| (f["name"].as_str().unwrap(), f))
+            .collect();
+        assert_eq!(by_name["ERASE_NVME"]["type"], "boolean");
+        assert_eq!(by_name["ERASE_NVME"]["default"], false);
+        assert_eq!(by_name["BOARDCTL_TARGET"]["type"], "string");
+        assert_eq!(by_name["BOARDCTL_TARGET"]["default"], JsonValue::Null);
+        assert_eq!(by_name["BOARDCTL_TARGET"]["required"], false);
+    }
+
+    #[test]
+    fn ignores_inline_env_blocks_and_unknown_fields() {
+        let raw = r#"{
+            "profiles": {
+                "noop": { "script": "n.sh" },
+                "weird": { "script": "w.sh", "envs": [{"K": "${UNKNOWN}"}] }
+            }
+        }"#;
+        let prov: ProvisionSection = serde_json::from_str(raw).unwrap();
+        assert!(resolve_profile_fields(&prov, prov.profiles.get("noop").unwrap()).is_empty());
+        assert!(resolve_profile_fields(&prov, prov.profiles.get("weird").unwrap()).is_empty());
+    }
 }
