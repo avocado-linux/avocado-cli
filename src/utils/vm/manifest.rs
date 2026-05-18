@@ -21,6 +21,14 @@ pub struct Manifest {
     /// Always `"avocado-direct"` today.
     pub format: String,
     pub format_version: u32,
+    /// Release version this manifest describes (e.g. `"0.1.0"`). Added
+    /// in the 0.1.0 release contract; absent on pre-release installs.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// ISO-8601 UTC of when this release was built. Display-only.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub released_at: Option<String>,
     pub platform: String,
     pub architecture: String,
     pub artifacts: HashMap<String, Artifact>,
@@ -35,6 +43,31 @@ pub struct Manifest {
     pub qemu_hint: Option<serde_json::Value>,
 }
 
+/// Per-artifact policy for what `avocado vm update` does with this
+/// entry when the local sha doesn't match the remote sha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePolicy {
+    /// Download + atomic-swap on update. Used for kernel, initramfs,
+    /// rootfs — stateless, regenerable from the release artifacts.
+    Replace,
+    /// Install on first run only; skip on subsequent updates so user
+    /// state in the artifact (Docker volumes, container caches, project
+    /// work in /data) survives image bumps. Used for `var`. Refreshed
+    /// only via the explicit `avocado vm reset-var` command.
+    SeedOnly,
+}
+
+impl Default for UpdatePolicy {
+    fn default() -> Self {
+        // Absent field on legacy manifests → treat as replaceable. The
+        // remote (post-0.1.0) manifests always carry the field; this
+        // default only matters for installed manifests written by an
+        // older CLI.
+        Self::Replace
+    }
+}
+
 /// One staged artifact: `kernel`, `initramfs`, `rootfs`, `var`, etc.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artifact {
@@ -42,6 +75,15 @@ pub struct Artifact {
     pub file: String,
     /// sha256 of the file (lowercase hex).
     pub sha256: String,
+    /// File size in bytes. Added in the 0.1.0 release contract for
+    /// display + progress-bar use; absent on pre-release installs.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub size: Option<u64>,
+    /// Per-artifact update policy. See [`UpdatePolicy`]. Defaults to
+    /// `Replace` if absent (legacy manifests).
+    #[serde(default)]
+    pub update_policy: UpdatePolicy,
     /// Kind hint — `kernel`, `initramfs-cpio-zst`, `erofs-lz4`, `btrfs`, …
     /// Carried for forward-compat — CLI doesn't dispatch on it yet.
     #[serde(rename = "type")]
