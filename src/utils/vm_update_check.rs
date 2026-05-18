@@ -115,8 +115,8 @@ fn decide(raw: &str, channel: &str, installed_version: Option<&str>) -> Option<U
 }
 
 async fn fetch(channel: &str) -> Result<String> {
-    let base = std::env::var("AVOCADO_VM_CHANNEL_URL_BASE")
-        .unwrap_or_else(|_| DEFAULT_BASE.to_string());
+    let base =
+        std::env::var("AVOCADO_VM_CHANNEL_URL_BASE").unwrap_or_else(|_| DEFAULT_BASE.to_string());
     let url = format!("{}/{}.json", base.trim_end_matches('/'), channel);
     let client = ClientBuilder::new()
         .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))

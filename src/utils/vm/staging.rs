@@ -70,13 +70,8 @@ impl StagingDir {
     pub fn commit(&self, file: &str) -> Result<()> {
         let from = self.slot(file);
         let to = self.install_dir.join(file);
-        fs::rename(&from, &to).with_context(|| {
-            format!(
-                "renaming {} -> {}",
-                from.display(),
-                to.display(),
-            )
-        })?;
+        fs::rename(&from, &to)
+            .with_context(|| format!("renaming {} -> {}", from.display(), to.display(),))?;
         Ok(())
     }
 
@@ -93,8 +88,11 @@ impl StagingDir {
     /// auto-restart the VM. Survives a crash mid-update so a retry
     /// preserves the intent.
     pub fn record_was_running(&self, was_running: bool) -> Result<()> {
-        fs::write(self.root.join(".was-running"), if was_running { "1" } else { "0" })
-            .context("writing .was-running marker")
+        fs::write(
+            self.root.join(".was-running"),
+            if was_running { "1" } else { "0" },
+        )
+        .context("writing .was-running marker")
     }
 
     /// Read the marker. `false` if the file is missing. Consumed by a
@@ -147,7 +145,10 @@ mod tests {
 
         let after = fs::read_to_string(install.join("Image")).unwrap();
         assert_eq!(after, "new-bytes");
-        assert!(!stage.slot("Image").exists(), "staged file should be moved, not copied");
+        assert!(
+            !stage.slot("Image").exists(),
+            "staged file should be moved, not copied"
+        );
     }
 
     #[test]
@@ -156,8 +157,18 @@ mod tests {
         let stage = StagingDir::create(tmp.path(), "0.2.0").unwrap();
         fs::write(stage.slot("blob"), b"hello").unwrap();
         // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-        assert!(stage.verify_sha256("blob", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824").is_ok());
-        assert!(stage.verify_sha256("blob", "0000000000000000000000000000000000000000000000000000000000000000").is_err());
+        assert!(stage
+            .verify_sha256(
+                "blob",
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            )
+            .is_ok());
+        assert!(stage
+            .verify_sha256(
+                "blob",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err());
     }
 
     #[test]

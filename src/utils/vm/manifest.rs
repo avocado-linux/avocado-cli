@@ -45,27 +45,22 @@ pub struct Manifest {
 
 /// Per-artifact policy for what `avocado vm update` does with this
 /// entry when the local sha doesn't match the remote sha.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdatePolicy {
     /// Download + atomic-swap on update. Used for kernel, initramfs,
     /// rootfs — stateless, regenerable from the release artifacts.
+    ///
+    /// Default for absent field: legacy manifests written before the
+    /// 0.1.0 contract land here. Post-0.1.0 manifests always carry the
+    /// field explicitly.
+    #[default]
     Replace,
     /// Install on first run only; skip on subsequent updates so user
     /// state in the artifact (Docker volumes, container caches, project
     /// work in /data) survives image bumps. Used for `var`. Refreshed
-    /// only via the explicit `avocado vm reset-var` command.
+    /// only via the explicit `avocado vm reset` command.
     SeedOnly,
-}
-
-impl Default for UpdatePolicy {
-    fn default() -> Self {
-        // Absent field on legacy manifests → treat as replaceable. The
-        // remote (post-0.1.0) manifests always carry the field; this
-        // default only matters for installed manifests written by an
-        // older CLI.
-        Self::Replace
-    }
 }
 
 /// One staged artifact: `kernel`, `initramfs`, `rootfs`, `var`, etc.
