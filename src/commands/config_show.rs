@@ -74,6 +74,16 @@ impl ConfigShowCommand {
             })
             .unwrap_or_default();
 
+        // Connect mirror info — the desktop "Delete project" flow uses
+        // this to decide whether to offer "also delete from Avocado
+        // Connect" and what IDs to pass to `connect projects delete`.
+        let connect = cfg.connect.as_ref().map(|c| {
+            json!({
+                "org": c.org,
+                "project": c.project,
+            })
+        });
+
         let payload = json!({
             "config_path": self.config_path,
             "distro": distro,
@@ -84,6 +94,7 @@ impl ConfigShowCommand {
             "src_dir": cfg.src_dir,
             "runtimes": runtimes,
             "provision_profiles": provision_profiles,
+            "connect": connect,
         });
 
         if self.output.is_json() {
@@ -142,6 +153,17 @@ fn print_human_summary(payload: &serde_json::Value) {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
             println!("  provision_profiles: [{}]", names.join(", "));
+        }
+    }
+    if let Some(c) = payload["connect"].as_object() {
+        let org = c.get("org").and_then(|v| v.as_str());
+        let project = c.get("project").and_then(|v| v.as_str());
+        if org.is_some() || project.is_some() {
+            println!(
+                "  connect: org={} project={}",
+                org.unwrap_or("-"),
+                project.unwrap_or("-"),
+            );
         }
     }
 }

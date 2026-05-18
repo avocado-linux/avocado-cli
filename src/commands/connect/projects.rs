@@ -1,9 +1,11 @@
 use anyhow::Result;
+use serde_json::json;
 
 use crate::commands::connect::client::{
     self, ConnectClient, CreateProjectParams, CreateProjectRequest,
 };
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::output_format::{emit_json_object, OutputFormat};
 
 pub struct ConnectProjectsListCommand {
     pub org: String,
@@ -48,6 +50,7 @@ pub struct ConnectProjectsCreateCommand {
     pub name: String,
     pub description: Option<String>,
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectProjectsCreateCommand {
@@ -66,10 +69,21 @@ impl ConnectProjectsCreateCommand {
 
         let project = client.create_project(&self.org, &req).await?;
 
-        print_success(
-            &format!("Created project '{}' (id: {})", project.name, project.id),
-            OutputLevel::Normal,
-        );
+        if self.output.is_json() {
+            // Single-shot JSON object — the desktop captures the new
+            // project ID here to persist a {org, project} linkage in
+            // its own per-project state file (no avocado.yaml writes).
+            emit_json_object(&json!({
+                "org": self.org,
+                "id": project.id,
+                "name": project.name,
+            }));
+        } else {
+            print_success(
+                &format!("Created project '{}' (id: {})", project.name, project.id),
+                OutputLevel::Normal,
+            );
+        }
 
         Ok(())
     }

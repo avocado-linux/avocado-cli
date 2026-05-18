@@ -851,6 +851,9 @@ enum ConnectProjectsCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format (human prose or single JSON object)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Delete a project
     Delete {
@@ -3159,6 +3162,7 @@ async fn main() -> Result<()> {
                     description,
                     config,
                     profile,
+                    output,
                 } => {
                     let resolved_org = commands::connect::resolve_org(org, &config)?;
                     let cmd = ConnectProjectsCreateCommand {
@@ -3166,6 +3170,7 @@ async fn main() -> Result<()> {
                         name,
                         description,
                         profile,
+                        output,
                     };
                     cmd.execute().await?;
                     Ok(())
