@@ -1,53 +1,17 @@
 use std::collections::HashMap;
-use std::io::Write;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::ValueEnum;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::commands::connect::client::{self, ConnectClient, ConnectConfig, Profile, ProfileUser};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::output_format::{emit_json_event, emit_json_object};
 
-/// Output format selector. Used by the three `connect auth` subcommands.
-/// Human is the default and matches the prose output users have today;
-/// Json switches each command to machine-readable output (single JSON
-/// object for status/logout, NDJSON for the interactive login flow).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "lowercase")]
-pub enum OutputFormat {
-    #[default]
-    Human,
-    Json,
-}
-
-impl OutputFormat {
-    pub fn is_json(self) -> bool {
-        matches!(self, OutputFormat::Json)
-    }
-}
-
-/// Print one JSON value followed by a newline and flush stdout. Used for
-/// NDJSON event emission during the interactive login flow so consumers
-/// can react line-by-line. Flush is important because stdout is
-/// line-buffered when attached to a TTY but block-buffered when piped to
-/// another process — and the macOS app pipes us.
-fn emit_json_event(value: &serde_json::Value) {
-    let line = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{line}");
-    let _ = stdout.flush();
-}
-
-/// Print one JSON object as the entire stdout output of a single-shot
-/// command (status, logout). Same flush semantics as `emit_json_event`.
-fn emit_json_object(value: &serde_json::Value) {
-    let line = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{line}");
-    let _ = stdout.flush();
-}
+/// Re-export so existing main.rs `use commands::connect::auth::OutputFormat` keeps working.
+/// New code should prefer `crate::utils::output_format::OutputFormat` directly.
+pub use crate::utils::output_format::OutputFormat;
 
 pub struct ConnectAuthLoginCommand {
     pub url: String,
@@ -201,7 +165,9 @@ impl ConnectAuthLoginCommand {
         };
         let temp_client = ConnectClient::from_profile(&temp_profile)?;
         let (final_token, organization_id) = match temp_client.get_me_full().await {
-            Ok(me) => provision_org_token(&temp_client, &me, token, &token_name, self.output).await?,
+            Ok(me) => {
+                provision_org_token(&temp_client, &me, token, &token_name, self.output).await?
+            }
             Err(e) => {
                 if self.output.is_json() {
                     emit_json_event(&serde_json::json!({
@@ -210,7 +176,9 @@ impl ConnectAuthLoginCommand {
                     }));
                 } else {
                     print_info(
-                        &format!("Warning: could not fetch org info ({e}); saving unscoped profile."),
+                        &format!(
+                            "Warning: could not fetch org info ({e}); saving unscoped profile."
+                        ),
                         OutputLevel::Normal,
                     );
                 }
