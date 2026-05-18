@@ -386,6 +386,12 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// List the provisioning profiles available for the resolved
+        /// target instead of provisioning. Reads the stone manifest
+        /// from the installed SDK volume; requires `avocado install`
+        /// to have run.
+        #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile"])]
+        list: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -2034,8 +2040,23 @@ async fn main() -> Result<()> {
             out,
             container_args,
             dnf_args,
+            list,
             output,
         } => {
+            // `--list` short-circuits the run: instead of provisioning,
+            // we read the stone manifest out of the installed SDK
+            // volume and return the profiles available for the
+            // resolved target. Same `--config` / `--target` /
+            // `--output` flags so callers stay uniform.
+            if list {
+                let cmd = crate::commands::profiles::ProfilesListCommand {
+                    config_path: config,
+                    target: target.or(cli.target.clone()),
+                    output,
+                };
+                cmd.execute().await?;
+                return Ok(());
+            }
             let _json_guard = run_with_json_lifecycle(
                 output,
                 "provision",

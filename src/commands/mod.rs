@@ -10,6 +10,7 @@ pub mod initramfs;
 pub mod install;
 pub mod kernel;
 pub mod load;
+pub mod profiles;
 pub mod provision;
 pub mod prune;
 pub mod rootfs;
