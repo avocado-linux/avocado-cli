@@ -85,15 +85,10 @@ impl ResetCommand {
         // doesn't leave a half-written file mistaken for valid state.
         let dest = paths.var_disk();
         if dest.exists() {
-            std::fs::remove_file(&dest)
-                .with_context(|| format!("removing {}", dest.display()))?;
+            std::fs::remove_file(&dest).with_context(|| format!("removing {}", dest.display()))?;
         }
         std::fs::copy(&var_src, &dest).with_context(|| {
-            format!(
-                "copying seed {} -> {}",
-                var_src.display(),
-                dest.display(),
-            )
+            format!("copying seed {} -> {}", var_src.display(), dest.display(),)
         })?;
 
         println!(

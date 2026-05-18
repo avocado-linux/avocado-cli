@@ -59,8 +59,8 @@ impl UserConfig {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Self = serde_yaml::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let cfg: Self =
+            serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
     }
 

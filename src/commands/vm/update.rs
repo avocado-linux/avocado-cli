@@ -61,10 +61,7 @@ impl UpdateCommand {
         // freshly-bootstrapped host (no manifest yet) are valid states.
         let installed_manifest_path = paths.install_manifest();
         let installed = if installed_manifest_path.exists() {
-            Some(
-                Manifest::load(&installed_manifest_path)
-                    .context("reading installed manifest")?,
-            )
+            Some(Manifest::load(&installed_manifest_path).context("reading installed manifest")?)
         } else {
             None
         };
@@ -84,7 +81,11 @@ impl UpdateCommand {
         };
 
         if self.check_only {
-            return print_update_available(&avail.pointer, installed_version.as_deref(), self.output);
+            return print_update_available(
+                &avail.pointer,
+                installed_version.as_deref(),
+                self.output,
+            );
         }
 
         // Decide a target platform — the manifest's `.platform` is the
@@ -93,7 +94,7 @@ impl UpdateCommand {
         let platform = installed
             .as_ref()
             .map(|m| m.platform.clone())
-            .unwrap_or_else(|| default_platform_for_host());
+            .unwrap_or_else(default_platform_for_host);
         let platform_entry = avail.pointer.platform(&platform).ok_or_else(|| {
             anyhow::anyhow!(
                 "channel '{}' does not advertise platform '{}' (available: {})",
@@ -134,9 +135,8 @@ impl UpdateCommand {
         // on a real update they're skipped entirely. `replace`
         // artifacts are pulled whenever the sha differs.
         let install_dir = paths.install_dir();
-        std::fs::create_dir_all(&install_dir).with_context(|| {
-            format!("creating install dir {}", install_dir.display())
-        })?;
+        std::fs::create_dir_all(&install_dir)
+            .with_context(|| format!("creating install dir {}", install_dir.display()))?;
         let downloads = plan_downloads(&new_manifest, installed.as_ref(), &install_dir);
         if downloads.is_empty() {
             println!("avocado vm update: nothing to download (all artifacts already current).");
@@ -158,12 +158,14 @@ impl UpdateCommand {
             println!(
                 "downloading {} ({} bytes)",
                 item.file,
-                item.size.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                item.size
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
             );
             let url = format!(
-                "{}{}",
+                "{}/{}",
                 platform_entry.base_url.trim_end_matches('/'),
-                format!("/{}", item.file)
+                item.file,
             );
             let bytes = http
                 .get(&url)
@@ -195,8 +197,8 @@ impl UpdateCommand {
         // Write the new manifest last — it's the marker that says
         // "this install is complete at this version."
         let manifest_path = install_dir.join("manifest.json");
-        let manifest_bytes = serde_json::to_vec_pretty(
-            &serde_json::from_str::<serde_json::Value>(
+        let manifest_bytes =
+            serde_json::to_vec_pretty(&serde_json::from_str::<serde_json::Value>(
                 &http
                     .get(&platform_entry.manifest_url)
                     .send()
@@ -204,8 +206,7 @@ impl UpdateCommand {
                     .error_for_status()?
                     .text()
                     .await?,
-            )?,
-        )?;
+            )?)?;
         std::fs::write(&manifest_path, &manifest_bytes)
             .with_context(|| format!("writing {}", manifest_path.display()))?;
 
@@ -313,18 +314,16 @@ fn confirm(p: &ChannelPointer, installed: Option<&str>) -> Result<()> {
     use std::io::Write;
     std::io::stdout().flush().ok();
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).context("reading confirmation")?;
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading confirmation")?;
     if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         bail!("aborted by user");
     }
     Ok(())
 }
 
-fn print_up_to_date(
-    installed: Option<&str>,
-    channel: &str,
-    output: OutputFormat,
-) -> Result<()> {
+fn print_up_to_date(installed: Option<&str>, channel: &str, output: OutputFormat) -> Result<()> {
     if output.is_json() {
         crate::utils::output_format::emit_json_object(&json!({
             "channel": channel,
