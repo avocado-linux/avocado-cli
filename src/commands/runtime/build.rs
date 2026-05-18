@@ -706,6 +706,29 @@ impl RuntimeBuildCommand {
             OutputLevel::Normal,
         );
 
+        // Run post_build hook if configured on the runtime. The script path is
+        // relative to /opt/src (the main avocado.yaml's src dir) — runtimes
+        // are only defined in the local config, so there's no remote source
+        // path to consider here.
+        if let Some(post_build) = merged_runtime
+            .as_ref()
+            .and_then(|rt| rt.get("post_build"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            self.run_post_build(
+                &post_build,
+                container_image,
+                target_arch,
+                repo_url,
+                repo_release,
+                merged_container_args,
+                container_helper,
+                runs_on_context,
+            )
+            .await?;
+        }
+
         // Write runtime build stamp (unless --no-stamps)
         if !self.no_stamps {
             let merged_runtime = config
@@ -2625,6 +2648,84 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
                     Extension may not be installed yet. Run 'avocado install' first."
             )),
         }
+    }
+
+    /// Run the runtime's `post_build` script inside the SDK container.
+    ///
+    /// The script path is interpreted relative to `/opt/src` — the mounted
+    /// source dir of the main avocado.yaml. Runtimes are only defined in the
+    /// local config, so there's no remote-extension include path to consider.
+    ///
+    /// The script runs after the runtime image is successfully built and
+    /// before the build stamp is written. The following environment is set:
+    /// - `AVOCADO_RUNTIME_NAME`: the runtime name
+    /// - `AVOCADO_TARGET`: the resolved target machine
+    /// - `AVOCADO_RUNTIME_BUILD_DIR`: `/opt/_avocado/<target>/runtimes/<runtime>` —
+    ///   the runtime build dir the script can inspect or post-process.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_post_build(
+        &self,
+        script_path: &str,
+        container_image: &str,
+        target_arch: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        merged_container_args: &Option<Vec<String>>,
+        container_helper: &SdkContainer,
+        runs_on_context: Option<&RunsOnContext>,
+    ) -> Result<()> {
+        print_info(
+            &format!(
+                "Running post_build script for runtime '{}': {script_path}",
+                self.runtime_name
+            ),
+            OutputLevel::Normal,
+        );
+
+        let runtime_build_dir = format!(
+            "/opt/_avocado/{}/runtimes/{}",
+            target_arch, self.runtime_name
+        );
+
+        let command = format!(
+            r#"if [ -f '{script_path}' ]; then echo 'Running post_build script: {script_path}'; export AVOCADO_RUNTIME_NAME='{runtime_name}'; export AVOCADO_TARGET='{target}'; export AVOCADO_RUNTIME_BUILD_DIR="{runtime_build_dir}"; bash '{script_path}'; else echo 'post_build script {script_path} not found.'; ls -la; exit 1; fi"#,
+            runtime_name = self.runtime_name,
+            target = target_arch,
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target_arch.to_string(),
+            command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            tui_context: self.tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
+            ..Default::default()
+        };
+
+        let success = run_container_command(container_helper, run_config, runs_on_context).await?;
+        if !success {
+            return Err(anyhow::anyhow!(
+                "post_build script '{script_path}' failed for runtime '{}'",
+                self.runtime_name
+            ));
+        }
+
+        print_success(
+            &format!(
+                "Successfully ran post_build script for runtime '{}'",
+                self.runtime_name
+            ),
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 }
 

@@ -969,6 +969,15 @@ pub fn compute_ext_input_hash_with_fs(
                 image.clone(),
             );
         }
+        // Include post_build so adding/removing/changing the hook re-runs the build.
+        // Note: this hashes the *path*, not the script's contents — re-run with
+        // --no-stamps to pick up edits to the script itself.
+        if let Some(post_build) = ext.get("post_build") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.post_build")),
+                post_build.clone(),
+            );
+        }
     }
 
     // Include the resolved filesystem format when provided — determines the image
@@ -1125,6 +1134,16 @@ pub fn compute_runtime_input_hash(
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.var")),
             var.clone(),
+        );
+    }
+
+    // Include post_build so adding/removing/changing the hook re-runs the build.
+    // Note: this hashes the *path*, not the script's contents — re-run with
+    // --no-stamps to pick up edits to the script itself.
+    if let Some(post_build) = merged_runtime.get("post_build") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.post_build")),
+            post_build.clone(),
         );
     }
 

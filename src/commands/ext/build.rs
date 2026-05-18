@@ -573,6 +573,33 @@ impl ExtBuildCommand {
             ExtensionLocation::Local { .. } => "/opt/src".to_string(),
         };
 
+        // Run the post_build hook before sealing any .raw images. By this
+        // point the ext sysroot has been populated by `avocado install` and
+        // any compile-dep install scripts above, so the hook can freely
+        // mutate it (e.g. to bake a generated file into the sysext/confext).
+        // The script path is relative to the extension's source dir:
+        // /opt/src for local extensions, or the merged remote-extension
+        // includes dir for remote ones (same convention as the
+        // compile/install scripts above).
+        if let Some(post_build) = ext_config
+            .get("post_build")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            self.run_post_build(
+                config,
+                &post_build,
+                container_image,
+                &target,
+                &ext_src_path,
+                repo_url.as_ref(),
+                repo_release.as_ref(),
+                &processed_container_args,
+                &effective_tui_context,
+            )
+            .await?;
+        }
+
         // Build extensions based on configuration
         let mut overall_success = true;
 
@@ -1685,6 +1712,88 @@ echo "Set proper permissions on authentication files""#,
 
         script_lines.join("")
     }
+
+    /// Run the extension's `post_build` script inside the SDK container.
+    ///
+    /// `script_path` is interpreted relative to `ext_src_path` (the extension's
+    /// source dir in the container — `/opt/src` for local extensions, or the
+    /// remote-extension includes dir for remote ones), so users author the path
+    /// relative to the avocado config that defines the extension.
+    ///
+    /// The script runs after all extension types are successfully built and
+    /// before the build stamp is written. The following environment is set:
+    /// - `AVOCADO_EXT_NAME`: the extension name
+    /// - `AVOCADO_TARGET`: the resolved target machine
+    /// - `AVOCADO_BUILD_EXT_SYSROOT`: `$AVOCADO_EXT_SYSROOTS/<ext>` — the
+    ///   built sysroot the script can inspect or post-process.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_post_build(
+        &self,
+        config: &Config,
+        script_path: &str,
+        container_image: &str,
+        target: &str,
+        ext_src_path: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        processed_container_args: &Option<Vec<String>>,
+        effective_tui_context: &Option<TuiContext>,
+    ) -> Result<()> {
+        print_info(
+            &format!(
+                "Running post_build script for extension '{}': {script_path}",
+                self.extension
+            ),
+            OutputLevel::Normal,
+        );
+
+        // Use double quotes around the workdir so shell variables like
+        // $AVOCADO_PREFIX (for remote extensions) get expanded.
+        let command = format!(
+            r#"cd "{workdir}" && if [ -f '{script_path}' ]; then echo 'Running post_build script: {script_path}'; export AVOCADO_EXT_NAME='{ext_name}'; export AVOCADO_TARGET='{target}'; export AVOCADO_BUILD_EXT_SYSROOT="$AVOCADO_EXT_SYSROOTS/{ext_name}"; bash '{script_path}'; else echo 'post_build script {script_path} not found.'; ls -la; exit 1; fi"#,
+            workdir = ext_src_path,
+            ext_name = self.extension,
+        );
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: processed_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            runs_on: self.runs_on.clone(),
+            nfs_port: self.nfs_port,
+            tui_context: effective_tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
+            ..Default::default()
+        };
+
+        let container_helper =
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+        let success = container_helper.run_in_container(run_config).await?;
+        if !success {
+            return Err(anyhow::anyhow!(
+                "post_build script '{script_path}' failed for extension '{}'",
+                self.extension
+            ));
+        }
+
+        print_success(
+            &format!(
+                "Successfully ran post_build script for extension '{}'",
+                self.extension
+            ),
+            OutputLevel::Normal,
+        );
+        Ok(())
+    }
+
     /// Handle compile dependencies with install scripts
     ///
     /// `sdk_config_path` is the path to the config file that contains the sdk.compile sections.
