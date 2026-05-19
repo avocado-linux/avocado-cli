@@ -429,8 +429,8 @@ async fn download_artifact(
         None
     };
 
-    let mut file = std::fs::File::create(dest)
-        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut stream = resp.bytes_stream();
     let mut written: u64 = 0;
     let mut last_emit = Instant::now();
