@@ -19,10 +19,13 @@
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
+use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::ClientBuilder;
 use serde_json::json;
+use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::utils::output_format::OutputFormat;
 use crate::utils::user_config::UserConfig;
@@ -115,9 +118,16 @@ impl UpdateCommand {
             confirm(&avail.pointer, installed_version.as_deref())?;
         }
 
-        // Fetch the per-platform manifest for the new version.
+        // HTTP client — `connect_timeout` is bounded so a stalled DNS /
+        // TCP handshake fails fast, but the overall request timeout is
+        // unset because artifact downloads can run several minutes on
+        // slow links (the var.btrfs alone is ~450 MB). A global
+        // `.timeout(Duration::from_secs(30))` is what previously caused
+        // `Error: operation timed out` mid-download on real-world
+        // connections.
         let http = ClientBuilder::new()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
             .build()?;
         let new_manifest: Manifest = serde_json::from_str(
             &http
@@ -154,28 +164,24 @@ impl UpdateCommand {
         let stage = StagingDir::create(&install_dir, &version)?;
         stage.record_was_running(was_running)?;
 
-        for item in &downloads {
-            println!(
-                "downloading {} ({} bytes)",
-                item.file,
-                item.size
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "?".into()),
-            );
+        let json_mode = self.output.is_json();
+        for (idx, item) in downloads.iter().enumerate() {
             let url = format!(
                 "{}/{}",
                 platform_entry.base_url.trim_end_matches('/'),
                 item.file,
             );
-            let bytes = http
-                .get(&url)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
-            std::fs::write(stage.slot(&item.file), &bytes)
-                .with_context(|| format!("writing staged {}", item.file))?;
+            download_artifact(
+                &http,
+                &url,
+                &stage.slot(&item.file),
+                item,
+                idx + 1,
+                downloads.len(),
+                json_mode,
+            )
+            .await
+            .with_context(|| format!("downloading {}", item.file))?;
             stage
                 .verify_sha256(&item.file, &item.sha256)
                 .context("staged artifact sha256 mismatch")?;
@@ -235,6 +241,7 @@ impl UpdateCommand {
                 cmdline_extra: None,
                 workspace: None,
                 var_size: None,
+                dns_override: None,
             };
             crate::utils::vm::lifecycle::start(opts).await?;
         }
@@ -364,6 +371,99 @@ fn print_update_available(
         println!("  source:       {}", DEFAULT_BASE);
         println!();
         println!("Run `avocado vm update` to apply.");
+    }
+    Ok(())
+}
+
+/// Stream-download one artifact to `dest`.
+///
+/// - Writes chunks straight to disk via std::fs::File. Doesn't buffer
+///   the full body in memory — important for the var.btrfs which is
+///   ~450 MB.
+/// - In human mode shows an indicatif progress bar with bytes / total /
+///   rate / ETA.
+/// - In `--output json` mode emits NDJSON progress events throttled to
+///   ~10 Hz so the desktop app can drive a progress bar without being
+///   flooded.
+async fn download_artifact(
+    http: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    item: &PlannedDownload,
+    idx: usize,
+    total_items: usize,
+    json_mode: bool,
+) -> Result<()> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()?;
+    let total_bytes = resp.content_length().or(item.size).unwrap_or(0);
+
+    if !json_mode {
+        println!(
+            "[{idx}/{total_items}] downloading {} ({} bytes)",
+            item.file, total_bytes,
+        );
+    }
+    let pb = if !json_mode {
+        let pb = ProgressBar::new(total_bytes);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  {bar:30.green/black}  {decimal_bytes:>10}/{decimal_total_bytes:<10}  {decimal_bytes_per_sec:>12}  ETA {eta:>5}",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        Some(pb)
+    } else {
+        crate::utils::output_format::emit_json_object(&json!({
+            "event": "download_started",
+            "file": item.file,
+            "size": total_bytes,
+            "index": idx,
+            "total": total_items,
+        }));
+        None
+    };
+
+    let mut file = std::fs::File::create(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut stream = resp.bytes_stream();
+    let mut written: u64 = 0;
+    let mut last_emit = Instant::now();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("reading body of {url}"))?;
+        file.write_all(&chunk)
+            .with_context(|| format!("writing to {}", dest.display()))?;
+        written += chunk.len() as u64;
+        if let Some(pb) = &pb {
+            pb.set_position(written);
+        } else if json_mode && last_emit.elapsed() >= Duration::from_millis(100) {
+            crate::utils::output_format::emit_json_object(&json!({
+                "event": "download_progress",
+                "file": item.file,
+                "bytes": written,
+                "total": total_bytes,
+            }));
+            last_emit = Instant::now();
+        }
+    }
+    file.sync_all().ok();
+    drop(file);
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+    if json_mode {
+        crate::utils::output_format::emit_json_object(&json!({
+            "event": "download_completed",
+            "file": item.file,
+            "bytes": written,
+            "index": idx,
+            "total": total_items,
+        }));
     }
     Ok(())
 }
