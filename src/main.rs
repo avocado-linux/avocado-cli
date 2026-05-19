@@ -2938,6 +2938,7 @@ async fn main() -> Result<()> {
                 cmdline_extra,
                 workspace,
                 var_size,
+                dns,
                 watch,
                 foreground,
             } => {
@@ -2949,6 +2950,7 @@ async fn main() -> Result<()> {
                     cmdline_extra,
                     workspace,
                     var_size,
+                    dns,
                     watch,
                     foreground,
                 };
@@ -2995,6 +2997,28 @@ async fn main() -> Result<()> {
                     .execute()
                     .await
             }
+            VmCommands::Config { command } => match command {
+                VmConfigCommands::Get { key, output } => {
+                    commands::vm::config::ConfigGetCommand { key, output }
+                        .execute()
+                        .await
+                }
+                VmConfigCommands::Set { key, values } => {
+                    commands::vm::config::ConfigSetCommand { key, values }
+                        .execute()
+                        .await
+                }
+                VmConfigCommands::Unset { key } => {
+                    commands::vm::config::ConfigUnsetCommand { key }
+                        .execute()
+                        .await
+                }
+                VmConfigCommands::List { output } => {
+                    commands::vm::config::ConfigListCommand { output }
+                        .execute()
+                        .await
+                }
+            },
         },
         Commands::Hitl { command } => match command {
             HitlCommands::Server {
@@ -4160,7 +4184,9 @@ enum VmCommands {
     /// Boot the avocado-vm (no-op if already running).
     Start {
         /// Directory containing `direct` profile output (manifest.json + artifacts).
-        /// Falls back to $AVOCADO_VM_DIR if unset.
+        /// Resolution order when unset: $AVOCADO_VM_DIR → ~/.avocado/vm/install/
+        /// (populated by `avocado vm update`) → last `vm start`/`vm rebuild`
+        /// dir → error.
         #[arg(long)]
         vm_source: Option<std::path::PathBuf>,
         /// Memory in MiB.
@@ -4186,6 +4212,12 @@ enum VmCommands {
         /// Default 50G — comfortable for SDK image + several container images.
         #[arg(long)]
         var_size: Option<String>,
+        /// One-shot DNS override applied to this start only. Repeatable —
+        /// `--dns 1.1.1.1 --dns 8.8.8.8` sets both. Wins over any value
+        /// persisted via `vm config set network.dns`; the persisted value
+        /// is unchanged. Useful when a VPN's slirp DNS proxy is broken.
+        #[arg(long = "dns")]
+        dns: Vec<String>,
         /// Tail the serial log live while waiting for boot-sync. On failure,
         /// the tail of the log is printed automatically even without this flag.
         #[arg(short = 'w', long)]
@@ -4230,6 +4262,13 @@ enum VmCommands {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Read/write persistent VM configuration at `~/.avocado/vm/config.yaml`.
+    /// Same file the Avocado.app settings UI edits — every knob shipped in
+    /// the desktop is reachable here.
+    Config {
+        #[command(subcommand)]
+        command: VmConfigCommands,
+    },
     /// Check for and apply VM image updates from the release channel.
     /// Stops + restarts the VM if it was running. Preserves the existing
     /// `var` partition; use `vm reset` to wipe state.
@@ -4245,6 +4284,40 @@ enum VmCommands {
         #[arg(short = 'y', long)]
         yes: bool,
         /// Output format (human prose or single JSON object).
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum VmConfigCommands {
+    /// Print the value of a dotted key (e.g. `network.dns`). Silent on
+    /// missing keys; use `--output json` to disambiguate missing vs empty.
+    Get {
+        /// Dotted key path, e.g. `network.dns` or `network.dns_search`.
+        key: String,
+        /// Output format (human plain text or JSON `{key, value}`).
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
+    },
+    /// Set a dotted key. Multiple values become a list (e.g.
+    /// `vm config set network.dns 1.1.1.1 8.8.8.8`).
+    Set {
+        /// Dotted key path.
+        key: String,
+        /// One or more values. A single value is stored as a scalar; two
+        /// or more are stored as a list. Use `vm config unset` to remove.
+        #[arg(required = true, num_args = 1..)]
+        values: Vec<String>,
+    },
+    /// Remove a dotted key. No-op if it doesn't exist.
+    Unset {
+        /// Dotted key path.
+        key: String,
+    },
+    /// Print the entire config (YAML by default, JSON with `--output json`).
+    /// The same JSON shape is what avocado-desktop reads to render its UI.
+    List {
         #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
         output: crate::utils::output_format::OutputFormat,
     },

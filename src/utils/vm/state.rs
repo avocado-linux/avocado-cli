@@ -54,6 +54,37 @@ impl VmPaths {
     pub fn install_manifest(&self) -> PathBuf {
         self.install_dir().join("manifest.json")
     }
+
+    /// Default artifact directory to boot from when the user didn't
+    /// pass `--vm-source` and `AVOCADO_VM_DIR` is unset. Layered:
+    ///
+    ///   1. [`install_dir`] if it has a manifest (i.e. the user ran
+    ///      `avocado vm update` — the common path for end-users).
+    ///   2. The `artifact-dir` pointer file written by previous
+    ///      `vm start` / `vm rebuild` runs, if it still points at
+    ///      an extant directory with a manifest (dev workflow).
+    ///   3. `None` — the caller surfaces an error pointing the user
+    ///      at `avocado vm update`.
+    pub fn default_vm_source(&self) -> Option<PathBuf> {
+        // Managed install first — that's what the user gets after
+        // `avocado vm update`.
+        let install = self.install_dir();
+        if install.join("manifest.json").is_file() {
+            return Some(install);
+        }
+        // Fallback: artifact-dir pointer file from the last explicit
+        // `vm start --vm-source <dir>` / `vm rebuild`.
+        if let Ok(raw) = std::fs::read_to_string(self.artifact_dir_file()) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                if p.join("manifest.json").is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
     /// Reserved for future artifact caching under ~/.avocado/vm/.
     #[allow(dead_code)]
     pub fn rootfs(&self) -> PathBuf {
@@ -124,6 +155,12 @@ impl VmPaths {
     /// from LaunchServices).
     pub fn artifact_dir_file(&self) -> PathBuf {
         self.root.join("artifact-dir")
+    }
+    /// Persistent VM configuration (DNS, future network knobs, etc.). Both
+    /// avocado-cli (`vm config set/get`) and Avocado.app's settings UI
+    /// read/write this file.
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join("config.yaml")
     }
 }
 

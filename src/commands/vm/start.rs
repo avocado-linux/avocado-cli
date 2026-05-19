@@ -16,6 +16,8 @@ pub struct StartCommand {
     pub cmdline_extra: Option<String>,
     pub workspace: Option<PathBuf>,
     pub var_size: Option<String>,
+    /// One-shot DNS override; empty means "fall through to persisted config".
+    pub dns: Vec<String>,
     pub watch: bool,
     #[allow(dead_code)]
     pub foreground: bool,
@@ -23,11 +25,26 @@ pub struct StartCommand {
 
 impl StartCommand {
     pub async fn execute(self) -> Result<()> {
+        // Resolution order: explicit CLI flag → AVOCADO_VM_DIR →
+        // managed install dir (populated by `avocado vm update`) →
+        // last `vm start` / `vm rebuild` artifact-dir pointer. Helps
+        // the common end-user flow where you just `avocado vm update`
+        // and then `avocado vm start` without juggling flags or env.
+        let paths_default = VmPaths::resolve()?;
         let vm_source = match self.vm_source {
             Some(p) => p,
-            None => std::env::var("AVOCADO_VM_DIR")
-                .map(PathBuf::from)
-                .context("--vm-source not given and AVOCADO_VM_DIR is unset; point at a directory containing `direct` profile output (manifest.json + kernel/initramfs/rootfs/var)")?,
+            None => {
+                if let Ok(raw) = std::env::var("AVOCADO_VM_DIR") {
+                    PathBuf::from(raw)
+                } else if let Some(p) = paths_default.default_vm_source() {
+                    p
+                } else {
+                    anyhow::bail!(
+                        "no avocado-vm install found. Run `avocado vm update` to install \
+                         the latest release, or pass `--vm-source <dir>` for a local build."
+                    );
+                }
+            }
         };
 
         print_info(
@@ -68,6 +85,11 @@ impl StartCommand {
             cmdline_extra: self.cmdline_extra,
             workspace: self.workspace,
             var_size: self.var_size,
+            dns_override: if self.dns.is_empty() {
+                None
+            } else {
+                Some(self.dns)
+            },
         };
         let result = lifecycle::start(opts).await;
 
