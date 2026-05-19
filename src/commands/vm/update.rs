@@ -20,7 +20,7 @@
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::ClientBuilder;
 use serde_json::json;
 use std::io::Write;
@@ -165,6 +165,35 @@ impl UpdateCommand {
         stage.record_was_running(was_running)?;
 
         let json_mode = self.output.is_json();
+
+        // Pre-create the MultiProgress + one ProgressBar per artifact
+        // so the user sees the whole queue from the start (bars at 0%
+        // for not-yet-started files, filling sequentially as each
+        // download runs). Matches `avocado connect upload`'s rendering
+        // for a consistent look across the CLI.
+        let multi = if !json_mode {
+            Some(MultiProgress::new())
+        } else {
+            None
+        };
+        let bars: Vec<Option<ProgressBar>> = downloads
+            .iter()
+            .map(|item| {
+                multi.as_ref().map(|m| {
+                    let pb = m.add(ProgressBar::new(item.size.unwrap_or(0)));
+                    pb.set_style(
+                        ProgressStyle::with_template(
+                            "  {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
+                        )
+                        .expect("static template parses")
+                        .progress_chars("#>-"),
+                    );
+                    pb.set_message(item.file.clone());
+                    pb
+                })
+            })
+            .collect();
+
         for (idx, item) in downloads.iter().enumerate() {
             let url = format!(
                 "{}/{}",
@@ -179,6 +208,7 @@ impl UpdateCommand {
                 idx + 1,
                 downloads.len(),
                 json_mode,
+                bars[idx].as_ref(),
             )
             .await
             .with_context(|| format!("downloading {}", item.file))?;
@@ -385,6 +415,7 @@ fn print_update_available(
 /// - In `--output json` mode emits NDJSON progress events throttled to
 ///   ~10 Hz so the desktop app can drive a progress bar without being
 ///   flooded.
+#[allow(clippy::too_many_arguments)]
 async fn download_artifact(
     http: &reqwest::Client,
     url: &str,
@@ -393,6 +424,7 @@ async fn download_artifact(
     idx: usize,
     total_items: usize,
     json_mode: bool,
+    pb: Option<&ProgressBar>,
 ) -> Result<()> {
     let resp = http
         .get(url)
@@ -402,23 +434,14 @@ async fn download_artifact(
         .error_for_status()?;
     let total_bytes = resp.content_length().or(item.size).unwrap_or(0);
 
-    if !json_mode {
-        println!(
-            "[{idx}/{total_items}] downloading {} ({} bytes)",
-            item.file, total_bytes,
-        );
-    }
-    let pb = if !json_mode {
-        let pb = ProgressBar::new(total_bytes);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "  {bar:30.green/black}  {decimal_bytes:>10}/{decimal_total_bytes:<10}  {decimal_bytes_per_sec:>12}  ETA {eta:>5}",
-            )
-            .unwrap()
-            .progress_chars("=> "),
-        );
-        Some(pb)
-    } else {
+    // Bar was pre-created in the caller with the manifest's `size`. The
+    // HTTP response's content_length is the authoritative figure once
+    // the request lands — adjust the length if it differs.
+    if let Some(pb) = pb {
+        if total_bytes > 0 {
+            pb.set_length(total_bytes);
+        }
+    } else if json_mode {
         crate::utils::output_format::emit_json_object(&json!({
             "event": "download_started",
             "file": item.file,
@@ -426,8 +449,7 @@ async fn download_artifact(
             "index": idx,
             "total": total_items,
         }));
-        None
-    };
+    }
 
     let mut file =
         std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -439,7 +461,7 @@ async fn download_artifact(
         file.write_all(&chunk)
             .with_context(|| format!("writing to {}", dest.display()))?;
         written += chunk.len() as u64;
-        if let Some(pb) = &pb {
+        if let Some(pb) = pb {
             pb.set_position(written);
         } else if json_mode && last_emit.elapsed() >= Duration::from_millis(100) {
             crate::utils::output_format::emit_json_object(&json!({
@@ -454,7 +476,9 @@ async fn download_artifact(
     file.sync_all().ok();
     drop(file);
     if let Some(pb) = pb {
-        pb.finish_and_clear();
+        // Leave the bar visible at 100% with a "(done)" tail — matches
+        // `avocado connect upload`'s finish-with-message style.
+        pb.finish_with_message(format!("{} (done)", item.file));
     }
     if json_mode {
         crate::utils::output_format::emit_json_object(&json!({
