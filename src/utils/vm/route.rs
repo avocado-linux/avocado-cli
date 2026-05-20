@@ -112,6 +112,7 @@ pub async fn ensure_routed_for_process(
             cmdline_extra: None,
             workspace: None,
             var_size: None,
+            dns_override: None,
         })
         .await?;
         status

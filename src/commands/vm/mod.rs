@@ -4,6 +4,7 @@
 //! work lives in the utils submodules; these modules just present the user-
 //! facing flags and pretty-print results.
 
+pub mod config;
 pub mod logs;
 pub mod rebuild;
 pub mod reset;

@@ -22,6 +22,7 @@ pub mod boot_sync;
 pub mod channel;
 #[cfg(target_os = "macos")]
 pub mod client;
+pub mod config;
 pub mod forward;
 pub mod lifecycle;
 pub mod manifest;

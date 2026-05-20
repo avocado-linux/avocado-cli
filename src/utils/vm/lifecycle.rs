@@ -35,6 +35,11 @@ pub struct StartOptions {
     /// until written), then btrfs is resized to fill it inside the VM.
     /// Shrinking is refused. `None` → default ([`DEFAULT_VAR_SIZE`]).
     pub var_size: Option<String>,
+    /// One-shot DNS override for this start only. Wins over the persisted
+    /// `network.dns` in `~/.avocado/vm/config.yaml`; the persisted value
+    /// is unchanged. `None` → fall through to the persisted config (or
+    /// SLIRP's DHCP-supplied 10.0.2.3 if neither is set).
+    pub dns_override: Option<Vec<String>>,
 }
 
 /// Default target size for the persistent var.btrfs. 50 GiB sparse — large
@@ -189,6 +194,17 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         );
     }
 
+    // Apply persisted network config (+ any one-shot --dns override). The
+    // most common reason this matters: macOS host on a VPN that pushes DNS
+    // via scoped resolvers, which QEMU's slirp DNS proxy (10.0.2.3) can't
+    // see. Pointing the guest at public resolvers via SLIRP's NAT works.
+    if let Err(e) = apply_network_config(&target, opts.dns_override.as_deref()).await {
+        crate::utils::output::print_warning(
+            &format!("applying network config in guest failed: {e:#}. Falling back to slirp's default DNS (10.0.2.3)."),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+
     // Bring up the docker-socket SSH forward so DOCKER_HOST=unix://… works
     // from the host without touching the user's ~/.ssh/config. Non-fatal
     // on error: a working VM with just SSH access is still useful for
@@ -322,6 +338,92 @@ pub fn ssh_target_for_running() -> Result<SshTarget> {
     let port = state::read_ssh_port(&paths)?
         .ok_or_else(|| anyhow::anyhow!("avocado-vm ssh-port file missing"))?;
     Ok(SshTarget::local(&paths, port))
+}
+
+/// Apply the persisted [`config::VmConfig`] (+ optional `--dns` one-shot
+/// override) inside the running guest. Currently only DNS is implemented;
+/// future knobs (MTU, http_proxy, …) hang off the same entry point.
+///
+/// Resolution order for DNS: `dns_override` if `Some(non-empty)`, else
+/// the persisted `network.dns`, else no-op (leave SLIRP's 10.0.2.3).
+async fn apply_network_config(
+    target: &super::ssh::SshTarget,
+    dns_override: Option<&[String]>,
+) -> Result<()> {
+    use super::config::VmConfig;
+
+    let paths = VmPaths::resolve()?;
+    let persisted = VmConfig::load(&paths).unwrap_or_default();
+    let persisted_dns = persisted
+        .network
+        .as_ref()
+        .and_then(|n| n.dns.as_ref())
+        .map(|v| v.as_slice());
+    let persisted_search = persisted
+        .network
+        .as_ref()
+        .and_then(|n| n.dns_search.as_ref())
+        .map(|v| v.as_slice());
+
+    let effective_dns: Option<&[String]> = match dns_override {
+        Some(v) if !v.is_empty() => Some(v),
+        _ => persisted_dns,
+    };
+
+    let Some(dns_list) = effective_dns else {
+        return Ok(()); // nothing to apply
+    };
+
+    for s in dns_list {
+        if !looks_like_ip(s) {
+            bail!("network.dns entry {s:?} is not an IPv4/IPv6 literal");
+        }
+    }
+    let dns_args = dns_list.join(" ");
+    target
+        .exec(&format!("resolvectl dns eth0 {dns_args}"))
+        .await
+        .with_context(|| format!("resolvectl dns eth0 {dns_args}"))?;
+
+    // If the user set explicit search domains, honor them verbatim; else
+    // install `~.` so the user-supplied resolvers handle every suffix
+    // (otherwise systemd-resolved still routes some queries to 10.0.2.3
+    // via per-link defaults).
+    let domains = match persisted_search {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .map(|d| shell_quote(d))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => "'~.'".to_string(),
+    };
+    target
+        .exec(&format!("resolvectl domain eth0 {domains}"))
+        .await
+        .with_context(|| format!("resolvectl domain eth0 {domains}"))?;
+
+    crate::utils::output::print_info(
+        &format!("applied guest DNS: {}", dns_list.join(", ")),
+        crate::utils::output::OutputLevel::Normal,
+    );
+    Ok(())
+}
+
+/// Very lax IP literal check — we just want to refuse obvious shell-injection
+/// attempts before passing user input into a remote command. Anything that
+/// isn't [0-9a-fA-F.:%/_] gets rejected; the kernel will catch malformed
+/// IPs later.
+fn looks_like_ip(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '%' | '/' | '_'))
+}
+
+/// Single-quote a search-domain string for shell. Search domains are
+/// constrained (RFC 1035 label charset), but be defensive anyway.
+fn shell_quote(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 /// Parse a human-readable size string ("50G", "10M", "1024K", "12345" bytes).

@@ -106,6 +106,7 @@ impl ResetCommand {
                 cmdline_extra: None,
                 workspace: None,
                 var_size: None,
+                dns_override: None,
             };
             lifecycle::start(opts).await?;
         }
