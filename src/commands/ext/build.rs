@@ -1024,6 +1024,15 @@ if ([ -d "$sysusers_dir1" ] && [ -n "$(find "$sysusers_dir1" -name "*.conf" 2>/d
     echo "[INFO] Found sysusers.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-sysusers\" to release file"
 fi
 
+# Check if extension includes tmpfiles.d config files and add systemd-tmpfiles --create to AVOCADO_ON_MERGE if needed
+tmpfiles_dir1="$AVOCADO_EXT_SYSROOTS/{}/usr/local/lib/tmpfiles.d"
+tmpfiles_dir2="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/tmpfiles.d"
+if ([ -d "$tmpfiles_dir1" ] && [ -n "$(find "$tmpfiles_dir1" -name "*.conf" 2>/dev/null | head -n 1)" ]) || \
+   ([ -d "$tmpfiles_dir2" ] && [ -n "$(find "$tmpfiles_dir2" -name "*.conf" 2>/dev/null | head -n 1)" ]); then
+    echo "AVOCADO_ON_MERGE=\"systemd-tmpfiles --create\"" >> "$release_file"
+    echo "[INFO] Found tmpfiles.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-tmpfiles --create\" to release file"
+fi
+
 # Add custom AVOCADO_ON_MERGE commands if specified
 {}
 
@@ -1040,6 +1049,9 @@ fi
             ext_scopes.join(" "),
             self.extension,
             modprobe_section,
+            self.extension,
+            self.extension,
+            self.extension,
             self.extension,
             self.extension,
             self.extension,
@@ -1234,6 +1246,13 @@ if [ -d "$ldso_etc_dir" ] && [ -n "$(find "$ldso_etc_dir" -name "*.conf" 2>/dev/
     echo "[INFO] Found ld.so.conf.d config files in extension '{}', added AVOCADO_ON_MERGE=\"ldconfig\" to release file"
 fi
 
+# Check if extension includes tmpfiles.d config files and add systemd-tmpfiles --create to AVOCADO_ON_MERGE if needed
+tmpfiles_etc_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/tmpfiles.d"
+if [ -d "$tmpfiles_etc_dir" ] && [ -n "$(find "$tmpfiles_etc_dir" -name "*.conf" 2>/dev/null | head -n 1)" ]; then
+    echo "AVOCADO_ON_MERGE=\"systemd-tmpfiles --create\"" >> "$release_file"
+    echo "[INFO] Found tmpfiles.d config files in extension '{}', added AVOCADO_ON_MERGE=\"systemd-tmpfiles --create\" to release file"
+fi
+
 # Add custom AVOCADO_ON_MERGE commands if specified
 {}
 
@@ -1251,6 +1270,8 @@ fi
             ext_version,
             if reload_service_manager { "1" } else { "0" },
             ext_scopes.join(" "),
+            self.extension,
+            self.extension,
             self.extension,
             self.extension,
             self.extension,
@@ -2030,6 +2051,17 @@ mod tests {
             .contains("echo \"AVOCADO_ON_MERGE=\\\"systemd-sysusers\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found sysusers.d config files in extension 'test-ext'"));
 
+        // Check for tmpfiles.d functionality
+        assert!(script
+            .contains("tmpfiles_dir1=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/local/lib/tmpfiles.d\""));
+        assert!(
+            script.contains("tmpfiles_dir2=\"$AVOCADO_EXT_SYSROOTS/test-ext/usr/lib/tmpfiles.d\"")
+        );
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"systemd-tmpfiles --create\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains("Found tmpfiles.d config files in extension 'test-ext'"));
+
         // Check for custom on_merge functionality (should be present but not activated)
         assert!(script.contains("# Add custom AVOCADO_ON_MERGE commands if specified"));
         // With no custom commands, no AVOCADO_ON_MERGE entries should be added for custom commands
@@ -2085,6 +2117,15 @@ mod tests {
         assert!(script.contains("ldso_etc_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/ld.so.conf.d\""));
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"ldconfig\\\"\" >> \"$release_file\""));
         assert!(script.contains("Found ld.so.conf.d config files in extension 'test-ext'"));
+
+        // Check for tmpfiles.d functionality in confext
+        assert!(
+            script.contains("tmpfiles_etc_dir=\"$AVOCADO_EXT_SYSROOTS/test-ext/etc/tmpfiles.d\"")
+        );
+        assert!(script.contains(
+            "echo \"AVOCADO_ON_MERGE=\\\"systemd-tmpfiles --create\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains("Found tmpfiles.d config files in extension 'test-ext'"));
 
         // Check for custom on_merge functionality (should be present but not activated)
         assert!(script.contains("# Add custom AVOCADO_ON_MERGE commands if specified"));
