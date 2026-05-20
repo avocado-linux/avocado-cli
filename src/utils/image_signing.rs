@@ -15,6 +15,7 @@ use ed25519_compact::{SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -80,19 +81,44 @@ impl ChecksumAlgorithm {
     }
 }
 
-/// Compute checksum of a file
+/// Compute checksum of a file by streaming it through the hasher in
+/// fixed-size chunks. Image files can be tens of GB, so reading them
+/// fully into memory is not safe.
 #[allow(dead_code)] // Public API for future use
 pub fn compute_file_hash(file_path: &Path, algorithm: &ChecksumAlgorithm) -> Result<Vec<u8>> {
-    let data = fs::read(file_path)
-        .with_context(|| format!("Failed to read file for hashing: {}", file_path.display()))?;
+    const HASH_CHUNK: usize = 1024 * 1024;
+
+    let mut file = fs::File::open(file_path)
+        .with_context(|| format!("Failed to open file for hashing: {}", file_path.display()))?;
+    let mut buf = vec![0u8; HASH_CHUNK];
 
     Ok(match algorithm {
         ChecksumAlgorithm::Sha256 => {
             let mut hasher = Sha256::new();
-            hasher.update(&data);
+            loop {
+                let n = file.read(&mut buf).with_context(|| {
+                    format!("Failed to read file for hashing: {}", file_path.display())
+                })?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
             hasher.finalize().to_vec()
         }
-        ChecksumAlgorithm::Blake3 => blake3::hash(&data).as_bytes().to_vec(),
+        ChecksumAlgorithm::Blake3 => {
+            let mut hasher = blake3::Hasher::new();
+            loop {
+                let n = file.read(&mut buf).with_context(|| {
+                    format!("Failed to read file for hashing: {}", file_path.display())
+                })?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            hasher.finalize().as_bytes().to_vec()
+        }
     })
 }
 
