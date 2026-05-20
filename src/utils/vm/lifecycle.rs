@@ -10,9 +10,16 @@ use std::time::Duration;
 
 use super::manifest::Manifest;
 use super::qemu::{self, QemuConfig};
+#[cfg(unix)]
 use super::qmp::QmpClient;
 use super::ssh::SshTarget;
 use super::state::{self, VmPaths};
+
+// POSIX signal numbers, declared here so call sites compile on Windows
+// where `libc::SIGTERM` / `libc::SIGKILL` are not defined. `send_signal`
+// itself is `#[cfg(unix)]` and is a no-op elsewhere.
+const SIGTERM: libc::c_int = 15;
+const SIGKILL: libc::c_int = 9;
 
 /// Knobs the `avocado vm start` command resolves from args + env.
 #[derive(Debug, Clone)]
@@ -268,6 +275,7 @@ pub async fn stop(force: bool) -> Result<()> {
     }
 
     // Try QMP quit first if the socket is around.
+    #[cfg(unix)]
     if paths.qmp_socket().exists() {
         if let Ok(mut q) = QmpClient::connect(&paths.qmp_socket()).await {
             let _ = q.quit().await;
@@ -283,9 +291,9 @@ pub async fn stop(force: bool) -> Result<()> {
     }
 
     if force {
-        send_signal(pid, libc::SIGKILL);
+        send_signal(pid, SIGKILL);
     } else {
-        send_signal(pid, libc::SIGTERM);
+        send_signal(pid, SIGTERM);
         for _ in 0..20 {
             if !state::pid_alive(pid) {
                 state::cleanup_transient(&paths);
@@ -293,7 +301,7 @@ pub async fn stop(force: bool) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        send_signal(pid, libc::SIGKILL);
+        send_signal(pid, SIGKILL);
     }
 
     // Final cleanup

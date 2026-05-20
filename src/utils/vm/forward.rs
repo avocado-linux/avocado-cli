@@ -25,6 +25,12 @@ use super::state::{self, VmPaths};
 
 const REMOTE_DOCKER_SOCK: &str = "/run/docker.sock";
 
+// POSIX signal numbers, declared here so call sites compile on Windows
+// where `libc::SIGTERM` / `libc::SIGKILL` are not defined. `send_signal`
+// itself is `#[cfg(unix)]` and is a no-op elsewhere.
+const SIGTERM: libc::c_int = 15;
+const SIGKILL: libc::c_int = 9;
+
 /// Spawn the SSH forward in the background. The returned pid is the ssh
 /// process; killing it cleans up the forwarded socket.
 pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
@@ -100,7 +106,7 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
         }
         if std::time::Instant::now() >= deadline {
             // Best-effort kill so we don't leak the process.
-            send_signal(pid, libc::SIGTERM);
+            send_signal(pid, SIGTERM);
             let _ = std::fs::remove_file(paths.forwarder_pid());
             bail!(
                 "timed out waiting for {} to appear (ssh forward not established)",
@@ -115,7 +121,7 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
 pub async fn stop(paths: &VmPaths) -> Result<()> {
     if let Ok(pid) = read_pid(&paths.forwarder_pid()) {
         if state::pid_alive(pid) {
-            send_signal(pid, libc::SIGTERM);
+            send_signal(pid, SIGTERM);
             for _ in 0..20 {
                 if !state::pid_alive(pid) {
                     break;
@@ -123,7 +129,7 @@ pub async fn stop(paths: &VmPaths) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if state::pid_alive(pid) {
-                send_signal(pid, libc::SIGKILL);
+                send_signal(pid, SIGKILL);
             }
         }
     }
