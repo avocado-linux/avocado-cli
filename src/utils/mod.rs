@@ -22,6 +22,7 @@ pub mod provision_result;
 pub mod remote;
 pub mod runs_on;
 pub mod runtime;
+pub mod runtime_extension;
 pub mod scheduler;
 pub mod signing_keys;
 #[cfg(unix)]

@@ -84,8 +84,10 @@ impl RuntimeDepsCommand {
         // New way: Read extensions from the `extensions` array
         if let Some(extensions) = runtime_spec.get("extensions").and_then(|e| e.as_sequence()) {
             for ext in extensions {
-                if let Some(ext_name) = ext.as_str() {
-                    dependencies.push(self.resolve_extension_dependency(parsed, ext_name));
+                if let Some(spec) =
+                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                {
+                    dependencies.push(self.resolve_extension_dependency(parsed, &spec.name));
                 }
             }
         }

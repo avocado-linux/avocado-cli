@@ -545,7 +545,10 @@ impl BuildCommand {
                     merged_value.get("extensions").and_then(|e| e.as_sequence())
                 {
                     for ext in extensions {
-                        if let Some(ext_name) = ext.as_str() {
+                        if let Some(spec) =
+                            crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                        {
+                            let ext_name = spec.name.as_str();
                             // Check if this extension has a source: field (remote extension)
                             if let Some(Some(source)) = ext_sources.get(ext_name) {
                                 // Remote extension with source field

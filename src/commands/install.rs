@@ -446,10 +446,11 @@ impl InstallCommand {
                                 merged_value.get("extensions").and_then(|e| e.as_sequence())
                             {
                                 for ext_val in extensions_list {
-                                    if let Some(ext_name) = ext_val.as_str() {
-                                        required_extensions.insert(ExtensionDependency::Local(
-                                            ext_name.to_string(),
-                                        ));
+                                    if let Some(spec) =
+                                        crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext_val)
+                                    {
+                                        required_extensions
+                                            .insert(ExtensionDependency::Local(spec.name));
                                     }
                                 }
                             }

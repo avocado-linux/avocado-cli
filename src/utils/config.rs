@@ -3154,8 +3154,10 @@ impl Config {
             .and_then(|e| e.as_sequence())
         {
             for ext in extensions {
-                if let Some(ext_name) = ext.as_str() {
-                    ext_deps.push(RuntimeExtDep::Local(ext_name.to_string()));
+                if let Some(spec) =
+                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                {
+                    ext_deps.push(RuntimeExtDep::Local(spec.name));
                 }
             }
         }
@@ -3940,9 +3942,12 @@ impl Config {
                 .with_context(|| format!("Failed to load composed config: {config_path_str}"))?;
 
             for ext_val in extensions {
-                let Some(ext_name) = ext_val.as_str() else {
+                let Some(spec) =
+                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext_val)
+                else {
                     continue;
                 };
+                let ext_name = spec.name.as_str();
 
                 // Look up the extension's content in the composed merged
                 // value. Handles template keys like
@@ -4310,8 +4315,10 @@ impl Config {
                             merged_value.get("extensions").and_then(|e| e.as_sequence())
                         {
                             for ext in extensions {
-                                if let Some(ext_name) = ext.as_str() {
-                                    if ext_name == extension_name {
+                                if let Some(spec) =
+                                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                                {
+                                    if spec.name == extension_name {
                                         if let Some(ext_section) = parsed.get("extensions") {
                                             if let Some(ext_map) = ext_section.as_mapping() {
                                                 for (ext_key, ext_config) in ext_map {
@@ -5310,8 +5317,10 @@ pub fn find_active_extensions(
                             merged_value.get("extensions").and_then(|e| e.as_sequence())
                         {
                             for ext_val in extensions_list {
-                                if let Some(ext_name) = ext_val.as_str() {
-                                    active_extensions.insert(ext_name.to_string());
+                                if let Some(spec) =
+                                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext_val)
+                                {
+                                    active_extensions.insert(spec.name);
                                 }
                             }
                         }

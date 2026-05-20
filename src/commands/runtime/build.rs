@@ -1189,14 +1189,28 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         let mut required_extensions = HashSet::new();
         let _extension_type_overrides: HashMap<String, Vec<String>> = HashMap::new();
 
+        // Names the runtime config explicitly marked `enabled: false`,
+        // stored as interpolated names so they match the entries in
+        // `resolved_extensions` (used to look up manifest entries below).
+        // Flows through into the manifest's `enabled` field so avocadoctl
+        // skips activation at refresh time.
+        let mut disabled_extensions: HashSet<String> = HashSet::new();
+
         // Collect extensions from the new `extensions` array format
         if let Some(extensions) = merged_runtime
             .get("extensions")
             .and_then(|e| e.as_sequence())
         {
             for ext in extensions {
-                if let Some(ext_name) = ext.as_str() {
-                    required_extensions.insert(ext_name.to_string());
+                if let Some(spec) =
+                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                {
+                    if !spec.enabled {
+                        let interpolated =
+                            crate::utils::interpolation::interpolate_name(&spec.name, target_arch);
+                        disabled_extensions.insert(interpolated);
+                    }
+                    required_extensions.insert(spec.name);
                 }
             }
         }
@@ -1349,6 +1363,19 @@ fi"#
             .collect();
         let ext_info_str = ext_info_pairs.join(" ");
 
+        // Space-separated, interpolated names that should land as
+        // `"enabled": false` in the manifest. Empty when no extension is
+        // disabled — Python reads this into a set, default-empty.
+        let ext_disabled_str: String = {
+            let mut names: Vec<&String> = disabled_extensions.iter().collect();
+            names.sort();
+            names
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
         // Resolve `image:` config for rootfs / initramfs / kernel. Same
         // dynamic accessors as extensions — the helpers don't care about
         // the parent yaml node's identity.
@@ -1430,6 +1457,7 @@ export AVOCADO_BUILT_AT="$BUILT_AT"
 export AVOCADO_RUNTIME_NAME="{runtime_name}"
 export AVOCADO_RUNTIME_VERSION="$RUNTIME_VERSION"
 export AVOCADO_EXT_PAIRS="{ext_info_str}"
+export AVOCADO_EXT_DISABLED="{ext_disabled_str}"
 export AVOCADO_ROOTFS_IMAGE_TYPE="{rootfs_image_type}"
 export AVOCADO_INITRAMFS_IMAGE_TYPE="{initramfs_image_type}"
 export AVOCADO_KERNEL_IMAGE_TYPE="{kernel_image_type}"
@@ -1559,6 +1587,19 @@ kos_amf = os.environ.get("AVOCADO_AMF_KOS") == "1"
 #
 MINI_HASH_PROTO = "1"
 MINI_HASH_BLOCK = 4096
+# Streaming SHA256. Images can be tens of GB (customer extensions in
+# particular); the previous hashlib.sha256(f.read()) form OOM-killed the
+# python3 child on a 20 GB extension. Chunk size is a balance: large
+# enough to keep syscall overhead negligible, small enough that resident
+# set stays flat regardless of file size.
+HASH_CHUNK = 1024 * 1024
+def sha256_file(filepath):
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(HASH_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 def mini_hash(filepath):
     file_size = os.path.getsize(filepath)
     n = min(MINI_HASH_BLOCK, file_size)
@@ -1578,6 +1619,11 @@ def mini_hash(filepath):
 
 ext_pairs = ext_pairs_str.split() if ext_pairs_str else []
 
+# Names the runtime config marked `enabled: false`. Emitted into the
+# manifest entry as `"enabled": false` (omitted when default-true) so
+# avocadoctl skips activation at refresh time.
+ext_disabled = set(os.environ.get("AVOCADO_EXT_DISABLED", "").split())
+
 extensions = []
 for pair in ext_pairs:
     parts = pair.split(":", 2)
@@ -1588,8 +1634,7 @@ for pair in ext_pairs:
     if not os.path.isfile(img_file):
         print("WARNING: Extension image not found: " + img_file)
         continue
-    with open(img_file, "rb") as f:
-        sha256 = hashlib.sha256(f.read()).hexdigest()
+    sha256 = sha256_file(img_file)
     size = os.path.getsize(img_file)
     image_id = str(uuid.uuid5(namespace, sha256))
     dest = os.path.join(images_dir, image_id + ext_suffix)
@@ -1598,6 +1643,8 @@ for pair in ext_pairs:
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
     if image_type != "raw":
         entry["image_type"] = image_type
+    if name in ext_disabled:
+        entry["enabled"] = False
     if kos_amf:
         entry["size"] = size
         entry["mini_hash"] = mini_hash(img_file)
@@ -1611,8 +1658,7 @@ for pair in ext_pairs:
 def add_image_entry(img_path, version, image_type):
     if not (img_path and os.path.isfile(img_path)):
         return None
-    with open(img_path, "rb") as f:
-        sha256 = hashlib.sha256(f.read()).hexdigest()
+    sha256 = sha256_file(img_path)
     size = os.path.getsize(img_path)
     image_id = str(uuid.uuid5(namespace, sha256))
     suffix = ".kab" if image_type == "kab" else ".raw"
@@ -2344,8 +2390,14 @@ namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 images_dir = os.environ["AVOCADO_IMAGES_DIR"]
 manifest_path = os.environ["AVOCADO_MANIFEST_PATH"]
 
+# Streaming SHA256 — see HASH_CHUNK rationale in the manifest builder
+# above. .aos bundles routinely exceed available RAM on builders.
+HASH_CHUNK = 1024 * 1024
+aos_h = hashlib.sha256()
 with open(aos_path, "rb") as f:
-    aos_sha256 = hashlib.sha256(f.read()).hexdigest()
+    for chunk in iter(lambda: f.read(HASH_CHUNK), b""):
+        aos_h.update(chunk)
+aos_sha256 = aos_h.hexdigest()
 aos_image_id = str(uuid.uuid5(namespace, aos_sha256))
 dest = os.path.join(images_dir, aos_image_id + ".raw")
 shutil.copy2(aos_path, dest)
