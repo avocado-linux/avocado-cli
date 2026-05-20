@@ -2,7 +2,7 @@
 
 Command line interface for Avocado.
 
-- [Documentation](https://docs.peridio.com/avocado-cli)
+- [Documentation](https://docs.peridio.com/developer-reference/avocado-cli/overview)
 
 ## Install
 
