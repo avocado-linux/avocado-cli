@@ -1106,7 +1106,10 @@ pub fn compute_runtime_input_hash(
         .and_then(|e| e.as_sequence())
     {
         for ext_val in ext_list {
-            if let Some(ext_name) = ext_val.as_str() {
+            if let Some(spec) =
+                crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext_val)
+            {
+                let ext_name = spec.name.as_str();
                 if let Some(docker_images) = parsed
                     .get("extensions")
                     .and_then(|e| e.get(ext_name))

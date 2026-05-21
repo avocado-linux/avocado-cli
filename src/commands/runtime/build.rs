@@ -2535,10 +2535,14 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
                 ext_config.get("extensions").and_then(|e| e.as_sequence())
             {
                 for nested_ext in nested_extensions {
-                    if let Some(nested_ext_name) = nested_ext.as_str() {
+                    if let Some(spec) =
+                        crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(
+                            nested_ext,
+                        )
+                    {
                         self.collect_extension_dependencies(
                             _config,
-                            nested_ext_name,
+                            &spec.name,
                             all_extensions,
                             visited,
                             _target_arch,
@@ -2586,7 +2590,10 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
 
         if let Some(ext_seq) = ext_list {
             for ext in ext_seq {
-                if let Some(ext_name) = ext.as_str() {
+                if let Some(spec) =
+                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                {
+                    let ext_name = spec.name.as_str();
                     let version = self
                         .resolve_extension_version(
                             parsed,
