@@ -1206,6 +1206,12 @@ enum ConfigCommands {
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
+        /// Include nested detail (extensions, packages, SDK summary,
+        /// runtime↔extension cross-references) under a `detail` key.
+        /// Default output is unchanged when this flag is absent so
+        /// existing consumers keep working byte-for-byte.
+        #[arg(long)]
+        detail: bool,
     },
 }
 
@@ -2920,10 +2926,15 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Config { command } => match command {
-            ConfigCommands::Show { config, output } => {
+            ConfigCommands::Show {
+                config,
+                output,
+                detail,
+            } => {
                 let cmd = ConfigShowCommand {
                     config_path: config,
                     output,
+                    detail,
                 };
                 cmd.execute().await?;
                 Ok(())
