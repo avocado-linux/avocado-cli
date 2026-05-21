@@ -185,9 +185,12 @@ impl CleanCommand {
         }
         lock_file.clear_all(&target);
 
-        // Save updated lock file
+        // Save updated lock file. `save_replacing` writes verbatim
+        // without merging from disk — required for unlock semantics
+        // since the regular `save` would re-add the cleared entries
+        // through merge.
         lock_file
-            .save(&src_dir)
+            .save_replacing(&src_dir)
             .with_context(|| "Failed to save lock file")?;
 
         print_success(
@@ -313,6 +316,7 @@ fi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::lockfile::SysrootType;
     use std::fs;
     use tempfile::TempDir;
 
@@ -379,6 +383,65 @@ mod tests {
         let result = clean_cmd.execute().await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_clean_unlock_actually_clears_entries() {
+        // Regression: `clean --unlock` must use `save_replacing` so
+        // cleared entries don't get merged back from disk. Previously
+        // it called `save`, which merged with on-disk state and made
+        // unlock a no-op — the desktop app's Unlock button hit this.
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let config_content = r#"
+default_target: "qemux86-64"
+sdk:
+  image: "test-image"
+"#;
+        let config_path = temp_path.join("avocado.yaml");
+        fs::write(&config_path, config_content).unwrap();
+
+        let mut lock = LockFile::new();
+        lock.set_locked_version(
+            "qemux86-64",
+            &SysrootType::Sdk("x86_64".to_string()),
+            "avocado-sdk-bootstrap",
+            "2024.0.129-r0.0",
+        );
+        lock.save(temp_path).unwrap();
+
+        assert!(lock
+            .get_locked_version(
+                "qemux86-64",
+                &SysrootType::Sdk("x86_64".to_string()),
+                "avocado-sdk-bootstrap"
+            )
+            .is_some());
+
+        let clean_cmd = CleanCommand::new(
+            Some(temp_path.to_str().unwrap().to_string()),
+            false,
+            None,
+            false,
+        )
+        .with_config_path(Some(config_path.to_string_lossy().to_string()))
+        .with_target(Some("qemux86-64".to_string()))
+        .with_unlock(true);
+        let result = clean_cmd.execute().await;
+        assert!(result.is_ok(), "clean --unlock failed: {result:?}");
+
+        let reloaded = LockFile::load(temp_path).unwrap();
+        assert!(
+            reloaded
+                .get_locked_version(
+                    "qemux86-64",
+                    &SysrootType::Sdk("x86_64".to_string()),
+                    "avocado-sdk-bootstrap"
+                )
+                .is_none(),
+            "lock entry should be cleared after `clean --unlock`"
+        );
     }
 
     #[tokio::test]
