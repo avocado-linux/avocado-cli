@@ -4,13 +4,6 @@
 //! [`state::VmPaths`], spawns it daemonized (via `setsid` + redirected
 //! stdio), records the pid, and surfaces a [`QemuHandle`] the lifecycle
 //! layer can stop later.
-//!
-//! On macOS the spawn step is delegated to Avocado.app (see
-//! `utils/vm/client.rs` + `lifecycle::delegate_start_to_app`), so this
-//! module's spawn helpers are unused there — the cfg_attr below silences
-//! the dead-code lint specifically for that platform without hiding
-//! actual bugs on Linux.
-#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -204,6 +197,21 @@ pub fn build_qemu_args(
     args.push("virtio-serial".into());
     args.push("-device".into());
     args.push("virtserialport,chardev=qga,name=org.qemu.guest_agent.0".into());
+
+    // Avocado control plane — second virtserialport on the same
+    // virtio-serial bus. The guest side opens
+    // `/dev/virtio-ports/avocado.control`; the host side gets a Unix
+    // socket at `paths.control_socket()` that Avocado.app connects to
+    // from `USBHostBridge`/`ControlPlane`. Without this, the desktop
+    // app's "Attach to VM" flow stalls on "agent hasn't responded"
+    // (the helper waits forever for `control.sock` to materialize).
+    args.push("-chardev".into());
+    args.push(format!(
+        "socket,id=avocadoctl,path={},server=on,wait=off",
+        paths.control_socket().display()
+    ));
+    args.push("-device".into());
+    args.push("virtserialport,chardev=avocadoctl,name=avocado.control".into());
 
     // Serial console -> logfile
     args.push("-serial".into());

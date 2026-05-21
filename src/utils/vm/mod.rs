@@ -2,7 +2,9 @@
 //!
 //! On macOS dev hosts (and eventually Windows), avocado-cli runs a single
 //! user-level QEMU guest that hosts its own `dockerd` and exposes a 9p
-//! source mount. USB passthrough is handled out-of-band by Avocado.app's
+//! source mount. The CLI owns the qemu process directly (spawn, signal,
+//! pidfile); Avocado.app, when installed, observes by adopting whatever
+//! pidfile shows. USB passthrough is handled out-of-band by Avocado.app's
 //! IOUSBHost → USB/IP → vhci_hcd bridge (see avocado-vm/macos/). This
 //! module manages the VM's lifecycle and the control channels avocado-cli
 //! uses to drive it (QMP for QEMU-level ops, qga for guest-side ops

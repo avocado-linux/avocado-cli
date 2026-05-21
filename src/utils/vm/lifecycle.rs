@@ -21,6 +21,20 @@ use super::state::{self, VmPaths};
 const SIGTERM: libc::c_int = 15;
 const SIGKILL: libc::c_int = 9;
 
+/// Best-effort one-way notification to Avocado.app (macOS only). All call
+/// sites are fire-and-forget: never blocks the CLI on the desktop's
+/// responsiveness, silently no-ops when the desktop isn't running or
+/// installed. The desktop has a pidfile reconciler as a backstop, so a
+/// dropped notification self-heals within ~2 s.
+fn notify_desktop(method: &str, params: serde_json::Value) {
+    #[cfg(target_os = "macos")]
+    super::client::notify(method, params);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (method, params);
+    }
+}
+
 /// Knobs the `avocado vm start` command resolves from args + env.
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -81,6 +95,11 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         // Stale pidfile — clean it up.
         state::cleanup_transient(&paths);
     }
+
+    // Announce intent so the desktop dashboard can flip to "Starting…"
+    // before the qemu pid even exists. Backstopped by the pidfile poller
+    // in case the notification doesn't get through.
+    notify_desktop("vm.notify.starting", serde_json::json!({}));
 
     // Resolve manifest + verify artifacts
     let artifact_dir = opts.vm_source;
@@ -148,29 +167,20 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         workspace: workspace.clone(),
     };
 
-    // On macOS, Avocado.app owns the QEMU process so its dashboard /
-    // USB bridge / virtio-serial control plane can observe lifecycle and
-    // wire up the rest of the supervisor stack. The CLI keeps its
-    // pre-flight (ssh keys, ssh config, var disk seeding) and post-boot
-    // wiring (workspace mount, docker forward); only the spawn step is
-    // delegated. Linux keeps the direct spawn.
+    // The CLI is authoritative for the qemu lifecycle on every platform.
+    // Avocado.app (when installed) observes via pidfile adoption rather
+    // than owning the process — that decoupling keeps the CLI usable on
+    // its own and avoids the IPC stall we used to hit when `vm stop` had
+    // to round-trip through the app.
     let pid = {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = (&manifest, &cfg); // suppress unused-var warnings on this arm
-            delegate_start_to_app(&artifact_dir, opts.memory_mib, opts.cpus, ssh_port).await?
+        let p = qemu::spawn_detached(&manifest, &paths, &cfg).await?;
+        // qemu's -pidfile flag will (re)write the pid; give it a moment, then
+        // also write our spawn-time pid as a fallback if the file doesn't appear.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !paths.pid_file().exists() {
+            let _ = std::fs::write(paths.pid_file(), p.to_string());
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let p = qemu::spawn_detached(&manifest, &paths, &cfg).await?;
-            // qemu's -pidfile flag will (re)write the pid; give it a moment, then
-            // also write our spawn-time pid as a fallback if the file doesn't appear.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if !paths.pid_file().exists() {
-                let _ = std::fs::write(paths.pid_file(), p.to_string());
-            }
-            p
-        }
+        p
     };
 
     // Wait for the guest to become ready — first signal wins (qga vs SSH).
@@ -226,6 +236,11 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         );
     }
 
+    notify_desktop(
+        "vm.notify.running",
+        serde_json::json!({ "pid": pid, "ssh_port": ssh_port }),
+    );
+
     Ok(VmStatus {
         running: true,
         pid: Some(pid),
@@ -238,6 +253,15 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
 
 /// Stop the VM gracefully. Sends QMP `quit`; falls back to SIGTERM/SIGKILL.
 pub async fn stop(force: bool) -> Result<()> {
+    let result = stop_inner(force).await;
+    // Announce regardless of how stop_inner exited (graceful, signal, or
+    // already-dead) — the desktop's pidfile reconciler reaches the same
+    // conclusion eventually, this just shortens the latency.
+    notify_desktop("vm.notify.stopped", serde_json::json!({}));
+    result
+}
+
+async fn stop_inner(force: bool) -> Result<()> {
     let paths = VmPaths::resolve()?;
 
     // Always try to tear down the docker socket forward first — the SSH
@@ -254,25 +278,10 @@ pub async fn stop(force: bool) -> Result<()> {
         }
     };
 
-    // On macOS, ask Avocado.app to stop its supervised qemu so the
-    // dashboard + lifecycle observers see the transition. Falls through to
-    // the pidfile-signal path if the app isn't reachable.
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(mut client) = super::client::Client::connect() {
-            if client.request("vm.stop", serde_json::json!({})).is_ok() {
-                // Wait for the app's monitored process to exit.
-                for _ in 0..40 {
-                    if !state::pid_alive(pid) {
-                        state::cleanup_transient(&paths);
-                        return Ok(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                // Fall through to forceful path below.
-            }
-        }
-    }
+    // Now that we know there's actually a live VM to take down, flip the
+    // dashboard to "Stopping…" right away rather than wait for the
+    // reconciler to notice the pid is gone.
+    notify_desktop("vm.notify.stopping", serde_json::json!({ "pid": pid }));
 
     // Try QMP quit first if the socket is around.
     #[cfg(unix)]
@@ -665,40 +674,3 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Ask Avocado.app to spawn qemu and wait for ready. Auto-launches the app
-/// if it isn't running yet. Returns the qemu pid the app reports.
-///
-/// Pre-flight (ssh keys, ssh-config, var.btrfs seeding, manifest sha256
-/// verify) has already happened by the time this is called — both sides
-/// trust ~/.avocado/vm/ for the supporting state.
-#[cfg(target_os = "macos")]
-async fn delegate_start_to_app(
-    artifact_dir: &Path,
-    memory_mib: u32,
-    cpus: u32,
-    ssh_port: u16,
-) -> Result<u32> {
-    let mut client = super::client::Client::connect_or_launch()
-        .context("failed to reach Avocado.app for vm.start")?;
-
-    let params = serde_json::json!({
-        "vm_dir": artifact_dir.display().to_string(),
-        "memory_mib": memory_mib,
-        "cpus": cpus,
-        "ssh_port": ssh_port,
-    });
-    let _ = client
-        .request("vm.start", params)
-        .context("vm.start dispatch")?;
-
-    // Block until the app reports running (or errors). The app's own
-    // monitor + pidfile sync gives us the authoritative pid.
-    let ready = client
-        .request("vm.wait_ready", serde_json::json!({ "timeout_sec": 120.0 }))
-        .context("vm.wait_ready")?;
-    let pid = ready
-        .get("pid")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("vm.wait_ready returned no pid: {ready}"))?;
-    Ok(pid as u32)
-}

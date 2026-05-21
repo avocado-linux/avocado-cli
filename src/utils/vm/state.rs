@@ -128,6 +128,15 @@ impl VmPaths {
     pub fn qga_socket(&self) -> PathBuf {
         self.root.join("qga.sock")
     }
+    /// Unix socket for the avocado control plane — a second virtio-serial
+    /// port exposed inside the guest as `/dev/virtio-ports/avocado.control`.
+    /// Avocado.app (USBHostBridge / ControlPlane) connects to this from
+    /// the host side; the in-guest avocado-vm-agent opens the matching
+    /// guest-side device for messages like `device_available` /
+    /// `device_gone` / `request_twiddle`.
+    pub fn control_socket(&self) -> PathBuf {
+        self.root.join("control.sock")
+    }
     pub fn serial_log(&self) -> PathBuf {
         self.root.join("serial.log")
     }
@@ -234,6 +243,7 @@ pub fn cleanup_transient(paths: &VmPaths) {
     for p in [
         paths.qmp_socket(),
         paths.qga_socket(),
+        paths.control_socket(),
         paths.pid_file(),
         paths.ssh_port_file(),
         paths.lock_file(),
