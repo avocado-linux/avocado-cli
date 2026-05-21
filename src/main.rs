@@ -439,6 +439,9 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Output format. JSON skips TUI rendering and emits NDJSON events.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Manage signing keys for extension and image signing
     #[command(name = "signing-keys")]
@@ -1644,6 +1647,9 @@ enum RuntimeCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Output format. JSON skips TUI rendering and emits NDJSON events.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Sign runtime images
     Sign {
@@ -2187,8 +2193,11 @@ async fn main() -> Result<()> {
             device,
             container_args,
             dnf_args,
+            output,
         } => {
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
+            let _json_guard =
+                run_with_json_lifecycle(output, "deploy", target.as_deref(), Some(&runtime));
 
             let deploy_cmd = RuntimeDeployCommand::new(
                 runtime,
@@ -2497,9 +2506,12 @@ async fn main() -> Result<()> {
                 device,
                 container_args,
                 dnf_args,
+                output,
             } => {
                 let runtime =
                     resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
+                let _json_guard =
+                    run_with_json_lifecycle(output, "deploy", target.as_deref(), Some(&runtime));
 
                 let deploy_cmd = RuntimeDeployCommand::new(
                     runtime,

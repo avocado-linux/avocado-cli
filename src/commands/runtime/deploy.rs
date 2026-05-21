@@ -3,6 +3,7 @@ use crate::utils::{
     container::{RunConfig, SdkContainer},
     lockfile::LockFile,
     output::{print_info, print_success, print_warning, OutputLevel},
+    output_format::{emit_json_event, is_json_output_active},
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
     target::resolve_target_required,
     update_repo::{self, HashCollectionOutput},
@@ -86,6 +87,14 @@ pub struct RuntimeDeployCommand {
     composed_config: Option<Arc<ComposedConfig>>,
 }
 
+/// Deploy phase identifiers used for NDJSON `task_registered` / `step` events
+/// when `--output json` is active. Names mirror the human-facing phase
+/// labels in `execute()` so the desktop app can render them directly.
+const PHASE_STAMPS: &str = "stamps";
+const PHASE_HASH: &str = "hash-collection";
+const PHASE_METADATA: &str = "metadata-sign";
+const PHASE_DEPLOY: &str = "deploy";
+
 impl RuntimeDeployCommand {
     pub fn new(
         runtime_name: String,
@@ -127,6 +136,42 @@ impl RuntimeDeployCommand {
     pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
         self.composed_config = Some(config);
         self
+    }
+
+    /// Register a phase as a known step so the desktop UI can render it
+    /// before it starts running. No-op in human-output mode.
+    fn emit_phase_register(name: &str, label: &str) {
+        if is_json_output_active() {
+            emit_json_event(&serde_json::json!({
+                "event": "task_registered",
+                "name": name,
+                "label": label,
+            }));
+        }
+    }
+
+    /// Transition a phase to the given status (`running`, `success`, `failed`).
+    /// No-op in human-output mode.
+    fn emit_phase_status(name: &str, status: &str) {
+        if is_json_output_active() {
+            emit_json_event(&serde_json::json!({
+                "event": "step",
+                "name": name,
+                "status": status,
+            }));
+        }
+    }
+
+    /// Annotate the most recent failed phase with an error message so the
+    /// desktop UI can surface it inline next to the step. No-op in human mode.
+    fn emit_phase_error(name: &str, message: &str) {
+        if is_json_output_active() {
+            emit_json_event(&serde_json::json!({
+                "event": "step_error",
+                "name": name,
+                "message": message,
+            }));
+        }
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -180,10 +225,21 @@ impl RuntimeDeployCommand {
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
+        // Pre-register all phases so the desktop UI can render the
+        // step list before any work starts. Order here matches the
+        // execution order below.
+        if !self.no_stamps {
+            Self::emit_phase_register(PHASE_STAMPS, "Verify build stamps");
+        }
+        Self::emit_phase_register(PHASE_HASH, "Collect artifact hashes");
+        Self::emit_phase_register(PHASE_METADATA, "Sign TUF metadata");
+        Self::emit_phase_register(PHASE_DEPLOY, "Deploy to device");
+
         // Validate stamps before proceeding (unless --no-stamps).
         // Deploy needs the runtime to be built; provision is not required —
         // deploy and provision are independent consumers of the build output.
         if !self.no_stamps {
+            Self::emit_phase_status(PHASE_STAMPS, "running");
             let required = vec![StampRequirement::new(
                 crate::utils::stamps::StampCommand::Build,
                 crate::utils::stamps::StampComponent::Runtime,
@@ -202,18 +258,28 @@ impl RuntimeDeployCommand {
                 ..Default::default()
             };
 
-            let output = container_helper
+            let output = match container_helper
                 .run_in_container_with_output(run_config)
-                .await?;
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    Self::emit_phase_error(PHASE_STAMPS, &e.to_string());
+                    Self::emit_phase_status(PHASE_STAMPS, "failed");
+                    return Err(e);
+                }
+            };
 
             let validation =
                 validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
 
             if !validation.is_satisfied() {
-                validation
-                    .into_error(&format!("Cannot deploy runtime '{}'", self.runtime_name))
-                    .print_and_exit();
+                let msg = format!("Cannot deploy runtime '{}'", self.runtime_name);
+                Self::emit_phase_error(PHASE_STAMPS, &msg);
+                Self::emit_phase_status(PHASE_STAMPS, "failed");
+                validation.into_error(&msg).print_and_exit();
             }
+            Self::emit_phase_status(PHASE_STAMPS, "success");
         }
 
         print_info(
@@ -229,6 +295,7 @@ impl RuntimeDeployCommand {
             "Phase 1: Collecting artifact hashes...",
             OutputLevel::Normal,
         );
+        Self::emit_phase_status(PHASE_HASH, "running");
 
         let hash_script = self.create_hash_collection_script(&target_arch);
         let hash_run_config = RunConfig {
@@ -243,13 +310,33 @@ impl RuntimeDeployCommand {
             ..Default::default()
         };
 
-        let hash_output = container_helper
+        let hash_output = match container_helper
             .run_in_container_with_output(hash_run_config)
-            .await?
-            .context("Hash collection script produced no output")?;
+            .await
+        {
+            Ok(Some(out)) => out,
+            Ok(None) => {
+                let msg = "Hash collection script produced no output";
+                Self::emit_phase_error(PHASE_HASH, msg);
+                Self::emit_phase_status(PHASE_HASH, "failed");
+                return Err(anyhow::anyhow!(msg));
+            }
+            Err(e) => {
+                Self::emit_phase_error(PHASE_HASH, &e.to_string());
+                Self::emit_phase_status(PHASE_HASH, "failed");
+                return Err(e);
+            }
+        };
 
-        let collection: HashCollectionOutput =
-            serde_json::from_str(&hash_output).context("Failed to parse hash collection output")?;
+        let collection: HashCollectionOutput = match serde_json::from_str(&hash_output) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("Failed to parse hash collection output: {e}");
+                Self::emit_phase_error(PHASE_HASH, &msg);
+                Self::emit_phase_status(PHASE_HASH, "failed");
+                return Err(anyhow::anyhow!(msg));
+            }
+        };
 
         if self.verbose {
             print_info(
@@ -260,22 +347,31 @@ impl RuntimeDeployCommand {
                 OutputLevel::Normal,
             );
         }
+        Self::emit_phase_status(PHASE_HASH, "success");
 
         // --- Phase 2: Generate and sign TUF metadata ---
         print_info(
             "Phase 2: Generating signed TUF metadata...",
             OutputLevel::Normal,
         );
+        Self::emit_phase_status(PHASE_METADATA, "running");
 
-        let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
-        let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
         let project_dir = std::path::Path::new(&self.config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
+        let staging_dir = project_dir.join(DEPLOY_STAGING_DIR);
 
-        let mut resolved_signing_key_name = signing_key_name.clone();
-        let signer =
-            match crate::utils::update_signing::resolve_signing_key(signing_key_name.as_deref())? {
+        // Group all metadata work in a single fallible block so any
+        // failure is attributed to PHASE_METADATA without wrapping every
+        // `?` site individually.
+        let metadata_result: Result<()> = (|| {
+            let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
+            let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
+
+            let mut resolved_signing_key_name = signing_key_name.clone();
+            let signer = match crate::utils::update_signing::resolve_signing_key(
+                signing_key_name.as_deref(),
+            )? {
                 Some(s) => s,
                 None => {
                     // Auto-generate a development signing key for local deploys
@@ -285,52 +381,59 @@ impl RuntimeDeployCommand {
                         .expect("dev signing key was just created")
                 }
             };
-        let content_signer = crate::utils::update_signing::resolve_content_key(
-            content_key_name.as_deref(),
-            resolved_signing_key_name.as_deref(),
-        )?
-        .expect("signing key is set, so content key resolution should return Some");
+            let content_signer = crate::utils::update_signing::resolve_content_key(
+                content_key_name.as_deref(),
+                resolved_signing_key_name.as_deref(),
+            )?
+            .expect("signing key is set, so content key resolution should return Some");
 
-        let repo_metadata = update_repo::generate_repo_metadata(
-            &collection.targets,
-            &collection.runtime_uuid,
-            &signer,
-            &content_signer,
-        )?;
+            let repo_metadata = update_repo::generate_repo_metadata(
+                &collection.targets,
+                &collection.runtime_uuid,
+                &signer,
+                &content_signer,
+            )?;
 
-        let staging_dir = project_dir.join(DEPLOY_STAGING_DIR);
-        let delegations_dir = staging_dir.join("delegations");
-        std::fs::create_dir_all(&delegations_dir).with_context(|| {
-            format!(
-                "Failed to create deploy staging directory: {}",
-                delegations_dir.display()
+            let delegations_dir = staging_dir.join("delegations");
+            std::fs::create_dir_all(&delegations_dir).with_context(|| {
+                format!(
+                    "Failed to create deploy staging directory: {}",
+                    delegations_dir.display()
+                )
+            })?;
+
+            std::fs::write(
+                staging_dir.join("targets.json"),
+                &repo_metadata.targets_json,
             )
-        })?;
+            .context("Failed to write targets.json")?;
+            std::fs::write(
+                staging_dir.join("snapshot.json"),
+                &repo_metadata.snapshot_json,
+            )
+            .context("Failed to write snapshot.json")?;
+            std::fs::write(
+                staging_dir.join("timestamp.json"),
+                &repo_metadata.timestamp_json,
+            )
+            .context("Failed to write timestamp.json")?;
+            if let Some(root_json) = &collection.root_json {
+                std::fs::write(staging_dir.join("root.json"), root_json)
+                    .context("Failed to write root.json to staging")?;
+            }
+            std::fs::write(
+                delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
+                &repo_metadata.delegated_targets_json,
+            )
+            .context("Failed to write delegated targets json")?;
+            Ok(())
+        })();
 
-        std::fs::write(
-            staging_dir.join("targets.json"),
-            &repo_metadata.targets_json,
-        )
-        .context("Failed to write targets.json")?;
-        std::fs::write(
-            staging_dir.join("snapshot.json"),
-            &repo_metadata.snapshot_json,
-        )
-        .context("Failed to write snapshot.json")?;
-        std::fs::write(
-            staging_dir.join("timestamp.json"),
-            &repo_metadata.timestamp_json,
-        )
-        .context("Failed to write timestamp.json")?;
-        if let Some(root_json) = &collection.root_json {
-            std::fs::write(staging_dir.join("root.json"), root_json)
-                .context("Failed to write root.json to staging")?;
+        if let Err(e) = metadata_result {
+            Self::emit_phase_error(PHASE_METADATA, &e.to_string());
+            Self::emit_phase_status(PHASE_METADATA, "failed");
+            return Err(e);
         }
-        std::fs::write(
-            delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
-            &repo_metadata.delegated_targets_json,
-        )
-        .context("Failed to write delegated targets json")?;
 
         if self.verbose {
             print_info(
@@ -338,14 +441,24 @@ impl RuntimeDeployCommand {
                 OutputLevel::Normal,
             );
         }
+        Self::emit_phase_status(PHASE_METADATA, "success");
 
         // --- Phase 3: Serve repo and trigger update ---
         print_info(
             "Phase 3: Serving update repository and triggering device update...",
             OutputLevel::Normal,
         );
+        Self::emit_phase_status(PHASE_DEPLOY, "running");
 
-        let deploy_script = self.create_deploy_script(&target_arch, &collection.runtime_uuid)?;
+        let deploy_script = match self.create_deploy_script(&target_arch, &collection.runtime_uuid)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                Self::emit_phase_error(PHASE_DEPLOY, &e.to_string());
+                Self::emit_phase_status(PHASE_DEPLOY, "failed");
+                return Err(e);
+            }
+        };
 
         let mut env_vars = HashMap::new();
         env_vars.insert("AVOCADO_TARGET".to_string(), target_arch.clone());
@@ -373,17 +486,31 @@ impl RuntimeDeployCommand {
             sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
-        let deploy_result = container_helper
+        let deploy_result = match container_helper
             .run_in_container(run_config)
             .await
-            .context("Failed to deploy runtime")?;
+            .context("Failed to deploy runtime")
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                Self::emit_phase_error(PHASE_DEPLOY, &e.to_string());
+                Self::emit_phase_status(PHASE_DEPLOY, "failed");
+                return Err(e);
+            }
+        };
 
         // Clean up staging directory
         let _ = std::fs::remove_dir_all(&staging_dir);
 
         if !deploy_result {
-            return Err(anyhow::anyhow!("Failed to deploy runtime"));
+            let msg = "Failed to deploy runtime";
+            Self::emit_phase_error(PHASE_DEPLOY, msg);
+            Self::emit_phase_status(PHASE_DEPLOY, "failed");
+            return Err(anyhow::anyhow!(msg));
         }
+
+        Self::emit_phase_status(PHASE_DEPLOY, "success");
 
         print_success(
             &format!(
