@@ -40,10 +40,13 @@ fn notify_desktop(method: &str, params: serde_json::Value) {
 pub struct StartOptions {
     /// Directory containing the `direct` profile output (manifest.json + artifacts).
     pub vm_source: PathBuf,
-    /// Memory in MiB.
-    pub memory_mib: u32,
-    /// vCPU count.
-    pub cpus: u32,
+    /// Memory in MiB. `None` → read from `runtime.memory_mib` in
+    /// ~/.avocado/vm/config.yaml, else fall back to [`DEFAULT_MEMORY_MIB`].
+    /// When `Some(_)`, the value is also persisted back to the config so
+    /// the next flag-less `vm start` (and Avocado.app) sees it.
+    pub memory_mib: Option<u32>,
+    /// vCPU count. Same resolution / persistence rules as [`memory_mib`].
+    pub cpus: Option<u32>,
     /// Host port for ssh-into-VM. `None` → pick a free port.
     pub ssh_port: Option<u16>,
     /// Extra kernel cmdline.
@@ -68,6 +71,14 @@ pub struct StartOptions {
 /// being wasteful on disk-pressure-sensitive hosts (the file only consumes
 /// what's actually written).
 pub const DEFAULT_VAR_SIZE: &str = "50G";
+
+/// Fallback CPU count when neither the `--cpus` flag nor `runtime.cpus` in
+/// `~/.avocado/vm/config.yaml` is set.
+pub const DEFAULT_CPUS: u32 = 4;
+
+/// Fallback memory size (MiB) when neither the `--memory-mib` flag nor
+/// `runtime.memory_mib` in `~/.avocado/vm/config.yaml` is set.
+pub const DEFAULT_MEMORY_MIB: u32 = 4096;
 
 /// What the `status` command needs to render.
 #[derive(Debug, Clone)]
@@ -158,9 +169,15 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // ~/.ssh/config but has no env hook for our key/known_hosts.
     write_ssh_config(&paths, ssh_port)?;
 
+    // Resolve cpu/memory: explicit flag wins, else persisted config, else
+    // the built-in defaults. When the user passed a flag, also persist it
+    // back to ~/.avocado/vm/config.yaml so the next flag-less `vm start`
+    // and Avocado.app's settings UI both see the same value.
+    let (cpus, memory_mib) = resolve_and_persist_runtime(&paths, opts.cpus, opts.memory_mib)?;
+
     let cfg = QemuConfig {
-        memory_mib: opts.memory_mib,
-        cpus: opts.cpus,
+        memory_mib,
+        cpus,
         ssh_port,
         cmdline_extra: opts.cmdline_extra,
         artifact_dir: artifact_dir.clone(),
@@ -355,6 +372,47 @@ pub fn ssh_target_for_running() -> Result<SshTarget> {
     let port = state::read_ssh_port(&paths)?
         .ok_or_else(|| anyhow::anyhow!("avocado-vm ssh-port file missing"))?;
     Ok(SshTarget::local(&paths, port))
+}
+
+/// Resolve effective cpu/memory and, if either was explicitly passed via
+/// CLI flags, persist them back to ~/.avocado/vm/config.yaml so subsequent
+/// flag-less starts (and Avocado.app's settings UI) converge.
+///
+/// Returns `(cpus, memory_mib)` actually used for the launch.
+fn resolve_and_persist_runtime(
+    paths: &VmPaths,
+    flag_cpus: Option<u32>,
+    flag_memory_mib: Option<u32>,
+) -> Result<(u32, u32)> {
+    use super::config::{RuntimeConfig, VmConfig};
+
+    let mut cfg = VmConfig::load(paths).unwrap_or_default();
+    let persisted_cpus = cfg.runtime.as_ref().and_then(|r| r.cpus);
+    let persisted_memory = cfg.runtime.as_ref().and_then(|r| r.memory_mib);
+
+    let cpus = flag_cpus.or(persisted_cpus).unwrap_or(DEFAULT_CPUS);
+    let memory_mib = flag_memory_mib
+        .or(persisted_memory)
+        .unwrap_or(DEFAULT_MEMORY_MIB);
+
+    // Only write back when the user actually passed a flag AND it
+    // differs from what's already on disk. Avoids touching the file
+    // (and growing its mtime) on every routine `vm start`.
+    let cpus_changed = flag_cpus.is_some() && persisted_cpus != Some(cpus);
+    let memory_changed = flag_memory_mib.is_some() && persisted_memory != Some(memory_mib);
+    if cpus_changed || memory_changed {
+        let runtime = cfg.runtime.get_or_insert_with(RuntimeConfig::default);
+        if cpus_changed {
+            runtime.cpus = Some(cpus);
+        }
+        if memory_changed {
+            runtime.memory_mib = Some(memory_mib);
+        }
+        cfg.save(paths)
+            .context("persisting runtime overrides to vm config")?;
+    }
+
+    Ok((cpus, memory_mib))
 }
 
 /// Apply the persisted [`config::VmConfig`] (+ optional `--dns` one-shot
@@ -673,4 +731,3 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
         .with_context(|| format!("writing {}", paths.ssh_config().display()))?;
     Ok(())
 }
-

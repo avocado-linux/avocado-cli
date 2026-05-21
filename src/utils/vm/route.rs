@@ -106,8 +106,8 @@ pub async fn ensure_routed_for_process(
         );
         let status = lifecycle::start(StartOptions {
             vm_source,
-            memory_mib: 4096,
-            cpus: 4,
+            memory_mib: None,
+            cpus: None,
             ssh_port: None,
             cmdline_extra: None,
             workspace: None,

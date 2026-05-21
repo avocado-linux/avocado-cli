@@ -23,9 +23,27 @@ pub struct VmConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeConfig>,
+
     /// Forward-compat bucket for keys this CLI version doesn't know about.
     /// Preserved verbatim on save so a newer desktop's settings survive an
     /// older CLI's round-trip.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// QEMU resource knobs the user can override. Persisted so `avocado vm start`
+/// (without flags) and Avocado.app's settings UI converge on the same values.
+/// `None` for a field means "fall back to the built-in default".
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u32>,
+
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,
 }
@@ -281,6 +299,32 @@ mod tests {
         cfg.set("network.dns", &["1.1.1.1".into()]).unwrap();
         cfg.unset("network.dns").unwrap();
         assert!(cfg.get("network.dns").unwrap().is_none());
+    }
+
+    #[test]
+    fn runtime_round_trip() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        let cfg = VmConfig {
+            runtime: Some(RuntimeConfig {
+                cpus: Some(6),
+                memory_mib: Some(8192),
+                extra: Default::default(),
+            }),
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = VmConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn set_runtime_via_dotted_key() {
+        let mut cfg = VmConfig::default();
+        cfg.set("runtime.cpus", &["6".into()]).unwrap();
+        cfg.set("runtime.memory_mib", &["8192".into()]).unwrap();
+        assert_eq!(cfg.runtime.as_ref().and_then(|r| r.cpus), Some(6));
+        assert_eq!(cfg.runtime.as_ref().and_then(|r| r.memory_mib), Some(8192));
     }
 
     #[test]

@@ -100,8 +100,8 @@ impl ResetCommand {
             println!("avocado vm reset: restarting VM…");
             let opts = lifecycle::StartOptions {
                 vm_source: artifact_dir,
-                memory_mib: 4096,
-                cpus: 4,
+                memory_mib: None,
+                cpus: None,
                 ssh_port: None,
                 cmdline_extra: None,
                 workspace: None,

@@ -44,14 +44,18 @@ fn socket_path() -> Option<PathBuf> {
 /// regardless of whether the desktop is installed or reachable.
 pub fn notify(method: &str, params: Value) {
     let Some(path) = socket_path() else { return };
-    let Ok(stream) = UnixStream::connect(&path) else { return };
+    let Ok(stream) = UnixStream::connect(&path) else {
+        return;
+    };
     // Apply timeouts up-front; without these `write_all` and `read_line`
     // can stall on a hung peer for far longer than we're willing to wait.
     let _ = stream.set_write_timeout(Some(NOTIFY_TIMEOUT));
     let _ = stream.set_read_timeout(Some(NOTIFY_TIMEOUT));
 
     let req = json!({ "method": method, "params": params, "id": 1 });
-    let Ok(mut buf) = serde_json::to_vec(&req) else { return };
+    let Ok(mut buf) = serde_json::to_vec(&req) else {
+        return;
+    };
     buf.push(b'\n');
 
     let mut stream = stream;

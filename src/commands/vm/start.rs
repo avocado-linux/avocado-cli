@@ -10,8 +10,8 @@ use crate::utils::vm::state::VmPaths;
 
 pub struct StartCommand {
     pub vm_source: Option<PathBuf>,
-    pub memory_mib: u32,
-    pub cpus: u32,
+    pub memory_mib: Option<u32>,
+    pub cpus: Option<u32>,
     pub ssh_port: Option<u16>,
     pub cmdline_extra: Option<String>,
     pub workspace: Option<PathBuf>,

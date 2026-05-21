@@ -258,15 +258,16 @@ impl UpdateCommand {
 
         if was_running {
             println!("avocado vm update: restarting VM…");
-            // Minimal start opts — pick defaults consistent with prior
-            // start. We deliberately don't try to reconstruct every
-            // flag the user originally used; this is "restart with
-            // defaults", and `avocado vm start --foo=...` is the path
-            // when the user wants to re-customise.
+            // Minimal start opts — None for cpus/memory means lifecycle::start
+            // reads `runtime.*` from ~/.avocado/vm/config.yaml (or falls back
+            // to DEFAULT_CPUS / DEFAULT_MEMORY_MIB). Other knobs we deliberately
+            // don't try to reconstruct from the user's original flags; this is
+            // "restart with persisted/default settings", and `vm start --foo=…`
+            // is the path when the user wants to re-customise.
             let opts = crate::utils::vm::lifecycle::StartOptions {
                 vm_source: install_dir.clone(),
-                memory_mib: 4096,
-                cpus: 4,
+                memory_mib: None,
+                cpus: None,
                 ssh_port: None,
                 cmdline_extra: None,
                 workspace: None,

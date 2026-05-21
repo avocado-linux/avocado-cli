@@ -4200,12 +4200,16 @@ enum VmCommands {
         /// dir → error.
         #[arg(long)]
         vm_source: Option<std::path::PathBuf>,
-        /// Memory in MiB.
-        #[arg(long, default_value_t = 4096)]
-        memory_mib: u32,
-        /// vCPU count.
-        #[arg(long, default_value_t = 4)]
-        cpus: u32,
+        /// Memory in MiB. Resolution order: this flag → `runtime.memory_mib`
+        /// in `~/.avocado/vm/config.yaml` (also written by Avocado.app's
+        /// settings UI) → 4096. When passed, the value is persisted back to
+        /// the config so the next flag-less `vm start` reuses it.
+        #[arg(long)]
+        memory_mib: Option<u32>,
+        /// vCPU count. Same resolution + persistence as `--memory-mib`,
+        /// falling back to `runtime.cpus` or 4.
+        #[arg(long)]
+        cpus: Option<u32>,
         /// Bind SSH on this host port (default: pick a free high port).
         #[arg(long)]
         ssh_port: Option<u16>,
