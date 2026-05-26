@@ -3,9 +3,10 @@ use crate::commands::rootfs::image::{generate_rootfs_build_script, NAMESPACE_UUI
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::get_post_install;
 use crate::utils::{
-    config::{ComposedConfig, Config},
+    config::{ComposedConfig, Config, ImageConfig},
     container::{RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
+    permissions::{mapping_from_hashmap, render_users_groups_script},
     runs_on::RunsOnContext,
     stamps::{
         compute_runtime_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
@@ -2220,18 +2221,43 @@ echo "Docker image priming complete.""#,
             }
         };
 
+        // Helper closure: given the rootfs/initramfs ImageConfig the runtime
+        // resolves to, render the users/groups script that will edit the
+        // image's work dir /etc/{passwd,shadow,group} in place. Returns an
+        // empty string when no permissions are configured on the image —
+        // the base packages (avocado-pkg-rootfs / avocado-pkg-initramfs)
+        // ship a generic passwd/shadow/group that we leave untouched.
+        let render_perms = |image: Option<&ImageConfig>, etc_dir: &str| -> String {
+            let Some(perms) = image.and_then(|img| config.resolve_image_permissions(img)) else {
+                return String::new();
+            };
+            let users = mapping_from_hashmap(perms.users.as_ref());
+            let groups = mapping_from_hashmap(perms.groups.as_ref());
+            render_users_groups_script(users.as_ref(), groups.as_ref(), etc_dir, None)
+        };
+
         let rootfs_post_install = get_post_install(parsed.get("rootfs"));
+        let rootfs_permissions_section = render_perms(
+            config.resolve_runtime_rootfs(&self.runtime_name),
+            "$ROOTFS_WORK/etc",
+        );
         let rootfs_build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
             &config.get_rootfs_filesystem(),
             rootfs_post_install.as_deref(),
+            &rootfs_permissions_section,
         );
 
         let initramfs_post_install = get_post_install(parsed.get("initramfs"));
+        let initramfs_permissions_section = render_perms(
+            config.resolve_runtime_initramfs(&self.runtime_name),
+            "$INITRAMFS_WORK/etc",
+        );
         let initramfs_build_section = generate_initramfs_build_script(
             NAMESPACE_UUID,
             &config.get_initramfs_filesystem(),
             initramfs_post_install.as_deref(),
+            &initramfs_permissions_section,
         );
 
         let script = format!(

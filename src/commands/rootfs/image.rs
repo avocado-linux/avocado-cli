@@ -11,6 +11,7 @@ use crate::utils::{
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
     output::{print_error, print_info, print_success, OutputLevel},
+    permissions::{mapping_from_hashmap, render_users_groups_script},
     runs_on::RunsOnContext,
     target::resolve_target_required,
 };
@@ -119,6 +120,7 @@ pub fn generate_rootfs_build_script(
     namespace_uuid: &str,
     rootfs_filesystem: &str,
     post_install: Option<&str>,
+    permissions_section: &str,
 ) -> String {
     let post = resolve_install_hooks(post_install, DEFAULT_ROOTFS_POST_INSTALL);
     let post_install_block = render_hook_block("post_install", &post);
@@ -138,6 +140,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     mkdir -p "$(dirname "$ROOTFS_WORK")"
     rm -rf "$ROOTFS_WORK"
     cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
+{permissions_section}
 
 {post_install_block}
 
@@ -199,6 +202,7 @@ fi"#,
         namespace_uuid = namespace_uuid,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
+        permissions_section = permissions_section,
     )
 }
 
@@ -285,10 +289,25 @@ impl RootfsImageCommand {
         let rootfs_filesystem = config.get_rootfs_filesystem();
         let rootfs_node = composed.merged_value.get("rootfs");
         let post_install = get_post_install(rootfs_node);
+        let permissions_section = config
+            .rootfs_default()
+            .and_then(|img| config.resolve_image_permissions(img))
+            .map(|p| {
+                let users = mapping_from_hashmap(p.users.as_ref());
+                let groups = mapping_from_hashmap(p.groups.as_ref());
+                render_users_groups_script(
+                    users.as_ref(),
+                    groups.as_ref(),
+                    "$ROOTFS_WORK/etc",
+                    None,
+                )
+            })
+            .unwrap_or_default();
         let build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
             &rootfs_filesystem,
             post_install.as_deref(),
+            &permissions_section,
         );
 
         // If the avocado.yaml asks for a kab-wrapped rootfs, validate the
