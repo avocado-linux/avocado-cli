@@ -8,6 +8,7 @@ use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
+use crate::utils::permissions::render_users_groups_script;
 use crate::utils::stamps::{
     compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
     resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
@@ -438,9 +439,25 @@ impl ExtBuildCommand {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Get users and groups configuration
+        // Get users and groups configuration. These are now deprecated on
+        // extensions — they should be declared in a top-level `permissions:`
+        // block and referenced from rootfs/initramfs. Continue to honor
+        // them during the deprecation window, but surface a warning so
+        // users have time to migrate.
         let users_config = ext_config.get("users").and_then(|v| v.as_mapping());
         let groups_config = ext_config.get("groups").and_then(|v| v.as_mapping());
+        if users_config.is_some() || groups_config.is_some() {
+            print_warning(
+                &format!(
+                    "[DEPRECATED] extension '{}' declares `users:` / `groups:`. \
+                     These are deprecated on extensions and will be removed in a future release. \
+                     Declare users and groups in a top-level `permissions:` block and reference \
+                     it from your rootfs/initramfs entries instead.",
+                    self.extension
+                ),
+                OutputLevel::Normal,
+            );
+        }
 
         // Validate that confext is present if enable_services is used
         if !enable_services.is_empty() && !ext_types.contains(&"confext") {
@@ -1284,454 +1301,22 @@ fi
     }
 
     /// Creates a script section for handling user and group configuration
-    /// This will copy passwd/shadow/group files and create/modify users and groups
+    /// Thin wrapper around [`render_users_groups_script`] that targets the
+    /// extension's sysroot `/etc` and seeds it from the rootfs `/etc`. Kept
+    /// for the legacy `extensions.<name>.users`/`groups` path during the
+    /// deprecation period; new code should call the shared helper directly.
     fn create_users_script_section(
         &self,
         users_config: Option<&serde_yaml::Mapping>,
         groups_config: Option<&serde_yaml::Mapping>,
     ) -> String {
-        // If neither users nor groups are configured, return empty string
-        if users_config.is_none() && groups_config.is_none() {
-            return String::new();
-        }
-
-        let mut script_lines = Vec::new();
-        let mut has_valid_users = false;
-        script_lines.push("\n# Copy and manage user authentication files".to_string());
-
-        // Copy authentication files from rootfs
-        script_lines.push(format!(
-            r#"
-# Copy authentication files from rootfs to extension
-echo "Copying /etc/passwd, /etc/shadow, and /etc/group from rootfs to extension"
-mkdir -p "$AVOCADO_EXT_SYSROOTS/{}/etc"
-cp "$AVOCADO_PREFIX/rootfs/etc/passwd" "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd"
-cp "$AVOCADO_PREFIX/rootfs/etc/shadow" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
-cp "$AVOCADO_PREFIX/rootfs/etc/group" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-"#,
-            self.extension, self.extension, self.extension, self.extension
-        ));
-
-        // Auto-incrementing counters for uid/gid starting at 1000
-        script_lines.push(
-            "# Auto-incrementing counters for uid/gid\nCURRENT_UID=1000\nCURRENT_GID=1000\n"
-                .to_string(),
-        );
-
-        // Process groups first (they might be referenced by users)
-        if let Some(groups) = groups_config {
-            script_lines.push("\n# Create groups".to_string());
-
-            for (groupname_val, group_config) in groups {
-                // Convert groupname from Value to String
-                let groupname = match groupname_val.as_str() {
-                    Some(name) => name,
-                    None => continue, // Skip if groupname is not a string
-                };
-
-                if let Some(group_table) = group_config.as_mapping() {
-                    // Parse comprehensive group configuration with defaults
-                    let gid = if let Some(gid_value) = group_table.get("gid") {
-                        if let Some(gid_num) = gid_value.as_i64() {
-                            gid_num.to_string()
-                        } else if let Some(gid_num) = gid_value.as_u64() {
-                            gid_num.to_string()
-                        } else {
-                            "$CURRENT_GID".to_string()
-                        }
-                    } else {
-                        "$CURRENT_GID".to_string()
-                    };
-
-                    let system_group = group_table
-                        .get("system")
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-
-                    let password = group_table
-                        .get("password")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or(""); // Default: no group password
-
-                    let members = if let Some(members_value) = group_table.get("members") {
-                        if let Some(members_array) = members_value.as_sequence() {
-                            members_array
-                                .iter()
-                                .filter_map(|m| m.as_str())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        } else {
-                            "".to_string()
-                        }
-                    } else {
-                        "".to_string()
-                    };
-
-                    let _admins = if let Some(admins_value) = group_table.get("admins") {
-                        if let Some(admins_array) = admins_value.as_sequence() {
-                            admins_array
-                                .iter()
-                                .filter_map(|a| a.as_str())
-                                .collect::<Vec<_>>()
-                        } else {
-                            vec![]
-                        }
-                    } else {
-                        vec![]
-                    };
-
-                    // Escape password for potential gshadow entry
-                    let _escaped_group_password = password.replace("/", "\\/").replace("&", "\\&");
-
-                    let system_type = if system_group { " (system group)" } else { "" };
-                    let password_note = if !password.is_empty() {
-                        " with password"
-                    } else {
-                        ""
-                    };
-                    let members_msg = if !members.is_empty() {
-                        format!(" and members: {members}")
-                    } else {
-                        "".to_string()
-                    };
-                    let password_config = if !password.is_empty() {
-                        format!("\n# Set group password for '{groupname}'\necho \"Note: Group password configured for '{groupname}'\"")
-                    } else {
-                        "".to_string()
-                    };
-
-                    script_lines.push(format!(
-                        r#"
-# Create group '{}'{}
-echo "Creating group '{}'"{}
-if ! grep -q "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"; then
-    echo "{}:x:{}:{}" >> "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-    echo "Group '{}' created with GID {}{}"
-    if [ "{}" = "$CURRENT_GID" ]; then
-        CURRENT_GID=$((CURRENT_GID + 1))
-    fi
-else
-    echo "Group '{}' already exists, updating members"
-    # Update members if specified
-    if [ -n "{}" ]; then
-        sed -i "s|^{}:x:{}:.*$|{}:x:{}:{}|" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-        echo "Updated members for group '{}'"
-    fi
-fi{}"#,
-                        groupname,
-                        system_type,
-                        groupname,
-                        password_note,
-                        groupname,
-                        self.extension,
-                        groupname,
-                        gid,
-                        members,
-                        self.extension,
-                        groupname,
-                        gid,
-                        members_msg,
-                        gid,
-                        groupname,
-                        members,
-                        groupname,
-                        gid,
-                        groupname,
-                        gid,
-                        members,
-                        self.extension,
-                        groupname,
-                        password_config
-                    ));
-                } else {
-                    // Simple group with just GID auto-assignment
-                    script_lines.push(format!(
-                        r#"
-# Create group '{}'
-echo "Creating group '{}'"
-if ! grep -q "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"; then
-    echo "{}:x:$CURRENT_GID:" >> "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-    echo "Group '{}' created with GID $CURRENT_GID"
-    CURRENT_GID=$((CURRENT_GID + 1))
-else
-    echo "Group '{}' already exists"
-fi"#,
-                        groupname,
-                        groupname,
-                        groupname,
-                        self.extension,
-                        groupname,
-                        self.extension,
-                        groupname,
-                        groupname
-                    ));
-                }
-            }
-        }
-
-        // Process users
-        if let Some(users) = users_config {
-            let mut user_script_lines = Vec::new();
-
-            for (username_val, user_config) in users {
-                // Convert username from Value to String
-                let username = match username_val.as_str() {
-                    Some(name) => name,
-                    None => continue, // Skip if username is not a string
-                };
-
-                if let Some(user_table) = user_config.as_mapping() {
-                    // Check if user has password field - if not, create with disabled login
-                    let password = user_table
-                        .get("password")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("*"); // Default to no login allowed
-
-                    has_valid_users = true;
-
-                    // Parse comprehensive user configuration with defaults
-                    let uid = if let Some(uid_value) = user_table.get("uid") {
-                        if let Some(uid_num) = uid_value.as_i64() {
-                            uid_num.to_string()
-                        } else {
-                            "$CURRENT_UID".to_string()
-                        }
-                    } else {
-                        "$CURRENT_UID".to_string()
-                    };
-
-                    let gid = if let Some(gid_value) = user_table.get("gid") {
-                        if let Some(gid_num) = gid_value.as_i64() {
-                            gid_num.to_string()
-                        } else {
-                            "$CURRENT_UID".to_string() // Default to same as UID for user private groups
-                        }
-                    } else {
-                        "$CURRENT_UID".to_string()
-                    };
-
-                    let gecos = user_table
-                        .get("gecos")
-                        .and_then(|g| g.as_str())
-                        .unwrap_or(username); // Default to username
-
-                    let default_home = format!("/home/{username}");
-                    let home = user_table
-                        .get("home")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or(&default_home); // Default to /home/username
-
-                    let shell = user_table
-                        .get("shell")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("/bin/sh"); // Default shell
-
-                    let groups = if let Some(groups_value) = user_table.get("groups") {
-                        if let Some(groups_array) = groups_value.as_sequence() {
-                            groups_array
-                                .iter()
-                                .filter_map(|g| g.as_str())
-                                .map(|s| s.to_string())
-                                .collect::<Vec<_>>()
-                        } else {
-                            vec![username.to_string()] // Default to user's own group
-                        }
-                    } else {
-                        vec![username.to_string()] // Default to user's own group
-                    };
-
-                    let _primary_group = groups.first().map(|s| s.as_str()).unwrap_or(username);
-
-                    // Shadow file attributes with defaults
-                    let last_change = user_table
-                        .get("last_change")
-                        .and_then(|l| l.as_i64())
-                        .unwrap_or(19000); // Default to a reasonable epoch day
-
-                    let min_days = user_table
-                        .get("min_days")
-                        .and_then(|m| m.as_i64())
-                        .unwrap_or(0); // Default: no minimum
-
-                    let max_days = user_table
-                        .get("max_days")
-                        .and_then(|m| m.as_i64())
-                        .unwrap_or(99999); // Default: no maximum
-
-                    let warn_days = user_table
-                        .get("warn_days")
-                        .and_then(|w| w.as_i64())
-                        .unwrap_or(7); // Default: warn 7 days before
-
-                    let inactive_days = user_table
-                        .get("inactive_days")
-                        .and_then(|i| i.as_i64())
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| "".to_string()); // Default: no inactive period
-
-                    let expire_date = user_table
-                        .get("expire_date")
-                        .and_then(|e| e.as_i64())
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "".to_string()); // Default: no expiration
-
-                    let disabled = user_table
-                        .get("disabled")
-                        .and_then(|d| d.as_bool())
-                        .unwrap_or(false);
-
-                    let system_user = user_table
-                        .get("system")
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-
-                    // Escape special characters in password for sed
-                    // Note: We use | as sed delimiter to avoid conflicts with / in passwords
-                    // We only need to escape characters that have special meaning in sed replacement strings
-                    let escaped_password = password
-                        .replace("\\", "\\\\") // Escape backslashes first
-                        .replace("&", "\\&") // Escape ampersands (sed replacement reference)
-                        .replace("$", "\\$"); // Escape dollar signs (sed end-of-line anchor)
-
-                    let warning_message = if password.is_empty() {
-                        format!("\necho \"[WARNING] User '{username}' will be able to login with NO PASSWORD\"")
-                    } else {
-                        String::new()
-                    };
-
-                    // Create user in passwd file
-                    user_script_lines.push(format!(
-                        r#"
-# Create user '{}'
-echo "Creating user '{}'{}"{}
-if ! grep -q "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd"; then
-    # Add user to passwd file with comprehensive attributes
-    echo "{}:x:{}:{}:{}:{}:{}" >> "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd"
-    echo "User '{}' created with UID {}, GID {}, home '{}', shell '{}'"
-
-    if [ "{}" = "$CURRENT_UID" ]; then
-        CURRENT_UID=$((CURRENT_UID + 1))
-    fi
-else
-    echo "User '{}' already exists, updating attributes"
-fi"#,
-                        username,
-                        username,
-                        if system_user { " (system user)" } else { "" },
-                        warning_message,
-                        username,
-                        self.extension,
-                        username,
-                        uid,
-                        gid,
-                        gecos,
-                        home,
-                        shell,
-                        self.extension,
-                        username,
-                        uid,
-                        gid,
-                        home,
-                        shell,
-                        uid,
-                        username
-                    ));
-
-                    // Create/update user in shadow file with comprehensive attributes
-                    user_script_lines.push(format!(
-                        r#"
-# Set password and shadow attributes for user '{}'
-echo "Setting password and aging policy for user '{}'"
-if grep -q "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"; then
-    # Update existing user's shadow entry completely
-    sed -i "s|^{}:.*$|{}:{}:{}:{}:{}:{}:{}:{}:|" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
-    echo "Updated shadow entry for existing user '{}'"
-else
-    # Add new user to shadow file with full attributes
-    echo "{}:{}:{}:{}:{}:{}:{}:{}:" >> "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
-    echo "Added new user '{}' to shadow file"
-fi{}"#,
-                        username,
-                        username,
-                        username,
-                        self.extension,
-                        username,
-                        username,
-                        escaped_password,
-                        last_change,
-                        min_days,
-                        max_days,
-                        warn_days,
-                        inactive_days,
-                        expire_date,
-                        self.extension,
-                        username,
-                        username,
-                        escaped_password,
-                        last_change,
-                        min_days,
-                        max_days,
-                        warn_days,
-                        inactive_days,
-                        expire_date,
-                        self.extension,
-                        username,
-                        if disabled {
-                            "\necho \"Note: User account is marked as disabled\""
-                        } else {
-                            ""
-                        }
-                    ));
-
-                    // Add user to additional groups if specified
-                    if groups.len() > 1 {
-                        user_script_lines.push(format!(
-                            r#"
-# Add user '{username}' to additional groups"#
-                        ));
-
-                        for group in &groups[1..] {
-                            // Skip primary group
-                            user_script_lines.push(format!(
-                                r#"
-if grep -q "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"; then
-    # Add user to group if not already present
-    if ! grep "^{}:" "$AVOCADO_EXT_SYSROOTS/{}/etc/group" | grep -q "{}"; then
-        sed -i "s|^{}:\([^:]*\):\([^:]*\):\(.*\)$|{}:\1:\2:\3,{}|" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-        echo "Added user '{}' to group '{}'"
-    fi
-else
-    echo "Warning: Group '{}' not found, cannot add user '{}'"
-fi"#,
-                                group, self.extension, group, self.extension, username, group, group, username, self.extension, username, group, group, username
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Add user scripts to main script if there are valid users
-            if has_valid_users {
-                script_lines.push("\n# Create and configure users".to_string());
-                script_lines.extend(user_script_lines);
-            }
-        }
-
-        // Set proper permissions only if we processed any users or groups
-        if groups_config.is_some() || has_valid_users {
-            script_lines.push(format!(
-                r#"
-# Set proper ownership and permissions for authentication files
-chown root:root "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd" "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow" "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-chmod 644 "$AVOCADO_EXT_SYSROOTS/{}/etc/passwd"
-chmod 640 "$AVOCADO_EXT_SYSROOTS/{}/etc/shadow"
-chmod 644 "$AVOCADO_EXT_SYSROOTS/{}/etc/group"
-echo "Set proper permissions on authentication files""#,
-                self.extension, self.extension, self.extension, self.extension, self.extension, self.extension
-            ));
-        }
-
-        script_lines.join("")
+        let etc_dir = format!("$AVOCADO_EXT_SYSROOTS/{}/etc", self.extension);
+        render_users_groups_script(
+            users_config,
+            groups_config,
+            &etc_dir,
+            Some("$AVOCADO_PREFIX/rootfs/etc"),
+        )
     }
 
     /// Run the extension's `post_build` script inside the SDK container.
@@ -3022,8 +2607,10 @@ mod tests {
 
         // Verify the users script section contains the expected commands
         assert!(script.contains("# Copy and manage user authentication files"));
-        assert!(script
-            .contains("Copying /etc/passwd, /etc/shadow, and /etc/group from rootfs to extension"));
+        assert!(script.contains(
+            "Copying /etc/passwd, /etc/shadow, and /etc/group from \
+             $AVOCADO_PREFIX/rootfs/etc to $AVOCADO_EXT_SYSROOTS/avocado-dev/etc"
+        ));
         assert!(script.contains("mkdir -p \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc\""));
         assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/passwd\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/passwd\""));
         assert!(script.contains("cp \"$AVOCADO_PREFIX/rootfs/etc/shadow\" \"$AVOCADO_EXT_SYSROOTS/avocado-dev/etc/shadow\""));

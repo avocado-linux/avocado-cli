@@ -228,6 +228,7 @@ mod tests {
             rootfs: None,
             initramfs: None,
             kernel: None,
+            permissions: None,
         }
     }
 

@@ -16,6 +16,7 @@ pub mod lockfile;
 pub mod nfs_server;
 pub mod output;
 pub mod output_format;
+pub mod permissions;
 pub mod pkcs11_devices;
 pub mod prerequisites;
 pub mod provision_result;

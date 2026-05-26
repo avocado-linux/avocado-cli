@@ -154,6 +154,7 @@ where
             "overlay",
             "image",
             "post_install",
+            "permissions",
         ],
         "rootfs",
     )
@@ -175,9 +176,23 @@ where
             "overlay",
             "image",
             "post_install",
+            "permissions",
         ],
         "initramfs",
     )
+}
+
+/// Custom deserializer for top-level `permissions:` field. Accepts either a
+/// singleton form (`permissions: { users: ..., groups: ... }` — synthesized
+/// as the implicit `default` entry) or a named-map form
+/// (`permissions: { main: { users: ... } }`).
+fn deserialize_permissions_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, PermissionsConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    named_or_single_deserializer::deserialize(deserializer, &["users", "groups"], "permissions")
 }
 
 /// Custom deserializer module for container_args
@@ -596,6 +611,16 @@ pub enum ImageRef {
     Inline(Box<ImageConfig>),
 }
 
+/// A permissions reference on a rootfs/initramfs image: either a name
+/// pointing at a top-level `permissions.<name>` entry, or an inline
+/// anonymous block. Same untagged shape as [`KernelRef`] / [`ImageRef`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PermissionsRef {
+    Named(String),
+    Inline(Box<PermissionsConfig>),
+}
+
 /// Runtime configuration section
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -746,6 +771,22 @@ pub struct ImageConfig {
     /// the defaults run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_install: Option<String>,
+    /// Optional permissions reference. Either a string name pointing at a
+    /// top-level `permissions.<name>` entry, or an inline `PermissionsConfig`.
+    /// When present, users/groups are provisioned into this image's work
+    /// directory (`/etc/passwd`, `/etc/shadow`, `/etc/group`) during build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionsRef>,
+}
+
+/// Permissions block: users and groups to provision into a built image
+/// (rootfs or initramfs). Values are kept as raw YAML so the existing
+/// dynamic field parser in [`crate::utils::permissions`] can consume them
+/// without re-typing every shadow attribute.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PermissionsConfig {
+    pub users: Option<HashMap<String, serde_yaml::Value>>,
+    pub groups: Option<HashMap<String, serde_yaml::Value>>,
 }
 
 /// Provision profile configuration
@@ -1315,6 +1356,14 @@ pub struct Config {
     /// applied across runtimes that don't pin their own.
     #[serde(default, deserialize_with = "deserialize_kernels")]
     pub kernel: Option<HashMap<String, KernelConfig>>,
+    /// Top-level permissions definition(s). Accepts either a singleton
+    /// `PermissionsConfig` (synthesized as the implicit `default` entry) or a
+    /// `name → PermissionsConfig` map. Referenced by name from rootfs or
+    /// initramfs entries via their `permissions:` field. Users/groups
+    /// declared here are baked into the corresponding image's
+    /// `/etc/passwd|shadow|group` during build.
+    #[serde(default, deserialize_with = "deserialize_permissions_map")]
+    pub permissions: Option<HashMap<String, PermissionsConfig>>,
 }
 
 impl Config {
@@ -1776,6 +1825,7 @@ impl Config {
                 signing_keys: None,
                 connect: None,
                 kernel: None,
+                permissions: None,
             });
 
         // Resolve target: CLI arg > env var > config default
@@ -3389,7 +3439,63 @@ impl Config {
                 }
             }
         }
+
+        // Validate permissions refs on top-level rootfs/initramfs entries.
+        let check_perms =
+            |owner_kind: &str, entries: Option<&HashMap<String, ImageConfig>>| -> Result<()> {
+                let Some(entries) = entries else {
+                    return Ok(());
+                };
+                for (entry_name, img) in entries {
+                    let Some(PermissionsRef::Named(pname)) = img.permissions.as_ref() else {
+                        continue;
+                    };
+                    let map = self.permissions.as_ref();
+                    if map.is_none_or(|m| !m.contains_key(pname)) {
+                        let available = map
+                            .map(|m| {
+                                let mut names: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                                names.sort_unstable();
+                                names.join(", ")
+                            })
+                            .unwrap_or_default();
+                        return Err(if available.is_empty() {
+                            anyhow::anyhow!(
+                                "{owner_kind} '{entry_name}' references permissions '{pname}', \
+                             but no top-level `permissions:` map is defined in avocado.yaml"
+                            )
+                        } else {
+                            anyhow::anyhow!(
+                                "{owner_kind} '{entry_name}' references permissions '{pname}', \
+                             which is not defined in the top-level `permissions:` map. \
+                             Available: {available}"
+                            )
+                        });
+                    }
+                }
+                Ok(())
+            };
+        check_perms("rootfs", self.rootfs.as_ref())?;
+        check_perms("initramfs", self.initramfs.as_ref())?;
+
         Ok(())
+    }
+
+    /// Resolve an [`ImageConfig`]'s `permissions:` reference to a borrowed
+    /// [`PermissionsConfig`]. Returns the inline body for `Inline(_)`, looks
+    /// up the top-level map for `Named(_)`, and `None` when no permissions
+    /// are configured on the image. Assumes `validate_runtime_refs` has
+    /// already run — an unresolved named ref returns `None` here rather
+    /// than erroring (callers in build paths treat absence as "no
+    /// permissions to apply").
+    pub fn resolve_image_permissions<'a>(
+        &'a self,
+        image: &'a ImageConfig,
+    ) -> Option<&'a PermissionsConfig> {
+        match image.permissions.as_ref()? {
+            PermissionsRef::Inline(b) => Some(b.as_ref()),
+            PermissionsRef::Named(name) => self.permissions.as_ref()?.get(name),
+        }
     }
 
     /// Load configuration from a YAML string
@@ -10935,6 +11041,143 @@ default_target: qemux86-64
         let config = Config::load_from_yaml_str(yaml).unwrap();
         // No top-level config to reference — synthesis is pointless.
         assert!(config.runtimes.is_none());
+    }
+
+    // --- permissions: top-level + per-image ref tests ---
+
+    #[test]
+    fn test_permissions_singleton_form_synthesizes_default() {
+        let yaml = r#"
+permissions:
+  users:
+    root:
+      password: ""
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let perms = config.permissions.as_ref().expect("permissions parsed");
+        assert_eq!(perms.len(), 1);
+        assert!(perms.contains_key("default"));
+        let entry = perms.get("default").unwrap();
+        let users = entry.users.as_ref().expect("users present");
+        assert!(users.contains_key("root"));
+    }
+
+    #[test]
+    fn test_permissions_named_map_form_with_multiple_entries() {
+        let yaml = r#"
+permissions:
+  main:
+    users:
+      root:
+        password: ""
+  service:
+    users:
+      avocado:
+        uid: 1000
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let perms = config.permissions.as_ref().unwrap();
+        assert_eq!(perms.len(), 2);
+        assert!(perms.contains_key("main"));
+        assert!(perms.contains_key("service"));
+    }
+
+    #[test]
+    fn test_image_permissions_named_ref_resolves() {
+        let yaml = r#"
+permissions:
+  main:
+    users:
+      root:
+        password: ""
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+    permissions: main
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let rootfs = config.rootfs_default().expect("rootfs default present");
+        let resolved = config
+            .resolve_image_permissions(rootfs)
+            .expect("permissions resolved");
+        assert!(resolved.users.as_ref().unwrap().contains_key("root"));
+    }
+
+    #[test]
+    fn test_image_permissions_inline_form() {
+        let yaml = r#"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+    permissions:
+      users:
+        root:
+          password: ""
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let rootfs = config.rootfs_default().expect("rootfs default present");
+        let resolved = config
+            .resolve_image_permissions(rootfs)
+            .expect("inline permissions resolved");
+        assert!(resolved.users.as_ref().unwrap().contains_key("root"));
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_unresolved_rootfs_permissions() {
+        let yaml = r#"
+permissions:
+  main:
+    users:
+      root:
+        password: ""
+rootfs:
+  base:
+    packages: { avocado-pkg-rootfs: "*" }
+    permissions: nope
+runtimes:
+  prod:
+    rootfs: base
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("rootfs 'base'")
+                && err.contains("'nope'")
+                && err.contains("Available: main"),
+            "expected unresolved-permissions-ref error mentioning the rootfs entry; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_refs_rejects_unresolved_initramfs_permissions() {
+        let yaml = r#"
+initramfs:
+  base:
+    packages: { avocado-pkg-initramfs: "*" }
+    permissions: ghost
+runtimes:
+  prod:
+    initramfs: base
+"#;
+        let err = Config::load_from_yaml_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("initramfs 'base'")
+                && err.contains("'ghost'")
+                && err.contains("no top-level"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_image_permissions_absent_is_none() {
+        let yaml = r#"
+rootfs:
+  default:
+    packages: { avocado-pkg-rootfs: "*" }
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let rootfs = config.rootfs_default().unwrap();
+        assert!(rootfs.permissions.is_none());
+        assert!(config.resolve_image_permissions(rootfs).is_none());
     }
 
     #[test]
