@@ -115,8 +115,20 @@ impl Manifest {
     /// Verify every artifact's sha256 against the file on disk.
     /// `artifact_dir` is where the artifacts live (typically same dir as the
     /// manifest); each `artifact.file` is resolved relative to it.
+    ///
+    /// **`SeedOnly` artifacts are intentionally skipped.** Their sha in the
+    /// manifest represents the *initial seed* (what the file looks like at
+    /// release time). After the VM boots, the guest mutates the var image
+    /// (Docker volumes, project state) and the on-disk sha diverges from
+    /// the manifest's seed sha by design. Including them here would fail
+    /// every boot after the first write, and — worse — every `vm update`
+    /// would fail when the new release ships a new seed sha but we kept
+    /// the user's mutated var (the whole point of `SeedOnly`).
     pub fn verify_all(&self, artifact_dir: &Path) -> Result<()> {
         for (role, art) in &self.artifacts {
+            if art.update_policy == UpdatePolicy::SeedOnly {
+                continue;
+            }
             let path = artifact_dir.join(&art.file);
             let computed = sha256_file(&path)
                 .with_context(|| format!("hashing {} for role '{role}'", path.display()))?;
@@ -235,6 +247,41 @@ mod tests {
         let m = Manifest::load(&mp).unwrap();
         let err = m.verify_all(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("sha256 mismatch"));
+    }
+
+    #[test]
+    fn verify_all_skips_seed_only_artifacts() {
+        // var is SeedOnly — after the VM writes to it, the on-disk sha
+        // legitimately diverges from the manifest's seed sha. verify_all
+        // must NOT bail on that mismatch (otherwise every boot after the
+        // first write would fail, and `vm update` to a release with a new
+        // seed sha would fail with sha256 mismatch even though we
+        // intentionally preserved the user's mutated var).
+        let tmp = tempfile::tempdir().unwrap();
+        let var_path = tmp.path().join("var.btrfs");
+        std::fs::write(&var_path, b"user data written after seed").unwrap();
+
+        let raw = r#"{
+            "format": "avocado-direct",
+            "format_version": 1,
+            "platform": "p",
+            "architecture": "arm64",
+            "artifacts": {
+                "var": {
+                    "file": "var.btrfs",
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "type": "btrfs",
+                    "update_policy": "seed_only"
+                }
+            },
+            "cmdline_default": ""
+        }"#;
+        let mp = tmp.path().join("manifest.json");
+        std::fs::write(&mp, raw).unwrap();
+        let m = Manifest::load(&mp).unwrap();
+        // Despite the on-disk file's sha NOT matching the manifest, this
+        // should succeed because var is SeedOnly.
+        m.verify_all(tmp.path()).unwrap();
     }
 
     #[test]
