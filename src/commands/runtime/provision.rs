@@ -180,7 +180,7 @@ impl RuntimeProvisionCommand {
             };
 
             // Validate all stamps from batch output
-            let validation = validate_stamps_batch(&required, output_str, None);
+            let validation = validate_stamps_batch(&required, output_str, &[]);
 
             if !validation.is_satisfied() {
                 // Include the --runs-on target in error message for SDK install hints

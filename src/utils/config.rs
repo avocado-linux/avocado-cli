@@ -3867,6 +3867,20 @@ impl Config {
     }
 
     /// Get the resolved source directory path
+    /// Best-effort project root for resolving project-relative paths
+    /// (`post_install` / `post_build` scripts, etc.) when reading them off
+    /// disk on the host. Uses the resolved `src_dir` when set, otherwise
+    /// falls back to the directory containing the config file.
+    pub fn project_root<P: AsRef<Path>>(&self, config_path: P) -> PathBuf {
+        self.get_resolved_src_dir(&config_path).unwrap_or_else(|| {
+            config_path
+                .as_ref()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        })
+    }
+
     /// If src_dir is configured, it resolves relative paths relative to the config file
     /// If not configured, returns None (use default behavior)
     pub fn get_resolved_src_dir<P: AsRef<Path>>(&self, config_path: P) -> Option<PathBuf> {

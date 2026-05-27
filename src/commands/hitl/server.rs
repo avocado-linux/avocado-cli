@@ -130,7 +130,7 @@ impl HitlServerCommand {
 
             // Validate all stamps from batch output
             let validation =
-                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
 
             if !validation.is_satisfied() {
                 validation
@@ -526,7 +526,7 @@ mod tests {
             build_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
         assert!(result.is_satisfied());
     }
 
@@ -567,7 +567,7 @@ mod tests {
             install_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
         assert!(!result.is_satisfied());
         assert_eq!(result.missing.len(), 1);
         assert_eq!(result.missing[0].relative_path(), "ext/app/build.stamp");
@@ -618,7 +618,7 @@ mod tests {
             build_json
         );
 
-        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        let result_before = validate_stamps_batch(&requirements, &output_before, &[]);
         assert!(result_before.is_satisfied(), "Should pass before clean");
 
         // After ext clean network-driver: SDK still there, ext stamps gone
@@ -628,7 +628,7 @@ mod tests {
             sdk_json
         );
 
-        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        let result_after = validate_stamps_batch(&requirements, &output_after, &[]);
         assert!(!result_after.is_satisfied(), "Should fail after ext clean");
         assert_eq!(
             result_after.missing.len(),
@@ -698,7 +698,7 @@ mod tests {
             ext_b_build_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output_partial, None);
+        let result = validate_stamps_batch(&requirements, &output_partial, &[]);
         assert!(
             !result.is_satisfied(),
             "Should fail when one extension is cleaned"

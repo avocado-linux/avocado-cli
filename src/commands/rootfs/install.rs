@@ -816,12 +816,12 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             if let Some(parsed) = params.parsed {
                 let stamp_result = match params.sysroot_type {
                     SysrootType::Rootfs => {
-                        let inputs = compute_rootfs_input_hash(parsed)?;
+                        let inputs = compute_rootfs_input_hash(parsed, params.src_dir)?;
                         let outputs = StampOutputs::default();
                         Ok(Stamp::rootfs_install(params.target, inputs, outputs))
                     }
                     SysrootType::Initramfs => {
-                        let inputs = compute_initramfs_input_hash(parsed)?;
+                        let inputs = compute_initramfs_input_hash(parsed, params.src_dir)?;
                         let outputs = StampOutputs::default();
                         Ok(Stamp::initramfs_install(params.target, inputs, outputs))
                     }

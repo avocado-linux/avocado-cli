@@ -235,8 +235,7 @@ impl ExtCleanCommand {
             .run_in_container_with_output(run_config)
             .await?;
 
-        let validation =
-            validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+        let validation = validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
 
         if !validation.is_satisfied() {
             validation

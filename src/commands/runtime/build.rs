@@ -9,9 +9,10 @@ use crate::utils::{
     permissions::{mapping_from_hashmap, render_users_groups_script},
     runs_on::RunsOnContext,
     stamps::{
-        compute_runtime_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
-        resolve_required_stamps_for_runtime_build, validate_stamps_batch, Stamp, StampComponent,
-        StampOutputs,
+        compute_runtime_build_input_hash, compute_runtime_install_input_hash,
+        generate_batch_read_stamps_script, generate_write_stamp_script,
+        resolve_required_stamps_for_runtime_build, validate_stamps_batch, CurrentInput, Stamp,
+        StampCommand, StampComponent, StampOutputs,
     },
     target::resolve_target_required,
     tui::{TaskId, TuiGuard},
@@ -271,16 +272,22 @@ impl RuntimeBuildCommand {
                 .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)
                 .ok()
                 .flatten();
-            let current_inputs = merged_runtime
+            let project_root = config.project_root(&self.config_path);
+            let install_inputs = merged_runtime
                 .as_ref()
-                .and_then(|mr| compute_runtime_input_hash(mr, &self.runtime_name, parsed).ok());
-            let validation = validate_stamps_batch(
-                &required,
-                output.as_deref().unwrap_or(""),
-                current_inputs
-                    .as_ref()
-                    .map(|i| (&StampComponent::Runtime, i)),
-            );
+                .and_then(|mr| compute_runtime_install_input_hash(mr, &self.runtime_name).ok());
+            let build_inputs = merged_runtime.as_ref().and_then(|mr| {
+                compute_runtime_build_input_hash(mr, &self.runtime_name, parsed, &project_root).ok()
+            });
+            let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
+            if let Some(ref i) = install_inputs {
+                current_inputs.push((StampComponent::Runtime, StampCommand::Install, i));
+            }
+            if let Some(ref i) = build_inputs {
+                current_inputs.push((StampComponent::Runtime, StampCommand::Build, i));
+            }
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &current_inputs);
 
             if !validation.is_satisfied() {
                 validation
@@ -736,7 +743,12 @@ impl RuntimeBuildCommand {
             let merged_runtime = config
                 .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?
                 .unwrap_or_default();
-            let inputs = compute_runtime_input_hash(&merged_runtime, &self.runtime_name, parsed)?;
+            let inputs = compute_runtime_build_input_hash(
+                &merged_runtime,
+                &self.runtime_name,
+                parsed,
+                &config.project_root(&self.config_path),
+            )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::runtime_build(&self.runtime_name, target_arch, inputs, outputs);
             let stamp_script = generate_write_stamp_script(&stamp)?;

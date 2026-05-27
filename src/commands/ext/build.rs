@@ -10,9 +10,9 @@ use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
 use crate::utils::permissions::render_users_groups_script;
 use crate::utils::stamps::{
-    compute_ext_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
-    resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
-    StampOutputs,
+    compute_ext_build_input_hash, compute_ext_install_input_hash,
+    generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
+    validate_stamps_batch, Stamp, StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -266,17 +266,22 @@ impl ExtBuildCommand {
                 .run_in_container_with_output(run_config)
                 .await?;
 
-            // Compute current inputs from composed config for staleness detection.
-            // This ensures that changes to path-based extension packages are detected.
-            // Only compare against Extension stamps — SDK/compile-deps stamps use their own hash.
-            let current_inputs = compute_ext_input_hash(parsed, &self.extension).ok();
-            let validation = validate_stamps_batch(
-                &required,
-                output.as_deref().unwrap_or(""),
-                current_inputs
-                    .as_ref()
-                    .map(|i| (&StampComponent::Extension, i)),
-            );
+            // Compute step-scoped current inputs for staleness detection.
+            // Install + build stamps have different input hashes — each requirement
+            // is matched against the entry for its (component, command) pair.
+            let project_root = config.project_root(&self.config_path);
+            let install_inputs = compute_ext_install_input_hash(parsed, &self.extension).ok();
+            let build_inputs =
+                compute_ext_build_input_hash(parsed, &self.extension, &project_root).ok();
+            let mut current_inputs: Vec<crate::utils::stamps::CurrentInput<'_>> = Vec::new();
+            if let Some(ref i) = install_inputs {
+                current_inputs.push((StampComponent::Extension, StampCommand::Install, i));
+            }
+            if let Some(ref i) = build_inputs {
+                current_inputs.push((StampComponent::Extension, StampCommand::Build, i));
+            }
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &current_inputs);
 
             if !validation.is_satisfied() {
                 let err =
@@ -706,7 +711,11 @@ impl ExtBuildCommand {
             // Use the composed/merged config (which includes remote extension configs)
             // rather than re-reading the raw local file, so that path-based extension
             // packages are included in the hash for proper staleness detection.
-            let inputs = compute_ext_input_hash(parsed, &self.extension)?;
+            let inputs = compute_ext_build_input_hash(
+                parsed,
+                &self.extension,
+                &config.project_root(&self.config_path),
+            )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);
             let stamp_script = generate_write_stamp_script(&stamp)?;

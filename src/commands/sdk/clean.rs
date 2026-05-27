@@ -132,7 +132,7 @@ impl SdkCleanCommand {
                 .await?;
 
             let validation =
-                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
 
             if !validation.is_satisfied() {
                 validation

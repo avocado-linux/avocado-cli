@@ -7,14 +7,12 @@
 //! 2. Detects staleness via content-addressable hashing (config + package list)
 //! 3. Enforces command ordering with dependency resolution from config
 
-// Allow deprecated variants for backward compatibility during migration
-#![allow(deprecated)]
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::path::Path;
 
 /// Get the local machine's CPU architecture
 ///
@@ -35,8 +33,11 @@ pub fn get_local_arch() -> &'static str {
     }
 }
 
-/// Current stamp format version
-pub const STAMP_VERSION: u32 = 1;
+/// Current stamp format version. Bumped from 1 → 2 in the per-step input-hash
+/// rework: each component step now has its own narrow hash, so old stamps
+/// written under the broader shared hashes cannot be compared with current
+/// inputs. Any stamp at an older version is treated as stale.
+pub const STAMP_VERSION: u32 = 2;
 
 /// Command types that can have stamps
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -357,6 +358,13 @@ impl Stamp {
 
     /// Check if the stamp inputs match the current inputs
     pub fn is_current(&self, current_inputs: &StampInputs) -> bool {
+        // Stamp format version must match — older stamps were written
+        // against the pre-split shared hash functions and cannot be
+        // compared against the new narrower per-step hashes.
+        if self.version != STAMP_VERSION {
+            return false;
+        }
+
         // Config hash must always match
         if self.inputs.config_hash != current_inputs.config_hash {
             return false;
@@ -814,12 +822,90 @@ pub fn compute_config_hash(value: &serde_yaml::Value) -> Result<String> {
     Ok(compute_hash(&json))
 }
 
+// ─── Per-step input-hash helpers ────────────────────────────────────────
+//
+// The hash functions below split each component's inputs into narrow,
+// step-scoped subsets. Adding a field to `runtime build`'s hash should NOT
+// invalidate `runtime install`'s stamp; this is enforced via separate
+// `compute_<component>_<step>_input_hash` functions, each pulling only the
+// keys that actually affect that step.
+//
+// `narrow_kernel_for_hash` and `hash_script_at` are shared building blocks
+// to keep the hash-data construction consistent across components.
+
+/// Extract the subset of a `kernel:` YAML block that actually affects what
+/// gets installed or built. Returns a fresh mapping with only `package`,
+/// `version`, `compile`, `install` keys (when present). Unknown / new
+/// fields are deliberately ignored so cosmetic kernel-block edits
+/// (comments, metadata, future additions that don't drive selection) do
+/// not invalidate stamps.
+fn narrow_kernel_for_hash(kernel: &serde_yaml::Value) -> serde_yaml::Value {
+    let mut out = serde_yaml::Mapping::new();
+    for key in ["package", "version", "compile", "install"] {
+        if let Some(v) = kernel.get(key) {
+            out.insert(serde_yaml::Value::String(key.to_string()), v.clone());
+        }
+    }
+    serde_yaml::Value::Mapping(out)
+}
+
+/// Hash the contents of a project-relative script file. The returned
+/// string is embedded into a hash mapping alongside the original relative
+/// path so the stamp invalidates on either (a) path changes, or (b)
+/// script-content edits.
+///
+/// Missing files hash to the literal `"missing"` sentinel — that way, a
+/// stamp written when the file existed will invalidate if the file is
+/// later removed, and adding the file later (path unchanged) invalidates
+/// the old "missing" stamp.
+fn hash_script_at(project_root: &Path, rel_path: &str) -> String {
+    let abs = project_root.join(rel_path);
+    match std::fs::read(&abs) {
+        Ok(bytes) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let result = hasher.finalize();
+            let mut hex = String::with_capacity(result.len() * 2);
+            for b in result.iter() {
+                use std::fmt::Write;
+                let _ = write!(hex, "{b:02x}");
+            }
+            format!("sha256:{hex}")
+        }
+        Err(_) => "missing".to_string(),
+    }
+}
+
+/// Build the `{path, content_sha256}` mapping that we embed into input
+/// hashes for `post_build` / `post_install` hooks. Both fields go into
+/// the parent mapping so a path swap OR a content edit invalidates.
+fn script_hash_value(project_root: &Path, rel_path: &str) -> serde_yaml::Value {
+    let mut m = serde_yaml::Mapping::new();
+    m.insert(
+        serde_yaml::Value::String("path".to_string()),
+        serde_yaml::Value::String(rel_path.to_string()),
+    );
+    m.insert(
+        serde_yaml::Value::String("content_sha256".to_string()),
+        serde_yaml::Value::String(hash_script_at(project_root, rel_path)),
+    );
+    serde_yaml::Value::Mapping(m)
+}
+
 /// Compute input hash for SDK install
-/// Includes: sdk.dependencies, sdk.image, repo URLs
+///
+/// Includes only inputs that affect the SDK toolchain install itself:
+/// `sdk.packages`, `sdk.image`, `sdk.repo_url`, `sdk.repo_release`.
+///
+/// **Does NOT include `rootfs.packages` / `initramfs.packages`** —
+/// the rootfs and initramfs sysroots are populated by separate
+/// `rootfs install` / `initramfs install` steps with their own stamps.
+/// The orchestrating `avocado sdk install` command writes each of those
+/// stamps independently, so a rootfs-package change invalidates only
+/// the rootfs-install stamp and not the entire SDK toolchain install.
 pub fn compute_sdk_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
-    // Include sdk.dependencies
     if let Some(sdk) = config.get("sdk") {
         if let Some(deps) = sdk.get("packages") {
             hash_data.insert(
@@ -843,26 +929,6 @@ pub fn compute_sdk_input_hash(config: &serde_yaml::Value) -> Result<StampInputs>
             hash_data.insert(
                 serde_yaml::Value::String("sdk.repo_release".to_string()),
                 repo_release.clone(),
-            );
-        }
-    }
-
-    // Include rootfs.packages (affects rootfs sysroot installed during sdk install)
-    if let Some(rootfs) = config.get("rootfs") {
-        if let Some(packages) = rootfs.get("packages") {
-            hash_data.insert(
-                serde_yaml::Value::String("rootfs.packages".to_string()),
-                packages.clone(),
-            );
-        }
-    }
-
-    // Include initramfs.packages (affects initramfs sysroot installed during sdk install)
-    if let Some(initramfs) = config.get("initramfs") {
-        if let Some(packages) = initramfs.get("packages") {
-            hash_data.insert(
-                serde_yaml::Value::String("initramfs.packages".to_string()),
-                packages.clone(),
             );
         }
     }
@@ -918,22 +984,22 @@ pub fn compute_compile_deps_input_hash(
     Ok(StampInputs::new(config_hash))
 }
 
-pub fn compute_ext_input_hash(config: &serde_yaml::Value, ext_name: &str) -> Result<StampInputs> {
-    compute_ext_input_hash_with_fs(config, ext_name, None)
-}
-
-/// Compute input hash for an extension, including an optional resolved filesystem format.
-/// When `filesystem` is `Some`, it is included in the hash so that changing the image
-/// format (e.g. squashfs → erofs-lz4) invalidates the stamp.  The caller is responsible
-/// for resolving the effective value (explicit per-extension override or rootfs default).
-pub fn compute_ext_input_hash_with_fs(
+/// Compute input hash for **extension install**.
+///
+/// Includes only inputs that affect the package-install step:
+/// - `ext.<name>.packages` (what gets installed)
+/// - `ext.<name>.types` (sysext/confext drives a small set of auto-included packages)
+/// - `ext.<name>.source` (where the extension is fetched from)
+///
+/// Deliberately excludes `image`, `var_files`, `subvolumes`, `post_build`,
+/// `filesystem`, `permissions`, `overlay`, `version`, and all merge/service
+/// fields — those affect build/image output, not what gets installed.
+pub fn compute_ext_install_input_hash(
     config: &serde_yaml::Value,
     ext_name: &str,
-    filesystem: Option<&str>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
-    // Include ext.<name>.dependencies
     if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
         if let Some(deps) = ext.get("packages") {
             hash_data.insert(
@@ -941,47 +1007,68 @@ pub fn compute_ext_input_hash_with_fs(
                 deps.clone(),
             );
         }
-        // Also include types as they affect build
         if let Some(types) = ext.get("types") {
             hash_data.insert(
                 serde_yaml::Value::String(format!("ext.{ext_name}.types")),
                 types.clone(),
             );
         }
-        // Include var_files as they affect which files are excluded from the .raw image
+        if let Some(source) = ext.get("source") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.source")),
+                source.clone(),
+            );
+        }
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for **extension build**.
+///
+/// Includes the install inputs (so a package change invalidates build too)
+/// plus build-only inputs: `image` (kabtool args), `overlay`, and the
+/// `post_build` hook (both the relative path and its file content).
+///
+/// Excludes `var_files`, `subvolumes`, and the resolved `filesystem` —
+/// those only affect the image step.
+pub fn compute_ext_build_input_hash(
+    config: &serde_yaml::Value,
+    ext_name: &str,
+    project_root: &Path,
+) -> Result<StampInputs> {
+    let hash_data = ext_build_hash_data(config, ext_name, project_root);
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for **extension image**.
+///
+/// Includes the build inputs plus image-only inputs: `var_files`,
+/// `subvolumes`, and the resolved `filesystem` format.
+pub fn compute_ext_image_input_hash(
+    config: &serde_yaml::Value,
+    ext_name: &str,
+    filesystem: Option<&str>,
+    project_root: &Path,
+) -> Result<StampInputs> {
+    let mut hash_data = ext_build_hash_data(config, ext_name, project_root);
+
+    if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
         if let Some(var_files) = ext.get("var_files") {
             hash_data.insert(
                 serde_yaml::Value::String(format!("ext.{ext_name}.var_files")),
                 var_files.clone(),
             );
         }
-        // Include subvolumes as they affect var image creation flags
         if let Some(subvolumes) = ext.get("subvolumes") {
             hash_data.insert(
                 serde_yaml::Value::String(format!("ext.{ext_name}.subvolumes")),
                 subvolumes.clone(),
             );
         }
-        // Include image config as it determines output format and kabtool args
-        if let Some(image) = ext.get("image") {
-            hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{ext_name}.image")),
-                image.clone(),
-            );
-        }
-        // Include post_build so adding/removing/changing the hook re-runs the build.
-        // Note: this hashes the *path*, not the script's contents — re-run with
-        // --no-stamps to pick up edits to the script itself.
-        if let Some(post_build) = ext.get("post_build") {
-            hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{ext_name}.post_build")),
-                post_build.clone(),
-            );
-        }
     }
-
-    // Include the resolved filesystem format when provided — determines the image
-    // format (.raw contents) and must invalidate the stamp when it changes.
     if let Some(fs) = filesystem {
         hash_data.insert(
             serde_yaml::Value::String(format!("ext.{ext_name}.filesystem")),
@@ -993,15 +1080,72 @@ pub fn compute_ext_input_hash_with_fs(
     Ok(StampInputs::new(config_hash))
 }
 
-/// Compute input hash for rootfs install
-/// Includes: rootfs.packages, top-level kernel config
+/// Shared mapping construction for `ext build` (and the subset used by
+/// `ext image`). Keeping both steps' shared inputs in one place avoids
+/// drift between the two hash functions.
+fn ext_build_hash_data(
+    config: &serde_yaml::Value,
+    ext_name: &str,
+    project_root: &Path,
+) -> serde_yaml::Mapping {
+    let mut hash_data = serde_yaml::Mapping::new();
+
+    if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
+        // Install-time inputs are also build-time inputs — a package change
+        // invalidates everything downstream.
+        if let Some(deps) = ext.get("packages") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.dependencies")),
+                deps.clone(),
+            );
+        }
+        if let Some(types) = ext.get("types") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.types")),
+                types.clone(),
+            );
+        }
+        if let Some(source) = ext.get("source") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.source")),
+                source.clone(),
+            );
+        }
+        // Build-only inputs.
+        if let Some(image) = ext.get("image") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.image")),
+                image.clone(),
+            );
+        }
+        if let Some(overlay) = ext.get("overlay") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.overlay")),
+                overlay.clone(),
+            );
+        }
+        if let Some(post_build) = ext.get("post_build").and_then(|v| v.as_str()) {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.post_build")),
+                script_hash_value(project_root, post_build),
+            );
+        }
+    }
+
+    hash_data
+}
+
+/// Compute input hash for **rootfs install**.
 ///
-/// The kernel block matters because rootfs install auto-appends
-/// `kernel-image-<kver>` and `packagegroup-avocado-rootfs-modules-<kver>`
-/// based on the resolved kernel version. Changing `kernel.version`
-/// changes what gets installed even though `rootfs.packages` is unchanged,
-/// so the stamp must invalidate when the kernel block changes.
-pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
+/// Includes `rootfs.packages`, `rootfs.overlay`, and the narrowed kernel
+/// selection (`package`/`version`/`compile`/`install` only — adding an
+/// unrelated `kernel.metadata` field does NOT invalidate). Also includes
+/// the `post_install` hook path and its file contents so an in-place
+/// script edit invalidates without `--no-stamps`.
+pub fn compute_rootfs_input_hash(
+    config: &serde_yaml::Value,
+    project_root: &Path,
+) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
     if let Some(rootfs) = config.get("rootfs") {
@@ -1017,12 +1161,18 @@ pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInpu
                 overlay.clone(),
             );
         }
+        if let Some(post_install) = rootfs.get("post_install").and_then(|v| v.as_str()) {
+            hash_data.insert(
+                serde_yaml::Value::String("rootfs.post_install".to_string()),
+                script_hash_value(project_root, post_install),
+            );
+        }
     }
 
     if let Some(kernel) = config.get("kernel") {
         hash_data.insert(
             serde_yaml::Value::String("kernel".to_string()),
-            kernel.clone(),
+            narrow_kernel_for_hash(kernel),
         );
     }
 
@@ -1030,13 +1180,14 @@ pub fn compute_rootfs_input_hash(config: &serde_yaml::Value) -> Result<StampInpu
     Ok(StampInputs::new(config_hash))
 }
 
-/// Compute input hash for initramfs install
-/// Includes: initramfs.packages, top-level kernel config
+/// Compute input hash for **initramfs install**.
 ///
-/// Same rationale as `compute_rootfs_input_hash`: initramfs install
-/// auto-appends `packagegroup-avocado-initramfs-modules-<kver>` based
-/// on the resolved kernel version.
-pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampInputs> {
+/// Same shape as [`compute_rootfs_input_hash`] — narrowed kernel block,
+/// `post_install` content hashed alongside its path.
+pub fn compute_initramfs_input_hash(
+    config: &serde_yaml::Value,
+    project_root: &Path,
+) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
     if let Some(initramfs) = config.get("initramfs") {
@@ -1052,12 +1203,18 @@ pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampI
                 overlay.clone(),
             );
         }
+        if let Some(post_install) = initramfs.get("post_install").and_then(|v| v.as_str()) {
+            hash_data.insert(
+                serde_yaml::Value::String("initramfs.post_install".to_string()),
+                script_hash_value(project_root, post_install),
+            );
+        }
     }
 
     if let Some(kernel) = config.get("kernel") {
         hash_data.insert(
             serde_yaml::Value::String("kernel".to_string()),
-            kernel.clone(),
+            narrow_kernel_for_hash(kernel),
         );
     }
 
@@ -1065,25 +1222,26 @@ pub fn compute_initramfs_input_hash(config: &serde_yaml::Value) -> Result<StampI
     Ok(StampInputs::new(config_hash))
 }
 
-/// Compute input hash for runtime install
-/// Includes: runtime.<name>.dependencies (merged with target), kernel config,
-/// extension docker_images (affects var partition priming)
-pub fn compute_runtime_input_hash(
+/// Compute input hash for **runtime install**.
+///
+/// Includes only the inputs that affect the package-install step for the
+/// runtime sysroot: `runtime.<name>.packages` (merged with per-target
+/// overrides) and `runtime.<name>.target`. Excludes kernel, var, var_files,
+/// post_build, rootfs/initramfs filesystem, and extension docker_images —
+/// those affect the build step, not what gets installed for the runtime
+/// itself.
+pub fn compute_runtime_install_input_hash(
     merged_runtime: &serde_yaml::Value,
     runtime_name: &str,
-    parsed: &serde_yaml::Value,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
-    // Include the merged dependencies section
     if let Some(deps) = merged_runtime.get("packages") {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.dependencies")),
             deps.clone(),
         );
     }
-
-    // Include target if specified
     if let Some(target) = merged_runtime.get("target") {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.target")),
@@ -1091,16 +1249,48 @@ pub fn compute_runtime_input_hash(
         );
     }
 
-    // Include kernel config if specified (changes to kernel config should trigger rebuild)
-    if let Some(kernel) = merged_runtime.get("kernel") {
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for **runtime build**.
+///
+/// Includes the install inputs plus build-only inputs: the narrowed
+/// kernel selection (`package`/`version`/`compile`/`install` only), the
+/// runtime-level `var` and `var_files` config, the `post_build` hook
+/// (path + content), the rootfs/initramfs filesystem formats this
+/// runtime consumes, and any extension `docker_images` that this runtime
+/// needs primed at build time.
+pub fn compute_runtime_build_input_hash(
+    merged_runtime: &serde_yaml::Value,
+    runtime_name: &str,
+    parsed: &serde_yaml::Value,
+    project_root: &Path,
+) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+
+    // Install inputs are also build inputs.
+    if let Some(deps) = merged_runtime.get("packages") {
         hash_data.insert(
-            serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
-            kernel.clone(),
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.dependencies")),
+            deps.clone(),
+        );
+    }
+    if let Some(target) = merged_runtime.get("target") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.target")),
+            target.clone(),
         );
     }
 
-    // Include docker_images from extensions in this runtime
-    // (changes to extension docker_images should trigger runtime rebuild to re-prime images)
+    // Build-only inputs.
+    if let Some(kernel) = merged_runtime.get("kernel") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
+            narrow_kernel_for_hash(kernel),
+        );
+    }
+
     if let Some(ext_list) = merged_runtime
         .get("extensions")
         .and_then(|e| e.as_sequence())
@@ -1124,33 +1314,25 @@ pub fn compute_runtime_input_hash(
         }
     }
 
-    // Include runtime-level var_files if specified
     if let Some(var_files) = merged_runtime.get("var_files") {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.var_files")),
             var_files.clone(),
         );
     }
-
-    // Include runtime-level var config (subvolumes, compression) if specified
     if let Some(var) = merged_runtime.get("var") {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.var")),
             var.clone(),
         );
     }
-
-    // Include post_build so adding/removing/changing the hook re-runs the build.
-    // Note: this hashes the *path*, not the script's contents — re-run with
-    // --no-stamps to pick up edits to the script itself.
-    if let Some(post_build) = merged_runtime.get("post_build") {
+    if let Some(post_build) = merged_runtime.get("post_build").and_then(|v| v.as_str()) {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.post_build")),
-            post_build.clone(),
+            script_hash_value(project_root, post_build),
         );
     }
 
-    // Include rootfs/initramfs filesystem formats (changes should trigger rebuild)
     if let Some(rootfs) = parsed.get("rootfs") {
         if let Some(fs) = rootfs.get("filesystem") {
             hash_data.insert(
@@ -1271,16 +1453,23 @@ pub fn parse_batch_stamps_output(
     result
 }
 
+/// A (component, command) key paired with the freshly computed input
+/// hash for that specific step. Passed into [`validate_stamps_batch`]
+/// so each requirement is compared against the correct step-scoped hash.
+pub type CurrentInput<'a> = (StampComponent, StampCommand, &'a StampInputs);
+
 /// Validate all stamp requirements from batch output in a single pass.
 ///
-/// `current_inputs` is an optional (component, hash) pair used for staleness detection.
-/// The hash is only compared against stamps matching the specified component type.
-/// Dependency stamps (e.g., SDK stamps when building an extension) are validated
-/// for existence only — their content hash was verified when they were created.
+/// `current_inputs` is a slice of (component, command, hash) triples
+/// used for staleness detection. A requirement is matched against the
+/// triple whose component AND command both match it. Requirements with
+/// no matching entry are validated for existence only — appropriate for
+/// dependency stamps (e.g. SDK stamps when building an extension) whose
+/// content hash was verified when they were created.
 pub fn validate_stamps_batch(
     requirements: &[StampRequirement],
     batch_output: &str,
-    current_inputs: Option<(&StampComponent, &StampInputs)>,
+    current_inputs: &[CurrentInput<'_>],
 ) -> StampValidationResult {
     let stamp_data = parse_batch_stamps_output(batch_output);
     let mut validation = StampValidationResult::new();
@@ -1289,10 +1478,10 @@ pub fn validate_stamps_batch(
         let stamp_path = req.relative_path();
         let json_content = stamp_data.get(&stamp_path).and_then(|v| v.as_ref());
 
-        // Only apply current_inputs to stamps matching the specified component type.
         let inputs_for_req = current_inputs
-            .filter(|(component, _)| req.component == **component)
-            .map(|(_, inputs)| inputs);
+            .iter()
+            .find(|(component, command, _)| req.component == *component && req.command == *command)
+            .map(|(_, _, inputs)| *inputs);
 
         check_stamp_requirement(
             req,
@@ -2099,7 +2288,7 @@ ext/my-ext/build.stamp:::null"#
             ext_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         assert!(result.is_satisfied());
         assert_eq!(result.satisfied.len(), 2);
@@ -2129,7 +2318,7 @@ ext/my-ext/build.stamp:::null"#
             sdk_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         assert!(!result.is_satisfied());
         assert_eq!(result.satisfied.len(), 1);
@@ -2144,7 +2333,7 @@ ext/my-ext/build.stamp:::null"#
             StampRequirement::ext_install("my-ext"),
         ];
 
-        let result = validate_stamps_batch(&requirements, "", None);
+        let result = validate_stamps_batch(&requirements, "", &[]);
 
         assert!(!result.is_satisfied());
         assert!(result.satisfied.is_empty());
@@ -2364,7 +2553,7 @@ ext/my-ext/build.stamp:::null"#
             sdk_json,
             ext_json
         );
-        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        let result_before = validate_stamps_batch(&requirements, &output_before, &[]);
         assert!(result_before.is_satisfied());
 
         // After ext clean: SDK still there, ext stamps gone
@@ -2373,7 +2562,7 @@ ext/my-ext/build.stamp:::null"#
             get_local_arch(),
             sdk_json
         );
-        let result_after = validate_stamps_batch(&requirements, &output_after_ext_clean, None);
+        let result_after = validate_stamps_batch(&requirements, &output_after_ext_clean, &[]);
         assert!(!result_after.is_satisfied());
         assert_eq!(result_after.missing.len(), 1);
         assert_eq!(
@@ -2403,7 +2592,7 @@ runtime/my-runtime/build.stamp:::null"#,
             get_local_arch()
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         assert!(!result.is_satisfied());
         assert!(result.satisfied.is_empty());
@@ -2435,7 +2624,11 @@ runtime/my-runtime/build.stamp:::null"#,
         let result = validate_stamps_batch(
             &requirements,
             &output,
-            Some((&StampComponent::Extension, &changed_inputs)),
+            &[(
+                StampComponent::Extension,
+                StampCommand::Install,
+                &changed_inputs,
+            )],
         );
 
         assert!(!result.is_satisfied());
@@ -2483,7 +2676,11 @@ runtime/my-runtime/build.stamp:::null"#,
         let result = validate_stamps_batch(
             &requirements,
             &output,
-            Some((&StampComponent::Extension, &changed_inputs)),
+            &[(
+                StampComponent::Extension,
+                StampCommand::Install,
+                &changed_inputs,
+            )],
         );
 
         assert!(!result.is_satisfied());
@@ -2675,9 +2872,20 @@ kernel:
         .unwrap();
 
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let hash_without =
-            compute_runtime_input_hash(&without_kernel, "dev", &empty_parsed).unwrap();
-        let hash_with = compute_runtime_input_hash(&with_kernel, "dev", &empty_parsed).unwrap();
+        let hash_without = compute_runtime_build_input_hash(
+            &without_kernel,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_with = compute_runtime_build_input_hash(
+            &with_kernel,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
 
         // Hashes should differ when kernel config is added
         assert_ne!(hash_without.config_hash, hash_with.config_hash);
@@ -2708,10 +2916,20 @@ kernel:
         .unwrap();
 
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let hash_package =
-            compute_runtime_input_hash(&kernel_package, "dev", &empty_parsed).unwrap();
-        let hash_compile =
-            compute_runtime_input_hash(&kernel_compile, "dev", &empty_parsed).unwrap();
+        let hash_package = compute_runtime_build_input_hash(
+            &kernel_package,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_compile = compute_runtime_build_input_hash(
+            &kernel_compile,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
 
         // Switching kernel mode should produce a different hash
         assert_ne!(hash_package.config_hash, hash_compile.config_hash);
@@ -2745,8 +2963,16 @@ extensions:
         )
         .unwrap();
 
-        let hash_without = compute_ext_input_hash(&config_without, "my-ext").unwrap();
-        let hash_with = compute_ext_input_hash(&config_with, "my-ext").unwrap();
+        let hash_without = compute_ext_image_input_hash(
+            &config_without,
+            "my-ext",
+            None,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_with =
+            compute_ext_image_input_hash(&config_with, "my-ext", None, std::path::Path::new("."))
+                .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -2790,8 +3016,20 @@ extensions:
         )
         .unwrap();
 
-        let hash_without = compute_runtime_input_hash(&runtime, "dev", &parsed_without).unwrap();
-        let hash_with = compute_runtime_input_hash(&runtime, "dev", &parsed_with).unwrap();
+        let hash_without = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed_without,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_with = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed_with,
+            std::path::Path::new("."),
+        )
+        .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -2821,9 +3059,20 @@ var_files:
         .unwrap();
 
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let hash_without =
-            compute_runtime_input_hash(&runtime_without, "dev", &empty_parsed).unwrap();
-        let hash_with = compute_runtime_input_hash(&runtime_with, "dev", &empty_parsed).unwrap();
+        let hash_without = compute_runtime_build_input_hash(
+            &runtime_without,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_with = compute_runtime_build_input_hash(
+            &runtime_with,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -2861,8 +3110,16 @@ extensions:
         )
         .unwrap();
 
-        let hash_without = compute_ext_input_hash(&config_without, "my-ext").unwrap();
-        let hash_with = compute_ext_input_hash(&config_with, "my-ext").unwrap();
+        let hash_without = compute_ext_image_input_hash(
+            &config_without,
+            "my-ext",
+            None,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_with =
+            compute_ext_image_input_hash(&config_with, "my-ext", None, std::path::Path::new("."))
+                .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -2894,13 +3151,389 @@ var:
         .unwrap();
 
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let hash_without =
-            compute_runtime_input_hash(&runtime_without, "dev", &empty_parsed).unwrap();
-        let hash_with = compute_runtime_input_hash(&runtime_with, "dev", &empty_parsed).unwrap();
+        let hash_without = compute_runtime_build_input_hash(
+            &runtime_without,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let hash_with = compute_runtime_build_input_hash(
+            &runtime_with,
+            "dev",
+            &empty_parsed,
+            std::path::Path::new("."),
+        )
+        .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
             "Adding var config should change the runtime input hash"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Negative-invalidation tests
+    //
+    // Each test asserts that mutating a field that the step does NOT care
+    // about leaves the step's input hash unchanged. Without these, the
+    // per-step split is one refactor away from regressing back to the
+    // shared-hash over-invalidation behavior.
+    // ────────────────────────────────────────────────────────────────────
+
+    fn ext_with_extras(extras: &str) -> serde_yaml::Value {
+        let yaml = format!(
+            r#"
+extensions:
+  my-ext:
+    packages:
+      foo: "*"
+    types: [sysext]
+{extras}
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    fn ext_install_hash(value: &serde_yaml::Value) -> String {
+        compute_ext_install_input_hash(value, "my-ext")
+            .unwrap()
+            .config_hash
+    }
+
+    fn ext_build_hash(value: &serde_yaml::Value) -> String {
+        compute_ext_build_input_hash(value, "my-ext", std::path::Path::new("."))
+            .unwrap()
+            .config_hash
+    }
+
+    fn ext_image_hash(value: &serde_yaml::Value) -> String {
+        compute_ext_image_input_hash(value, "my-ext", None, std::path::Path::new("."))
+            .unwrap()
+            .config_hash
+    }
+
+    #[test]
+    fn ext_install_unaffected_by_image_field() {
+        let base = ext_with_extras("");
+        let with_image = ext_with_extras("    image:\n      type: kab\n      args: \"-v 1.0.0\"");
+        assert_eq!(ext_install_hash(&base), ext_install_hash(&with_image));
+    }
+
+    #[test]
+    fn ext_install_unaffected_by_var_files() {
+        let base = ext_with_extras("");
+        let with_var = ext_with_extras("    var_files:\n      - \"var/lib/docker/**\"");
+        assert_eq!(ext_install_hash(&base), ext_install_hash(&with_var));
+    }
+
+    #[test]
+    fn ext_install_unaffected_by_subvolumes_and_post_build() {
+        let base = ext_with_extras("");
+        let with = ext_with_extras(
+            "    subvolumes:\n      lib/docker:\n        nodatacow: true\n    post_build: scripts/build.sh",
+        );
+        assert_eq!(ext_install_hash(&base), ext_install_hash(&with));
+    }
+
+    #[test]
+    fn ext_install_unaffected_by_metadata_and_runtime_fields() {
+        let base = ext_with_extras("");
+        let with = ext_with_extras(
+            "    version: \"1.0.0\"\n    scopes: [system]\n    enable_services: [foo.service]\n    \
+             on_merge: [\"echo hi\"]\n    on_unmerge: [\"echo bye\"]",
+        );
+        assert_eq!(ext_install_hash(&base), ext_install_hash(&with));
+    }
+
+    #[test]
+    fn ext_build_unaffected_by_var_files_and_subvolumes() {
+        let base = ext_with_extras("");
+        let with = ext_with_extras(
+            "    var_files:\n      - \"var/lib/docker/**\"\n    subvolumes:\n      lib/x:\n        nodatacow: true",
+        );
+        assert_eq!(ext_build_hash(&base), ext_build_hash(&with));
+    }
+
+    #[test]
+    fn ext_build_unaffected_by_filesystem_override() {
+        // The filesystem field is image-only — build must not see it.
+        let base = ext_with_extras("");
+        let with_fs = ext_with_extras("    filesystem: erofs-zst");
+        assert_eq!(ext_build_hash(&base), ext_build_hash(&with_fs));
+    }
+
+    #[test]
+    fn ext_image_includes_var_files_and_subvolumes() {
+        let base = ext_with_extras("");
+        let with = ext_with_extras(
+            "    var_files:\n      - \"var/lib/docker/**\"\n    subvolumes:\n      lib/x:\n        nodatacow: true",
+        );
+        assert_ne!(ext_image_hash(&base), ext_image_hash(&with));
+    }
+
+    #[test]
+    fn ext_build_content_changes_invalidate_when_post_build_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("build.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho original\n").unwrap();
+
+        let config = ext_with_extras("    post_build: build.sh");
+        let h1 = compute_ext_build_input_hash(&config, "my-ext", tmp.path())
+            .unwrap()
+            .config_hash;
+
+        std::fs::write(&script, b"#!/bin/sh\necho edited\n").unwrap();
+        let h2 = compute_ext_build_input_hash(&config, "my-ext", tmp.path())
+            .unwrap()
+            .config_hash;
+
+        assert_ne!(
+            h1, h2,
+            "editing post_build script body should invalidate the build hash"
+        );
+    }
+
+    fn runtime(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn runtime_install_unaffected_by_build_only_fields() {
+        let base = runtime(
+            r#"
+packages:
+  avocado-runtime: "*"
+target: "x86_64"
+"#,
+        );
+        let with_build_only = runtime(
+            r#"
+packages:
+  avocado-runtime: "*"
+target: "x86_64"
+kernel:
+  version: "6.6.*"
+var:
+  compression: zstd
+var_files:
+  - source: "files/x"
+    dest: "lib/x"
+post_build: scripts/post.sh
+"#,
+        );
+        let h1 = compute_runtime_install_input_hash(&base, "dev")
+            .unwrap()
+            .config_hash;
+        let h2 = compute_runtime_install_input_hash(&with_build_only, "dev")
+            .unwrap()
+            .config_hash;
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn runtime_install_unaffected_by_top_level_rootfs_initramfs_filesystem() {
+        let runtime_node = runtime(
+            r#"
+packages:
+  avocado-runtime: "*"
+target: "x86_64"
+"#,
+        );
+        let parsed_a: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  filesystem: erofs-lz4
+initramfs:
+  filesystem: cpio.zst
+"#,
+        )
+        .unwrap();
+        let parsed_b: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  filesystem: erofs-zst
+initramfs:
+  filesystem: cpio
+"#,
+        )
+        .unwrap();
+        // install hash ignores the parsed/top-level filesystem entirely.
+        let h_a = compute_runtime_install_input_hash(&runtime_node, "dev")
+            .unwrap()
+            .config_hash;
+        let h_b = compute_runtime_install_input_hash(&runtime_node, "dev")
+            .unwrap()
+            .config_hash;
+        assert_eq!(h_a, h_b);
+        // sanity: build hash DOES include filesystem
+        let b_a = compute_runtime_build_input_hash(
+            &runtime_node,
+            "dev",
+            &parsed_a,
+            std::path::Path::new("."),
+        )
+        .unwrap()
+        .config_hash;
+        let b_b = compute_runtime_build_input_hash(
+            &runtime_node,
+            "dev",
+            &parsed_b,
+            std::path::Path::new("."),
+        )
+        .unwrap()
+        .config_hash;
+        assert_ne!(
+            b_a, b_b,
+            "runtime build SHOULD invalidate on filesystem swap"
+        );
+    }
+
+    #[test]
+    fn sdk_install_unaffected_by_rootfs_initramfs_packages() {
+        let base: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sdk:
+  image: my-sdk:1
+  packages:
+    sdk-deps: "*"
+rootfs:
+  packages:
+    pkg-a: "*"
+initramfs:
+  packages:
+    pkg-b: "*"
+"#,
+        )
+        .unwrap();
+        let bumped: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sdk:
+  image: my-sdk:1
+  packages:
+    sdk-deps: "*"
+rootfs:
+  packages:
+    pkg-a: ">=2.0"
+initramfs:
+  packages:
+    pkg-b: ">=3.0"
+"#,
+        )
+        .unwrap();
+        let h_base = compute_sdk_input_hash(&base).unwrap().config_hash;
+        let h_bumped = compute_sdk_input_hash(&bumped).unwrap().config_hash;
+        assert_eq!(
+            h_base, h_bumped,
+            "rootfs/initramfs package bumps must not invalidate the SDK install stamp"
+        );
+    }
+
+    #[test]
+    fn rootfs_install_ignores_unrelated_kernel_fields() {
+        let base: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+kernel:
+  version: "6.6.*"
+  package: kernel-image
+"#,
+        )
+        .unwrap();
+        let with_metadata: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+kernel:
+  version: "6.6.*"
+  package: kernel-image
+  metadata: cosmetic
+  description: "added later"
+"#,
+        )
+        .unwrap();
+        let h_base = compute_rootfs_input_hash(&base, std::path::Path::new("."))
+            .unwrap()
+            .config_hash;
+        let h_extra = compute_rootfs_input_hash(&with_metadata, std::path::Path::new("."))
+            .unwrap()
+            .config_hash;
+        assert_eq!(
+            h_base, h_extra,
+            "adding unrelated keys under `kernel:` must not invalidate the rootfs install stamp"
+        );
+    }
+
+    #[test]
+    fn rootfs_install_invalidates_on_kernel_version_change() {
+        let v1: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+kernel:
+  version: "6.6.*"
+"#,
+        )
+        .unwrap();
+        let v2: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+kernel:
+  version: "6.7.*"
+"#,
+        )
+        .unwrap();
+        let h_v1 = compute_rootfs_input_hash(&v1, std::path::Path::new("."))
+            .unwrap()
+            .config_hash;
+        let h_v2 = compute_rootfs_input_hash(&v2, std::path::Path::new("."))
+            .unwrap()
+            .config_hash;
+        assert_ne!(h_v1, h_v2);
+    }
+
+    #[test]
+    fn rootfs_install_post_install_content_change_invalidates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("post.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho v1\n").unwrap();
+
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+  post_install: post.sh
+"#,
+        )
+        .unwrap();
+        let h1 = compute_rootfs_input_hash(&config, tmp.path())
+            .unwrap()
+            .config_hash;
+
+        std::fs::write(&script, b"#!/bin/sh\necho v2\n").unwrap();
+        let h2 = compute_rootfs_input_hash(&config, tmp.path())
+            .unwrap()
+            .config_hash;
+
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn stamp_version_bump_invalidates_old_stamps() {
+        let inputs = StampInputs::new("sha256:abc".to_string());
+        let mut stamp = Stamp::sdk_install("x86_64", inputs.clone(), StampOutputs::default());
+        // Forge an older version.
+        stamp.version = STAMP_VERSION - 1;
+        assert!(
+            !stamp.is_current(&inputs),
+            "older stamp version should be reported as stale"
         );
     }
 }

@@ -359,7 +359,7 @@ mod tests {
             rt_json
         );
 
-        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        let result_before = validate_stamps_batch(&requirements, &output_before, &[]);
         assert!(result_before.is_satisfied());
 
         // After runtime clean: SDK still there, runtime stamps gone
@@ -369,7 +369,7 @@ mod tests {
             sdk_json
         );
 
-        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        let result_after = validate_stamps_batch(&requirements, &output_after, &[]);
         assert!(!result_after.is_satisfied());
         assert_eq!(result_after.missing.len(), 1);
         assert_eq!(
@@ -434,7 +434,7 @@ mod tests {
             ext_build_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output_after, None);
+        let result = validate_stamps_batch(&requirements, &output_after, &[]);
         assert!(!result.is_satisfied());
         // Only runtime stamp should be missing
         assert_eq!(result.satisfied.len(), 3);

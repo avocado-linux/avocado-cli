@@ -58,7 +58,7 @@ pub async fn check_prerequisites<T: TaskPrerequisites>(
         .context("Failed to run prerequisite stamp check")?
         .unwrap_or_default();
 
-    let validation = validate_stamps_batch(&requirements, &stdout, None);
+    let validation = validate_stamps_batch(&requirements, &stdout, &[]);
 
     if !validation.is_satisfied() {
         validation

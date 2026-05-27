@@ -9,9 +9,9 @@ use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::stamps::{
-    compute_ext_input_hash, compute_ext_input_hash_with_fs, generate_batch_read_stamps_script,
-    generate_write_stamp_script, resolve_required_stamps, validate_stamps_batch, Stamp,
-    StampCommand, StampComponent, StampOutputs,
+    compute_ext_build_input_hash, compute_ext_image_input_hash, compute_ext_install_input_hash,
+    generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
+    validate_stamps_batch, CurrentInput, Stamp, StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -267,17 +267,33 @@ impl ExtImageCommand {
                 .run_in_container_with_output(run_config)
                 .await?;
 
-            // Compute current inputs from composed config for staleness detection.
-            // Use the base hash (without filesystem) to match what install/build stamps wrote.
-            // The filesystem-aware hash is only used when writing/reading the image stamp itself.
-            let current_inputs = compute_ext_input_hash(parsed, &self.extension).ok();
-            let validation = validate_stamps_batch(
-                &required,
-                output.as_deref().unwrap_or(""),
-                current_inputs
-                    .as_ref()
-                    .map(|i| (&StampComponent::Extension, i)),
-            );
+            // Compute step-scoped current inputs. Each Extension stamp
+            // (install / build / image) has its own narrow hash; pass all
+            // three so validate_stamps_batch can match each requirement
+            // against the matching step's hash.
+            let project_root = config.project_root(&self.config_path);
+            let install_inputs = compute_ext_install_input_hash(parsed, &self.extension).ok();
+            let build_inputs =
+                compute_ext_build_input_hash(parsed, &self.extension, &project_root).ok();
+            let image_inputs = compute_ext_image_input_hash(
+                parsed,
+                &self.extension,
+                Some(effective_fs),
+                &project_root,
+            )
+            .ok();
+            let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
+            if let Some(ref i) = install_inputs {
+                current_inputs.push((StampComponent::Extension, StampCommand::Install, i));
+            }
+            if let Some(ref i) = build_inputs {
+                current_inputs.push((StampComponent::Extension, StampCommand::Build, i));
+            }
+            if let Some(ref i) = image_inputs {
+                current_inputs.push((StampComponent::Extension, StampCommand::Image, i));
+            }
+            let validation =
+                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &current_inputs);
 
             if !validation.is_satisfied() {
                 validation
@@ -631,8 +647,12 @@ impl ExtImageCommand {
 
             // Write extension image stamp (unless --no-stamps)
             if !self.no_stamps {
-                let inputs =
-                    compute_ext_input_hash_with_fs(parsed, &self.extension, Some(filesystem))?;
+                let inputs = compute_ext_image_input_hash(
+                    parsed,
+                    &self.extension,
+                    Some(filesystem),
+                    &config.project_root(&self.config_path),
+                )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;

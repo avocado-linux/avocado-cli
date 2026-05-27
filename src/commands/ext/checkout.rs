@@ -136,7 +136,7 @@ impl ExtCheckoutCommand {
                     .await?;
 
                 let validation =
-                    validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+                    validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
 
                 if !validation.is_satisfied() {
                     validation
@@ -676,7 +676,7 @@ mod tests {
             install_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         // Should pass without needing build stamp
         assert!(result.is_satisfied());
@@ -708,7 +708,7 @@ mod tests {
             sdk_json
         );
 
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         assert!(!result.is_satisfied());
         assert_eq!(result.missing.len(), 1);
@@ -752,7 +752,7 @@ mod tests {
             install_json
         );
 
-        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        let result_before = validate_stamps_batch(&requirements, &output_before, &[]);
         assert!(result_before.is_satisfied(), "Should pass before clean");
 
         // After ext clean: SDK still there, ext stamp gone
@@ -762,7 +762,7 @@ mod tests {
             sdk_json
         );
 
-        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        let result_after = validate_stamps_batch(&requirements, &output_after, &[]);
         assert!(!result_after.is_satisfied(), "Should fail after ext clean");
         assert_eq!(result_after.missing.len(), 1);
     }
