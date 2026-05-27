@@ -11136,6 +11136,50 @@ rootfs:
         assert!(resolved.users.as_ref().unwrap().contains_key("root"));
     }
 
+    /// Regression: when a runtime has no explicit `rootfs:` / `initramfs:`
+    /// ref, runtime build must still pick up the top-level default entry's
+    /// `permissions:`. Previously `resolve_runtime_rootfs` returned None
+    /// here, the permissions section came out empty, and root login was
+    /// silently broken on the resulting image.
+    #[test]
+    fn test_rootfs_default_fallback_carries_permissions() {
+        let yaml = r#"
+default_target: qemuarm64
+permissions:
+  dev:
+    users:
+      root:
+        password: ""
+rootfs:
+  permissions: dev
+initramfs:
+  permissions: dev
+runtimes:
+  dev:
+    target: aarch64-unknown-linux-gnu
+    packages: { avocado-runtime: "*" }
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        // Runtime has no explicit rootfs/initramfs ref — must fall back
+        // to the top-level default entry to pick up permissions.
+        assert!(config.resolve_runtime_rootfs("dev").is_none());
+        assert!(config.resolve_runtime_initramfs("dev").is_none());
+        let default_rootfs = config
+            .rootfs_default()
+            .expect("rootfs default present from singleton form");
+        let perms = config
+            .resolve_image_permissions(default_rootfs)
+            .expect("permissions resolve via default rootfs");
+        assert!(perms.users.as_ref().unwrap().contains_key("root"));
+        let default_initramfs = config
+            .initramfs_default()
+            .expect("initramfs default present from singleton form");
+        let perms = config
+            .resolve_image_permissions(default_initramfs)
+            .expect("permissions resolve via default initramfs");
+        assert!(perms.users.as_ref().unwrap().contains_key("root"));
+    }
+
     #[test]
     fn test_validate_runtime_refs_rejects_unresolved_rootfs_permissions() {
         let yaml = r#"
