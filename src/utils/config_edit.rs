@@ -296,6 +296,26 @@ fn leading_spaces(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// Returns true if a non-blank, non-comment `line` is still part of a YAML
+/// sequence block under a key at `list_indent`. A line ends the block when
+/// it is a sibling key at `list_indent` (or shallower) that is not itself a
+/// `- ` sequence item. YAML permits sequence items at the same indent as
+/// their parent key (compact style) as well as deeper indents.
+fn line_continues_sequence(line: &str, list_indent: usize) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return true;
+    }
+    let indent = leading_spaces(line);
+    if indent > list_indent {
+        return true;
+    }
+    if indent == list_indent && (trimmed.starts_with("- ") || trimmed == "-") {
+        return true;
+    }
+    false
+}
+
 /// Ensure avocado-ext-connect and avocado-ext-tunnels are present in avocado.yaml.
 ///
 /// Adds them to the top-level `extensions:` section (as package sources) and to the
@@ -546,14 +566,14 @@ fn add_runtime_extension_entry_before(
     let mut list_end = ext_list_line + 1;
     let mut entry_indent = None;
     for (i, line) in lines.iter().enumerate().skip(ext_list_line + 1) {
+        if !line_continues_sequence(line, list_indent) {
+            break;
+        }
         if line.trim().is_empty() || line.trim().starts_with('#') {
             list_end = i + 1;
             continue;
         }
         let indent = leading_spaces(line);
-        if indent <= list_indent {
-            break;
-        }
         if entry_indent.is_none() {
             entry_indent = Some(indent);
         }
@@ -639,12 +659,11 @@ fn has_runtime_extension_entry(content: &str, runtime_name: &str, ext_name: &str
 
     // Scan list items (lines starting with `- `)
     for line in lines.iter().skip(ext_list_line + 1) {
+        if !line_continues_sequence(line, list_indent) {
+            break;
+        }
         if line.trim().is_empty() || line.trim().starts_with('#') {
             continue;
-        }
-        let indent = leading_spaces(line);
-        if indent <= list_indent {
-            break;
         }
         let trimmed = line.trim();
         if trimmed == format!("- {ext_name}") {
@@ -711,14 +730,14 @@ fn add_runtime_extension_entry(
     let mut list_end = ext_list_line + 1;
     let mut entry_indent = None;
     for (i, line) in lines.iter().enumerate().skip(ext_list_line + 1) {
+        if !line_continues_sequence(line, list_indent) {
+            break;
+        }
         if line.trim().is_empty() || line.trim().starts_with('#') {
             list_end = i + 1;
             continue;
         }
         let indent = leading_spaces(line);
-        if indent <= list_indent {
-            break;
-        }
         if entry_indent.is_none() {
             entry_indent = Some(indent);
         }
@@ -1057,21 +1076,22 @@ fn remove_runtime_extension_entry(
     })?;
     let list_indent = leading_spaces(lines[ext_list_line]);
 
-    // Find and remove the matching entry
+    // Find and remove the matching entry. Determine the end of the sequence
+    // block first so we don't accidentally drop matching tokens that live
+    // outside the list (e.g. inside a later extension definition).
     let target = format!("- {ext_name}");
-    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut block_end = ext_list_line + 1;
+    for (i, line) in lines.iter().enumerate().skip(ext_list_line + 1) {
+        if !line_continues_sequence(line, list_indent) {
+            break;
+        }
+        block_end = i + 1;
+    }
 
+    let mut result_lines: Vec<String> = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
-        if i > ext_list_line {
-            let indent = leading_spaces(line);
-            if !line.trim().is_empty() && !line.trim().starts_with('#') && indent <= list_indent {
-                // Past the extensions list — just copy
-                result_lines.push(line.to_string());
-                continue;
-            }
-            if line.trim() == target {
-                continue; // skip this entry
-            }
+        if i > ext_list_line && i < block_end && line.trim() == target {
+            continue; // skip this entry
         }
         result_lines.push(line.to_string());
     }
@@ -1521,6 +1541,133 @@ extensions:
         );
         // Connect should still be there
         assert!(result.contains("avocado-ext-connect:"));
+    }
+
+    #[test]
+    fn test_ensure_connect_extensions_compact_indent_runtime_list() {
+        // Compact-style sequence: items at the same indent as the `extensions:` key.
+        // This is what the shell-heartbeat reference scaffold emits as of avocado 0.40.0.
+        // Regression for ENG-1868: previously the inserter hard-coded 6-space indent,
+        // producing unparseable mixed-indent YAML.
+        let config = r#"runtimes:
+  dev:
+    extensions:
+    - avocado-ext-dev
+    - avocado-ext-sshd-dev
+    - app
+    packages:
+      avocado-runtime: '*'
+
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: '*'
+  avocado-ext-sshd-dev:
+    source:
+      type: package
+      version: '*'
+  app:
+    types:
+    - sysext
+    version: "0.1.0"
+"#;
+        let (result, changed) = ensure_connect_extensions_in_yaml(config, "dev").unwrap();
+        assert!(changed);
+
+        // Newly added runtime entries must match the existing 4-space indent
+        // (the same indent as the `extensions:` key), not the previously
+        // hard-coded 6-space level.
+        assert!(result.contains("    - avocado-ext-connect-config\n"));
+        assert!(result.contains("    - avocado-ext-connect\n"));
+        assert!(result.contains("    - avocado-ext-tunnels\n"));
+        assert!(
+            !result.contains("      - avocado-ext-connect"),
+            "must not emit 6-space indent when existing items are at 4-space:\n{result}"
+        );
+
+        // Result must remain valid YAML — round-trip through a real parser.
+        let _: serde_yaml::Value = serde_yaml::from_str(&result)
+            .unwrap_or_else(|e| panic!("connect init produced unparseable YAML: {e}\n{result}"));
+
+        // Ordering: connect-config precedes connect (precedence on overlay merge).
+        let cfg_pos = result.find("- avocado-ext-connect-config").unwrap();
+        let conn_pos = result.find("- avocado-ext-connect\n").unwrap();
+        assert!(cfg_pos < conn_pos);
+
+        // Original entries preserved.
+        assert!(result.contains("    - avocado-ext-dev"));
+        assert!(result.contains("    - avocado-ext-sshd-dev"));
+    }
+
+    #[test]
+    fn test_has_runtime_extension_entry_compact_indent() {
+        let config = r#"runtimes:
+  dev:
+    extensions:
+    - avocado-ext-dev
+    - avocado-ext-connect
+    packages:
+      avocado-runtime: '*'
+"#;
+        assert!(has_runtime_extension_entry(
+            config,
+            "dev",
+            "avocado-ext-connect"
+        ));
+        assert!(has_runtime_extension_entry(
+            config,
+            "dev",
+            "avocado-ext-dev"
+        ));
+        assert!(!has_runtime_extension_entry(
+            config,
+            "dev",
+            "avocado-ext-tunnels"
+        ));
+    }
+
+    #[test]
+    fn test_remove_connect_config_extension_compact_indent() {
+        let config = r#"runtimes:
+  dev:
+    extensions:
+    - avocado-ext-dev
+    - avocado-ext-connect-config
+    - avocado-ext-connect
+    - avocado-ext-tunnels
+    packages:
+      avocado-runtime: '*'
+
+extensions:
+  avocado-ext-dev:
+    source:
+      type: package
+      version: '*'
+
+  avocado-ext-connect-config:
+    types:
+    - confext
+    version: "0.1.0"
+    overlay: overlay
+
+  avocado-ext-connect:
+    source:
+      type: package
+      version: "*"
+
+  avocado-ext-tunnels:
+    source:
+      type: package
+      version: "*"
+"#;
+        let (result, changed) = remove_connect_config_extension_in_yaml(config, "dev").unwrap();
+        assert!(changed);
+        assert!(!result.contains("avocado-ext-connect-config"));
+        assert!(result.contains("- avocado-ext-connect\n"));
+        assert!(result.contains("- avocado-ext-tunnels\n"));
+        assert!(result.contains("- avocado-ext-dev\n"));
+        let _: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
     }
 
     #[test]
