@@ -270,8 +270,7 @@ impl RuntimeDeployCommand {
                 }
             };
 
-            let validation =
-                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+            let validation = validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &[]);
 
             if !validation.is_satisfied() {
                 let msg = format!("Cannot deploy runtime '{}'", self.runtime_name);

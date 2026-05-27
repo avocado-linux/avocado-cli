@@ -13,7 +13,7 @@ use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
-    compute_runtime_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
+    compute_runtime_install_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -314,7 +314,7 @@ impl RuntimeInstallCommand {
                     &target_arch,
                     &self.config_path,
                 )? {
-                    let inputs = compute_runtime_input_hash(&merged_runtime, runtime_name, parsed)?;
+                    let inputs = compute_runtime_install_input_hash(&merged_runtime, runtime_name)?;
                     let outputs = StampOutputs::default();
                     let stamp = Stamp::runtime_install(runtime_name, &target_arch, inputs, outputs);
                     let stamp_script = generate_write_stamp_script(&stamp)?;

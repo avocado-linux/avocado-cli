@@ -13,7 +13,7 @@ use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType
 use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
-    compute_ext_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
+    compute_ext_install_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -412,7 +412,7 @@ impl ExtInstallCommand {
                     ctx.renderer
                         .append_output(&ctx.task_id, "Writing install stamp...".to_string());
                 }
-                let inputs = compute_ext_input_hash(parsed, ext_name)?;
+                let inputs = compute_ext_install_input_hash(parsed, ext_name)?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;

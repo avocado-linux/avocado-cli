@@ -154,7 +154,7 @@ impl SdkCompileCommand {
                 .await?;
 
             let validation =
-                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), None);
+                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
 
             if !validation.is_satisfied() {
                 validation
@@ -533,7 +533,7 @@ dependencies = { gcc = "*" }
 
         // SDK stamp missing
         let output = format!("sdk/{}/install.stamp:::null", get_local_arch());
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         assert!(!result.is_satisfied());
         assert_eq!(result.missing.len(), 1);
@@ -558,7 +558,7 @@ dependencies = { gcc = "*" }
         let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
 
         let output = format!("sdk/{}/install.stamp:::{}", get_local_arch(), sdk_json);
-        let result = validate_stamps_batch(&requirements, &output, None);
+        let result = validate_stamps_batch(&requirements, &output, &[]);
 
         assert!(result.is_satisfied());
         assert_eq!(result.satisfied.len(), 1);
@@ -582,12 +582,12 @@ dependencies = { gcc = "*" }
         let sdk_json = serde_json::to_string(&sdk_stamp).unwrap();
 
         let output_before = format!("sdk/{}/install.stamp:::{}", get_local_arch(), sdk_json);
-        let result_before = validate_stamps_batch(&requirements, &output_before, None);
+        let result_before = validate_stamps_batch(&requirements, &output_before, &[]);
         assert!(result_before.is_satisfied(), "Should pass before clean");
 
         // After clean --stamps: SDK stamp gone (simulating rm -rf .stamps/)
         let output_after = format!("sdk/{}/install.stamp:::null", get_local_arch());
-        let result_after = validate_stamps_batch(&requirements, &output_after, None);
+        let result_after = validate_stamps_batch(&requirements, &output_after, &[]);
         assert!(
             !result_after.is_satisfied(),
             "Should fail after clean --stamps"

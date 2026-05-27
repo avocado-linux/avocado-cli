@@ -197,8 +197,7 @@ impl BuildCommand {
             let output = container_helper
                 .run_in_container_with_output(run_config)
                 .await?;
-            let validation =
-                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), None);
+            let validation = validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &[]);
 
             if !validation.is_satisfied() {
                 let error =
