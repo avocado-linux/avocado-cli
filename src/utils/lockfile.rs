@@ -1394,7 +1394,19 @@ impl LockFile {
         }
     }
 
-    /// Clear all entries for a target (SDK, rootfs, initramfs, target-sysroot, extensions, runtimes)
+    /// Clear all entries for a target. Drops package locks across every
+    /// sysroot AND releases the pinned `KERNEL_VERSION` map + the
+    /// per-kernel sysroot table.
+    ///
+    /// Leaving `kernel_versions` / `kernels` populated after an unlock
+    /// caused the desktop's Unlock + reinstall flow to fail with
+    /// `No match for argument: kernel-image-<old-pinned-version>`:
+    /// the package locks were cleared so dnf re-resolved sysroot
+    /// content from the latest feed, but the pinned KERNEL_VERSION
+    /// was still demanded by name. When the feed had since dropped
+    /// the exact pinned version (rolling distro), dnf bailed.
+    /// Unlock semantically means "let me re-pick latest"; the kernel
+    /// pins must come along for the ride.
     pub fn clear_all(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.sdk.clear();
@@ -1403,6 +1415,8 @@ impl LockFile {
             target_locks.target_sysroot.clear();
             target_locks.extensions.clear();
             target_locks.runtimes.clear();
+            target_locks.kernel_versions.clear();
+            target_locks.kernels.clear();
         }
     }
 

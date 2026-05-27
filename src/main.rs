@@ -3783,18 +3783,33 @@ async fn main() -> Result<()> {
         if let Ok(Ok(Some(version))) =
             tokio::time::timeout(std::time::Duration::from_secs(5), handle).await
         {
-            let upgrade_hint = match utils::install_method::current_install_method() {
-                utils::install_method::InstallMethod::Homebrew => {
-                    "Run 'avocado upgrade' or 'brew upgrade avocado-cli' to update."
-                }
-                _ => "Run 'avocado upgrade' to update.",
-            };
-            eprintln!(
-                "\n\x1b[93m[UPDATE]\x1b[0m avocado {} is available (you have {}).\n         {}",
-                version,
-                env!("CARGO_PKG_VERSION"),
-                upgrade_hint
-            );
+            // Suppress the banner when the user asked for JSON / NDJSON
+            // output. The banner goes to stderr, but callers that
+            // capture both streams (e.g. the avocado-desktop CLI runner
+            // merges stdout + stderr in causal order) ended up feeding
+            // the banner into a JSON parser, which then refused the
+            // entire payload. Silent-when-machine-readable is the
+            // safer contract.
+            let json_mode = std::env::args().any(|a| a == "--output")
+                && std::env::args()
+                    .skip_while(|a| a != "--output")
+                    .nth(1)
+                    .as_deref()
+                    == Some("json");
+            if !json_mode {
+                let upgrade_hint = match utils::install_method::current_install_method() {
+                    utils::install_method::InstallMethod::Homebrew => {
+                        "Run 'avocado upgrade' or 'brew upgrade avocado-cli' to update."
+                    }
+                    _ => "Run 'avocado upgrade' to update.",
+                };
+                eprintln!(
+                    "\n\x1b[93m[UPDATE]\x1b[0m avocado {} is available (you have {}).\n         {}",
+                    version,
+                    env!("CARGO_PKG_VERSION"),
+                    upgrade_hint
+                );
+            }
         }
     }
 

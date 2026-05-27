@@ -445,6 +445,66 @@ sdk:
     }
 
     #[tokio::test]
+    async fn test_clean_unlock_clears_pinned_kernel_versions() {
+        // Regression: `clean --unlock` must also drop pinned
+        // `kernel_versions` and the per-kernel sysroot table.
+        // Without this, the next install picked the latest packages
+        // (good) but still demanded the old pinned KERNEL_VERSION
+        // by name (`kernel-image-6.6.123-yocto-standard`), and dnf
+        // failed with "No match for argument: …" once the feed had
+        // moved past that exact version.
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let config_content = r#"
+default_target: "qemux86-64"
+sdk:
+  image: "test-image"
+"#;
+        let config_path = temp_path.join("avocado.yaml");
+        fs::write(&config_path, config_content).unwrap();
+
+        // Seed both a kernel_versions pin and a kernels sysroot
+        // package entry. Both must be cleared.
+        let mut lock = LockFile::new();
+        {
+            let tl = lock.targets.entry("qemux86-64".to_string()).or_default();
+            tl.kernel_versions
+                .insert("rootfs".to_string(), "6.6.123-yocto-standard".to_string());
+            let mut pkgs = std::collections::HashMap::new();
+            pkgs.insert("kernel-image".to_string(), "6.6.123-r0.0".to_string());
+            tl.kernels
+                .insert("6.6.123-yocto-standard".to_string(), pkgs);
+        }
+        lock.save(temp_path).unwrap();
+
+        let clean_cmd = CleanCommand::new(
+            Some(temp_path.to_str().unwrap().to_string()),
+            false,
+            None,
+            false,
+        )
+        .with_config_path(Some(config_path.to_string_lossy().to_string()))
+        .with_target(Some("qemux86-64".to_string()))
+        .with_unlock(true);
+        let result = clean_cmd.execute().await;
+        assert!(result.is_ok(), "clean --unlock failed: {result:?}");
+
+        let reloaded = LockFile::load(temp_path).unwrap();
+        let tl = reloaded.targets.get("qemux86-64").expect("target survives");
+        assert!(
+            tl.kernel_versions.is_empty(),
+            "kernel_versions should be cleared by --unlock, got: {:?}",
+            tl.kernel_versions
+        );
+        assert!(
+            tl.kernels.is_empty(),
+            "kernels sysroot table should be cleared by --unlock, got: {:?}",
+            tl.kernels
+        );
+    }
+
+    #[tokio::test]
     async fn test_clean_skip_volumes_keeps_state_file() {
         // `--skip-volumes` means "leave both the volume and its
         // state-file pointer alone" — stamps-/unlock-only invocations
