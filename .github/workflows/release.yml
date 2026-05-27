@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, security]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -75,7 +75,7 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         run: sudo apt-get update && sudo apt-get install -y cmake
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -235,7 +235,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Check out homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: avocado-linux/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
