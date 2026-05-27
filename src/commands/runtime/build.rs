@@ -2248,11 +2248,21 @@ echo "Docker image priming complete.""#,
             render_users_groups_script(users.as_ref(), groups.as_ref(), etc_dir, None)
         };
 
+        // When the runtime doesn't declare its own `rootfs:` / `initramfs:`
+        // ref, fall back to the top-level default entry — same fallback the
+        // image build itself uses to find filesystem/post_install settings.
+        // Without this fallback, projects that only set permissions at the
+        // top level (the common case) silently get no permissions baked
+        // into the work dir.
+        let resolved_rootfs = config
+            .resolve_runtime_rootfs(&self.runtime_name)
+            .or_else(|| config.rootfs_default());
+        let resolved_initramfs = config
+            .resolve_runtime_initramfs(&self.runtime_name)
+            .or_else(|| config.initramfs_default());
+
         let rootfs_post_install = get_post_install(parsed.get("rootfs"));
-        let rootfs_permissions_section = render_perms(
-            config.resolve_runtime_rootfs(&self.runtime_name),
-            "$ROOTFS_WORK/etc",
-        );
+        let rootfs_permissions_section = render_perms(resolved_rootfs, "$ROOTFS_WORK/etc");
         let rootfs_build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
             &config.get_rootfs_filesystem(),
@@ -2261,10 +2271,7 @@ echo "Docker image priming complete.""#,
         );
 
         let initramfs_post_install = get_post_install(parsed.get("initramfs"));
-        let initramfs_permissions_section = render_perms(
-            config.resolve_runtime_initramfs(&self.runtime_name),
-            "$INITRAMFS_WORK/etc",
-        );
+        let initramfs_permissions_section = render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
         let initramfs_build_section = generate_initramfs_build_script(
             NAMESPACE_UUID,
             &config.get_initramfs_filesystem(),
