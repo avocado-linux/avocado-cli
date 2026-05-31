@@ -210,9 +210,7 @@ pub async fn resolve_latest(config: &Config, target: &str) -> Result<Option<Repo
     else {
         return Ok(None);
     };
-    let Some(repo_url) = config.get_repo_url() else {
-        return Ok(None);
-    };
+    let repo_url = config.effective_repo_url();
     let client = build_client(config)?;
     match fetch_latest(&client, &repo_url, &release, &channel, target).await? {
         LatestResult::Unsupported => Ok(None),
@@ -269,9 +267,7 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
         // No release/channel to derive a feed from — nothing to pin.
         return Ok(());
     };
-    let Some(repo_url) = config.get_repo_url() else {
-        return Ok(());
-    };
+    let repo_url = config.effective_repo_url();
 
     let mut lock = LockFile::load(src_dir)
         .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;

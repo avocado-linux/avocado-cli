@@ -1373,6 +1373,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// Default prod package-feed base URL, used when neither config
+    /// (`distro.repo.url`/`sdk.repo_url`) nor env sets one. Single source of
+    /// truth: the container env-builder and the snapshot resolver both derive
+    /// the default from here, so the resolver pins against the same feed the
+    /// container's dnf fetches from.
+    pub const DEFAULT_REPO_URL: &'static str = "https://repo.avocadolinux.org";
+
     /// Validate that the running CLI version satisfies the `cli_requirement` if set.
     pub fn validate_cli_requirement(&self) -> Result<()> {
         if let Some(ref requirement) = self.cli_requirement {
@@ -3592,6 +3599,15 @@ impl Config {
         }
         // Legacy fallback: sdk.repo_url
         self.sdk.as_ref()?.repo_url.as_ref().cloned()
+    }
+
+    /// Effective repo base URL: the configured value, or [`Self::DEFAULT_REPO_URL`]
+    /// when none is set. Single source of truth for the prod-feed default — used by
+    /// the snapshot resolver and the container env-builder so the resolver pins
+    /// against the same feed the container's dnf actually fetches from.
+    pub fn effective_repo_url(&self) -> String {
+        self.get_repo_url()
+            .unwrap_or_else(|| Self::DEFAULT_REPO_URL.to_string())
     }
 
     /// Path to a CA cert to trust for the repo endpoint.
