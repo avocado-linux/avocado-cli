@@ -153,6 +153,11 @@ impl SdkInstallCommand {
         let config = &composed.config;
         let target = validate_and_log_target(self.target.as_deref(), config)?;
 
+        // Apply the reproducible snapshot pin (auto-pin on first fetch) before
+        // any repo_release is read, so the SDK + target sysroots fetch against
+        // the frozen channel snapshot.
+        crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &target).await?;
+
         // Merge container args from config with CLI args
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 

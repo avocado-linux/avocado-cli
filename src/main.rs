@@ -73,6 +73,7 @@ use commands::signing_keys::{
     SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
 };
 use commands::unlock::UnlockCommand;
+use commands::update::UpdateCommand;
 use commands::upgrade::UpgradeCommand;
 
 #[derive(Parser)]
@@ -549,6 +550,19 @@ enum Commands {
         /// Unlock initramfs
         #[arg(long)]
         initramfs: bool,
+    },
+    /// Move a target forward: advance to the latest feed snapshot and re-resolve
+    /// packages to their latest versions on the next install (rewrites the lock).
+    Update {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Target architecture
+        #[arg(short, long)]
+        target: Option<String>,
     },
     /// Avocado Connect platform commands (auth, upload)
     Connect {
@@ -2334,6 +2348,15 @@ async fn main() -> Result<()> {
                 initramfs,
             );
             unlock_cmd.execute()?;
+            Ok(())
+        }
+        Commands::Update {
+            config,
+            verbose,
+            target,
+        } => {
+            let update_cmd = UpdateCommand::new(config, target.or(cli.target), verbose);
+            update_cmd.execute().await?;
             Ok(())
         }
         Commands::Runtime { command } => match command {

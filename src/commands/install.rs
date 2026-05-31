@@ -121,6 +121,12 @@ impl InstallCommand {
         let _parsed = &composed.merged_value;
         let _target = validate_and_log_target(self.target.as_deref(), config)?;
 
+        // Resolve & apply the reproducible snapshot pin once, before any sysroot
+        // fetch. This exposes AVOCADO_RELEASEVER so every sub-install (SDK,
+        // rootfs, initramfs, extensions, runtimes) freezes to the same immutable
+        // channel snapshot — auto-pinning on first fetch, reusing the pin after.
+        crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &_target).await?;
+
         // Compute target runtimes early so we can show a useful start message.
         let initial_runtimes = self.find_target_relevant_runtimes(config, _parsed, &_target)?;
         if initial_runtimes.len() == 1 {
