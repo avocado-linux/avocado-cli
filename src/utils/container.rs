@@ -661,9 +661,16 @@ impl SdkContainer {
             host_platform.to_string(),
         );
 
-        if let Some(url) = &config.repo_url {
-            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
-        }
+        // Always provide the repo URL (configured value or the prod default) so
+        // the container shell never needs its own literal default — single source
+        // of truth is Config::DEFAULT_REPO_URL.
+        env_vars.insert(
+            "AVOCADO_SDK_REPO_URL".to_string(),
+            config
+                .repo_url
+                .clone()
+                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+        );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
@@ -838,9 +845,16 @@ impl SdkContainer {
         // Set host platform - the remote is running the container
         env_vars.insert("AVOCADO_HOST_PLATFORM".to_string(), "linux".to_string());
 
-        if let Some(url) = &config.repo_url {
-            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
-        }
+        // Always provide the repo URL (configured value or the prod default) so
+        // the container shell never needs its own literal default — single source
+        // of truth is Config::DEFAULT_REPO_URL.
+        env_vars.insert(
+            "AVOCADO_SDK_REPO_URL".to_string(),
+            config
+                .repo_url
+                .clone()
+                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+        );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
@@ -1219,9 +1233,16 @@ impl SdkContainer {
             host_platform.to_string(),
         );
 
-        if let Some(url) = &config.repo_url {
-            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
-        }
+        // Always provide the repo URL (configured value or the prod default) so
+        // the container shell never needs its own literal default — single source
+        // of truth is Config::DEFAULT_REPO_URL.
+        env_vars.insert(
+            "AVOCADO_SDK_REPO_URL".to_string(),
+            config
+                .repo_url
+                .clone()
+                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+        );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
@@ -1465,9 +1486,16 @@ impl SdkContainer {
         // Set host platform - the remote is running the container
         env_vars.insert("AVOCADO_HOST_PLATFORM".to_string(), "linux".to_string());
 
-        if let Some(url) = &config.repo_url {
-            env_vars.insert("AVOCADO_SDK_REPO_URL".to_string(), url.clone());
-        }
+        // Always provide the repo URL (configured value or the prod default) so
+        // the container shell never needs its own literal default — single source
+        // of truth is Config::DEFAULT_REPO_URL.
+        env_vars.insert(
+            "AVOCADO_SDK_REPO_URL".to_string(),
+            config
+                .repo_url
+                .clone()
+                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+        );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
@@ -2058,12 +2086,9 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
     done
 fi
 
-# Get repo url from environment or default to prod
-if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
-    REPO_URL="$AVOCADO_SDK_REPO_URL"
-else
-    REPO_URL="https://repo.avocadolinux.org"
-fi
+# Repo URL is always supplied by the CLI env-builder (Config::DEFAULT_REPO_URL
+# when unset), so there is no literal default to drift here.
+REPO_URL="$AVOCADO_SDK_REPO_URL"
 
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'"; fi
 
@@ -2349,12 +2374,9 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
     done
 fi
 
-# Get repo url from environment or default to prod
-if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
-    REPO_URL="$AVOCADO_SDK_REPO_URL"
-else
-    REPO_URL="https://repo.avocadolinux.org"
-fi
+# Repo URL is always supplied by the CLI env-builder (Config::DEFAULT_REPO_URL
+# when unset), so there is no literal default to drift here.
+REPO_URL="$AVOCADO_SDK_REPO_URL"
 
 if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'"; fi
 
