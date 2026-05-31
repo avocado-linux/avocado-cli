@@ -860,6 +860,12 @@ pub struct DistroRepoConfig {
     pub url: Option<String>,
     /// Explicit releasever override. When not set, derived from distro.release/channel.
     pub releasever: Option<String>,
+    /// Path to a CA cert (PEM) to trust for the repo endpoint (self-signed / private CA).
+    /// Env override: AVOCADO_REPO_CA. Appended to the SDK trust bundle for all dnf phases.
+    pub ca: Option<String>,
+    /// TLS verification toggle for the repo endpoint. Set false to skip verification
+    /// (testing only). Env override: AVOCADO_REPO_INSECURE=1. Default: verify.
+    pub tls_verify: Option<bool>,
 }
 
 /// Reference to a Docker image for priming on the var partition at build time.
@@ -1658,6 +1664,10 @@ impl Config {
             .with_context(|| "Failed to deserialize composed configuration")?;
 
         config.validate_cli_requirement()?;
+
+        // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
+        // env so the container env-builders pick them up the same as the env-var form.
+        config.promote_repo_tls_env();
 
         Ok(ComposedConfig {
             config,
@@ -3290,6 +3300,10 @@ impl Config {
         config.synthesize_implicit_default_runtime();
         config.validate_runtime_refs()?;
 
+        // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
+        // env so the container env-builders pick them up the same as the env-var form.
+        config.promote_repo_tls_env();
+
         Ok(config)
     }
 
@@ -3578,6 +3592,51 @@ impl Config {
         }
         // Legacy fallback: sdk.repo_url
         self.sdk.as_ref()?.repo_url.as_ref().cloned()
+    }
+
+    /// Path to a CA cert to trust for the repo endpoint.
+    /// Priority: AVOCADO_REPO_CA (env) > distro.repo.ca (config).
+    pub fn get_repo_ca(&self) -> Option<String> {
+        if let Ok(p) = env::var("AVOCADO_REPO_CA") {
+            if !p.is_empty() {
+                return Some(p);
+            }
+        }
+        self.distro
+            .as_ref()
+            .and_then(|d| d.repo.as_ref())
+            .and_then(|r| r.ca.as_ref())
+            .cloned()
+    }
+
+    /// Whether to skip TLS verification for the repo endpoint (testing only).
+    /// Priority: AVOCADO_REPO_INSECURE (env, truthy) > distro.repo.tls_verify == false.
+    pub fn get_repo_insecure(&self) -> bool {
+        if let Ok(v) = env::var("AVOCADO_REPO_INSECURE") {
+            return matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        self.distro
+            .as_ref()
+            .and_then(|d| d.repo.as_ref())
+            .and_then(|r| r.tls_verify)
+            .map(|verify| !verify)
+            .unwrap_or(false)
+    }
+
+    /// Promote config-file repo TLS settings to the process env so the container
+    /// env-builders (which don't see the avocado Config) pick them up uniformly with
+    /// the env-var form. Env values already set always win; we never override them.
+    pub fn promote_repo_tls_env(&self) {
+        // When the env var isn't already set, get_repo_ca()/get_repo_insecure() return the
+        // config-file value; promote it so the container env-builders see it uniformly.
+        if env::var_os("AVOCADO_REPO_CA").is_none() {
+            if let Some(ca) = self.get_repo_ca() {
+                env::set_var("AVOCADO_REPO_CA", ca);
+            }
+        }
+        if env::var_os("AVOCADO_REPO_INSECURE").is_none() && self.get_repo_insecure() {
+            env::set_var("AVOCADO_REPO_INSECURE", "1");
+        }
     }
 
     /// Get the releasever for DNF --releasever.

@@ -353,6 +353,55 @@ fn add_security_opts(container_cmd: &mut Vec<String>) {
     }
 }
 
+/// Shared bash that wires a custom repo CA / insecure TLS into EVERY dnf phase. Centralized:
+/// every dnf call trusts `$SSL_CERT_FILE` / `$CURL_CA_BUNDLE` (the SDK bundle) — and explicit
+/// `--setopt=sslcacert=$SSL_CERT_FILE` sites point at the same file — so appending the CA to
+/// that bundle covers sdk/ext/runtime/rootfs/initramfs, the `dnf` subcommands, and host AND
+/// target repo confs. Likewise every call starts with `$DNF_SDK_HOST`, so adding
+/// `--setopt=sslverify=0` there disables verification everywhere when insecure.
+/// Must run AFTER `AVOCADO_SDK_PREFIX`, `SSL_CERT_FILE`, and `DNF_SDK_HOST` are defined, and
+/// before the first dnf call. Driven by env: AVOCADO_REPO_CA_B64 (base64 PEM) / AVOCADO_REPO_INSECURE.
+pub const REPO_TLS_SETUP_SNIPPET: &str = r##"
+# --- custom repo CA / insecure TLS (AVOCADO_REPO_CA / AVOCADO_REPO_INSECURE) ---
+if [ -n "${AVOCADO_REPO_CA_B64:-}" ]; then
+    _avocado_ca_bundle="${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt"
+    mkdir -p "$(dirname "$_avocado_ca_bundle")"
+    if ! grep -q "BEGIN AVOCADO_REPO_CA" "$_avocado_ca_bundle" 2>/dev/null; then
+        { echo "# BEGIN AVOCADO_REPO_CA"; printf '%s' "$AVOCADO_REPO_CA_B64" | base64 -d; echo; echo "# END AVOCADO_REPO_CA"; } >> "$_avocado_ca_bundle"
+        echo "[INFO] Added custom repo CA to the SDK trust bundle."
+    fi
+fi
+if [ "${AVOCADO_REPO_INSECURE:-}" = "1" ]; then
+    export DNF_SDK_HOST="${DNF_SDK_HOST} --setopt=sslverify=0"
+    echo "[WARN] AVOCADO_REPO_INSECURE=1: TLS verification DISABLED for all dnf operations."
+fi
+"##;
+
+/// Inject the repo-TLS transport env (read from the process env) into a container's env map.
+/// `AVOCADO_REPO_CA` is a host path; we read it and pass the PEM as base64 (`AVOCADO_REPO_CA_B64`)
+/// so the multi-line cert survives as a single env value. Insecure is a passthrough flag.
+pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, String>) {
+    if let Ok(path) = std::env::var("AVOCADO_REPO_CA") {
+        if !path.is_empty() {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    env_vars.insert("AVOCADO_REPO_CA_B64".to_string(), b64);
+                }
+                Err(e) => {
+                    eprintln!("[WARN] AVOCADO_REPO_CA={path} could not be read ({e}); repo CA not applied.");
+                }
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("AVOCADO_REPO_INSECURE") {
+        if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+            env_vars.insert("AVOCADO_REPO_INSECURE".to_string(), "1".to_string());
+        }
+    }
+}
+
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -618,6 +667,8 @@ impl SdkContainer {
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
+        // Custom repo CA / insecure TLS, applied across all dnf phases (see REPO_TLS_SETUP_SNIPPET).
+        inject_repo_tls_env(&mut env_vars);
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
@@ -793,6 +844,8 @@ impl SdkContainer {
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
+        // Custom repo CA / insecure TLS, applied across all dnf phases (see REPO_TLS_SETUP_SNIPPET).
+        inject_repo_tls_env(&mut env_vars);
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
@@ -1172,6 +1225,8 @@ impl SdkContainer {
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
+        // Custom repo CA / insecure TLS, applied across all dnf phases (see REPO_TLS_SETUP_SNIPPET).
+        inject_repo_tls_env(&mut env_vars);
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
@@ -1416,6 +1471,8 @@ impl SdkContainer {
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
         }
+        // Custom repo CA / insecure TLS, applied across all dnf phases (see REPO_TLS_SETUP_SNIPPET).
+        inject_repo_tls_env(&mut env_vars);
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
@@ -2187,6 +2244,8 @@ if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
 fi
 "#,
             );
+            // Custom repo CA / insecure TLS, applied across all dnf phases.
+            script.push_str(REPO_TLS_SETUP_SNIPPET);
         }
 
         script
@@ -2476,6 +2535,8 @@ if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
 fi
 "#,
             );
+            // Custom repo CA / insecure TLS, applied across all dnf phases.
+            script.push_str(REPO_TLS_SETUP_SNIPPET);
         }
 
         script
