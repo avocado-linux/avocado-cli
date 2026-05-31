@@ -28,6 +28,7 @@ pub mod scheduler;
 pub mod signing_keys;
 #[cfg(unix)]
 pub mod signing_service;
+pub mod snapshot;
 pub mod stamps;
 pub mod target;
 pub mod tui;

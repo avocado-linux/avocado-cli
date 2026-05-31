@@ -36,7 +36,11 @@ static LOCKFILE_SAVE_GATE: Mutex<()> = Mutex::new(());
 ///            `RuntimeLock` carrying both `packages` and per-runtime
 ///            `extensions`. Migration from v5 wraps the old flat map as
 ///            `{ packages: <old>, extensions: {} }`.
-const LOCKFILE_VERSION: u32 = 6;
+/// Version 7: Adds per-target `repo-snapshot`, the immutable channel snapshot
+///            the target's packages were resolved against. Additive — v6
+///            lockfiles read as v7 with `repo_snapshot: None` and behave
+///            exactly as before (track the live channel head).
+const LOCKFILE_VERSION: u32 = 7;
 
 /// Lock file name
 const LOCKFILE_NAME: &str = "lock.json";
@@ -235,6 +239,29 @@ pub type PackageVersions = HashMap<String, String>;
 /// Used for SDK (keyed by host arch) and runtimes (keyed by name)
 pub type NestedPackageVersions = HashMap<String, PackageVersions>;
 
+/// The immutable channel snapshot a target's packages were resolved against.
+///
+/// Recorded on the first fetch that resolves a snapshot (auto-pin). Subsequent
+/// fetches — including after `avocado clean` — re-resolve against this exact
+/// snapshot subtree (`{release}/{channel}/snapshots/{snapshot}`) so the build
+/// reproduces even after the live channel head advances or evicts the NEVRAs
+/// this lockfile pins. `avocado update` advances it; `avocado unlock` clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSnapshot {
+    /// Distro release (feed year) the snapshot belongs to, e.g. "2026".
+    pub release: String,
+    /// Channel the snapshot belongs to, e.g. "edge".
+    pub channel: String,
+    /// Snapshot id — the immutable `snapshots/<id>` path segment.
+    pub snapshot: String,
+    /// Provenance: the base repo URL resolved against at pin time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    /// Provenance: snapshot mint time (from `snapshots-latest.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+}
+
 /// Source metadata for a fetched extension in the lock file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionSourceLock {
@@ -404,6 +431,18 @@ pub struct TargetLocks {
     #[serde(default, skip_serializing_if = "boot_record_is_empty")]
     pub boot: BootRecord,
 
+    /// The immutable channel snapshot this target's packages were resolved
+    /// against (lockfile v7+). Auto-pinned on first fetch; reused on every
+    /// later fetch so a clean+rebuild reproduces exactly. `None` means the
+    /// target tracks the live channel head (pre-v7 behavior, or a feed that
+    /// doesn't serve snapshots).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "repo-snapshot"
+    )]
+    pub repo_snapshot: Option<RepoSnapshot>,
+
     /// In-memory only: sysroot sections explicitly cleared during this process
     /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
     /// Not persisted. `merge_with` skips re-inserting disk packages for any
@@ -485,9 +524,13 @@ impl LockFile {
             if lock_file.version == LOCKFILE_VERSION {
                 return Ok(lock_file);
             }
-            if lock_file.version == 3 || lock_file.version == 4 {
-                // v3 → v4 → v5 → v6: empty runtimes maps parse equivalently;
-                // new fields default-empty via serde.
+            if lock_file.version == 3 || lock_file.version == 4 || lock_file.version == 6 {
+                // v3 → v4 → v5 → v6 → v7: each of these parses cleanly as the
+                // current shape — the intervening additions (kernel-versions,
+                // kernels/boot, repo-snapshot) are all `#[serde(default)]`, and
+                // v6's runtime shape is already the current one. Only the
+                // `version` field differs, bumped here. (v5's runtime map shape
+                // is incompatible, so it still falls through to migration.)
                 lock_file.version = LOCKFILE_VERSION;
                 return Ok(lock_file);
             }
@@ -908,6 +951,13 @@ impl LockFile {
             {
                 self_target.boot = other_target.boot;
             }
+            // Repo snapshot — adopt disk's pin only when self has none, so a
+            // concurrent writer's freshly-resolved pin isn't dropped. An
+            // explicit clear (unlock) goes through `save_replacing`, which
+            // never merges, so a cleared pin stays cleared.
+            if self_target.repo_snapshot.is_none() {
+                self_target.repo_snapshot = other_target.repo_snapshot;
+            }
         }
 
         self
@@ -927,6 +977,20 @@ impl LockFile {
                 );
             }
         }
+    }
+
+    /// Get the recorded repo snapshot pin for a target, if any.
+    pub fn get_repo_snapshot(&self, target: &str) -> Option<&RepoSnapshot> {
+        self.targets.get(target)?.repo_snapshot.as_ref()
+    }
+
+    /// Record (or replace) the repo snapshot pin for a target. Used by the
+    /// auto-pin-on-first-fetch path and by `avocado update`.
+    pub fn set_repo_snapshot(&mut self, target: &str, snapshot: RepoSnapshot) {
+        self.targets
+            .entry(target.to_string())
+            .or_default()
+            .repo_snapshot = Some(snapshot);
     }
 
     /// Get the locked version for a package in a specific target and sysroot
@@ -1417,6 +1481,9 @@ impl LockFile {
             target_locks.runtimes.clear();
             target_locks.kernel_versions.clear();
             target_locks.kernels.clear();
+            // Drop the snapshot pin too: unlock means "re-pick latest snapshot
+            // on the next fetch", mirroring the kernel-pin reset above.
+            target_locks.repo_snapshot = None;
         }
     }
 
@@ -3001,5 +3068,116 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         // New v5 fields default to empty.
         assert!(target.kernels.is_empty());
         assert!(target.boot.is_empty());
+    }
+
+    #[test]
+    fn test_migrate_v6_to_v7_additive() {
+        use tempfile::TempDir;
+
+        // A v6 lockfile parses directly as v7 (repo-snapshot is #[serde(default)]),
+        // with only the version bumped and no snapshot pin recorded.
+        let v6_json = r#"{"version":6,"distro_release":"2026","targets":{"qemux86-64":{"rootfs":{"avocado-pkg-rootfs":"1.0.0-r0"},"runtimes":{"dev":{"packages":{"base":"2.0.0-r0"}}}}}}
+"#;
+        let temp_dir = TempDir::new().unwrap();
+        let lock_dir = temp_dir.path().join(LOCKFILE_DIR);
+        fs::create_dir_all(&lock_dir).unwrap();
+        fs::write(lock_dir.join(LOCKFILE_NAME), v6_json).unwrap();
+
+        let loaded = LockFile::load(temp_dir.path()).unwrap();
+        // Version bumped to v7.
+        assert_eq!(loaded.version, LOCKFILE_VERSION);
+        // Existing v6 state preserved.
+        assert_eq!(
+            loaded.get_locked_version("qemux86-64", &SysrootType::Rootfs, "avocado-pkg-rootfs"),
+            Some(&"1.0.0-r0".to_string())
+        );
+        // New v7 field defaults to None — behaves as "track head".
+        assert!(loaded.get_repo_snapshot("qemux86-64").is_none());
+    }
+
+    #[test]
+    fn test_repo_snapshot_round_trip() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut lock = LockFile::new();
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "2026".to_string(),
+                channel: "edge".to_string(),
+                snapshot: "20260531T120000Z-qemux86-64".to_string(),
+                repo_url: Some("https://repo.example.com".to_string()),
+                created: Some("2026-05-31T12:00:00Z".to_string()),
+            },
+        );
+        lock.save(temp_dir.path()).unwrap();
+
+        // Persisted under the kebab-case key and reloads intact.
+        let raw = fs::read_to_string(LockFile::get_path(temp_dir.path())).unwrap();
+        assert!(raw.contains("\"repo-snapshot\""));
+
+        let loaded = LockFile::load(temp_dir.path()).unwrap();
+        let snap = loaded.get_repo_snapshot("qemux86-64").unwrap();
+        assert_eq!(snap.release, "2026");
+        assert_eq!(snap.channel, "edge");
+        assert_eq!(snap.snapshot, "20260531T120000Z-qemux86-64");
+    }
+
+    #[test]
+    fn test_clear_all_clears_repo_snapshot() {
+        let mut lock = LockFile::new();
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "2026".to_string(),
+                channel: "edge".to_string(),
+                snapshot: "SNAP".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        assert!(lock.get_repo_snapshot("qemux86-64").is_some());
+        // Unlock semantics: clearing a target drops the snapshot pin too.
+        lock.clear_all("qemux86-64");
+        assert!(lock.get_repo_snapshot("qemux86-64").is_none());
+    }
+
+    #[test]
+    fn test_merge_adopts_disk_snapshot_when_self_unset() {
+        use tempfile::TempDir;
+
+        // Disk has a pin; an in-memory writer that didn't touch the pin must
+        // not drop it on save() (merge adopts disk's value).
+        let temp_dir = TempDir::new().unwrap();
+        let mut on_disk = LockFile::new();
+        on_disk.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "2026".to_string(),
+                channel: "edge".to_string(),
+                snapshot: "DISK".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        on_disk.save(temp_dir.path()).unwrap();
+
+        // A fresh writer recording an unrelated package, no snapshot in hand.
+        let mut writer = LockFile::new();
+        writer.set_locked_version("qemux86-64", &SysrootType::Rootfs, "curl", "8.0.0-r0");
+        writer.save(temp_dir.path()).unwrap();
+
+        let loaded = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            loaded
+                .get_repo_snapshot("qemux86-64")
+                .map(|s| s.snapshot.as_str()),
+            Some("DISK")
+        );
+        assert_eq!(
+            loaded.get_locked_version("qemux86-64", &SysrootType::Rootfs, "curl"),
+            Some(&"8.0.0-r0".to_string())
+        );
     }
 }

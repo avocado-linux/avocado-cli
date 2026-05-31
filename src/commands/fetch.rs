@@ -84,6 +84,12 @@ impl FetchCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
+        // Resolve & apply the reproducible snapshot pin before refreshing
+        // metadata, so `fetch` caches the pinned snapshot's repodata (and
+        // auto-pins on first run) rather than the advancing live head.
+        crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &target_arch)
+            .await?;
+
         // Get container configuration from interpolated config
         let container_image = config
             .get_sdk_image()

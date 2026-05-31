@@ -122,6 +122,10 @@ impl RuntimeInstallCommand {
         // Merge container args from config and CLI (similar to SDK commands)
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
+        // Apply the reproducible snapshot pin before reading repo_release.
+        let target = resolve_target_required(self.target.as_deref(), config)?;
+        crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &target).await?;
+
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();

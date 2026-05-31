@@ -946,6 +946,8 @@ impl RootfsInstallCommand {
 
         let config = &composed.config;
         let target = validate_and_log_target(self.target.as_deref(), config)?;
+        // Apply the reproducible snapshot pin before any repo_release is read.
+        crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &target).await?;
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
         let container_image = config.get_sdk_image().ok_or_else(|| {
             anyhow::anyhow!("No container image specified in config under 'sdk.image'")
