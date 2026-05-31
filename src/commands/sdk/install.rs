@@ -1599,7 +1599,13 @@ fi
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.to_string(),
-            command: env_setup_command.to_string(),
+            // Append the shared repo-TLS setup so the bootstrap's FIRST dnf (installing the
+            // target package from the sdk/all repo) trusts a custom CA / honors insecure.
+            command: format!(
+                "{}{}",
+                env_setup_command,
+                crate::utils::container::REPO_TLS_SETUP_SNIPPET
+            ),
             verbose: self.verbose,
             source_environment: true,
             interactive: false,
