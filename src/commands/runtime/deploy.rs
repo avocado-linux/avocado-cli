@@ -1,6 +1,6 @@
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::{RunConfig, SdkContainer},
+    container::{is_docker_desktop, is_vm_routing_active, RunConfig, SdkContainer},
     lockfile::LockFile,
     output::{print_info, print_success, print_warning, OutputLevel},
     output_format::{emit_json_event, is_json_output_active},
@@ -472,6 +472,36 @@ impl RuntimeDeployCommand {
             env_vars.insert("AVOCADO_DEPLOY_REPO_PORT".to_string(), repo_port);
         }
 
+        // On macOS/Windows the deploy container runs inside a Linux VM, so
+        // the TUF repo server it starts is unreachable by the device unless
+        // we hand the device this host's LAN IP, publish the repo port out
+        // of the container, and (avocado-vm only) open a qemu slirp forward.
+        // No-op on Linux (native docker), where deploy already works.
+        let repo_port: u16 = std::env::var("AVOCADO_DEPLOY_REPO_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_DEPLOY_REPO_PORT);
+        let mut container_args = config.merge_sdk_container_args(self.container_args.as_ref());
+        // If the SDK container runs with host networking, the published-port
+        // (`-p`) trick is both unnecessary and discarded by docker, so the
+        // shim skips it (see prepare_mac_deploy_net).
+        let host_net = container_args
+            .as_deref()
+            .map(|args| {
+                args.iter()
+                    .any(|a| a == "--network=host" || a == "--net=host")
+            })
+            .unwrap_or(false);
+        let MacDeployNet {
+            env: mac_env,
+            container_args: mac_args,
+            forward,
+        } = prepare_mac_deploy_net(&self.device, repo_port, host_net, self.verbose).await;
+        env_vars.extend(mac_env);
+        if !mac_args.is_empty() {
+            container_args.get_or_insert_with(Vec::new).extend(mac_args);
+        }
+
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.clone(),
@@ -480,16 +510,20 @@ impl RuntimeDeployCommand {
             source_environment: true,
             interactive: false,
             env_vars: Some(env_vars),
-            container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
+            container_args,
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
             ..Default::default()
         };
-        let deploy_result = match container_helper
+        let run_outcome = container_helper
             .run_in_container(run_config)
             .await
-            .context("Failed to deploy runtime")
-        {
+            .context("Failed to deploy runtime");
+        // Tear down the VM port forward (best-effort) regardless of outcome.
+        if let Some(fwd) = forward {
+            fwd.close().await;
+        }
+        let deploy_result = match run_outcome {
             Ok(r) => r,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&staging_dir);
@@ -738,6 +772,147 @@ fi
 
         Ok(script)
     }
+}
+
+/// Host-side networking shim for `avocado deploy` on macOS/Windows, where
+/// the deploy container runs inside a Linux VM (avocado-vm or Docker
+/// Desktop). The TUF repo HTTP server it starts is otherwise trapped in
+/// the container netns, and the script's in-container host-IP autodetect
+/// returns a VM-internal address the device can't reach. No-op on Linux.
+/// See docs/features/macos-deploy-port-forwarding.md.
+struct MacDeployNet {
+    /// Extra env for the deploy container (AVOCADO_DEPLOY_REPO_HOST).
+    env: HashMap<String, String>,
+    /// Extra `docker run` args (publish the repo port: `-p <port>:<port>`).
+    container_args: Vec<String>,
+    /// A qemu slirp forward to tear down afterward (avocado-vm only).
+    forward: Option<OpenForward>,
+}
+
+/// A qemu slirp host-forward opened for the duration of one deploy. Teardown
+/// is async, so it's closed explicitly by the caller rather than via `Drop`.
+struct OpenForward {
+    qmp_socket: std::path::PathBuf,
+    host_port: u16,
+}
+
+impl OpenForward {
+    async fn close(self) {
+        if let Ok(mut c) = crate::utils::vm::qmp::QmpClient::connect(&self.qmp_socket).await {
+            let _ = c.hostfwd_remove("net0", "0.0.0.0", self.host_port).await;
+        }
+    }
+}
+
+/// Build the macOS/Windows deploy networking shim. Returns an empty (no-op)
+/// value on Linux so the native-docker path is left exactly as-is.
+async fn prepare_mac_deploy_net(
+    device: &str,
+    port: u16,
+    host_net: bool,
+    verbose: bool,
+) -> MacDeployNet {
+    let mut net = MacDeployNet {
+        env: HashMap::new(),
+        container_args: Vec::new(),
+        forward: None,
+    };
+
+    // Linux runs the container on native docker — no VM in between, deploy
+    // already works. Leave it untouched.
+    if !is_docker_desktop() {
+        return net;
+    }
+
+    // Publish the repo port out of the container's netns — but only when it
+    // has its own. With `--network=host` the container already shares the
+    // VM's network (so the qemu hostfwd below reaches `:{port}` directly),
+    // and docker discards `-p` with a "Published ports are discarded when
+    // using host network mode" warning, so skip it.
+    if !host_net {
+        net.container_args.push("-p".to_string());
+        net.container_args.push(format!("{port}:{port}"));
+    }
+
+    // Both Mac contexts: tell the device the host LAN IP it can reach us on,
+    // overriding the broken in-container autodetect. Respect a user override.
+    if std::env::var("AVOCADO_DEPLOY_REPO_HOST").is_err() {
+        let host = DeviceSpec::parse(device)
+            .map(|s| s.host)
+            .unwrap_or_default();
+        match crate::utils::remote::get_local_ip_for_remote(&host).await {
+            Ok(ip) => {
+                if verbose {
+                    print_info(
+                        &format!("deploy: repo host IP {ip} (reachable by device {host})"),
+                        OutputLevel::Normal,
+                    );
+                }
+                net.env
+                    .insert("AVOCADO_DEPLOY_REPO_HOST".to_string(), ip.to_string());
+            }
+            Err(e) => print_warning(
+                &format!(
+                    "deploy: could not determine a LAN IP the device can reach this host on \
+                     ({e}). Set AVOCADO_DEPLOY_REPO_HOST to the right address."
+                ),
+                OutputLevel::Normal,
+            ),
+        }
+    }
+
+    // avocado-vm only: open a slirp hostfwd so the LAN device can reach the
+    // published port through qemu. Docker Desktop forwards `-p` to the host
+    // itself (vpnkit), so it needs no qemu step.
+    if is_vm_routing_active() {
+        let sock = match crate::utils::vm::state::VmPaths::resolve() {
+            Ok(p) => p.qmp_socket(),
+            Err(e) => {
+                print_warning(
+                    &format!("deploy: can't locate the avocado-vm for port forwarding ({e})."),
+                    OutputLevel::Normal,
+                );
+                return net;
+            }
+        };
+        match crate::utils::vm::qmp::QmpClient::connect(&sock).await {
+            Ok(mut c) => {
+                // Clear any stale forward from a prior interrupted deploy, then add.
+                let _ = c.hostfwd_remove("net0", "0.0.0.0", port).await;
+                match c.hostfwd_add("net0", "0.0.0.0", port, port).await {
+                    Ok(()) => {
+                        if verbose {
+                            print_info(
+                                &format!(
+                                    "deploy: opened VM port forward 0.0.0.0:{port} → guest :{port}"
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        net.forward = Some(OpenForward {
+                            qmp_socket: sock,
+                            host_port: port,
+                        });
+                    }
+                    Err(e) => print_warning(
+                        &format!(
+                            "deploy: failed to open the VM port forward for {port} ({e}); the \
+                             device may be unable to fetch the repo. Is the avocado-vm running?"
+                        ),
+                        OutputLevel::Normal,
+                    ),
+                }
+            }
+            Err(e) => print_warning(
+                &format!(
+                    "deploy: couldn't reach the avocado-vm QMP socket for port forwarding ({e})."
+                ),
+                OutputLevel::Normal,
+            ),
+        }
+    }
+
+    net
 }
 
 #[cfg(test)]

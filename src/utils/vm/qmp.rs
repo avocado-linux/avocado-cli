@@ -70,6 +70,64 @@ impl QmpClient {
         Ok(v.get("return").cloned().unwrap_or(Value::Null))
     }
 
+    /// Run an HMP (human monitor) command via `human-monitor-command`.
+    /// HMP errors come back *inside* the returned string, not the QMP
+    /// `error` field, so callers must inspect the returned text.
+    pub async fn human_monitor_command(&mut self, command_line: &str) -> Result<String> {
+        let v = self
+            .execute(
+                "human-monitor-command",
+                Some(serde_json::json!({ "command-line": command_line })),
+            )
+            .await?;
+        Ok(v.as_str().unwrap_or_default().to_string())
+    }
+
+    /// Add a slirp host-forwarding rule to a `user` netdev at runtime:
+    /// `host_addr:host_port` on the host → `:guest_port` in the guest.
+    /// Use `host_addr = "0.0.0.0"` to make the forward reachable from the
+    /// LAN (not just loopback). TCP only — that's all deploy needs.
+    pub async fn hostfwd_add(
+        &mut self,
+        netdev: &str,
+        host_addr: &str,
+        host_port: u16,
+        guest_port: u16,
+    ) -> Result<()> {
+        // qemu hostfwd_add form: `<netdev> tcp:<hostaddr>:<hostport>-:<guestport>`
+        let out = self
+            .human_monitor_command(&format!(
+                "hostfwd_add {netdev} tcp:{host_addr}:{host_port}-:{guest_port}"
+            ))
+            .await?;
+        let out = out.trim();
+        if !out.is_empty() {
+            bail!("hostfwd_add failed: {out}");
+        }
+        Ok(())
+    }
+
+    /// Remove a previously-added slirp host-forwarding rule. The remove
+    /// form omits the guest side: `<netdev> tcp:<hostaddr>:<hostport>`.
+    /// A "not found" reply is tolerated so cleanup is idempotent.
+    pub async fn hostfwd_remove(
+        &mut self,
+        netdev: &str,
+        host_addr: &str,
+        host_port: u16,
+    ) -> Result<()> {
+        let out = self
+            .human_monitor_command(&format!(
+                "hostfwd_remove {netdev} tcp:{host_addr}:{host_port}"
+            ))
+            .await?;
+        let out = out.trim();
+        if !out.is_empty() && !out.contains("not found") {
+            bail!("hostfwd_remove failed: {out}");
+        }
+        Ok(())
+    }
+
     /// Read lines until we see one that has a `return` or `error` key
     /// (i.e. a command response). Events are skipped.
     async fn read_until_response(&mut self, dur: Duration) -> Result<Value> {
@@ -187,5 +245,79 @@ mod tests {
         let mut client = QmpClient::connect(&socket).await.unwrap();
         let err = client.execute("device_add", None).await.unwrap_err();
         assert!(format!("{err:#}").contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn hostfwd_add_ok_on_empty_return() {
+        let socket = spawn_mock(|mut rh, mut wh| async move {
+            wh.write_all(b"{\"QMP\":{\"version\":{}}}\n").await.unwrap();
+            let mut line = String::new();
+            rh.read_line(&mut line).await.unwrap();
+            wh.write_all(b"{\"return\":{}}\n").await.unwrap();
+            line.clear();
+            rh.read_line(&mut line).await.unwrap();
+            // The HMP command is carried inside human-monitor-command.
+            assert!(line.contains("human-monitor-command"));
+            assert!(line.contains("hostfwd_add net0 tcp:0.0.0.0:8585-:8585"));
+            // Success: hostfwd_add prints nothing.
+            wh.write_all(b"{\"return\":\"\"}\n").await.unwrap();
+        })
+        .await;
+
+        let mut client = QmpClient::connect(&socket).await.unwrap();
+        client
+            .hostfwd_add("net0", "0.0.0.0", 8585, 8585)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hostfwd_add_errors_on_nonempty_return() {
+        let socket = spawn_mock(|mut rh, mut wh| async move {
+            wh.write_all(b"{\"QMP\":{\"version\":{}}}\n").await.unwrap();
+            let mut line = String::new();
+            rh.read_line(&mut line).await.unwrap();
+            wh.write_all(b"{\"return\":{}}\n").await.unwrap();
+            line.clear();
+            rh.read_line(&mut line).await.unwrap();
+            // HMP errors come back in the return string, not the QMP error field.
+            wh.write_all(b"{\"return\":\"Could not set up host forwarding rule\\n\"}\n")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let mut client = QmpClient::connect(&socket).await.unwrap();
+        let err = client
+            .hostfwd_add("net0", "0.0.0.0", 8585, 8585)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("hostfwd_add failed"));
+    }
+
+    #[tokio::test]
+    async fn hostfwd_remove_tolerates_not_found() {
+        let socket = spawn_mock(|mut rh, mut wh| async move {
+            wh.write_all(b"{\"QMP\":{\"version\":{}}}\n").await.unwrap();
+            let mut line = String::new();
+            rh.read_line(&mut line).await.unwrap();
+            wh.write_all(b"{\"return\":{}}\n").await.unwrap();
+            line.clear();
+            rh.read_line(&mut line).await.unwrap();
+            assert!(line.contains("hostfwd_remove net0 tcp:0.0.0.0:8585"));
+            // A stale-cleanup "not found" reply must not be treated as an error.
+            wh.write_all(
+                b"{\"return\":\"host forwarding rule for tcp:0.0.0.0:8585 not found\\n\"}\n",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let mut client = QmpClient::connect(&socket).await.unwrap();
+        client
+            .hostfwd_remove("net0", "0.0.0.0", 8585)
+            .await
+            .unwrap();
     }
 }

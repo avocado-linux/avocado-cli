@@ -1,8 +1,8 @@
 # `avocado deploy` on macOS: VM port forwarding
 
-Status: **proposal / plan**. Investigation + design for making
+Status: **implemented + validated** (avocado-vm path). Makes
 `avocado runtime deploy` work on macOS, where the build/deploy runs
-inside the slirp-NAT'd avocado-vm.
+inside the slirp-NAT'd avocado-vm. Validation notes in §12.
 
 ## 1. Symptom
 
@@ -91,14 +91,16 @@ hostfwd_remove net0 tcp:0.0.0.0:8585          # close
   `qemu.rs` at VM start. Simpler, but leaves a LAN port open for the
   VM's whole lifetime — rejected in favor of open-only-during-deploy.
 
-### 4b. Expose the container's repo port to the VM
+### 4b. Expose the container's repo port out of its VM
 
-In `deploy.rs`, when routing through the VM, publish the repo port from
-the SDK container to the VM host so the qemu forward lands on it:
+On macOS (both contexts) publish the repo port from the SDK container so
+it escapes the container netns:
 
-- Add `-p 8585:8585` to the deploy container args (or `--net=host`,
-  matching the HITL server's pattern). Then
-  `macOS:8585 → (hostfwd) → VM:8585 → (docker -p) → container:8585`.
+- Add `-p 8585:8585` to the deploy container args.
+- **avocado-vm:** `-p` publishes onto the VM's interfaces; the qemu
+  `hostfwd` (§4a) then carries `macOS:8585 → VM:8585 → container:8585`.
+- **Docker Desktop:** `-p` is forwarded straight to the macOS host by
+  Docker Desktop's vpnkit — no qemu step.
 
 ### 4c. Hand the device the right host IP
 
@@ -118,24 +120,40 @@ device ── http GET ──► macOS-LAN-IP:8585
 container ── ssh ──► device   (outbound slirp NAT)
 ```
 
-## 5. Orchestration (where the glue lives)
+## 5. Detection & orchestration (where the glue lives)
 
-`avocado deploy` runs on the **host**, so the host-side command wraps the
-deploy with the forward lifecycle. On macOS + VM-routing active:
+Deploy fails on **both** macOS contexts, because in either one the deploy
+container runs inside a Linux VM — the avocado-vm *or* Docker Desktop's
+LinuxKit VM — so its in-container `ip route`/`ip addr` autodetect returns
+a VM-internal address the device can't reach. Linux runs the container on
+native docker with no VM in between, so it already works and must stay
+untouched.
 
-1. Resolve macOS LAN IP via `get_local_ip_for_remote(device_host)`.
-2. QMP `hostfwd_add net0 tcp:0.0.0.0:8585-:8585` against the VM's
-   `qmp.sock` (path from `VmPaths`).
-3. Run the deploy container with `AVOCADO_DEPLOY_REPO_HOST=<LAN IP>` and
-   `-p 8585:8585`.
-4. On completion (success or error), QMP `hostfwd_remove` to close the
-   LAN port. Best-effort; also reconcile stale forwards on next `vm
-   start`.
+So the gate is **two-tier**, mirroring the split the HITL server already
+uses (`is_docker_desktop()` → publish vs host-net):
 
-Gate all of this on macOS + `route::resolve_mode() == Apply` (the same
-signal that says "we're talking to the avocado-vm's docker"). On Linux
-with a real local docker / `--runs-on`, deploy already works as-is —
-leave it untouched.
+- **`is_docker_desktop()`** (`cfg!(macos) || cfg!(windows)`) — the deploy
+  container is inside a Linux VM. Apply the fixes common to both Mac
+  contexts:
+  1. `AVOCADO_DEPLOY_REPO_HOST` = macOS LAN IP via
+     `get_local_ip_for_remote(device_host)` (overrides the broken
+     in-container autodetect). Respect an explicit user-set value.
+  2. Publish the repo port from the container (`-p <port>:<port>`).
+  - **+ `is_vm_routing_active()`** (DOCKER_HOST → avocado-vm socket):
+    *also* open a qemu `hostfwd` (`tcp:0.0.0.0:<port>-:<port>`) via QMP
+    against the VM's `qmp.sock` (`VmPaths`), because raw slirp doesn't
+    auto-expose the published port to the host LAN. Removed on completion
+    (success or error); reconcile stale forwards on next `vm start`.
+  - **else (Docker Desktop)**: no qemu step — Docker Desktop's `-p`
+    already forwards the container port to the macOS host (vpnkit).
+- **Linux** — `is_docker_desktop()` false → skip everything; current
+  behavior preserved (works today, no VM, native docker).
+
+Key correction over an earlier draft: the discriminator is
+`is_docker_desktop()`, **not** `is_vm_routing_active()` alone — the
+Docker-Desktop-on-Mac case is broken too. The qemu `hostfwd` is the
+*only* avocado-vm-specific piece; the LAN-IP injection + port publish are
+shared by both Mac contexts.
 
 ## 6. Scenarios
 
@@ -188,3 +206,40 @@ leave it untouched.
 - **No desktop change needed:** the CLI owns the qemu lifecycle on macOS;
   the desktop app drives `avocado` and is unaffected. A future Devices/UI
   affordance could call `vm port-forward`, but it's out of scope.
+
+## 12. Validation (2026-06-01)
+
+Validated end-to-end on the **avocado-vm path** deploying to a real
+Raspberry Pi 4 on the LAN:
+
+- The repo was served at the **macOS host LAN IP** (`AVOCADO_DEPLOY_REPO_HOST`
+  injection working), and the device successfully fetched
+  `GET /metadata/timestamp.json → 200` through the qemu `hostfwd` → VM →
+  container. The device→repo reachability that was previously impossible
+  on macOS now works.
+- `qemu hostfwd_add` is accepted by the pinned qemu (open question §9
+  resolved).
+
+Findings folded back into the implementation:
+
+- **Host-networking SDK containers:** when the SDK container runs
+  `--network=host` (e.g. projects that set it), docker discards the `-p`
+  publish with a "Published ports are discarded when using host network
+  mode" warning — and it's unnecessary there, since the container already
+  shares the VM's `:8585` that the `hostfwd` targets. The shim now skips
+  `-p` when host networking is detected.
+
+Out of scope / separate concerns surfaced during testing:
+
+- **Device trust:** sideload deploy then fails at the device with
+  `Signature verification failed … got 0, need 1` unless the device's
+  installed TUF root matches the project's signing key — i.e. the device
+  must be provisioned/flashed from an image built with the same
+  `signing-keys`. This is a provisioning/trust matter, independent of the
+  port-forwarding fix.
+- **Docker Desktop path** (`--no-vm-auto-start`): the LAN-IP + `-p` half
+  applies, but it's **not yet validated**, and a project using
+  `--network=host` won't expose the port to macOS under Docker Desktop
+  (host net there is the LinuxKit VM, not the host) — needs the project
+  to use bridge networking, plus confirmation that Docker Desktop's `-p`
+  binds a LAN-reachable address.
