@@ -10,6 +10,8 @@
 use anyhow::Result;
 use std::env;
 
+use crate::utils::output::{print_warning, OutputLevel};
+
 /// Resolve an environment variable template.
 ///
 /// # Arguments
@@ -30,8 +32,16 @@ pub fn resolve(var_name: &str) -> Result<Option<String>> {
     match env::var(var_name) {
         Ok(value) => Ok(Some(value)),
         Err(_) => {
-            eprintln!(
-                "[WARNING] Environment variable '{var_name}' is not set, replacing with empty string"
+            // Route through `print_warning` (not a raw `eprintln!`) so the
+            // message is suppressed while a TUI renderer is active. A direct
+            // stderr write here lands inside the renderer's cursor region
+            // without being counted in `rendered_lines`, so the next redraw's
+            // MoveUp/Clear clears one line too few and strands a task line.
+            print_warning(
+                &format!(
+                    "Environment variable '{var_name}' is not set, replacing with empty string"
+                ),
+                OutputLevel::Normal,
             );
             Ok(Some(String::new()))
         }
