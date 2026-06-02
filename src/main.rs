@@ -3296,7 +3296,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectProjectsListCommand {
                         org: resolved_org,
                         profile,
@@ -3312,7 +3314,9 @@ async fn main() -> Result<()> {
                     profile,
                     output,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectProjectsCreateCommand {
                         org: resolved_org,
                         name,
@@ -3330,7 +3334,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectProjectsDeleteCommand {
                         org: resolved_org,
                         id,
@@ -3347,7 +3353,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectDevicesListCommand {
                         org: resolved_org,
                         profile,
@@ -3362,7 +3370,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectDevicesCreateCommand {
                         org: resolved_org,
                         name,
@@ -3379,7 +3389,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectDevicesDeleteCommand {
                         org: resolved_org,
                         id,
@@ -3397,7 +3409,10 @@ async fn main() -> Result<()> {
                         config,
                         profile,
                     } => {
-                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let profile_org =
+                            commands::connect::profile_organization_id(profile.as_deref())?;
+                        let resolved_org =
+                            commands::connect::resolve_org(org, &config, profile_org)?;
                         let cmd = ConnectDeviceReclaimListCommand {
                             org: resolved_org,
                             status: status.as_str().to_string(),
@@ -3414,7 +3429,10 @@ async fn main() -> Result<()> {
                         config,
                         profile,
                     } => {
-                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let profile_org =
+                            commands::connect::profile_organization_id(profile.as_deref())?;
+                        let resolved_org =
+                            commands::connect::resolve_org(org, &config, profile_org)?;
                         let cmd = ConnectDeviceReclaimApproveCommand {
                             org: resolved_org,
                             id,
@@ -3432,7 +3450,10 @@ async fn main() -> Result<()> {
                         config,
                         profile,
                     } => {
-                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let profile_org =
+                            commands::connect::profile_organization_id(profile.as_deref())?;
+                        let resolved_org =
+                            commands::connect::resolve_org(org, &config, profile_org)?;
                         let cmd = ConnectDeviceReclaimDenyCommand {
                             org: resolved_org,
                             id,
@@ -3450,7 +3471,10 @@ async fn main() -> Result<()> {
                         config,
                         profile,
                     } => {
-                        let resolved_org = commands::connect::resolve_org(org, &config)?;
+                        let profile_org =
+                            commands::connect::profile_organization_id(profile.as_deref())?;
+                        let resolved_org =
+                            commands::connect::resolve_org(org, &config, profile_org)?;
                         let cmd = ConnectDeviceReclaimDeleteCommand {
                             org: resolved_org,
                             id,
@@ -3469,8 +3493,15 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
                     let (resolved_org, resolved_project) =
-                        commands::connect::resolve_org_and_project(org, project, &config)?;
+                        commands::connect::resolve_org_and_project(
+                            org,
+                            project,
+                            &config,
+                            profile_org,
+                        )?;
                     let cmd = ConnectCohortsListCommand {
                         org: resolved_org,
                         project: resolved_project,
@@ -3487,8 +3518,15 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
                     let (resolved_org, resolved_project) =
-                        commands::connect::resolve_org_and_project(org, project, &config)?;
+                        commands::connect::resolve_org_and_project(
+                            org,
+                            project,
+                            &config,
+                            profile_org,
+                        )?;
                     let cmd = ConnectCohortsCreateCommand {
                         org: resolved_org,
                         project: resolved_project,
@@ -3507,8 +3545,15 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
                     let (resolved_org, resolved_project) =
-                        commands::connect::resolve_org_and_project(org, project, &config)?;
+                        commands::connect::resolve_org_and_project(
+                            org,
+                            project,
+                            &config,
+                            profile_org,
+                        )?;
                     let cmd = ConnectCohortsDeleteCommand {
                         org: resolved_org,
                         project: resolved_project,
@@ -3526,7 +3571,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectClaimTokensListCommand {
                         org: resolved_org,
                         profile,
@@ -3545,7 +3592,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectClaimTokensCreateCommand {
                         org: resolved_org,
                         project,
@@ -3566,7 +3615,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
                     let cmd = ConnectClaimTokensDeleteCommand {
                         org: resolved_org,
                         id,
@@ -3593,10 +3644,12 @@ async fn main() -> Result<()> {
                 deploy_tag,
                 deploy_activate,
             } => {
+                let profile_org = commands::connect::profile_organization_id(profile.as_deref())?;
                 let (resolved_org, resolved_project) = commands::connect::resolve_org_and_project(
                     org.clone(),
                     project.clone(),
                     &config,
+                    profile_org,
                 )?;
 
                 let cmd = ConnectUploadCommand {
@@ -3630,8 +3683,9 @@ async fn main() -> Result<()> {
                 config,
                 profile,
             } => {
+                let profile_org = commands::connect::profile_organization_id(profile.as_deref())?;
                 let (resolved_org, resolved_project) =
-                    commands::connect::resolve_org_and_project(org, project, &config)?;
+                    commands::connect::resolve_org_and_project(org, project, &config, profile_org)?;
                 let cmd = ConnectDeployCommand {
                     org: resolved_org,
                     project: resolved_project,
@@ -3651,7 +3705,8 @@ async fn main() -> Result<()> {
                 config,
                 profile,
             } => {
-                let resolved_org = commands::connect::resolve_org(org, &config)?;
+                let profile_org = commands::connect::profile_organization_id(profile.as_deref())?;
+                let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                 let cmd = ConnectServerKeyCommand {
                     org: resolved_org,
@@ -3668,7 +3723,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectKeysRegisterCommand {
                         org: resolved_org,
@@ -3685,7 +3742,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectKeysApproveCommand {
                         org: resolved_org,
@@ -3701,7 +3760,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectKeysListCommand {
                         org: resolved_org,
@@ -3717,7 +3778,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectKeysRetireCommand {
                         org: resolved_org,
@@ -3734,7 +3797,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectTrustStatusCommand {
                         org: resolved_org,
@@ -3749,7 +3814,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectTrustPromoteRootCommand {
                         key,
@@ -3765,7 +3832,9 @@ async fn main() -> Result<()> {
                     config,
                     profile,
                 } => {
-                    let resolved_org = commands::connect::resolve_org(org, &config)?;
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let resolved_org = commands::connect::resolve_org(org, &config, profile_org)?;
 
                     let cmd = ConnectTrustRotateServerKeyCommand {
                         key,
