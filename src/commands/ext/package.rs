@@ -625,7 +625,10 @@ if [ "$FILE_COUNT" -eq 0 ]; then
 fi
 
 # Create spec file
-# Package root (/) maps to the extension's src_dir
+# The extension's src_dir maps to a top-level /<ext_name>/ directory in the package, so
+# that installing into a SHARED includes installroot lands its content at
+# includes/<ext_name>/ without colliding with other extensions' files (and one rpmdb
+# tracks all installed extensions).
 cat > SPECS/package.spec << SPEC_EOF
 %define _buildhost reproducible
 AutoReqProv: no
@@ -637,12 +640,16 @@ Summary: {summary}
 License: {license}
 Vendor: {vendor}
 Group: {group}{url_line}
+# Self-describe the on-disk layout so the CLI knows how to install this package: content
+# is nested under /<ext_name>/, so it installs into the SHARED includes installroot.
+# Legacy packages (content at /) lack this provide and use the per-ext installroot.
+Provides: avocado-ext-layout(nested)
 
 %description
 {description}
 
 %files
-/*
+/{name}
 
 %prep
 # No prep needed
@@ -651,10 +658,10 @@ Group: {group}{url_line}
 # No build needed
 
 %install
-mkdir -p %{{buildroot}}
-# Copy staged files to buildroot root
-# This allows installation to \$AVOCADO_PREFIX/includes/<ext_name>/
-cp -r "$STAGING_DIR"/* %{{buildroot}}/
+# Nest the staged files under /<ext_name>/ so a shared includes installroot yields
+# includes/<ext_name>/... (collision-free, one rpmdb per includes root).
+mkdir -p %{{buildroot}}/{name}
+cp -r "$STAGING_DIR"/* %{{buildroot}}/{name}/
 
 %clean
 # Skip clean section - not needed for our use case
