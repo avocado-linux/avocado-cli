@@ -218,9 +218,11 @@ impl ExtensionFetcher {
 
     /// Fetch an extension from the avocado package repository
     ///
-    /// Installs the extension package into a per-extension installroot at
-    /// `$AVOCADO_PREFIX/includes/<ext_name>` using DNF with `--installroot`.
-    /// This gives proper RPM tracking, clean upgrades, and version management.
+    /// Installs the extension package into the SHARED `$AVOCADO_PREFIX/includes`
+    /// installroot using DNF with `--installroot`. Packages nest their content under a
+    /// top-level `/<ext_name>/` dir, so the content lands at `includes/<ext_name>/` and a
+    /// single rpmdb tracks every installed extension (proper tracking, clean upgrades,
+    /// version management, no cross-extension file collisions).
     async fn fetch_from_repo(
         &self,
         ext_name: &str,
@@ -251,15 +253,14 @@ impl ExtensionFetcher {
 
         let repo_arg = repo_name.map(|r| format!("--repo={r}")).unwrap_or_default();
 
-        // Use container path $AVOCADO_PREFIX/includes/<ext_name> as the installroot
-        let installroot = format!("$AVOCADO_PREFIX/includes/{ext_name}");
-
-        // Force mode: clean the installroot for a fresh install
-        let force_clean = if force {
-            format!(r#"rm -rf "{installroot}""#)
-        } else {
-            String::new()
-        };
+        // The package self-describes its layout via `Provides: avocado-ext-layout(nested)`.
+        // - NESTED (new): content under /<ext_name>/ -> install into the SHARED includes
+        //   installroot, so it lands at includes/<ext_name>/ with one rpmdb tracking all exts.
+        // - LEGACY (no such provide): content at / -> per-extension installroot includes/<ext_name>.
+        // Either way the final content is includes/<ext_name>/, so consumers are unchanged. The
+        // installroot is chosen at run time by repoquerying the package's provides.
+        let ext_dir = format!("$AVOCADO_PREFIX/includes/{ext_name}");
+        let force_str = if force { "true" } else { "false" };
 
         // Install the extension package using DNF with --installroot
         // Uses $DNF_SDK_COMBINED_REPO_CONF to access both SDK and target-specific repos
@@ -267,21 +268,39 @@ impl ExtensionFetcher {
             r#"
 set -e
 
-{force_clean}
+# Detect the package's on-disk layout from its provides (repo metadata, no download).
+if RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+   $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {repo_arg} \
+   repoquery --provides {package_spec} 2>/dev/null | grep -q 'avocado-ext-layout(nested)'; then
+    INSTALLROOT="$AVOCADO_PREFIX/includes"
+    echo "Extension '{ext_name}': nested layout -> shared includes installroot"
+else
+    INSTALLROOT="{ext_dir}"
+    echo "Extension '{ext_name}': legacy layout -> per-extension installroot"
+fi
 
-# Install the extension package into the per-extension installroot
+# Force: remove just this extension (rpmdb entry + content dir) for a clean reinstall,
+# without disturbing other extensions sharing the installroot.
+if [ "{force_str}" = "true" ]; then
+    RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS --installroot="$INSTALLROOT" -y remove {package_name} 2>/dev/null || true
+    rm -rf "{ext_dir}"
+fi
+
+mkdir -p "$INSTALLROOT"
+
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST \
     $DNF_SDK_HOST_OPTS \
     $DNF_SDK_COMBINED_REPO_CONF \
     {repo_arg} \
-    --installroot={installroot} \
+    --installroot="$INSTALLROOT" \
     -y \
     install \
     {package_spec}
 
-echo "Successfully fetched extension '{ext_name}' (package: {package_spec}) to {installroot}"
+echo "Successfully installed extension '{ext_name}' (package: {package_spec}) to {ext_dir}"
 "#
         );
 
