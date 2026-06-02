@@ -1,0 +1,52 @@
+supported_targets: '*'
+
+extensions:
+  avocado-ext-cli:
+    # Version is injected at build time: `AVOCADO_EXT_VERSION=<x> avocado ext package …`
+    # (CI sets it from the release/tag; unset => empty + a warning).
+    version: '{{ env.AVOCADO_EXT_VERSION }}'
+    release: r0
+    summary: Avocado build system command line interface
+    description: Avocado build system command line interface for managing the system
+    license: Apache-2.0
+    url: https://github.com/avocadolinux/avocado-cli
+    vendor: Avocado Linux <info@avocadolinux.org>
+    # Stage the Rust source (the repo root IS the project) plus the packaging
+    # artifacts, so `ext package` can compile it. configs/ is required:
+    # src references include_str!("../../configs/default.yaml").
+    package_files:
+      - avocado.yaml
+      - avocado-cli-*.sh
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - src
+      - configs
+
+    packages:
+      bash: '*'
+      avocado-cli-bin:
+        compile: avocado-cli-compile
+        install: avocado-cli-install.sh
+
+    sdk:
+      packages:
+        nativesdk-binutils: '*'
+        nativesdk-cargo: '*'
+        nativesdk-gcc: '*'
+        nativesdk-glibc-dev: '*'
+        nativesdk-libgcc-dev: '*'
+        nativesdk-rust: '*'
+        nativesdk-git: '*'
+        packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}: '*'
+
+sdk:
+  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}-{{ env.AVOCADO_DISTRO_CHANNEL }}
+
+  compile:
+    avocado-cli-compile:
+      compile: avocado-cli-compile.sh
+      clean: avocado-cli-clean.sh
+      packages:
+        libstd-rs: '*'
+        libstd-rs-dev: '*'

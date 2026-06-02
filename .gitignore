@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Transient cross-compile config written by avocado-cli-compile.sh during `ext package`
+/.cargo/
+
 # Cargo lock file (uncomment if this is a library)
 # Cargo.lock
 
