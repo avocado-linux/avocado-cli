@@ -5,7 +5,9 @@ use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::commands::connect::client::{self, ConnectClient, ConnectConfig, Profile, ProfileUser};
+use crate::commands::connect::client::{
+    self, ConnectClient, ConnectConfig, OrgInfo, Profile, ProfileUser,
+};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
 use crate::utils::output_format::{emit_json_event, emit_json_object};
 
@@ -17,6 +19,7 @@ pub struct ConnectAuthLoginCommand {
     pub url: String,
     pub profile: Option<String>,
     pub token: Option<String>,
+    pub org: Option<String>,
     pub output: OutputFormat,
 }
 
@@ -25,6 +28,7 @@ impl ConnectAuthLoginCommand {
         url: Option<String>,
         profile: Option<String>,
         token: Option<String>,
+        org: Option<String>,
         output: OutputFormat,
     ) -> Self {
         let url = url
@@ -34,6 +38,7 @@ impl ConnectAuthLoginCommand {
             url,
             profile,
             token,
+            org,
             output,
         }
     }
@@ -101,20 +106,38 @@ impl ConnectAuthLoginCommand {
             anyhow::bail!("state mismatch — possible CSRF attack. please try again.");
         }
 
-        // Exchange the code for an API token before redirecting browser
         let profile_name = self.profile.as_deref().unwrap_or("default");
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "unknown".to_string());
         let token_name = format!("avocado-cli-{hostname}-{profile_name}");
 
+        // Resolve the org BEFORE exchange so the minted token is scoped
+        // correctly on the server side. Phoenix.Token codes are stateless, so
+        // verifying via list-orgs does not consume the code — the same code
+        // is reused for the exchange call below.
+        let chosen_org =
+            match resolve_org_for_login(&self.url, &code, self.org.as_deref(), self.output).await {
+                Ok(o) => o,
+                Err(e) => {
+                    let error_url = format!("{}/cli/login?error=org_resolution_failed", self.url);
+                    respond_redirect(&mut stream, &error_url).await;
+                    return Err(e);
+                }
+            };
+
+        let mut exchange_body = serde_json::json!({
+            "code": code,
+            "cli_token_name": token_name,
+        });
+        if let Some(ref org) = chosen_org {
+            exchange_body["organization_id"] = serde_json::Value::String(org.id.clone());
+        }
+
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{}/auth/cli/exchange", self.url))
-            .json(&serde_json::json!({
-                "code": code,
-                "cli_token_name": token_name
-            }))
+            .json(&exchange_body)
             .send()
             .await;
 
@@ -143,6 +166,7 @@ impl ConnectAuthLoginCommand {
         let token = body["data"]["token"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("no token in exchange response"))?;
+        let organization_id = body["data"]["organization_id"].as_str().map(str::to_string);
         let user_email = body["data"]["user"]["email"].as_str().unwrap_or("unknown");
         let user_name = body["data"]["user"]["name"].as_str().unwrap_or("unknown");
 
@@ -150,49 +174,7 @@ impl ConnectAuthLoginCommand {
         let success_url = format!("{}/cli/success", self.url);
         respond_redirect(&mut stream, &success_url).await;
 
-        // Provision an org-scoped token from the unscoped browser token.
-        // If this fails for any reason, fall back to saving the unscoped token so
-        // the user is always logged in after a successful browser auth.
-        let temp_profile = Profile {
-            api_url: self.url.clone(),
-            token: token.to_string(),
-            user: ProfileUser {
-                email: user_email.to_string(),
-                name: user_name.to_string(),
-            },
-            created_at: chrono::Utc::now().to_rfc3339(),
-            organization_id: None,
-        };
-        let temp_client = ConnectClient::from_profile(&temp_profile)?;
-        let (final_token, organization_id) = match temp_client.get_me_full().await {
-            Ok(me) => {
-                provision_org_token(&temp_client, &me, token, &token_name, self.output).await?
-            }
-            Err(e) => {
-                if self.output.is_json() {
-                    emit_json_event(&serde_json::json!({
-                        "event": "info",
-                        "message": format!("Warning: could not fetch org info ({e}); saving unscoped profile."),
-                    }));
-                } else {
-                    print_info(
-                        &format!(
-                            "Warning: could not fetch org info ({e}); saving unscoped profile."
-                        ),
-                        OutputLevel::Normal,
-                    );
-                }
-                (token.to_string(), None)
-            }
-        };
-
-        self.save_profile(
-            profile_name,
-            &final_token,
-            user_email,
-            user_name,
-            organization_id,
-        )?;
+        self.save_profile(profile_name, token, user_email, user_name, organization_id)?;
 
         Ok(())
     }
@@ -413,6 +395,168 @@ fn hex_digit(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Outcome of the pure org-selection decision. Separated from the IO/UI
+/// concerns so it can be unit-tested without an HTTP server or a TTY.
+#[derive(Debug)]
+enum OrgPick {
+    /// User has zero orgs. Caller should pass no `organization_id` to
+    /// exchange (server falls back to nil scope).
+    None,
+    /// An org was definitively chosen — either by explicit `--org` hint or
+    /// by single-org auto-select.
+    Resolved(OrgInfo),
+    /// Multi-org interactive case. Caller must run the terminal picker
+    /// over these orgs.
+    NeedPrompt(Vec<OrgInfo>),
+}
+
+/// Decide which org to scope the about-to-be-minted CLI token to.
+///
+/// Resolution order:
+///   1. `--org <id>` flag, if set, must match exactly one org by id (UUID).
+///      No match → error. Name matching is intentionally not supported —
+///      `--org` is for non-interactive scripting where org names can change
+///      but ids are stable, and other `avocado connect` commands accept ids
+///      only.
+///   2. If the user has exactly one org, auto-select it.
+///   3. Multiple orgs + JSON output → error (can't prompt non-interactively;
+///      caller must pass `--org`).
+///   4. Multiple orgs + human output → caller must prompt.
+///   5. Zero orgs → `None` (caller passes no org to exchange; server falls
+///      back to its default scoping).
+///
+/// Pure logic. No HTTP, no stdin, no stdout. The wrapper `resolve_org_for_login`
+/// adds the IO around this.
+fn pick_org(orgs: Vec<OrgInfo>, org_hint: Option<&str>, output: OutputFormat) -> Result<OrgPick> {
+    if orgs.is_empty() {
+        return Ok(OrgPick::None);
+    }
+
+    if let Some(hint) = org_hint {
+        return match orgs.iter().find(|o| o.id == hint) {
+            Some(o) => Ok(OrgPick::Resolved(o.clone())),
+            None => {
+                let available = orgs
+                    .iter()
+                    .map(|o| format!("{} ({})", o.name, o.id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("organization '{hint}' not found. Available: {available}");
+            }
+        };
+    }
+
+    if orgs.len() == 1 {
+        return Ok(OrgPick::Resolved(orgs.into_iter().next().unwrap()));
+    }
+
+    if output.is_json() {
+        anyhow::bail!(
+            "multiple organizations available; pass --org <id> for non-interactive login"
+        );
+    }
+
+    Ok(OrgPick::NeedPrompt(orgs))
+}
+
+/// Resolve which org the about-to-be-minted CLI token should be scoped to,
+/// performing HTTP and interactive prompting around the pure decision in
+/// `pick_org`.
+async fn resolve_org_for_login(
+    base_url: &str,
+    code: &str,
+    org_hint: Option<&str>,
+    output: OutputFormat,
+) -> Result<Option<OrgInfo>> {
+    let orgs = list_orgs_by_code(base_url, code).await?;
+
+    match pick_org(orgs, org_hint, output)? {
+        OrgPick::None => Ok(None),
+        OrgPick::Resolved(org) => {
+            // Only announce auto-select when there was no explicit hint —
+            // the user already knows what they chose if they passed --org.
+            if org_hint.is_none() {
+                let msg = format!("Auto-selected only available organization: {}", org.name);
+                if output.is_json() {
+                    emit_json_event(&serde_json::json!({"event": "info", "message": msg}));
+                } else {
+                    print_info(&msg, OutputLevel::Normal);
+                }
+            }
+            Ok(Some(org))
+        }
+        OrgPick::NeedPrompt(orgs) => {
+            let picked = prompt_select_org(&orgs)?;
+            Ok(Some(picked))
+        }
+    }
+}
+
+/// POST /auth/cli/list-orgs {code} — returns the user's orgs without
+/// consuming the code. The same `code` is reused for the subsequent exchange
+/// call.
+async fn list_orgs_by_code(base_url: &str, code: &str) -> Result<Vec<OrgInfo>> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Data,
+    }
+    #[derive(serde::Deserialize)]
+    struct Data {
+        organizations: Vec<OrgInfo>,
+    }
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{base_url}/auth/cli/list-orgs"))
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .context("failed to call /auth/cli/list-orgs")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let msg = body["message"]
+            .as_str()
+            .or(body["error"].as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("list-orgs failed ({status}): {msg}");
+    }
+
+    let parsed: Resp = resp.json().await.context("invalid list-orgs response")?;
+    Ok(parsed.data.organizations)
+}
+
+/// Numbered terminal picker for org selection. Mirrors the picker in
+/// `commands/connect/init.rs`; intentionally duplicated here rather than
+/// shared because the two call sites have slightly different framing
+/// (init runs against a saved profile; login runs against a bootstrap code)
+/// and a premature abstraction would obscure that.
+fn prompt_select_org(orgs: &[OrgInfo]) -> Result<OrgInfo> {
+    println!("\nSelect an organization:");
+    for (i, org) in orgs.iter().enumerate() {
+        println!(
+            "  [{}] {} ({}) - role: {}",
+            i + 1,
+            org.name,
+            org.id,
+            org.role
+        );
+    }
+    eprint!("\nEnter number (1-{}): ", orgs.len());
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("failed to read input")?;
+
+    let choice: usize = input.trim().parse().context("invalid number")?;
+    if choice < 1 || choice > orgs.len() {
+        anyhow::bail!("selection out of range");
+    }
+    Ok(orgs[choice - 1].clone())
 }
 
 /// Given an authenticated client and its /api/me response, return (token, Option<org_id>).
@@ -668,5 +812,107 @@ impl ConnectAuthStatusCommand {
 
         emit_json_object(&payload);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn org(id: &str, name: &str) -> OrgInfo {
+        OrgInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            role: "owner".to_string(),
+        }
+    }
+
+    #[test]
+    fn pick_org_zero_orgs_returns_none() {
+        let result = pick_org(vec![], None, OutputFormat::Human).unwrap();
+        assert!(matches!(result, OrgPick::None));
+    }
+
+    #[test]
+    fn pick_org_single_org_is_resolved_without_hint() {
+        let only = org("uuid-1", "Acme");
+        let result = pick_org(vec![only], None, OutputFormat::Human).unwrap();
+        match result {
+            OrgPick::Resolved(o) => assert_eq!(o.id, "uuid-1"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pick_org_hint_matches_by_id_in_multi_org() {
+        let acme = org("uuid-1", "Acme");
+        let northwind = org("uuid-2", "Northwind");
+        let result = pick_org(vec![acme, northwind], Some("uuid-2"), OutputFormat::Human).unwrap();
+        match result {
+            OrgPick::Resolved(o) => assert_eq!(o.id, "uuid-2"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pick_org_hint_does_not_match_by_name() {
+        // Name matching is intentionally not supported — id-only.
+        let acme = org("uuid-1", "Acme");
+        let result = pick_org(vec![acme], Some("Acme"), OutputFormat::Human);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("'Acme' not found"), "got: {err}");
+    }
+
+    #[test]
+    fn pick_org_hint_not_found_lists_available_orgs() {
+        let acme = org("uuid-1", "Acme");
+        let northwind = org("uuid-2", "Northwind");
+        let result = pick_org(
+            vec![acme, northwind],
+            Some("uuid-bogus"),
+            OutputFormat::Human,
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("uuid-bogus"), "got: {err}");
+        assert!(err.contains("Acme (uuid-1)"), "got: {err}");
+        assert!(err.contains("Northwind (uuid-2)"), "got: {err}");
+    }
+
+    #[test]
+    fn pick_org_multi_org_json_output_errors_without_hint() {
+        let acme = org("uuid-1", "Acme");
+        let northwind = org("uuid-2", "Northwind");
+        let result = pick_org(vec![acme, northwind], None, OutputFormat::Json);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("--org"), "got: {err}");
+        assert!(err.contains("non-interactive"), "got: {err}");
+    }
+
+    #[test]
+    fn pick_org_multi_org_human_output_needs_prompt() {
+        let acme = org("uuid-1", "Acme");
+        let northwind = org("uuid-2", "Northwind");
+        let result = pick_org(vec![acme, northwind], None, OutputFormat::Human).unwrap();
+        match result {
+            OrgPick::NeedPrompt(orgs) => {
+                assert_eq!(orgs.len(), 2);
+                assert_eq!(orgs[0].id, "uuid-1");
+                assert_eq!(orgs[1].id, "uuid-2");
+            }
+            other => panic!("expected NeedPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pick_org_hint_wins_even_in_json_output() {
+        // JSON-mode multi-org normally errors, but an explicit hint bypasses
+        // the prompt-required check.
+        let acme = org("uuid-1", "Acme");
+        let northwind = org("uuid-2", "Northwind");
+        let result = pick_org(vec![acme, northwind], Some("uuid-1"), OutputFormat::Json).unwrap();
+        match result {
+            OrgPick::Resolved(o) => assert_eq!(o.id, "uuid-1"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
     }
 }

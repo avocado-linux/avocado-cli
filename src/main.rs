@@ -1231,6 +1231,10 @@ enum ConnectAuthCommands {
         /// Use an existing API token instead of browser login
         #[arg(long)]
         token: Option<String>,
+        /// Organization id (UUID) to scope the new token to. Required for
+        /// non-interactive multi-org logins; ignored when --token is set.
+        #[arg(long)]
+        org: Option<String>,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -3239,9 +3243,10 @@ async fn main() -> Result<()> {
                     url,
                     profile,
                     token,
+                    org,
                     output,
                 } => {
-                    let cmd = ConnectAuthLoginCommand::new(url, profile, token, output);
+                    let cmd = ConnectAuthLoginCommand::new(url, profile, token, org, output);
                     cmd.execute().await?;
                     Ok(())
                 }
