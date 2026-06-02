@@ -613,6 +613,11 @@ enum ConnectCommands {
         #[command(subcommand)]
         command: ConnectOrgsCommands,
     },
+    /// Publish extensions to the feed (super-admin)
+    Ext {
+        #[command(subcommand)]
+        command: ConnectExtCommands,
+    },
     /// Manage projects
     Projects {
         #[command(subcommand)]
@@ -849,6 +854,74 @@ enum ConnectKeysCommands {
 enum ConnectOrgsCommands {
     /// List organizations you belong to
     List {
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectExtCommands {
+    /// Build-once publish a packaged extension RPM to the feed (super-admin)
+    Publish {
+        /// Path to the extension RPM (from `avocado ext package`)
+        rpm: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Extension name (default: parsed from the RPM filename)
+        #[arg(long)]
+        name: Option<String>,
+        /// Extension version (default: parsed from the RPM filename)
+        #[arg(long)]
+        version: Option<String>,
+        /// Extension release (default: parsed, else r0)
+        #[arg(long)]
+        release: Option<String>,
+        /// Extension arch (default: parsed, else noarch)
+        #[arg(long)]
+        arch: Option<String>,
+        /// Target feed release
+        #[arg(long, default_value = "2026")]
+        target_release: String,
+        /// Target feed channel
+        #[arg(long, default_value = "edge")]
+        target_channel: String,
+        /// Comma-separated target machines
+        #[arg(long, default_value = "qemux86-64,qemuarm64")]
+        targets: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Show the status of a published extension version
+    Status {
+        /// Version id
+        id: String,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// List published extension versions
+    List {
+        /// Filter by package name
+        #[arg(long)]
+        name: Option<String>,
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
@@ -3314,6 +3387,67 @@ async fn main() -> Result<()> {
             ConnectCommands::Orgs { command } => match command {
                 ConnectOrgsCommands::List { profile } => {
                     let cmd = ConnectOrgsListCommand { profile };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::Ext { command } => match command {
+                ConnectExtCommands::Publish {
+                    rpm,
+                    org,
+                    name,
+                    version,
+                    release,
+                    arch,
+                    target_release,
+                    target_channel,
+                    targets,
+                    config,
+                    profile,
+                } => {
+                    let cmd = commands::connect::ext::ExtPublishCommand {
+                        config,
+                        org,
+                        profile,
+                        rpm,
+                        name,
+                        version,
+                        release,
+                        arch,
+                        target_release,
+                        target_channel,
+                        targets,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectExtCommands::Status {
+                    id,
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let cmd = commands::connect::ext::ExtStatusCommand {
+                        config,
+                        org,
+                        profile,
+                        id,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+                ConnectExtCommands::List {
+                    name,
+                    org,
+                    config,
+                    profile,
+                } => {
+                    let cmd = commands::connect::ext::ExtListCommand {
+                        config,
+                        org,
+                        profile,
+                        name,
+                    };
                     cmd.execute().await?;
                     Ok(())
                 }
