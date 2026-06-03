@@ -166,13 +166,18 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // Loopback-only port QEMU's hostfwd binds to. The supervisor
     // listens on the user-facing `ssh_port` and proxies through to
     // this one; downstream callers (vm shell, forward.rs, Avocado.app)
-    // only ever see `ssh_port`.
-    let internal_ssh_port = qemu::pick_free_port()?;
-    std::fs::write(
-        paths.internal_ssh_port_file(),
-        internal_ssh_port.to_string(),
-    )
-    .with_context(|| format!("writing {}", paths.internal_ssh_port_file().display()))?;
+    // only ever see `ssh_port`. On non-unix the supervisor is
+    // unavailable (uses tokio's UnixListener), so QEMU binds the
+    // user-facing port directly — pre-supervisor behavior.
+    #[cfg(unix)]
+    let qemu_hostfwd_port = {
+        let internal = qemu::pick_free_port()?;
+        std::fs::write(paths.internal_ssh_port_file(), internal.to_string())
+            .with_context(|| format!("writing {}", paths.internal_ssh_port_file().display()))?;
+        internal
+    };
+    #[cfg(not(unix))]
+    let qemu_hostfwd_port = ssh_port;
 
     // Now that the port is known, write the ssh-config + wire it into
     // ~/.ssh/config. This is required for `DOCKER_HOST=ssh://avocado-vm`
@@ -189,7 +194,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     let cfg = QemuConfig {
         memory_mib,
         cpus,
-        ssh_port: internal_ssh_port,
+        ssh_port: qemu_hostfwd_port,
         cmdline_extra: opts.cmdline_extra,
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
@@ -216,8 +221,16 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // `idle_after_secs` of no proxied activity, sends QMP `stop` to
     // halt the vCPUs; wakes on the next incoming TCP. boot_sync below
     // goes through the proxy, which is why we spawn before waiting.
+    // Unix-only because the supervisor uses tokio's UnixListener for
+    // the docker-socket path; on Windows the supervisor is absent
+    // (idle_after_secs forced to 0) and we fall through to the legacy
+    // long-lived docker forwarder below.
+    #[cfg(unix)]
     let idle_after_secs = resolve_idle_after_secs(&paths);
-    spawn_supervisor(&paths, ssh_port, internal_ssh_port, idle_after_secs).await?;
+    #[cfg(not(unix))]
+    let idle_after_secs: u64 = 0;
+    #[cfg(unix)]
+    spawn_supervisor(&paths, ssh_port, qemu_hostfwd_port, idle_after_secs).await?;
 
     // Wait for the guest to become ready — first signal wins (qga vs SSH).
     let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_socket(), ssh_port, None)
@@ -311,6 +324,7 @@ async fn stop_inner(force: bool) -> Result<()> {
     // exited, the next `vm start` would race against a still-bound port.
     // The docker socket forwarder is an SSH child that can outlive QEMU
     // if we shut down by signal, leaving a stale `docker.sock`.
+    #[cfg(unix)]
     stop_supervisor(&paths);
     let _ = super::forward::stop(&paths).await;
 
@@ -765,12 +779,14 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
 /// when the user steps away from active work and not pausing mid-pause
 /// during normal SSH/docker bursts. Users with snappier wake budgets
 /// can lower via `avocado vm config set idle.hibernate_after_secs N`.
+#[cfg(unix)]
 const DEFAULT_IDLE_AFTER_SECS: u64 = 60;
 
 /// Resolve the hibernate timeout. Env var wins (one-shot override for
 /// experimentation), else the persisted `idle.hibernate_after_secs`,
 /// else the default. `0` disables hibernation while keeping the proxy
 /// up — useful for isolating proxy issues from QMP issues.
+#[cfg(unix)]
 fn resolve_idle_after_secs(paths: &VmPaths) -> u64 {
     if let Ok(raw) = std::env::var("AVOCADO_VM_IDLE_HIBERNATE_SECS") {
         if let Ok(parsed) = raw.parse::<u64>() {
@@ -796,6 +812,7 @@ fn resolve_idle_after_secs(paths: &VmPaths) -> u64 {
 /// Best-effort SIGTERM → SIGKILL on the supervisor pid, then remove
 /// its pidfile + internal-ssh-port marker. Idempotent — missing
 /// pidfile / dead pid is a no-op.
+#[cfg(unix)]
 fn stop_supervisor(paths: &VmPaths) {
     let pidfile = paths.supervisor_pid();
     if let Ok(raw) = std::fs::read_to_string(&pidfile) {
@@ -818,6 +835,7 @@ fn stop_supervisor(paths: &VmPaths) {
     let _ = std::fs::remove_file(paths.internal_ssh_port_file());
 }
 
+#[cfg(unix)]
 async fn spawn_supervisor(
     paths: &VmPaths,
     user_port: u16,

@@ -39,4 +39,5 @@ pub mod share;
 pub mod ssh;
 pub mod staging;
 pub mod state;
+#[cfg(unix)]
 pub mod supervisor;

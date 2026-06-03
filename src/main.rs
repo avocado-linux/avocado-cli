@@ -3080,6 +3080,7 @@ async fn main() -> Result<()> {
                 cmd.execute().await
             }
             VmCommands::Stop { force } => commands::vm::stop::StopCommand { force }.execute().await,
+            #[cfg(unix)]
             VmCommands::Supervise {
                 user_port,
                 internal_port,
@@ -4570,7 +4571,9 @@ enum VmCommands {
     /// Long-lived hibernation supervisor. Internal — spawned by `vm start`,
     /// not for direct use. Owns the user-facing SSH port AND docker
     /// socket, proxies to QEMU's internal hostfwd / SSH tunnel, and
-    /// sends QMP stop/cont on the idle timeout.
+    /// sends QMP stop/cont on the idle timeout. Unix-only because the
+    /// docker socket path requires UnixListener.
+    #[cfg(unix)]
     #[command(hide = true)]
     Supervise {
         #[arg(long)]

@@ -12,5 +12,6 @@ pub mod shell;
 pub mod start;
 pub mod status;
 pub mod stop;
+#[cfg(unix)]
 pub mod supervise;
 pub mod update;
