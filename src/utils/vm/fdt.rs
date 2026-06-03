@@ -45,14 +45,21 @@ pub struct Node {
 
 impl Node {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), props: Vec::new(), children: Vec::new() }
+        Self {
+            name: name.into(),
+            props: Vec::new(),
+            children: Vec::new(),
+        }
     }
 
     pub fn set_prop(&mut self, name: &str, value: Vec<u8>) {
         if let Some(p) = self.props.iter_mut().find(|p| p.name == name) {
             p.value = value;
         } else {
-            self.props.push(Property { name: name.to_string(), value });
+            self.props.push(Property {
+                name: name.to_string(),
+                value,
+            });
         }
     }
 
@@ -96,10 +103,12 @@ pub fn parse(data: &[u8]) -> Result<Fdt> {
         bail!("unsupported DTB version {version} (need v16+)");
     }
     if data.len() < totalsize {
-        bail!("DTB truncated: header says {totalsize} bytes, got {}", data.len());
+        bail!(
+            "DTB truncated: header says {totalsize} bytes, got {}",
+            data.len()
+        );
     }
-    if off_dt_struct + size_dt_struct > data.len()
-        || off_dt_strings + size_dt_strings > data.len()
+    if off_dt_struct + size_dt_struct > data.len() || off_dt_strings + size_dt_strings > data.len()
     {
         bail!("DTB struct/strings offsets out of bounds");
     }
@@ -119,7 +128,11 @@ pub fn parse(data: &[u8]) -> Result<Fdt> {
         mem_rsv.push((addr, size));
     }
 
-    let mut parser = Parser { data, pos: off_dt_struct, strings_base: off_dt_strings };
+    let mut parser = Parser {
+        data,
+        pos: off_dt_struct,
+        strings_base: off_dt_strings,
+    };
     let first = parser.read_u32()?;
     if first != FDT_BEGIN_NODE {
         bail!("DTB struct block must start with BEGIN_NODE, got {first:#x}");
@@ -129,7 +142,11 @@ pub fn parse(data: &[u8]) -> Result<Fdt> {
     if last != FDT_END {
         bail!("DTB struct block missing FDT_END terminator, got {last:#x}");
     }
-    Ok(Fdt { root, mem_rsv, boot_cpuid_phys })
+    Ok(Fdt {
+        root,
+        mem_rsv,
+        boot_cpuid_phys,
+    })
 }
 
 struct Parser<'a> {
@@ -160,7 +177,7 @@ impl<'a> Parser<'a> {
             .with_context(|| format!("non-utf8 name at offset {start}"))?
             .to_string();
         self.pos += 1;
-        while self.pos % 4 != 0 {
+        while !self.pos.is_multiple_of(4) {
             self.pos += 1;
         }
         Ok(s)
@@ -197,7 +214,7 @@ impl<'a> Parser<'a> {
                         })?
                         .to_vec();
                     self.pos += len;
-                    while self.pos % 4 != 0 {
+                    while !self.pos.is_multiple_of(4) {
                         self.pos += 1;
                     }
                     node.props.push(Property {
@@ -223,7 +240,12 @@ struct Emitter {
 }
 
 impl Emitter {
-    fn new() -> Self { Self { structs: Vec::new(), strings: Vec::new() } }
+    fn new() -> Self {
+        Self {
+            structs: Vec::new(),
+            strings: Vec::new(),
+        }
+    }
 
     fn intern(&mut self, name: &str) -> u32 {
         let bytes = name.as_bytes();
@@ -244,10 +266,12 @@ impl Emitter {
         off
     }
 
-    fn push_u32(&mut self, v: u32) { self.structs.extend_from_slice(&v.to_be_bytes()); }
+    fn push_u32(&mut self, v: u32) {
+        self.structs.extend_from_slice(&v.to_be_bytes());
+    }
 
     fn pad4(&mut self) {
-        while self.structs.len() % 4 != 0 {
+        while !self.structs.len().is_multiple_of(4) {
             self.structs.push(0);
         }
     }
@@ -326,7 +350,9 @@ fn max_phandle(node: &Node) -> u32 {
     max
 }
 
-fn be32(v: u32) -> Vec<u8> { v.to_be_bytes().to_vec() }
+fn be32(v: u32) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
 fn strprop(s: &str) -> Vec<u8> {
     let mut v = s.as_bytes().to_vec();
     v.push(0);
@@ -405,7 +431,11 @@ mod tests {
             cpus.children.push(cpu);
         }
         root.children.push(cpus);
-        let fdt = Fdt { root, mem_rsv: vec![], boot_cpuid_phys: 0 };
+        let fdt = Fdt {
+            root,
+            mem_rsv: vec![],
+            boot_cpuid_phys: 0,
+        };
         serialize(&fdt)
     }
 
@@ -441,7 +471,10 @@ mod tests {
                 .iter()
                 .find(|p| p.name == "cpu-idle-states")
                 .expect("cpu-idle-states missing on cpu node");
-            assert_eq!(u32::from_be_bytes(cis.value.as_slice().try_into().unwrap()), phandle);
+            assert_eq!(
+                u32::from_be_bytes(cis.value.as_slice().try_into().unwrap()),
+                phandle
+            );
         }
     }
 
@@ -454,7 +487,10 @@ mod tests {
         let rt = parse(&out).unwrap();
         assert!(rt.root.children.iter().any(|c| c.name == "idle-states"));
         let cpus = rt.root.children.iter().find(|c| c.name == "cpus").unwrap();
-        assert!(cpus.children.iter().all(|c| c.props.iter().any(|p| p.name == "cpu-idle-states")));
+        assert!(cpus
+            .children
+            .iter()
+            .all(|c| c.props.iter().any(|p| p.name == "cpu-idle-states")));
     }
 
     #[test]
@@ -468,7 +504,11 @@ mod tests {
     fn patch_fails_when_no_cpus_node() {
         let mut root = Node::new("");
         root.set_prop("#address-cells", be32(2));
-        let fdt_in = Fdt { root, mem_rsv: vec![], boot_cpuid_phys: 0 };
+        let fdt_in = Fdt {
+            root,
+            mem_rsv: vec![],
+            boot_cpuid_phys: 0,
+        };
         let bytes = serialize(&fdt_in);
         let mut fdt = parse(&bytes).unwrap();
         assert!(patch_idle_states(&mut fdt, 4).is_err());
@@ -482,7 +522,11 @@ mod tests {
         cpu.set_prop("reg", be32(0));
         cpus.children.push(cpu);
         root.children.push(cpus);
-        let fdt_in = Fdt { root, mem_rsv: vec![], boot_cpuid_phys: 0x42 };
+        let fdt_in = Fdt {
+            root,
+            mem_rsv: vec![],
+            boot_cpuid_phys: 0x42,
+        };
         let bytes = serialize(&fdt_in);
         let parsed = parse(&bytes).unwrap();
         assert_eq!(parsed.boot_cpuid_phys, 0x42);

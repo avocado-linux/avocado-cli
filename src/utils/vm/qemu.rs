@@ -231,7 +231,9 @@ pub fn build_qemu_args(
     // Failures degrade gracefully: log + skip, kernel falls back to the
     // auto-generated DTB it would have used anyway.
     if matches!(arch.as_str(), "arm64" | "aarch64") {
-        let dtb_override = std::env::var("AVOCADO_VM_DTB").ok().filter(|s| !s.is_empty());
+        let dtb_override = std::env::var("AVOCADO_VM_DTB")
+            .ok()
+            .filter(|s| !s.is_empty());
         match dtb_override {
             Some(path) => {
                 args.push("-dtb".into());
@@ -288,8 +290,7 @@ fn ensure_idle_states_dtb(paths: &VmPaths, cfg: &QemuConfig) -> Result<PathBuf> 
     let raw = std::fs::read(tmp.path())
         .with_context(|| format!("failed to read dumped DTB at {}", tmp.path().display()))?;
     let mut fdt = fdt::parse(&raw).context("failed to parse QEMU-generated DTB")?;
-    fdt::patch_idle_states(&mut fdt, cfg.cpus)
-        .context("failed to splice idle-states into DTB")?;
+    fdt::patch_idle_states(&mut fdt, cfg.cpus).context("failed to splice idle-states into DTB")?;
     let patched = fdt::serialize(&fdt);
     std::fs::write(tmp.path(), &patched)
         .with_context(|| format!("failed to write patched DTB to {}", tmp.path().display()))?;
@@ -341,10 +342,8 @@ fn dump_base_dtb(qemu_bin: &str, cfg: &QemuConfig, out: &Path) -> Result<()> {
 /// cache; a binary that hasn't been touched produces the same key
 /// indefinitely.
 fn qemu_binary_tag(qemu_bin: &str) -> Result<String> {
-    let path = which_on_path(qemu_bin)
-        .with_context(|| format!("{qemu_bin} not found on $PATH"))?;
-    let meta = std::fs::metadata(&path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let path = which_on_path(qemu_bin).with_context(|| format!("{qemu_bin} not found on $PATH"))?;
+    let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
     let mtime = meta
         .modified()
         .ok()

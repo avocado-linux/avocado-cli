@@ -419,10 +419,7 @@ fn spawn_ssh_tunnel(args: &RunArgs) -> Result<u32> {
         "-p",
         &args.internal_port.to_string(),
         "-L",
-        &format!(
-            "{}:/run/docker.sock",
-            args.docker_socket_internal.display()
-        ),
+        &format!("{}:/run/docker.sock", args.docker_socket_internal.display()),
         "root@127.0.0.1",
     ]);
     cmd.stdin(Stdio::null());
@@ -463,5 +460,7 @@ async fn wait_for_term() -> Result<()> {
 
 #[cfg(not(unix))]
 async fn wait_for_term() -> Result<()> {
-    tokio::signal::ctrl_c().await.context("install ctrl-c handler")
+    tokio::signal::ctrl_c()
+        .await
+        .context("install ctrl-c handler")
 }

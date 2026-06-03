@@ -3090,19 +3090,21 @@ async fn main() -> Result<()> {
                 docker_socket_internal,
                 ssh_key,
                 known_hosts,
-            } => commands::vm::supervise::SuperviseCommand {
-                user_port,
-                internal_port,
-                qmp_socket,
-                idle_after_secs,
-                pid_file,
-                docker_socket,
-                docker_socket_internal,
-                ssh_key,
-                known_hosts,
+            } => {
+                commands::vm::supervise::SuperviseCommand {
+                    user_port,
+                    internal_port,
+                    qmp_socket,
+                    idle_after_secs,
+                    pid_file,
+                    docker_socket,
+                    docker_socket_internal,
+                    ssh_key,
+                    known_hosts,
+                }
+                .execute()
+                .await
             }
-            .execute()
-            .await,
             VmCommands::Status => commands::vm::status::StatusCommand.execute().await,
             VmCommands::Shell { command } => {
                 commands::vm::shell::ShellCommand { command }

@@ -168,8 +168,11 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // this one; downstream callers (vm shell, forward.rs, Avocado.app)
     // only ever see `ssh_port`.
     let internal_ssh_port = qemu::pick_free_port()?;
-    std::fs::write(paths.internal_ssh_port_file(), internal_ssh_port.to_string())
-        .with_context(|| format!("writing {}", paths.internal_ssh_port_file().display()))?;
+    std::fs::write(
+        paths.internal_ssh_port_file(),
+        internal_ssh_port.to_string(),
+    )
+    .with_context(|| format!("writing {}", paths.internal_ssh_port_file().display()))?;
 
     // Now that the port is known, write the ssh-config + wire it into
     // ~/.ssh/config. This is required for `DOCKER_HOST=ssh://avocado-vm`
@@ -874,7 +877,10 @@ async fn spawn_supervisor(
     // proxy is ready before boot_sync starts pumping connections through.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", user_port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", user_port))
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
