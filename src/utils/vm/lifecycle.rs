@@ -185,6 +185,22 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     #[cfg(not(unix))]
     let qemu_hostfwd_port = ssh_port;
 
+    // Infrastructure SSH port — second user-facing port that the
+    // supervisor proxies identically to `ssh_port`, but connections to
+    // it do NOT count toward the idle-hibernation timer. Long-lived
+    // telemetry channels (Avocado.app's agent SSH tunnel, docker
+    // /events subscriptions) connect here so they wake the VM on
+    // attach but don't pin it awake forever.
+    #[cfg(unix)]
+    let infra_ssh_port = {
+        let port = qemu::pick_free_port()?;
+        std::fs::write(paths.infra_ssh_port_file(), port.to_string())
+            .with_context(|| format!("writing {}", paths.infra_ssh_port_file().display()))?;
+        port
+    };
+    #[cfg(not(unix))]
+    let infra_ssh_port = ssh_port;
+
     // Now that the port is known, write the ssh-config + wire it into
     // ~/.ssh/config. This is required for `DOCKER_HOST=ssh://avocado-vm`
     // to resolve in any subprocess we spawn — Docker's ssh transport reads
@@ -236,7 +252,14 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     #[cfg(not(unix))]
     let idle_after_secs: u64 = 0;
     #[cfg(unix)]
-    spawn_supervisor(&paths, ssh_port, qemu_hostfwd_port, idle_after_secs).await?;
+    spawn_supervisor(
+        &paths,
+        ssh_port,
+        qemu_hostfwd_port,
+        infra_ssh_port,
+        idle_after_secs,
+    )
+    .await?;
 
     // Wait for the guest to become ready — first signal wins (qga vs SSH).
     let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_socket(), ssh_port, None)
@@ -880,6 +903,7 @@ fn stop_supervisor(paths: &VmPaths) {
     }
     let _ = std::fs::remove_file(pidfile);
     let _ = std::fs::remove_file(paths.internal_ssh_port_file());
+    let _ = std::fs::remove_file(paths.infra_ssh_port_file());
 }
 
 #[cfg(unix)]
@@ -887,6 +911,7 @@ async fn spawn_supervisor(
     paths: &VmPaths,
     user_port: u16,
     internal_port: u16,
+    infra_port: u16,
     idle_after_secs: u64,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("locating current avocado binary")?;
@@ -898,6 +923,8 @@ async fn spawn_supervisor(
         &user_port.to_string(),
         "--internal-port",
         &internal_port.to_string(),
+        "--infra-port",
+        &infra_port.to_string(),
         "--qmp-socket",
         &paths.qmp_socket().to_string_lossy(),
         "--idle-after-secs",
@@ -908,6 +935,8 @@ async fn spawn_supervisor(
         &paths.docker_socket().to_string_lossy(),
         "--docker-socket-internal",
         &paths.docker_socket_internal().to_string_lossy(),
+        "--docker-socket-stream",
+        &paths.docker_socket_stream().to_string_lossy(),
         "--ssh-key",
         &paths.ssh_key().to_string_lossy(),
         "--known-hosts",

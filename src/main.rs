@@ -3084,22 +3084,26 @@ async fn main() -> Result<()> {
             VmCommands::Supervise {
                 user_port,
                 internal_port,
+                infra_port,
                 qmp_socket,
                 idle_after_secs,
                 pid_file,
                 docker_socket,
                 docker_socket_internal,
+                docker_socket_stream,
                 ssh_key,
                 known_hosts,
             } => {
                 commands::vm::supervise::SuperviseCommand {
                     user_port,
                     internal_port,
+                    infra_port,
                     qmp_socket,
                     idle_after_secs,
                     pid_file,
                     docker_socket,
                     docker_socket_internal,
+                    docker_socket_stream,
                     ssh_key,
                     known_hosts,
                 }
@@ -4581,6 +4585,8 @@ enum VmCommands {
         #[arg(long)]
         internal_port: u16,
         #[arg(long)]
+        infra_port: u16,
+        #[arg(long)]
         qmp_socket: std::path::PathBuf,
         #[arg(long)]
         idle_after_secs: u64,
@@ -4590,6 +4596,8 @@ enum VmCommands {
         docker_socket: std::path::PathBuf,
         #[arg(long)]
         docker_socket_internal: std::path::PathBuf,
+        #[arg(long)]
+        docker_socket_stream: std::path::PathBuf,
         #[arg(long)]
         ssh_key: std::path::PathBuf,
         #[arg(long)]

@@ -13,11 +13,13 @@ use crate::utils::vm::supervisor::{run, RunArgs};
 pub struct SuperviseCommand {
     pub user_port: u16,
     pub internal_port: u16,
+    pub infra_port: u16,
     pub qmp_socket: PathBuf,
     pub idle_after_secs: u64,
     pub pid_file: PathBuf,
     pub docker_socket: PathBuf,
     pub docker_socket_internal: PathBuf,
+    pub docker_socket_stream: PathBuf,
     pub ssh_key: PathBuf,
     pub known_hosts: PathBuf,
 }
@@ -27,11 +29,13 @@ impl SuperviseCommand {
         run(RunArgs {
             user_port: self.user_port,
             internal_port: self.internal_port,
+            infra_port: self.infra_port,
             qmp_socket: self.qmp_socket,
             idle_after_secs: self.idle_after_secs,
             pid_file: self.pid_file,
             docker_socket: self.docker_socket,
             docker_socket_internal: self.docker_socket_internal,
+            docker_socket_stream: self.docker_socket_stream,
             ssh_key: self.ssh_key,
             known_hosts: self.known_hosts,
         })

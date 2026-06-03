@@ -41,6 +41,15 @@ use tokio::sync::Mutex;
 use super::qmp::QmpClient;
 use super::state;
 
+/// Log a supervisor event with a UTC timestamp prefix. Timestamps make
+/// pause/wake cycles in `~/.avocado/vm/supervisor.log` legible without
+/// having to correlate against shell history.
+macro_rules! slog {
+    ($($arg:tt)*) => {{
+        eprintln!("[{}] supervisor: {}", chrono::Utc::now().to_rfc3339(), format_args!($($arg)*))
+    }};
+}
+
 /// Arguments passed from the `avocado vm supervise` subcommand into the
 /// supervisor loop. Plain owned data so the caller can construct it from
 /// clap-parsed flags without leaking lifetimes.
@@ -64,6 +73,16 @@ pub struct RunArgs {
     /// Host path the supervisor's SSH `-L` tunnel binds to; only the
     /// docker proxy connects here.
     pub docker_socket_internal: PathBuf,
+    /// "Infrastructure" TCP lane — second user-facing port that
+    /// wakes the VM on connect but does NOT count toward idle.
+    /// Used by long-lived telemetry channels (Avocado.app's agent SSH
+    /// tunnel) so they don't pin the VM awake.
+    pub infra_port: u16,
+    /// "Infrastructure" docker socket. Same SSH `-L` tunnel as
+    /// `docker_socket`, but accepted connections here don't count
+    /// toward idle — meant for `GET /events` style streaming
+    /// subscriptions.
+    pub docker_socket_stream: PathBuf,
     /// SSH private key for tunneling to the guest.
     pub ssh_key: PathBuf,
     /// known_hosts file the SSH tunnel uses.
@@ -102,7 +121,7 @@ impl State {
                 .await
                 .context("QMP cont")?;
             self.paused.store(false, Ordering::Relaxed);
-            eprintln!("supervisor: resumed VM on incoming connection");
+            slog!("resumed VM on incoming connection");
         }
         Ok(())
     }
@@ -145,7 +164,7 @@ impl State {
         loop {
             if self.args.docker_socket_internal.exists() {
                 *lock = Some(pid);
-                eprintln!("supervisor: docker tunnel up (pid {pid})");
+                slog!("docker tunnel up (pid {pid})");
                 return Ok(());
             }
             if !state::pid_alive(pid) {
@@ -244,6 +263,28 @@ pub async fn run(args: RunArgs) -> Result<()> {
         args.docker_socket.display()
     );
 
+    // Infrastructure TCP lane — wakes the VM on connect, proxies to the
+    // same internal hostfwd, but does NOT count toward idle. Long-lived
+    // telemetry channels (desktop's agent SSH tunnel, future event-stream
+    // consumers) connect here so they don't pin the VM awake.
+    let infra_tcp_listener = TcpListener::bind(("127.0.0.1", args.infra_port))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{}", args.infra_port))?;
+    eprintln!(
+        "supervisor: infra TCP listening on 127.0.0.1:{} → 127.0.0.1:{} (idle-exempt)",
+        args.infra_port, args.internal_port
+    );
+
+    // Infrastructure docker socket — same SSH tunnel, doesn't count toward
+    // idle. Meant for `GET /events` streaming subscriptions.
+    let _ = std::fs::remove_file(&args.docker_socket_stream);
+    let infra_unix_listener = UnixListener::bind(&args.docker_socket_stream)
+        .with_context(|| format!("binding {}", args.docker_socket_stream.display()))?;
+    eprintln!(
+        "supervisor: infra Unix listening on {} → SSH→/run/docker.sock (idle-exempt)",
+        args.docker_socket_stream.display()
+    );
+
     if args.idle_after_secs > 0 {
         let state_t = state.clone();
         tokio::spawn(async move {
@@ -257,7 +298,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let state_sig = state.clone();
     tokio::spawn(async move {
         if let Err(e) = wait_for_term().await {
-            eprintln!("supervisor: signal handler error: {e:#}");
+            slog!("signal handler error: {e:#}");
             return;
         }
         let _ = state_sig.wake().await; // ensure VM is resumed before we exit
@@ -265,32 +306,58 @@ pub async fn run(args: RunArgs) -> Result<()> {
         std::process::exit(0);
     });
 
-    // Main accept loop: select between TCP and Unix listeners. Spawned
+    // Main accept loop: select between TCP/Unix user-facing listeners
+    // (counted) and the two infra listeners (idle-exempt). Spawned
     // tasks own their connection through close.
     loop {
         tokio::select! {
             res = tcp_listener.accept() => {
                 let (sock, peer) = match res {
                     Ok(v) => v,
-                    Err(e) => { eprintln!("supervisor: TCP accept error: {e:#}"); continue; }
+                    Err(e) => { slog!("TCP accept error: {e:#}"); continue; }
                 };
                 let s = state.clone();
                 let internal_port = args.internal_port;
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tcp(sock, internal_port, s).await {
-                        eprintln!("supervisor: TCP conn {peer} error: {e:#}");
+                    if let Err(e) = handle_tcp(sock, internal_port, s, /* count */ true).await {
+                        slog!("TCP conn {peer} error: {e:#}");
+                    }
+                });
+            }
+            res = infra_tcp_listener.accept() => {
+                let (sock, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => { slog!("infra TCP accept error: {e:#}"); continue; }
+                };
+                let s = state.clone();
+                let internal_port = args.internal_port;
+                tokio::spawn(async move {
+                    if let Err(e) = handle_tcp(sock, internal_port, s, /* count */ false).await {
+                        slog!("infra TCP conn {peer} error: {e:#}");
                     }
                 });
             }
             res = unix_listener.accept() => {
                 let (sock, _peer) = match res {
                     Ok(v) => v,
-                    Err(e) => { eprintln!("supervisor: Unix accept error: {e:#}"); continue; }
+                    Err(e) => { slog!("Unix accept error: {e:#}"); continue; }
                 };
                 let s = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_docker(sock, s).await {
-                        eprintln!("supervisor: docker conn error: {e:#}");
+                    if let Err(e) = handle_docker(sock, s, /* count */ true).await {
+                        slog!("docker conn error: {e:#}");
+                    }
+                });
+            }
+            res = infra_unix_listener.accept() => {
+                let (sock, _peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => { slog!("infra Unix accept error: {e:#}"); continue; }
+                };
+                let s = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_docker(sock, s, /* count */ false).await {
+                        slog!("infra docker conn error: {e:#}");
                     }
                 });
             }
@@ -298,12 +365,32 @@ pub async fn run(args: RunArgs) -> Result<()> {
     }
 }
 
-async fn handle_tcp(mut incoming: TcpStream, internal_port: u16, state: Arc<State>) -> Result<()> {
-    state.active_conns.fetch_add(1, Ordering::Relaxed);
-    state.touch();
-
-    if let Err(e) = state.wake().await {
-        eprintln!("supervisor: wake failed: {e}");
+/// Proxy a TCP connection from a user-facing or infra listener to QEMU's
+/// internal hostfwd.
+///
+/// `count`-true: user-facing traffic (a real SSH session, etc.) —
+/// bumps `active_conns` + activity time, and calls `wake()` to bring
+/// the VM out of hibernation. Drives the VM lifecycle.
+///
+/// `count`-false: infrastructure (long-lived telemetry like the
+/// desktop's agent SSH tunnel) — does NOT touch activity counters and
+/// does NOT wake the VM. Just opportunistically uses the VM if it's
+/// already running. Otherwise the inner connect to `internal_port`
+/// succeeds (QEMU slirp accepts) but bytes queue without delivery; the
+/// caller times out and retries with backoff. Keeps hibernation
+/// intact: only real user activity can wake the VM.
+async fn handle_tcp(
+    mut incoming: TcpStream,
+    internal_port: u16,
+    state: Arc<State>,
+    count: bool,
+) -> Result<()> {
+    if count {
+        state.active_conns.fetch_add(1, Ordering::Relaxed);
+        state.touch();
+        if let Err(e) = state.wake().await {
+            slog!("wake failed: {e}");
+        }
     }
 
     let mut inner = TcpStream::connect(("127.0.0.1", internal_port))
@@ -313,23 +400,44 @@ async fn handle_tcp(mut incoming: TcpStream, internal_port: u16, state: Arc<Stat
     let _ = incoming.shutdown().await;
     let _ = inner.shutdown().await;
 
-    state.active_conns.fetch_sub(1, Ordering::Relaxed);
-    state.touch();
+    if count {
+        state.active_conns.fetch_sub(1, Ordering::Relaxed);
+        state.touch();
+    }
     classify_close(res)
 }
 
-async fn handle_docker(mut client: UnixStream, state: Arc<State>) -> Result<()> {
-    state.active_conns.fetch_add(1, Ordering::Relaxed);
-    state.touch();
-
-    // Wake VM first (QMP cont). Then bring the SSH tunnel up — the
-    // tunnel's auth handshake needs guest sshd running, which is only
-    // true post-wake.
-    state.wake().await.context("waking VM for docker conn")?;
-    state
-        .ensure_tunnel()
-        .await
-        .context("bringing docker tunnel up")?;
+/// Proxy a docker client to the supervisor-managed SSH tunnel.
+///
+/// `count`-true: user-facing docker call (avocado build, docker ps from
+/// the user shell, etc.) — wakes VM + brings tunnel up if needed,
+/// counts toward idle. The VM stays awake until the call finishes.
+///
+/// `count`-false: infrastructure (containers watcher's `/events` stream,
+/// snapshot refreshes) — does NOT wake VM and does NOT ensure the
+/// tunnel. Just connects to the existing tunnel socket; if it's down
+/// (paused VM, boot still in progress), returns a fast error. Caller
+/// backs off and retries. This is what lets hibernation actually stick
+/// when the desktop is open: the watcher's reconnect attempts can't
+/// pin the VM awake by themselves, only user activity can.
+async fn handle_docker(mut client: UnixStream, state: Arc<State>, count: bool) -> Result<()> {
+    if count {
+        state.active_conns.fetch_add(1, Ordering::Relaxed);
+        state.touch();
+        state.wake().await.context("waking VM for docker conn")?;
+        state
+            .ensure_tunnel()
+            .await
+            .context("bringing docker tunnel up")?;
+    } else if !state.args.docker_socket_internal.exists() {
+        // Infra: tunnel not currently up. Fail fast — caller (likely
+        // ContainersWatcher) backs off and retries; a future
+        // user-driven docker call will bring the tunnel up and the
+        // next retry will succeed.
+        return Err(anyhow::anyhow!(
+            "docker tunnel not up (VM paused or still booting)"
+        ));
+    }
 
     let mut backend = UnixStream::connect(&state.args.docker_socket_internal)
         .await
@@ -343,8 +451,10 @@ async fn handle_docker(mut client: UnixStream, state: Arc<State>) -> Result<()> 
     let _ = client.shutdown().await;
     let _ = backend.shutdown().await;
 
-    state.active_conns.fetch_sub(1, Ordering::Relaxed);
-    state.touch();
+    if count {
+        state.active_conns.fetch_sub(1, Ordering::Relaxed);
+        state.touch();
+    }
     classify_close(res)
 }
 
@@ -377,9 +487,9 @@ async fn idle_watcher(state: Arc<State>) {
         let since = now_ms() - state.last_activity_ms.load(Ordering::Relaxed);
         if since >= state.idle_threshold_ms {
             match state.pause().await {
-                Ok(_) => eprintln!("supervisor: paused VM after {since} ms idle"),
+                Ok(_) => slog!("paused VM after {since} ms idle"),
                 Err(e) => {
-                    eprintln!("supervisor: pause failed: {e}");
+                    slog!("pause failed: {e}");
                     state.touch(); // back off
                 }
             }

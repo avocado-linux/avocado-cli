@@ -183,6 +183,22 @@ impl VmPaths {
     pub fn internal_ssh_port_file(&self) -> PathBuf {
         self.root.join("internal-ssh-port")
     }
+    /// Supervisor's "infrastructure" SSH lane — a second TCP listener
+    /// that proxies to QEMU's internal hostfwd identically to the
+    /// user-facing port, BUT does not count toward the idle-hibernation
+    /// activity tracker. Long-lived telemetry channels (Avocado.app's
+    /// agent SSH tunnel, future event-stream consumers) connect here
+    /// so they wake the VM on attach but don't pin it awake forever.
+    pub fn infra_ssh_port_file(&self) -> PathBuf {
+        self.root.join("infra-ssh-port")
+    }
+    /// "Infrastructure" docker socket. Same backing SSH tunnel as
+    /// `docker_socket()`, but connections here don't count toward idle
+    /// — meant for streaming subscriptions like `GET /events` that
+    /// stay open for the VM's lifetime.
+    pub fn docker_socket_stream(&self) -> PathBuf {
+        self.root.join("docker-stream.sock")
+    }
     /// Absolute path to the artifact directory that was last used for `vm
     /// start`. The macOS Avocado.app reads this when launched without an
     /// AVOCADO_VM_DIR env var (Finder/Dock launches inherit a sanitized env
@@ -280,9 +296,11 @@ pub fn cleanup_transient(paths: &VmPaths) {
         paths.lock_file(),
         paths.docker_socket(),
         paths.docker_socket_internal(),
+        paths.docker_socket_stream(),
         paths.forwarder_pid(),
         paths.supervisor_pid(),
         paths.internal_ssh_port_file(),
+        paths.infra_ssh_port_file(),
     ] {
         let _ = std::fs::remove_file(&p);
     }
