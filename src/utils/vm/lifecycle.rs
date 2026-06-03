@@ -758,11 +758,11 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
 }
 
 /// Default idle timeout in seconds when neither config nor env var sets
-/// one. Aggressive for testing while the hibernation supervisor is new
-/// — production should land on a more user-friendly default (multiple
-/// minutes) once the wake-on-connect path has been exercised in real
-/// workflows.
-const DEFAULT_IDLE_AFTER_SECS: u64 = 10;
+/// one. One minute strikes a balance between freeing host CPU promptly
+/// when the user steps away from active work and not pausing mid-pause
+/// during normal SSH/docker bursts. Users with snappier wake budgets
+/// can lower via `avocado vm config set idle.hibernate_after_secs N`.
+const DEFAULT_IDLE_AFTER_SECS: u64 = 60;
 
 /// Resolve the hibernate timeout. Env var wins (one-shot override for
 /// experimentation), else the persisted `idle.hibernate_after_secs`,
