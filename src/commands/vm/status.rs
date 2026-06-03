@@ -10,8 +10,12 @@ impl StatusCommand {
     pub async fn execute(self) -> Result<()> {
         let s = lifecycle::status().await?;
         if s.running {
+            let state_tag = match s.paused {
+                Some(true) => " (hibernated — wakes on next ssh/docker call)",
+                _ => "",
+            };
             println!(
-                "avocado-vm running (pid {}, ssh 127.0.0.1:{})",
+                "avocado-vm running (pid {}, ssh 127.0.0.1:{}){state_tag}",
                 s.pid.unwrap_or(0),
                 s.ssh_port.unwrap_or(0),
             );

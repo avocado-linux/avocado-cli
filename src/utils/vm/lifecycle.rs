@@ -89,6 +89,12 @@ pub struct VmStatus {
     pub manifest_platform: Option<String>,
     pub manifest_arch: Option<String>,
     pub paths: VmPaths,
+    /// `Some(true)` when QEMU has been paused by the hibernation
+    /// supervisor (vCPUs halted, host CPU ~0%, RAM resident — wakes
+    /// on next inbound SSH/docker connection). `Some(false)` when
+    /// confirmed running. `None` when liveness couldn't be probed (no
+    /// QMP socket, supervisor down, non-unix host, etc.).
+    pub paused: Option<bool>,
 }
 
 /// Start the VM. Errors if one is already running. Performs manifest sha256
@@ -303,6 +309,8 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         manifest_platform: Some(manifest.platform),
         manifest_arch: Some(manifest.architecture),
         paths,
+        // We just finished boot — definitely not paused.
+        paused: Some(false),
     })
 }
 
@@ -393,6 +401,15 @@ pub async fn status() -> Result<VmStatus> {
         (None, None)
     };
 
+    // Probe QMP for paused state — the hibernation supervisor halts
+    // vCPUs via QMP `stop` when idle, so a running pid does not
+    // necessarily mean the guest is actively executing. `query-status`
+    // returns `{ status: "running" | "paused", ... }`. Failures here
+    // (no socket, QMP unreachable on non-unix, etc.) leave the field
+    // as `None` so callers can distinguish "couldn't tell" from
+    // "definitely paused".
+    let paused = if running { probe_paused(&paths).await } else { None };
+
     Ok(VmStatus {
         running,
         pid: if running { pid } else { None },
@@ -400,6 +417,7 @@ pub async fn status() -> Result<VmStatus> {
         manifest_platform: platform,
         manifest_arch: arch,
         paths,
+        paused,
     })
 }
 
@@ -772,6 +790,35 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
     std::fs::write(paths.ssh_config(), content)
         .with_context(|| format!("writing {}", paths.ssh_config().display()))?;
     Ok(())
+}
+
+/// Ask QEMU via QMP whether the VM is currently paused. Returns
+/// `Some(true)` for paused, `Some(false)` for any non-paused running
+/// state, and `None` if the QMP socket is unreachable. Short timeout
+/// (~500ms) so a wedged QEMU doesn't make `vm status` hang.
+async fn probe_paused(paths: &VmPaths) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        if !paths.qmp_socket().exists() {
+            return None;
+        }
+        let probe = async {
+            let mut client = QmpClient::connect(&paths.qmp_socket()).await.ok()?;
+            let v = client.execute("query-status", None).await.ok()?;
+            v.get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s == "paused")
+        };
+        tokio::time::timeout(Duration::from_millis(500), probe)
+            .await
+            .ok()
+            .flatten()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        None
+    }
 }
 
 /// Default idle timeout in seconds when neither config nor env var sets
