@@ -39,3 +39,4 @@ pub mod share;
 pub mod ssh;
 pub mod staging;
 pub mod state;
+pub mod supervisor;

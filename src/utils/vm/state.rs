@@ -154,9 +154,34 @@ impl VmPaths {
     pub fn docker_socket(&self) -> PathBuf {
         self.root.join("docker.sock")
     }
+    /// Internal-only landing point for the supervisor-managed SSH `-L`
+    /// tunnel to `/run/docker.sock`. Lives next to `docker.sock` but
+    /// distinct so the user-facing socket can stay alive (owned by the
+    /// supervisor) while this one comes and goes with VM wake/pause.
+    pub fn docker_socket_internal(&self) -> PathBuf {
+        self.root.join("docker.sock.internal")
+    }
     /// PID of the SSH process maintaining the docker socket forward.
     pub fn forwarder_pid(&self) -> PathBuf {
         self.root.join("forwarder.pid")
+    }
+    /// PID of the hibernation supervisor (TCP proxy + QMP stop/cont).
+    /// Distinct from `pid_file` (QEMU) so the lifecycle layer can tear
+    /// down the supervisor before QEMU on shutdown.
+    pub fn supervisor_pid(&self) -> PathBuf {
+        self.root.join("supervisor.pid")
+    }
+    /// Append-only log for the supervisor's pause/resume events. Tail
+    /// this while reproducing a hibernation issue — every QMP stop /
+    /// cont and every accept hits this file.
+    pub fn supervisor_log(&self) -> PathBuf {
+        self.root.join("supervisor.log")
+    }
+    /// Loopback-only port QEMU's SSH hostfwd binds to. The supervisor
+    /// listens on the user-facing `ssh-port` and proxies to this one;
+    /// callers never connect here directly.
+    pub fn internal_ssh_port_file(&self) -> PathBuf {
+        self.root.join("internal-ssh-port")
     }
     /// Absolute path to the artifact directory that was last used for `vm
     /// start`. The macOS Avocado.app reads this when launched without an
@@ -254,7 +279,10 @@ pub fn cleanup_transient(paths: &VmPaths) {
         paths.ssh_port_file(),
         paths.lock_file(),
         paths.docker_socket(),
+        paths.docker_socket_internal(),
         paths.forwarder_pid(),
+        paths.supervisor_pid(),
+        paths.internal_ssh_port_file(),
     ] {
         let _ = std::fs::remove_file(&p);
     }

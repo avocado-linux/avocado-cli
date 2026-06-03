@@ -163,6 +163,14 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     };
     state::write_ssh_port(&paths, ssh_port)?;
 
+    // Loopback-only port QEMU's hostfwd binds to. The supervisor
+    // listens on the user-facing `ssh_port` and proxies through to
+    // this one; downstream callers (vm shell, forward.rs, Avocado.app)
+    // only ever see `ssh_port`.
+    let internal_ssh_port = qemu::pick_free_port()?;
+    std::fs::write(paths.internal_ssh_port_file(), internal_ssh_port.to_string())
+        .with_context(|| format!("writing {}", paths.internal_ssh_port_file().display()))?;
+
     // Now that the port is known, write the ssh-config + wire it into
     // ~/.ssh/config. This is required for `DOCKER_HOST=ssh://avocado-vm`
     // to resolve in any subprocess we spawn — Docker's ssh transport reads
@@ -178,7 +186,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     let cfg = QemuConfig {
         memory_mib,
         cpus,
-        ssh_port,
+        ssh_port: internal_ssh_port,
         cmdline_extra: opts.cmdline_extra,
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
@@ -199,6 +207,14 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         }
         p
     };
+
+    // Spawn the hibernation supervisor. Owns the user-facing SSH port
+    // and proxies through to QEMU's internal hostfwd. After
+    // `idle_after_secs` of no proxied activity, sends QMP `stop` to
+    // halt the vCPUs; wakes on the next incoming TCP. boot_sync below
+    // goes through the proxy, which is why we spawn before waiting.
+    let idle_after_secs = resolve_idle_after_secs(&paths);
+    spawn_supervisor(&paths, ssh_port, internal_ssh_port, idle_after_secs).await?;
 
     // Wait for the guest to become ready — first signal wins (qga vs SSH).
     let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_socket(), ssh_port, None)
@@ -239,18 +255,24 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         );
     }
 
-    // Bring up the docker-socket SSH forward so DOCKER_HOST=unix://… works
-    // from the host without touching the user's ~/.ssh/config. Non-fatal
-    // on error: a working VM with just SSH access is still useful for
-    // debugging.
-    if let Err(e) = super::forward::start(&paths, ssh_port).await {
-        crate::utils::output::print_warning(
-            &format!(
-                "docker socket forward failed: {e:#}. Local DOCKER_HOST routing won't work until you start it. \
-                 (`avocado vm stop && avocado vm start` retries.)"
-            ),
-            crate::utils::output::OutputLevel::Normal,
-        );
+    // Docker socket. With hibernation enabled (supervisor running), the
+    // supervisor owns `docker.sock` directly and manages an SSH `-L`
+    // tunnel internally with VM wake/pause lifecycle. Without
+    // hibernation (idle_after_secs == 0), keep the legacy long-lived
+    // forwarder behavior so existing setups don't regress.
+    //
+    // Non-fatal on error: a working VM with just SSH access is still
+    // useful for debugging.
+    if idle_after_secs == 0 {
+        if let Err(e) = super::forward::start(&paths, ssh_port).await {
+            crate::utils::output::print_warning(
+                &format!(
+                    "docker socket forward failed: {e:#}. Local DOCKER_HOST routing won't work until you start it. \
+                     (`avocado vm stop && avocado vm start` retries.)"
+                ),
+                crate::utils::output::OutputLevel::Normal,
+            );
+        }
     }
 
     notify_desktop(
@@ -281,9 +303,12 @@ pub async fn stop(force: bool) -> Result<()> {
 async fn stop_inner(force: bool) -> Result<()> {
     let paths = VmPaths::resolve()?;
 
-    // Always try to tear down the docker socket forward first — the SSH
-    // process can outlive QEMU if we shut down the VM by signal, leaving
-    // a stale `docker.sock` on the host.
+    // Tear down auxiliary host-side processes BEFORE QEMU. The supervisor
+    // owns the user-facing SSH port; if we left it running after QEMU
+    // exited, the next `vm start` would race against a still-bound port.
+    // The docker socket forwarder is an SSH child that can outlive QEMU
+    // if we shut down by signal, leaving a stale `docker.sock`.
+    stop_supervisor(&paths);
     let _ = super::forward::stop(&paths).await;
 
     let pid = match state::read_pid(&paths)? {
@@ -730,4 +755,142 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
     std::fs::write(paths.ssh_config(), content)
         .with_context(|| format!("writing {}", paths.ssh_config().display()))?;
     Ok(())
+}
+
+/// Default idle timeout in seconds when neither config nor env var sets
+/// one. Aggressive for testing while the hibernation supervisor is new
+/// — production should land on a more user-friendly default (multiple
+/// minutes) once the wake-on-connect path has been exercised in real
+/// workflows.
+const DEFAULT_IDLE_AFTER_SECS: u64 = 10;
+
+/// Resolve the hibernate timeout. Env var wins (one-shot override for
+/// experimentation), else the persisted `idle.hibernate_after_secs`,
+/// else the default. `0` disables hibernation while keeping the proxy
+/// up — useful for isolating proxy issues from QMP issues.
+fn resolve_idle_after_secs(paths: &VmPaths) -> u64 {
+    if let Ok(raw) = std::env::var("AVOCADO_VM_IDLE_HIBERNATE_SECS") {
+        if let Ok(parsed) = raw.parse::<u64>() {
+            return parsed;
+        }
+    }
+    if let Ok(cfg) = super::config::VmConfig::load(paths) {
+        if let Some(idle) = &cfg.idle {
+            if let Some(v) = idle.hibernate_after_secs {
+                return v;
+            }
+        }
+    }
+    DEFAULT_IDLE_AFTER_SECS
+}
+
+/// Spawn `avocado vm supervise` as a detached child. Same daemonization
+/// pattern as QEMU (setsid + null stdio), pid recorded so `stop_inner`
+/// can take it down before QEMU. We re-exec the running binary
+/// (`std::env::current_exe`) rather than expecting an installed
+/// `avocado` on PATH — that way a `cargo run` or out-of-tree binary
+/// supervises itself instead of pulling in a stale system copy.
+/// Best-effort SIGTERM → SIGKILL on the supervisor pid, then remove
+/// its pidfile + internal-ssh-port marker. Idempotent — missing
+/// pidfile / dead pid is a no-op.
+fn stop_supervisor(paths: &VmPaths) {
+    let pidfile = paths.supervisor_pid();
+    if let Ok(raw) = std::fs::read_to_string(&pidfile) {
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            if state::pid_alive(pid) {
+                send_signal(pid, SIGTERM);
+                for _ in 0..20 {
+                    if !state::pid_alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if state::pid_alive(pid) {
+                    send_signal(pid, SIGKILL);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(pidfile);
+    let _ = std::fs::remove_file(paths.internal_ssh_port_file());
+}
+
+async fn spawn_supervisor(
+    paths: &VmPaths,
+    user_port: u16,
+    internal_port: u16,
+    idle_after_secs: u64,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("locating current avocado binary")?;
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.args([
+        "vm",
+        "supervise",
+        "--user-port",
+        &user_port.to_string(),
+        "--internal-port",
+        &internal_port.to_string(),
+        "--qmp-socket",
+        &paths.qmp_socket().to_string_lossy(),
+        "--idle-after-secs",
+        &idle_after_secs.to_string(),
+        "--pid-file",
+        &paths.supervisor_pid().to_string_lossy(),
+        "--docker-socket",
+        &paths.docker_socket().to_string_lossy(),
+        "--docker-socket-internal",
+        &paths.docker_socket_internal().to_string_lossy(),
+        "--ssh-key",
+        &paths.ssh_key().to_string_lossy(),
+        "--known-hosts",
+        &paths.known_hosts().to_string_lossy(),
+    ]);
+    // Append the supervisor's stderr to ~/.avocado/vm/supervisor.log so
+    // pause/resume events are recoverable post-mortem. `tail -F` is
+    // robust to the file appearing only after first launch.
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.supervisor_log())
+        .with_context(|| format!("opening {}", paths.supervisor_log().display()))?;
+    let log_dup = log.try_clone().context("cloning supervisor log handle")?;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(log);
+    cmd.stderr(log_dup);
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn supervisor: {}", exe.display()))?;
+    let spawn_pid = child.id().unwrap_or(0);
+    drop(child);
+
+    // Poll briefly for the supervisor's listener to come up — proves the
+    // proxy is ready before boot_sync starts pumping connections through.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", user_port)).await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            // Don't fail the whole boot — log + carry on with whatever
+            // the supervisor managed to do. Worst case the user-facing
+            // port refuses connections and the user sees a normal SSH
+            // connection error.
+            crate::utils::output::print_warning(
+                &format!(
+                    "hibernation supervisor (pid {spawn_pid}) didn't bind 127.0.0.1:{user_port} within 5s; \
+                     proxy may be down. SSH may not work until you restart with `vm stop && vm start`."
+                ),
+                crate::utils::output::OutputLevel::Normal,
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

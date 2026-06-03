@@ -26,6 +26,9 @@ pub struct VmConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeConfig>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<IdleConfig>,
+
     /// Forward-compat bucket for keys this CLI version doesn't know about.
     /// Preserved verbatim on save so a newer desktop's settings survive an
     /// older CLI's round-trip.
@@ -43,6 +46,20 @@ pub struct RuntimeConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
+
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// Hibernation knobs. The supervisor process (`avocado vm supervise`)
+/// proxies the user-facing SSH port to QEMU's internal hostfwd; after
+/// `hibernate_after_secs` of no proxied activity, it sends QMP `stop`
+/// to halt the vCPUs. Wake happens automatically on the next incoming
+/// connection. Set `hibernate_after_secs` to 0 (or omit) to disable.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdleConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hibernate_after_secs: Option<u64>,
 
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,

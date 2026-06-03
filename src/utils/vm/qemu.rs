@@ -265,13 +265,18 @@ pub fn build_qemu_args(
 /// then atomically renames into place. Cost is ~500ms per cache miss,
 /// hidden under the rest of VM boot. Cache hits return immediately.
 fn ensure_idle_states_dtb(paths: &VmPaths, cfg: &QemuConfig) -> Result<PathBuf> {
-    let qemu_version = qemu_version_tag("qemu-system-aarch64")?;
+    // Cache key uses the QEMU binary's mtime instead of `--version` to
+    // avoid shelling out on every launch. A `brew upgrade qemu` bumps
+    // the mtime, which naturally invalidates the cache. The mtime stat
+    // is microseconds; the `--version` subprocess pays the full dyld
+    // load cost (~300-500 ms on macOS) for libsnappy/libpng/libfdt.
+    let qemu_tag = qemu_binary_tag("qemu-system-aarch64")?;
     let cache_dir = paths.dtb_cache_dir();
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("failed to create {}", cache_dir.display()))?;
     let cache_path = cache_dir.join(format!(
         "virt-smp{}-m{}-q{}.dtb",
-        cfg.cpus, cfg.memory_mib, qemu_version
+        cfg.cpus, cfg.memory_mib, qemu_tag
     ));
     if cache_path.is_file() {
         return Ok(cache_path);
@@ -329,31 +334,24 @@ fn dump_base_dtb(qemu_bin: &str, cfg: &QemuConfig, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stable, filename-safe identifier for the QEMU binary's version, used
-/// in the DTB cache key. First line of `--version` looks like
-/// `QEMU emulator version 11.0.0` — we slugify the version token.
-fn qemu_version_tag(qemu_bin: &str) -> Result<String> {
-    let output = std::process::Command::new(qemu_bin)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to run `{qemu_bin} --version`"))?;
-    if !output.status.success() {
-        bail!("{qemu_bin} --version exited with {}", output.status);
-    }
-    let first = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    // "QEMU emulator version 11.0.0" -> "11.0.0"
-    let version = first
-        .split_whitespace()
-        .find(|tok| tok.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .unwrap_or("unknown");
-    Ok(version
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
-        .collect())
+/// Stable, filename-safe identifier for the QEMU binary, used in the
+/// DTB cache key. Uses the binary's mtime (seconds since epoch) rather
+/// than `--version` so we don't spawn a subprocess on every launch.
+/// `brew upgrade qemu` bumps the mtime, naturally invalidating the
+/// cache; a binary that hasn't been touched produces the same key
+/// indefinitely.
+fn qemu_binary_tag(qemu_bin: &str) -> Result<String> {
+    let path = which_on_path(qemu_bin)
+        .with_context(|| format!("{qemu_bin} not found on $PATH"))?;
+    let meta = std::fs::metadata(&path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(format!("m{mtime}"))
 }
 
 /// Spawn QEMU detached from the controlling terminal. Returns the child pid.

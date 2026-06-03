@@ -3080,6 +3080,29 @@ async fn main() -> Result<()> {
                 cmd.execute().await
             }
             VmCommands::Stop { force } => commands::vm::stop::StopCommand { force }.execute().await,
+            VmCommands::Supervise {
+                user_port,
+                internal_port,
+                qmp_socket,
+                idle_after_secs,
+                pid_file,
+                docker_socket,
+                docker_socket_internal,
+                ssh_key,
+                known_hosts,
+            } => commands::vm::supervise::SuperviseCommand {
+                user_port,
+                internal_port,
+                qmp_socket,
+                idle_after_secs,
+                pid_file,
+                docker_socket,
+                docker_socket_internal,
+                ssh_key,
+                known_hosts,
+            }
+            .execute()
+            .await,
             VmCommands::Status => commands::vm::status::StatusCommand.execute().await,
             VmCommands::Shell { command } => {
                 commands::vm::shell::ShellCommand { command }
@@ -4541,6 +4564,31 @@ enum VmCommands {
     Config {
         #[command(subcommand)]
         command: VmConfigCommands,
+    },
+    /// Long-lived hibernation supervisor. Internal — spawned by `vm start`,
+    /// not for direct use. Owns the user-facing SSH port AND docker
+    /// socket, proxies to QEMU's internal hostfwd / SSH tunnel, and
+    /// sends QMP stop/cont on the idle timeout.
+    #[command(hide = true)]
+    Supervise {
+        #[arg(long)]
+        user_port: u16,
+        #[arg(long)]
+        internal_port: u16,
+        #[arg(long)]
+        qmp_socket: std::path::PathBuf,
+        #[arg(long)]
+        idle_after_secs: u64,
+        #[arg(long)]
+        pid_file: std::path::PathBuf,
+        #[arg(long)]
+        docker_socket: std::path::PathBuf,
+        #[arg(long)]
+        docker_socket_internal: std::path::PathBuf,
+        #[arg(long)]
+        ssh_key: std::path::PathBuf,
+        #[arg(long)]
+        known_hosts: std::path::PathBuf,
     },
     /// Check for and apply VM image updates from the release channel.
     /// Stops + restarts the VM if it was running. Preserves the existing
