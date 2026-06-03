@@ -65,7 +65,19 @@ fn machine_for(arch: &str) -> &'static str {
 }
 
 /// CPU model per arch.
+///
+/// `-cpu host` passes the physical CPU through, which only works with a
+/// hardware accelerator (HVF on macOS, KVM on Linux). On hosts that fall
+/// back to TCG software emulation (Windows — see [`accel_flag`]) there is
+/// no "host" model, so we emulate a fully-featured CPU with `max`. This
+/// mirrors `accel_flag`'s platform split exactly.
 fn cpu_for(arch: &str) -> &'static str {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = arch;
+        "max"
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     match arch {
         "arm64" | "aarch64" => "host",
         "x86_64" => "host",
@@ -363,8 +375,30 @@ pub async fn spawn_detached(manifest: &Manifest, paths: &VmPaths, cfg: &QemuConf
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(&args);
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    // QEMU's own stderr is the only place startup failures (unsupported
+    // chardev backend, bad device, accelerator issues) surface. On unix
+    // we daemonize and discard it; on Windows capture it to `qemu.log` in
+    // the state dir so `vm start` failures are diagnosable instead of a
+    // silent instant exit.
+    #[cfg(windows)]
+    {
+        let log_path = paths.serial_log().with_file_name("qemu.log");
+        match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
+            Ok((out, err)) => {
+                cmd.stdout(Stdio::from(out));
+                cmd.stderr(Stdio::from(err));
+            }
+            Err(_) => {
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
     // Put the child in its own session so Ctrl-C in the avocado CLI doesn't
     // kill QEMU (the user manages lifetime via `avocado vm stop`). The
     // `pre_exec` method is exposed by tokio::process::Command directly on
@@ -402,12 +436,34 @@ pub fn ensure_qemu_available(manifest: &Manifest) -> Result<()> {
 fn which_on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let full = dir.join(bin);
-        if full.is_file() {
-            return Some(full);
+        for candidate in executable_candidates(&dir, bin) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
+}
+
+/// Candidate filenames for `bin` in `dir`. On Windows the binary on disk
+/// is `qemu-system-aarch64.exe`, but callers pass the bare name, so we
+/// also probe each extension in `%PATHEXT%` (defaulting to the usual
+/// `.COM;.EXE;.BAT;.CMD`). On unix the bare name is the only candidate.
+fn executable_candidates(dir: &std::path::Path, bin: &str) -> Vec<PathBuf> {
+    let mut out = vec![dir.join(bin)];
+    #[cfg(windows)]
+    {
+        // Skip extension probing if the caller already gave one.
+        if std::path::Path::new(bin).extension().is_none() {
+            let pathext = std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+                let ext = ext.trim_start_matches('.');
+                out.push(dir.join(format!("{bin}.{ext}")));
+            }
+        }
+    }
+    out
 }
 
 /// Pick a free TCP port on the loopback by binding to 0 and reading what

@@ -163,6 +163,22 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     let workspace = super::share::resolve_workspace(opts.workspace.as_deref())?;
     super::share::record_workspace(&paths, &workspace)?;
 
+    // Windows exposes the workspace over SMB (the QEMU build has no 9p and
+    // virtio-fs needs a Linux-only virtiofsd). Set up the host share +
+    // dedicated account now. Best-effort: it needs administrator, and the
+    // VM is still useful (docker, shell) without the workspace mounted.
+    #[cfg(windows)]
+    if let Err(e) = super::share::ensure_host_share(&paths, &workspace) {
+        crate::utils::output::print_warning(
+            &format!(
+                "could not set up the SMB workspace share: {e:#}. Project files \
+                 won't be visible inside the VM — run avocado once as administrator \
+                 to create the share."
+            ),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+
     let ssh_port = match opts.ssh_port {
         Some(p) => p,
         None => qemu::pick_free_port()?,
@@ -272,6 +288,17 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // but the VM stays up.
     let target = super::ssh::SshTarget::local(&paths, ssh_port);
     if let Err(e) = super::share::ensure_mounted_in_guest(&target).await {
+        // Windows: the SMB mount is best-effort (the share may be absent
+        // without admin, and docker-only flows don't need it). Warn and
+        // keep the VM up. Unix: surface the 9p mount error.
+        #[cfg(windows)]
+        crate::utils::output::print_warning(
+            &format!(
+                "workspace SMB mount failed: {e:#}. Project files won't be available in the VM."
+            ),
+            crate::utils::output::OutputLevel::Normal,
+        );
+        #[cfg(not(windows))]
         // Don't tear down the VM — user can `avocado vm shell` and inspect.
         return Err(e).context("workspace 9p mount in guest");
     }
@@ -632,6 +659,19 @@ fn grow_var_file(paths: &VmPaths, target_bytes: u64) -> Result<()> {
     if target_bytes <= current {
         return Ok(());
     }
+    // On Windows/NTFS `set_len` reserves the full allocation up front, so
+    // extending a freshly-seeded var disk to the 50 GiB default fails with
+    // ERROR_DISK_FULL on anything but a near-empty volume. macOS/Linux make
+    // the file sparse implicitly. Mark it sparse via `fsutil` (built into
+    // Windows, no extra deps) so the logical size costs only written blocks
+    // — the same effect the "sparse" comments above already assume.
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("fsutil")
+            .args(["sparse", "setflag", &var.to_string_lossy()])
+            .status();
+    }
+
     use std::fs::OpenOptions;
     let f = OpenOptions::new()
         .write(true)

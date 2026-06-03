@@ -71,6 +71,15 @@ pub fn is_docker_desktop() -> bool {
     cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
+/// True iff this process's stdin is a real terminal. `docker run -t`
+/// allocates a PTY and fails outright when stdin isn't a TTY (headless
+/// drivers like the desktop app, or any piped/redirected stdin), so we
+/// gate the `-t` flag on this.
+fn stdin_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
 /// True iff `DOCKER_HOST` points at the avocado-vm's forwarded socket
 /// (set up by `utils::vm::route`). When this is true, `docker run` is
 /// going to execute inside the VM, so VM-local paths like
@@ -85,7 +94,7 @@ pub fn is_vm_routing_active() -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    host == format!("unix://{}", paths.docker_socket().display())
+    crate::utils::vm::state::expected_docker_host(&paths).is_some_and(|expected| host == expected)
 }
 
 /// When docker is going to execute inside the avocado-vm, ensure the
@@ -141,10 +150,11 @@ fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
         Ok(p) => p,
         Err(_) => return src_path.to_path_buf(),
     };
-    // VM routing is in effect iff DOCKER_HOST is our forwarded local socket.
-    let expected = format!("unix://{}", paths.docker_socket().display());
-    if host != expected {
-        return src_path.to_path_buf();
+    // VM routing is in effect iff DOCKER_HOST is our forwarded docker host
+    // (unix socket on unix, loopback TCP on Windows).
+    match crate::utils::vm::state::expected_docker_host(&paths) {
+        Some(expected) if expected == host => {}
+        _ => return src_path.to_path_buf(),
     }
     let workspace = match crate::utils::vm::share::read_recorded_workspace(&paths) {
         Ok(Some(w)) => w,
@@ -944,7 +954,16 @@ impl SdkContainer {
         }
 
         if config.interactive {
-            extra_args.push("-it".to_string());
+            // `-i` keeps stdin open for dnf prompts. `-t` allocates a PTY,
+            // but docker rejects it when stdin isn't a real terminal
+            // ("cannot attach stdin to a TTY-enabled container") — which is
+            // the case when avocado is driven headless (the desktop app, or
+            // any piped/redirected stdin). Only request the PTY when we
+            // actually have one.
+            extra_args.push("-i".to_string());
+            if stdin_is_tty() {
+                extra_args.push("-t".to_string());
+            }
         }
 
         let extra_args_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
@@ -1018,9 +1037,14 @@ impl SdkContainer {
         let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
         let json_active = crate::utils::output_format::is_json_output_active();
         if config.interactive && !json_active {
-            // Explicit interactive mode (e.g. avocado shell): full -it
+            // Explicit interactive mode (e.g. avocado shell): -i always, and
+            // -t only when stdin is a real terminal. Driven headless (desktop
+            // app / piped stdin) docker rejects -t with "cannot attach stdin
+            // to a TTY-enabled container".
             container_cmd.push("-i".to_string());
-            container_cmd.push("-t".to_string());
+            if stdin_is_tty() {
+                container_cmd.push("-t".to_string());
+            }
         } else if config.tui_context.is_none() && !global_tui_active && !json_active {
             // Non-TUI mode: keep stdin open for prompts, no PTY
             container_cmd.push("-i".to_string());

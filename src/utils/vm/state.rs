@@ -199,6 +199,14 @@ impl VmPaths {
     pub fn docker_socket_stream(&self) -> PathBuf {
         self.root.join("docker-stream.sock")
     }
+    /// Windows-only: the loopback TCP port the docker forward listens on.
+    /// Windows OpenSSH `-L` can't bind a local AF_UNIX socket and the
+    /// docker client has no `unix://` transport there, so on Windows the
+    /// forward is `ssh -L 127.0.0.1:<port>:/run/docker.sock` and
+    /// `DOCKER_HOST=tcp://127.0.0.1:<port>`. See [`expected_docker_host`].
+    pub fn docker_port_file(&self) -> PathBuf {
+        self.root.join("docker-port")
+    }
     /// Absolute path to the artifact directory that was last used for `vm
     /// start`. The macOS Avocado.app reads this when launched without an
     /// AVOCADO_VM_DIR env var (Finder/Dock launches inherit a sanitized env
@@ -255,6 +263,43 @@ pub fn write_ssh_port(paths: &VmPaths, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Read the Windows docker-forward TCP port. `None` if missing.
+#[cfg(not(unix))]
+pub fn read_docker_port(paths: &VmPaths) -> Option<u16> {
+    let p = paths.docker_port_file();
+    std::fs::read_to_string(p).ok()?.trim().parse().ok()
+}
+
+/// Write the Windows docker-forward TCP port. Atomic via `tempfile::persist`.
+#[cfg(not(unix))]
+pub fn write_docker_port(paths: &VmPaths, port: u16) -> Result<()> {
+    paths.ensure()?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&paths.root)
+        .context("failed to create temp file for docker-port")?;
+    use std::io::Write;
+    writeln!(tmp, "{port}").context("failed to write docker-port temp file")?;
+    tmp.persist(paths.docker_port_file())
+        .context("failed to persist docker-port file")?;
+    Ok(())
+}
+
+/// The `DOCKER_HOST` value pointing at the avocado-vm's forwarded docker
+/// daemon, or `None` if the forward isn't established. Single source of
+/// truth shared by [`super::route`] (which sets it) and
+/// [`crate::utils::container`] (which detects VM routing by comparing to
+/// it). Unix uses the forwarded Unix socket; Windows uses the loopback
+/// TCP port (see [`VmPaths::docker_port_file`]).
+pub fn expected_docker_host(paths: &VmPaths) -> Option<String> {
+    #[cfg(unix)]
+    {
+        Some(format!("unix://{}", paths.docker_socket().display()))
+    }
+    #[cfg(not(unix))]
+    {
+        read_docker_port(paths).map(|port| format!("tcp://127.0.0.1:{port}"))
+    }
+}
+
 /// Read the QEMU pid, if a pidfile is present.
 pub fn read_pid(paths: &VmPaths) -> Result<Option<u32>> {
     let p = paths.pid_file();
@@ -279,8 +324,20 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        false
+        // No POSIX signals on Windows. Query the process table via
+        // `tasklist`, filtered to this PID server-side so a match yields
+        // exactly one row. We detect a live process by the presence of an
+        // image name (`.exe`) rather than the "No tasks…" message, which
+        // is localized; the `.exe` suffix is not.
+        match std::process::Command::new("tasklist")
+            .args(["/NH", "/FI", &format!("PID eq {pid}")])
+            .output()
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .contains(".exe"),
+            Err(_) => false,
+        }
     }
 }
 
@@ -297,6 +354,7 @@ pub fn cleanup_transient(paths: &VmPaths) {
         paths.docker_socket(),
         paths.docker_socket_internal(),
         paths.docker_socket_stream(),
+        paths.docker_port_file(),
         paths.forwarder_pid(),
         paths.supervisor_pid(),
         paths.internal_ssh_port_file(),

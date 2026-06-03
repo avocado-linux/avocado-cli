@@ -74,6 +74,107 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(raw.trim())))
 }
 
+// ─── Windows SMB workspace share ──────────────────────────────────────
+//
+// The Windows QEMU build has no 9p/virtfs, and virtio-fs needs a
+// Linux-only `virtiofsd`. But the guest kernel has cifs/smb3 built in and
+// Windows is a native SMB server, so on Windows we expose the workspace
+// over SMB: a dedicated low-privilege local account + a share scoped to
+// it, mounted in the guest from the slirp gateway (`//10.0.2.2/...`).
+
+/// Share name published on the host and mounted by the guest.
+#[cfg(windows)]
+pub const WINDOWS_SHARE_NAME: &str = "AvocadoWorkspace";
+/// Dedicated local account the guest authenticates as. Low-privilege;
+/// only granted access to the workspace share.
+#[cfg(windows)]
+const SMB_USER: &str = "avocadovm";
+
+/// Path of the persisted SMB password (generated once per host).
+#[cfg(windows)]
+fn smb_password_file(paths: &VmPaths) -> PathBuf {
+    paths.root.join("smb-password")
+}
+
+/// Read the persisted SMB password, generating + storing one on first use.
+#[cfg(windows)]
+fn read_or_create_smb_password(paths: &VmPaths) -> Result<String> {
+    let file = smb_password_file(paths);
+    if let Ok(existing) = std::fs::read_to_string(&file) {
+        let trimmed = existing.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    // Time/pid-seeded token. This guards a loopback-only share to a
+    // dedicated low-privilege account, not a public service. The leading
+    // "Av" guarantees Windows password-complexity (upper+lower+digit).
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut x = (std::process::id() as u64) | 1;
+    let mut hex = String::new();
+    for _ in 0..4 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xdead_beef);
+        x ^= nanos;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        hex.push_str(&format!("{x:016x}"));
+    }
+    let pw = format!("Av{hex}");
+    paths.ensure()?;
+    std::fs::write(&file, &pw).with_context(|| format!("writing {}", file.display()))?;
+    Ok(pw)
+}
+
+/// Run a PowerShell snippet, returning an error (with captured stderr) on
+/// non-zero exit. Used for the privileged share/user management.
+#[cfg(windows)]
+fn run_powershell(script: &str) -> Result<()> {
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .context("spawning powershell")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Ensure the host SMB share + dedicated account exist and the account can
+/// read/write `workspace`. Idempotent. Requires administrator (share and
+/// local-account creation); callers treat failure as a best-effort warning
+/// — the VM still runs, the workspace just won't be visible inside it.
+#[cfg(windows)]
+pub fn ensure_host_share(paths: &VmPaths, workspace: &Path) -> Result<()> {
+    let password = read_or_create_smb_password(paths)?;
+    // Single PowerShell pass: (re)create the dedicated user with the
+    // persisted password, grant it modify rights on the workspace tree,
+    // and (re)publish the share scoped to that user. `$ErrorActionPreference
+    // = Stop` surfaces any step's failure as a non-zero exit.
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$u='{user}'
+$pw=ConvertTo-SecureString '{pw}' -AsPlainText -Force
+if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {{ Set-LocalUser -Name $u -Password $pw }}
+else {{ New-LocalUser -Name $u -Password $pw -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null }}
+icacls '{ws}' /grant ('{user}:(OI)(CI)M') | Out-Null
+if (-not (Get-SmbShare -Name '{share}' -ErrorAction SilentlyContinue)) {{
+  New-SmbShare -Name '{share}' -Path '{ws}' -FullAccess $u | Out-Null
+}}"#,
+        user = SMB_USER,
+        pw = password,
+        ws = workspace.display(),
+        share = WINDOWS_SHARE_NAME,
+    );
+    run_powershell(&script).context("setting up the SMB workspace share (needs administrator)")
+}
+
 /// QEMU arg fragments declaring the workspace 9p export.
 /// Append these to the rest of the `-fsdev` / `-device` lines.
 ///
@@ -81,6 +182,17 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
 /// has its own copy of the arg-building logic in `VMSupervisor.swift`.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn qemu_args_for(workspace: &Path) -> Vec<String> {
+    // The official Windows QEMU build ships with 9p/virtfs disabled
+    // (`-fsdev: fsdev support is disabled`), so we can't declare the
+    // workspace share there. Boot without it; workspace-dependent flows
+    // (host-path docker volumes, in-VM builds against host files) are
+    // degraded on Windows until a virtio-fs / alternative share lands.
+    #[cfg(windows)]
+    {
+        let _ = workspace;
+        Vec::new()
+    }
+    #[cfg(not(windows))]
     vec![
         "-fsdev".to_string(),
         format!(
@@ -95,6 +207,52 @@ pub fn qemu_args_for(workspace: &Path) -> Vec<String> {
 /// Mount `/mnt/workspace` inside the guest if not already mounted.
 /// Idempotent: re-running is cheap and safe.
 pub async fn ensure_mounted_in_guest(target: &SshTarget) -> Result<()> {
+    #[cfg(windows)]
+    {
+        ensure_mounted_in_guest_windows(target).await
+    }
+    #[cfg(not(windows))]
+    {
+        ensure_mounted_in_guest_unix(target).await
+    }
+}
+
+/// Mount the host's SMB workspace share inside the guest via cifs. The
+/// host is reachable at the slirp gateway `10.0.2.2`; cifs/smb3 is built
+/// into the guest kernel. `file_mode`/`dir_mode` 0777 so containers
+/// (arbitrary uid) can read/write; `noserverino` avoids cifs inode churn.
+#[cfg(windows)]
+async fn ensure_mounted_in_guest_windows(target: &SshTarget) -> Result<()> {
+    let check = target
+        .exec(&format!(
+            "if mountpoint -q {VM_MOUNT_POINT}; then echo MOUNTED; else echo MISSING; fi"
+        ))
+        .await?;
+    if check.0.trim() == "MOUNTED" {
+        return Ok(());
+    }
+    let paths = VmPaths::resolve()?;
+    let password = std::fs::read_to_string(smb_password_file(&paths))
+        .context("reading SMB password (was the host share set up at vm start?)")?
+        .trim()
+        .to_string();
+    let cmd = format!(
+        "mkdir -p {mp} && mount -t cifs //10.0.2.2/{share} {mp} \
+         -o username={user},password={pw},vers=3.0,uid=0,gid=0,file_mode=0777,dir_mode=0777,noserverino",
+        mp = VM_MOUNT_POINT,
+        share = WINDOWS_SHARE_NAME,
+        user = SMB_USER,
+        pw = password,
+    );
+    target
+        .exec(&cmd)
+        .await
+        .with_context(|| format!("failed to mount SMB workspace at {VM_MOUNT_POINT} in VM"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn ensure_mounted_in_guest_unix(target: &SshTarget) -> Result<()> {
     let check = target
         .exec(&format!(
             "if mountpoint -q {VM_MOUNT_POINT}; then echo MOUNTED; else echo MISSING; fi"
@@ -121,6 +279,15 @@ pub fn translate_to_vm(host_path: &Path, workspace_root: &Path) -> Result<PathBu
     let canon = host_path
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", host_path.display()))?;
+    // On Windows `canonicalize()` yields a `\\?\C:\…` verbatim path, but the
+    // recorded workspace root is a plain `C:\…`; canonicalize the root too
+    // so the `strip_prefix` actually matches.
+    #[cfg(windows)]
+    let root_buf = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    #[cfg(windows)]
+    let workspace_root: &Path = &root_buf;
     let rel = canon.strip_prefix(workspace_root).with_context(|| {
         format!(
             "{} is not under workspace root {}; set AVOCADO_VM_WORKSPACE to a directory that contains it, \
@@ -129,6 +296,15 @@ pub fn translate_to_vm(host_path: &Path, workspace_root: &Path) -> Result<PathBu
             workspace_root.display(),
         )
     })?;
+    // The in-VM mount is POSIX. On Windows the relative path has `\`
+    // separators — rewrite to `/` so the path is valid inside the guest
+    // (and so docker's `-v` parser doesn't choke on a drive-colon).
+    #[cfg(windows)]
+    {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        return Ok(PathBuf::from(format!("{VM_MOUNT_POINT}/{rel}")));
+    }
+    #[cfg(not(windows))]
     Ok(Path::new(VM_MOUNT_POINT).join(rel))
 }
 

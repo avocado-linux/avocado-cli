@@ -128,21 +128,32 @@ pub async fn ensure_routed_for_process(
     // DOCKER_HOST at that socket means every spawned `docker` subprocess
     // just talks to a Unix socket — no ssh transport in the docker client,
     // no ssh-config modifications, no host-key verification edge cases.
-    let socket = paths.docker_socket();
-    if !socket.exists() {
-        // Be loud — auto-routing without a working socket leaves the user
+    // Is the docker forward live? unix: the forwarded AF_UNIX socket file
+    // exists. windows: the forwarder ssh process is alive (its loopback TCP
+    // listener dies with it) and we recorded the port — there's no local
+    // socket file in the TCP scheme.
+    #[cfg(unix)]
+    let forward_live = paths.docker_socket().exists();
+    #[cfg(not(unix))]
+    let forward_live = crate::utils::vm::forward::is_alive(&paths)
+        && state::read_docker_port(&paths).is_some();
+
+    if !forward_live {
+        // Be loud — auto-routing without a working forward leaves the user
         // hitting "Cannot connect to the Docker daemon" mysteriously.
         print_warning(
             &format!(
-                "docker socket forward {} is missing; the VM may not be fully up or the forwarder failed to start. \
-                 Run `avocado vm stop && avocado vm start` to retry.",
-                socket.display()
+                "docker forward is not established (state dir {}); the VM may not be fully up \
+                 or the forwarder failed to start. Run `avocado vm stop && avocado vm start` to retry.",
+                paths.root.display()
             ),
             OutputLevel::Normal,
         );
         return Ok(RoutingMode::OptedOut);
     }
-    std::env::set_var("DOCKER_HOST", format!("unix://{}", socket.display()));
+    let docker_host = state::expected_docker_host(&paths)
+        .ok_or_else(|| anyhow::anyhow!("docker forward live but DOCKER_HOST could not be derived"))?;
+    std::env::set_var("DOCKER_HOST", docker_host);
     Ok(RoutingMode::Apply)
 }
 
