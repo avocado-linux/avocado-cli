@@ -171,6 +171,12 @@ impl VmPaths {
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.yaml")
     }
+    /// Cache directory for patched DTBs (one per `(arch, smp, memory_mib,
+    /// qemu_version)` combination). Tiny files (~10 KB each), no eviction
+    /// needed.
+    pub fn dtb_cache_dir(&self) -> PathBuf {
+        self.root.join("dtb")
+    }
 }
 
 /// Find the user's home directory. Wraps the `directories` crate so callers

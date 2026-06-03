@@ -6,9 +6,10 @@
 //! layer can stop later.
 
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use super::fdt;
 use super::manifest::Manifest;
 use super::state::VmPaths;
 
@@ -221,7 +222,138 @@ pub fn build_qemu_args(
     args.push("-pidfile".into());
     args.push(paths.pid_file().to_string_lossy().into_owned());
 
+    // On arm64, splice PSCI idle-states into the DTB so the in-guest
+    // cpuidle driver actually binds. See fdt.rs for the why; the short
+    // version is "QEMU virt doesn't emit cpu-idle-states bindings, so
+    // CONFIG_ARM_PSCI_CPUIDLE has nothing to attach to and idle CPUs spin
+    // through HVF vmexit/vmenter at ~80% host each."
+    //
+    // Failures degrade gracefully: log + skip, kernel falls back to the
+    // auto-generated DTB it would have used anyway.
+    if matches!(arch.as_str(), "arm64" | "aarch64") {
+        let dtb_override = std::env::var("AVOCADO_VM_DTB").ok().filter(|s| !s.is_empty());
+        match dtb_override {
+            Some(path) => {
+                args.push("-dtb".into());
+                args.push(path);
+            }
+            None => match ensure_idle_states_dtb(paths, cfg) {
+                Ok(path) => {
+                    args.push("-dtb".into());
+                    args.push(path.to_string_lossy().into_owned());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warn: PSCI idle-states DTB preparation failed ({e}); booting with \
+                         auto-generated DTB (expect higher host CPU at guest idle)"
+                    );
+                }
+            },
+        }
+    }
+
     Ok(args)
+}
+
+/// Produce a DTB patched with PSCI `idle-states` for the current QEMU
+/// config. Cached under `~/.avocado/vm/dtb/`, keyed by parameters that
+/// affect the DT layout (memory range and cpu count change DT nodes;
+/// QEMU version may change auto-generated property shapes).
+///
+/// The cache miss path runs `qemu-system-aarch64 -machine virt,dumpdtb=…`
+/// to capture QEMU's auto-generated DTB, splices in the missing nodes,
+/// then atomically renames into place. Cost is ~500ms per cache miss,
+/// hidden under the rest of VM boot. Cache hits return immediately.
+fn ensure_idle_states_dtb(paths: &VmPaths, cfg: &QemuConfig) -> Result<PathBuf> {
+    let qemu_version = qemu_version_tag("qemu-system-aarch64")?;
+    let cache_dir = paths.dtb_cache_dir();
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    let cache_path = cache_dir.join(format!(
+        "virt-smp{}-m{}-q{}.dtb",
+        cfg.cpus, cfg.memory_mib, qemu_version
+    ));
+    if cache_path.is_file() {
+        return Ok(cache_path);
+    }
+    let tmp = tempfile::NamedTempFile::new_in(&cache_dir)
+        .context("failed to create temp file for DTB dump")?;
+    dump_base_dtb("qemu-system-aarch64", cfg, tmp.path())
+        .context("failed to dump base DTB from QEMU")?;
+    let raw = std::fs::read(tmp.path())
+        .with_context(|| format!("failed to read dumped DTB at {}", tmp.path().display()))?;
+    let mut fdt = fdt::parse(&raw).context("failed to parse QEMU-generated DTB")?;
+    fdt::patch_idle_states(&mut fdt, cfg.cpus)
+        .context("failed to splice idle-states into DTB")?;
+    let patched = fdt::serialize(&fdt);
+    std::fs::write(tmp.path(), &patched)
+        .with_context(|| format!("failed to write patched DTB to {}", tmp.path().display()))?;
+    tmp.persist(&cache_path)
+        .with_context(|| format!("failed to install patched DTB at {}", cache_path.display()))?;
+    Ok(cache_path)
+}
+
+/// Run `qemu-system-aarch64 -machine virt,dumpdtb=PATH` and let QEMU
+/// write its auto-generated DTB, then exit. We pass the same
+/// `-machine`, `-smp`, `-m`, `-cpu`, `-accel` flags that affect DT
+/// generation so the dumped tree matches what the real launch would see.
+fn dump_base_dtb(qemu_bin: &str, cfg: &QemuConfig, out: &Path) -> Result<()> {
+    let machine = format!("virt,dumpdtb={}", out.display());
+    let status = std::process::Command::new(qemu_bin)
+        .args([
+            "-machine",
+            &machine,
+            "-accel",
+            accel_flag(),
+            "-cpu",
+            cpu_for("aarch64"),
+            "-smp",
+            &cfg.cpus.to_string(),
+            "-m",
+            &format!("{}M", cfg.memory_mib),
+            "-nographic",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to spawn {qemu_bin} for dumpdtb"))?;
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        bail!(
+            "{qemu_bin} dumpdtb exited with {}: {}",
+            status.status,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Stable, filename-safe identifier for the QEMU binary's version, used
+/// in the DTB cache key. First line of `--version` looks like
+/// `QEMU emulator version 11.0.0` — we slugify the version token.
+fn qemu_version_tag(qemu_bin: &str) -> Result<String> {
+    let output = std::process::Command::new(qemu_bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to run `{qemu_bin} --version`"))?;
+    if !output.status.success() {
+        bail!("{qemu_bin} --version exited with {}", output.status);
+    }
+    let first = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // "QEMU emulator version 11.0.0" -> "11.0.0"
+    let version = first
+        .split_whitespace()
+        .find(|tok| tok.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("unknown");
+    Ok(version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect())
 }
 
 /// Spawn QEMU detached from the controlling terminal. Returns the child pid.
