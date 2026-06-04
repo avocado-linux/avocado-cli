@@ -114,6 +114,14 @@ impl State {
     /// fast (single QMP round-trip). Does NOT touch the SSH tunnel:
     /// TCP-proxy callers don't need it, and bundling it would make
     /// every SSH probe wait 8s on tunnel spawn during boot.
+    ///
+    /// On macOS, fires `vm.notify.woke` to Avocado.app after the
+    /// successful `cont` so the desktop can re-attach USB devices that
+    /// the host-side USB/IP helper may have dropped while the VM was
+    /// paused (the helper times out reading from a frozen guest, drops
+    /// the IOUSBHost claim, and leaves vhci_hcd holding a dead FD).
+    /// The notification is best-effort; if the desktop isn't running,
+    /// it's a silent no-op.
     async fn wake(self: &Arc<Self>) -> Result<()> {
         let _guard = self.qmp_lock.lock().await;
         if self.paused.load(Ordering::Relaxed) {
@@ -122,6 +130,7 @@ impl State {
                 .context("QMP cont")?;
             self.paused.store(false, Ordering::Relaxed);
             slog!("resumed VM on incoming connection");
+            notify_woke().await;
         }
         Ok(())
     }
@@ -555,6 +564,23 @@ async fn qmp_send(socket: &Path, cmd: &str, args: Option<serde_json::Value>) -> 
     let _ = client.execute(cmd, args).await?;
     Ok(())
 }
+
+/// Fire `vm.notify.woke` to Avocado.app via the shared CLI/desktop
+/// notify channel. Dispatched via `spawn_blocking` because the underlying
+/// `client::notify` uses sync std-net I/O with a 100ms timeout; running
+/// it directly on the runtime thread would briefly block the supervisor's
+/// accept loop on a slow/missing desktop.
+#[cfg(target_os = "macos")]
+async fn notify_woke() {
+    tokio::task::spawn_blocking(|| {
+        super::client::notify("vm.notify.woke", serde_json::json!({}));
+    })
+    .await
+    .ok();
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn notify_woke() {}
 
 #[cfg(unix)]
 async fn wait_for_term() -> Result<()> {
