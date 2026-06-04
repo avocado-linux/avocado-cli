@@ -431,7 +431,11 @@ pub async fn status() -> Result<VmStatus> {
     // (no socket, QMP unreachable on non-unix, etc.) leave the field
     // as `None` so callers can distinguish "couldn't tell" from
     // "definitely paused".
-    let paused = if running { probe_paused(&paths).await } else { None };
+    let paused = if running {
+        probe_paused(&paths).await
+    } else {
+        None
+    };
 
     Ok(VmStatus {
         running,
