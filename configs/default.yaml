@@ -90,7 +90,7 @@ permissions:
 ##
 
 sdk:
-  image: "docker.io/avocadolinux/sdk:{{ config.distro.release }}-{{ config.distro.channel }}"
+  image: "docker.io/avocadolinux/sdk:{{ config.distro.release }}"
 
   container_args:
     - --privileged

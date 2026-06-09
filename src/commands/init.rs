@@ -1138,7 +1138,7 @@ mod tests {
         assert!(content.contains("avocado-ext-dev:"));
         assert!(content.contains("type: package"));
         assert!(
-            content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.release }}-{{ config.distro.channel }}\"")
+            content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.release }}\"")
         );
         // Empty root password now comes from the `dev` permissions profile
         // referenced by rootfs/initramfs, not a standalone `config` confext.
