@@ -1127,7 +1127,7 @@ mod tests {
         let content = fs::read_to_string(&config_path).unwrap();
         let expected_target = InitCommand::get_default_target();
         assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
-        assert!(content.contains("cli_requirement: \">=0.26.0\""));
+        assert!(content.contains("cli_requirement: \">=0.41.0\""));
         assert!(content.contains("distro:"));
         assert!(content.contains("channel: edge"));
         assert!(content.contains("release: 2024"));
@@ -1140,11 +1140,15 @@ mod tests {
         assert!(
             content.contains("image: \"docker.io/avocadolinux/sdk:{{ config.distro.release }}-{{ config.distro.channel }}\"")
         );
+        // Empty root password now comes from the `dev` permissions profile
+        // referenced by rootfs/initramfs, not a standalone `config` confext.
+        assert!(content.contains("permissions:"));
+        assert!(content.contains("rootfs:"));
+        assert!(content.contains("initramfs:"));
         assert!(content.contains("extensions:"));
         assert!(content.contains("app:"));
         assert!(content.contains("- sysext"));
         assert!(content.contains("- confext"));
-        assert!(content.contains("config:"));
         assert!(content.contains("avocado-sdk-toolchain: \"*\""));
     }
 

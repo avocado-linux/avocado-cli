@@ -1,4 +1,4 @@
-cli_requirement: ">=0.26.0"
+cli_requirement: ">=0.41.0"
 
 default_target: "{target}"
 
@@ -24,7 +24,6 @@ runtimes:
       - avocado-ext-dev
       - avocado-ext-sshd-dev
       - avocado-bsp-{{ avocado.target.board }}
-      - config
       - app
     packages:
       avocado-runtime: "*"
@@ -62,15 +61,26 @@ extensions:
       #curl: "*"
       #iperf3: "*"
 
-  # Generated default config extension
-  # Use or modify this to configure "real" user accounts (passwd, shadow, group)
-  # or configure other system services
-  config:
-    types:
-      - confext
-    version: "0.1.0"
+##
+## Images
+##
 
-    # NOT FOR PRODUCTION: Set root password to empty string
+rootfs:
+  permissions: dev
+
+initramfs:
+  permissions: dev
+
+##
+## Permissions
+##
+
+# NOT FOR PRODUCTION: the `dev` profile sets an empty root password and is
+# referenced by rootfs/initramfs above. Define additional profiles with real
+# users, groups, and hashed passwords, then point rootfs/initramfs at them via
+# `permissions: <name>`.
+permissions:
+  dev:
     users:
       root:
         password: ""
