@@ -1,14 +1,17 @@
 use anyhow::Result;
+use serde_json::json;
 
 use crate::commands::connect::client::{
     self, ConnectClient, CreateCohortParams, CreateCohortRequest,
 };
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::output_format::{emit_json_object, OutputFormat};
 
 pub struct ConnectCohortsListCommand {
     pub org: String,
     pub project: String,
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectCohortsListCommand {
@@ -19,6 +22,16 @@ impl ConnectCohortsListCommand {
         let client = ConnectClient::from_profile(profile)?;
 
         let cohorts = client.list_cohorts(&self.org, &self.project).await?;
+
+        if self.output.is_json() {
+            emit_json_object(&json!({
+                "cohorts": cohorts.iter().map(|c| json!({
+                    "id": c.id,
+                    "name": c.name,
+                })).collect::<Vec<_>>()
+            }));
+            return Ok(());
+        }
 
         if cohorts.is_empty() {
             print_info("No cohorts found.", OutputLevel::Normal);

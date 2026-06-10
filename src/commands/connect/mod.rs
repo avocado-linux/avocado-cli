@@ -11,6 +11,7 @@ pub mod init;
 pub mod keys;
 pub mod orgs;
 pub mod projects;
+pub mod runtimes;
 pub mod server_key;
 pub mod trust;
 pub mod upload;

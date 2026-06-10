@@ -43,6 +43,7 @@ use commands::connect::server_key::ConnectServerKeyCommand;
 use commands::connect::trust::{
     ConnectTrustPromoteRootCommand, ConnectTrustRotateServerKeyCommand, ConnectTrustStatusCommand,
 };
+use commands::connect::runtimes::ConnectRuntimesListCommand;
 use commands::connect::upload::ConnectUploadCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
@@ -598,6 +599,9 @@ enum ConnectCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format (human prose or NDJSON event stream)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Remove connect configuration (connect section, connect-config extension, and device config overlay)
     Clean {
@@ -607,6 +611,9 @@ enum ConnectCommands {
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
+        /// Output format (human prose or single JSON object)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Manage organizations
     Orgs {
@@ -632,6 +639,11 @@ enum ConnectCommands {
     Cohorts {
         #[command(subcommand)]
         command: ConnectCohortsCommands,
+    },
+    /// List uploaded runtimes on the Connect platform
+    Runtimes {
+        #[command(subcommand)]
+        command: ConnectRuntimesCommands,
     },
     /// Manage claim tokens
     ClaimTokens {
@@ -681,6 +693,9 @@ enum ConnectCommands {
         /// Deploy after upload: activate immediately (skip draft)
         #[arg(long)]
         deploy_activate: bool,
+        /// Output format (human prose or NDJSON event stream)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Deploy a runtime to a cohort
     Deploy {
@@ -714,6 +729,9 @@ enum ConnectCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format (human prose or NDJSON event stream)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Retrieve the Connect server's TUF signing public key
     ServerKey {
@@ -857,6 +875,9 @@ enum ConnectOrgsCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format (human prose or single JSON object)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
 }
 
@@ -941,6 +962,9 @@ enum ConnectProjectsCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format (human prose or single JSON object)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Create a new project
     Create {
@@ -1177,6 +1201,9 @@ enum ConnectCohortsCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+        /// Output format (human prose or single JSON object)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
     /// Create a new cohort
     Create {
@@ -1219,6 +1246,28 @@ enum ConnectCohortsCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConnectRuntimesCommands {
+    /// List runtimes uploaded to the Connect platform
+    List {
+        /// Organization ID (or set connect.org in avocado.yaml)
+        #[arg(long)]
+        org: Option<String>,
+        /// Project ID (or set connect.project in avocado.yaml)
+        #[arg(long)]
+        project: Option<String>,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Profile name (defaults to the active default profile)
+        #[arg(long)]
+        profile: Option<String>,
+        /// Output format (human prose or single JSON object)
+        #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
+        output: crate::utils::output_format::OutputFormat,
     },
 }
 
@@ -3394,6 +3443,7 @@ async fn main() -> Result<()> {
                 runtime,
                 config,
                 profile,
+                output,
             } => {
                 let cmd = ConnectInitCommand {
                     org,
@@ -3402,21 +3452,23 @@ async fn main() -> Result<()> {
                     runtime,
                     config_path: config,
                     profile,
+                    output,
                 };
                 cmd.execute().await?;
                 Ok(())
             }
-            ConnectCommands::Clean { runtime, config } => {
+            ConnectCommands::Clean { runtime, config, output } => {
                 let cmd = ConnectCleanCommand {
                     runtime,
                     config_path: config,
+                    output,
                 };
                 cmd.execute()?;
                 Ok(())
             }
             ConnectCommands::Orgs { command } => match command {
-                ConnectOrgsCommands::List { profile } => {
-                    let cmd = ConnectOrgsListCommand { profile };
+                ConnectOrgsCommands::List { profile, output } => {
+                    let cmd = ConnectOrgsListCommand { profile, output };
                     cmd.execute().await?;
                     Ok(())
                 }
@@ -3487,6 +3539,7 @@ async fn main() -> Result<()> {
                     org,
                     config,
                     profile,
+                    output,
                 } => {
                     let profile_org =
                         commands::connect::profile_organization_id(profile.as_deref())?;
@@ -3494,6 +3547,7 @@ async fn main() -> Result<()> {
                     let cmd = ConnectProjectsListCommand {
                         org: resolved_org,
                         profile,
+                        output,
                     };
                     cmd.execute().await?;
                     Ok(())
@@ -3684,6 +3738,7 @@ async fn main() -> Result<()> {
                     project,
                     config,
                     profile,
+                    output,
                 } => {
                     let profile_org =
                         commands::connect::profile_organization_id(profile.as_deref())?;
@@ -3698,6 +3753,7 @@ async fn main() -> Result<()> {
                         org: resolved_org,
                         project: resolved_project,
                         profile,
+                        output,
                     };
                     cmd.execute().await?;
                     Ok(())
@@ -3752,6 +3808,33 @@ async fn main() -> Result<()> {
                         id,
                         yes,
                         profile,
+                    };
+                    cmd.execute().await?;
+                    Ok(())
+                }
+            },
+            ConnectCommands::Runtimes { command } => match command {
+                ConnectRuntimesCommands::List {
+                    org,
+                    project,
+                    config,
+                    profile,
+                    output,
+                } => {
+                    let profile_org =
+                        commands::connect::profile_organization_id(profile.as_deref())?;
+                    let (resolved_org, resolved_project) =
+                        commands::connect::resolve_org_and_project(
+                            org,
+                            project,
+                            &config,
+                            profile_org,
+                        )?;
+                    let cmd = ConnectRuntimesListCommand {
+                        org: resolved_org,
+                        project: resolved_project,
+                        profile,
+                        output,
                     };
                     cmd.execute().await?;
                     Ok(())
@@ -3835,6 +3918,7 @@ async fn main() -> Result<()> {
                 deploy_name,
                 deploy_tag,
                 deploy_activate,
+                output,
             } => {
                 let profile_org = commands::connect::profile_organization_id(profile.as_deref())?;
                 let (resolved_org, resolved_project) = commands::connect::resolve_org_and_project(
@@ -3859,6 +3943,7 @@ async fn main() -> Result<()> {
                     deploy_name,
                     deploy_tags: deploy_tag,
                     deploy_activate,
+                    output,
                 };
                 cmd.execute().await?;
                 Ok(())
@@ -3874,6 +3959,7 @@ async fn main() -> Result<()> {
                 activate,
                 config,
                 profile,
+                output,
             } => {
                 let profile_org = commands::connect::profile_organization_id(profile.as_deref())?;
                 let (resolved_org, resolved_project) =
@@ -3888,6 +3974,7 @@ async fn main() -> Result<()> {
                     tags: tag,
                     activate,
                     profile,
+                    output,
                 };
                 cmd.execute().await?;
                 Ok(())

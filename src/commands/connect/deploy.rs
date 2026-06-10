@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde_json::json;
 
 use crate::commands::connect::client::{
     self, CohortInfo, ConnectClient, CreateDeploymentParams, CreateDeploymentRequest,
     RuntimeListItem,
 };
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output_format::{
+    emit_json_event, is_json_output_active, JsonOutputGuard, OutputFormat,
+};
 
 pub struct ConnectDeployCommand {
     pub org: String,
@@ -17,22 +21,30 @@ pub struct ConnectDeployCommand {
     pub tags: Vec<String>,
     pub activate: bool,
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectDeployCommand {
     pub async fn execute(&self) -> Result<()> {
+        if self.output.is_json() {
+            if self.runtime.is_none() {
+                anyhow::bail!("--runtime is required when using --output json");
+            }
+            if self.cohort.is_none() {
+                anyhow::bail!("--cohort is required when using --output json");
+            }
+        }
+
+        let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
+
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
         let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
-        // Select runtime (fetches full record even when --runtime is passed)
         let selected_runtime = self.resolve_runtime(&client).await?;
-
-        // Select cohort (fetches full record even when --cohort is passed)
         let selected_cohort = self.resolve_cohort(&client).await?;
 
-        // Generate deployment name if not provided
         let version_display = selected_runtime
             .display_version
             .as_deref()
@@ -42,7 +54,6 @@ impl ConnectDeployCommand {
             format!("{version_display}-{timestamp}")
         });
 
-        // Create deployment
         print_info(
             &format!("Creating deployment '{deploy_name}'..."),
             OutputLevel::Normal,
@@ -62,38 +73,13 @@ impl ConnectDeployCommand {
             .create_deployment(&self.org, &self.project, &req)
             .await?;
 
-        // Always print ID first — if activation fails, user still has the deployment ID
-        println!();
-        print_success(
-            &format!(
-                "Deployment '{}' created (id: {})",
-                deploy_name, deployment.id
-            ),
-            OutputLevel::Normal,
-        );
-        println!("  Runtime:  {} ({})", version_display, selected_runtime.id);
-        if !selected_cohort.name.is_empty() {
-            println!(
-                "  Cohort:   {} ({})",
-                selected_cohort.name, selected_cohort.id
-            );
-        } else {
-            println!("  Cohort:   {}", selected_cohort.id);
-        }
-        if !self.tags.is_empty() {
-            println!("  Tags:     {}", self.tags.join(", "));
-        }
-
-        // Optionally activate
-        if self.activate {
+        let final_status = if self.activate {
             print_info("Activating deployment...", OutputLevel::Normal);
             match client
                 .activate_deployment(&self.org, &self.project, &deployment.id)
                 .await
             {
-                Ok(activated) => {
-                    println!("  Status:   {}", activated.status);
-                }
+                Ok(activated) => activated.status,
                 Err(e) => {
                     print_warning(
                         &format!(
@@ -102,10 +88,44 @@ impl ConnectDeployCommand {
                         ),
                         OutputLevel::Normal,
                     );
+                    deployment.status.clone()
                 }
             }
         } else {
-            println!("  Status:   {}", deployment.status);
+            deployment.status.clone()
+        };
+
+        if self.output.is_json() {
+            emit_json_event(&json!({
+                "event": "complete",
+                "deployment_id": deployment.id,
+                "deployment_name": deploy_name,
+                "runtime_id": selected_runtime.id,
+                "cohort_id": selected_cohort.id,
+                "status": final_status,
+            }));
+        } else {
+            println!();
+            print_success(
+                &format!(
+                    "Deployment '{}' created (id: {})",
+                    deploy_name, deployment.id
+                ),
+                OutputLevel::Normal,
+            );
+            println!("  Runtime:  {} ({})", version_display, selected_runtime.id);
+            if !selected_cohort.name.is_empty() {
+                println!(
+                    "  Cohort:   {} ({})",
+                    selected_cohort.name, selected_cohort.id
+                );
+            } else {
+                println!("  Cohort:   {}", selected_cohort.id);
+            }
+            if !self.tags.is_empty() {
+                println!("  Tags:     {}", self.tags.join(", "));
+            }
+            println!("  Status:   {final_status}");
         }
 
         Ok(())
@@ -229,24 +249,13 @@ pub async fn deploy_after_upload(params: &DeployAfterUploadParams<'_>) -> Result
 
     let deployment = client.create_deployment(org, project, &req).await?;
 
-    // Always print ID first
-    print_success(
-        &format!(
-            "Deployment '{}' created (id: {})",
-            deploy_name, deployment.id
-        ),
-        OutputLevel::Normal,
-    );
-
-    if *activate {
+    let final_status = if *activate {
         print_info("Activating deployment...", OutputLevel::Normal);
         match client
             .activate_deployment(org, project, &deployment.id)
             .await
         {
-            Ok(activated) => {
-                println!("  Status: {}", activated.status);
-            }
+            Ok(activated) => activated.status,
             Err(e) => {
                 print_warning(
                     &format!(
@@ -255,10 +264,30 @@ pub async fn deploy_after_upload(params: &DeployAfterUploadParams<'_>) -> Result
                     ),
                     OutputLevel::Normal,
                 );
+                deployment.status.clone()
             }
         }
     } else {
-        println!("  Status: {}", deployment.status);
+        deployment.status.clone()
+    };
+
+    if is_json_output_active() {
+        emit_json_event(&json!({
+            "event": "deployed",
+            "deployment_id": deployment.id,
+            "deployment_name": deploy_name,
+            "cohort_id": cohort_id,
+            "status": final_status,
+        }));
+    } else {
+        print_success(
+            &format!(
+                "Deployment '{}' created (id: {})",
+                deploy_name, deployment.id
+            ),
+            OutputLevel::Normal,
+        );
+        println!("  Status: {final_status}");
     }
 
     Ok(())

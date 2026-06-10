@@ -482,22 +482,27 @@ impl RuntimeDeployCommand {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_DEPLOY_REPO_PORT);
         let mut container_args = config.merge_sdk_container_args(self.container_args.as_ref());
-        // If the SDK container runs with host networking, the published-port
-        // (`-p`) trick is both unnecessary and discarded by docker, so the
-        // shim skips it (see prepare_mac_deploy_net).
+        // Whether the SDK container requests host networking. On avocado-vm the
+        // published-port (`-p`) trick is unnecessary and discarded by docker,
+        // so the shim skips it; on Docker Desktop host networking traps the
+        // repo port in the LinuxKit VM, so the shim strips it instead (see
+        // prepare_mac_deploy_net).
         let host_net = container_args
             .as_deref()
-            .map(|args| {
-                args.iter()
-                    .any(|a| a == "--network=host" || a == "--net=host")
-            })
+            .map(args_have_host_network)
             .unwrap_or(false);
         let MacDeployNet {
             env: mac_env,
             container_args: mac_args,
+            strip_host_net,
             forward,
         } = prepare_mac_deploy_net(&self.device, repo_port, host_net, self.verbose).await;
         env_vars.extend(mac_env);
+        if strip_host_net {
+            if let Some(args) = container_args.as_mut() {
+                strip_host_network_args(args);
+            }
+        }
         if !mac_args.is_empty() {
             container_args.get_or_insert_with(Vec::new).extend(mac_args);
         }
@@ -785,8 +790,51 @@ struct MacDeployNet {
     env: HashMap<String, String>,
     /// Extra `docker run` args (publish the repo port: `-p <port>:<port>`).
     container_args: Vec<String>,
+    /// Strip `--network=host` from the merged container args before running.
+    /// Docker Desktop traps a host-networked container's ports inside the
+    /// LinuxKit VM (unreachable from the Mac/LAN), and `-p` publishing is
+    /// incompatible with host networking — so the deploy container must run on
+    /// its own bridge netns. The caller applies this to the merged args.
+    strip_host_net: bool,
     /// A qemu slirp forward to tear down afterward (avocado-vm only).
     forward: Option<OpenForward>,
+}
+
+/// True if `args` request host networking, in either the `--network=host` /
+/// `--net=host` form or the space-separated `--network host` / `--net host`
+/// form.
+fn args_have_host_network(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        a == "--network=host"
+            || a == "--net=host"
+            || ((a == "--network" || a == "--net")
+                && args.get(i + 1).map(|v| v == "host").unwrap_or(false))
+    })
+}
+
+/// Remove host-networking flags from container args so a published port (`-p`)
+/// takes effect. Handles both the `--network=host` / `--net=host` and
+/// space-separated `--network host` / `--net host` forms. See
+/// [`args_have_host_network`] and `prepare_mac_deploy_net`.
+fn strip_host_network_args(args: &mut Vec<String>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--network=host" || a == "--net=host" {
+            i += 1;
+            continue;
+        }
+        if (a == "--network" || a == "--net")
+            && args.get(i + 1).map(|v| v == "host").unwrap_or(false)
+        {
+            i += 2;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    *args = out;
 }
 
 /// A qemu slirp host-forward opened for the duration of one deploy. Teardown
@@ -821,6 +869,7 @@ async fn prepare_mac_deploy_net(
     let mut net = MacDeployNet {
         env: HashMap::new(),
         container_args: Vec::new(),
+        strip_host_net: false,
         forward: None,
     };
 
@@ -830,14 +879,29 @@ async fn prepare_mac_deploy_net(
         return net;
     }
 
-    // Publish the repo port out of the container's netns — but only when it
-    // has its own. With `--network=host` the container already shares the
-    // VM's network (so the qemu hostfwd below reaches `:{port}` directly),
-    // and docker discards `-p` with a "Published ports are discarded when
-    // using host network mode" warning, so skip it.
-    if !host_net {
+    let vm_routing = is_vm_routing_active();
+
+    // Expose the in-container TUF repo server to the LAN device. The two macOS
+    // backends need different bridges:
+    //
+    //  * Docker Desktop (no avocado-vm): vpnkit only forwards *published*
+    //    (`-p`) ports to the Mac, and `-p` is incompatible with host
+    //    networking — a host-networked container's ports stay trapped in the
+    //    LinuxKit VM, unreachable from the Mac/LAN (the "Connection refused"
+    //    people hit). So force the deploy container onto its own bridge netns
+    //    (strip `--network=host`) and publish the port on 0.0.0.0. Deploy only
+    //    needs outbound SSH + inbound HTTP, both of which work on a bridge.
+    //
+    //  * avocado-vm: the container stays host-networked *inside qemu* and the
+    //    qemu slirp hostfwd below bridges the port to the Mac; docker discards
+    //    `-p` under host networking, so only publish when it has its own netns.
+    let publish = if vm_routing { !host_net } else { true };
+    if !vm_routing && host_net {
+        net.strip_host_net = true;
+    }
+    if publish {
         net.container_args.push("-p".to_string());
-        net.container_args.push(format!("{port}:{port}"));
+        net.container_args.push(format!("0.0.0.0:{port}:{port}"));
     }
 
     // Both Mac contexts: tell the device the host LAN IP it can reach us on,
@@ -870,7 +934,7 @@ async fn prepare_mac_deploy_net(
     // avocado-vm only: open a slirp hostfwd so the LAN device can reach the
     // published port through qemu. Docker Desktop forwards `-p` to the host
     // itself (vpnkit), so it needs no qemu step.
-    if is_vm_routing_active() {
+    if vm_routing {
         let sock = match crate::utils::vm::state::VmPaths::resolve() {
             Ok(p) => p.qmp_socket(),
             Err(e) => {
@@ -1283,5 +1347,62 @@ mod tests {
 
         assert!(script.contains("trap cleanup EXIT"));
         assert!(script.contains("kill \"$HTTP_PID\""));
+    }
+
+    // --- host-networking detection / stripping (Docker Desktop deploy) ---
+
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_args_have_host_network_eq_form() {
+        assert!(args_have_host_network(&sv(&["--privileged", "--network=host"])));
+        assert!(args_have_host_network(&sv(&["--net=host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_space_form() {
+        assert!(args_have_host_network(&sv(&["--network", "host"])));
+        assert!(args_have_host_network(&sv(&["--net", "host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_none() {
+        assert!(!args_have_host_network(&sv(&["--privileged"])));
+        // `--network` followed by something other than host is not host networking.
+        assert!(!args_have_host_network(&sv(&["--network", "bridge"])));
+        assert!(!args_have_host_network(&sv(&[])));
+    }
+
+    #[test]
+    fn test_strip_host_network_eq_form() {
+        let mut args = sv(&["--privileged", "--network=host", "-v", "/x:/y"]);
+        strip_host_network_args(&mut args);
+        assert_eq!(args, sv(&["--privileged", "-v", "/x:/y"]));
+        assert!(!args_have_host_network(&args));
+    }
+
+    #[test]
+    fn test_strip_host_network_space_form() {
+        let mut args = sv(&["--net", "host", "--privileged"]);
+        strip_host_network_args(&mut args);
+        assert_eq!(args, sv(&["--privileged"]));
+    }
+
+    #[test]
+    fn test_strip_host_network_preserves_non_host_network() {
+        // A non-host `--network <name>` must survive untouched.
+        let mut args = sv(&["--network", "mynet", "--privileged"]);
+        strip_host_network_args(&mut args);
+        assert_eq!(args, sv(&["--network", "mynet", "--privileged"]));
+    }
+
+    #[test]
+    fn test_strip_host_network_noop_when_absent() {
+        let mut args = sv(&["--privileged", "-p", "8585:8585"]);
+        let before = args.clone();
+        strip_host_network_args(&mut args);
+        assert_eq!(args, before);
     }
 }

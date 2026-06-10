@@ -1,10 +1,13 @@
 use anyhow::Result;
+use serde_json::json;
 
 use crate::commands::connect::client::{self, ConnectClient};
 use crate::utils::output::{print_info, OutputLevel};
+use crate::utils::output_format::{emit_json_object, OutputFormat};
 
 pub struct ConnectOrgsListCommand {
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectOrgsListCommand {
@@ -15,6 +18,17 @@ impl ConnectOrgsListCommand {
         let client = ConnectClient::from_profile(profile)?;
 
         let me = client.get_me_full().await?;
+
+        if self.output.is_json() {
+            emit_json_object(&json!({
+                "organizations": me.organizations.iter().map(|o| json!({
+                    "id": o.id,
+                    "name": o.name,
+                    "role": o.role,
+                })).collect::<Vec<_>>()
+            }));
+            return Ok(());
+        }
 
         if me.organizations.is_empty() {
             print_info("No organizations found.", OutputLevel::Normal);

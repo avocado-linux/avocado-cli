@@ -12,6 +12,7 @@ use crate::commands::connect::client::{
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output_format::{emit_json_event, is_json_output_active, JsonOutputGuard, OutputFormat};
 use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
@@ -33,6 +34,7 @@ pub struct ConnectUploadCommand {
     pub deploy_name: Option<String>,
     pub deploy_tags: Vec<String>,
     pub deploy_activate: bool,
+    pub output: OutputFormat,
 }
 
 struct ArtifactInfo {
@@ -55,6 +57,8 @@ impl TaskPrerequisites for ConnectUploadCommand {
 
 impl ConnectUploadCommand {
     pub async fn execute(&self) -> Result<()> {
+        let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
+
         // 0. Validate deploy-after-upload flags
         super::deploy::validate_deploy_flags(
             &self.deploy_cohort,
@@ -341,7 +345,7 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
-        if self.publish {
+        let final_status = if self.publish {
             print_info("Publishing runtime...", OutputLevel::Normal);
             let published = connect
                 .publish_runtime(&self.org, &self.project, &runtime.id)
@@ -353,6 +357,18 @@ impl ConnectUploadCommand {
                 ),
                 OutputLevel::Normal,
             );
+            published.status
+        } else {
+            runtime.status.clone()
+        };
+
+        if is_json_output_active() {
+            emit_json_event(&serde_json::json!({
+                "event": "complete",
+                "runtime_id": runtime.id,
+                "version": runtime.version,
+                "status": final_status,
+            }));
         }
 
         if let Some(ref cohort_id) = self.deploy_cohort {
@@ -411,7 +427,7 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
-        if self.publish {
+        let final_status = if self.publish {
             print_info("Publishing runtime...", OutputLevel::Normal);
             let published = connect
                 .publish_runtime(&self.org, &self.project, &runtime.id)
@@ -423,6 +439,18 @@ impl ConnectUploadCommand {
                 ),
                 OutputLevel::Normal,
             );
+            published.status
+        } else {
+            result.status.clone()
+        };
+
+        if is_json_output_active() {
+            emit_json_event(&serde_json::json!({
+                "event": "complete",
+                "runtime_id": runtime.id,
+                "version": result.version,
+                "status": final_status,
+            }));
         }
 
         if let Some(ref cohort_id) = self.deploy_cohort {
@@ -560,6 +588,7 @@ impl ConnectUploadCommand {
         let volume_manager = VolumeManager::new(container.container_tool.clone(), false);
         let volume_state = volume_manager.get_or_create_volume(&container.cwd).await?;
 
+        let json_mode = is_json_output_active();
         let multi = MultiProgress::new();
         let mut all_completed = Vec::new();
 
@@ -575,14 +604,19 @@ impl ConnectUploadCommand {
                     )
                 })?;
 
-            let pb = multi.add(ProgressBar::new(artifact.size_bytes));
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "  {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
-                )?
-                .progress_chars("#>-"),
-            );
-            pb.set_message(artifact.name.clone());
+            let pb = if json_mode {
+                ProgressBar::hidden()
+            } else {
+                let pb = multi.add(ProgressBar::new(artifact.size_bytes));
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "  {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
+                    )?
+                    .progress_chars("#>-"),
+                );
+                pb.set_message(artifact.name.clone());
+                pb
+            };
 
             // Convert container path (/opt/_avocado/...) to volume-relative path
             let volume_path = artifact
@@ -740,7 +774,16 @@ impl ConnectUploadCommand {
                 }
             };
 
-            pb.finish_with_message(format!("{} (done)", artifact.name));
+            if json_mode {
+                emit_json_event(&serde_json::json!({
+                    "event": "artifact_uploaded",
+                    "artifact": artifact.name,
+                    "image_id": artifact.image_id,
+                    "bytes": artifact.size_bytes,
+                }));
+            } else {
+                pb.finish_with_message(format!("{} (done)", artifact.name));
+            }
 
             // Ensure container exits cleanly
             let status = child.wait().await?;
@@ -1002,6 +1045,7 @@ async fn upload_artifacts(
         OutputLevel::Normal,
     );
 
+    let json_mode = is_json_output_active();
     let multi = MultiProgress::new();
 
     for spec in &to_upload {
@@ -1010,14 +1054,19 @@ async fn upload_artifacts(
             .find(|a| a.image_id == spec.image_id)
             .with_context(|| format!("API returned unknown image_id '{}'", spec.image_id))?;
 
-        let pb = multi.add(ProgressBar::new(artifact.size_bytes));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "  {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
-            )?
-            .progress_chars("#>-"),
-        );
-        pb.set_message(format!("{}...", &spec.image_id[..8]));
+        let pb = if json_mode {
+            ProgressBar::hidden()
+        } else {
+            let pb = multi.add(ProgressBar::new(artifact.size_bytes));
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "  {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})",
+                )?
+                .progress_chars("#>-"),
+            );
+            pb.set_message(format!("{}...", &spec.image_id[..8]));
+            pb
+        };
 
         let mut file = tokio::fs::File::open(&artifact.path).await?;
         let mut completed_parts = Vec::new();
@@ -1118,7 +1167,15 @@ async fn upload_artifacts(
             pb.set_position(std::cmp::min(offset + PART_SIZE, artifact.size_bytes));
         }
 
-        pb.finish_with_message(format!("{}... (done)", &spec.image_id[..8]));
+        if json_mode {
+            emit_json_event(&serde_json::json!({
+                "event": "artifact_uploaded",
+                "image_id": spec.image_id,
+                "bytes": artifact.size_bytes,
+            }));
+        } else {
+            pb.finish_with_message(format!("{}... (done)", &spec.image_id[..8]));
+        }
 
         all_completed.push(BlobParts {
             image_id: spec.image_id.clone(),

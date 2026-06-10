@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
+use serde_json::json;
 use std::path::Path;
 
 use crate::utils::config_edit;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output_format::{emit_json_object, OutputFormat};
 
 pub struct ConnectCleanCommand {
     pub runtime: String,
     pub config_path: String,
+    pub output: OutputFormat,
 }
 
 impl ConnectCleanCommand {
@@ -21,6 +24,9 @@ impl ConnectCleanCommand {
 
         let config_dir = config_path.parent().unwrap_or(Path::new("."));
         let mut any_changes = false;
+        let mut removed_connect_section = false;
+        let mut removed_extension = false;
+        let mut removed_overlay = false;
 
         // 1. Remove connect: section from avocado.yaml
         match config_edit::remove_connect_fields(config_path) {
@@ -30,6 +36,7 @@ impl ConnectCleanCommand {
                     OutputLevel::Normal,
                 );
                 any_changes = true;
+                removed_connect_section = true;
             }
             Ok(false) => {
                 print_info(
@@ -53,6 +60,7 @@ impl ConnectCleanCommand {
                     OutputLevel::Normal,
                 );
                 any_changes = true;
+                removed_extension = true;
             }
             Ok(false) => {
                 print_info(
@@ -78,11 +86,21 @@ impl ConnectCleanCommand {
                 OutputLevel::Normal,
             );
             any_changes = true;
+            removed_overlay = true;
         } else {
             print_info(
                 &format!("{} does not exist, skipping.", overlay_conn_dir.display()),
                 OutputLevel::Normal,
             );
+        }
+
+        if self.output.is_json() {
+            emit_json_object(&json!({
+                "removed_connect_section": removed_connect_section,
+                "removed_extension": removed_extension,
+                "removed_overlay": removed_overlay,
+            }));
+            return Ok(());
         }
 
         if any_changes {

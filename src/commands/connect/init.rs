@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde_json::json;
 use std::path::Path;
 
 use crate::commands::connect::client::{
@@ -8,6 +9,7 @@ use crate::commands::connect::client::{
 };
 use crate::utils::config_edit;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output_format::{emit_json_event, JsonOutputGuard, OutputFormat};
 
 pub struct ConnectInitCommand {
     pub org: Option<String>,
@@ -16,10 +18,23 @@ pub struct ConnectInitCommand {
     pub runtime: String,
     pub config_path: String,
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectInitCommand {
     pub async fn execute(&self) -> Result<()> {
+        if self.output.is_json() {
+            if self.org.is_none() {
+                anyhow::bail!("--org is required when using --output json");
+            }
+            if self.project.is_none() {
+                anyhow::bail!("--project is required when using --output json");
+            }
+        }
+
+        // Suppress all prose output in JSON mode — callers read the NDJSON stream.
+        let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
+
         // 1. Verify login
         let mut config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
@@ -41,7 +56,6 @@ impl ConnectInitCommand {
 
         // 2. Select organization
         let selected_org = if let Some(ref org_flag) = self.org {
-            // Non-interactive: use provided org
             me.organizations
                 .iter()
                 .find(|o| o.id == *org_flag)
@@ -71,7 +85,6 @@ impl ConnectInitCommand {
         // 3. Ensure we have an org-scoped profile for the selected org (unless --profile was explicit)
         if self.profile.is_none() {
             if let Some((_, org_profile)) = config.find_profile_by_org(&selected_org.id) {
-                // Reuse existing org-scoped profile.
                 print_info(
                     &format!(
                         "Using existing org-scoped profile for '{}'.",
@@ -81,7 +94,6 @@ impl ConnectInitCommand {
                 );
                 client = ConnectClient::from_profile(org_profile)?;
             } else {
-                // Create a new org-scoped token and profile.
                 let hostname = std::env::var("HOSTNAME")
                     .or_else(|_| std::env::var("COMPUTERNAME"))
                     .unwrap_or_else(|_| "unknown".to_string());
@@ -97,7 +109,6 @@ impl ConnectInitCommand {
                     .create_org_token(&selected_org.id, &token_name)
                     .await?;
 
-                // Derive a profile name from the org name.
                 let profile_name = selected_org.name.to_lowercase().replace(' ', "-");
                 let new_profile = Profile {
                     api_url: initial_api_url.clone(),
@@ -185,6 +196,12 @@ impl ConnectInitCommand {
             );
             Some(cohort)
         } else if cohorts.len() > 1 {
+            if self.output.is_json() {
+                anyhow::bail!(
+                    "--cohort is required when using --output json and multiple cohorts exist. Available: {}",
+                    cohorts.iter().map(|c| format!("{} ({})", c.name, c.id)).collect::<Vec<_>>().join(", ")
+                );
+            }
             Some(prompt_select_cohort(&cohorts)?)
         } else {
             print_info(
@@ -238,7 +255,8 @@ impl ConnectInitCommand {
         let overlay_path = config_dir.join(&overlay_dir);
         let config_toml_path = overlay_path.join("etc/avocado-conn/config.toml");
 
-        if config_toml_path.exists() {
+        // In JSON mode, auto-overwrite existing config. In interactive mode, prompt.
+        if config_toml_path.exists() && !self.output.is_json() {
             print_warning(
                 "Device already has connect configuration at:",
                 OutputLevel::Normal,
@@ -335,16 +353,28 @@ keepalive_secs = 30
             OutputLevel::Normal,
         );
 
-        // 13. Print summary
-        print_final_summary(
-            &selected_org,
-            &selected_project,
-            &selected_cohort,
-            &server_key.public_key_hex,
-            &server_key.keyid,
-            Some(&token_name),
-            &self.config_path,
-        );
+        // 13. Print summary or emit JSON completion event
+        if self.output.is_json() {
+            emit_json_event(&json!({
+                "event": "complete",
+                "org": selected_org.id,
+                "org_name": selected_org.name,
+                "project": selected_project.id,
+                "project_name": selected_project.name,
+                "cohort": selected_cohort.as_ref().map(|c| c.id.as_str()),
+                "claim_token": token_name,
+            }));
+        } else {
+            print_final_summary(
+                &selected_org,
+                &selected_project,
+                &selected_cohort,
+                &server_key.public_key_hex,
+                &server_key.keyid,
+                Some(&token_name),
+                &self.config_path,
+            );
+        }
 
         Ok(())
     }

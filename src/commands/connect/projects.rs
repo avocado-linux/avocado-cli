@@ -10,6 +10,7 @@ use crate::utils::output_format::{emit_json_object, OutputFormat};
 pub struct ConnectProjectsListCommand {
     pub org: String,
     pub profile: Option<String>,
+    pub output: OutputFormat,
 }
 
 impl ConnectProjectsListCommand {
@@ -20,6 +21,16 @@ impl ConnectProjectsListCommand {
         let client = ConnectClient::from_profile(profile)?;
 
         let projects = client.list_projects(&self.org).await?;
+
+        if self.output.is_json() {
+            emit_json_object(&json!({
+                "projects": projects.iter().map(|p| json!({
+                    "id": p.id,
+                    "name": p.name,
+                })).collect::<Vec<_>>()
+            }));
+            return Ok(());
+        }
 
         if projects.is_empty() {
             print_info(
