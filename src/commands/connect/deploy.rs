@@ -8,8 +8,31 @@ use crate::commands::connect::client::{
 };
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::output_format::{
-    emit_json_event, is_json_output_active, JsonOutputGuard, OutputFormat,
+    emit_json_event, emit_step, emit_step_error, emit_task_registered, is_json_output_active,
+    JsonOutputGuard, OutputFormat,
 };
+
+// Step names for the desktop per-step strip.
+const PHASE_RESOLVE: &str = "resolve";
+const PHASE_CREATE: &str = "create-deployment";
+const PHASE_ACTIVATE: &str = "activate";
+
+/// Run a phase, emitting `running` → `success`/`failed` (+ `step_error`) so the
+/// desktop strip tracks fleet-deploy progress like build/install.
+async fn run_phase<T>(name: &str, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    emit_step(name, "running");
+    match fut.await {
+        Ok(v) => {
+            emit_step(name, "success");
+            Ok(v)
+        }
+        Err(e) => {
+            emit_step_error(name, &format!("{e:#}"));
+            emit_step(name, "failed");
+            Err(e)
+        }
+    }
+}
 
 pub struct ConnectDeployCommand {
     pub org: String,
@@ -36,14 +59,32 @@ impl ConnectDeployCommand {
         }
 
         let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
+        let result = self.execute_inner().await;
+        if let Err(e) = &result {
+            if is_json_output_active() {
+                emit_json_event(&json!({ "event": "error", "message": format!("{e:#}") }));
+            }
+        }
+        result
+    }
+
+    async fn execute_inner(&self) -> Result<()> {
+        // Register steps up front so the desktop shows the full list.
+        emit_task_registered(PHASE_RESOLVE, "Resolve runtime + cohort");
+        emit_task_registered(PHASE_CREATE, "Create deployment");
+        emit_task_registered(PHASE_ACTIVATE, "Activate deployment");
 
         let config = client::load_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
         let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
-        let selected_runtime = self.resolve_runtime(&client).await?;
-        let selected_cohort = self.resolve_cohort(&client).await?;
+        let (selected_runtime, selected_cohort) = run_phase(PHASE_RESOLVE, async {
+            let r = self.resolve_runtime(&client).await?;
+            let c = self.resolve_cohort(&client).await?;
+            Ok((r, c))
+        })
+        .await?;
 
         let version_display = selected_runtime
             .display_version
@@ -69,18 +110,28 @@ impl ConnectDeployCommand {
             },
         };
 
-        let deployment = client
-            .create_deployment(&self.org, &self.project, &req)
-            .await?;
+        let deployment = run_phase(
+            PHASE_CREATE,
+            client.create_deployment(&self.org, &self.project, &req),
+        )
+        .await?;
 
         let final_status = if self.activate {
             print_info("Activating deployment...", OutputLevel::Normal);
+            emit_step(PHASE_ACTIVATE, "running");
             match client
                 .activate_deployment(&self.org, &self.project, &deployment.id)
                 .await
             {
-                Ok(activated) => activated.status,
+                Ok(activated) => {
+                    emit_step(PHASE_ACTIVATE, "success");
+                    activated.status
+                }
                 Err(e) => {
+                    // Activation failure is non-fatal: the deployment exists in
+                    // draft. Surface it as a step error but don't fail the run.
+                    emit_step_error(PHASE_ACTIVATE, &format!("{e}"));
+                    emit_step(PHASE_ACTIVATE, "failed");
                     print_warning(
                         &format!(
                             "Deployment created but activation failed: {e}\n  \
@@ -92,6 +143,7 @@ impl ConnectDeployCommand {
                 }
             }
         } else {
+            emit_step(PHASE_ACTIVATE, "skipped");
             deployment.status.clone()
         };
 

@@ -660,9 +660,9 @@ enum ConnectCommands {
         project: Option<String>,
         /// Runtime name to upload
         runtime: String,
-        /// Version string (defaults to runtime name-version from manifest)
+        /// Human-readable version for this upload (e.g. v0.0.2-dev)
         #[arg(long)]
-        version: Option<String>,
+        version: String,
         /// Description for the upload
         #[arg(long)]
         description: Option<String>,
@@ -1964,6 +1964,13 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Clean { .. }
             | Commands::Sign { .. }
             | Commands::Deploy { .. }
+            // `connect upload` runs a prerequisite stamp check + in-container
+            // artifact discovery, both of which need Docker. The other connect
+            // subcommands are pure Connect-API calls, so they stay off the VM
+            // (routing can auto-start it) — gate on the subcommand, not the group.
+            | Commands::Connect {
+                command: ConnectCommands::Upload { .. }
+            }
     )
 }
 
@@ -4879,5 +4886,32 @@ mod tests {
         let empty_vec = vec![];
         let result = build_env_vars(None, Some(&empty_vec));
         assert_eq!(result, None);
+    }
+
+    /// `connect upload` talks to Docker (prerequisite stamp check +
+    /// in-container artifact discovery), so it must route to the avocado-vm.
+    /// The other `connect` subcommands are pure Connect-API calls and must
+    /// NOT route — routing can auto-start the VM, which is wrong for e.g.
+    /// `connect auth`/`deploy`. Pins the Docker-socket fix against regressions
+    /// (dropping the upload arm, or over-broadly routing all of `Connect`).
+    #[test]
+    fn needs_vm_routing_gates_connect_upload_only() {
+        let cmd = |args: &[&str]| Cli::try_parse_from(args).expect("args should parse").command;
+
+        // connect upload → routes
+        assert!(needs_vm_routing(&cmd(&[
+            "avocado", "connect", "upload", "dev", "--version", "v0.0.1",
+        ])));
+
+        // other connect subcommands → do NOT route
+        assert!(!needs_vm_routing(&cmd(&[
+            "avocado", "connect", "deploy", "--runtime", "r", "--cohort", "c",
+        ])));
+        assert!(!needs_vm_routing(&cmd(&["avocado", "connect", "clean"])));
+
+        // sanity: an existing docker command still routes
+        assert!(needs_vm_routing(&cmd(&[
+            "avocado", "build", "--target", "qemux86-64",
+        ])));
     }
 }

@@ -11,19 +11,62 @@ use crate::commands::connect::client::{
 };
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
-use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
-use crate::utils::output_format::{emit_json_event, is_json_output_active, JsonOutputGuard, OutputFormat};
+use crate::utils::output::{print_success, print_warning, tui_is_active, OutputLevel};
+use crate::utils::output_format::{
+    emit_json_event, emit_step, emit_step_error, emit_task_registered, is_json_output_active,
+    JsonOutputGuard, OutputFormat,
+};
 use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
 
 const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
 
+/// Progress line for the upload flow. In `--output json` mode (which the
+/// desktop uses), `print_info` is suppressed, so emit an `output` event the
+/// desktop appends to the run's terminal instead. Outside JSON mode this
+/// mirrors `print_info` exactly.
+fn progress(msg: &str, _level: OutputLevel) {
+    if is_json_output_active() {
+        emit_json_event(&serde_json::json!({ "event": "output", "line": msg }));
+    } else if !tui_is_active() {
+        println!("\x1b[94m[INFO]\x1b[0m {msg}");
+    }
+}
+
+// Step names for the desktop per-step strip (container upload path).
+const PHASE_PREREQ: &str = "prerequisites";
+const PHASE_DISCOVER: &str = "discover";
+const PHASE_CREATE: &str = "create-runtime";
+const PHASE_UPLOAD: &str = "upload-artifacts";
+const PHASE_FINALIZE: &str = "finalize";
+
+/// Run one phase of the upload, emitting `running` → `success`/`failed` step
+/// events around it (and a `step_error` with the reason on failure) so the
+/// desktop strip tracks progress like build/install.
+async fn run_phase<T>(
+    name: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    emit_step(name, "running");
+    match fut.await {
+        Ok(v) => {
+            emit_step(name, "success");
+            Ok(v)
+        }
+        Err(e) => {
+            emit_step_error(name, &format!("{e:#}"));
+            emit_step(name, "failed");
+            Err(e)
+        }
+    }
+}
+
 pub struct ConnectUploadCommand {
     pub org: String,
     pub project: String,
     pub runtime: String,
-    pub version: Option<String>,
+    pub version: String,
     pub description: Option<String>,
     pub config_path: String,
     pub target: Option<String>,
@@ -57,8 +100,26 @@ impl TaskPrerequisites for ConnectUploadCommand {
 
 impl ConnectUploadCommand {
     pub async fn execute(&self) -> Result<()> {
+        // Guard stays alive across the error-emit below so the event lands
+        // on the JSON stream the desktop is parsing.
         let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
+        let result = self.execute_inner().await;
+        if let Err(e) = &result {
+            // `print_info` is suppressed in JSON mode and the command's only
+            // other signal is the process exit code — emit the failure reason
+            // as an `error` event so the desktop surfaces it instead of a bare
+            // "avocado exited 1".
+            if is_json_output_active() {
+                emit_json_event(&serde_json::json!({
+                    "event": "error",
+                    "message": format!("{e:#}"),
+                }));
+            }
+        }
+        result
+    }
 
+    async fn execute_inner(&self) -> Result<()> {
         // 0. Validate deploy-after-upload flags
         super::deploy::validate_deploy_flags(
             &self.deploy_cohort,
@@ -96,20 +157,17 @@ impl ConnectUploadCommand {
         let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir().await?;
 
         let manifest = read_manifest(&artifacts_dir)?;
-        let version = self
-            .version
-            .clone()
-            .unwrap_or_else(|| format_version_from_manifest(&manifest));
+        let version = self.version.clone();
         let build_id = manifest
             .get("id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        print_info("Discovering artifacts...", OutputLevel::Normal);
+        progress("Discovering artifacts...", OutputLevel::Normal);
         let artifact_infos = discover_artifacts(&artifacts_dir, &manifest)?;
 
         for info in &artifact_infos {
-            print_info(
+            progress(
                 &format!("  {} ({})", info.image_id, format_bytes(info.size_bytes)),
                 OutputLevel::Normal,
             );
@@ -181,22 +239,30 @@ impl ConnectUploadCommand {
         connect: &ConnectClient,
         project_config: &Config,
     ) -> Result<()> {
+        // Register the steps up front so the desktop shows the full list.
+        emit_task_registered(PHASE_PREREQ, "Verify build prerequisites");
+        emit_task_registered(PHASE_DISCOVER, "Discover artifacts");
+        emit_task_registered(PHASE_CREATE, "Create runtime");
+        emit_task_registered(PHASE_UPLOAD, "Upload artifacts");
+        emit_task_registered(PHASE_FINALIZE, "Finalize");
+
         // Validate prerequisites (runtime has been built)
         let target = resolve_target_required(self.target.as_deref(), project_config)?;
         let container_image = project_config
             .get_sdk_image()
             .context("No SDK container image specified in configuration")?;
         let container = SdkContainer::from_config(&self.config_path, project_config)?;
-        check_prerequisites(self, &target, &container, container_image).await?;
+        run_phase(
+            PHASE_PREREQ,
+            check_prerequisites(self, &target, &container, container_image),
+        )
+        .await?;
 
         // Phase A: Discover artifacts inside the container
-        let discovery = self.discover_in_container(project_config).await?;
+        let discovery = run_phase(PHASE_DISCOVER, self.discover_in_container(project_config)).await?;
 
         let manifest = &discovery.manifest;
-        let version = self
-            .version
-            .clone()
-            .unwrap_or_else(|| format_version_from_manifest(manifest));
+        let version = self.version.clone();
         let build_id = manifest
             .get("id")
             .and_then(|v| v.as_str())
@@ -220,8 +286,9 @@ impl ConnectUploadCommand {
         };
 
         // Phase B: Create runtime via API
-        let (runtime, num_artifacts) = self
-            .create_runtime_api(
+        let (runtime, num_artifacts) = run_phase(
+            PHASE_CREATE,
+            self.create_runtime_api(
                 connect,
                 version,
                 build_id,
@@ -238,23 +305,33 @@ impl ConnectUploadCommand {
                     })
                     .collect::<Vec<_>>(),
                 delegation_refs,
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         if runtime.status == "draft" {
+            // Nothing to upload (all artifacts already present) — mark the
+            // upload/finalize steps skipped so the strip doesn't look stuck.
+            emit_step(PHASE_UPLOAD, "skipped");
+            emit_step(PHASE_FINALIZE, "skipped");
             self.handle_draft_status(connect, &runtime, num_artifacts)
                 .await?;
             return Ok(());
         }
 
         // Phase C: Stream artifacts from Docker volume and upload with progress
-        let completed_parts = self
-            .upload_in_container(project_config, connect, &runtime.artifacts, &discovery)
-            .await?;
+        let completed_parts = run_phase(
+            PHASE_UPLOAD,
+            self.upload_in_container(project_config, connect, &runtime.artifacts, &discovery),
+        )
+        .await?;
 
         // Phase D: Complete and finalize
-        self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts)
-            .await
+        run_phase(
+            PHASE_FINALIZE,
+            self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts),
+        )
+        .await
     }
 
     /// Create a runtime via the Connect API. Returns the runtime data and
@@ -268,7 +345,7 @@ impl ConnectUploadCommand {
         artifacts: &[ArtifactParam],
         delegation: Option<(&String, &String, &String)>,
     ) -> Result<(client::RuntimeCreateData, usize)> {
-        print_info(
+        progress(
             &format!("Creating runtime {version}..."),
             OutputLevel::Normal,
         );
@@ -346,7 +423,7 @@ impl ConnectUploadCommand {
         );
 
         let final_status = if self.publish {
-            print_info("Publishing runtime...", OutputLevel::Normal);
+            progress("Publishing runtime...", OutputLevel::Normal);
             let published = connect
                 .publish_runtime(&self.org, &self.project, &runtime.id)
                 .await?;
@@ -407,7 +484,7 @@ impl ConnectUploadCommand {
             return Ok(());
         }
 
-        print_info("Completing upload...", OutputLevel::Normal);
+        progress("Completing upload...", OutputLevel::Normal);
         let result = connect
             .complete_runtime(
                 &self.org,
@@ -428,7 +505,7 @@ impl ConnectUploadCommand {
         );
 
         let final_status = if self.publish {
-            print_info("Publishing runtime...", OutputLevel::Normal);
+            progress("Publishing runtime...", OutputLevel::Normal);
             let published = connect
                 .publish_runtime(&self.org, &self.project, &runtime.id)
                 .await?;
@@ -501,7 +578,7 @@ impl ConnectUploadCommand {
             .context("No SDK container image specified in configuration")?;
         let container = SdkContainer::from_config(&self.config_path, config)?;
 
-        print_info(
+        progress(
             "Discovering artifacts in build volume...",
             OutputLevel::Normal,
         );
@@ -531,7 +608,7 @@ impl ConnectUploadCommand {
             })?;
 
         for info in &result.artifacts {
-            print_info(
+            progress(
                 &format!("  {} ({})", info.name, format_bytes(info.size_bytes)),
                 OutputLevel::Normal,
             );
@@ -561,12 +638,12 @@ impl ConnectUploadCommand {
             .collect();
 
         if to_upload.is_empty() {
-            print_info("All artifact(s) already uploaded.", OutputLevel::Normal);
+            progress("All artifact(s) already uploaded.", OutputLevel::Normal);
             return Ok(Vec::new());
         }
 
         let skipped = upload_specs.len() - to_upload.len();
-        print_info(
+        progress(
             &format!(
                 "Uploading {} artifact(s){}...",
                 to_upload.len(),
@@ -855,22 +932,6 @@ fn read_manifest(dir: &Path) -> Result<serde_json::Value> {
     )
 }
 
-fn format_version_from_manifest(manifest: &serde_json::Value) -> String {
-    if let Some(runtime) = manifest.get("runtime") {
-        if let (Some(name), Some(ver)) = (
-            runtime.get("name").and_then(|v| v.as_str()),
-            runtime.get("version").and_then(|v| v.as_str()),
-        ) {
-            return format!("{name}-{ver}");
-        }
-    }
-    manifest
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Artifact discovery (manifest-driven, with SHA256 hashing for TUF)
 // ---------------------------------------------------------------------------
@@ -1012,7 +1073,7 @@ async fn upload_artifacts(
 
     for spec in upload_specs {
         if spec.parts.is_empty() {
-            print_info(
+            progress(
                 &format!("  {} (already uploaded, skipping)", spec.image_id),
                 OutputLevel::Normal,
             );
@@ -1024,7 +1085,7 @@ async fn upload_artifacts(
 
     if to_upload.is_empty() {
         if skipped > 0 {
-            print_info(
+            progress(
                 &format!("All {skipped} artifact(s) already uploaded."),
                 OutputLevel::Normal,
             );
@@ -1032,7 +1093,7 @@ async fn upload_artifacts(
         return Ok(all_completed);
     }
 
-    print_info(
+    progress(
         &format!(
             "Uploading {} artifact(s){}...",
             to_upload.len(),

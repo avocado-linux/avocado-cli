@@ -56,6 +56,46 @@ pub fn emit_json_object(value: &serde_json::Value) {
 }
 
 // ---------------------------------------------------------------------------
+// Step-event helpers — the same NDJSON vocabulary the task renderer emits for
+// `build`/`install` (`task_registered` / `step` / `step_error`), so the
+// desktop's per-step strip works identically for imperative commands
+// (`connect upload`, `connect deploy`) that don't run the task scheduler.
+// All are no-ops outside JSON output mode.
+
+/// Register a step up front so the desktop shows it (pending) before it runs.
+pub fn emit_task_registered(name: &str, label: &str) {
+    if is_json_output_active() {
+        emit_json_event(&serde_json::json!({
+            "event": "task_registered",
+            "name": name,
+            "label": label,
+        }));
+    }
+}
+
+/// Transition a step to `pending` / `running` / `success` / `failed` / `skipped`.
+pub fn emit_step(name: &str, status: &str) {
+    if is_json_output_active() {
+        emit_json_event(&serde_json::json!({
+            "event": "step",
+            "name": name,
+            "status": status,
+        }));
+    }
+}
+
+/// Attach an error message to a step so the desktop can show it inline.
+pub fn emit_step_error(name: &str, message: &str) {
+    if is_json_output_active() {
+        emit_json_event(&serde_json::json!({
+            "event": "step_error",
+            "name": name,
+            "message": message,
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process-wide "JSON output active" flag.
 //
 // Long-running commands that wrap a task scheduler / TUI flip this on at the
