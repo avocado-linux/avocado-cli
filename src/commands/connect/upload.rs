@@ -44,10 +44,7 @@ const PHASE_FINALIZE: &str = "finalize";
 /// Run one phase of the upload, emitting `running` → `success`/`failed` step
 /// events around it (and a `step_error` with the reason on failure) so the
 /// desktop strip tracks progress like build/install.
-async fn run_phase<T>(
-    name: &str,
-    fut: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
+async fn run_phase<T>(name: &str, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     emit_step(name, "running");
     match fut.await {
         Ok(v) => {
@@ -259,7 +256,8 @@ impl ConnectUploadCommand {
         .await?;
 
         // Phase A: Discover artifacts inside the container
-        let discovery = run_phase(PHASE_DISCOVER, self.discover_in_container(project_config)).await?;
+        let discovery =
+            run_phase(PHASE_DISCOVER, self.discover_in_container(project_config)).await?;
 
         let manifest = &discovery.manifest;
         let version = self.version.clone();

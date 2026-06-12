@@ -1357,7 +1357,10 @@ mod tests {
 
     #[test]
     fn test_args_have_host_network_eq_form() {
-        assert!(args_have_host_network(&sv(&["--privileged", "--network=host"])));
+        assert!(args_have_host_network(&sv(&[
+            "--privileged",
+            "--network=host"
+        ])));
         assert!(args_have_host_network(&sv(&["--net=host"])));
     }
 
