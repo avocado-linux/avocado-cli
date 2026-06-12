@@ -554,6 +554,20 @@ impl ExtPackageCommand {
         // Convert package_files to a space-separated string for the shell script
         let package_files_str = package_files.join(" ");
 
+        // Stamp the supported targets into the RPM as `avocado-target(<machine>)` provides,
+        // derived from avocado.yaml `supported_targets` (never a hardcoded list). The feed
+        // server reads these to route the package to the right per-target `-ext` feed(s).
+        // `get_supported_targets()` returns the explicit list, or None for `*`/unset — both
+        // of which mean "all targets", which we record as the single wildcard `avocado-target(*)`.
+        let target_provides = match config.get_supported_targets() {
+            Some(targets) if !targets.is_empty() => targets
+                .iter()
+                .map(|t| format!("Provides: avocado-target({t})"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => "Provides: avocado-target(*)".to_string(),
+        };
+
         // Create RPM using rpmbuild in container
         // Package root (/) maps to the extension's src_dir contents
         let rpm_build_script = format!(
@@ -644,6 +658,11 @@ Group: {group}{url_line}
 # is nested under /<ext_name>/, so it installs into the SHARED includes installroot.
 # Legacy packages (content at /) lack this provide and use the per-ext installroot.
 Provides: avocado-ext-layout(nested)
+# Self-describe which targets this extension supports, derived from avocado.yaml
+# supported_targets. Surfaced in the feed's repo metadata (primary.xml) so the CLI can
+# query target compatibility without downloading the RPM, and so the feed server can route
+# it to the correct per-target -ext feed(s). "*" means all targets (cross-target).
+{target_provides}
 
 %description
 {description}
@@ -699,6 +718,7 @@ rm -rf "$TMPDIR"
             },
             description = metadata.description,
             arch = metadata.arch,
+            target_provides = target_provides,
             rpm_filename = rpm_filename,
             container_src_dir = container_src_dir,
             package_files_str = package_files_str,

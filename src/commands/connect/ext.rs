@@ -75,7 +75,7 @@ pub struct ExtPublishCommand {
     pub arch: Option<String>,
     pub target_release: String,
     pub target_channel: String,
-    pub targets: String,
+    pub targets: Option<String>,
 }
 
 impl ExtPublishCommand {
@@ -117,12 +117,22 @@ impl ExtPublishCommand {
         if name.is_empty() || version.is_empty() {
             anyhow::bail!("could not determine extension name/version — pass --name and --version");
         }
-        let machines: Vec<String> = self
-            .targets
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Target machines: an explicit --targets overrides; otherwise derive from the
+        // project's avocado.yaml `supported_targets` (never a hardcoded list). A wildcard or
+        // unset `supported_targets` ("all targets") yields an empty list here — the RPM still
+        // carries an `avocado-target(*)` provide, and the feed server expands it to every
+        // known target feed on ingest.
+        let machines: Vec<String> = match &self.targets {
+            Some(t) => t
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => crate::utils::config::load_config(&self.config)
+                .ok()
+                .and_then(|c| c.get_supported_targets())
+                .unwrap_or_default(),
+        };
 
         let client = http_client()?;
 

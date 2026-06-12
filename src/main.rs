@@ -908,9 +908,10 @@ enum ConnectExtCommands {
         /// Target feed channel
         #[arg(long, default_value = "edge")]
         target_channel: String,
-        /// Comma-separated target machines
-        #[arg(long, default_value = "qemux86-64,qemuarm64")]
-        targets: String,
+        /// Override the target machines (comma-separated). Defaults to the project's
+        /// `supported_targets` from avocado.yaml; only pass this to override that.
+        #[arg(long)]
+        targets: Option<String>,
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
         config: String,
