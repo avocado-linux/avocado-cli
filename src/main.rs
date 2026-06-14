@@ -902,12 +902,6 @@ enum ConnectExtCommands {
         /// Extension arch (default: parsed, else noarch)
         #[arg(long)]
         arch: Option<String>,
-        /// Target feed release
-        #[arg(long, default_value = "2026")]
-        target_release: String,
-        /// Target feed channel
-        #[arg(long, default_value = "edge")]
-        target_channel: String,
         /// Override the target machines (comma-separated). Defaults to the project's
         /// `supported_targets` from avocado.yaml; only pass this to override that.
         #[arg(long)]
@@ -3493,8 +3487,6 @@ async fn main() -> Result<()> {
                     version,
                     release,
                     arch,
-                    target_release,
-                    target_channel,
                     targets,
                     config,
                     profile,
@@ -3508,8 +3500,6 @@ async fn main() -> Result<()> {
                         version,
                         release,
                         arch,
-                        target_release,
-                        target_channel,
                         targets,
                     };
                     cmd.execute().await?;

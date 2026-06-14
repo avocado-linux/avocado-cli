@@ -73,8 +73,6 @@ pub struct ExtPublishCommand {
     pub version: Option<String>,
     pub release: Option<String>,
     pub arch: Option<String>,
-    pub target_release: String,
-    pub target_channel: String,
     pub targets: Option<String>,
 }
 
@@ -84,13 +82,14 @@ impl ExtPublishCommand {
         // platform (Peridio) org, which connect fills in server-side for super-admins.
         // When given (flag or connect.org), it publishes into that tenant org and
         // selects a matching auth profile.
+        // Load the project config once — it drives the org fallback, the target machines, AND
+        // the target feed (release/channel) below.
+        let project_cfg = crate::utils::config::load_config(&self.config).ok();
         let org = self.org.clone().or_else(|| {
-            std::path::Path::new(&self.config)
-                .exists()
-                .then(|| crate::utils::config::load_config(&self.config).ok())
-                .flatten()
-                .and_then(|c| c.connect)
-                .and_then(|c| c.org)
+            project_cfg
+                .as_ref()
+                .and_then(|c| c.connect.as_ref())
+                .and_then(|c| c.org.clone())
         });
         let cfg = client::load_config()?
             .context("Not logged in. Run 'avocado connect auth login' first.")?;
@@ -128,18 +127,39 @@ impl ExtPublishCommand {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            None => crate::utils::config::load_config(&self.config)
-                .ok()
+            None => project_cfg
+                .as_ref()
                 .and_then(|c| c.get_supported_targets())
                 .unwrap_or_default(),
         };
+
+        // Target feed = the configured distro release/channel (AVOCADO_DISTRO_RELEASE/CHANNEL
+        // env > distro.release/channel in avocado.yaml). There is no separate publish flag: the
+        // feed you publish into always matches the distro you're configured to build, so the two
+        // can't silently diverge. To publish into a different feed, change the distro config/env.
+        let target_release = project_cfg
+            .as_ref()
+            .and_then(|c| c.get_distro_release())
+            .or_else(|| std::env::var("AVOCADO_DISTRO_RELEASE").ok())
+            .context(
+                "no target feed release — set distro.release in avocado.yaml (or AVOCADO_DISTRO_RELEASE)",
+            )?;
+        let target_channel = project_cfg
+            .as_ref()
+            .and_then(|c| c.get_distro_channel())
+            .or_else(|| std::env::var("AVOCADO_DISTRO_CHANNEL").ok())
+            .context(
+                "no target feed channel — set distro.channel in avocado.yaml (or AVOCADO_DISTRO_CHANNEL)",
+            )?;
 
         let client = http_client()?;
 
         // 1. reserve version + get presigned staging URL (409 if taken)
         let org_label = org.as_deref().unwrap_or("platform");
         print_info(
-            &format!("Publishing {name}-{version}-{release}.{arch} to {api} (org {org_label})..."),
+            &format!(
+                "Publishing {name}-{version}-{release}.{arch} to {target_release}/{target_channel} via {api} (org {org_label})..."
+            ),
             OutputLevel::Normal,
         );
         let res = client
@@ -153,8 +173,8 @@ impl ExtPublishCommand {
                 "arch": arch,
                 "sha256": sha,
                 "size_bytes": size,
-                "target_release": self.target_release,
-                "target_channel": self.target_channel,
+                "target_release": target_release,
+                "target_channel": target_channel,
                 "target_machines": machines,
             }))
             .send()
