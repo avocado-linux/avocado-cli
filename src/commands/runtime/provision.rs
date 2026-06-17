@@ -342,7 +342,14 @@ impl RuntimeProvisionCommand {
         // Surface the container-side path so provision scripts (e.g.
         // stone-provision-tegraflash.sh) can repack boot.img with the resolver-
         // pinned kernel instead of relying on the build-baked one.
-        if let Ok(src_dir) = std::env::current_dir() {
+        // Resolve against the configured `src_dir` (where install wrote the
+        // lock + docker volume), falling back to the CWD. A per-board runtime
+        // (`runtimes/<board>/avocado.yaml` + `src_dir: ../..`) is provisioned
+        // from the board dir, so the CWD is not the src_dir.
+        let lock_src_dir = config
+            .get_resolved_src_dir(&self.config.config_path)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(src_dir) = lock_src_dir {
             if let Ok(lock_file) = LockFile::load(&src_dir) {
                 // Validate kernel consistency before provision. Any drift between
                 // rootfs/initramfs kvers, or a pinned kver without a populated
@@ -410,8 +417,14 @@ impl RuntimeProvisionCommand {
             Some(env_vars)
         };
 
-        // Copy state file to container volume if it exists
-        let src_dir = std::env::current_dir()?;
+        // Copy state file to container volume if it exists. Use the same
+        // resolved `src_dir` as the docker volume / lockfile (not the CWD), so
+        // a per-board runtime provisioned from `runtimes/<board>/` reads the
+        // state file from — and attaches the volume keyed at — the repo root.
+        let src_dir = match config.get_resolved_src_dir(&self.config.config_path) {
+            Some(dir) => dir,
+            None => std::env::current_dir()?,
+        };
         let state_file_existed =
             if let Some((ref state_file_path, ref container_state_path)) = state_file_info {
                 self.copy_state_to_container(
