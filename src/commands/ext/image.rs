@@ -186,10 +186,21 @@ impl ExtImageCommand {
                 ));
             }
 
-            let lock_src_dir = std::path::Path::new(&self.config_path)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let lock_file = LockFile::load(lock_src_dir)
+            // Resolve the lockfile against the same `src_dir` that
+            // `install`/`runtime install` use to *write* it (see
+            // `get_resolved_src_dir`), not the config file's directory. With a
+            // per-board runtime laid out as `runtimes/<board>/avocado.yaml` +
+            // `src_dir: ../..`, the lock lives at the repo root, not next to
+            // the config — so `config_path.parent()` would miss it.
+            let lock_src_dir = config
+                .get_resolved_src_dir(&self.config_path)
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&self.config_path)
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                });
+            let lock_file = LockFile::load(&lock_src_dir)
                 .with_context(|| "Failed to load lock file for sysroot precondition check")?;
             if let Some(target_locks) = lock_file.targets.get(&target) {
                 if target_locks.rootfs.is_empty() {

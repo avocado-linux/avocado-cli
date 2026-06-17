@@ -1713,7 +1713,26 @@ impl Config {
         main_config: &mut serde_yaml::Value,
         config_path: &Path,
     ) -> Result<()> {
-        let main_config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+        // Resolve path sources relative to `src_dir` when set (falling back to
+        // the config file's directory), so rootfs/initramfs/kernel `source.path`
+        // use the SAME base as extension `source: { type: path }` sources (see
+        // ext_fetch::ExtensionPathState). Without this they resolve against the
+        // config dir, which breaks configs that live in a subdirectory whose
+        // `src_dir` points at a parent (e.g. one runtime per directory).
+        let base_dir = match main_config.get("src_dir").and_then(|v| v.as_str()) {
+            Some(s) => {
+                let p = Path::new(s);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    let joined = config_dir.join(p);
+                    joined.canonicalize().unwrap_or(joined)
+                }
+            }
+            None => config_dir,
+        };
 
         for key in ["rootfs", "initramfs", "kernel"] {
             // Read the source.path declaration; skip the section entirely
@@ -1746,7 +1765,7 @@ impl Config {
             };
 
             // Resolve the fragment file (.yaml preferred, .yml fallback).
-            let fragment_dir = main_config_dir.join(&path_str);
+            let fragment_dir = base_dir.join(&path_str);
             let fragment_yaml = fragment_dir.join("avocado.yaml");
             let fragment_yml = fragment_dir.join("avocado.yml");
             let fragment_path = if fragment_yaml.is_file() {
@@ -11388,6 +11407,61 @@ rootfs:
             "erofs-lz4",
             "fragment's filesystem must merge in"
         );
+    }
+
+    #[test]
+    fn test_image_section_path_source_resolves_relative_to_src_dir() {
+        // Main config in a subdir (runtimes/<board>/) with `src_dir: ../..`
+        // pointing at the repo root, where os-kabs/ lives. The rootfs
+        // source.path must resolve against src_dir (root), NOT the config dir
+        // — matching how extension `source: { type: path }` paths resolve.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let board_dir = root.join("runtimes").join("flex");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        let main_yaml = r#"
+src_dir: ../..
+default_target: raspberrypi4
+
+sdk:
+  image: test-image
+
+runtimes:
+  kos-bootloader-flex:
+    type: kos
+
+rootfs:
+  source:
+    type: path
+    path: os-kabs/avocado-os-rootfs
+"#;
+        let main_path = board_dir.join("avocado.yaml");
+        std::fs::write(&main_path, main_yaml).unwrap();
+
+        // Fragment at the repo root (== src_dir), NOT under the board dir.
+        let fragment_dir = root.join("os-kabs").join("avocado-os-rootfs");
+        std::fs::create_dir_all(&fragment_dir).unwrap();
+        let fragment_yaml = r#"
+rootfs:
+  filesystem: erofs-lz4
+  packages:
+    avocado-pkg-rootfs: '*'
+  image:
+    type: kab
+    args: '-b -t kos.layer.basefs -v 2024.1.0 --tag raspberrypi4'
+"#;
+        std::fs::write(fragment_dir.join("avocado.yaml"), fragment_yaml).unwrap();
+
+        let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
+        assert!(
+            composed
+                .config
+                .get_rootfs_packages()
+                .contains_key("avocado-pkg-rootfs"),
+            "rootfs source.path must resolve relative to src_dir (repo root), not the config dir"
+        );
+        assert_eq!(composed.config.get_rootfs_filesystem(), "erofs-lz4");
     }
 
     #[test]
