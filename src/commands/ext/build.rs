@@ -171,7 +171,16 @@ impl ExtBuildCommand {
         // Runtime-bound preconditions. Skipped when no runtime is in scope
         // (legacy per-target builds keep working unchanged).
         if let Some(runtime_name) = self.runtime.as_deref() {
-            // Membership: <ext> must appear in runtimes.<r>.extensions: [...]
+            // Membership is advisory, not a gate. Building an extension that
+            // isn't listed in `runtimes.<r>.extensions` is a first-class
+            // workflow — e.g. checking that a shared extension compiles for a
+            // PR without wiring it into a runtime (shared-extension configs
+            // have no `runtimes:` block at all; the CLI synthesizes an empty
+            // implicit `default`). This mirrors `ext install`, which already
+            // installs any extension into the runtime-scoped sysroot without
+            // requiring config membership. A non-member build still runs
+            // against the runtime's sysroot tree; we only warn so the absence
+            // stays visible (e.g. a typo'd extension name).
             let ext_deps = config.get_runtime_extension_dependencies_detailed(
                 runtime_name,
                 &target,
@@ -179,14 +188,15 @@ impl ExtBuildCommand {
             )?;
             let is_member = ext_deps.iter().any(|d| d.name() == self.extension);
             if !is_member {
-                return Err(anyhow::anyhow!(
-                    "Extension '{}' is not a member of runtime '{}'. \
-                     Add it to runtimes.{}.extensions in {}.",
-                    self.extension,
-                    runtime_name,
-                    runtime_name,
-                    self.config_path,
-                ));
+                print_warning(
+                    &format!(
+                        "Extension '{}' is not a member of runtime '{}'. \
+                         Building it standalone; add it to runtimes.{}.extensions \
+                         in {} to include it in the runtime.",
+                        self.extension, runtime_name, runtime_name, self.config_path,
+                    ),
+                    OutputLevel::Normal,
+                );
             }
 
             // Sysroot precondition: rootfs (and kernel sysroot, if a kernel
