@@ -169,6 +169,10 @@ impl ExtImageCommand {
         // Runtime-bound preconditions. Skipped when no runtime is in scope
         // (legacy per-target image runs keep working unchanged).
         if let Some(runtime_name) = self.runtime.as_deref() {
+            // Membership is advisory, not a gate — see `ExtBuildCommand::execute`
+            // for the rationale. Imaging a non-member extension standalone (to
+            // verify it builds for a PR, with no `runtimes:` block in a shared-
+            // extension config) is a supported workflow; warn but proceed.
             let ext_deps = config.get_runtime_extension_dependencies_detailed(
                 runtime_name,
                 &target,
@@ -176,14 +180,15 @@ impl ExtImageCommand {
             )?;
             let is_member = ext_deps.iter().any(|d| d.name() == self.extension);
             if !is_member {
-                return Err(anyhow::anyhow!(
-                    "Extension '{}' is not a member of runtime '{}'. \
-                     Add it to runtimes.{}.extensions in {}.",
-                    self.extension,
-                    runtime_name,
-                    runtime_name,
-                    self.config_path,
-                ));
+                print_warning(
+                    &format!(
+                        "Extension '{}' is not a member of runtime '{}'. \
+                         Imaging it standalone; add it to runtimes.{}.extensions \
+                         in {} to include it in the runtime.",
+                        self.extension, runtime_name, runtime_name, self.config_path,
+                    ),
+                    OutputLevel::Normal,
+                );
             }
 
             let lock_src_dir = std::path::Path::new(&self.config_path)
