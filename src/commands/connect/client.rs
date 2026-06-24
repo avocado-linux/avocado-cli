@@ -205,10 +205,6 @@ struct ServerKeyWrapper {
 // Connect signing types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-pub struct SignForDeployRequest<'a> {
-    pub targets: &'a [TargetFileInfo],
-}
 
 #[derive(Debug, Deserialize)]
 pub struct SignForDeployResponse {
@@ -1437,13 +1433,11 @@ impl ConnectClient {
             self.api_url, org
         );
 
-        let body = SignForDeployRequest { targets };
-
         let res = self
             .http
             .post(&url)
             .header("authorization", format!("Bearer {}", self.token))
-            .json(&body)
+            .json(&serde_json::json!({ "targets": targets }))
             .send()
             .await
             .context("Failed to sign deploy metadata")?;
@@ -2304,27 +2298,6 @@ mod tests {
         } else {
             panic!("expected UrlExpired");
         }
-    }
-
-    // --- sign_for_deploy types ---
-
-    #[test]
-    fn test_sign_for_deploy_request_serializes_targets_no_runtime_uuid() {
-        use crate::utils::update_repo::TargetFileInfo;
-        let targets = vec![TargetFileInfo {
-            name: "firmware.raw".to_string(),
-            sha256: "ab".repeat(32),
-            size: 2048,
-        }];
-        let req = SignForDeployRequest { targets: &targets };
-        let json: serde_json::Value = serde_json::to_value(&req).unwrap();
-        // targets array must be present
-        assert!(json["targets"].is_array());
-        let t = &json["targets"][0];
-        assert_eq!(t["name"], "firmware.raw");
-        assert_eq!(t["size"], 2048);
-        // must NOT include runtime_uuid
-        assert!(json.get("runtime_uuid").is_none());
     }
 
     #[test]
