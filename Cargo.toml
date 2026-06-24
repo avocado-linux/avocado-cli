@@ -47,7 +47,11 @@ reqwest = { version = "0.13", default-features = false, features = [
 indicatif = "0.18"
 futures-util = "0.3.30"
 flate2 = "1.0.32"
-gzp = "2.0"
+# Pure-Rust deflate backend. gzp's default features pull C/C++ native deps
+# (deflate_zlib_ng -> libz-ng-sys needs g++, libdeflate -> libdeflater needs a C
+# toolchain) that don't cross-compile in the avocado SDK (no target g++). gzp is
+# only used for `avocado save` gzip, so miniz_oxide is an acceptable trade.
+gzp = { version = "2.0", default-features = false, features = ["deflate_rust"] }
 tar = "0.4.41"
 uuid = { version = "1.0", features = ["v4", "v5"] }
 libc = "0.2"
