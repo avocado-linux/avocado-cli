@@ -1,0 +1,47 @@
+name: Extension Test
+
+# "Does it build" check on PRs for the avocado-ext-cli extension (this repo's Rust source
+# is compiled in place by `avocado ext build`). The matrix lives here (the caller owns it);
+# each leg calls the single-combo reusable helper. This is separate from pr.yml, which runs
+# the CLI's own unit tests + security audit, and from release.yml, which builds the
+# standalone binaries.
+#
+# `ext build` validates the extension version, and this extension's version tracks the
+# packaged program (Cargo.toml), so we resolve it here and pass it through as `ext-version`.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  version:
+    name: Resolve version from Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.cargo.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read Cargo.toml [package] version
+        id: cargo
+        run: |
+          v="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")"
+          if [ -z "$v" ]; then
+            echo "::error::could not read [package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "Program version (Cargo.toml): $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: qemux86-64, distro-release: "2024", distro-channel: edge-next }
+    uses: avocado-linux/actions/.github/workflows/extension-test.yml@v1
+    with:
+      target:         ${{ matrix.target }}
+      distro-release: ${{ matrix.distro-release }}
+      distro-channel: ${{ matrix.distro-channel }}
+      repo-url:       ${{ matrix.repo-url }}
+      ext-version:    ${{ needs.version.outputs.version }}

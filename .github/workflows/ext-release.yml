@@ -1,0 +1,56 @@
+name: Extension Release
+
+# Package + publish the avocado-ext-cli extension on a version tag. Runs alongside
+# release.yml (which builds the standalone binaries + Homebrew tap) on the SAME tag, so a
+# single CLI release tag both ships the binaries and publishes the extension.
+#
+# The extension version TRACKS THE PACKAGED PROGRAM: it is read from Cargo.toml ([package]
+# version) and passed to the reusable helper as `ext-version`, which exports it as
+# AVOCADO_EXT_VERSION so the `version: '{{ env.AVOCADO_EXT_VERSION }}'` template in
+# avocado.yaml resolves at package time. The pushed tag must equal the Cargo.toml version
+# (the helper guards it).
+#
+# Release flow: bump Cargo.toml version -> tag the same value -> push tag.
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+
+jobs:
+  version:
+    name: Resolve version from Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.cargo.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read Cargo.toml [package] version
+        id: cargo
+        run: |
+          v="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")"
+          if [ -z "$v" ]; then
+            echo "::error::could not read [package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "Program version (Cargo.toml): $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: qemux86-64, distro-release: "2026", distro-channel: edge }
+          - { target: qemux86-64, distro-release: "2024", distro-channel: edge-next }
+    uses: avocado-linux/actions/.github/workflows/extension-release.yml@v1
+    with:
+      target:         ${{ matrix.target }}
+      distro-release: ${{ matrix.distro-release }}
+      distro-channel: ${{ matrix.distro-channel }}
+      ext-version:    ${{ needs.version.outputs.version }}
+    secrets:
+      connect-token: ${{ secrets.AVOCADO_CONNECT_TOKEN }}
+      connect-org:   ${{ secrets.AVOCADO_CONNECT_ORG }}
