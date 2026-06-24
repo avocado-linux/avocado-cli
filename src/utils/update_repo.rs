@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -16,7 +16,7 @@ pub fn compute_image_id(sha256_hex: &str) -> String {
 }
 
 /// Information about a single target file in the TUF repository.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TargetFileInfo {
     pub name: String,
     pub sha256: String,
@@ -774,5 +774,24 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(content_key_hex, content_signer.public_key_hex);
+    }
+
+    #[test]
+    fn test_target_file_info_serialize_roundtrip() {
+        let info = TargetFileInfo {
+            name: "firmware.raw".to_string(),
+            sha256: "ab".repeat(32),
+            size: 1024,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        // Assert the wire keys match what the Connect signing API expects.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["name"], "firmware.raw");
+        assert_eq!(v["sha256"], "ab".repeat(32).as_str());
+        assert_eq!(v["size"], 1024u64);
+        let back: TargetFileInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, info.name);
+        assert_eq!(back.sha256, info.sha256);
+        assert_eq!(back.size, info.size);
     }
 }
