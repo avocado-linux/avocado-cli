@@ -12,6 +12,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: these jobs only check out and build (no GitHub writes). The
+# reusable workflow inherits this cap.
+permissions:
+  contents: read
+
 jobs:
   version:
     name: Resolve version from Cargo.toml
