@@ -43,4 +43,15 @@ cat > .cargo/config.toml << EOF
 rustflags = ["--sysroot=$SDKTARGETSYSROOT/usr", "-C", "link-arg=--sysroot=$SDKTARGETSYSROOT"]
 EOF
 
-cargo build --release --target "$RUST_TARGET"
+# The SDK exports $CC as the cross-compiler command (bare name + target flags +
+# --sysroot), but in the `ext build` environment that compiler binary lives in
+# the SDK target-sysroot bindir, which is not on PATH. Without this, the `cc`
+# crate (pulled in by the remaining C dep aws-lc-sys) can't resolve the compiler
+# from $CC and falls back to guessing "<triple>-gcc", failing with ToolNotFound.
+# Put the SDK compiler bindir on PATH so the build uses exactly the $CC the SDK
+# configured. Arch-agnostic: derived from $SDKTARGETSYSROOT, no hardcoded triple.
+export PATH="$SDKTARGETSYSROOT/usr/bin:$PATH"
+
+# --locked: published builds run from staged package_files; fail loudly on a
+# missing/stale Cargo.lock instead of silently re-resolving dependencies.
+cargo build --locked --release --target "$RUST_TARGET"
