@@ -411,8 +411,7 @@ impl RuntimeDeployCommand {
                 std::fs::write(staging_dir.join("timestamp.json"), &signed.timestamp_json)
                     .context("Failed to write timestamp.json")?;
                 std::fs::write(
-                    delegations_dir
-                        .join(format!("runtime-{}.json", collection.runtime_uuid)),
+                    delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
                     &signed.delegated_targets_json,
                 )
                 .context("Failed to write delegated targets json")?;
@@ -436,10 +435,8 @@ impl RuntimeDeployCommand {
                     );
                 }
 
-                let signing_key_name =
-                    config.get_runtime_signing_key_name(&self.runtime_name);
-                let content_key_name =
-                    config.get_runtime_content_key_name(&self.runtime_name);
+                let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
+                let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
 
                 let mut resolved_signing_key_name = signing_key_name.clone();
                 let signer = match crate::utils::update_signing::resolve_signing_key(
@@ -448,8 +445,7 @@ impl RuntimeDeployCommand {
                     Some(s) => s,
                     None => {
                         // Auto-generate a development signing key for local deploys
-                        let dev_key_name =
-                            crate::utils::signing_keys::ensure_dev_signing_key()?;
+                        let dev_key_name = crate::utils::signing_keys::ensure_dev_signing_key()?;
                         resolved_signing_key_name = Some(dev_key_name.clone());
                         crate::utils::update_signing::resolve_signing_key(Some(&dev_key_name))?
                             .expect("dev signing key was just created")
@@ -484,8 +480,7 @@ impl RuntimeDeployCommand {
                 )
                 .context("Failed to write timestamp.json")?;
                 std::fs::write(
-                    delegations_dir
-                        .join(format!("runtime-{}.json", collection.runtime_uuid)),
+                    delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
                     &repo_metadata.delegated_targets_json,
                 )
                 .context("Failed to write delegated targets json")?;
