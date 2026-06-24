@@ -2,14 +2,15 @@ supported_targets: '*'
 
 extensions:
   avocado-ext-cli:
-    # Version is injected at build time: `AVOCADO_EXT_VERSION=<x> avocado ext package …`
-    # (CI sets it from the release/tag; unset => empty + a warning).
+    # The extension version tracks the packaged program: CI reads it from Cargo.toml
+    # ([package] version) and exports AVOCADO_EXT_VERSION (.github/workflows/ext-release.yml).
+    # Locally: `AVOCADO_EXT_VERSION=<x> avocado ext package …` (unset => empty + a warning).
     version: '{{ env.AVOCADO_EXT_VERSION }}'
     release: r0
     summary: Avocado build system command line interface
     description: Avocado build system command line interface for managing the system
     license: Apache-2.0
-    url: https://github.com/avocadolinux/avocado-cli
+    url: https://github.com/avocado-linux/avocado-cli
     vendor: Avocado Linux <info@avocadolinux.org>
     # Stage the Rust source (the repo root IS the project) plus the packaging
     # artifacts, so `ext package` can compile it. configs/ is required:
@@ -41,7 +42,7 @@ extensions:
         packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}: '*'
 
 sdk:
-  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}-{{ env.AVOCADO_DISTRO_CHANNEL }}
+  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}
 
   compile:
     avocado-cli-compile:
