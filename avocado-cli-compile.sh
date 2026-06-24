@@ -32,8 +32,9 @@ for var in $(env | grep -o 'CARGO_TARGET_[A-Z0-9_]*_RUSTFLAGS'); do
     unset "$var"
 done
 
-# Remove any existing config that might conflict
-rm -rf .cargo
+# Remove only the generated cross-compile config, preserving any committed
+# .cargo files used for development.
+rm -f .cargo/config.toml
 
 # Create config.toml with cross-compilation settings
 mkdir -p .cargo

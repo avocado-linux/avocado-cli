@@ -43,5 +43,4 @@ jobs:
       target:         ${{ matrix.target }}
       distro-release: ${{ matrix.distro-release }}
       distro-channel: ${{ matrix.distro-channel }}
-      repo-url:       ${{ matrix.repo-url }}
       ext-version:    ${{ needs.version.outputs.version }}
