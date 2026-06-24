@@ -205,7 +205,6 @@ struct ServerKeyWrapper {
 // Connect signing types
 // ---------------------------------------------------------------------------
 
-
 #[derive(Debug, Deserialize)]
 pub struct SignForDeployResponse {
     pub targets_json: String,
@@ -1428,10 +1427,7 @@ impl ConnectClient {
         org: &str,
         targets: &[TargetFileInfo],
     ) -> Result<SignForDeployResponse> {
-        let url = format!(
-            "{}/api/orgs/{}/signing/sign-for-deploy",
-            self.api_url, org
-        );
+        let url = format!("{}/api/orgs/{}/signing/sign-for-deploy", self.api_url, org);
 
         let res = self
             .http
