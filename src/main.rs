@@ -441,6 +441,10 @@ enum Commands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Sign TUF metadata via the Connect platform instead of locally.
+        /// Use this when deploying to a device that has received a Connect OTA update.
+        #[arg(long)]
+        connect_sign: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -1782,6 +1786,10 @@ enum RuntimeCommands {
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         dnf_args: Option<Vec<String>>,
+        /// Sign TUF metadata via the Connect platform instead of locally.
+        /// Use this when deploying to a device that has received a Connect OTA update.
+        #[arg(long)]
+        connect_sign: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -2335,6 +2343,7 @@ async fn main() -> Result<()> {
             device,
             container_args,
             dnf_args,
+            connect_sign,
             output,
         } => {
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
@@ -2351,6 +2360,7 @@ async fn main() -> Result<()> {
                 dnf_args,
             )
             .with_no_stamps(cli.no_stamps)
+            .with_connect_sign(connect_sign)
             .with_sdk_arch(cli.sdk_arch.clone());
             deploy_cmd.execute().await?;
             Ok(())
@@ -2657,6 +2667,7 @@ async fn main() -> Result<()> {
                 device,
                 container_args,
                 dnf_args,
+                connect_sign,
                 output,
             } => {
                 let runtime =
@@ -2674,6 +2685,7 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
+                .with_connect_sign(connect_sign)
                 .with_sdk_arch(cli.sdk_arch.clone());
                 deploy_cmd.execute().await?;
                 Ok(())
