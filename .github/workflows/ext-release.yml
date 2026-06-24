@@ -18,6 +18,11 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+-*'
   workflow_dispatch:
 
+# Least privilege: checkout + package + publish-via-PAT only (no GitHub writes).
+# The reusable workflow inherits this cap; the PAT publish path needs nothing more.
+permissions:
+  contents: read
+
 jobs:
   version:
     name: Resolve version from Cargo.toml
