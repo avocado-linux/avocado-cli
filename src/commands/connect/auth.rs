@@ -421,8 +421,9 @@ enum OrgPick {
 ///      but ids are stable, and other `avocado connect` commands accept ids
 ///      only.
 ///   2. If the user has exactly one org, auto-select it.
-///   3. Multiple orgs + JSON output → error (can't prompt non-interactively;
-///      caller must pass `--org`).
+///   3. Multiple orgs + JSON output → auto-select the default (first) org.
+///      Non-interactive callers can't prompt; the first org is the default
+///      by convention and `--org` overrides it.
 ///   4. Multiple orgs + human output → caller must prompt.
 ///   5. Zero orgs → `None` (caller passes no org to exchange; server falls
 ///      back to its default scoping).
@@ -452,10 +453,14 @@ fn pick_org(orgs: Vec<OrgInfo>, org_hint: Option<&str>, output: OutputFormat) ->
         return Ok(OrgPick::Resolved(orgs.into_iter().next().unwrap()));
     }
 
+    // Multiple orgs. Non-interactive callers (JSON output — e.g. Avocado
+    // Desktop) can't answer a prompt, so auto-select the default org. The
+    // first org is the default by convention: the interactive picker lists
+    // it first as the default, and the `--token` login path already
+    // auto-selects `me.organizations.first()` (see `provision_org_token`).
+    // An explicit `--org <id>` (handled above) always overrides.
     if output.is_json() {
-        anyhow::bail!(
-            "multiple organizations available; pass --org <id> for non-interactive login"
-        );
+        return Ok(OrgPick::Resolved(orgs.into_iter().next().unwrap()));
     }
 
     Ok(OrgPick::NeedPrompt(orgs))
@@ -471,6 +476,7 @@ async fn resolve_org_for_login(
     output: OutputFormat,
 ) -> Result<Option<OrgInfo>> {
     let orgs = list_orgs_by_code(base_url, code).await?;
+    let org_count = orgs.len();
 
     match pick_org(orgs, org_hint, output)? {
         OrgPick::None => Ok(None),
@@ -478,7 +484,11 @@ async fn resolve_org_for_login(
             // Only announce auto-select when there was no explicit hint —
             // the user already knows what they chose if they passed --org.
             if org_hint.is_none() {
-                let msg = format!("Auto-selected only available organization: {}", org.name);
+                let msg = if org_count == 1 {
+                    format!("Auto-selected only available organization: {}", org.name)
+                } else {
+                    format!("Auto-selected default organization: {}", org.name)
+                };
                 if output.is_json() {
                     emit_json_event(&serde_json::json!({"event": "info", "message": msg}));
                 } else {
@@ -879,13 +889,17 @@ mod tests {
     }
 
     #[test]
-    fn pick_org_multi_org_json_output_errors_without_hint() {
+    fn pick_org_multi_org_json_output_auto_selects_default() {
+        // Non-interactive (JSON) callers can't be prompted, so the first
+        // org (the default by convention) is auto-selected rather than
+        // erroring. Regression guard for the multi-org desktop login bug.
         let acme = org("uuid-1", "Acme");
         let northwind = org("uuid-2", "Northwind");
-        let result = pick_org(vec![acme, northwind], None, OutputFormat::Json);
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("--org"), "got: {err}");
-        assert!(err.contains("non-interactive"), "got: {err}");
+        let result = pick_org(vec![acme, northwind], None, OutputFormat::Json).unwrap();
+        match result {
+            OrgPick::Resolved(o) => assert_eq!(o.id, "uuid-1"),
+            other => panic!("expected Resolved(default), got {other:?}"),
+        }
     }
 
     #[test]
