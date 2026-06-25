@@ -88,6 +88,10 @@ fn build_base_payload(config_path: &str, cfg: &Config) -> serde_json::Value {
                         "target": r.target,
                         "target_board": r.target_board,
                         "version": r.version,
+                        // Desktop gates "Sign via Connect" on this signal. Resolved
+                        // the same way the deploy nudge does (per-runtime signing key,
+                        // falling back to connect.server_key) so the two agree.
+                        "signing_enabled": cfg.get_server_key_for_runtime(name).is_some(),
                     })
                 })
                 .collect();
@@ -469,6 +473,64 @@ mod tests {
 
     fn yaml(s: &str) -> Value {
         serde_yaml::from_str(s).unwrap()
+    }
+
+    fn config(s: &str) -> Config {
+        serde_yaml::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn base_payload_marks_signing_enabled_per_runtime() {
+        // global-key inherits connect.server_key; own-key sets its own;
+        // the per-runtime resolver (get_server_key_for_runtime) must light
+        // both up so the desktop can gate "Sign via Connect" the same way
+        // the deploy nudge does.
+        let cfg = config(
+            r#"
+connect:
+  org: my-org
+  project: my-proj
+  server_key: deadbeef
+runtimes:
+  global-key:
+    target: qemux86-64
+  own-key:
+    target: qemux86-64
+    signing:
+      server_key: cafe1234
+"#,
+        );
+
+        let payload = build_base_payload("/tmp/avocado.yaml", &cfg);
+        let runtimes = payload["runtimes"].as_array().unwrap();
+
+        let global = runtimes.iter().find(|r| r["name"] == "global-key").unwrap();
+        let own = runtimes.iter().find(|r| r["name"] == "own-key").unwrap();
+        assert_eq!(global["signing_enabled"], true);
+        assert_eq!(own["signing_enabled"], true);
+
+        // Existing connect block is unchanged.
+        assert_eq!(payload["connect"]["org"], "my-org");
+        assert_eq!(payload["connect"]["project"], "my-proj");
+    }
+
+    #[test]
+    fn base_payload_signing_disabled_without_key() {
+        let cfg = config(
+            r#"
+runtimes:
+  no-key:
+    target: qemux86-64
+"#,
+        );
+        let payload = build_base_payload("/tmp/avocado.yaml", &cfg);
+        let no_key = payload["runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "no-key")
+            .unwrap();
+        assert_eq!(no_key["signing_enabled"], false);
     }
 
     #[test]
