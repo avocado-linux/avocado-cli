@@ -359,7 +359,11 @@ impl RuntimeDeployCommand {
 
         // --- Phase 2: Generate and sign TUF metadata ---
         print_info(
-            "Phase 2: Generating signed TUF metadata...",
+            if self.connect_sign {
+                "Phase 2: Signing TUF metadata via Connect..."
+            } else {
+                "Phase 2: Generating signed TUF metadata..."
+            },
             OutputLevel::Normal,
         );
         Self::emit_phase_status(PHASE_METADATA, "running");
