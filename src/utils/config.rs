@@ -4831,6 +4831,37 @@ impl Config {
 
     /// Get extension SDK dependencies from configuration, including nested external extension dependencies and target-specific dependencies
     /// Returns a HashMap where keys are extension names and values are their SDK dependencies
+    /// Merge an extension's per-target `sdk.packages` into `merged_deps`,
+    /// honoring BOTH the preferred `target-<name>:` override key and the legacy
+    /// bare `<name>:` key. This mirrors how runtime `packages:` overrides resolve
+    /// (via `resolve_overrides_in_value`), so a `target-`-keyed `sdk.packages`
+    /// block is not silently dropped when collecting SDK dependencies.
+    fn merge_target_sdk_packages(
+        ext_config_table: &serde_yaml::Mapping,
+        target: &str,
+        merged_deps: &mut HashMap<String, serde_yaml::Value>,
+    ) {
+        // Bare `<name>:` first, then `target-<name>:`, so the preferred prefixed
+        // form wins if both happen to be present.
+        for key in [target.to_string(), format!("target-{target}")] {
+            let Some(deps_table) = ext_config_table
+                .get(key.as_str())
+                .and_then(|s| s.as_mapping())
+                .and_then(|t| t.get("sdk"))
+                .and_then(|s| s.as_mapping())
+                .and_then(|s| s.get("packages"))
+                .and_then(|p| p.as_mapping())
+            else {
+                continue;
+            };
+            for (k, v) in deps_table.iter() {
+                if let Some(key_str) = k.as_str() {
+                    merged_deps.insert(key_str.to_string(), v.clone());
+                }
+            }
+        }
+    }
+
     pub fn get_extension_sdk_dependencies_with_config_path_and_target(
         &self,
         config_content: &str,
@@ -4877,33 +4908,15 @@ impl Config {
                                 }
                             }
 
-                            // Then, if we have a target, collect target-specific dependencies from [extensions.<ext_name>.<target>.sdk.packages]
+                            // Then, if we have a target, merge target-specific SDK
+                            // packages -- honoring both `target-<name>:` and the
+                            // legacy bare `<name>:` override keys.
                             if let Some(target) = target {
-                                if let Some(target_section) = ext_config_table.get(target) {
-                                    if let Some(target_table) = target_section.as_mapping() {
-                                        if let Some(sdk_section) = target_table.get("sdk") {
-                                            if let Some(sdk_table) = sdk_section.as_mapping() {
-                                                if let Some(dependencies) =
-                                                    sdk_table.get("packages")
-                                                {
-                                                    if let Some(deps_table) =
-                                                        dependencies.as_mapping()
-                                                    {
-                                                        // Target-specific dependencies override base dependencies
-                                                        for (k, v) in deps_table.iter() {
-                                                            if let Some(key_str) = k.as_str() {
-                                                                merged_deps.insert(
-                                                                    key_str.to_string(),
-                                                                    v.clone(),
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                Self::merge_target_sdk_packages(
+                                    ext_config_table,
+                                    target,
+                                    &mut merged_deps,
+                                );
                             }
 
                             // Add the merged dependencies if any exist
@@ -5068,40 +5081,16 @@ impl Config {
                                                                 }
                                                             }
 
-                                                            // Then, if we have a target, collect target-specific dependencies from [extensions.<ext_name>.<target>.sdk.packages]
+                                                            // Then, if we have a target, merge
+                                                            // target-specific SDK packages --
+                                                            // honoring both `target-<name>:` and
+                                                            // the legacy bare `<name>:` keys.
                                                             if let Some(target) = target {
-                                                                if let Some(target_section) =
-                                                                    external_ext_config_table
-                                                                        .get(target)
-                                                                {
-                                                                    if let Some(target_table) =
-                                                                        target_section.as_mapping()
-                                                                    {
-                                                                        if let Some(sdk_section) =
-                                                                            target_table.get("sdk")
-                                                                        {
-                                                                            if let Some(sdk_table) =
-                                                                                sdk_section
-                                                                                    .as_mapping()
-                                                                            {
-                                                                                if let Some(
-                                                                                    dependencies,
-                                                                                ) = sdk_table
-                                                                                    .get("packages")
-                                                                                {
-                                                                                    if let Some(deps_table) = dependencies.as_mapping() {
-                                                                                        // Target-specific dependencies override base dependencies
-                                                                                        for (k, v) in deps_table.iter() {
-                                                                                            if let Some(key_str) = k.as_str() {
-                                                                                                merged_deps.insert(key_str.to_string(), v.clone());
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
+                                                                Self::merge_target_sdk_packages(
+                                                                    external_ext_config_table,
+                                                                    target,
+                                                                    &mut merged_deps,
+                                                                );
                                                             }
 
                                                             // Add the merged dependencies if any exist
@@ -5909,6 +5898,60 @@ extensions:
         );
         assert_eq!(
             another_ext_arm.get("nativesdk-arm-tool").unwrap().as_str(),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn test_extension_sdk_dependencies_target_prefix() {
+        // The preferred `target-<name>:` override key must be honored for
+        // `sdk.packages`, the same as the legacy bare `<name>:` key. Regression
+        // test: the SDK collectors previously matched only the bare key, so
+        // `target-`-keyed sdk packages were silently dropped.
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:apollo-edge"
+
+extensions:
+  avocado-ext-imx-npu:
+    types:
+      - sysext
+    sdk:
+      packages:
+        nativesdk-uv: "*"
+    target-imx93-frdm:
+      sdk:
+        packages:
+          nativesdk-ethos-u-vela: "*"
+"#;
+
+        let config = Config::load_from_yaml_str(config_content).unwrap();
+
+        // A non-matching target gets the base sdk packages only.
+        let deps_other = config
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                config_content,
+                None,
+                Some("imx8mp-evk"),
+            )
+            .unwrap();
+        let npu_other = deps_other.get("avocado-ext-imx-npu").unwrap();
+        assert_eq!(npu_other.len(), 1);
+        assert!(npu_other.get("nativesdk-ethos-u-vela").is_none());
+
+        // The matching target merges base + `target-<name>:` sdk packages.
+        let deps_93 = config
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                config_content,
+                None,
+                Some("imx93-frdm"),
+            )
+            .unwrap();
+        let npu_93 = deps_93.get("avocado-ext-imx-npu").unwrap();
+        assert_eq!(npu_93.len(), 2);
+        assert_eq!(npu_93.get("nativesdk-uv").unwrap().as_str(), Some("*"));
+        assert_eq!(
+            npu_93.get("nativesdk-ethos-u-vela").unwrap().as_str(),
             Some("*")
         );
     }
