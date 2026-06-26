@@ -1,3 +1,4 @@
+use crate::commands::connect::client::{self as connect_client, ConnectClient};
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{is_docker_desktop, is_vm_routing_active, RunConfig, SdkContainer},
@@ -82,6 +83,7 @@ pub struct RuntimeDeployCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    connect_sign: bool,
     sdk_arch: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
@@ -114,6 +116,7 @@ impl RuntimeDeployCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            connect_sign: false,
             sdk_arch: None,
             composed_config: None,
         }
@@ -122,6 +125,12 @@ impl RuntimeDeployCommand {
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Route Phase 2 TUF metadata signing through the Connect platform
+    pub fn with_connect_sign(mut self, connect_sign: bool) -> Self {
+        self.connect_sign = connect_sign;
         self
     }
 
@@ -350,7 +359,11 @@ impl RuntimeDeployCommand {
 
         // --- Phase 2: Generate and sign TUF metadata ---
         print_info(
-            "Phase 2: Generating signed TUF metadata...",
+            if self.connect_sign {
+                "Phase 2: Signing TUF metadata via Connect..."
+            } else {
+                "Phase 2: Generating signed TUF metadata..."
+            },
             OutputLevel::Normal,
         );
         Self::emit_phase_status(PHASE_METADATA, "running");
@@ -360,40 +373,11 @@ impl RuntimeDeployCommand {
             .unwrap_or(std::path::Path::new("."));
         let staging_dir = project_dir.join(DEPLOY_STAGING_DIR);
 
+        let delegations_dir = staging_dir.join("delegations");
         // Group all metadata work in a single fallible block so any
         // failure is attributed to PHASE_METADATA without wrapping every
         // `?` site individually.
-        let metadata_result: Result<()> = (|| {
-            let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
-            let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
-
-            let mut resolved_signing_key_name = signing_key_name.clone();
-            let signer = match crate::utils::update_signing::resolve_signing_key(
-                signing_key_name.as_deref(),
-            )? {
-                Some(s) => s,
-                None => {
-                    // Auto-generate a development signing key for local deploys
-                    let dev_key_name = crate::utils::signing_keys::ensure_dev_signing_key()?;
-                    resolved_signing_key_name = Some(dev_key_name.clone());
-                    crate::utils::update_signing::resolve_signing_key(Some(&dev_key_name))?
-                        .expect("dev signing key was just created")
-                }
-            };
-            let content_signer = crate::utils::update_signing::resolve_content_key(
-                content_key_name.as_deref(),
-                resolved_signing_key_name.as_deref(),
-            )?
-            .expect("signing key is set, so content key resolution should return Some");
-
-            let repo_metadata = update_repo::generate_repo_metadata(
-                &collection.targets,
-                &collection.runtime_uuid,
-                &signer,
-                &content_signer,
-            )?;
-
-            let delegations_dir = staging_dir.join("delegations");
+        let metadata_result: Result<()> = async {
             std::fs::create_dir_all(&delegations_dir).with_context(|| {
                 format!(
                     "Failed to create deploy staging directory: {}",
@@ -401,32 +385,117 @@ impl RuntimeDeployCommand {
                 )
             })?;
 
-            std::fs::write(
-                staging_dir.join("targets.json"),
-                &repo_metadata.targets_json,
-            )
-            .context("Failed to write targets.json")?;
-            std::fs::write(
-                staging_dir.join("snapshot.json"),
-                &repo_metadata.snapshot_json,
-            )
-            .context("Failed to write snapshot.json")?;
-            std::fs::write(
-                staging_dir.join("timestamp.json"),
-                &repo_metadata.timestamp_json,
-            )
-            .context("Failed to write timestamp.json")?;
+            if self.connect_sign {
+                // Route Phase 2 through the Connect signing endpoint.
+                let connect_config = connect_client::load_config()?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--connect-sign requires an active Connect session. \
+                         Run `avocado connect auth login` first."
+                    )
+                })?;
+                let org_hint = config.connect.as_ref().and_then(|c| c.org.as_deref());
+                let (_, profile) = connect_config.resolve_profile(None, org_hint)?;
+                let org = org_hint
+                    .map(str::to_owned)
+                    .or_else(|| profile.organization_id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--connect-sign requires a Connect org. Set `connect.org` in \
+                             avocado.yaml, or authenticate with an org-associated account."
+                        )
+                    })?;
+                let client = ConnectClient::from_profile(profile)?;
+
+                let signed = client.sign_for_deploy(&org, &collection.targets).await?;
+
+                std::fs::write(staging_dir.join("targets.json"), &signed.targets_json)
+                    .context("Failed to write targets.json")?;
+                std::fs::write(staging_dir.join("snapshot.json"), &signed.snapshot_json)
+                    .context("Failed to write snapshot.json")?;
+                std::fs::write(staging_dir.join("timestamp.json"), &signed.timestamp_json)
+                    .context("Failed to write timestamp.json")?;
+                std::fs::write(
+                    delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
+                    &signed.delegated_targets_json,
+                )
+                .context("Failed to write delegated targets json")?;
+
+                print_info(
+                    "Connect-signed metadata expires after 7 days. \
+                     Re-run `avocado deploy --connect-sign` to refresh.",
+                    OutputLevel::Normal,
+                );
+            } else {
+                // Default: sign locally with the project or dev key.
+                if config
+                    .get_server_key_for_runtime(&self.runtime_name)
+                    .is_some()
+                {
+                    print_warning(
+                        "This project has a Connect server key configured. \
+                         A locally-signed deploy may be rejected by a device that has \
+                         received a Connect OTA update. Use `--connect-sign` to sign via Connect.",
+                        OutputLevel::Normal,
+                    );
+                }
+
+                let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
+                let content_key_name = config.get_runtime_content_key_name(&self.runtime_name);
+
+                let mut resolved_signing_key_name = signing_key_name.clone();
+                let signer = match crate::utils::update_signing::resolve_signing_key(
+                    signing_key_name.as_deref(),
+                )? {
+                    Some(s) => s,
+                    None => {
+                        // Auto-generate a development signing key for local deploys
+                        let dev_key_name = crate::utils::signing_keys::ensure_dev_signing_key()?;
+                        resolved_signing_key_name = Some(dev_key_name.clone());
+                        crate::utils::update_signing::resolve_signing_key(Some(&dev_key_name))?
+                            .expect("dev signing key was just created")
+                    }
+                };
+                let content_signer = crate::utils::update_signing::resolve_content_key(
+                    content_key_name.as_deref(),
+                    resolved_signing_key_name.as_deref(),
+                )?
+                .expect("signing key is set, so content key resolution should return Some");
+
+                let repo_metadata = update_repo::generate_repo_metadata(
+                    &collection.targets,
+                    &collection.runtime_uuid,
+                    &signer,
+                    &content_signer,
+                )?;
+
+                std::fs::write(
+                    staging_dir.join("targets.json"),
+                    &repo_metadata.targets_json,
+                )
+                .context("Failed to write targets.json")?;
+                std::fs::write(
+                    staging_dir.join("snapshot.json"),
+                    &repo_metadata.snapshot_json,
+                )
+                .context("Failed to write snapshot.json")?;
+                std::fs::write(
+                    staging_dir.join("timestamp.json"),
+                    &repo_metadata.timestamp_json,
+                )
+                .context("Failed to write timestamp.json")?;
+                std::fs::write(
+                    delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
+                    &repo_metadata.delegated_targets_json,
+                )
+                .context("Failed to write delegated targets json")?;
+            }
             if let Some(root_json) = &collection.root_json {
                 std::fs::write(staging_dir.join("root.json"), root_json)
                     .context("Failed to write root.json to staging")?;
             }
-            std::fs::write(
-                delegations_dir.join(format!("runtime-{}.json", collection.runtime_uuid)),
-                &repo_metadata.delegated_targets_json,
-            )
-            .context("Failed to write delegated targets json")?;
             Ok(())
-        })();
+        }
+        .await;
 
         if let Err(e) = metadata_result {
             Self::emit_phase_error(PHASE_METADATA, &e.to_string());
@@ -1407,5 +1476,36 @@ mod tests {
         let before = args.clone();
         strip_host_network_args(&mut args);
         assert_eq!(args, before);
+    }
+
+    // --- connect-sign builder and nudge ---
+
+    #[test]
+    fn test_connect_sign_default_false() {
+        let cmd = RuntimeDeployCommand::new(
+            "my-runtime".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            "192.168.1.1".to_string(),
+            None,
+            None,
+        );
+        assert!(!cmd.connect_sign);
+    }
+
+    #[test]
+    fn test_with_connect_sign_sets_flag() {
+        let cmd = RuntimeDeployCommand::new(
+            "my-runtime".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            "192.168.1.1".to_string(),
+            None,
+            None,
+        )
+        .with_connect_sign(true);
+        assert!(cmd.connect_sign);
     }
 }
