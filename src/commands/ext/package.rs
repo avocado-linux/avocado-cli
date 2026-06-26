@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -568,6 +569,55 @@ impl ExtPackageCommand {
             _ => "Provides: avocado-target(*)".to_string(),
         };
 
+        // Resolve package-time-only fields in the avocado.yaml that ships in the
+        // package payload. Today that is just `version`: the in-source program
+        // extensions declare `version: '{{ env.AVOCADO_EXT_VERSION }}'` so the
+        // packaged version tracks Cargo.toml, but that template only resolves
+        // while AVOCADO_EXT_VERSION is set (package time). If it survives into the
+        // published package, a downstream runtime build — which has no such env in
+        // scope — interpolates it to '' and fails semver validation. We bake just
+        // the resolved value (`metadata.version`, already interpolated + validated)
+        // and leave every other template (e.g. `{{ avocado.target }}`,
+        // `{{ env.AVOCADO_DISTRO_RELEASE }}`) for the consumer to resolve at their
+        // build time. Additional required fields can be folded in here later.
+        let version_bake_section = {
+            let cfg_basename = std::path::Path::new(ext_config_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "avocado.yaml".to_string());
+            match fs::read_to_string(ext_config_path) {
+                Ok(text) => {
+                    let baked = bake_extension_version(&text, &self.extension, &metadata.version)
+                        .with_context(|| {
+                        format!(
+                            "Failed to bake resolved version '{}' into the packaged \
+                                     config for extension '{}'",
+                            metadata.version, self.extension
+                        )
+                    })?;
+                    let b64 = BASE64_STANDARD.encode(baked.as_bytes());
+                    format!(
+                        r#"
+# Bake the resolved extension version into the packaged config so the published
+# avocado.yaml carries a concrete semver instead of an env-only template that
+# would interpolate to '' during a downstream runtime build.
+if [ -f "$STAGING_DIR/{basename}" ]; then
+    printf '%s' '{b64}' | base64 -d > "$STAGING_DIR/{basename}"
+    echo "Baked resolved version '{version}' into {basename}"
+fi
+"#,
+                        basename = cfg_basename,
+                        b64 = b64,
+                        version = metadata.version,
+                    )
+                }
+                // Remote/unreadable source (e.g. packaging a fetched remote ext
+                // whose config lives in the container volume): leave the payload
+                // untouched rather than fail the package.
+                Err(_) => String::new(),
+            }
+        };
+
         // Create RPM using rpmbuild in container
         // Package root (/) maps to the extension's src_dir contents
         let rpm_build_script = format!(
@@ -630,7 +680,7 @@ for pattern in $PACKAGE_FILES; do
     done
 done
 cd "$TMPDIR"
-
+{version_bake_section}
 echo "Creating RPM with $FILE_COUNT files from source directory..."
 
 if [ "$FILE_COUNT" -eq 0 ]; then
@@ -722,6 +772,7 @@ rm -rf "$TMPDIR"
             rpm_filename = rpm_filename,
             container_src_dir = container_src_dir,
             package_files_str = package_files_str,
+            version_bake_section = version_bake_section,
         );
 
         // Run the RPM build in the container
@@ -893,6 +944,98 @@ rm -rf "$TMPDIR"
     }
 }
 
+/// Rewrite `extensions.<ext_name>.version` in an avocado.yaml document to a
+/// concrete, resolved `version`, preserving the rest of the file verbatim —
+/// comments and every other templated value stay intact.
+///
+/// This is the package-time resolution of a "required field": the in-source
+/// program extensions declare `version: '{{ env.AVOCADO_EXT_VERSION }}'` so the
+/// packaged version tracks Cargo.toml, but that template only resolves while the
+/// env var is set. Baking the resolved value makes the published config
+/// self-contained while leaving other templates (e.g. `{{ avocado.target }}`)
+/// for the consumer to resolve at their build time.
+///
+/// A deliberate line-scoped edit rather than a serde round-trip: round-tripping
+/// would drop comments and could re-quote/normalize the surviving template
+/// strings. Only the `version:` key that is a direct child of the named
+/// extension is touched (a nested `version:` under, say, `packages:` is left
+/// alone). Returns an error if that key can't be located — the caller has
+/// already proven a valid version exists, so a miss means an unexpected layout.
+fn bake_extension_version(text: &str, ext_name: &str, version: &str) -> Result<String> {
+    // Key portion of a `key: value` line (handles optional quoting of the key).
+    fn line_key(trimmed: &str) -> &str {
+        trimmed
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count() + 1);
+    let mut in_extensions = false; // inside the top-level `extensions:` map
+    let mut ext_indent: Option<usize> = None; // indent of the `<ext_name>:` key
+    let mut child_indent: Option<usize> = None; // indent of the ext's direct children
+    let mut replaced = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        // Blank/comment lines are kept verbatim and don't affect block tracking.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+
+        // A line at or above the extension key's indent ends the ext block; a
+        // top-level line also toggles whether we're inside `extensions:`. Fall
+        // through so the same line can re-open a sibling extension block.
+        if let Some(ei) = ext_indent {
+            if indent <= ei {
+                ext_indent = None;
+                child_indent = None;
+            }
+        }
+
+        if indent == 0 {
+            in_extensions = trimmed.starts_with("extensions:");
+            out.push(line.to_string());
+            continue;
+        }
+
+        if in_extensions && ext_indent.is_none() {
+            if line_key(trimmed) == ext_name {
+                ext_indent = Some(indent);
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        if ext_indent.is_some() {
+            // Inside the ext block. The first child line fixes the direct-child
+            // indent; only a `version:` at that exact indent is the field we bake.
+            let ci = *child_indent.get_or_insert(indent);
+            if !replaced && indent == ci && line_key(trimmed) == "version" {
+                out.push(format!("{}version: '{version}'", " ".repeat(indent)));
+                replaced = true;
+                continue;
+            }
+        }
+
+        out.push(line.to_string());
+    }
+
+    if !replaced {
+        anyhow::bail!("could not locate `version:` for extension '{ext_name}' in its avocado.yaml");
+    }
+
+    let mut result = out.join("\n");
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
 /// RPM metadata structure
 #[derive(Debug)]
 struct RpmMetadata {
@@ -911,6 +1054,72 @@ struct RpmMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bake_extension_version_replaces_only_version_keeps_other_templates() {
+        let src = "supported_targets: '*'\n\
+extensions:\n  \
+  avocado-ext-cli:\n    \
+    # tracks Cargo.toml at package time\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n    \
+    release: r0\n    \
+    sdk:\n      \
+      packages:\n        \
+        packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}: '*'\n\
+sdk:\n  \
+  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}\n";
+
+        let out = bake_extension_version(src, "avocado-ext-cli", "1.2.3").unwrap();
+
+        // The version field is resolved...
+        assert!(out.contains("    version: '1.2.3'"));
+        assert!(!out.contains("AVOCADO_EXT_VERSION"));
+        // ...the explanatory comment is preserved...
+        assert!(out.contains("# tracks Cargo.toml at package time"));
+        // ...and every other template is left for the consumer to resolve.
+        assert!(out.contains("packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}"));
+        assert!(out.contains("docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_bake_extension_version_ignores_nested_version_keys() {
+        // A `version:` nested under packages must NOT be mistaken for the field.
+        let src = "extensions:\n  \
+  my-ext:\n    \
+    packages:\n      \
+      some-dep:\n        \
+        version: '9.9.9'\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
+
+        let out = bake_extension_version(src, "my-ext", "0.4.0").unwrap();
+        assert!(out.contains("        version: '9.9.9'")); // nested untouched
+        assert!(out.contains("    version: '0.4.0'")); // direct child baked
+    }
+
+    #[test]
+    fn test_bake_extension_version_only_named_extension() {
+        let src = "extensions:\n  \
+  ext-a:\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n  \
+  ext-b:\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
+
+        let out = bake_extension_version(src, "ext-b", "2.0.0").unwrap();
+        // ext-a's template is preserved; only ext-b is baked.
+        let a_idx = out.find("ext-a:").unwrap();
+        let b_idx = out.find("ext-b:").unwrap();
+        assert!(out[a_idx..b_idx].contains("'{{ env.AVOCADO_EXT_VERSION }}'"));
+        assert!(out[b_idx..].contains("version: '2.0.0'"));
+        assert!(!out[b_idx..].contains("AVOCADO_EXT_VERSION"));
+    }
+
+    #[test]
+    fn test_bake_extension_version_errors_when_absent() {
+        let src = "extensions:\n  my-ext:\n    release: r0\n";
+        let err = bake_extension_version(src, "my-ext", "1.0.0").unwrap_err();
+        assert!(err.to_string().contains("could not locate `version:`"));
+    }
 
     #[test]
     fn test_generate_summary_from_name() {
