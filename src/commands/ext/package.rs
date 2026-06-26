@@ -587,15 +587,14 @@ impl ExtPackageCommand {
                 .unwrap_or_else(|| "avocado.yaml".to_string());
             match fs::read_to_string(ext_config_path) {
                 Ok(text) => {
-                    let baked =
-                        bake_extension_version(&text, &self.extension, &metadata.version)
-                            .with_context(|| {
-                                format!(
-                                    "Failed to bake resolved version '{}' into the packaged \
+                    let baked = bake_extension_version(&text, &self.extension, &metadata.version)
+                        .with_context(|| {
+                        format!(
+                            "Failed to bake resolved version '{}' into the packaged \
                                      config for extension '{}'",
-                                    metadata.version, self.extension
-                                )
-                            })?;
+                            metadata.version, self.extension
+                        )
+                    })?;
                     let b64 = BASE64_STANDARD.encode(baked.as_bytes());
                     format!(
                         r#"
@@ -1027,9 +1026,7 @@ fn bake_extension_version(text: &str, ext_name: &str, version: &str) -> Result<S
     }
 
     if !replaced {
-        anyhow::bail!(
-            "could not locate `version:` for extension '{ext_name}' in its avocado.yaml"
-        );
+        anyhow::bail!("could not locate `version:` for extension '{ext_name}' in its avocado.yaml");
     }
 
     let mut result = out.join("\n");
