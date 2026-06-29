@@ -1197,9 +1197,272 @@ fn scope_label(scope: &PackageScope) -> String {
     }
 }
 
+/// Rewrite `extensions.<ext_name>.version` in an avocado.yaml document to a
+/// concrete, resolved `version`, preserving the rest of the file verbatim —
+/// comments and every other templated value stay intact.
+///
+/// This is the package-time resolution of a "required field": the in-source
+/// program extensions declare `version: '{{ env.AVOCADO_EXT_VERSION }}'` so the
+/// packaged version tracks Cargo.toml, but that template only resolves while the
+/// env var is set. Baking the resolved value makes the published config
+/// self-contained while leaving other templates (e.g. `{{ avocado.target }}`)
+/// for the consumer to resolve at their build time.
+///
+/// A deliberate line-scoped edit rather than a serde round-trip: round-tripping
+/// would drop comments and could re-quote/normalize the surviving template
+/// strings.
+///
+/// Matching mirrors [`super::find_ext_in_mapping`] — the extension key is
+/// matched directly *and* via `{{ avocado.target }}` interpolation, so a
+/// template-keyed extension (e.g. `avocado-bsp-{{ avocado.target }}`) resolves
+/// the same way the merged config that produced `version` did. The resolved
+/// value is baked into:
+///   - the extension's direct-child `version:` (inserted if absent — e.g. when
+///     the merged version originated from a `target-<name>:` override block), and
+///   - any `version:` that is a direct child of a `target-*:` / `kernel-*:`
+///     override sub-block of the extension (so a surviving template there can't
+///     interpolate to `''` downstream).
+///
+/// A `version:` nested deeper (e.g. under `packages:`) is left untouched.
+///
+/// Errors only if the extension block itself can't be located, which means the
+/// raw text doesn't match the merged config the caller already resolved against.
+pub fn bake_extension_version(
+    text: &str,
+    ext_name: &str,
+    target: &str,
+    version: &str,
+) -> Result<String> {
+    use crate::utils::interpolation::interpolate_name;
+
+    let lines: Vec<&str> = text.lines().collect();
+    let extensions_idx = find_top_level_key(&lines, "extensions").with_context(|| {
+        format!("could not locate `extensions:` block while baking version for '{ext_name}'")
+    })?;
+
+    // Does a top-level `extensions:` child key name `ext_name`, directly or
+    // after `{{ avocado.target }}` interpolation? (Same rule as find_ext_in_mapping.)
+    let key_matches = |key: &str| -> bool {
+        key == ext_name || (key.contains("{{") && interpolate_name(key, target) == ext_name)
+    };
+
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+
+    // Walk the extension block. Indents: 0 = top level, `ext_indent` = the
+    // matched extension key, `child_indent` = its direct children, and a
+    // `target-*`/`kernel-*` direct child opens an override sub-block whose own
+    // direct children we also bake.
+    let mut ext_key_idx: Option<usize> = None;
+    let mut ext_indent = 0usize;
+    let mut child_indent: Option<usize> = None;
+    let mut baked_direct = false;
+    let mut in_extensions = false;
+    let mut in_override = false; // current direct child is a target-/kernel- block
+    let mut override_child_indent: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(line);
+
+        // Before we've matched the extension, just track whether we're inside
+        // `extensions:` and look for the matching key at any depth-1 child.
+        if ext_key_idx.is_none() {
+            if indent == 0 {
+                in_extensions = i == extensions_idx;
+                continue;
+            }
+            if in_extensions {
+                if let Some(key) = extract_package_name(line) {
+                    if key_matches(&key) {
+                        ext_key_idx = Some(i);
+                        ext_indent = indent;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // We're past the matched extension key. The block ends at the first
+        // line indented at or above the extension key itself.
+        if indent <= ext_indent {
+            break;
+        }
+
+        let ci = *child_indent.get_or_insert(indent);
+        let key = extract_package_name(line);
+
+        if indent == ci {
+            // Direct child of the extension.
+            in_override = key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("target-") || k.starts_with("kernel-"));
+            override_child_indent = None;
+            if key.as_deref() == Some("version") {
+                out[i] = format!("{}version: '{version}'", " ".repeat(indent));
+                baked_direct = true;
+            }
+        } else if in_override {
+            // Inside a target-/kernel- override block; bake only its direct
+            // `version:` child (not anything nested deeper, e.g. its packages).
+            let oci = *override_child_indent.get_or_insert(indent);
+            if indent == oci && key.as_deref() == Some("version") {
+                out[i] = format!("{}version: '{version}'", " ".repeat(indent));
+            }
+        }
+        // Any other line (deeper non-override nesting, e.g. packages.*.version)
+        // is left exactly as-is.
+    }
+
+    let ext_key_idx = ext_key_idx.with_context(|| {
+        format!("could not locate extension '{ext_name}' in the packaged avocado.yaml")
+    })?;
+
+    // No direct-child `version:` existed (e.g. the merged version came solely
+    // from a `target-<name>:` block). Insert a concrete one so the published
+    // config always carries a base version instead of relying on an override.
+    if !baked_direct {
+        let indent = child_indent.unwrap_or(ext_indent + 2);
+        out.insert(
+            ext_key_idx + 1,
+            format!("{}version: '{version}'", " ".repeat(indent)),
+        );
+    }
+
+    let mut result = out.join("\n");
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bake_extension_version_replaces_only_version_keeps_other_templates() {
+        let src = "supported_targets: '*'\n\
+extensions:\n  \
+  avocado-ext-cli:\n    \
+    # tracks Cargo.toml at package time\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n    \
+    release: r0\n    \
+    sdk:\n      \
+      packages:\n        \
+        packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}: '*'\n\
+sdk:\n  \
+  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}\n";
+
+        let out = bake_extension_version(src, "avocado-ext-cli", "qemux86-64", "1.2.3").unwrap();
+
+        // The version field is resolved...
+        assert!(out.contains("    version: '1.2.3'"));
+        assert!(!out.contains("AVOCADO_EXT_VERSION"));
+        // ...the explanatory comment is preserved...
+        assert!(out.contains("# tracks Cargo.toml at package time"));
+        // ...and every other template is left for the consumer to resolve.
+        assert!(out.contains("packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}"));
+        assert!(out.contains("docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_bake_extension_version_ignores_nested_version_keys() {
+        // A `version:` nested under packages must NOT be mistaken for the field.
+        let src = "extensions:\n  \
+  my-ext:\n    \
+    packages:\n      \
+      some-dep:\n        \
+        version: '9.9.9'\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
+
+        let out = bake_extension_version(src, "my-ext", "qemux86-64", "0.4.0").unwrap();
+        assert!(out.contains("        version: '9.9.9'")); // nested untouched
+        assert!(out.contains("    version: '0.4.0'")); // direct child baked
+    }
+
+    #[test]
+    fn test_bake_extension_version_only_named_extension() {
+        let src = "extensions:\n  \
+  ext-a:\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n  \
+  ext-b:\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
+
+        let out = bake_extension_version(src, "ext-b", "qemux86-64", "2.0.0").unwrap();
+        // ext-a's template is preserved; only ext-b is baked.
+        let a_idx = out.find("ext-a:").unwrap();
+        let b_idx = out.find("ext-b:").unwrap();
+        assert!(out[a_idx..b_idx].contains("'{{ env.AVOCADO_EXT_VERSION }}'"));
+        assert!(out[b_idx..].contains("version: '2.0.0'"));
+        assert!(!out[b_idx..].contains("AVOCADO_EXT_VERSION"));
+    }
+
+    #[test]
+    fn test_bake_extension_version_errors_when_extension_absent() {
+        let src = "extensions:\n  other-ext:\n    version: '1.0.0'\n";
+        let err = bake_extension_version(src, "my-ext", "qemux86-64", "1.0.0").unwrap_err();
+        assert!(err.to_string().contains("locate extension 'my-ext'"));
+    }
+
+    #[test]
+    fn test_bake_extension_version_matches_template_keyed_extension() {
+        // The on-disk key is a `{{ avocado.target }}` template; the resolved
+        // extension name is what `ext package` operates on. Literal comparison
+        // would never match and would have hard-failed before.
+        let src = "extensions:\n  \
+  avocado-bsp-{{ avocado.target }}:\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n    \
+    release: r0\n";
+
+        let out = bake_extension_version(src, "avocado-bsp-raspberrypi5", "raspberrypi5", "3.1.4")
+            .unwrap();
+        // The template key itself is preserved; only its version is baked.
+        assert!(out.contains("avocado-bsp-{{ avocado.target }}:"));
+        assert!(out.contains("    version: '3.1.4'"));
+        assert!(!out.contains("AVOCADO_EXT_VERSION"));
+    }
+
+    #[test]
+    fn test_bake_extension_version_inserts_when_only_in_target_block() {
+        // The merged version originated from a `target-<name>:` override and
+        // there is no direct-child `version:`. We bake the override's version
+        // AND insert a concrete base version so the published config is
+        // self-contained for every target.
+        let src = "extensions:\n  \
+  my-ext:\n    \
+    release: r0\n    \
+    target-imx8mp:\n      \
+      version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
+
+        let out = bake_extension_version(src, "my-ext", "imx8mp", "1.5.0").unwrap();
+        // Override-block template is resolved...
+        assert!(out.contains("      version: '1.5.0'"));
+        // ...and a base version is inserted as a direct child.
+        let ext_idx = out.find("my-ext:").unwrap();
+        let target_idx = out.find("target-imx8mp:").unwrap();
+        assert!(out[ext_idx..target_idx].contains("    version: '1.5.0'"));
+        assert!(!out.contains("AVOCADO_EXT_VERSION"));
+    }
+
+    #[test]
+    fn test_bake_extension_version_bakes_base_and_target_block() {
+        // Both a base template and a target-block template exist: bake both so
+        // neither survives to interpolate to '' downstream (the half-bake case).
+        let src = "extensions:\n  \
+  my-ext:\n    \
+    version: '{{ env.AVOCADO_EXT_VERSION }}'\n    \
+    target-imx8mp:\n      \
+      version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
+
+        let out = bake_extension_version(src, "my-ext", "imx8mp", "2.2.2").unwrap();
+        assert!(!out.contains("AVOCADO_EXT_VERSION"));
+        assert!(out.contains("    version: '2.2.2'")); // base
+        assert!(out.contains("      version: '2.2.2'")); // target block
+    }
 
     const SAMPLE_CONFIG: &str = r#"default_target: "qemux86-64"
 

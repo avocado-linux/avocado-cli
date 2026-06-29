@@ -143,6 +143,14 @@ impl ExtPackageCommand {
             }
         };
 
+        // On-disk config filename (avocado.yaml or avocado.yml). Used both for the
+        // default packaged config and for the version bake so a `.yml` ext stages
+        // and bakes under its real name rather than a hardcoded `avocado.yaml`.
+        let cfg_basename = std::path::Path::new(&ext_config_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "avocado.yaml".to_string());
+
         if self.verbose {
             match &extension_location {
                 ExtensionLocation::Local { name, config_path } => {
@@ -207,7 +215,8 @@ impl ExtPackageCommand {
         // Determine which files to package
         // Pass both merged config (for package_files), raw config (for all target overlays),
         // and full parsed config (for sdk.compile scripts)
-        let package_files = self.get_package_files(&ext_config, raw_ext_config.as_ref(), parsed);
+        let package_files =
+            self.get_package_files(&ext_config, raw_ext_config.as_ref(), parsed, &cfg_basename);
 
         if self.verbose {
             print_info(
@@ -232,6 +241,7 @@ impl ExtPackageCommand {
                 &target,
                 &ext_config_path,
                 &package_files,
+                &cfg_basename,
             )
             .await?;
 
@@ -306,6 +316,7 @@ impl ExtPackageCommand {
         ext_config: &serde_yaml::Value,
         raw_ext_config: Option<&serde_yaml::Value>,
         full_parsed_config: &serde_yaml::Value,
+        cfg_basename: &str,
     ) -> Vec<String> {
         // Check if package_files is explicitly defined
         if let Some(package_files) = ext_config.get("package_files") {
@@ -320,8 +331,10 @@ impl ExtPackageCommand {
             }
         }
 
-        // Default behavior: avocado.yaml + overlays + compile scripts + install scripts
-        let mut default_files = vec!["avocado.yaml".to_string()];
+        // Default behavior: the config file + overlays + compile scripts + install
+        // scripts. Use the actual on-disk config name so an `avocado.yml` ext is
+        // staged (and later baked) under its real name.
+        let mut default_files = vec![cfg_basename.to_string()];
         let mut seen_files = std::collections::HashSet::new();
 
         // If we have the raw extension config, scan for all overlays
@@ -519,6 +532,7 @@ impl ExtPackageCommand {
         target: &str,
         ext_config_path: &str,
         package_files: &[String],
+        cfg_basename: &str,
     ) -> Result<PathBuf> {
         let container_image = config
             .get_sdk_image()
@@ -581,14 +595,15 @@ impl ExtPackageCommand {
         // `{{ env.AVOCADO_DISTRO_RELEASE }}`) for the consumer to resolve at their
         // build time. Additional required fields can be folded in here later.
         let version_bake_section = {
-            let cfg_basename = std::path::Path::new(ext_config_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "avocado.yaml".to_string());
             match fs::read_to_string(ext_config_path) {
                 Ok(text) => {
-                    let baked = bake_extension_version(&text, &self.extension, &metadata.version)
-                        .with_context(|| {
+                    let baked = crate::utils::config_edit::bake_extension_version(
+                        &text,
+                        &self.extension,
+                        target,
+                        &metadata.version,
+                    )
+                    .with_context(|| {
                         format!(
                             "Failed to bake resolved version '{}' into the packaged \
                                      config for extension '{}'",
@@ -596,6 +611,9 @@ impl ExtPackageCommand {
                         )
                     })?;
                     let b64 = BASE64_STANDARD.encode(baked.as_bytes());
+                    // The resolved version is baked into the base64 payload only;
+                    // it is never interpolated into the shell, so a version string
+                    // carrying pre-release/build metadata can't reach the command line.
                     format!(
                         r#"
 # Bake the resolved extension version into the packaged config so the published
@@ -603,12 +621,11 @@ impl ExtPackageCommand {
 # would interpolate to '' during a downstream runtime build.
 if [ -f "$STAGING_DIR/{basename}" ]; then
     printf '%s' '{b64}' | base64 -d > "$STAGING_DIR/{basename}"
-    echo "Baked resolved version '{version}' into {basename}"
+    echo "Baked resolved extension version into {basename}"
 fi
 "#,
                         basename = cfg_basename,
                         b64 = b64,
-                        version = metadata.version,
                     )
                 }
                 // Remote/unreadable source (e.g. packaging a fetched remote ext
@@ -944,98 +961,6 @@ rm -rf "$TMPDIR"
     }
 }
 
-/// Rewrite `extensions.<ext_name>.version` in an avocado.yaml document to a
-/// concrete, resolved `version`, preserving the rest of the file verbatim —
-/// comments and every other templated value stay intact.
-///
-/// This is the package-time resolution of a "required field": the in-source
-/// program extensions declare `version: '{{ env.AVOCADO_EXT_VERSION }}'` so the
-/// packaged version tracks Cargo.toml, but that template only resolves while the
-/// env var is set. Baking the resolved value makes the published config
-/// self-contained while leaving other templates (e.g. `{{ avocado.target }}`)
-/// for the consumer to resolve at their build time.
-///
-/// A deliberate line-scoped edit rather than a serde round-trip: round-tripping
-/// would drop comments and could re-quote/normalize the surviving template
-/// strings. Only the `version:` key that is a direct child of the named
-/// extension is touched (a nested `version:` under, say, `packages:` is left
-/// alone). Returns an error if that key can't be located — the caller has
-/// already proven a valid version exists, so a miss means an unexpected layout.
-fn bake_extension_version(text: &str, ext_name: &str, version: &str) -> Result<String> {
-    // Key portion of a `key: value` line (handles optional quoting of the key).
-    fn line_key(trimmed: &str) -> &str {
-        trimmed
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-    }
-
-    let mut out: Vec<String> = Vec::with_capacity(text.lines().count() + 1);
-    let mut in_extensions = false; // inside the top-level `extensions:` map
-    let mut ext_indent: Option<usize> = None; // indent of the `<ext_name>:` key
-    let mut child_indent: Option<usize> = None; // indent of the ext's direct children
-    let mut replaced = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        // Blank/comment lines are kept verbatim and don't affect block tracking.
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            out.push(line.to_string());
-            continue;
-        }
-        let indent = line.len() - trimmed.len();
-
-        // A line at or above the extension key's indent ends the ext block; a
-        // top-level line also toggles whether we're inside `extensions:`. Fall
-        // through so the same line can re-open a sibling extension block.
-        if let Some(ei) = ext_indent {
-            if indent <= ei {
-                ext_indent = None;
-                child_indent = None;
-            }
-        }
-
-        if indent == 0 {
-            in_extensions = trimmed.starts_with("extensions:");
-            out.push(line.to_string());
-            continue;
-        }
-
-        if in_extensions && ext_indent.is_none() {
-            if line_key(trimmed) == ext_name {
-                ext_indent = Some(indent);
-            }
-            out.push(line.to_string());
-            continue;
-        }
-
-        if ext_indent.is_some() {
-            // Inside the ext block. The first child line fixes the direct-child
-            // indent; only a `version:` at that exact indent is the field we bake.
-            let ci = *child_indent.get_or_insert(indent);
-            if !replaced && indent == ci && line_key(trimmed) == "version" {
-                out.push(format!("{}version: '{version}'", " ".repeat(indent)));
-                replaced = true;
-                continue;
-            }
-        }
-
-        out.push(line.to_string());
-    }
-
-    if !replaced {
-        anyhow::bail!("could not locate `version:` for extension '{ext_name}' in its avocado.yaml");
-    }
-
-    let mut result = out.join("\n");
-    if text.ends_with('\n') {
-        result.push('\n');
-    }
-    Ok(result)
-}
-
 /// RPM metadata structure
 #[derive(Debug)]
 struct RpmMetadata {
@@ -1054,72 +979,6 @@ struct RpmMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_bake_extension_version_replaces_only_version_keeps_other_templates() {
-        let src = "supported_targets: '*'\n\
-extensions:\n  \
-  avocado-ext-cli:\n    \
-    # tracks Cargo.toml at package time\n    \
-    version: '{{ env.AVOCADO_EXT_VERSION }}'\n    \
-    release: r0\n    \
-    sdk:\n      \
-      packages:\n        \
-        packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}: '*'\n\
-sdk:\n  \
-  image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}\n";
-
-        let out = bake_extension_version(src, "avocado-ext-cli", "1.2.3").unwrap();
-
-        // The version field is resolved...
-        assert!(out.contains("    version: '1.2.3'"));
-        assert!(!out.contains("AVOCADO_EXT_VERSION"));
-        // ...the explanatory comment is preserved...
-        assert!(out.contains("# tracks Cargo.toml at package time"));
-        // ...and every other template is left for the consumer to resolve.
-        assert!(out.contains("packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}"));
-        assert!(out.contains("docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}"));
-        assert!(out.ends_with('\n'));
-    }
-
-    #[test]
-    fn test_bake_extension_version_ignores_nested_version_keys() {
-        // A `version:` nested under packages must NOT be mistaken for the field.
-        let src = "extensions:\n  \
-  my-ext:\n    \
-    packages:\n      \
-      some-dep:\n        \
-        version: '9.9.9'\n    \
-    version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
-
-        let out = bake_extension_version(src, "my-ext", "0.4.0").unwrap();
-        assert!(out.contains("        version: '9.9.9'")); // nested untouched
-        assert!(out.contains("    version: '0.4.0'")); // direct child baked
-    }
-
-    #[test]
-    fn test_bake_extension_version_only_named_extension() {
-        let src = "extensions:\n  \
-  ext-a:\n    \
-    version: '{{ env.AVOCADO_EXT_VERSION }}'\n  \
-  ext-b:\n    \
-    version: '{{ env.AVOCADO_EXT_VERSION }}'\n";
-
-        let out = bake_extension_version(src, "ext-b", "2.0.0").unwrap();
-        // ext-a's template is preserved; only ext-b is baked.
-        let a_idx = out.find("ext-a:").unwrap();
-        let b_idx = out.find("ext-b:").unwrap();
-        assert!(out[a_idx..b_idx].contains("'{{ env.AVOCADO_EXT_VERSION }}'"));
-        assert!(out[b_idx..].contains("version: '2.0.0'"));
-        assert!(!out[b_idx..].contains("AVOCADO_EXT_VERSION"));
-    }
-
-    #[test]
-    fn test_bake_extension_version_errors_when_absent() {
-        let src = "extensions:\n  my-ext:\n    release: r0\n";
-        let err = bake_extension_version(src, "my-ext", "1.0.0").unwrap_err();
-        assert!(err.to_string().contains("could not locate `version:`"));
-    }
 
     #[test]
     fn test_generate_summary_from_name() {
@@ -1392,7 +1251,7 @@ sdk:\n  \
 
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, None, &empty_full_config);
+        let files = cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml");
         assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 
@@ -1423,7 +1282,12 @@ sdk:\n  \
         // Use the same config as raw config to test overlay extraction
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, Some(&ext_config), &empty_full_config);
+        let files = cmd.get_package_files(
+            &ext_config,
+            Some(&ext_config),
+            &empty_full_config,
+            "avocado.yaml",
+        );
         assert_eq!(
             files,
             vec!["avocado.yaml".to_string(), "my-overlay".to_string()]
@@ -1467,7 +1331,12 @@ sdk:\n  \
         // Use the same config as raw config to test overlay extraction
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, Some(&ext_config), &empty_full_config);
+        let files = cmd.get_package_files(
+            &ext_config,
+            Some(&ext_config),
+            &empty_full_config,
+            "avocado.yaml",
+        );
         assert_eq!(
             files,
             vec!["avocado.yaml".to_string(), "overlays/prod".to_string()]
@@ -1513,7 +1382,12 @@ sdk:\n  \
 
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, Some(&ext_config), &empty_full_config);
+        let files = cmd.get_package_files(
+            &ext_config,
+            Some(&ext_config),
+            &empty_full_config,
+            "avocado.yaml",
+        );
         assert_eq!(
             files,
             vec![
@@ -1551,7 +1425,7 @@ sdk:\n  \
 
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, None, &empty_full_config);
+        let files = cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml");
         assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 
@@ -1615,7 +1489,12 @@ sdk:\n  \
 
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&merged_config, Some(&raw_config), &empty_full_config);
+        let files = cmd.get_package_files(
+            &merged_config,
+            Some(&raw_config),
+            &empty_full_config,
+            "avocado.yaml",
+        );
 
         // Should include avocado.yaml and both target-specific overlays
         assert!(files.contains(&"avocado.yaml".to_string()));
