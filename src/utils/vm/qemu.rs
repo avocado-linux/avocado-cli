@@ -167,7 +167,12 @@ pub fn build_qemu_args(
         cfg.ssh_port
     ));
     args.push("-device".into());
-    args.push("virtio-net-device,netdev=net0".into());
+    // virtio-net-pci, not virtio-net-device: the x86 `q35` machine exposes
+    // PCIe, not the virtio-mmio bus that `virtio-net-device` binds to, so the
+    // mmio variant aborts qemu at startup with "No 'virtio-bus' bus found for
+    // device 'virtio-net-device'" and `vm start` never boots. arm64 `virt`
+    // also has PCIe, so -pci is correct for both arches (matches virtio-9p-pci).
+    args.push("virtio-net-pci,netdev=net0".into());
 
     // USB host controller (empty; USB devices are attached at runtime via QMP)
     args.push("-device".into());
