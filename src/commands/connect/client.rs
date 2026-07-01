@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+
+use crate::utils::update_repo::TargetFileInfo;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -197,6 +199,23 @@ pub struct ServerKeyResponse {
 #[derive(Debug, Deserialize)]
 struct ServerKeyWrapper {
     data: ServerKeyResponse,
+}
+
+// ---------------------------------------------------------------------------
+// Connect signing types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SignForDeployResponse {
+    pub targets_json: String,
+    pub snapshot_json: String,
+    pub timestamp_json: String,
+    pub delegated_targets_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignForDeployWrapper {
+    data: SignForDeployResponse,
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +1420,33 @@ impl ConnectClient {
         let resp: ServerKeyWrapper = res.json().await?;
         Ok(resp.data)
     }
+
+    /// Sign TUF deploy metadata via the Connect platform.
+    pub async fn sign_for_deploy(
+        &self,
+        org: &str,
+        targets: &[TargetFileInfo],
+    ) -> Result<SignForDeployResponse> {
+        let url = format!("{}/api/orgs/{}/signing/sign-for-deploy", self.api_url, org);
+
+        let res = self
+            .http
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .json(&serde_json::json!({ "targets": targets }))
+            .send()
+            .await
+            .context("Failed to sign deploy metadata")?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to sign deploy metadata (HTTP {status}): {body}");
+        }
+
+        let resp: SignForDeployWrapper = res.json().await?;
+        Ok(resp.data)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2248,5 +2294,22 @@ mod tests {
         } else {
             panic!("expected UrlExpired");
         }
+    }
+
+    #[test]
+    fn test_sign_for_deploy_response_deserializes_four_fields() {
+        let raw = r#"{
+            "data": {
+                "targets_json": "{\"targets\":true}",
+                "snapshot_json": "{\"snapshot\":true}",
+                "timestamp_json": "{\"timestamp\":true}",
+                "delegated_targets_json": "{\"delegated\":true}"
+            }
+        }"#;
+        let resp: SignForDeployWrapper = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.data.targets_json, "{\"targets\":true}");
+        assert_eq!(resp.data.snapshot_json, "{\"snapshot\":true}");
+        assert_eq!(resp.data.timestamp_json, "{\"timestamp\":true}");
+        assert_eq!(resp.data.delegated_targets_json, "{\"delegated\":true}");
     }
 }
