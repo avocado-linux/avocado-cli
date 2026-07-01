@@ -143,6 +143,12 @@ impl VmPaths {
     pub fn pid_file(&self) -> PathBuf {
         self.root.join("qemu.pid")
     }
+    pub fn tpm_dir(&self) -> PathBuf {
+        self.root.join("tpm")
+    }
+    pub fn tpm_socket(&self) -> PathBuf {
+        self.root.join("tpm").join("swtpm-sock")
+    }
     pub fn lock_file(&self) -> PathBuf {
         self.root.join("lock")
     }

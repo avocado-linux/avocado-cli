@@ -110,6 +110,16 @@ pub fn build_qemu_args(
         cmdline.push_str(extra.trim());
     }
 
+    // The avocado-vm image ships the `tpm2` distro feature, so systemd waits
+    // for /dev/tpm0 at boot. When no swtpm-backed TPM is wired (its control
+    // socket is absent because swtpm is not installed or failed to start),
+    // tell systemd not to wait so the guest doesn't block ~90s on the missing
+    // device. When the socket IS present the TPM device args below satisfy the
+    // wait instead.
+    if !paths.tpm_socket().exists() {
+        cmdline.push_str(" systemd.tpm2_wait=false");
+    }
+
     let mut args: Vec<String> = Vec::new();
 
     args.push("-machine".into());
@@ -218,6 +228,15 @@ pub fn build_qemu_args(
     ));
     args.push("-device".into());
     args.push("virtserialport,chardev=avocadoctl,name=avocado.control".into());
+
+    // Software TPM (swtpm), wired only when the lifecycle layer started it and
+    // its control socket exists. Mirrors meta-avocado's run-qemux86-64-swtpm so
+    // the guest's tpm2 feature finds /dev/tpm0 instead of blocking on it.
+    if paths.tpm_socket().exists() {
+        for a in super::tpm::qemu_tpm_args(paths, &arch) {
+            args.push(a);
+        }
+    }
 
     // Serial console -> logfile
     args.push("-serial".into());
