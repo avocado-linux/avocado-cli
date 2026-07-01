@@ -227,6 +227,16 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // than owning the process — that decoupling keeps the CLI usable on
     // its own and avoids the IPC stall we used to hit when `vm stop` had
     // to round-trip through the app.
+    // Provide a software TPM before qemu when swtpm is available; the
+    // avocado-vm image's tpm2 feature makes systemd wait for /dev/tpm0. When
+    // swtpm is absent the guest cmdline gets systemd.tpm2_wait=false instead
+    // (see qemu::build_qemu_args), so this is a soft enhancement, not a gate.
+    if super::tpm::swtpm_available() {
+        if let Err(e) = super::tpm::spawn_swtpm(&paths) {
+            eprintln!("warning: swtpm setup failed ({e}); booting the VM without a TPM");
+        }
+    }
+
     let pid = {
         let p = qemu::spawn_detached(&manifest, &paths, &cfg).await?;
         // qemu's -pidfile flag will (re)write the pid; give it a moment, then
@@ -358,6 +368,7 @@ async fn stop_inner(force: bool) -> Result<()> {
     #[cfg(unix)]
     stop_supervisor(&paths);
     let _ = super::forward::stop(&paths).await;
+    super::tpm::stop_swtpm(&paths);
 
     let pid = match state::read_pid(&paths)? {
         Some(pid) if state::pid_alive(pid) => pid,

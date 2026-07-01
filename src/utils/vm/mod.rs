@@ -41,3 +41,4 @@ pub mod staging;
 pub mod state;
 #[cfg(unix)]
 pub mod supervisor;
+pub mod tpm;
