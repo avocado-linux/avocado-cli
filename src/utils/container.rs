@@ -482,6 +482,10 @@ pub struct SdkContainer {
     pub container_tool: String,
     pub cwd: PathBuf,
     pub src_dir: Option<PathBuf>,
+    /// Path to the project's `avocado.yaml`, used to derive `type: path`
+    /// extension mounts directly from config at container launch (source of
+    /// truth), so no separate persisted state can drift from it.
+    pub config_path: Option<PathBuf>,
     pub verbose: bool,
 }
 
@@ -498,6 +502,7 @@ impl SdkContainer {
             container_tool: "docker".to_string(),
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             src_dir: None,
+            config_path: None,
             verbose: false,
         }
     }
@@ -509,8 +514,15 @@ impl SdkContainer {
             container_tool,
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             src_dir: None,
+            config_path: None,
             verbose: false,
         }
+    }
+
+    /// Set the config file path (used to derive `type: path` extension mounts).
+    pub fn with_config_path(mut self, config_path: Option<PathBuf>) -> Self {
+        self.config_path = config_path;
+        self
     }
 
     /// Set verbose mode
@@ -528,45 +540,137 @@ impl SdkContainer {
     /// Create a new SdkContainer with configuration from config file
     pub fn from_config(config_path: &str, config: &crate::utils::config::Config) -> Result<Self> {
         let src_dir = config.get_resolved_src_dir(config_path);
-        Ok(Self::new().with_src_dir(src_dir))
+        Ok(Self::new()
+            .with_src_dir(src_dir)
+            .with_config_path(Some(PathBuf::from(config_path))))
     }
 
-    /// Load extension path mounts from the state file
+    /// Derive extension path mounts directly from `avocado.yaml`.
     ///
-    /// Returns a HashMap of extension name -> host path for extensions that use
-    /// `source: { type: path }` and were registered via `avocado ext fetch`.
+    /// Returns a map of extension name -> resolved host path for every extension
+    /// whose `source: { type: path, path: … }` is declared in the config, to be
+    /// bindfs-mounted at `$AVOCADO_PREFIX/includes/<ext>` at container runtime.
     ///
-    /// These paths should be added to `RunConfig.ext_path_mounts` so they get
-    /// mounted via bindfs at container runtime.
-    pub fn load_ext_path_mounts(&self) -> Option<HashMap<String, PathBuf>> {
-        use crate::utils::ext_fetch::ExtensionPathState;
+    /// The config is the single source of truth: flipping an extension's source
+    /// between `package` and `path` takes effect immediately with no separate
+    /// state file to reconcile or go stale. Only lightweight parsing +
+    /// interpolation is done here (no remote-extension composition) since a
+    /// `type: path` source is declared inline and needs no network.
+    pub fn derive_ext_path_mounts(&self, target: &str) -> Option<HashMap<String, PathBuf>> {
+        // Resolve the config file: prefer an explicit `config_path`, otherwise
+        // look for avocado.yaml/.yml under `src_dir` (or cwd). This mirrors how
+        // the removed ext-paths.json state was located via src_dir/cwd, so
+        // commands that build a bare `SdkContainer::new()` (e.g. `ext install`,
+        // `runtime install`) still mount `type: path` extensions.
+        let search_base = self.src_dir.clone().unwrap_or_else(|| self.cwd.clone());
+        let config_path = self.config_path.clone().or_else(|| {
+            ["avocado.yaml", "avocado.yml"]
+                .iter()
+                .map(|n| search_base.join(n))
+                .find(|p| p.is_file())
+        })?;
 
-        let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        // Base for resolving relative `path:` sources: `src_dir` if set, else the
+        // config file's directory (matches the removed `fetch_from_path`), so a
+        // relative source resolves the same regardless of the process cwd.
+        let base_dir = self
+            .src_dir
+            .clone()
+            .or_else(|| config_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.cwd.clone());
 
-        match ExtensionPathState::load_from_dir(src_dir) {
-            Ok(Some(state)) if !state.path_mounts.is_empty() => {
-                if self.verbose {
-                    print_info(
-                        &format!(
-                            "Loaded {} extension path mount(s) from state file",
-                            state.path_mounts.len()
-                        ),
-                        OutputLevel::Normal,
-                    );
-                }
-                Some(state.path_mounts)
-            }
-            Ok(_) => None,
+        // Read/parse/interpolate failures disable path mounts; warn
+        // unconditionally (not just under --verbose) so a broken avocado.yaml
+        // surfaces rather than silently dropping every mount.
+        let warn = |stage: &str, e: &dyn std::fmt::Display| {
+            crate::utils::output::print_warning(
+                &format!(
+                    "Could not {stage} {} to derive extension path mounts: {e}",
+                    config_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+        };
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
             Err(e) => {
-                if self.verbose {
-                    print_info(
-                        &format!("Warning: Failed to load extension path state: {e}"),
-                        OutputLevel::Normal,
-                    );
-                }
-                None
+                warn("read", &e);
+                return None;
             }
+        };
+        let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                warn("parse", &e);
+                return None;
+            }
+        };
+
+        // Build the interpolation context from the full config (so
+        // `{{ avocado.target/board/distro }}` resolve), then interpolate ONLY the
+        // `extensions` subtree. Scoping the interpolation there means an error in
+        // an unrelated top-level field can't drop every path mount.
+        let context =
+            crate::utils::interpolation::AvocadoContext::from_main_config(&value, Some(target));
+        let mut extensions = value.get("extensions").cloned()?;
+        if let Err(e) =
+            crate::utils::interpolation::interpolate_config_with_context(&mut extensions, &context)
+        {
+            warn("interpolate", &e);
+            return None;
         }
+        let extensions = extensions.as_mapping()?;
+
+        let mut mounts = HashMap::new();
+        for (key, ext) in extensions {
+            let Some(name) = key.as_str() else { continue };
+            let Some(source) = ext.get("source") else {
+                continue;
+            };
+            if source.get("type").and_then(|t| t.as_str()) != Some("path") {
+                continue;
+            }
+            let Some(path) = source.get("path").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            let resolved = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                base_dir.join(path)
+            };
+            let resolved = resolved.canonicalize().unwrap_or(resolved);
+            // Skip (with a clear warning) a source dir that doesn't exist rather
+            // than bindfs-mounting a nonexistent path, which fails cryptically at
+            // container launch. Mirrors the pre-flight check `ext fetch` had.
+            if !resolved.is_dir() {
+                crate::utils::output::print_warning(
+                    &format!(
+                        "Extension '{name}' path source does not exist: {} — skipping mount \
+                         (check `source.path` in {})",
+                        resolved.display(),
+                        config_path.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+                continue;
+            }
+            mounts.insert(name.to_string(), resolved);
+        }
+
+        if mounts.is_empty() {
+            return None;
+        }
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Derived {} extension path mount(s) from {}",
+                    mounts.len(),
+                    config_path.display()
+                ),
+                OutputLevel::Normal,
+            );
+        }
+        Some(mounts)
     }
 
     /// Create a shared RunsOnContext for running multiple commands on a remote host
@@ -716,11 +820,12 @@ impl SdkContainer {
             config.container_name.clone()
         };
 
-        // Auto-populate ext_path_mounts from state file if not already set
+        // Auto-populate ext_path_mounts by deriving them from avocado.yaml if
+        // not already set explicitly by the caller.
         let effective_ext_path_mounts = if config.ext_path_mounts.is_some() {
             config.ext_path_mounts.clone()
         } else {
-            self.load_ext_path_mounts()
+            self.derive_ext_path_mounts(&config.target)
         };
 
         // Create a modified config with the container name and ext_path_mounts
@@ -1280,11 +1385,12 @@ impl SdkContainer {
 
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
-        // Auto-populate ext_path_mounts from state file if not already set
+        // Auto-populate ext_path_mounts by deriving them from avocado.yaml if
+        // not already set explicitly by the caller.
         let effective_ext_path_mounts = if config.ext_path_mounts.is_some() {
             config.ext_path_mounts.clone()
         } else {
-            self.load_ext_path_mounts()
+            self.derive_ext_path_mounts(&config.target)
         };
 
         // Create effective config with ext_path_mounts
@@ -2814,6 +2920,99 @@ mod tests {
         let container = SdkContainer::new();
         assert_eq!(container.container_tool, "docker");
         assert!(!container.verbose);
+    }
+
+    #[test]
+    fn derive_ext_path_mounts_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A real extension dir the path source points at (must exist to canonicalize).
+        std::fs::create_dir_all(root.join("ext/local-thing")).unwrap();
+        let cfg = root.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+extensions:
+  local-thing:
+    source:
+      type: path
+      path: ext/local-thing
+  a-package:
+    source:
+      type: package
+      version: "*"
+"#,
+        )
+        .unwrap();
+
+        let container = SdkContainer::new()
+            .with_src_dir(Some(root.to_path_buf()))
+            .with_config_path(Some(cfg));
+
+        let mounts = container
+            .derive_ext_path_mounts("qemux86-64")
+            .expect("path extension should produce a mount");
+        // Only the `type: path` extension is mounted; package is ignored.
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts.get("local-thing").unwrap(),
+            &root.join("ext/local-thing").canonicalize().unwrap()
+        );
+        assert!(!mounts.contains_key("a-package"));
+    }
+
+    #[test]
+    fn derive_ext_path_mounts_none_when_no_path_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "extensions:\n  a-package:\n    source:\n      type: package\n      version: \"*\"\n",
+        )
+        .unwrap();
+        let container = SdkContainer::new()
+            .with_src_dir(Some(tmp.path().to_path_buf()))
+            .with_config_path(Some(cfg));
+        assert!(container.derive_ext_path_mounts("qemux86-64").is_none());
+    }
+
+    #[test]
+    fn derive_ext_path_mounts_falls_back_to_src_dir_without_config_path() {
+        // `ext install` / `runtime install` build a bare SdkContainer::new()
+        // (no config_path). Deriving must still find avocado.yaml via src_dir so
+        // `type: path` extensions are mounted (regression guard).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("ext/local-thing")).unwrap();
+        std::fs::write(
+            root.join("avocado.yaml"),
+            "extensions:\n  local-thing:\n    source:\n      type: path\n      path: ext/local-thing\n",
+        )
+        .unwrap();
+
+        let container = SdkContainer::new().with_src_dir(Some(root.to_path_buf()));
+        let mounts = container
+            .derive_ext_path_mounts("qemux86-64")
+            .expect("path mount should be derived from src_dir even without config_path");
+        assert!(mounts.contains_key("local-thing"));
+    }
+
+    #[test]
+    fn derive_ext_path_mounts_skips_missing_source_dir() {
+        // A typo'd/absent `path:` source is skipped (with a warning) rather than
+        // mounted against a nonexistent host dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg = root.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "extensions:\n  gone:\n    source:\n      type: path\n      path: does/not/exist\n",
+        )
+        .unwrap();
+        let container = SdkContainer::new()
+            .with_src_dir(Some(root.to_path_buf()))
+            .with_config_path(Some(cfg));
+        assert!(container.derive_ext_path_mounts("qemux86-64").is_none());
     }
 
     #[test]
