@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::utils::config::Config;
+use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
 use crate::utils::volume::VolumeState;
@@ -204,11 +205,29 @@ fn build_save_archive(
         )?;
     }
 
-    // 3. Add .avocado/ directory if present
+    // 3. Add .avocado/ directory if present.
+    //
+    // First migrate any legacy `.avocado/lock.json` to the top-level
+    // `avocado.lock` so the bundle ships exactly one (canonical) lock file —
+    // otherwise the `.avocado/` archive below and step 3b would both carry a lock
+    // and they could disagree on restore. `load()` + `save_replacing()` writes
+    // `avocado.lock` and (via `write_to_disk`) drops the legacy file.
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    if LockFile::legacy_path(config_dir).exists() {
+        if let Ok(lock) = LockFile::load(config_dir) {
+            let _ = lock.save_replacing(config_dir);
+        }
+    }
+
     let avocado_dir = config_dir.join(".avocado");
     if avocado_dir.is_dir() {
         tar.append_dir_all(format!("{ARCHIVE_PREFIX}/config/.avocado"), &avocado_dir)?;
+    }
+
+    // 3b. Add the top-level avocado.lock (relocated out of .avocado/) if present.
+    let lockfile = LockFile::get_path(config_dir);
+    if lockfile.is_file() {
+        tar.append_path_with_name(&lockfile, format!("{ARCHIVE_PREFIX}/config/avocado.lock"))?;
     }
 
     // 4. Add src_dir if requested

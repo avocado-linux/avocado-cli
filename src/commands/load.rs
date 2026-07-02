@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::volume::VolumeState;
 
@@ -205,6 +206,43 @@ fn import_archive(
         let dest_avocado_dir = config_dir.join(".avocado");
         copy_dir_recursive(&archive_avocado_dir, &dest_avocado_dir)
             .with_context(|| "Failed to restore .avocado/ directory")?;
+    }
+
+    // Restore the lock file, normalized to the top-level avocado.lock. Prefer the
+    // archive's top-level avocado.lock; fall back to a legacy .avocado/lock.json
+    // from older bundles so their pins aren't silently ignored. Don't clobber an
+    // existing local lock without --force (mirrors the avocado.yaml handling
+    // above), then drop any restored legacy copy so the two can't diverge.
+    let dest_lockfile = LockFile::get_path(config_dir);
+    let archive_lockfile = {
+        let top = archive_config_dir.join("avocado.lock");
+        let legacy = archive_config_dir.join(".avocado").join("lock.json");
+        if top.is_file() {
+            Some(top)
+        } else if legacy.is_file() {
+            Some(legacy)
+        } else {
+            None
+        }
+    };
+    if let Some(src) = archive_lockfile {
+        if dest_lockfile.exists() && !force {
+            print_warning(
+                &format!(
+                    "{} already exists, skipping (use --force to overwrite)",
+                    dest_lockfile.display()
+                ),
+                OutputLevel::Normal,
+            );
+        } else {
+            fs::copy(&src, &dest_lockfile).with_context(|| "Failed to restore avocado.lock")?;
+        }
+    }
+    // The canonical lock now lives at the top level; drop any legacy copy the
+    // .avocado/ restore brought in so `load()` can't read a divergent file.
+    let restored_legacy = LockFile::legacy_path(config_dir);
+    if restored_legacy.exists() {
+        let _ = fs::remove_file(&restored_legacy);
     }
 
     // Restore src_dir if archive includes it
