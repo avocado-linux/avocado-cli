@@ -656,21 +656,46 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
 
     // Build optional overlay snippet — appended to the install command so it
     // runs in the same container invocation immediately after DNF finishes.
-    let overlay_snippet = params
-        .parsed
-        .and_then(|parsed| {
+    let overlay_snippet = {
+        let overlay_value = params.parsed.and_then(|parsed| {
             let key = match params.sysroot_type {
                 SysrootType::Rootfs => "rootfs",
                 SysrootType::Initramfs => "initramfs",
                 _ => return None,
             };
-            parsed.get(key)?.get("overlay")
-        })
-        .map(|v| {
-            let (dir, opaque) = parse_overlay_config(v);
-            build_overlay_script(&dir, opaque, sysroot_dir)
-        })
-        .unwrap_or_default();
+            parsed.get(key)?.get("overlay").cloned()
+        });
+        if let (Some(v), Some(parsed)) = (overlay_value, params.parsed) {
+            let (dir, opaque) = parse_overlay_config(&v);
+            // Opt-in preprocessing: materialize an interpolated copy of the
+            // overlay on the host under `.avocado/overlay-staging/` and copy
+            // from there, so `{{ ... }}` in overlay files is substituted without
+            // mutating the working tree.
+            let spec = crate::utils::overlay_preprocess::PreprocessSpec::from_overlay_value(&v);
+            let effective_dir = if spec.is_enabled() {
+                let context = crate::utils::interpolation::AvocadoContext::from_main_config(
+                    parsed,
+                    Some(params.target),
+                );
+                match crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
+                    params.src_dir,
+                    &dir,
+                    sysroot_dir,
+                    &spec,
+                    parsed,
+                    &context,
+                )? {
+                    Some(staging_rel_dir) => staging_rel_dir,
+                    None => dir,
+                }
+            } else {
+                dir
+            };
+            build_overlay_script(&effective_dir, opaque, sysroot_dir)
+        } else {
+            String::new()
+        }
+    };
 
     let exclude_str = if off_kernel_excludes.is_empty() {
         String::new()

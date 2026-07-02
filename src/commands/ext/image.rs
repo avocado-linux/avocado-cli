@@ -289,13 +289,21 @@ impl ExtImageCommand {
             // against the matching step's hash.
             let project_root = config.project_root(&self.config_path);
             let install_inputs = compute_ext_install_input_hash(parsed, &self.extension).ok();
-            let build_inputs =
-                compute_ext_build_input_hash(parsed, &self.extension, &project_root).ok();
+            let build_inputs = compute_ext_build_input_hash(
+                parsed,
+                &self.extension,
+                &project_root,
+                Some(target.as_str()),
+                self.runtime.as_deref(),
+            )
+            .ok();
             let image_inputs = compute_ext_image_input_hash(
                 parsed,
                 &self.extension,
                 Some(effective_fs),
                 &project_root,
+                Some(target.as_str()),
+                self.runtime.as_deref(),
             )
             .ok();
             let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
@@ -668,6 +676,8 @@ impl ExtImageCommand {
                     &self.extension,
                     Some(filesystem),
                     &config.project_root(&self.config_path),
+                    Some(target.as_str()),
+                    self.runtime.as_deref(),
                 )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);

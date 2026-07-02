@@ -21,6 +21,8 @@ use crate::utils::tui::{TaskId, TuiGuard};
 struct OverlayConfig {
     dir: String,
     mode: OverlayMode,
+    /// Opt-in `{{ }}` preprocessing of overlay file contents.
+    preprocess: crate::utils::overlay_preprocess::PreprocessSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,8 +294,14 @@ impl ExtBuildCommand {
             // is matched against the entry for its (component, command) pair.
             let project_root = config.project_root(&self.config_path);
             let install_inputs = compute_ext_install_input_hash(parsed, &self.extension).ok();
-            let build_inputs =
-                compute_ext_build_input_hash(parsed, &self.extension, &project_root).ok();
+            let build_inputs = compute_ext_build_input_hash(
+                parsed,
+                &self.extension,
+                &project_root,
+                Some(target.as_str()),
+                self.runtime.as_deref(),
+            )
+            .ok();
             let mut current_inputs: Vec<crate::utils::stamps::CurrentInput<'_>> = Vec::new();
             if let Some(ref i) = install_inputs {
                 current_inputs.push((StampComponent::Extension, StampCommand::Install, i));
@@ -554,12 +562,14 @@ impl ExtBuildCommand {
             })?;
 
         // Get overlay configuration
-        let overlay_config = ext_config.get("overlay").map(|v| {
+        let mut overlay_config = ext_config.get("overlay").map(|v| {
+            use crate::utils::overlay_preprocess::PreprocessSpec;
             if let Some(dir_str) = v.as_str() {
                 // Simple string format: overlay = "directory"
                 OverlayConfig {
                     dir: dir_str.to_string(),
                     mode: OverlayMode::Merge, // Default to merge mode
+                    preprocess: PreprocessSpec::None,
                 }
             } else if let Some(table) = v.as_mapping() {
                 // Table format: overlay = {dir = "directory", mode = "opaque"}
@@ -574,12 +584,17 @@ impl ExtBuildCommand {
                     _ => OverlayMode::Merge, // Default to merge mode
                 };
 
-                OverlayConfig { dir, mode }
+                OverlayConfig {
+                    dir,
+                    mode,
+                    preprocess: PreprocessSpec::from_overlay_value(v),
+                }
             } else {
                 // Fallback for invalid format
                 OverlayConfig {
                     dir: "overlay".to_string(),
                     mode: OverlayMode::Merge,
+                    preprocess: PreprocessSpec::None,
                 }
             }
         });
@@ -615,6 +630,65 @@ impl ExtBuildCommand {
             }
             ExtensionLocation::Local { .. } => "/opt/src".to_string(),
         };
+
+        // Opt-in overlay preprocessing (local extensions only). Materialize an
+        // interpolated copy of the overlay on the host under
+        // `.avocado/overlay-staging/` and redirect the in-container copy to it,
+        // so `{{ ... }}` in overlay files is substituted without mutating the
+        // working tree. Remote-extension overlays live in the SDK volume (not on
+        // the host), so they can't be preprocessed here — warn and skip.
+        if let Some(oc) = overlay_config.as_mut() {
+            if oc.preprocess.is_enabled() {
+                match &extension_location {
+                    ExtensionLocation::Local { .. } => {
+                        let project_root = config.project_root(&self.config_path);
+                        let mut context =
+                            crate::utils::interpolation::AvocadoContext::from_main_config(
+                                parsed,
+                                Some(target.as_str()),
+                            );
+                        // The selected runtime drives `{{ avocado.runtime }}` and
+                        // the runtime-scoped target board; from_main_config only
+                        // sees env/default, so override it when one was chosen.
+                        if let Some(rt) = self.runtime.as_deref() {
+                            context.runtime = Some(rt.to_string());
+                        }
+                        let label = format!(
+                            "ext-{}",
+                            self.extension
+                                .chars()
+                                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' {
+                                    c
+                                } else {
+                                    '_'
+                                })
+                                .collect::<String>()
+                        );
+                        if let Some(staging_rel_dir) =
+                            crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
+                                &project_root,
+                                &oc.dir,
+                                &label,
+                                &oc.preprocess,
+                                parsed,
+                                &context,
+                            )?
+                        {
+                            oc.dir = staging_rel_dir;
+                        }
+                    }
+                    ExtensionLocation::Remote { name, .. } => {
+                        print_warning(
+                            &format!(
+                                "Overlay preprocessing is not supported for remote extension \
+                                 '{name}'; copying overlay verbatim."
+                            ),
+                            OutputLevel::Normal,
+                        );
+                    }
+                }
+            }
+        }
 
         // Run the post_build hook before sealing any .raw images. By this
         // point the ext sysroot has been populated by `avocado install` and
@@ -736,6 +810,8 @@ impl ExtBuildCommand {
                 parsed,
                 &self.extension,
                 &config.project_root(&self.config_path),
+                Some(target.as_str()),
+                self.runtime.as_deref(),
             )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);
@@ -1913,6 +1989,7 @@ mod tests {
         let overlay_config = OverlayConfig {
             dir: "peridio".to_string(),
             mode: OverlayMode::Merge,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
         };
         let script = cmd.create_sysext_build_script(
             "1.0",
@@ -1955,6 +2032,7 @@ mod tests {
         let overlay_config = OverlayConfig {
             dir: "peridio".to_string(),
             mode: OverlayMode::Merge,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
         };
         let script = cmd.create_confext_build_script(
             "1.0",
@@ -1997,6 +2075,7 @@ mod tests {
         let overlay_config = OverlayConfig {
             dir: "peridio".to_string(),
             mode: OverlayMode::Opaque,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
         };
         let script = cmd.create_sysext_build_script(
             "1.0",
@@ -2040,6 +2119,7 @@ mod tests {
         let overlay_config = OverlayConfig {
             dir: "peridio".to_string(),
             mode: OverlayMode::Opaque,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
         };
         let script = cmd.create_confext_build_script(
             "1.0",

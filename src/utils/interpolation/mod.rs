@@ -194,6 +194,35 @@ pub fn interpolate_config_with_context(
     Ok(())
 }
 
+/// Preprocess `{{ ... }}` templates inside arbitrary file contents (e.g. an
+/// overlay file), using the same `env.`/`config.`/`avocado.` resolution as the
+/// YAML interpolator.
+///
+/// `root` is the composed config tree (for `{{ config.* }}`); `context` carries
+/// the resolved target/board/distro values (for `{{ avocado.* }}`). Missing
+/// `env.*` variables warn and resolve to an empty string, identical to
+/// `avocado.yaml` interpolation. Input that contains no templates is returned
+/// unchanged.
+///
+/// Runs in *lenient* mode: a `{{ ... }}` whose context isn't one of ours (e.g.
+/// Go/Jinja/Helm template syntax an overlay file legitimately ships) is left
+/// untouched instead of aborting the build. Only `env`/`config`/`avocado`
+/// templates are substituted.
+pub fn preprocess_text(input: &str, root: &Value, context: &AvocadoContext) -> Result<String> {
+    let mut resolving_stack = HashSet::new();
+    let path: Vec<String> = Vec::new();
+    Ok(interpolate_string(
+        input,
+        root,
+        context,
+        &mut resolving_stack,
+        &path,
+        &YamlLocation::Value,
+        true,
+    )?
+    .unwrap_or_else(|| input.to_string()))
+}
+
 /// Represents where in the YAML structure a template was found.
 #[derive(Clone, Debug)]
 enum YamlLocation {
@@ -243,7 +272,7 @@ fn interpolate_value(
         Value::String(s) => {
             let location = YamlLocation::Value;
             if let Some(new_value) =
-                interpolate_string(s, root, context, resolving_stack, path, &location)?
+                interpolate_string(s, root, context, resolving_stack, path, &location, false)?
             {
                 *s = new_value;
                 changed = true;
@@ -264,6 +293,7 @@ fn interpolate_value(
                         resolving_stack,
                         path,
                         &location,
+                        false,
                     )? {
                         keys_to_replace.push((k.clone(), Value::String(new_key), v.clone()));
                     }
@@ -326,6 +356,7 @@ fn interpolate_string(
     resolving_stack: &mut HashSet<String>,
     path: &[String],
     location: &YamlLocation,
+    lenient: bool,
 ) -> Result<Option<String>> {
     // Regex to match {{ ... }} templates
     let re = Regex::new(r"\{\{\s*([^}]+)\s*\}\}").unwrap();
@@ -342,7 +373,7 @@ fn interpolate_string(
         let full_match = capture.get(0).unwrap().as_str();
         let template = capture.get(1).unwrap().as_str().trim();
 
-        match resolve_template(template, root, context, resolving_stack) {
+        match resolve_template(template, root, context, resolving_stack, lenient) {
             Ok(Some(replacement)) => {
                 result = result.replace(full_match, &replacement);
                 any_replaced = true;
@@ -380,6 +411,7 @@ fn resolve_template(
     root: &Value,
     context: &AvocadoContext,
     resolving_stack: &mut HashSet<String>,
+    lenient: bool,
 ) -> Result<Option<String>> {
     // Check for circular reference
     if resolving_stack.contains(template) {
@@ -430,9 +462,17 @@ fn resolve_template(
             avocado::resolve(path, root, Some(context))
         }
         _ => {
-            anyhow::bail!(
-                "Unknown template context: {context_name}. Expected 'env', 'config', or 'avocado'"
-            );
+            if lenient {
+                // Overlay preprocessing: a `{{ ... }}` whose context isn't one of
+                // ours (e.g. Go/Jinja/Helm template syntax like `{{ .Values.x }}`
+                // or `{{ range }}`) is left untouched rather than aborting the
+                // build. Only our env/config/avocado templates are substituted.
+                Ok(None)
+            } else {
+                anyhow::bail!(
+                    "Unknown template context: {context_name}. Expected 'env', 'config', or 'avocado'"
+                );
+            }
         }
     };
 
