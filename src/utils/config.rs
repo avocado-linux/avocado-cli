@@ -1911,13 +1911,23 @@ impl Config {
             );
         }
 
-        // Load extension path state for path-based extensions
-        let ext_path_state = crate::utils::ext_fetch::ExtensionPathState::load_from_dir(&src_dir)
-            .ok()
-            .flatten();
-
         // For each remote extension, try to read its config
         for (ext_name, source) in remote_extensions {
+            // For a `type: path` source, resolve its host dir directly from the
+            // config declaration (relative to src_dir) — the config is the
+            // source of truth, so no separate state file is consulted.
+            let path_source_dir: Option<PathBuf> = match &source {
+                ExtensionSource::Path { path, .. } => {
+                    let p = if Path::new(path).is_absolute() {
+                        PathBuf::from(path)
+                    } else {
+                        src_dir.join(path)
+                    };
+                    Some(p.canonicalize().unwrap_or(p))
+                }
+                _ => None,
+            };
+
             // Try multiple methods to read the extension config:
             // 0. Path-based extension: read directly from source path (for source: { type: path })
             // 1. Direct container path (when running inside a container)
@@ -1925,72 +1935,67 @@ impl Config {
             // 3. Local fallback path (for development)
 
             let ext_content = {
-                // Method 0: Check if this is a path-based extension (source: { type: path })
-                // For path-based extensions, read from the registered source path on the host
-                if let Some(ref state) = ext_path_state {
-                    if let Some(source_path) = state.path_mounts.get(&ext_name) {
-                        let config_path_yaml = source_path.join("avocado.yaml");
-                        let config_path_yml = source_path.join("avocado.yml");
+                // Method 0: path-based extension (source: { type: path }) — read
+                // its config directly from the declared source path on the host.
+                if let Some(ref source_path) = path_source_dir {
+                    let config_path_yaml = source_path.join("avocado.yaml");
+                    let config_path_yml = source_path.join("avocado.yml");
 
-                        if verbose {
-                            eprintln!(
-                                "[DEBUG] Extension '{}' is path-based, checking: {}",
-                                ext_name,
-                                config_path_yaml.display()
-                            );
+                    if verbose {
+                        eprintln!(
+                            "[DEBUG] Extension '{}' is path-based, checking: {}",
+                            ext_name,
+                            config_path_yaml.display()
+                        );
+                    }
+
+                    if config_path_yaml.exists() {
+                        match fs::read_to_string(&config_path_yaml) {
+                            Ok(content) => {
+                                if verbose {
+                                    eprintln!(
+                                        "[DEBUG]   Read {} bytes from path-based source",
+                                        content.len()
+                                    );
+                                }
+                                content
+                            }
+                            Err(e) => {
+                                if verbose {
+                                    eprintln!("[DEBUG]   Failed to read: {e}");
+                                }
+                                continue;
+                            }
                         }
-
-                        if config_path_yaml.exists() {
-                            match fs::read_to_string(&config_path_yaml) {
-                                Ok(content) => {
-                                    if verbose {
-                                        eprintln!(
-                                            "[DEBUG]   Read {} bytes from path-based source",
-                                            content.len()
-                                        );
-                                    }
-                                    content
+                    } else if config_path_yml.exists() {
+                        match fs::read_to_string(&config_path_yml) {
+                            Ok(content) => {
+                                if verbose {
+                                    eprintln!(
+                                        "[DEBUG]   Read {} bytes from path-based source (.yml)",
+                                        content.len()
+                                    );
                                 }
-                                Err(e) => {
-                                    if verbose {
-                                        eprintln!("[DEBUG]   Failed to read: {e}");
-                                    }
-                                    continue;
-                                }
+                                content
                             }
-                        } else if config_path_yml.exists() {
-                            match fs::read_to_string(&config_path_yml) {
-                                Ok(content) => {
-                                    if verbose {
-                                        eprintln!(
-                                            "[DEBUG]   Read {} bytes from path-based source (.yml)",
-                                            content.len()
-                                        );
-                                    }
-                                    content
+                            Err(e) => {
+                                if verbose {
+                                    eprintln!("[DEBUG]   Failed to read: {e}");
                                 }
-                                Err(e) => {
-                                    if verbose {
-                                        eprintln!("[DEBUG]   Failed to read: {e}");
-                                    }
-                                    continue;
-                                }
+                                continue;
                             }
-                        } else {
-                            if verbose {
-                                eprintln!(
-                                    "[DEBUG]   Path-based source path has no avocado.yaml/yml: {}",
-                                    source_path.display()
-                                );
-                            }
-                            continue;
                         }
                     } else {
-                        // Not a path-based extension, fall through to other methods
-                        "".to_string()
+                        if verbose {
+                            eprintln!(
+                                "[DEBUG]   Path-based source path has no avocado.yaml/yml: {}",
+                                source_path.display()
+                            );
+                        }
+                        continue;
                     }
                 } else {
-                    // No path state, fall through to other methods
+                    // package/git — fall through to other methods
                     "".to_string()
                 }
             };
@@ -2160,17 +2165,19 @@ impl Config {
             };
 
             // Record this extension's source path
-            // For path-based extensions, use the actual host path
-            // For other remote extensions, use the container path
-            let ext_config_path_str = if let Some(ref state) = ext_path_state {
-                if let Some(source_path) = state.path_mounts.get(&ext_name) {
-                    source_path
-                        .join("avocado.yaml")
-                        .to_string_lossy()
-                        .to_string()
+            // For path-based extensions, use the actual host path — recording
+            // the config file that actually exists (avocado.yml is a valid
+            // alternative to avocado.yaml) so downstream relative-path
+            // resolution reads the real file.
+            // For other remote extensions, use the container path.
+            let ext_config_path_str = if let Some(ref source_path) = path_source_dir {
+                let yml = source_path.join("avocado.yml");
+                let config_file = if yml.exists() {
+                    yml
                 } else {
-                    format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml")
-                }
+                    source_path.join("avocado.yaml")
+                };
+                config_file.to_string_lossy().to_string()
             } else {
                 format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml")
             };
