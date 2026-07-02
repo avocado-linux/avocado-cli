@@ -369,7 +369,7 @@ impl ConnectUploadCommand {
         Ok((runtime, num_artifacts))
     }
 
-    /// Read `avocado.yaml` (converted YAML→JSON) and `.avocado/lock.json`
+    /// Read `avocado.yaml` (converted YAML→JSON) and the lock file
     /// (raw JSON) to ship alongside the runtime create request.
     fn read_config_and_lockfile(
         &self,
@@ -384,7 +384,16 @@ impl ConnectUploadCommand {
         let project_root = Path::new(&self.config_path)
             .parent()
             .unwrap_or_else(|| Path::new("."));
-        let lockfile_path = project_root.join(".avocado").join("lock.json");
+        // Prefer the top-level `avocado.lock`, falling back to the legacy
+        // `.avocado/lock.json` for not-yet-migrated projects.
+        let lockfile_path = {
+            let new_path = crate::utils::lockfile::LockFile::get_path(project_root);
+            if new_path.exists() {
+                new_path
+            } else {
+                crate::utils::lockfile::LockFile::legacy_path(project_root)
+            }
+        };
         let lockfile_json = if lockfile_path.exists() {
             let content = std::fs::read_to_string(&lockfile_path)
                 .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;

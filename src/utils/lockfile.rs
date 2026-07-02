@@ -42,11 +42,15 @@ static LOCKFILE_SAVE_GATE: Mutex<()> = Mutex::new(());
 ///            exactly as before (track the live channel head).
 const LOCKFILE_VERSION: u32 = 7;
 
-/// Lock file name
-const LOCKFILE_NAME: &str = "lock.json";
+/// Lock file name. Lives at the top level of `src_dir` (like `Cargo.lock` /
+/// `flake.lock`) so `.avocado/` can be a purely-scratch, gitignored directory.
+const LOCKFILE_NAME: &str = "avocado.lock";
 
-/// Lock file directory within src_dir
-const LOCKFILE_DIR: &str = ".avocado";
+/// Legacy lock file location, used before the lock was promoted to a top-level
+/// `avocado.lock`: `<src_dir>/.avocado/lock.json`. Read once and migrated to the
+/// new path by [`LockFile::load`].
+const LEGACY_LOCKFILE_DIR: &str = ".avocado";
+const LEGACY_LOCKFILE_NAME: &str = "lock.json";
 
 /// Represents different sysroot types for package installation
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -480,9 +484,15 @@ impl LockFile {
         }
     }
 
-    /// Get the lock file path for a given src_dir
+    /// Get the lock file path for a given src_dir.
     pub fn get_path(src_dir: &Path) -> PathBuf {
-        src_dir.join(LOCKFILE_DIR).join(LOCKFILE_NAME)
+        src_dir.join(LOCKFILE_NAME)
+    }
+
+    /// Pre-relocation lock file path (`<src_dir>/.avocado/lock.json`). Used by
+    /// [`LockFile::load`] to migrate an existing lock to the new top-level path.
+    pub fn legacy_path(src_dir: &Path) -> PathBuf {
+        src_dir.join(LEGACY_LOCKFILE_DIR).join(LEGACY_LOCKFILE_NAME)
     }
 
     /// Load lock file from disk, or return a new one if it doesn't exist
@@ -500,20 +510,41 @@ impl LockFile {
     ///   `{ packages: <old>, extensions: {} }`.
     pub fn load(src_dir: &Path) -> Result<Self> {
         let path = Self::get_path(src_dir);
+        let legacy_path = Self::legacy_path(src_dir);
 
-        if !path.exists() {
+        // Prefer the top-level `avocado.lock`; fall back to reading a legacy
+        // `.avocado/lock.json`. `load()` is read-only: it never writes or
+        // relocates, so it can be called (including from within `save()`, which
+        // holds the save gate) without racing or leaving the legacy file
+        // half-migrated. Physical migration — writing `avocado.lock` and dropping
+        // the legacy file — happens on the next `save()` via `write_to_disk`,
+        // which runs under the gate.
+        let (content, read_path) = if path.exists() {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
+            (content, path)
+        } else if legacy_path.exists() {
+            let content = fs::read_to_string(&legacy_path)
+                .with_context(|| format!("Failed to read lock file: {}", legacy_path.display()))?;
+            (content, legacy_path)
+        } else {
             return Ok(Self::new());
-        }
+        };
 
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read lock file: {}", path.display()))?;
+        let lock_file = Self::parse_and_migrate(&content, &read_path)?;
 
-        // First, try to parse as current (v6) format. The new fields use
+        Ok(lock_file)
+    }
+
+    /// Parse lock file `content`, migrating older on-disk versions to the
+    /// current `LOCKFILE_VERSION`. `path` is used only for error messages.
+    fn parse_and_migrate(content: &str, path: &Path) -> Result<Self> {
+        // First, try to parse as current format. The newer fields use
         // `#[serde(default)]`, so v3/v4 files parse here and differ only in
         // the `version` field (bumped below). v5 files have the old runtime
         // shape and fail to parse, so they fall through to the explicit
         // migration path.
-        if let Ok(mut lock_file) = serde_json::from_str::<LockFile>(&content) {
+        if let Ok(mut lock_file) = serde_json::from_str::<LockFile>(content) {
             if lock_file.version > LOCKFILE_VERSION {
                 anyhow::bail!(
                     "Lock file version {} is newer than supported version {}. Please upgrade avocado-cli.",
@@ -537,7 +568,7 @@ impl LockFile {
         }
 
         // Fall through: parse as JSON and migrate from older shapes.
-        let old_lock: serde_json::Value = serde_json::from_str(&content)
+        let old_lock: serde_json::Value = serde_json::from_str(content)
             .with_context(|| format!("Failed to parse lock file: {}", path.display()))?;
 
         let version = old_lock
@@ -799,7 +830,12 @@ impl LockFile {
         // top so concurrent writers' updates accumulate instead of
         // clobbering each other.
         let path = Self::get_path(src_dir);
-        let to_write = if path.exists() {
+        // Merge with whatever `load()` returns so a save that happens before an
+        // explicit load doesn't clobber existing pins. `load()` reads the
+        // top-level `avocado.lock` if present, else a legacy `.avocado/lock.json`
+        // (an existing `avocado.lock` takes precedence — a legacy file alongside
+        // it is ignored). `write_to_disk` below then drops the legacy file.
+        let to_write = if path.exists() || Self::legacy_path(src_dir).exists() {
             let on_disk = Self::load(src_dir).context(
                 "Failed to reload lock file before merging — concurrent writer left disk in an unreadable state",
             )?;
@@ -844,7 +880,7 @@ impl LockFile {
             .with_context(|| "Failed to serialize lock file")?;
         let content_with_newline = format!("{content}\n");
 
-        let tmp_path = path.with_extension("json.tmp");
+        let tmp_path = path.with_extension("lock.tmp");
         fs::write(&tmp_path, content_with_newline)
             .with_context(|| format!("Failed to write lock file temp: {}", tmp_path.display()))?;
         fs::rename(&tmp_path, &path).with_context(|| {
@@ -854,6 +890,16 @@ impl LockFile {
                 path.display()
             )
         })?;
+
+        // Physical migration point: now that the canonical `avocado.lock` is on
+        // disk, drop any legacy `.avocado/lock.json` so the two can't diverge and
+        // no bundle ships both. Runs under the save gate (every writer holds it),
+        // and is best-effort: a lingering legacy is harmless since `load()` always
+        // prefers `avocado.lock`.
+        let legacy = Self::legacy_path(src_dir);
+        if legacy.exists() {
+            let _ = fs::remove_file(&legacy);
+        }
         Ok(())
     }
 
@@ -1796,7 +1842,52 @@ wget 1.21-r0.core2_64
         let path = LockFile::get_path(std::path::Path::new("/home/user/project"));
         assert_eq!(
             path,
+            std::path::PathBuf::from("/home/user/project/avocado.lock")
+        );
+        let legacy = LockFile::legacy_path(std::path::Path::new("/home/user/project"));
+        assert_eq!(
+            legacy,
             std::path::PathBuf::from("/home/user/project/.avocado/lock.json")
+        );
+    }
+
+    #[test]
+    fn test_legacy_lock_is_migrated_to_top_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path();
+
+        // Seed a legacy `.avocado/lock.json` and ensure the new path is absent.
+        let legacy = LockFile::legacy_path(src_dir);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let mut seed = LockFile::new();
+        let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
+        seed.set_locked_version("qemux86-64", &sdk_x86, "curl", "7.88.1-r0.x86_64");
+        fs::write(&legacy, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
+
+        // `load()` reads the legacy pins but does NOT write/relocate on its own.
+        let loaded = LockFile::load(src_dir).unwrap();
+        assert_eq!(
+            loaded
+                .get_locked_version("qemux86-64", &sdk_x86, "curl")
+                .map(String::as_str),
+            Some("7.88.1-r0.x86_64")
+        );
+        assert!(!LockFile::get_path(src_dir).exists());
+        assert!(legacy.exists());
+
+        // Migration happens on the next save (the gated write path): avocado.lock
+        // is written and the legacy file is dropped, pins preserved.
+        loaded.save(src_dir).unwrap();
+        assert!(LockFile::get_path(src_dir).exists());
+        assert!(!legacy.exists());
+
+        // Re-loading reads the new path and is stable.
+        let reloaded = LockFile::load(src_dir).unwrap();
+        assert_eq!(
+            reloaded
+                .get_locked_version("qemux86-64", &sdk_x86, "curl")
+                .map(String::as_str),
+            Some("7.88.1-r0.x86_64")
         );
     }
 
@@ -3011,9 +3102,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             }
         }"#;
         let temp_dir = tempfile::tempdir().unwrap();
-        let lock_dir = temp_dir.path().join(LOCKFILE_DIR);
-        fs::create_dir_all(&lock_dir).unwrap();
-        fs::write(lock_dir.join(LOCKFILE_NAME), v5_json).unwrap();
+        fs::write(LockFile::get_path(temp_dir.path()), v5_json).unwrap();
 
         let loaded = LockFile::load(temp_dir.path()).unwrap();
         assert_eq!(loaded.version, LOCKFILE_VERSION);
@@ -3049,9 +3138,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             }
         }"#;
         let temp_dir = tempfile::tempdir().unwrap();
-        let lock_dir = temp_dir.path().join(LOCKFILE_DIR);
-        fs::create_dir_all(&lock_dir).unwrap();
-        fs::write(lock_dir.join(LOCKFILE_NAME), v4_json).unwrap();
+        fs::write(LockFile::get_path(temp_dir.path()), v4_json).unwrap();
 
         let loaded = LockFile::load(temp_dir.path()).unwrap();
         assert_eq!(loaded.version, LOCKFILE_VERSION); // bumped to v5
@@ -3079,9 +3166,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let v6_json = r#"{"version":6,"distro_release":"2026","targets":{"qemux86-64":{"rootfs":{"avocado-pkg-rootfs":"1.0.0-r0"},"runtimes":{"dev":{"packages":{"base":"2.0.0-r0"}}}}}}
 "#;
         let temp_dir = TempDir::new().unwrap();
-        let lock_dir = temp_dir.path().join(LOCKFILE_DIR);
-        fs::create_dir_all(&lock_dir).unwrap();
-        fs::write(lock_dir.join(LOCKFILE_NAME), v6_json).unwrap();
+        fs::write(LockFile::get_path(temp_dir.path()), v6_json).unwrap();
 
         let loaded = LockFile::load(temp_dir.path()).unwrap();
         // Version bumped to v7.

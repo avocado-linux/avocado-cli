@@ -848,26 +848,45 @@ impl InitCommand {
                 format!("Failed to read existing '{}'", gitignore_path.display())
             })?;
 
-            // Check if .avocado-state is already in the .gitignore
-            if !existing_content.contains(".avocado-state") {
-                // Append to existing .gitignore
+            // Ensure both the legacy state file and the `.avocado/` scratch dir
+            // are ignored. `avocado.lock` is intentionally NOT ignored — it's a
+            // tracked, committed pin file (like Cargo.lock).
+            //
+            // Match whole lines (trimmed), not substrings: a substring test would
+            // treat a pre-existing `.avocado/lock.json` line as already covering
+            // `.avocado/` (so the broad scratch ignore is never added), and a bare
+            // `.avocado` entry would both fail a `.avocado/` substring test and be
+            // double-appended.
+            let existing_lines: std::collections::HashSet<&str> =
+                existing_content.lines().map(str::trim).collect();
+            let mut to_add = String::new();
+            if !existing_lines.contains(".avocado-state") {
+                to_add.push_str(".avocado-state\n");
+            }
+            if !existing_lines.contains(".avocado/") {
+                to_add.push_str(".avocado/\n");
+            }
+            if !to_add.is_empty() {
                 let mut updated_content = existing_content;
                 if !updated_content.ends_with('\n') {
                     updated_content.push('\n');
                 }
-                updated_content.push_str("\n# Avocado state files\n.avocado-state\n");
+                updated_content.push_str("\n# Avocado scratch + state (avocado.lock is tracked)\n");
+                updated_content.push_str(&to_add);
 
                 fs::write(&gitignore_path, updated_content)
                     .with_context(|| format!("Failed to update '{}'", gitignore_path.display()))?;
 
-                self.emit_info("✓ Updated .gitignore to ignore .avocado-state files.");
+                self.emit_info("✓ Updated .gitignore to ignore Avocado scratch files.");
             }
 
             return Ok(());
         }
 
-        // Create new .gitignore with Avocado-specific entries
-        let gitignore_content = "# Avocado state files\n.avocado-state\n";
+        // Create new .gitignore with Avocado-specific entries. `avocado.lock`
+        // is deliberately tracked (committed), so it is not listed here.
+        let gitignore_content =
+            "# Avocado scratch + state (avocado.lock is tracked)\n.avocado-state\n.avocado/\n";
 
         fs::write(&gitignore_path, gitignore_content).with_context(|| {
             format!(
