@@ -406,7 +406,9 @@ impl RuntimeDeployCommand {
                     })?;
                 let client = ConnectClient::from_profile(profile)?;
 
-                let signed = client.sign_for_deploy(&org, &collection.targets).await?;
+                let signed = client
+                    .sign_for_deploy(&org, &collection.targets, &collection.runtime_uuid)
+                    .await?;
 
                 std::fs::write(staging_dir.join("targets.json"), &signed.targets_json)
                     .context("Failed to write targets.json")?;
