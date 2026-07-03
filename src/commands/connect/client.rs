@@ -1422,10 +1422,17 @@ impl ConnectClient {
     }
 
     /// Sign TUF deploy metadata via the Connect platform.
+    ///
+    /// `runtime_uuid` is required — the server uses it to name the per-runtime
+    /// delegation role (`runtime-<uuid>`) so the returned `delegated_targets_json`
+    /// matches the path this CLI writes it to locally
+    /// (`delegations/runtime-<uuid>.json`), which is where the device's TUF
+    /// client expects to find it.
     pub async fn sign_for_deploy(
         &self,
         org: &str,
         targets: &[TargetFileInfo],
+        runtime_uuid: &str,
     ) -> Result<SignForDeployResponse> {
         let url = format!("{}/api/orgs/{}/signing/sign-for-deploy", self.api_url, org);
 
@@ -1433,7 +1440,7 @@ impl ConnectClient {
             .http
             .post(&url)
             .header("authorization", format!("Bearer {}", self.token))
-            .json(&serde_json::json!({ "targets": targets }))
+            .json(&serde_json::json!({ "targets": targets, "runtime_uuid": runtime_uuid }))
             .send()
             .await
             .context("Failed to sign deploy metadata")?;
