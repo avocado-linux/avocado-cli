@@ -287,7 +287,16 @@ impl RootfsImageCommand {
         print_info("Building rootfs image.", OutputLevel::Normal);
 
         let rootfs_filesystem = config.get_rootfs_filesystem();
-        let rootfs_node = composed.merged_value.get("rootfs");
+        // Honor per-target `target-<name>:` overrides inside the `rootfs:`
+        // section (e.g. a custom `--tag`). Apply the same override merge
+        // extensions use, but on the already-composed value so path-based
+        // rootfs sources (merge_path_based_image_sections) are preserved.
+        let rootfs_merged = composed
+            .merged_value
+            .get("rootfs")
+            .cloned()
+            .map(|v| config.resolve_overrides_in_value(v, &target_arch, None, "rootfs"));
+        let rootfs_node = rootfs_merged.as_ref();
         let post_install = get_post_install(rootfs_node);
         let permissions_section = config
             .rootfs_default()

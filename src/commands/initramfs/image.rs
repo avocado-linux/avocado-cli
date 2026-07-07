@@ -218,7 +218,16 @@ impl InitramfsImageCommand {
         print_info("Building initramfs image.", OutputLevel::Normal);
 
         let initramfs_filesystem = config.get_initramfs_filesystem();
-        let initramfs_node = composed.merged_value.get("initramfs");
+        // Honor per-target `target-<name>:` overrides inside the `initramfs:`
+        // section (e.g. a custom `--tag`). Apply the same override merge
+        // extensions use, but on the already-composed value so path-based
+        // sources (merge_path_based_image_sections) are preserved.
+        let initramfs_merged = composed
+            .merged_value
+            .get("initramfs")
+            .cloned()
+            .map(|v| config.resolve_overrides_in_value(v, &target_arch, None, "initramfs"));
+        let initramfs_node = initramfs_merged.as_ref();
         let post_install = get_post_install(initramfs_node);
         let permissions_section = config
             .initramfs_default()
