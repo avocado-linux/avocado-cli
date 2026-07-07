@@ -4,10 +4,10 @@
 //! kernel binary is just a file dropped into the rootfs sysroot by the
 //! `kernel-image-*` package. This command:
 //!
-//!   1. Locates the uncompressed kernel binary under
-//!      `$AVOCADO_PREFIX/rootfs/boot/` (preferring `Image-<kver>` over
-//!      compressed `*.gz`, skipping the metadata `System.map-*` and
-//!      `config-*` siblings).
+//!   1. Locates the kernel image staged by `rootfs install` at
+//!      `$AVOCADO_PREFIX/kernel/<kver>/Image` — a normalized symlink to the
+//!      arch's real kernel (Image on arm64, bzImage on x86-64, …), the same
+//!      location the runtime build reads.
 //!   2. When `kernel.image.type: kab` is set in avocado.yaml, wraps it
 //!      into a signed `.kab` using the SDK's `kabtool` — same recipe
 //!      `runtime build` uses, via the shared helper in `utils::kab_wrap`.
@@ -148,30 +148,22 @@ impl KernelImageCommand {
             String::new()
         };
 
-        // Locate the uncompressed kernel binary in the rootfs sysroot
-        // boot directory and copy it into $OUTPUT_DIR. Skip System.map /
-        // config metadata + .gz variants. Mirrors how runtime/build.rs
-        // computes AVOCADO_KERNEL_IMAGE for the wrap step.
+        // Resolve the kernel image staged by `rootfs install` at
+        // $AVOCADO_PREFIX/kernel/<kver>/Image — a normalized symlink to the
+        // arch's real kernel (Image on arm64, bzImage on x86-64, …). This is
+        // the SAME location runtime/build.rs reads, so standalone
+        // `avocado kernel image` locates the kernel identically across arches.
+        // (The raw rootfs/boot/ file keeps its arch-specific name, so scanning
+        // it only ever matched arm64's `Image`.)
         let internal_output_dir = "$AVOCADO_PREFIX/output/images";
         let locate_section = r#"
-ROOTFS_BOOT="$AVOCADO_PREFIX/rootfs/boot"
-if [ ! -d "$ROOTFS_BOOT" ]; then
-    echo "ERROR: rootfs sysroot has no /boot — run 'avocado rootfs install' first" >&2
-    exit 1
-fi
-KERNEL_SRC=""
-for f in "$ROOTFS_BOOT"/Image "$ROOTFS_BOOT"/Image-*; do
-    [ -f "$f" ] || continue
-    case "$f" in
-        *.gz|*/System.map-*|*/config-*) continue ;;
-    esac
-    KERNEL_SRC="$f"
-    break
-done
+KERNEL_SRC=$(ls "$AVOCADO_PREFIX"/kernel/*/Image 2>/dev/null | head -1)
 if [ -z "$KERNEL_SRC" ]; then
-    echo "ERROR: no uncompressed kernel image found in $ROOTFS_BOOT" >&2
+    echo "ERROR: no staged kernel image at $AVOCADO_PREFIX/kernel/*/Image — run 'avocado rootfs install' first" >&2
     exit 1
 fi
+# cp follows the Image symlink, copying the real kernel content under the
+# normalized name (same as the runtime build).
 KERNEL_BASENAME=$(basename "$KERNEL_SRC")
 AVOCADO_KERNEL_IMAGE="$OUTPUT_DIR/$KERNEL_BASENAME"
 cp -f "$KERNEL_SRC" "$AVOCADO_KERNEL_IMAGE"
