@@ -60,11 +60,13 @@ mod named_or_single_deserializer {
                 .map(|s| s.starts_with("target-") || s.starts_with("kernel-"))
                 .unwrap_or(false)
         };
+        let original_len = mapping.len();
         let mapping: serde_yaml::Mapping = mapping
             .iter()
             .filter(|(k, _)| !is_override_key(k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let had_override_keys = mapping.len() != original_len;
 
         let known: std::collections::HashSet<&str> = field_names.iter().copied().collect();
         let total = mapping.len();
@@ -77,7 +79,19 @@ mod named_or_single_deserializer {
         let value = serde_yaml::Value::Mapping(mapping);
 
         if field_key_count == 0 {
-            // Named-map form.
+            // Named-map form. `target-<name>:`/`kernel-<spec>:` overrides only
+            // make sense inside singleton form (they override the singleton's
+            // config fields), so their presence here means the section has no
+            // recognized config fields to override — most likely a mis-indented
+            // or misplaced override. Reject it rather than silently dropping it.
+            if had_override_keys {
+                return Err(de::Error::custom(format!(
+                    "{kind_label}: `target-<name>:`/`kernel-<spec>:` override keys are only valid \
+                     in singleton form (alongside config field keys like `{}`), not in named-map \
+                     form",
+                    field_names.join("`, `")
+                )));
+            }
             let named: HashMap<String, T> =
                 serde_yaml::from_value(value).map_err(de::Error::custom)?;
             return Ok(Some(named));
@@ -10857,6 +10871,74 @@ rootfs:
         // neither singleton fields nor named-map entries in the typed struct.
         assert!(rootfs.contains_key("default"));
         assert_eq!(rootfs.len(), 1);
+    }
+
+    #[test]
+    fn test_initramfs_target_override_keys_do_not_trip_mixed_form() {
+        // Same as the rootfs case, but for the `initramfs:` section.
+        let yaml = r#"
+initramfs:
+  image:
+    type: kab
+    args: '-b -t kos.layer.initramfs --tag base'
+  target-qemux86-64:
+    image:
+      args: '-b -t kos.layer.initramfs --tag qemu-x64'
+  target-qemuarm64:
+    image:
+      args: '-b -t kos.layer.initramfs --tag qemu-arm64'
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let initramfs = config.initramfs.as_ref().unwrap();
+        assert!(initramfs.contains_key("default"));
+        assert_eq!(initramfs.len(), 1);
+    }
+
+    #[test]
+    fn test_kernel_target_override_keys_do_not_trip_mixed_form() {
+        // The `kernel:` section honors both `target-<name>:` and `kernel-<spec>:`
+        // override sub-keys; neither must trip the mix-of-forms guard.
+        let yaml = r#"
+kernel:
+  image:
+    type: kab
+    args: '-b -t kos.layer.kernel --tag base'
+  target-qemux86-64:
+    image:
+      args: '-b -t kos.layer.kernel --tag qemu-x64'
+  kernel-6.6:
+    image:
+      args: '-b -t kos.layer.kernel --tag kernel-6-6'
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernel = config.kernel.as_ref().unwrap();
+        assert!(kernel.contains_key("default"));
+        assert_eq!(kernel.len(), 1);
+    }
+
+    #[test]
+    fn test_override_keys_in_named_map_form_are_rejected() {
+        // Override sub-keys only make sense in singleton form. When a section is
+        // in named-map form (no recognized config fields at the top level), a
+        // stray `target-*`/`kernel-*` key is almost certainly a mistake and must
+        // be rejected rather than silently dropped.
+        let yaml = r#"
+rootfs:
+  main:
+    image:
+      type: kab
+      args: '-b -t kos.layer.rootfs'
+  target-qemux86-64:
+    image:
+      args: '-b -t kos.layer.rootfs --tag qemu-x64'
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("override keys are only valid") && err.contains("rootfs"),
+            "got: {err}"
+        );
     }
 
     #[test]
