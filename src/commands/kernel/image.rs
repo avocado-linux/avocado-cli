@@ -107,14 +107,13 @@ impl KernelImageCommand {
         print_info("Building kernel image.", OutputLevel::Normal);
 
         // Honor per-target `target-<name>:` overrides inside the `kernel:`
-        // section (e.g. a custom `--tag`). Apply the same override merge
-        // extensions use, but on the already-composed value so path-based
-        // sources (merge_path_based_image_sections) are preserved.
-        let kernel_merged = composed
-            .merged_value
-            .get("kernel")
-            .cloned()
-            .map(|v| config.resolve_overrides_in_value(v, &target_arch, None, "kernel"));
+        // section (e.g. a custom `--tag`). Resolved on the already-composed
+        // value so path-based sources (merge_path_based_image_sections) are
+        // preserved. `kernel-<spec>:` overrides can't be applied here (the
+        // kernel version isn't known until inside the container), so the helper
+        // warns rather than silently dropping them.
+        let kernel_merged =
+            config.resolve_image_section(&composed.merged_value, "kernel", &target_arch);
         let kernel_node = kernel_merged.as_ref();
         let image_type = kernel_node
             .and_then(get_ext_image_type)
