@@ -701,8 +701,19 @@ echo "TUF repository assembled at $REPO_DIR"
 ls -la "$REPO_DIR/metadata/"
 ls -la "$REPO_DIR/targets/"
 
-# Start HTTP server bound to all interfaces so the device can reach it
-python3 -m http.server "$PORT" --bind 0.0.0.0 --directory "$REPO_DIR" &
+# Start HTTP server bound to all interfaces so the device can reach it.
+# Use an inline server rather than `python3 -m http.server`: the latter calls
+# socket.getfqdn() in server_bind() BEFORE listen(), and on hosts with slow
+# reverse DNS (e.g. a container resolver with no PTR record) that lookup blocks
+# ~10s, so the socket accepts no connections until it returns -- long past the
+# readiness wait below, making the device fetch fail with "connection refused".
+# Neutralizing getfqdn makes the server listen immediately.
+python3 -c '
+import sys, socket, functools, http.server
+socket.getfqdn = lambda *a: ""
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[2])
+http.server.HTTPServer(("0.0.0.0", int(sys.argv[1])), handler).serve_forever()
+' "$PORT" "$REPO_DIR" &
 HTTP_PID=$!
 
 cleanup() {{
@@ -712,7 +723,27 @@ cleanup() {{
 }}
 trap cleanup EXIT
 
-sleep 1
+# Wait until the repo server actually accepts connections before pointing the
+# device at it. A fixed sleep races server startup latency; poll the port so
+# any bind delay is tolerated (bounded to ~30s). The server is backgrounded, so
+# `set -e` cannot catch a bind failure -- check the process is still alive each
+# iteration and fail fast with an actionable message if it dies or never binds.
+REPO_READY=
+for _ in $(seq 1 60); do
+    if ! kill -0 "$HTTP_PID" 2>/dev/null; then
+        echo "ERROR: repo server (pid $HTTP_PID) exited before listening on port $PORT" >&2
+        exit 1
+    fi
+    if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1])))==0 else 1)' "$PORT" 2>/dev/null; then
+        REPO_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [ -z "$REPO_READY" ]; then
+    echo "ERROR: repo server did not become reachable on port $PORT within 30s" >&2
+    exit 1
+fi
 
 # Determine the IP the device should use to reach this HTTP server.
 # AVOCADO_DEPLOY_REPO_HOST overrides all auto-detection (useful for QEMU
@@ -1111,7 +1142,7 @@ mod tests {
         assert!(script.contains("SSH_DEST=\"root@device.local\""));
         assert!(script.contains("DEVICE_HOST=\"device.local\""));
         assert!(script.contains("SSH_PORT_ARGS=\"\""));
-        assert!(script.contains("python3 -m http.server"));
+        assert!(script.contains("http.server.HTTPServer((\"0.0.0.0\", int(sys.argv[1]))"));
         assert!(script.contains("avocadoctl runtime add --url"));
         assert!(script.contains("ssh -o StrictHostKeyChecking=no"));
         assert!(script.contains("delegations/runtime-${RUNTIME_UUID}.json"));
@@ -1328,7 +1359,8 @@ mod tests {
 
         let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
-        assert!(script.contains("--bind 0.0.0.0"));
+        // The inline repo server binds all interfaces so the device can reach it.
+        assert!(script.contains("(\"0.0.0.0\", int(sys.argv[1]))"));
     }
 
     #[test]
