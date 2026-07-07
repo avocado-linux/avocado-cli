@@ -443,6 +443,9 @@ enum Commands {
         dnf_args: Option<Vec<String>>,
         /// Sign TUF metadata via the Connect platform instead of locally.
         /// Use this when deploying to a device that has received a Connect OTA update.
+        /// Requires a local signing key configured for the runtime (Level 2:
+        /// `signing.key` + `avocado connect trust promote-root`); without one no
+        /// root.json is baked and the deploy fails during Phase 1 hash collection.
         #[arg(long)]
         connect_sign: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
@@ -1788,6 +1791,9 @@ enum RuntimeCommands {
         dnf_args: Option<Vec<String>>,
         /// Sign TUF metadata via the Connect platform instead of locally.
         /// Use this when deploying to a device that has received a Connect OTA update.
+        /// Requires a local signing key configured for the runtime (Level 2:
+        /// `signing.key` + `avocado connect trust promote-root`); without one no
+        /// root.json is baked and the deploy fails during Phase 1 hash collection.
         #[arg(long)]
         connect_sign: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
