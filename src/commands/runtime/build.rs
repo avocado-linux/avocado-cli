@@ -1389,27 +1389,28 @@ fi"#
                 .join(" ")
         };
 
-        // Resolve `image:` config for rootfs / initramfs / kernel. Same
-        // dynamic accessors as extensions — the helpers don't care about
-        // the parent yaml node's identity.
-        let resolve_img = |yaml_key: &str| -> (String, Option<String>) {
-            // Honor per-target `target-<name>:` overrides (e.g. a custom
-            // `--tag`) inside the rootfs/initramfs/kernel section, matching the
-            // standalone `avocado <role> image` commands.
-            let merged = parsed
-                .get(yaml_key)
-                .cloned()
-                .map(|v| config.resolve_overrides_in_value(v, target_arch, None, yaml_key));
-            let node = merged.as_ref();
-            let t = node
+        // Resolve the rootfs / initramfs / kernel sections once, folding in
+        // per-target `target-<name>:` overrides (e.g. a custom `--tag`) to match
+        // the standalone `avocado <role> image` commands. Resolving once here
+        // means every reader below (image type/args *and* `post_install`) sees
+        // the same per-target node instead of the raw section.
+        let rootfs_section = config.resolve_image_section(parsed, "rootfs", target_arch);
+        let initramfs_section = config.resolve_image_section(parsed, "initramfs", target_arch);
+        let kernel_section = config.resolve_image_section(parsed, "kernel", target_arch);
+
+        // Extract `image:` type/args from an already-resolved section. Same
+        // dynamic accessors as extensions — the helpers don't care about the
+        // parent yaml node's identity.
+        let resolve_img = |section: Option<&serde_yaml::Value>| -> (String, Option<String>) {
+            let t = section
                 .and_then(crate::utils::config::get_ext_image_type)
                 .unwrap_or_else(|| "raw".to_string());
-            let a = node.and_then(crate::utils::config::get_ext_image_args);
+            let a = section.and_then(crate::utils::config::get_ext_image_args);
             (t, a)
         };
-        let (rootfs_image_type, rootfs_image_args) = resolve_img("rootfs");
-        let (initramfs_image_type, initramfs_image_args) = resolve_img("initramfs");
-        let (kernel_image_type, kernel_image_args) = resolve_img("kernel");
+        let (rootfs_image_type, rootfs_image_args) = resolve_img(rootfs_section.as_ref());
+        let (initramfs_image_type, initramfs_image_args) = resolve_img(initramfs_section.as_ref());
+        let (kernel_image_type, kernel_image_args) = resolve_img(kernel_section.as_ref());
 
         // Default kabtool args mirror ext/image.rs:879. Used when the
         // config provides `image: { type: kab }` without an explicit `args`.
@@ -2268,7 +2269,10 @@ echo "Docker image priming complete.""#,
             .resolve_runtime_initramfs(&self.runtime_name)
             .or_else(|| config.initramfs_default());
 
-        let rootfs_post_install = get_post_install(parsed.get("rootfs"));
+        // Read `post_install` from the per-target-resolved section (not raw
+        // `parsed`) so a `target-<name>:` override's script is honored, matching
+        // how the image tag override is applied above.
+        let rootfs_post_install = get_post_install(rootfs_section.as_ref());
         let rootfs_permissions_section = render_perms(resolved_rootfs, "$ROOTFS_WORK/etc");
         let rootfs_build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
@@ -2277,7 +2281,7 @@ echo "Docker image priming complete.""#,
             &rootfs_permissions_section,
         );
 
-        let initramfs_post_install = get_post_install(parsed.get("initramfs"));
+        let initramfs_post_install = get_post_install(initramfs_section.as_ref());
         let initramfs_permissions_section = render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
         let initramfs_build_section = generate_initramfs_build_script(
             NAMESPACE_UUID,

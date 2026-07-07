@@ -41,7 +41,7 @@ mod named_or_single_deserializer {
         if value.is_null() {
             return Ok(None);
         }
-        let mapping = match &value {
+        let mut mapping = match value {
             serde_yaml::Value::Mapping(m) => m,
             _ => {
                 return Err(de::Error::custom(format!(
@@ -50,52 +50,46 @@ mod named_or_single_deserializer {
             }
         };
 
-        // Per-target / per-kernel override sub-keys (`target-<name>:`,
-        // `kernel-<spec>:`) are resolved later by the image commands on the raw
-        // composed value. Drop them before shape inference and the typed
-        // deserialize below, so a `rootfs: { image: ..., target-qemux86-64: ... }`
-        // isn't mistaken for a mix of singleton + named-map forms.
-        let is_override_key = |k: &serde_yaml::Value| {
-            k.as_str()
-                .map(|s| s.starts_with("target-") || s.starts_with("kernel-"))
-                .unwrap_or(false)
-        };
-        let original_len = mapping.len();
-        let mapping: serde_yaml::Mapping = mapping
-            .iter()
-            .filter(|(k, _)| !is_override_key(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let had_override_keys = mapping.len() != original_len;
-
         let known: std::collections::HashSet<&str> = field_names.iter().copied().collect();
-        let total = mapping.len();
         let field_key_count = mapping
             .iter()
             .filter_map(|(k, _)| k.as_str())
             .filter(|s| known.contains(s))
             .count();
 
-        let value = serde_yaml::Value::Mapping(mapping);
-
         if field_key_count == 0 {
-            // Named-map form. `target-<name>:`/`kernel-<spec>:` overrides only
-            // make sense inside singleton form (they override the singleton's
-            // config fields), so their presence here means the section has no
-            // recognized config fields to override — most likely a mis-indented
-            // or misplaced override. Reject it rather than silently dropping it.
-            if had_override_keys {
-                return Err(de::Error::custom(format!(
-                    "{kind_label}: `target-<name>:`/`kernel-<spec>:` override keys are only valid \
-                     in singleton form (alongside config field keys like `{}`), not in named-map \
-                     form",
-                    field_names.join("`, `")
-                )));
-            }
+            // Named-map form: none of the top-level keys are config fields, so
+            // every key is an entry name — including names that happen to start
+            // with `target-`/`kernel-` (e.g. a `kernel: { kernel-lts: ... }` map
+            // referenced elsewhere by name). Don't treat those as overrides here;
+            // that reserved-prefix handling only applies inside singleton form.
             let named: HashMap<String, T> =
-                serde_yaml::from_value(value).map_err(de::Error::custom)?;
+                serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
+                    .map_err(de::Error::custom)?;
             return Ok(Some(named));
         }
+
+        // Singleton form. Per-target / per-kernel override sub-keys
+        // (`target-<name>:`, `kernel-<spec>:`) are resolved later by the image
+        // commands on the raw composed value; strip them here so they don't
+        // count as unknown singleton fields and falsely trip the mixed-form
+        // guard below. Probe first so the common override-free config skips the
+        // mutation entirely.
+        let is_override_key = |k: &serde_yaml::Value| {
+            k.as_str()
+                .map(|s| s.starts_with("target-") || s.starts_with("kernel-"))
+                .unwrap_or(false)
+        };
+        if mapping.keys().any(is_override_key) {
+            mapping.retain(|k, _| !is_override_key(k));
+        }
+
+        let total = mapping.len();
+        let field_key_count = mapping
+            .iter()
+            .filter_map(|(k, _)| k.as_str())
+            .filter(|s| known.contains(s))
+            .count();
 
         if field_key_count != total {
             return Err(de::Error::custom(format!(
@@ -106,7 +100,8 @@ mod named_or_single_deserializer {
         }
 
         // Singleton form — wrap as the implicit `default` entry.
-        let single: T = serde_yaml::from_value(value).map_err(de::Error::custom)?;
+        let single: T = serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
+            .map_err(de::Error::custom)?;
         let mut result = HashMap::new();
         result.insert("default".to_string(), single);
         Ok(Some(result))
@@ -2993,6 +2988,42 @@ impl Config {
     ) -> serde_yaml::Value {
         let cleaned = self.resolve_overrides_in_value(base, current_target, None, "<override>");
         self.merge_values(cleaned, target_override)
+    }
+
+    /// Pull a top-level image section (`rootfs` / `initramfs` / `kernel`) out of
+    /// a composed value and fold in its `target-<name>:` overrides for `target`.
+    ///
+    /// Shared by the standalone `avocado <role> image` commands and
+    /// `runtime build` so every reader of the section (image tag/type *and*
+    /// `post_install`) sees the same per-target-resolved node. Returns `None`
+    /// when the section is absent.
+    ///
+    /// These build paths don't know the kernel version at CLI time (it's only
+    /// discovered inside the container from the `Image-*` glob), so
+    /// `kernel-<spec>:` overrides can't be resolved here. Rather than dropping
+    /// them silently, warn: only `target-<name>:` overrides are honored for
+    /// image builds.
+    pub fn resolve_image_section(
+        &self,
+        composed: &serde_yaml::Value,
+        section: &str,
+        target: &str,
+    ) -> Option<serde_yaml::Value> {
+        let node = composed.get(section)?.clone();
+        if node.as_mapping().is_some_and(|m| {
+            m.keys()
+                .any(|k| k.as_str().is_some_and(|s| s.starts_with("kernel-")))
+        }) {
+            print_warning(
+                &format!(
+                    "`kernel-<spec>:` overrides in `{section}:` are ignored when building images \
+                     (the kernel version isn't known at build time); only `target-<name>:` \
+                     overrides are honored here."
+                ),
+                OutputLevel::Normal,
+            );
+        }
+        Some(self.resolve_overrides_in_value(node, target, None, section))
     }
 
     /// Apply prefix-dispatched override sub-sections in `value`. Supports:
@@ -10917,28 +10948,44 @@ kernel:
     }
 
     #[test]
-    fn test_override_keys_in_named_map_form_are_rejected() {
-        // Override sub-keys only make sense in singleton form. When a section is
-        // in named-map form (no recognized config fields at the top level), a
-        // stray `target-*`/`kernel-*` key is almost certainly a mistake and must
-        // be rejected rather than silently dropped.
+    fn test_named_map_entries_with_reserved_prefixes_are_not_stripped() {
+        // Reserved-prefix stripping only applies inside singleton form. A
+        // named-map section whose *entry names* start with `kernel-`/`target-`
+        // (e.g. a `kernel:` map referenced elsewhere by name) must round-trip as
+        // named entries, not be mistaken for overrides and dropped/rejected.
+        let yaml = r#"
+kernel:
+  kernel-lts:
+    version: '6.6'
+  kernel-mainline:
+    version: '6.12'
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let kernel = config.kernel.as_ref().unwrap();
+        assert_eq!(kernel.len(), 2);
+        assert!(kernel.contains_key("kernel-lts"));
+        assert!(kernel.contains_key("kernel-mainline"));
+    }
+
+    #[test]
+    fn test_per_target_only_section_parses() {
+        // A section with only `target-<name>:` sub-keys and no shared base field
+        // has no recognized config fields, so it parses as a named map (matching
+        // pre-override behavior) rather than hard-erroring. The image commands
+        // still resolve the per-target override on the raw composed value.
         let yaml = r#"
 rootfs:
-  main:
-    image:
-      type: kab
-      args: '-b -t kos.layer.rootfs'
   target-qemux86-64:
     image:
       args: '-b -t kos.layer.rootfs --tag qemu-x64'
+  target-qemuarm64:
+    image:
+      args: '-b -t kos.layer.rootfs --tag qemu-arm64'
 "#;
-        let err = serde_yaml::from_str::<Config>(yaml)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("override keys are only valid") && err.contains("rootfs"),
-            "got: {err}"
-        );
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let rootfs = config.rootfs.as_ref().unwrap();
+        assert_eq!(rootfs.len(), 2);
+        assert!(rootfs.contains_key("target-qemux86-64"));
     }
 
     #[test]
