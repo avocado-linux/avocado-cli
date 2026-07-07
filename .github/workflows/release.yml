@@ -28,8 +28,9 @@ jobs:
         with:
           generate_release_notes: true
           # RCs ship as full "latest" releases so the update tooling and Homebrew
-          # present them to users. alpha/beta remain internal-only prereleases.
-          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          # present them to users. Every other prerelease label (alpha, beta,
+          # preview, ...) stays an internal-only prerelease.
+          prerelease: ${{ contains(github.ref_name, '-') && !contains(github.ref_name, '-rc') }}
 
   release:
     permissions:
