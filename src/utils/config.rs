@@ -50,6 +50,22 @@ mod named_or_single_deserializer {
             }
         };
 
+        // Per-target / per-kernel override sub-keys (`target-<name>:`,
+        // `kernel-<spec>:`) are resolved later by the image commands on the raw
+        // composed value. Drop them before shape inference and the typed
+        // deserialize below, so a `rootfs: { image: ..., target-qemux86-64: ... }`
+        // isn't mistaken for a mix of singleton + named-map forms.
+        let is_override_key = |k: &serde_yaml::Value| {
+            k.as_str()
+                .map(|s| s.starts_with("target-") || s.starts_with("kernel-"))
+                .unwrap_or(false)
+        };
+        let mapping: serde_yaml::Mapping = mapping
+            .iter()
+            .filter(|(k, _)| !is_override_key(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         let known: std::collections::HashSet<&str> = field_names.iter().copied().collect();
         let total = mapping.len();
         let field_key_count = mapping
@@ -57,6 +73,8 @@ mod named_or_single_deserializer {
             .filter_map(|(k, _)| k.as_str())
             .filter(|s| known.contains(s))
             .count();
+
+        let value = serde_yaml::Value::Mapping(mapping);
 
         if field_key_count == 0 {
             // Named-map form.
@@ -10814,6 +10832,31 @@ rootfs:
             err.contains("cannot mix") && err.contains("rootfs"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_rootfs_target_override_keys_do_not_trip_mixed_form() {
+        // Per-target override sub-keys inside a singleton rootfs must not trip
+        // the mix-of-forms guard; they are stripped from the typed struct
+        // (the image command resolves them on the raw composed value for the tag).
+        let yaml = r#"
+rootfs:
+  image:
+    type: kab
+    args: '-b -t kos.layer.rootfs --tag base'
+  target-qemux86-64:
+    image:
+      args: '-b -t kos.layer.rootfs --tag qemu-x64'
+  target-qemuarm64:
+    image:
+      args: '-b -t kos.layer.rootfs --tag qemu-arm64'
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let rootfs = config.rootfs.as_ref().unwrap();
+        // Only the synthesized `default` singleton entry; override keys are
+        // neither singleton fields nor named-map entries in the typed struct.
+        assert!(rootfs.contains_key("default"));
+        assert_eq!(rootfs.len(), 1);
     }
 
     #[test]

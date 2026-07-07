@@ -1393,7 +1393,14 @@ fi"#
         // dynamic accessors as extensions — the helpers don't care about
         // the parent yaml node's identity.
         let resolve_img = |yaml_key: &str| -> (String, Option<String>) {
-            let node = parsed.get(yaml_key);
+            // Honor per-target `target-<name>:` overrides (e.g. a custom
+            // `--tag`) inside the rootfs/initramfs/kernel section, matching the
+            // standalone `avocado <role> image` commands.
+            let merged = parsed
+                .get(yaml_key)
+                .cloned()
+                .map(|v| config.resolve_overrides_in_value(v, target_arch, None, yaml_key));
+            let node = merged.as_ref();
             let t = node
                 .and_then(crate::utils::config::get_ext_image_type)
                 .unwrap_or_else(|| "raw".to_string());

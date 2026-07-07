@@ -106,7 +106,16 @@ impl KernelImageCommand {
 
         print_info("Building kernel image.", OutputLevel::Normal);
 
-        let kernel_node = composed.merged_value.get("kernel");
+        // Honor per-target `target-<name>:` overrides inside the `kernel:`
+        // section (e.g. a custom `--tag`). Apply the same override merge
+        // extensions use, but on the already-composed value so path-based
+        // sources (merge_path_based_image_sections) are preserved.
+        let kernel_merged = composed
+            .merged_value
+            .get("kernel")
+            .cloned()
+            .map(|v| config.resolve_overrides_in_value(v, &target_arch, None, "kernel"));
+        let kernel_node = kernel_merged.as_ref();
         let image_type = kernel_node
             .and_then(get_ext_image_type)
             .unwrap_or_else(|| "raw".to_string());
