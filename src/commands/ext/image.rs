@@ -450,19 +450,22 @@ impl ExtImageCommand {
                     }
                 }
 
-                if let Some(ext_val) = ext_section {
-                    let base_ext = ext_val.clone();
-                    // Check for target-specific override within this extension
-                    let target_override = ext_val.get(&target).cloned();
-                    if let Some(override_val) = target_override {
-                        // Merge target override into base, filtering out other target sections
-                        Some(config.merge_target_override(base_ext, override_val, &target))
-                    } else {
-                        Some(base_ext)
-                    }
-                } else {
-                    None
-                }
+                // Resolve target-<name>: / kernel-<spec>: / legacy bare <name>:
+                // overrides from the composed extension value (find_ext_in_mapping
+                // returns it raw). Using resolve_overrides_in_value here — rather
+                // than only checking a bare `<target>:` key — means the preferred
+                // `target-<name>:` form is honored in the runtime-build path too
+                // (previously only the standalone `Local` path resolved it, so a
+                // path-sourced ext in `avocado build` got the base config: no
+                // per-target overlay and the base `--tag`).
+                ext_section.map(|ext_val| {
+                    config.resolve_overrides_in_value(
+                        ext_val.clone(),
+                        &target,
+                        None,
+                        &format!("extensions.{}", self.extension),
+                    )
+                })
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
