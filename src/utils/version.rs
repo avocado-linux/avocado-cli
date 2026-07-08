@@ -51,7 +51,16 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
         )
     })?;
 
-    if !req.matches(&running) {
+    // First try the exact running version, so a requirement that explicitly
+    // pins a pre-release (e.g. "=1.0.0-rc.1") is still satisfiable when running
+    // that build. Then fall back to the running version with pre-release/build
+    // metadata stripped: semver only lets a pre-release satisfy a comparator
+    // that carries a matching pre-release tag, so without this fallback an
+    // ordinary requirement like ">=0.25" or "^1" would spuriously reject every
+    // RC build. The full version is still shown in the error message below.
+    let running_release = Version::new(running.major, running.minor, running.patch);
+
+    if !req.matches(&running) && !req.matches(&running_release) {
         anyhow::bail!(
             "This project requires avocado CLI version '{requirement}', \
              but you are running version {running}.\n\n\
@@ -87,11 +96,15 @@ mod tests {
 
     #[test]
     fn test_check_cli_requirement_satisfied() {
-        // Current version is 0.25.1, so >=0.0.1 should pass
+        // Any released version is >= 0.0.1. This also covers pre-release builds
+        // (e.g. `1.0.0-rc.0`), which are matched as their release version.
         assert!(check_cli_requirement(">=0.0.1").is_ok());
         // Exact current version
         let current = env!("CARGO_PKG_VERSION");
         assert!(check_cli_requirement(&format!(">={current}")).is_ok());
+        // A requirement that explicitly pins the exact running version —
+        // including a pre-release tag — must still match that build.
+        assert!(check_cli_requirement(&format!("={current}")).is_ok());
     }
 
     #[test]
@@ -106,8 +119,10 @@ mod tests {
 
     #[test]
     fn test_check_cli_requirement_complex() {
-        // Caret requirement that should match
-        assert!(check_cli_requirement("^0").is_ok());
+        // Caret requirement on the running major should match (derived so the
+        // test doesn't rot across major bumps).
+        let major = Version::parse(env!("CARGO_PKG_VERSION")).unwrap().major;
+        assert!(check_cli_requirement(&format!("^{major}")).is_ok());
         // Wildcard that matches anything
         assert!(check_cli_requirement("*").is_ok());
     }
