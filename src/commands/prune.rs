@@ -6,11 +6,10 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
 use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
-use crate::utils::volume::VolumeState;
+use crate::utils::volume::avo_abandonment_reason;
 
 /// Information about a Docker volume from `docker volume inspect`
 #[derive(Debug, Clone, Deserialize)]
@@ -207,59 +206,20 @@ impl PruneCommand {
     /// 2. If .avocado-state file exists in that directory
     /// 3. If the state file links back to this volume's UUID
     async fn classify_avo_volume(&self, volume_name: &str) -> Result<VolumeStatus> {
-        // Get volume info including labels
+        // Read the recorded source_path label, then delegate the on-disk
+        // decision to the shared classifier so `prune` and the init-time
+        // reap agree on what "abandoned" means.
         let volume_info = self.inspect_volume(volume_name).await?;
+        let source_path = volume_info
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("avocado.source_path"))
+            .map(String::as_str);
 
-        // Get the source_path label
-        let source_path = match &volume_info.labels {
-            Some(labels) => labels.get("avocado.source_path"),
-            None => None,
-        };
-
-        let source_path = match source_path {
-            Some(path) => path,
-            None => {
-                return Ok(VolumeStatus::Abandoned(
-                    "no source_path label found".to_string(),
-                ));
-            }
-        };
-
-        // Check if the source directory exists
-        let source_dir = Path::new(source_path);
-        if !source_dir.exists() {
-            return Ok(VolumeStatus::Abandoned(format!(
-                "source directory '{source_path}' does not exist"
-            )));
-        }
-
-        // Check for .avocado-state file
-        let state_file = source_dir.join(".avocado-state");
-        if !state_file.exists() {
-            return Ok(VolumeStatus::Abandoned(format!(
-                "no .avocado-state file in '{source_path}'"
-            )));
-        }
-
-        // Load and verify the state file links to this volume
-        match VolumeState::load_from_dir(source_dir) {
-            Ok(Some(state)) => {
-                if state.volume_name == volume_name {
-                    Ok(VolumeStatus::Active)
-                } else {
-                    Ok(VolumeStatus::Abandoned(format!(
-                        ".avocado-state links to '{}', not this volume",
-                        state.volume_name
-                    )))
-                }
-            }
-            Ok(None) => Ok(VolumeStatus::Abandoned(format!(
-                "could not read .avocado-state in '{source_path}'"
-            ))),
-            Err(e) => Ok(VolumeStatus::Abandoned(format!(
-                "error reading .avocado-state: {e}"
-            ))),
-        }
+        Ok(match avo_abandonment_reason(volume_name, source_path) {
+            Some(reason) => VolumeStatus::Abandoned(reason),
+            None => VolumeStatus::Active,
+        })
     }
 
     /// Classify an avocado-src-* or avocado-state-* volume

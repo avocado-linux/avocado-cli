@@ -70,6 +70,41 @@ impl VolumeState {
     }
 }
 
+/// Decide whether an `avo-<uuid>` volume is abandoned, based solely on
+/// on-disk state (no container calls), given the `avocado.source_path`
+/// label recorded on the volume when it was created.
+///
+/// Returns `Some(reason)` when the volume is a stale leftover safe to
+/// reap, or `None` when it is still bound to a live project. The checks
+/// mirror the ones `avocado prune` applies so both paths agree on what
+/// "abandoned" means.
+pub fn avo_abandonment_reason(volume_name: &str, source_path: Option<&str>) -> Option<String> {
+    let source_path = match source_path {
+        Some(path) => path,
+        None => return Some("no source_path label found".to_string()),
+    };
+
+    let source_dir = Path::new(source_path);
+    if !source_dir.exists() {
+        return Some(format!("source directory '{source_path}' does not exist"));
+    }
+
+    let state_file = source_dir.join(".avocado-state");
+    if !state_file.exists() {
+        return Some(format!("no .avocado-state file in '{source_path}'"));
+    }
+
+    match VolumeState::load_from_dir(source_dir) {
+        Ok(Some(state)) if state.volume_name == volume_name => None,
+        Ok(Some(state)) => Some(format!(
+            ".avocado-state links to '{}', not this volume",
+            state.volume_name
+        )),
+        Ok(None) => Some(format!("could not read .avocado-state in '{source_path}'")),
+        Err(e) => Some(format!("error reading .avocado-state: {e}")),
+    }
+}
+
 /// Docker volume manager for Avocado operations
 pub struct VolumeManager {
     container_tool: String,
@@ -109,6 +144,20 @@ impl VolumeManager {
             }
         }
 
+        // We're about to mint a fresh volume for this project. That's the
+        // natural moment to sweep volumes left behind by projects deleted
+        // from disk without `avocado clean`: a manual `rm -rf` drops the
+        // project folder but not its per-project `avo-<uuid>` volume, so
+        // they otherwise accumulate forever. Best-effort by design — a
+        // container-tool hiccup must never block volume creation.
+        let reaped = self.reap_abandoned_avo_volumes().await;
+        if !reaped.is_empty() && self.verbose {
+            print_info(
+                &format!("Reaped {} abandoned build volume(s).", reaped.len()),
+                OutputLevel::Normal,
+            );
+        }
+
         // Create new volume state
         let state = VolumeState::new(source_dir.to_path_buf(), self.container_tool.clone());
 
@@ -126,6 +175,72 @@ impl VolumeManager {
         }
 
         Ok(state)
+    }
+
+    /// Best-effort removal of abandoned `avo-*` volumes left behind by
+    /// projects deleted from disk without `avocado clean`. Each `avo-*`
+    /// volume is classified with [`avo_abandonment_reason`] and removed
+    /// when abandoned. Any container-tool failure — daemon down, volume
+    /// still held by a container — is swallowed so this never blocks the
+    /// caller. Returns the names of the volumes actually removed.
+    pub async fn reap_abandoned_avo_volumes(&self) -> Vec<String> {
+        let names = match self.list_avo_volumes().await {
+            Ok(names) => names,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut removed = Vec::new();
+        for name in names {
+            let source_path = self.inspect_source_path_label(&name).await;
+            if avo_abandonment_reason(&name, source_path.as_deref()).is_some()
+                && self.remove_volume(&name).await.is_ok()
+            {
+                removed.push(name);
+            }
+        }
+        removed
+    }
+
+    /// List every `avo-*` docker volume name.
+    async fn list_avo_volumes(&self) -> Result<Vec<String>> {
+        let output = AsyncCommand::new(&self.container_tool)
+            .args(["volume", "ls", "--format", "{{.Name}}"])
+            .output()
+            .await
+            .with_context(|| "Failed to list docker volumes")?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to list docker volumes");
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.starts_with("avo-"))
+            .map(|s| s.to_string())
+            .collect())
+    }
+
+    /// Read the `avocado.source_path` label off a volume. Returns `None`
+    /// when the volume is missing, unlabeled, or the inspect output
+    /// cannot be parsed.
+    async fn inspect_source_path_label(&self, volume_name: &str) -> Option<String> {
+        let output = AsyncCommand::new(&self.container_tool)
+            .args(["volume", "inspect", volume_name])
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let infos: Vec<VolumeInfo> =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).ok()?;
+        infos
+            .into_iter()
+            .next()
+            .and_then(|info| info.labels)
+            .and_then(|labels| labels.get("avocado.source_path").cloned())
     }
 
     /// Check if a docker volume exists
@@ -436,5 +551,54 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let result = VolumeState::load_from_dir(temp_dir.path()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_abandonment_reason_active_when_state_matches() {
+        // A volume whose recorded source directory still holds a
+        // .avocado-state file pointing back at it is live: no reason.
+        let temp_dir = TempDir::new().unwrap();
+        let state = VolumeState::new(temp_dir.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(temp_dir.path()).unwrap();
+
+        assert_eq!(
+            avo_abandonment_reason(&state.volume_name, Some(&state.source_path)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_abandonment_reason_no_source_path_label() {
+        let reason = avo_abandonment_reason("avo-x", None).unwrap();
+        assert!(reason.contains("no source_path label"));
+    }
+
+    #[test]
+    fn test_abandonment_reason_missing_source_dir() {
+        let reason =
+            avo_abandonment_reason("avo-x", Some("/nonexistent/avocado/project/xyz")).unwrap();
+        assert!(reason.contains("does not exist"));
+    }
+
+    #[test]
+    fn test_abandonment_reason_no_state_file() {
+        // Source dir exists but carries no .avocado-state: abandoned.
+        let temp_dir = TempDir::new().unwrap();
+        let reason =
+            avo_abandonment_reason("avo-x", Some(temp_dir.path().to_str().unwrap())).unwrap();
+        assert!(reason.contains("no .avocado-state"));
+    }
+
+    #[test]
+    fn test_abandonment_reason_state_points_elsewhere() {
+        // The state file links to a different volume name, so this
+        // volume is a stale leftover safe to reap.
+        let temp_dir = TempDir::new().unwrap();
+        let state = VolumeState::new(temp_dir.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(temp_dir.path()).unwrap();
+
+        let reason =
+            avo_abandonment_reason("avo-different-uuid", Some(&state.source_path)).unwrap();
+        assert!(reason.contains("not this volume"));
     }
 }
