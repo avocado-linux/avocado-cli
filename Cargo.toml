@@ -1,6 +1,6 @@
 [package]
 name = "avocado-cli"
-version = "0.41.2"
+version = "1.0.0-rc.1"
 edition = "2021"
 description = "Command line interface for Avocado."
 authors = ["Avocado"]
