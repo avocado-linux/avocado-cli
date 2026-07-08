@@ -140,6 +140,18 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     mkdir -p "$(dirname "$ROOTFS_WORK")"
     rm -rf "$ROOTFS_WORK"
     cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
+
+    # A fully-installed sysroot always ships /etc/passwd. If it is absent
+    # the build volume is half-populated or stale (e.g. a prior install
+    # was interrupted, or the project dir was deleted without `avocado
+    # clean`). Fail here with an actionable message rather than letting
+    # the user-creation step below emit a cryptic
+    # `grep: .../etc/passwd: No such file`.
+    if [ ! -f "$ROOTFS_WORK/etc/passwd" ]; then
+        echo "ERROR: rootfs staging at $ROOTFS_WORK is missing /etc/passwd. The build volume looks half-populated or stale." >&2
+        echo "Reset the build state with 'avocado clean' and 'avocado prune', then re-run 'avocado install -f' and 'avocado build'." >&2
+        exit 1
+    fi
 {permissions_section}
 
 {post_install_block}
@@ -498,5 +510,61 @@ export AVOCADO_OS_VERSION_ID
         print_success("Built rootfs image.", OutputLevel::Normal);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rootfs_script_guards_against_half_populated_sysroot() {
+        // A stale or interrupted build volume can leave the sysroot with
+        // /usr present but /etc/passwd missing, which used to surface as
+        // a cryptic `grep: .../etc/passwd: No such file` from the
+        // user-creation step. The generated script must instead fail
+        // fast with an actionable message pointing at `avocado clean`.
+        let script = generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            "# permissions placeholder\n",
+        );
+
+        assert!(
+            script.contains("$ROOTFS_WORK/etc/passwd"),
+            "script must check for the base rootfs /etc/passwd before user creation"
+        );
+        assert!(
+            script.contains("avocado clean"),
+            "script must tell the user to run `avocado clean` on a stale volume"
+        );
+        assert!(
+            script.contains("avocado prune"),
+            "script must also point at `avocado prune`, since clean alone does not \
+             clear abandoned volumes that can shadow a build"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_passwd_guard_precedes_permissions_section() {
+        // The guard only helps if it runs before the user-creation
+        // (permissions) step it protects.
+        let marker = "# PERMISSIONS_MARKER_FOR_TEST";
+        let script = generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            marker,
+        );
+
+        let guard_pos = script
+            .find("$ROOTFS_WORK/etc/passwd")
+            .expect("guard present");
+        let perms_pos = script.find(marker).expect("permissions section present");
+        assert!(
+            guard_pos < perms_pos,
+            "the /etc/passwd guard must run before the permissions/user-creation section"
+        );
     }
 }
