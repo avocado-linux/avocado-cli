@@ -1877,7 +1877,7 @@ echo "Provisioned update authority: metadata/root.json""#
                         anyhow::bail!(
                             "Signing key is configured but connect.server_key is missing.\n\
                              Level 2 requires the server key to build a multi-key root.json.\n\
-                             Run 'avocado connect trust promote-root' to set up Level 2,\n\
+                             Run 'avocado connect trust promote-root --key <KEY>' to set up Level 2,\n\
                              or remove signing.key to use Level 0 (server-managed)."
                         );
                     }

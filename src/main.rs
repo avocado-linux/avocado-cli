@@ -444,7 +444,7 @@ enum Commands {
         /// Sign TUF metadata via the Connect platform instead of locally.
         /// Use this when deploying to a device that has received a Connect OTA update.
         /// Requires a local signing key configured for the runtime (Level 2:
-        /// `signing.key` + `avocado connect trust promote-root`); without one no
+        /// signing.key + avocado connect trust promote-root --key <KEY>); without one no
         /// root.json is baked and the deploy fails during Phase 1 hash collection.
         #[arg(long)]
         connect_sign: bool,
@@ -1792,7 +1792,7 @@ enum RuntimeCommands {
         /// Sign TUF metadata via the Connect platform instead of locally.
         /// Use this when deploying to a device that has received a Connect OTA update.
         /// Requires a local signing key configured for the runtime (Level 2:
-        /// `signing.key` + `avocado connect trust promote-root`); without one no
+        /// signing.key + avocado connect trust promote-root --key <KEY>); without one no
         /// root.json is baked and the deploy fails during Phase 1 hash collection.
         #[arg(long)]
         connect_sign: bool,

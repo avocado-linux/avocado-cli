@@ -672,7 +672,7 @@ if [ ! -f "$ROOT_JSON_FILE" ]; then
     echo "ERROR: No root.json found at $ROOT_JSON_FILE" >&2
     echo "       The runtime has no update-authority (root.json) baked into its build." >&2
     echo "       This usually means no signing key is configured. Set 'signing.key' for" >&2
-    echo "       the runtime (for a Connect project, run 'avocado connect trust promote-root')" >&2
+    echo "       the runtime (for a Connect project, run 'avocado connect trust promote-root --key <KEY>')" >&2
     echo "       and rebuild. --connect-sign requires a local signing key for this reason." >&2
     exit 1
 fi
