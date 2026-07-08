@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::find_ext_in_mapping;
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
@@ -379,24 +378,11 @@ impl ExtBuildCommand {
         // For local extensions, this uses get_merged_ext_config which reads from the file
         let ext_config = match &extension_location {
             ExtensionLocation::Remote { .. } => {
-                // Use the already-merged config from `parsed` which contains remote extension configs
-                // Then apply target-specific overrides manually
-                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
-                let ext_section = find_ext_in_mapping(parsed, &self.extension, &target);
-                // Resolve target-<name>: / kernel-<spec>: / legacy bare <name>:
-                // overrides from the composed extension value so the preferred
-                // `target-<name>:` form is honored in the runtime-build path too
-                // (previously only the standalone `Local` path resolved it, so a
-                // path-sourced ext in `avocado build` got the base config: no
-                // per-target overlay).
-                ext_section.map(|ext_val| {
-                    config.resolve_overrides_in_value(
-                        ext_val.clone(),
-                        &target,
-                        None,
-                        &format!("extensions.{}", self.extension),
-                    )
-                })
+                // Resolve the remote/path-sourced ext's config from the composed
+                // value, honoring its `target-<name>:` overrides (overlay + `--tag`)
+                // — the same result the Local path gets via get_merged_ext_config.
+                // Shared with `ext image`.
+                super::resolve_remote_ext_config(config, parsed, &self.extension, &target)
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
