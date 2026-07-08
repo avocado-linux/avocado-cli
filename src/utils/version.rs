@@ -51,7 +51,16 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
         )
     })?;
 
-    if !req.matches(&running) {
+    // Match against the running version with any pre-release/build metadata
+    // stripped, so a pre-release build (e.g. a `1.0.0-rc.0` release candidate)
+    // is treated as its release version for gating. Otherwise semver's rule
+    // that pre-release versions only satisfy comparators carrying a matching
+    // pre-release tag would make an ordinary requirement like ">=0.25" or "^1"
+    // spuriously reject every RC build. The full version is still shown in the
+    // error message below.
+    let running_release = Version::new(running.major, running.minor, running.patch);
+
+    if !req.matches(&running_release) {
         anyhow::bail!(
             "This project requires avocado CLI version '{requirement}', \
              but you are running version {running}.\n\n\
@@ -87,7 +96,8 @@ mod tests {
 
     #[test]
     fn test_check_cli_requirement_satisfied() {
-        // Current version is 0.25.1, so >=0.0.1 should pass
+        // Any released version is >= 0.0.1. This also covers pre-release builds
+        // (e.g. `1.0.0-rc.0`), which are matched as their release version.
         assert!(check_cli_requirement(">=0.0.1").is_ok());
         // Exact current version
         let current = env!("CARGO_PKG_VERSION");
@@ -106,8 +116,10 @@ mod tests {
 
     #[test]
     fn test_check_cli_requirement_complex() {
-        // Caret requirement that should match
-        assert!(check_cli_requirement("^0").is_ok());
+        // Caret requirement on the running major should match (derived so the
+        // test doesn't rot across major bumps).
+        let major = Version::parse(env!("CARGO_PKG_VERSION")).unwrap().major;
+        assert!(check_cli_requirement(&format!("^{major}")).is_ok());
         // Wildcard that matches anything
         assert!(check_cli_requirement("*").is_ok());
     }
