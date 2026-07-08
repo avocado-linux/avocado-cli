@@ -157,7 +157,17 @@ impl KernelImageCommand {
         // it only ever matched arm64's `Image`.)
         let internal_output_dir = "$AVOCADO_PREFIX/output/images";
         let locate_section = r#"
-KERNEL_SRC=$(ls "$AVOCADO_PREFIX"/kernel/*/Image 2>/dev/null | head -1)
+# Take the first staged kernel (bash sorts the glob, matching how
+# runtime/build.rs resolves this path). The for-glob idiom leaves
+# KERNEL_SRC empty on no match instead of failing the pipeline, so the
+# actionable error below fires rather than `set -euo pipefail` aborting
+# the script on the bare `ls` exit code.
+KERNEL_SRC=""
+for f in "$AVOCADO_PREFIX"/kernel/*/Image; do
+    [ -e "$f" ] || continue
+    KERNEL_SRC="$f"
+    break
+done
 if [ -z "$KERNEL_SRC" ]; then
     echo "ERROR: no staged kernel image at $AVOCADO_PREFIX/kernel/*/Image — run 'avocado rootfs install' first" >&2
     exit 1
