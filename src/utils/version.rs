@@ -71,6 +71,18 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
     Ok(())
 }
 
+/// Convert a semver version string into an RPM-compatible `Version:` value.
+///
+/// RPM forbids `-` in the Version field (it is the Version/Release separator),
+/// so a semver pre-release like `1.0.0-rc.1` is illegal and `rpmbuild` rejects
+/// it. RPM uses `~` for pre-release ordering — `1.0.0~rc.1` sorts *before*
+/// `1.0.0`, matching semver pre-release precedence — and `^` for post-release,
+/// so map the pre-release `-` to `~` and the build-metadata `+` to `^`. A plain
+/// release version (no `-`/`+`) is returned unchanged.
+pub fn to_rpm_version(version: &str) -> String {
+    version.replace('-', "~").replace('+', "^")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +137,18 @@ mod tests {
         assert!(check_cli_requirement(&format!("^{major}")).is_ok());
         // Wildcard that matches anything
         assert!(check_cli_requirement("*").is_ok());
+    }
+
+    #[test]
+    fn test_to_rpm_version() {
+        // Plain release versions are unchanged.
+        assert_eq!(to_rpm_version("1.0.0"), "1.0.0");
+        assert_eq!(to_rpm_version("2.1.3"), "2.1.3");
+        // Pre-release `-` becomes `~` (sorts before the release in RPM).
+        assert_eq!(to_rpm_version("1.0.0-rc.1"), "1.0.0~rc.1");
+        assert_eq!(to_rpm_version("1.0.0-alpha.2"), "1.0.0~alpha.2");
+        // Build metadata `+` becomes `^`.
+        assert_eq!(to_rpm_version("1.0.0+build.5"), "1.0.0^build.5");
     }
 
     #[test]

@@ -560,10 +560,17 @@ impl ExtPackageCommand {
             format!("/opt/src/{ext_src_dir}")
         };
 
-        // Create the RPM filename
+        // RPM forbids `-` in Version (it is the Version/Release separator), so map
+        // the semver version to its RPM form (`1.0.0-rc.1` -> `1.0.0~rc.1`). Used
+        // for the spec `Version:` and the built RPM's name; the semver form is kept
+        // for the avocado.yaml baked into the payload (consumers validate semver).
+        let rpm_version = crate::utils::version::to_rpm_version(&metadata.version);
+
+        // Create the RPM filename (matches the built RPM's NVR, so it uses the
+        // RPM-form version, not the semver form).
         let rpm_filename = format!(
             "{}-{}-{}.{}.rpm",
-            metadata.name, metadata.version, metadata.release, metadata.arch
+            metadata.name, rpm_version, metadata.release, metadata.arch
         );
 
         // Convert package_files to a space-separated string for the shell script
@@ -772,7 +779,7 @@ echo "RPM created successfully: $AVOCADO_PREFIX/output/extensions/{rpm_filename}
 rm -rf "$TMPDIR"
 "#,
             name = metadata.name,
-            version = metadata.version,
+            version = rpm_version,
             release = metadata.release,
             summary = metadata.summary,
             license = metadata.license,
