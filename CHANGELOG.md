@@ -55,6 +55,13 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
   `-alpha`/`-beta` tags remain internal-only prereleases. (#170)
 - **VM guest networking.** VMs use `virtio-net-pci` so the guest NIC binds on the
   q35 machine type.
+- **Abandoned build volumes reclaimed automatically.** `install` and `build` now
+  delete provably-abandoned per-project `avo-*` Docker volumes (source directory
+  gone, or `.avocado-state` missing or pointing at a different volume) when a new
+  volume is created, so they no longer accumulate after a project directory is
+  removed without `avocado clean`. A stale or half-populated volume now fails the
+  rootfs build with an actionable message pointing at `avocado clean`/`avocado
+  prune` instead of a cryptic `grep: .../etc/passwd` error. (#178)
 
 ### Fixed
 - **Standalone `avocado kernel image` on non-arm targets.** The command located

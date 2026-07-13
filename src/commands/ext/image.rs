@@ -652,7 +652,7 @@ impl ExtImageCommand {
                     &format!(
                         "Successfully created image for extension '{}-{}': {}",
                         self.extension,
-                        &ext_version,
+                        ext_version,
                         PathBuf::from(output_dir).join(&image_filename).display()
                     ),
                     OutputLevel::Normal,
@@ -662,7 +662,7 @@ impl ExtImageCommand {
                     &format!(
                         "Successfully created image for extension '{}-{}' (types: {}).",
                         self.extension,
-                        &ext_version,
+                        ext_version,
                         ext_types.join(", ")
                     ),
                     OutputLevel::Normal,

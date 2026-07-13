@@ -2916,10 +2916,7 @@ impl Config {
         let mut current = yaml;
 
         for part in parts {
-            match current.get(part) {
-                Some(value) => current = value,
-                None => return None,
-            }
+            current = current.get(part)?;
         }
 
         Some(current)

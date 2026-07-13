@@ -100,12 +100,12 @@ impl UpgradeCommand {
             if err.kind() == ErrorKind::PermissionDenied {
                 return Err(format!(
                     "CLI failed to upgrade: permission denied writing to {}",
-                    &current_cli_executable.display()
+                    current_cli_executable.display()
                 ));
             }
             return Err(format!(
                 "CLI failed to upgrade: unknown error writing to {}",
-                &current_cli_executable.display()
+                current_cli_executable.display()
             ));
         }
 
