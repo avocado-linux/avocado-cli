@@ -148,7 +148,7 @@ impl VolumeManager {
         // natural moment to sweep volumes left behind by projects deleted
         // from disk without `avocado clean`: a manual `rm -rf` drops the
         // project folder but not its per-project `avo-<uuid>` volume, so
-        // they otherwise accumulate forever. Best-effort by design — a
+        // they otherwise accumulate forever. Best-effort by design: a
         // container-tool hiccup must never block volume creation.
         let reaped = self.reap_abandoned_avo_volumes().await;
         if !reaped.is_empty() && self.verbose {
@@ -161,11 +161,18 @@ impl VolumeManager {
         // Create new volume state
         let state = VolumeState::new(source_dir.to_path_buf(), self.container_tool.clone());
 
+        // Persist the state file BEFORE creating the docker volume. This
+        // closes a cross-process race: a concurrent reap in another project
+        // must never observe this volume after `docker volume create` but
+        // before its `.avocado-state` exists, which would classify it as
+        // abandoned and delete it mid-mint. Writing state first means the
+        // volume is never visible without its state pointer. `volume_exists`
+        // already tolerates a state file pointing at a not-yet-created
+        // volume, so a failed create is simply superseded on the next call.
+        state.save_to_dir(source_dir)?;
+
         // Create the docker volume with metadata
         self.create_volume(&state).await?;
-
-        // Save state to file
-        state.save_to_dir(source_dir)?;
 
         if self.verbose {
             print_info(
@@ -180,9 +187,10 @@ impl VolumeManager {
     /// Best-effort removal of abandoned `avo-*` volumes left behind by
     /// projects deleted from disk without `avocado clean`. Each `avo-*`
     /// volume is classified with [`avo_abandonment_reason`] and removed
-    /// when abandoned. Any container-tool failure — daemon down, volume
-    /// still held by a container — is swallowed so this never blocks the
-    /// caller. Returns the names of the volumes actually removed.
+    /// when abandoned. Any container-tool failure (daemon down, volume
+    /// still held by a container, inspect error) is swallowed or skipped so
+    /// this never blocks the caller, and a failed inspect is skipped rather
+    /// than reaped. Returns the names of the volumes actually removed.
     pub async fn reap_abandoned_avo_volumes(&self) -> Vec<String> {
         let names = match self.list_avo_volumes().await {
             Ok(names) => names,
@@ -191,11 +199,23 @@ impl VolumeManager {
 
         let mut removed = Vec::new();
         for name in names {
-            let source_path = self.inspect_source_path_label(&name).await;
-            if avo_abandonment_reason(&name, source_path.as_deref()).is_some()
-                && self.remove_volume(&name).await.is_ok()
-            {
-                removed.push(name);
+            // Skip on inspect failure: a transient docker hiccup must never
+            // be read as "no source_path label", which would classify an
+            // active project's volume as abandoned and delete it.
+            let source_path = match self.inspect_source_path_label(&name).await {
+                Ok(source_path) => source_path,
+                Err(_) => continue,
+            };
+            if let Some(reason) = avo_abandonment_reason(&name, source_path.as_deref()) {
+                if self.remove_volume(&name).await.is_ok() {
+                    if self.verbose {
+                        print_info(
+                            &format!("Reaped abandoned build volume '{name}': {reason}"),
+                            OutputLevel::Normal,
+                        );
+                    }
+                    removed.push(name);
+                }
             }
         }
         removed
@@ -220,27 +240,34 @@ impl VolumeManager {
             .collect())
     }
 
-    /// Read the `avocado.source_path` label off a volume. Returns `None`
-    /// when the volume is missing, unlabeled, or the inspect output
-    /// cannot be parsed.
-    async fn inspect_source_path_label(&self, volume_name: &str) -> Option<String> {
+    /// Read the `avocado.source_path` label off a volume.
+    ///
+    /// Returns `Ok(Some(path))` when the label is present, `Ok(None)` when
+    /// the volume exists but carries no such label, and `Err` when the
+    /// inspect itself failed (daemon down, timeout, unparseable output).
+    /// The tri-state is load-bearing for the reap: a failed inspect must
+    /// NOT collapse to "no label", or a transient hiccup would classify an
+    /// active project's volume as abandoned and delete it. The caller skips
+    /// the volume on `Err`.
+    async fn inspect_source_path_label(&self, volume_name: &str) -> Result<Option<String>> {
         let output = AsyncCommand::new(&self.container_tool)
             .args(["volume", "inspect", volume_name])
             .output()
             .await
-            .ok()?;
+            .with_context(|| format!("Failed to inspect volume {volume_name}"))?;
 
         if !output.status.success() {
-            return None;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to inspect volume {volume_name}: {}", stderr.trim());
         }
 
-        let infos: Vec<VolumeInfo> =
-            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).ok()?;
-        infos
+        let infos: Vec<VolumeInfo> = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+            .with_context(|| "Failed to parse volume inspect output")?;
+        Ok(infos
             .into_iter()
             .next()
             .and_then(|info| info.labels)
-            .and_then(|labels| labels.get("avocado.source_path").cloned())
+            .and_then(|labels| labels.get("avocado.source_path").cloned()))
     }
 
     /// Check if a docker volume exists
