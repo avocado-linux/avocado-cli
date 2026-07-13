@@ -134,7 +134,7 @@ impl SdkDepsCommand {
         self.collect_compile_dependencies_by_section(config, &mut sections);
 
         // Sort packages within each section
-        for (_, packages) in sections.iter_mut() {
+        for packages in sections.values_mut() {
             packages.sort_by(|a, b| a.1.cmp(&b.1)); // Sort by package name
         }
 

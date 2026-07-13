@@ -42,7 +42,7 @@ impl ConnectKeysListCommand {
 
             println!(
                 "{:<12} {:<10} {:<10} {:<66} {:<24}",
-                key.key_type, key.status, user, &key.keyid, activated
+                key.key_type, key.status, user, key.keyid, activated
             );
         }
 
