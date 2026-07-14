@@ -3072,6 +3072,12 @@ impl Config {
     ///   3. `target-<name>:` match
     ///   4. `kernel-<spec>:` matches (in source order)
     ///
+    /// A matched `target-<name>:` (and legacy bare-target) block is resolved
+    /// RECURSIVELY with the same target + resolved kernel before being merged,
+    /// so override keys nested inside it — notably `kernel-<spec>:` — compose
+    /// (per-board × per-kernel). Without this a nested `kernel-<spec>:` would
+    /// leak through as a literal key instead of being applied/stripped.
+    ///
     /// `section_path` is for diagnostic context only.
     pub fn resolve_overrides_in_value(
         &self,
@@ -3157,9 +3163,14 @@ impl Config {
 
         let mut merged = serde_yaml::Value::Mapping(map);
         if let Some(v) = legacy_target_match {
+            // Recurse so override keys nested inside the target block (e.g.
+            // kernel-<spec>:) resolve against the same target + kernel instead
+            // of leaking through as literal keys.
+            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
             merged = self.merge_values(merged, v);
         }
         if let Some(v) = target_match {
+            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
             merged = self.merge_values(merged, v);
         }
         for v in kernel_matches {
@@ -8073,6 +8084,78 @@ extensions:
 
         // Cleanup
         std::fs::remove_file(temp_file).ok();
+    }
+
+    #[test]
+    fn test_nested_kernel_under_target_resolves() {
+        // A shared BSP-style extension: per-board packages live under
+        // target-<name>, with kernel-<spec> package blocks NESTED inside the
+        // target block. The resolver must recurse into the matched target
+        // block and apply the kernel block matching the resolved kernel.
+        let config =
+            Config::load_from_str("supported_targets: [\"raspberrypi4\", \"raspberrypi5\"]\n")
+                .unwrap();
+
+        let ext: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  common-pkg: '*'
+target-raspberrypi5:
+  packages:
+    board-pkg: '*'
+  kernel-6.6.*:
+    packages:
+      rpivid-hevc: '*'
+  kernel-6.12.*:
+    packages:
+      rpi-hevc-dec: '*'
+      drm-shmem-helper: '*'
+"#,
+        )
+        .unwrap();
+
+        // raspberrypi5 on a 6.12 kernel -> base + target + nested 6.12 block.
+        let r = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi5",
+            Some("6.12.25"),
+            "extensions.avocado-bsp",
+        );
+        let pkgs = r
+            .get("packages")
+            .and_then(|p| p.as_mapping())
+            .expect("packages");
+        assert!(pkgs.contains_key("common-pkg"));
+        assert!(pkgs.contains_key("board-pkg"));
+        assert!(pkgs.contains_key("rpi-hevc-dec"));
+        assert!(pkgs.contains_key("drm-shmem-helper"));
+        assert!(!pkgs.contains_key("rpivid-hevc"));
+        // No override keys leak through, at the section level or into packages.
+        assert!(r.get("target-raspberrypi5").is_none());
+        assert!(r.get("kernel-6.12.*").is_none());
+        assert!(!pkgs.contains_key("kernel-6.12.*"));
+        assert!(!pkgs.contains_key("kernel-6.6.*"));
+
+        // raspberrypi5 on a 6.6 kernel -> nested 6.6 block instead.
+        let r66 = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi5",
+            Some("6.6.90"),
+            "extensions.avocado-bsp",
+        );
+        let p66 = r66.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(p66.contains_key("rpivid-hevc"));
+        assert!(!p66.contains_key("rpi-hevc-dec"));
+
+        // Unknown kernel (build/image path, resolved_kver = None): nested
+        // kernel blocks are stripped, not applied and not leaked.
+        let rnone =
+            config.resolve_overrides_in_value(ext, "raspberrypi5", None, "extensions.avocado-bsp");
+        let pnone = rnone.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(pnone.contains_key("board-pkg"));
+        assert!(!pnone.contains_key("rpi-hevc-dec"));
+        assert!(!pnone.contains_key("rpivid-hevc"));
+        assert!(!pnone.contains_key("kernel-6.12.*"));
     }
 
     #[test]
