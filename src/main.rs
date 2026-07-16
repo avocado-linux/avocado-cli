@@ -91,7 +91,7 @@ struct Cli {
     target: Option<String>,
 
     /// Global target board (overrides AVOCADO_TARGET_BOARD and config for
-    /// `{{ avocado.target_board }}` interpolation)
+    /// `{{ avocado.target.board }}` interpolation)
     #[arg(long)]
     target_board: Option<String>,
 
@@ -343,7 +343,7 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
-        /// Target board override for `{{ avocado.target_board }}`
+        /// Target board override for `{{ avocado.target.board }}`
         #[arg(long)]
         target_board: Option<String>,
         /// Additional arguments to pass to the container runtime

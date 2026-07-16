@@ -41,7 +41,7 @@ pub struct BuildCommand {
     pub extension: Option<String>,
     /// Global target architecture
     pub target: Option<String>,
-    /// Global target board override for `{{ avocado.target_board }}`
+    /// Global target board override for `{{ avocado.target.board }}`
     pub target_board: Option<String>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,

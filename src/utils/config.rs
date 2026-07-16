@@ -1592,7 +1592,7 @@ impl Config {
 
     /// Like [`Self::load_composed`], but also accepts a CLI `--target-board`
     /// override that takes precedence over env/config when resolving
-    /// `{{ avocado.target_board }}` during interpolation.
+    /// `{{ avocado.target.board }}` during interpolation.
     pub fn load_composed_with_board<P: AsRef<Path>>(
         config_path: P,
         target: Option<&str>,
