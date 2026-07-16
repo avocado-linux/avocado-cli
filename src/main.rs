@@ -90,11 +90,6 @@ struct Cli {
     #[arg(long)]
     target: Option<String>,
 
-    /// Global target board (overrides AVOCADO_TARGET_BOARD and config for
-    /// `{{ avocado.target.board }}` interpolation)
-    #[arg(long)]
-    target_board: Option<String>,
-
     /// Disable stamp validation and writing
     #[arg(long)]
     no_stamps: bool,
@@ -2239,7 +2234,7 @@ async fn main() -> Result<()> {
             .with_no_stamps(cli.no_stamps)
             .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
             .with_sdk_arch(cli.sdk_arch.clone())
-            .with_target_board(target_board.or(cli.target_board.clone()));
+            .with_target_board(target_board);
             build_cmd.execute().await?;
             Ok(())
         }
@@ -2344,7 +2339,7 @@ async fn main() -> Result<()> {
                     verbose,
                     force,
                     target: target.or(cli.target),
-                    target_board: target_board.or(cli.target_board.clone()),
+                    target_board,
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     out,
@@ -2601,7 +2596,7 @@ async fn main() -> Result<()> {
                         verbose,
                         force,
                         target: target.or(cli.target),
-                        target_board: target_board.or(cli.target_board.clone()),
+                        target_board,
                         provision_profile: provision_profile.clone(),
                         env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                         out,
@@ -2817,7 +2812,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board.or(cli.target_board.clone()))
+                .with_target_board(target_board)
                 .with_runtime(resolved_runtime);
                 build_cmd.execute().await?;
                 Ok(())
@@ -3002,7 +2997,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board.or(cli.target_board.clone()));
+                .with_target_board(target_board);
                 install_cmd.execute().await?;
                 Ok(())
             }
