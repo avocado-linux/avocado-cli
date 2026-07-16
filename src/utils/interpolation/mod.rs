@@ -498,6 +498,41 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_target_board_cli_override_end_to_end() {
+        // The CLI override reaches `{{ avocado.target.board }}` through the
+        // real interpolate_config seam and wins over AVOCADO_TARGET_BOARD.
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+
+        let mut config = parse_yaml(
+            r#"
+default_target: qemux86-64
+image: "board-{{ avocado.target.board }}"
+"#,
+        );
+        interpolate_config(&mut config, None, Some("flag-board")).unwrap();
+        assert_eq!(
+            config.get("image").unwrap().as_str().unwrap(),
+            "board-flag-board"
+        );
+
+        // With no override, the env var still wins (unchanged behavior).
+        let mut config = parse_yaml(
+            r#"
+default_target: qemux86-64
+image: "board-{{ avocado.target.board }}"
+"#,
+        );
+        interpolate_config(&mut config, None, None).unwrap();
+        assert_eq!(
+            config.get("image").unwrap().as_str().unwrap(),
+            "board-env-board"
+        );
+
+        env::remove_var("AVOCADO_TARGET_BOARD");
+    }
+
+    #[test]
     fn test_basic_env_interpolation() {
         env::set_var("TEST_VAR", "test_value");
 
