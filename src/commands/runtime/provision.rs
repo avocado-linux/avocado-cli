@@ -133,7 +133,8 @@ impl RuntimeProvisionCommand {
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.config.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config.config_path, config)?
-                .verbose(self.config.verbose);
+                .verbose(self.config.verbose)
+                .with_cli_target_board(self.config.target_board.clone());
 
             // Provision requires runtime build stamp
             // When using --runs-on, check for SDK stamp matching remote's architecture
@@ -532,7 +533,8 @@ impl RuntimeProvisionCommand {
         // Write provision stamp (unless --no-stamps)
         if !self.config.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config.config_path, config)?
-                .verbose(self.config.verbose);
+                .verbose(self.config.verbose)
+                .with_cli_target_board(self.config.target_board.clone());
 
             let inputs = StampInputs::new("provision".to_string());
             let outputs = StampOutputs::default();

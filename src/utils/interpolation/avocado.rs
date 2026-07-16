@@ -53,8 +53,9 @@ pub struct AvocadoContext {
     pub target: Option<String>,
     /// Optional board variant within a target. `None` here means the resolver
     /// will fall back to `target` at lookup time, so `{{ avocado.target.board }}`
-    /// equals `{{ avocado.target }}` by default. Precedence:
-    /// env > resolved-runtime's `target_board` > top-level `default_target_board`.
+    /// equals `{{ avocado.target }}` by default. Precedence: CLI `--target-board`
+    /// override > env `AVOCADO_TARGET_BOARD` > resolved-runtime's `target_board`
+    /// > top-level `default_target_board`.
     pub target_board: Option<String>,
     /// Resolved runtime name. Precedence: env `AVOCADO_RUNTIME` >
     /// `default_runtime` > sole runtime when exactly one is defined. `None`

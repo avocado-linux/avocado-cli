@@ -267,8 +267,9 @@ impl ExtBuildCommand {
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose)
+                .with_cli_target_board(self.target_board.clone());
 
             // Resolve required stamps for extension build
             let required = resolve_required_stamps(
@@ -398,7 +399,12 @@ impl ExtBuildCommand {
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
+                config.get_merged_ext_config_with_board(
+                    &self.extension,
+                    &target,
+                    config_path,
+                    self.target_board.as_deref(),
+                )?
             }
         }
         .ok_or_else(|| {
@@ -623,7 +629,8 @@ impl ExtBuildCommand {
         let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Initialize SDK container helper
-        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .with_cli_target_board(self.target_board.clone());
 
         // Config is the source of truth for extension versions — no wildcard resolution.
         let ext_version = config_version.to_string();
@@ -853,8 +860,9 @@ impl ExtBuildCommand {
                 ..Default::default()
             };
 
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose)
+                .with_cli_target_board(self.target_board.clone());
             container_helper.run_in_container(run_config).await?;
 
             if self.verbose {
@@ -1503,8 +1511,9 @@ fi
             ..Default::default()
         };
 
-        let container_helper =
-            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .verbose(self.verbose)
+            .with_cli_target_board(self.target_board.clone());
         let success = container_helper.run_in_container(run_config).await?;
         if !success {
             return Err(anyhow::anyhow!(
@@ -1589,7 +1598,8 @@ fi
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Initialize SDK container helper
-        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .with_cli_target_board(self.target_board.clone());
 
         // Process each compile dependency
         for (dep_name, compile_section, install_script) in compile_install_deps {

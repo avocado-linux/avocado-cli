@@ -1518,6 +1518,19 @@ impl Config {
         target: &str,
         config_path: &str,
     ) -> Result<Option<serde_yaml::Value>> {
+        self.get_merged_section_with_board(section_path, target, config_path, None)
+    }
+
+    /// Like [`Self::get_merged_section`], but threads a CLI `--target-board`
+    /// override into the interpolation so a section value referencing
+    /// `{{ avocado.target.board }}` resolves to the flag's board.
+    pub fn get_merged_section_with_board(
+        &self,
+        section_path: &str,
+        target: &str,
+        config_path: &str,
+        cli_target_board: Option<&str>,
+    ) -> Result<Option<serde_yaml::Value>> {
         // Read the raw config to access target-specific sections
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {config_path}"))?;
@@ -1525,8 +1538,12 @@ impl Config {
         let mut parsed = Self::parse_config_value(config_path, &content)?;
 
         // Apply interpolation to the parsed config
-        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target), None)
-            .with_context(|| "Failed to interpolate configuration values")?;
+        crate::utils::interpolation::interpolate_config(
+            &mut parsed,
+            Some(target),
+            cli_target_board,
+        )
+        .with_context(|| "Failed to interpolate configuration values")?;
 
         let base_section = match self.get_nested_section(&parsed, section_path) {
             Some(v) => v.clone(),
@@ -3278,8 +3295,22 @@ impl Config {
         target: &str,
         config_path: &str,
     ) -> Result<Option<serde_yaml::Value>> {
+        self.get_merged_ext_config_with_board(ext_name, target, config_path, None)
+    }
+
+    /// Like [`Self::get_merged_ext_config`], but threads a CLI `--target-board`
+    /// override so an extension section referencing `{{ avocado.target.board }}`
+    /// (e.g. `overlay: "overlays/{{ avocado.target.board }}"`) resolves to the
+    /// flag's board rather than the env/config value.
+    pub fn get_merged_ext_config_with_board(
+        &self,
+        ext_name: &str,
+        target: &str,
+        config_path: &str,
+        cli_target_board: Option<&str>,
+    ) -> Result<Option<serde_yaml::Value>> {
         let section_path = format!("extensions.{ext_name}");
-        self.get_merged_section(&section_path, target, config_path)
+        self.get_merged_section_with_board(&section_path, target, config_path, cli_target_board)
     }
 
     /// Get detailed extension dependencies for a runtime (with type information)

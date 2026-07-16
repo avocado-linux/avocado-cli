@@ -257,8 +257,9 @@ impl ExtImageCommand {
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose)
+                .with_cli_target_board(self.target_board.clone());
 
             // Resolve required stamps for extension image
             let required = resolve_required_stamps(
@@ -465,7 +466,12 @@ impl ExtImageCommand {
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
+                config.get_merged_ext_config_with_board(
+                    &self.extension,
+                    &target,
+                    config_path,
+                    self.target_board.as_deref(),
+                )?
             }
         }
         .ok_or_else(|| {
@@ -713,8 +719,9 @@ impl ExtImageCommand {
                     ..Default::default()
                 };
 
-                let container_helper =
-                    SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+                let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                    .verbose(self.verbose)
+                    .with_cli_target_board(self.target_board.clone());
                 container_helper.run_in_container(run_config).await?;
 
                 if self.verbose {

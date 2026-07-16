@@ -183,8 +183,9 @@ impl BuildCommand {
             let container_image = config.get_sdk_image().ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'")
             })?;
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(false);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(false)
+                .with_cli_target_board(self.target_board.clone());
 
             // Check that SDK install stamp exists (required for all builds).
             // Use Runtime/Install which just requires sdk_install().
