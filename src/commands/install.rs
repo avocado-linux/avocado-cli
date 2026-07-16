@@ -35,6 +35,8 @@ pub struct InstallCommand {
     pub runtime: Option<String>,
     /// Global target architecture
     pub target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
@@ -68,6 +70,7 @@ impl InstallCommand {
             force,
             runtime,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -76,6 +79,12 @@ impl InstallCommand {
             sdk_arch: None,
             composed_config: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -110,9 +119,14 @@ impl InstallCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 
@@ -199,6 +213,7 @@ impl InstallCommand {
         .with_no_stamps(self.no_stamps)
         .with_runs_on(self.runs_on.clone(), self.nfs_port)
         .with_sdk_arch(self.sdk_arch.clone())
+        .with_target_board(self.target_board.clone())
         .with_composed_config(Arc::clone(&composed));
 
         if let Some(ctx) = sdk_tui_ctx {

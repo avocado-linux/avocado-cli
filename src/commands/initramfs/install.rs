@@ -20,6 +20,7 @@ pub struct InitramfsInstallCommand {
     verbose: bool,
     force: bool,
     target: Option<String>,
+    target_board: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
@@ -43,6 +44,7 @@ impl InitramfsInstallCommand {
             verbose,
             force,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -51,6 +53,12 @@ impl InitramfsInstallCommand {
             sdk_arch: None,
             composed_config: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
@@ -79,9 +87,14 @@ impl InitramfsInstallCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 
@@ -123,7 +136,7 @@ impl InitramfsInstallCommand {
             container_helper: &container_helper,
             container_image,
             target: &target,
-            target_board: None,
+            target_board: self.target_board.as_deref(),
             repo_url: repo_url.as_deref(),
             repo_release: repo_release.as_deref(),
             merged_container_args: merged_container_args.clone(),
