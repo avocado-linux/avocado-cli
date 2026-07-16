@@ -37,6 +37,8 @@ pub struct ExtBuildCommand {
     pub config_path: String,
     pub verbose: bool,
     pub target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     pub no_stamps: bool,
@@ -68,6 +70,7 @@ impl ExtBuildCommand {
             config_path,
             verbose,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -78,6 +81,12 @@ impl ExtBuildCommand {
             composed_config: None,
             tui_context: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -154,9 +163,14 @@ impl ExtBuildCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
         let config = &composed.config;
@@ -646,7 +660,7 @@ impl ExtBuildCommand {
                             crate::utils::interpolation::AvocadoContext::from_main_config(
                                 parsed,
                                 Some(target.as_str()),
-                                None,
+                                self.target_board.as_deref(),
                             );
                         // The selected runtime drives `{{ avocado.runtime }}` and
                         // the runtime-scoped target board; from_main_config only

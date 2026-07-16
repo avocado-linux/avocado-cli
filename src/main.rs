@@ -399,6 +399,9 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
@@ -1686,6 +1689,9 @@ enum RuntimeCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
@@ -2297,6 +2303,7 @@ async fn main() -> Result<()> {
             force,
             runtime,
             target,
+            target_board,
             provision_profile,
             env,
             out,
@@ -2337,6 +2344,7 @@ async fn main() -> Result<()> {
                     verbose,
                     force,
                     target: target.or(cli.target),
+                    target_board: target_board.or(cli.target_board.clone()),
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     out,
@@ -2576,6 +2584,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 target,
+                target_board,
                 provision_profile,
                 env,
                 out,
@@ -2592,6 +2601,7 @@ async fn main() -> Result<()> {
                         verbose,
                         force,
                         target: target.or(cli.target),
+                        target_board: target_board.or(cli.target_board.clone()),
                         provision_profile: provision_profile.clone(),
                         env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                         out,
@@ -2784,6 +2794,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                target_board,
                 runtime,
                 container_args,
                 dnf_args,
@@ -2806,6 +2817,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(target_board.or(cli.target_board.clone()))
                 .with_runtime(resolved_runtime);
                 build_cmd.execute().await?;
                 Ok(())
@@ -2975,6 +2987,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 target,
+                target_board,
                 container_args,
                 dnf_args,
             } => {
@@ -2988,7 +3001,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(target_board.or(cli.target_board.clone()));
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -4261,6 +4275,9 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Runtime to build the extension against (kernel/rootfs context).
         /// Required when the project has multiple runtimes. Resolves from
         /// AVOCADO_RUNTIME / default_runtime / sole-runtime when omitted.
@@ -4459,6 +4476,9 @@ enum RootfsCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

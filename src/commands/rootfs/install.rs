@@ -92,6 +92,8 @@ pub struct SysrootInstallParams<'a> {
     pub container_helper: &'a SdkContainer,
     pub container_image: &'a str,
     pub target: &'a str,
+    /// CLI target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<&'a str>,
     pub repo_url: Option<&'a str>,
     pub repo_release: Option<&'a str>,
     pub merged_container_args: Option<Vec<String>>,
@@ -676,7 +678,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                 let context = crate::utils::interpolation::AvocadoContext::from_main_config(
                     parsed,
                     Some(params.target),
-                    None,
+                    params.target_board,
                 );
                 match crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
                     params.src_dir,
@@ -905,6 +907,7 @@ pub struct RootfsInstallCommand {
     verbose: bool,
     force: bool,
     target: Option<String>,
+    target_board: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
@@ -928,6 +931,7 @@ impl RootfsInstallCommand {
             verbose,
             force,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -936,6 +940,12 @@ impl RootfsInstallCommand {
             sdk_arch: None,
             composed_config: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
@@ -964,9 +974,14 @@ impl RootfsInstallCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 
@@ -1008,6 +1023,7 @@ impl RootfsInstallCommand {
             container_helper: &container_helper,
             container_image,
             target: &target,
+            target_board: self.target_board.as_deref(),
             repo_url: repo_url.as_deref(),
             repo_release: repo_release.as_deref(),
             merged_container_args: merged_container_args.clone(),

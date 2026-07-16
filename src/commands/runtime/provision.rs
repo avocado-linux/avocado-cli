@@ -25,6 +25,8 @@ pub struct RuntimeProvisionConfig {
     pub verbose: bool,
     pub force: bool,
     pub target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     pub provision_profile: Option<String>,
     pub env_vars: Option<HashMap<String, String>>,
     pub out: Option<String>,
@@ -71,9 +73,10 @@ impl RuntimeProvisionCommand {
         // Use provided config or load fresh
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
-            None => Arc::new(Config::load_composed(
+            None => Arc::new(Config::load_composed_with_board(
                 &self.config.config_path,
                 self.config.target.as_deref(),
+                self.config.target_board.as_deref(),
             )?),
         };
         let config = &composed.config;
@@ -1161,6 +1164,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            target_board: None,
             provision_profile: None,
             env_vars: None,
             out: None,
@@ -1191,6 +1195,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            target_board: None,
             provision_profile: None,
             env_vars: None,
             out: None,
@@ -1227,6 +1232,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            target_board: None,
             provision_profile: None,
             env_vars: None,
             out: None,
@@ -1266,6 +1272,7 @@ mod tests {
             verbose: false,
             force: false,
             target: Some("x86_64".to_string()),
+            target_board: None,
             provision_profile: None,
             env_vars: Some(env_vars.clone()),
             out: None,

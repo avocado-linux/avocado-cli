@@ -19,6 +19,8 @@ pub struct ProvisionConfig {
     pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     /// Provision profile to use
     pub provision_profile: Option<String>,
     /// Environment variables to pass to the provision process
@@ -68,10 +70,14 @@ impl ProvisionCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config.config_path, self.config.target.as_deref())
-                    .with_context(|| {
-                        format!("Failed to load config from {}", self.config.config_path)
-                    })?,
+                Config::load_composed_with_board(
+                    &self.config.config_path,
+                    self.config.target.as_deref(),
+                    self.config.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load config from {}", self.config.config_path)
+                })?,
             ),
         };
         let config = &composed.config;
@@ -92,6 +98,7 @@ impl ProvisionCommand {
                 verbose: self.config.verbose,
                 force: self.config.force,
                 target: self.config.target.clone(),
+                target_board: self.config.target_board.clone(),
                 provision_profile: self.config.provision_profile.clone(),
                 env_vars: self.config.env_vars.clone(),
                 out: self.config.out.clone(),
@@ -125,6 +132,7 @@ mod tests {
             verbose: true,
             force: false,
             target: Some("x86_64".to_string()),
+            target_board: None,
             provision_profile: None,
             env_vars: Some(env_vars.clone()),
             out: None,
@@ -159,6 +167,7 @@ mod tests {
             verbose: false,
             force: true,
             target: None,
+            target_board: None,
             provision_profile: None,
             env_vars: None,
             out: None,
@@ -196,6 +205,7 @@ mod tests {
             verbose: false,
             force: false,
             target: None,
+            target_board: None,
             provision_profile: Some("production".to_string()),
             env_vars: Some(expected_env.clone()),
             out: None,
@@ -220,6 +230,7 @@ mod tests {
             verbose: false,
             force: false,
             target: None,
+            target_board: None,
             provision_profile: None,
             env_vars: None,
             out: Some("output".to_string()),

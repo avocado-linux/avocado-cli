@@ -123,6 +123,7 @@ impl InitramfsInstallCommand {
             container_helper: &container_helper,
             container_image,
             target: &target,
+            target_board: None,
             repo_url: repo_url.as_deref(),
             repo_release: repo_release.as_deref(),
             merged_container_args: merged_container_args.clone(),
