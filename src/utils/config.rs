@@ -1525,7 +1525,7 @@ impl Config {
         let mut parsed = Self::parse_config_value(config_path, &content)?;
 
         // Apply interpolation to the parsed config
-        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
+        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target), None)
             .with_context(|| "Failed to interpolate configuration values")?;
 
         let base_section = match self.get_nested_section(&parsed, section_path) {
@@ -1565,7 +1565,7 @@ impl Config {
         let mut parsed = Self::parse_config_value(path, content)?;
 
         // Apply interpolation with the target
-        crate::utils::interpolation::interpolate_config(&mut parsed, target)
+        crate::utils::interpolation::interpolate_config(&mut parsed, target, None)
             .with_context(|| "Failed to interpolate configuration values")?;
 
         Ok(parsed)
@@ -1690,7 +1690,7 @@ impl Config {
         }
 
         // Apply interpolation to the composed model
-        crate::utils::interpolation::interpolate_config(&mut main_config, target)
+        crate::utils::interpolation::interpolate_config(&mut main_config, target, None)
             .with_context(|| "Failed to interpolate composed configuration")?;
 
         // Deserialize the merged config into the Config struct
@@ -3338,7 +3338,7 @@ impl Config {
         let mut parsed = Self::parse_config_value(config_path, &content)?;
 
         // Apply interpolation to the parsed config
-        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
+        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target), None)
             .with_context(|| "Failed to interpolate configuration values")?;
 
         // Get the base section: base_path.nested_path
@@ -3382,7 +3382,7 @@ impl Config {
             serde_yaml::from_str(content).with_context(|| "Failed to parse YAML configuration")?;
 
         // Perform interpolation before deserializing to Config struct
-        crate::utils::interpolation::interpolate_config(&mut parsed, None)
+        crate::utils::interpolation::interpolate_config(&mut parsed, None, None)
             .with_context(|| "Failed to interpolate configuration values")?;
 
         // Deserialize to Config struct
@@ -3648,7 +3648,7 @@ impl Config {
             serde_yaml::from_str(&content).with_context(|| "Failed to parse YAML configuration")?;
 
         // Perform interpolation with the target
-        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target))
+        crate::utils::interpolation::interpolate_config(&mut parsed, Some(target), None)
             .with_context(|| "Failed to interpolate configuration values")?;
 
         // Extract SDK dependencies from the interpolated config
@@ -4942,7 +4942,7 @@ impl Config {
             // Default to YAML parsing with interpolation
             let mut value: serde_yaml::Value = serde_yaml::from_str(config_content)
                 .with_context(|| "Failed to parse configuration")?;
-            crate::utils::interpolation::interpolate_config(&mut value, target)
+            crate::utils::interpolation::interpolate_config(&mut value, target, None)
                 .with_context(|| "Failed to interpolate configuration values")?;
             value
         };

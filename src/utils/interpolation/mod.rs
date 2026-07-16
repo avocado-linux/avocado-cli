@@ -98,6 +98,8 @@ pub fn interpolate_name(input: &str, target: &str) -> String {
 /// # Arguments
 /// * `yaml_value` - The YAML value to interpolate (modified in place)
 /// * `cli_target` - Optional CLI target value for avocado.target interpolation
+/// * `cli_target_board` - Optional CLI target board override for
+///   avocado.target_board interpolation
 ///
 /// # Returns
 /// Result indicating success or error if config references cannot be resolved
@@ -110,12 +112,15 @@ pub fn interpolate_name(input: &str, target: &str) -> String {
 /// derived: "{{ config.base }}"
 /// "#).unwrap();
 ///
-/// interpolate_config(&mut config, None).unwrap();
+/// interpolate_config(&mut config, None, None).unwrap();
 /// assert_eq!(config.get("derived").unwrap().as_str().unwrap(), "value");
 /// ```
-pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> Result<()> {
-    // Create a context with just the target for backward compatibility
-    let context = AvocadoContext::from_main_config(yaml_value, cli_target, None);
+pub fn interpolate_config(
+    yaml_value: &mut Value,
+    cli_target: Option<&str>,
+    cli_target_board: Option<&str>,
+) -> Result<()> {
+    let context = AvocadoContext::from_main_config(yaml_value, cli_target, cli_target_board);
     interpolate_config_with_context(yaml_value, &context)
 }
 
@@ -502,7 +507,7 @@ key: "{{ env.TEST_VAR }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(config.get("key").unwrap().as_str().unwrap(), "test_value");
 
@@ -521,7 +526,7 @@ key: "{{ env.MISSING_VAR }}"
         );
 
         // Should succeed but replace with empty string
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(config.get("key").unwrap().as_str().unwrap(), "");
     }
@@ -535,7 +540,7 @@ derived: "{{ config.base }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("derived").unwrap().as_str().unwrap(),
@@ -554,7 +559,7 @@ reference: "{{ config.nested.deep.value }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("reference").unwrap().as_str().unwrap(),
@@ -579,7 +584,7 @@ reference: "{{ config.nonexistent.path }}"
         );
 
         // Should return an error with location context
-        let result = interpolate_config(&mut config, None);
+        let result = interpolate_config(&mut config, None, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let full_error = error_chain_string(&err);
@@ -603,7 +608,7 @@ target_ref: "{{ avocado.target }}"
 "#,
         );
 
-        interpolate_config(&mut config, Some("cli-target")).unwrap();
+        interpolate_config(&mut config, Some("cli-target"), None).unwrap();
 
         assert_eq!(
             config.get("target_ref").unwrap().as_str().unwrap(),
@@ -622,7 +627,7 @@ target_ref: "{{ avocado.target }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("target_ref").unwrap().as_str().unwrap(),
@@ -644,7 +649,7 @@ target_ref: "{{ avocado.target }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("target_ref").unwrap().as_str().unwrap(),
@@ -664,7 +669,7 @@ target_ref: "{{ avocado.target }}"
         );
 
         // Should succeed but leave template as-is
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("target_ref").unwrap().as_str().unwrap(),
@@ -689,7 +694,7 @@ reference: "{{ env.TEMPLATE }}"
 
         // First iteration resolves env.TEMPLATE to "{{ config.nested.value }}"
         // Second iteration resolves "{{ config.nested.value }}" to "final_value"
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         // Should be resolved to the final value through multiple passes
         assert_eq!(
@@ -710,7 +715,7 @@ c: "{{ config.b }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(config.get("b").unwrap().as_str().unwrap(), "value_a");
         assert_eq!(config.get("c").unwrap().as_str().unwrap(), "value_a");
@@ -726,7 +731,7 @@ b: "{{ config.a }}"
         );
 
         // Should error due to circular reference
-        let result = interpolate_config(&mut config, None);
+        let result = interpolate_config(&mut config, None, None);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(
@@ -744,7 +749,7 @@ a: "{{ config.a }}"
         );
 
         // Should error immediately on direct self-reference
-        let result = interpolate_config(&mut config, None);
+        let result = interpolate_config(&mut config, None, None);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         eprintln!("Direct self-reference error: {error_msg}");
@@ -765,7 +770,7 @@ c: "{{ config.a }}"
         );
 
         // Should error due to indirect circular reference
-        let result = interpolate_config(&mut config, None);
+        let result = interpolate_config(&mut config, None, None);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Circular reference"));
@@ -782,7 +787,7 @@ message: "{{ env.VAR1 }}-{{ env.VAR2 }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("message").unwrap().as_str().unwrap(),
@@ -803,7 +808,7 @@ key: "{{   env.TRIMMED   }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(config.get("key").unwrap().as_str().unwrap(), "value");
 
@@ -828,7 +833,7 @@ runtimes:
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         let runtime = config.get("runtimes").unwrap();
         let dev = runtime.get("dev").unwrap();
@@ -855,7 +860,7 @@ reference_bool: "{{ config.boolean }}"
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(config.get("reference_num").unwrap().as_str().unwrap(), "42");
         assert_eq!(
@@ -872,7 +877,7 @@ key: "{{ }}"
 "#,
         );
 
-        let result = interpolate_config(&mut config, None);
+        let result = interpolate_config(&mut config, None, None);
         assert!(result.is_err());
     }
 
@@ -884,7 +889,7 @@ key: "{{ unknown.value }}"
 "#,
         );
 
-        let result = interpolate_config(&mut config, None);
+        let result = interpolate_config(&mut config, None, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let full_error = error_chain_string(&err);
@@ -908,7 +913,7 @@ sdk:
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         let sdk = config.get("sdk").unwrap();
         assert_eq!(
@@ -937,7 +942,7 @@ sdk:
 "#,
         );
 
-        interpolate_config(&mut config, Some("qemux86-64")).unwrap();
+        interpolate_config(&mut config, Some("qemux86-64"), None).unwrap();
 
         let sdk = config.get("sdk").unwrap();
         let deps = sdk.get("packages").unwrap();
@@ -978,7 +983,7 @@ packages:
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         let deps = config.get("packages").unwrap();
         assert!(deps.get("package-custom").is_some());
@@ -1000,7 +1005,7 @@ mapping:
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         let mapping = config.get("mapping").unwrap();
         assert!(mapping.get("myprefix-key").is_some());
@@ -1061,7 +1066,7 @@ sdk:
 "#,
         );
 
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         let sdk = config.get("sdk").unwrap();
         assert_eq!(
@@ -1083,7 +1088,7 @@ reference: "{{ avocado.distro.version }}"
         );
 
         // No distro in config, so it should remain unresolved
-        interpolate_config(&mut config, None).unwrap();
+        interpolate_config(&mut config, None, None).unwrap();
 
         assert_eq!(
             config.get("reference").unwrap().as_str().unwrap(),

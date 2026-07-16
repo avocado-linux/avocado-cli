@@ -76,7 +76,7 @@ fn test_config_self_reference() {
 
     // Apply interpolation manually to check
     let mut parsed_copy = parsed.clone();
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed_copy, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed_copy, None, None).unwrap();
 
     let derived = parsed_copy.get("derived_image").unwrap().as_str().unwrap();
     assert_eq!(derived, "ghcr.io/avocado/base:latest");
@@ -88,7 +88,7 @@ fn test_nested_config_reference() {
     let content = fs::read_to_string(&config_path).unwrap();
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
 
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None, None).unwrap();
 
     let reference = parsed.get("reference_nested").unwrap().as_str().unwrap();
     assert_eq!(reference, "nested_value");
@@ -138,7 +138,7 @@ runtimes:
 "#;
 
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None, None).unwrap();
 
     // Should leave template as-is
     let runtime = parsed.get("runtimes").unwrap();
@@ -162,7 +162,7 @@ runtimes:
     image: "ghcr.io/avocado/{{ avocado.target.board }}"
 "#;
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None, None).unwrap();
 
     let dev = parsed
         .get("runtimes")
@@ -189,7 +189,7 @@ runtimes:
     image: "ghcr.io/avocado/{{ avocado.target.board }}"
 "#;
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None, None).unwrap();
 
     let dev = parsed
         .get("runtimes")
@@ -214,7 +214,7 @@ runtimes:
     image: "ghcr.io/avocado/{{ avocado.target.board }}"
 "#;
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None, None).unwrap();
 
     let dev = parsed
         .get("runtimes")
@@ -241,7 +241,7 @@ reference: "{{ config.nonexistent.path }}"
 "#;
 
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(test_yaml).unwrap();
-    let result = avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None);
+    let result = avocado_cli::utils::interpolation::interpolate_config(&mut parsed, None, None);
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -349,7 +349,7 @@ fn test_avocado_extensions_self_reference() {
     let content = fs::read_to_string(&config_path).unwrap();
     let mut parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
 
-    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, Some("raspberrypi4"))
+    avocado_cli::utils::interpolation::interpolate_config(&mut parsed, Some("raspberrypi4"), None)
         .unwrap();
 
     let ext = parsed.get("extensions").unwrap();
@@ -375,7 +375,7 @@ extensions:
     )
     .unwrap();
 
-    avocado_cli::utils::interpolation::interpolate_config(&mut config, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut config, None, None).unwrap();
 
     let args = config
         .get("extensions")
@@ -405,7 +405,7 @@ extensions:
     )
     .unwrap();
 
-    avocado_cli::utils::interpolation::interpolate_config(&mut config, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut config, None, None).unwrap();
 
     let dep_ver = config
         .get("extensions")
@@ -431,7 +431,7 @@ extensions:
     )
     .unwrap();
 
-    avocado_cli::utils::interpolation::interpolate_config(&mut config, None).unwrap();
+    avocado_cli::utils::interpolation::interpolate_config(&mut config, None, None).unwrap();
 
     let val = config
         .get("extensions")
