@@ -294,6 +294,7 @@ impl BuildCommand {
             let runs_on = self.runs_on.clone();
             let nfs_port = self.nfs_port;
             let sdk_arch = self.sdk_arch.clone();
+            let target_board = self.target_board.clone();
             let composed2 = Arc::clone(&composed);
             let renderer2 = renderer.clone();
             // When the project resolves to a single runtime, propagate it so
@@ -320,6 +321,7 @@ impl BuildCommand {
                     let dnf_args = dnf_args.clone();
                     let runs_on = runs_on.clone();
                     let sdk_arch = sdk_arch.clone();
+                    let target_board = target_board.clone();
                     let composed = Arc::clone(&composed2);
                     let renderer = renderer2.clone();
                     let dual_write_runtime = dual_write_runtime.clone();
@@ -343,6 +345,7 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
+                                .with_target_board(target_board)
                                 .with_composed_config(composed)
                                 .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
@@ -362,6 +365,7 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
+                                .with_target_board(target_board)
                                 .with_composed_config(composed)
                                 .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
@@ -646,6 +650,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
@@ -664,6 +669,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
@@ -691,6 +697,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for extension '{ext_name}'")
@@ -708,6 +715,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for remote extension '{name}'")

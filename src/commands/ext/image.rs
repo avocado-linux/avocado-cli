@@ -21,6 +21,9 @@ pub struct ExtImageCommand {
     config_path: String,
     verbose: bool,
     target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}` (feeds the
+    /// stamp input hash so a board switch invalidates the image).
+    target_board: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
@@ -52,6 +55,7 @@ impl ExtImageCommand {
             config_path,
             verbose,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -63,6 +67,12 @@ impl ExtImageCommand {
             composed_config: None,
             tui_context: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -295,6 +305,7 @@ impl ExtImageCommand {
                 &project_root,
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )
             .ok();
             let image_inputs = compute_ext_image_input_hash(
@@ -304,6 +315,7 @@ impl ExtImageCommand {
                 &project_root,
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )
             .ok();
             let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
@@ -678,6 +690,7 @@ impl ExtImageCommand {
                     &config.project_root(&self.config_path),
                     Some(target.as_str()),
                     self.runtime.as_deref(),
+                    self.target_board.as_deref(),
                 )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);

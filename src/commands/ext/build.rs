@@ -314,6 +314,7 @@ impl ExtBuildCommand {
                 &project_root,
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )
             .ok();
             let mut current_inputs: Vec<crate::utils::stamps::CurrentInput<'_>> = Vec::new();
@@ -827,6 +828,7 @@ impl ExtBuildCommand {
                 &config.project_root(&self.config_path),
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);

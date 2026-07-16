@@ -899,6 +899,10 @@ fn script_hash_value(project_root: &Path, rel_path: &str) -> serde_yaml::Value {
 /// file contents). When enabled, a changed template value (e.g. a new claim
 /// token) or an edited overlay file changes the digest and forces a rebuild.
 /// Only the SHA-256 is stored — never the resolved plaintext.
+// The (target, runtime, cli_target_board) trio mirrors the interpolation
+// context the materialize step builds; bundling them into a context struct is
+// the right cleanup once a fourth CLI override lands.
+#[allow(clippy::too_many_arguments)]
 fn fold_overlay_content_hash(
     hash_data: &mut serde_yaml::Mapping,
     key: &str,
@@ -907,6 +911,7 @@ fn fold_overlay_content_hash(
     project_root: &Path,
     target: Option<&str>,
     runtime: Option<&str>,
+    cli_target_board: Option<&str>,
 ) -> Result<()> {
     use crate::utils::overlay_preprocess::PreprocessSpec;
     let spec = PreprocessSpec::from_overlay_value(overlay);
@@ -919,11 +924,16 @@ fn fold_overlay_content_hash(
         .unwrap_or("overlay");
     // Build the same interpolation context the build's materialize step uses, so
     // the digest reflects the exact rendered overlay content. `target` keeps
-    // `{{ avocado.target/board }}` accurate; `runtime` (for the ext path) makes
+    // `{{ avocado.target }}` accurate and `cli_target_board` keeps
+    // `{{ avocado.target.board }}` accurate (so a --target-board switch
+    // invalidates the stamp); `runtime` (for the ext path) makes
     // `{{ avocado.runtime }}`-dependent content invalidate the stamp when the
     // selected runtime changes — the ext-build stamp isn't otherwise runtime-keyed.
-    let mut context =
-        crate::utils::interpolation::AvocadoContext::from_main_config(config, target, None);
+    let mut context = crate::utils::interpolation::AvocadoContext::from_main_config(
+        config,
+        target,
+        cli_target_board,
+    );
     if let Some(rt) = runtime {
         context.runtime = Some(rt.to_string());
     }
@@ -1091,8 +1101,16 @@ pub fn compute_ext_build_input_hash(
     project_root: &Path,
     target: Option<&str>,
     runtime: Option<&str>,
+    cli_target_board: Option<&str>,
 ) -> Result<StampInputs> {
-    let hash_data = ext_build_hash_data(config, ext_name, project_root, target, runtime)?;
+    let hash_data = ext_build_hash_data(
+        config,
+        ext_name,
+        project_root,
+        target,
+        runtime,
+        cli_target_board,
+    )?;
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }
@@ -1108,8 +1126,16 @@ pub fn compute_ext_image_input_hash(
     project_root: &Path,
     target: Option<&str>,
     runtime: Option<&str>,
+    cli_target_board: Option<&str>,
 ) -> Result<StampInputs> {
-    let mut hash_data = ext_build_hash_data(config, ext_name, project_root, target, runtime)?;
+    let mut hash_data = ext_build_hash_data(
+        config,
+        ext_name,
+        project_root,
+        target,
+        runtime,
+        cli_target_board,
+    )?;
 
     if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
         if let Some(var_files) = ext.get("var_files") {
@@ -1145,6 +1171,7 @@ fn ext_build_hash_data(
     project_root: &Path,
     target: Option<&str>,
     runtime: Option<&str>,
+    cli_target_board: Option<&str>,
 ) -> Result<serde_yaml::Mapping> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -1189,6 +1216,7 @@ fn ext_build_hash_data(
                 project_root,
                 target,
                 runtime,
+                cli_target_board,
             )?;
         }
         if let Some(post_build) = ext.get("post_build").and_then(|v| v.as_str()) {
@@ -1212,6 +1240,7 @@ fn ext_build_hash_data(
 pub fn compute_rootfs_input_hash(
     config: &serde_yaml::Value,
     project_root: &Path,
+    cli_target_board: Option<&str>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -1235,6 +1264,7 @@ pub fn compute_rootfs_input_hash(
                 project_root,
                 None,
                 None,
+                cli_target_board,
             )?;
         }
         if let Some(post_install) = rootfs.get("post_install").and_then(|v| v.as_str()) {
@@ -1263,6 +1293,7 @@ pub fn compute_rootfs_input_hash(
 pub fn compute_initramfs_input_hash(
     config: &serde_yaml::Value,
     project_root: &Path,
+    cli_target_board: Option<&str>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -1286,6 +1317,7 @@ pub fn compute_initramfs_input_hash(
                 project_root,
                 None,
                 None,
+                cli_target_board,
             )?;
         }
         if let Some(post_install) = initramfs.get("post_install").and_then(|v| v.as_str()) {
@@ -3055,6 +3087,7 @@ extensions:
             std::path::Path::new("."),
             None,
             None,
+            None,
         )
         .unwrap();
         let hash_with = compute_ext_image_input_hash(
@@ -3062,6 +3095,7 @@ extensions:
             "my-ext",
             None,
             std::path::Path::new("."),
+            None,
             None,
             None,
         )
@@ -3210,6 +3244,7 @@ extensions:
             std::path::Path::new("."),
             None,
             None,
+            None,
         )
         .unwrap();
         let hash_with = compute_ext_image_input_hash(
@@ -3217,6 +3252,7 @@ extensions:
             "my-ext",
             None,
             std::path::Path::new("."),
+            None,
             None,
             None,
         )
@@ -3303,15 +3339,23 @@ extensions:
     }
 
     fn ext_build_hash(value: &serde_yaml::Value) -> String {
-        compute_ext_build_input_hash(value, "my-ext", std::path::Path::new("."), None, None)
+        compute_ext_build_input_hash(value, "my-ext", std::path::Path::new("."), None, None, None)
             .unwrap()
             .config_hash
     }
 
     fn ext_image_hash(value: &serde_yaml::Value) -> String {
-        compute_ext_image_input_hash(value, "my-ext", None, std::path::Path::new("."), None, None)
-            .unwrap()
-            .config_hash
+        compute_ext_image_input_hash(
+            value,
+            "my-ext",
+            None,
+            std::path::Path::new("."),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .config_hash
     }
 
     #[test]
@@ -3380,12 +3424,12 @@ extensions:
         std::fs::write(&script, b"#!/bin/sh\necho original\n").unwrap();
 
         let config = ext_with_extras("    post_build: build.sh");
-        let h1 = compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None)
+        let h1 = compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None, None)
             .unwrap()
             .config_hash;
 
         std::fs::write(&script, b"#!/bin/sh\necho edited\n").unwrap();
-        let h2 = compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None)
+        let h2 = compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None, None)
             .unwrap()
             .config_hash;
 
@@ -3556,10 +3600,10 @@ kernel:
 "#,
         )
         .unwrap();
-        let h_base = compute_rootfs_input_hash(&base, std::path::Path::new("."))
+        let h_base = compute_rootfs_input_hash(&base, std::path::Path::new("."), None)
             .unwrap()
             .config_hash;
-        let h_extra = compute_rootfs_input_hash(&with_metadata, std::path::Path::new("."))
+        let h_extra = compute_rootfs_input_hash(&with_metadata, std::path::Path::new("."), None)
             .unwrap()
             .config_hash;
         assert_eq!(
@@ -3590,10 +3634,10 @@ kernel:
 "#,
         )
         .unwrap();
-        let h_v1 = compute_rootfs_input_hash(&v1, std::path::Path::new("."))
+        let h_v1 = compute_rootfs_input_hash(&v1, std::path::Path::new("."), None)
             .unwrap()
             .config_hash;
-        let h_v2 = compute_rootfs_input_hash(&v2, std::path::Path::new("."))
+        let h_v2 = compute_rootfs_input_hash(&v2, std::path::Path::new("."), None)
             .unwrap()
             .config_hash;
         assert_ne!(h_v1, h_v2);
@@ -3614,12 +3658,12 @@ rootfs:
 "#,
         )
         .unwrap();
-        let h1 = compute_rootfs_input_hash(&config, tmp.path())
+        let h1 = compute_rootfs_input_hash(&config, tmp.path(), None)
             .unwrap()
             .config_hash;
 
         std::fs::write(&script, b"#!/bin/sh\necho v2\n").unwrap();
-        let h2 = compute_rootfs_input_hash(&config, tmp.path())
+        let h2 = compute_rootfs_input_hash(&config, tmp.path(), None)
             .unwrap()
             .config_hash;
 
@@ -3650,11 +3694,11 @@ rootfs:
         .unwrap();
 
         std::env::set_var("STAMP_OVL_TOKEN", "aaa");
-        let h1 = compute_rootfs_input_hash(&config, tmp.path())
+        let h1 = compute_rootfs_input_hash(&config, tmp.path(), None)
             .unwrap()
             .config_hash;
         std::env::set_var("STAMP_OVL_TOKEN", "bbb");
-        let h2 = compute_rootfs_input_hash(&config, tmp.path())
+        let h2 = compute_rootfs_input_hash(&config, tmp.path(), None)
             .unwrap()
             .config_hash;
 
@@ -3694,6 +3738,7 @@ extensions:
             tmp.path(),
             Some("qemux86-64"),
             Some("dev"),
+            None,
         )
         .unwrap()
         .config_hash;
@@ -3703,10 +3748,63 @@ extensions:
             tmp.path(),
             Some("qemux86-64"),
             Some("prod"),
+            None,
         )
         .unwrap()
         .config_hash;
         assert_ne!(h_dev, h_prod);
+    }
+
+    #[test]
+    fn ext_build_hash_reflects_target_board_override_for_preprocessed_overlay() {
+        // An ext overlay whose content depends on `{{ avocado.target.board }}`
+        // must produce different build hashes per --target-board value, so a
+        // board switch invalidates the stamp instead of reusing a stale
+        // artifact. Both calls pass an explicit cli_target_board, which the
+        // resolver checks first, so this is independent of AVOCADO_TARGET_BOARD.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("overlay/etc")).unwrap();
+        std::fs::write(
+            tmp.path().join("overlay/etc/b.conf"),
+            "board = {{ avocado.target.board }}\n",
+        )
+        .unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    overlay:
+      dir: overlay
+      preprocess:
+        - etc/b.conf
+"#,
+        )
+        .unwrap();
+
+        let h_a = compute_ext_build_input_hash(
+            &config,
+            "my-ext",
+            tmp.path(),
+            Some("imx8mp-var-dart"),
+            None,
+            Some("variscite-sonata"),
+        )
+        .unwrap()
+        .config_hash;
+        let h_b = compute_ext_build_input_hash(
+            &config,
+            "my-ext",
+            tmp.path(),
+            Some("imx8mp-var-dart"),
+            None,
+            Some("other-board"),
+        )
+        .unwrap()
+        .config_hash;
+        assert_ne!(
+            h_a, h_b,
+            "switching --target-board must invalidate the ext build stamp"
+        );
     }
 
     #[test]
@@ -3728,11 +3826,11 @@ rootfs:
         )
         .unwrap();
 
-        let h1 = compute_rootfs_input_hash(&config, tmp.path())
+        let h1 = compute_rootfs_input_hash(&config, tmp.path(), None)
             .unwrap()
             .config_hash;
         std::fs::write(tmp.path().join("overlay/etc/f.txt"), "v2-different").unwrap();
-        let h2 = compute_rootfs_input_hash(&config, tmp.path())
+        let h2 = compute_rootfs_input_hash(&config, tmp.path(), None)
             .unwrap()
             .config_hash;
         assert_eq!(h1, h2);
