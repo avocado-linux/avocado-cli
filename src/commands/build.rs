@@ -41,6 +41,8 @@ pub struct BuildCommand {
     pub extension: Option<String>,
     /// Global target architecture
     pub target: Option<String>,
+    /// Global target board override for `{{ avocado.target_board }}`
+    pub target_board: Option<String>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
@@ -74,6 +76,7 @@ impl BuildCommand {
             runtime,
             extension,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -82,6 +85,12 @@ impl BuildCommand {
             sdk_arch: None,
             composed_config: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -116,9 +125,14 @@ impl BuildCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 

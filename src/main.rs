@@ -90,6 +90,11 @@ struct Cli {
     #[arg(long)]
     target: Option<String>,
 
+    /// Global target board (overrides AVOCADO_TARGET_BOARD and config for
+    /// `{{ avocado.target_board }}` interpolation)
+    #[arg(long)]
+    target_board: Option<String>,
+
     /// Disable stamp validation and writing
     #[arg(long)]
     no_stamps: bool,
@@ -338,6 +343,9 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target_board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -2203,6 +2211,7 @@ async fn main() -> Result<()> {
             runtime,
             extension,
             target,
+            target_board,
             container_args,
             dnf_args,
             output,
@@ -2223,7 +2232,8 @@ async fn main() -> Result<()> {
             )
             .with_no_stamps(cli.no_stamps)
             .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-            .with_sdk_arch(cli.sdk_arch.clone());
+            .with_sdk_arch(cli.sdk_arch.clone())
+            .with_target_board(target_board.or(cli.target_board.clone()));
             build_cmd.execute().await?;
             Ok(())
         }

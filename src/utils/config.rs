@@ -1587,6 +1587,17 @@ impl Config {
         config_path: P,
         target: Option<&str>,
     ) -> Result<ComposedConfig> {
+        Self::load_composed_with_board(config_path, target, None)
+    }
+
+    /// Like [`Self::load_composed`], but also accepts a CLI `--target-board`
+    /// override that takes precedence over env/config when resolving
+    /// `{{ avocado.target_board }}` during interpolation.
+    pub fn load_composed_with_board<P: AsRef<Path>>(
+        config_path: P,
+        target: Option<&str>,
+        cli_target_board: Option<&str>,
+    ) -> Result<ComposedConfig> {
         let path = config_path.as_ref();
         let config_path_str = path.to_string_lossy().to_string();
 
@@ -1690,7 +1701,7 @@ impl Config {
         }
 
         // Apply interpolation to the composed model
-        crate::utils::interpolation::interpolate_config(&mut main_config, target, None)
+        crate::utils::interpolation::interpolate_config(&mut main_config, target, cli_target_board)
             .with_context(|| "Failed to interpolate composed configuration")?;
 
         // Deserialize the merged config into the Config struct
