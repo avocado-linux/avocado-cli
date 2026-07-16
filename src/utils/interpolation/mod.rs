@@ -115,7 +115,7 @@ pub fn interpolate_name(input: &str, target: &str) -> String {
 /// ```
 pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> Result<()> {
     // Create a context with just the target for backward compatibility
-    let context = AvocadoContext::from_main_config(yaml_value, cli_target);
+    let context = AvocadoContext::from_main_config(yaml_value, cli_target, None);
     interpolate_config_with_context(yaml_value, &context)
 }
 
@@ -141,7 +141,7 @@ pub fn interpolate_config(yaml_value: &mut Value, cli_target: Option<&str>) -> R
 /// "#).unwrap();
 ///
 /// // Create context from main config
-/// let context = AvocadoContext::from_main_config(&main_config, Some("x86_64"));
+/// let context = AvocadoContext::from_main_config(&main_config, Some("x86_64"), None);
 ///
 /// // Use context to interpolate an extension config
 /// let mut ext_config = serde_yaml::from_str(r#"
@@ -1022,7 +1022,7 @@ distro:
         );
 
         // Create context from main config
-        let context = AvocadoContext::from_main_config(&main_config, Some("x86_64"));
+        let context = AvocadoContext::from_main_config(&main_config, Some("x86_64"), None);
 
         // Test interpolating an extension config
         let mut ext_config = parse_yaml(
@@ -1102,7 +1102,7 @@ distro:
 "#,
         );
 
-        let context = AvocadoContext::from_main_config(&main_config, Some("aarch64"));
+        let context = AvocadoContext::from_main_config(&main_config, Some("aarch64"), None);
 
         // Extension config has its OWN distro values, but avocado.distro should use main config
         let mut ext_config = parse_yaml(

@@ -610,8 +610,11 @@ impl SdkContainer {
         // `{{ avocado.target/board/distro }}` resolve), then interpolate ONLY the
         // `extensions` subtree. Scoping the interpolation there means an error in
         // an unrelated top-level field can't drop every path mount.
-        let context =
-            crate::utils::interpolation::AvocadoContext::from_main_config(&value, Some(target));
+        let context = crate::utils::interpolation::AvocadoContext::from_main_config(
+            &value,
+            Some(target),
+            None,
+        );
         let mut extensions = value.get("extensions").cloned()?;
         if let Err(e) =
             crate::utils::interpolation::interpolate_config_with_context(&mut extensions, &context)

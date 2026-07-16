@@ -922,7 +922,8 @@ fn fold_overlay_content_hash(
     // `{{ avocado.target/board }}` accurate; `runtime` (for the ext path) makes
     // `{{ avocado.runtime }}`-dependent content invalidate the stamp when the
     // selected runtime changes — the ext-build stamp isn't otherwise runtime-keyed.
-    let mut context = crate::utils::interpolation::AvocadoContext::from_main_config(config, target);
+    let mut context =
+        crate::utils::interpolation::AvocadoContext::from_main_config(config, target, None);
     if let Some(rt) = runtime {
         context.runtime = Some(rt.to_string());
     }

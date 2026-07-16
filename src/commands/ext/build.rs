@@ -646,6 +646,7 @@ impl ExtBuildCommand {
                             crate::utils::interpolation::AvocadoContext::from_main_config(
                                 parsed,
                                 Some(target.as_str()),
+                                None,
                             );
                         // The selected runtime drives `{{ avocado.runtime }}` and
                         // the runtime-scoped target board; from_main_config only

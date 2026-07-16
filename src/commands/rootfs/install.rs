@@ -676,6 +676,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                 let context = crate::utils::interpolation::AvocadoContext::from_main_config(
                     parsed,
                     Some(params.target),
+                    None,
                 );
                 match crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
                     params.src_dir,
