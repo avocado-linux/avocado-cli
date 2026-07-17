@@ -1427,6 +1427,33 @@ pub fn compute_runtime_build_input_hash(
                         docker_images.clone(),
                     );
                 }
+                // Device-tree overlays are compiled and delivered at runtime-build
+                // time, so a declaration change (or an edit to a .dtso the
+                // declaration points at) must invalidate this stamp. Fold both the
+                // declaration value and each source's content hash, mirroring how
+                // the overlay/post_build keys track file contents.
+                if let Some(dtos) = parsed
+                    .get("extensions")
+                    .and_then(|e| e.get(ext_name))
+                    .and_then(|ext| ext.get("device_tree_overlays"))
+                {
+                    hash_data.insert(
+                        serde_yaml::Value::String(format!("ext.{ext_name}.device_tree_overlays")),
+                        dtos.clone(),
+                    );
+                    if let Some(seq) = dtos.as_sequence() {
+                        for entry in seq {
+                            if let Some(src) = entry.get("src").and_then(|v| v.as_str()) {
+                                hash_data.insert(
+                                    serde_yaml::Value::String(format!(
+                                        "ext.{ext_name}.dtso_content.{src}"
+                                    )),
+                                    script_hash_value(project_root, src),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -3161,6 +3188,93 @@ extensions:
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
             "Adding docker_images to an extension should change the runtime input hash"
+        );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_includes_device_tree_overlays() {
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+extensions:
+  - board
+"#,
+        )
+        .unwrap();
+
+        let parsed_without: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  board:
+    version: "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        let parsed_with: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  board:
+    version: "1.0.0"
+    device_tree_overlays:
+      - name: spi-fast
+        src: overlays/spi-fast.dtso
+"#,
+        )
+        .unwrap();
+
+        let hash_without =
+            compute_runtime_build_input_hash(&runtime, "dev", &parsed_without, Path::new("."))
+                .unwrap();
+        let hash_with =
+            compute_runtime_build_input_hash(&runtime, "dev", &parsed_with, Path::new("."))
+                .unwrap();
+
+        assert_ne!(
+            hash_without.config_hash, hash_with.config_hash,
+            "declaring a device-tree overlay must change the runtime input hash"
+        );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_tracks_dtso_content() {
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+extensions:
+  - board
+"#,
+        )
+        .unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  board:
+    version: "1.0.0"
+    device_tree_overlays:
+      - name: spi-fast
+        src: overlays/spi-fast.dtso
+"#,
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dtso = tmp.path().join("overlays/spi-fast.dtso");
+        std::fs::create_dir_all(dtso.parent().unwrap()).unwrap();
+
+        std::fs::write(&dtso, "/dts-v1/;\n/plugin/;\n/ { /* v1 */ };\n").unwrap();
+        let hash_v1 =
+            compute_runtime_build_input_hash(&runtime, "dev", &parsed, tmp.path()).unwrap();
+
+        std::fs::write(&dtso, "/dts-v1/;\n/plugin/;\n/ { /* v2 edited */ };\n").unwrap();
+        let hash_v2 =
+            compute_runtime_build_input_hash(&runtime, "dev", &parsed, tmp.path()).unwrap();
+
+        assert_ne!(
+            hash_v1.config_hash, hash_v2.config_hash,
+            "editing a .dtso's contents must change the runtime input hash"
         );
     }
 
