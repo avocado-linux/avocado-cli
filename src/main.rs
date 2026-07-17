@@ -1870,6 +1870,19 @@ fn resolve_runtime_at_path(config_path: &str, cli_runtime: Option<&str>) -> Resu
     crate::utils::runtime::validate_and_log_runtime(cli_runtime, &config)
 }
 
+/// Park the CLI `--target-board` value in the process-scoped interpolation
+/// override, then return it unchanged for the usual per-command threading.
+///
+/// Wrapping each command's `--target-board` at the dispatch boundary guarantees
+/// the flag reaches the interpolation sites that compose config with a `None`
+/// board parameter (extension discovery, composed-config first pass), which the
+/// threaded parameter alone does not cover. Passing `None` clears any prior
+/// value, keeping resolution on the env/config chain.
+fn park_target_board(target_board: Option<String>) -> Option<String> {
+    crate::utils::interpolation::set_cli_target_board_override(target_board.clone());
+    target_board
+}
+
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
 fn parse_env_vars(env_args: Option<&Vec<String>>) -> Option<HashMap<String, String>> {
     env_args.map(|args| {
@@ -2128,7 +2141,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board);
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
             } else {
                 // Packages specified: add to config and install into specified scope
@@ -2242,7 +2255,7 @@ async fn main() -> Result<()> {
             .with_no_stamps(cli.no_stamps)
             .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
             .with_sdk_arch(cli.sdk_arch.clone())
-            .with_target_board(target_board);
+            .with_target_board(park_target_board(target_board));
             build_cmd.execute().await?;
             Ok(())
         }
@@ -2347,7 +2360,7 @@ async fn main() -> Result<()> {
                     verbose,
                     force,
                     target: target.or(cli.target),
-                    target_board,
+                    target_board: park_target_board(target_board),
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     out,
@@ -2604,7 +2617,7 @@ async fn main() -> Result<()> {
                         verbose,
                         force,
                         target: target.or(cli.target),
-                        target_board,
+                        target_board: park_target_board(target_board),
                         provision_profile: provision_profile.clone(),
                         env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                         out,
@@ -2820,7 +2833,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board)
+                .with_target_board(park_target_board(target_board))
                 .with_runtime(resolved_runtime);
                 build_cmd.execute().await?;
                 Ok(())
@@ -3005,7 +3018,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board);
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -3070,7 +3083,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board);
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -3319,7 +3332,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_target_board(target_board);
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
                 Ok(())
             }

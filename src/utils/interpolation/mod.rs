@@ -62,6 +62,7 @@ pub mod config;
 pub mod env;
 
 // Re-export AvocadoContext for convenience
+pub use avocado::set_cli_target_board_override;
 pub use avocado::AvocadoContext;
 
 const MAX_ITERATIONS: usize = 100;
