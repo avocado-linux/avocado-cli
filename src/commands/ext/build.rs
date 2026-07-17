@@ -37,6 +37,8 @@ pub struct ExtBuildCommand {
     pub config_path: String,
     pub verbose: bool,
     pub target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     pub container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     pub no_stamps: bool,
@@ -68,6 +70,7 @@ impl ExtBuildCommand {
             config_path,
             verbose,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -78,6 +81,12 @@ impl ExtBuildCommand {
             composed_config: None,
             tui_context: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -154,9 +163,14 @@ impl ExtBuildCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
         let config = &composed.config;
@@ -253,8 +267,9 @@ impl ExtBuildCommand {
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose)
+                .with_cli_target_board(self.target_board.clone());
 
             // Resolve required stamps for extension build
             let required = resolve_required_stamps(
@@ -300,6 +315,7 @@ impl ExtBuildCommand {
                 &project_root,
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )
             .ok();
             let mut current_inputs: Vec<crate::utils::stamps::CurrentInput<'_>> = Vec::new();
@@ -383,7 +399,12 @@ impl ExtBuildCommand {
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
+                config.get_merged_ext_config_with_board(
+                    &self.extension,
+                    &target,
+                    config_path,
+                    self.target_board.as_deref(),
+                )?
             }
         }
         .ok_or_else(|| {
@@ -608,7 +629,8 @@ impl ExtBuildCommand {
         let target_arch = resolve_target_required(self.target.as_deref(), config)?;
 
         // Initialize SDK container helper
-        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .with_cli_target_board(self.target_board.clone());
 
         // Config is the source of truth for extension versions — no wildcard resolution.
         let ext_version = config_version.to_string();
@@ -646,10 +668,13 @@ impl ExtBuildCommand {
                             crate::utils::interpolation::AvocadoContext::from_main_config(
                                 parsed,
                                 Some(target.as_str()),
+                                self.target_board.as_deref(),
                             );
-                        // The selected runtime drives `{{ avocado.runtime }}` and
-                        // the runtime-scoped target board; from_main_config only
-                        // sees env/default, so override it when one was chosen.
+                        // Override `{{ avocado.runtime }}` with the selected
+                        // runtime; from_main_config only sees env/default. The
+                        // target board is left as from_main_config resolved it
+                        // (CLI flag > env > default_target_board) and is not
+                        // re-derived for the selected runtime here.
                         if let Some(rt) = self.runtime.as_deref() {
                             context.runtime = Some(rt.to_string());
                         }
@@ -812,6 +837,7 @@ impl ExtBuildCommand {
                 &config.project_root(&self.config_path),
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);
@@ -836,8 +862,9 @@ impl ExtBuildCommand {
                 ..Default::default()
             };
 
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose)
+                .with_cli_target_board(self.target_board.clone());
             container_helper.run_in_container(run_config).await?;
 
             if self.verbose {
@@ -1486,8 +1513,9 @@ fi
             ..Default::default()
         };
 
-        let container_helper =
-            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .verbose(self.verbose)
+            .with_cli_target_board(self.target_board.clone());
         let success = container_helper.run_in_container(run_config).await?;
         if !success {
             return Err(anyhow::anyhow!(
@@ -1572,7 +1600,8 @@ fi
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Initialize SDK container helper
-        let container_helper = SdkContainer::from_config(&self.config_path, config)?;
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .with_cli_target_board(self.target_board.clone());
 
         // Process each compile dependency
         for (dep_name, compile_section, install_script) in compile_install_deps {

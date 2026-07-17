@@ -52,6 +52,8 @@ pub struct SdkInstallCommand {
     pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
@@ -84,6 +86,7 @@ impl SdkInstallCommand {
             verbose,
             force,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -93,6 +96,12 @@ impl SdkInstallCommand {
             composed_config: None,
             tui_context: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -144,9 +153,14 @@ impl SdkInstallCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 
@@ -456,6 +470,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             container_helper,
             container_image,
             target,
+            target_board: self.target_board.as_deref(),
             repo_url,
             repo_release,
             merged_container_args: merged_container_args.cloned(),
@@ -476,6 +491,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             container_helper,
             container_image,
             target,
+            target_board: self.target_board.as_deref(),
             repo_url,
             repo_release,
             merged_container_args: merged_container_args.cloned(),
@@ -1547,8 +1563,12 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
         .await?;
 
         // Reload composed config to include extension configs
-        let composed = Config::load_composed(&self.config_path, Some(target))
-            .with_context(|| "Failed to reload composed config after fetching extensions")?;
+        let composed = Config::load_composed_with_board(
+            &self.config_path,
+            Some(target),
+            self.target_board.as_deref(),
+        )
+        .with_context(|| "Failed to reload composed config after fetching extensions")?;
         let config = &composed.config;
 
         // Re-compute active extensions after config reload (remote extension configs may be merged)

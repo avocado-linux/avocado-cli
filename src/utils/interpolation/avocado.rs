@@ -20,6 +20,55 @@
 use anyhow::Result;
 use serde_yaml::Value;
 use std::env;
+use std::sync::RwLock;
+
+/// Process-scoped `--target-board` override, parked once at the CLI boundary.
+///
+/// The flag cannot be threaded as a parameter through every interpolation site:
+/// config composition re-derives the board at roughly a dozen call sites
+/// (`parse_config_value_with_interpolation`, `discover_remote_extensions`,
+/// `load_composed`'s first pass, and siblings), several of which pass `None`.
+/// Threading a parameter to each is exactly the discipline that already failed -
+/// the flag was silently dropped on the `sdk install` / `build` extension paths.
+/// Instead the resolved flag is stored here and read as the top tier of
+/// [`AvocadoContext::resolve_target_board_value`], through which every
+/// production context is built. Env (`AVOCADO_TARGET_BOARD`) already reaches
+/// every site the same way; this mirrors that channel for the flag.
+///
+/// Channel boundary: this global is the load-bearing channel in production - it
+/// reaches every interpolation site on its own, including the `None`-threaded
+/// ones. The explicit `cli_target_board` parameter (on `resolve_target_board_value`,
+/// `load_composed_with_board`, and the command builders) carries the *same*
+/// value and is therefore redundant at runtime; it is retained only so tests can
+/// inject a board hermetically without mutating this global (see the stamp-hash
+/// tests). Prefer the global; reach for the parameter only for isolated test
+/// injection.
+///
+/// Concurrency: parked exactly once, single-threaded, before any async work, so
+/// the write lock is never contended and cannot be poisoned - the `Ok`/`ok()`
+/// guards below are a deliberate consequence of that invariant, not a
+/// silent-failure hole. Unit tests share this one static across the whole test
+/// binary, so any test that sets it MUST carry `#[serial]` and set+clear around
+/// its assertion; a board-referencing test added without `#[serial]` could
+/// otherwise observe another test's value.
+static CLI_TARGET_BOARD_OVERRIDE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Park (or clear with `None`) the process-scoped `--target-board` override.
+/// Called once at the CLI boundary before command dispatch; tests set and clear
+/// it under `#[serial]`.
+pub fn set_cli_target_board_override(board: Option<String>) {
+    if let Ok(mut guard) = CLI_TARGET_BOARD_OVERRIDE.write() {
+        *guard = board;
+    }
+}
+
+/// Read the process-scoped `--target-board` override, if one was parked.
+fn cli_target_board_override() -> Option<String> {
+    CLI_TARGET_BOARD_OVERRIDE
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
 
 /// Convert a YAML value to a string, handling numbers (e.g., `release: 2024` parsed as integer).
 fn yaml_value_to_string(v: &Value) -> String {
@@ -53,8 +102,9 @@ pub struct AvocadoContext {
     pub target: Option<String>,
     /// Optional board variant within a target. `None` here means the resolver
     /// will fall back to `target` at lookup time, so `{{ avocado.target.board }}`
-    /// equals `{{ avocado.target }}` by default. Precedence:
-    /// env > resolved-runtime's `target_board` > top-level `default_target_board`.
+    /// equals `{{ avocado.target }}` by default. Precedence: CLI `--target-board`
+    /// override > env `AVOCADO_TARGET_BOARD` > resolved-runtime's `target_board`
+    /// > top-level `default_target_board`.
     pub target_board: Option<String>,
     /// Resolved runtime name. Precedence: env `AVOCADO_RUNTIME` >
     /// `default_runtime` > sole runtime when exactly one is defined. `None`
@@ -101,7 +151,12 @@ impl AvocadoContext {
     /// # Arguments
     /// * `root` - The main config YAML value
     /// * `cli_target` - Optional CLI target override (highest priority)
-    pub fn from_main_config(root: &Value, cli_target: Option<&str>) -> Self {
+    /// * `cli_target_board` - Optional CLI target board override (highest priority)
+    pub fn from_main_config(
+        root: &Value,
+        cli_target: Option<&str>,
+        cli_target_board: Option<&str>,
+    ) -> Self {
         // Resolve target with precedence: CLI > env > config
         let target = Self::resolve_target_value(root, cli_target);
 
@@ -109,11 +164,12 @@ impl AvocadoContext {
         // env > default_runtime > sole-runtime auto-resolve.
         let runtime = Self::resolve_runtime_name(root);
 
-        // Resolve target_board with precedence: env > resolved-runtime's
+        // Resolve target_board with precedence: CLI > env > resolved-runtime's
         // `target_board` > top-level `default_target_board`. Stored as None
         // when none are set so the resolver can fall back to `target` at
         // lookup time.
-        let target_board = Self::resolve_target_board_value(root, runtime.as_deref());
+        let target_board =
+            Self::resolve_target_board_value(root, cli_target_board, runtime.as_deref());
 
         // Extract distro values from the main config
         let (distro_release, distro_channel) = Self::extract_distro_values(root);
@@ -150,15 +206,33 @@ impl AvocadoContext {
         None
     }
 
-    /// Resolve the target board value. Precedence: env `AVOCADO_TARGET_BOARD`,
-    /// then the resolved runtime's `target_board`, then config
-    /// `default_target_board`. Returns `None` when none are set; the resolver
-    /// then falls back to the resolved target.
+    /// Resolve the target board value. Precedence: CLI override
+    /// `cli_target_board`, then env `AVOCADO_TARGET_BOARD`, then the resolved
+    /// runtime's `target_board`, then config `default_target_board`. Returns
+    /// `None` when none are set; the resolver then falls back to the resolved
+    /// target.
     ///
     /// `runtime_name` is the pre-resolved runtime (see
     /// [`Self::resolve_runtime_name`]); when `None`, the per-runtime
     /// `target_board` lookup is skipped.
-    fn resolve_target_board_value(root: &Value, runtime_name: Option<&str>) -> Option<String> {
+    fn resolve_target_board_value(
+        root: &Value,
+        cli_target_board: Option<&str>,
+        runtime_name: Option<&str>,
+    ) -> Option<String> {
+        // 1. CLI target board passed explicitly by the caller (highest priority).
+        if let Some(board) = cli_target_board {
+            return Some(board.to_string());
+        }
+
+        // 2. Process-scoped CLI override — the `--target-board` flag parked at
+        //    the boundary. Catches the interpolation sites that call in with
+        //    `cli_target_board = None`; without it the flag is silently dropped
+        //    on those paths and the board falls back to the target.
+        if let Some(board) = cli_target_board_override() {
+            return Some(board);
+        }
+
         if let Ok(board) = env::var("AVOCADO_TARGET_BOARD") {
             return Some(board);
         }
@@ -660,7 +734,7 @@ distro:
   channel: edge
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target, Some("x86_64-unknown-linux-gnu".to_string()));
         assert_eq!(ctx.distro_release, Some("2024".to_string()));
         assert_eq!(ctx.distro_channel, Some("edge".to_string()));
@@ -677,7 +751,7 @@ distro:
   channel: apollo-edge
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target, Some("x86_64-unknown-linux-gnu".to_string()));
         assert_eq!(ctx.distro_release, Some("0.1.0".to_string()));
         assert_eq!(ctx.distro_channel, Some("apollo-edge".to_string()));
@@ -693,7 +767,7 @@ distro:
   channel: edge
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, Some("cli-target"));
+        let ctx = AvocadoContext::from_main_config(&config, Some("cli-target"), None);
         assert_eq!(ctx.target, Some("cli-target".to_string()));
         assert_eq!(ctx.distro_release, Some("2024".to_string()));
         assert_eq!(ctx.distro_channel, Some("edge".to_string()));
@@ -702,7 +776,7 @@ distro:
     #[test]
     fn test_avocado_context_missing_distro() {
         let config = parse_yaml("default_target: x86_64");
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target, Some("x86_64".to_string()));
         assert_eq!(ctx.distro_release, None);
         assert_eq!(ctx.distro_channel, None);
@@ -718,7 +792,7 @@ default_target: imx8mp-evk
 default_target_board: imx8mp-evk-rev3
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target, Some("imx8mp-evk".to_string()));
         assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
     }
@@ -733,7 +807,7 @@ default_target: imx8mp-evk
 default_target_board: config-board
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("env-board".to_string()));
         env::remove_var("AVOCADO_TARGET_BOARD");
     }
@@ -745,7 +819,7 @@ default_target_board: config-board
         // The resolver — not the context — handles fallback to target.
         env::remove_var("AVOCADO_TARGET_BOARD");
         let config = parse_yaml("default_target: imx8mp-evk");
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target, Some("imx8mp-evk".to_string()));
         assert_eq!(ctx.target_board, None);
     }
@@ -769,7 +843,7 @@ runtimes:
     target_board: imx8mp-evk-rev1
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
     }
 
@@ -788,8 +862,90 @@ runtimes:
     target_board: imx8mp-evk-rev3
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_cli_override_beats_env_and_default() {
+        // The CLI override wins over both AVOCADO_TARGET_BOARD and a
+        // top-level default_target_board.
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: config-board
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None, Some("flag-board"));
+        assert_eq!(ctx.target_board, Some("flag-board".to_string()));
+        env::remove_var("AVOCADO_TARGET_BOARD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_board_none_override_preserves_env_chain() {
+        // With no CLI override, resolution is unchanged: the env var still wins.
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-evk
+default_target_board: config-board
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
+        assert_eq!(ctx.target_board, Some("env-board".to_string()));
+        env::remove_var("AVOCADO_TARGET_BOARD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cli_override_reaches_none_threaded_interpolation() {
+        // Reproduces the sdk-install / build defect: the config-loading pipeline
+        // calls interpolation with cli_target_board=None (via
+        // parse_config_value_with_interpolation), so a threaded parameter never
+        // carries the flag to those sites and the board silently falls back to
+        // the target. The process-scoped override is the only channel that
+        // reaches them.
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        set_cli_target_board_override(Some("flag-board".to_string()));
+        let config = parse_yaml(
+            r#"
+default_target: imx8mp-var-dart
+default_target_board: config-board
+"#,
+        );
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
+        set_cli_target_board_override(None);
+        assert_eq!(ctx.target_board, Some("flag-board".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_cli_override_beats_env_on_none_threaded_path() {
+        // The flag outranks AVOCADO_TARGET_BOARD even when threaded in as None,
+        // matching the documented precedence (CLI > env).
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        set_cli_target_board_override(Some("flag-board".to_string()));
+        let config = parse_yaml("default_target: imx8mp-var-dart");
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
+        set_cli_target_board_override(None);
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        assert_eq!(ctx.target_board, Some("flag-board".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_cli_override_preserves_env_on_none_threaded_path() {
+        // With the override cleared, resolution is unchanged: env still wins on
+        // the None-threaded path.
+        set_cli_target_board_override(None);
+        env::set_var("AVOCADO_TARGET_BOARD", "env-board");
+        let config = parse_yaml("default_target: imx8mp-var-dart");
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
+        env::remove_var("AVOCADO_TARGET_BOARD");
+        assert_eq!(ctx.target_board, Some("env-board".to_string()));
     }
 
     #[test]
@@ -809,7 +965,7 @@ runtimes:
     target_board: imx8mp-evk-rev3
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("imx8mp-evk-rev3".to_string()));
     }
 
@@ -830,7 +986,7 @@ runtimes:
     target_board: imx8mp-evk-rev1
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("imx8mp-evk-rev1".to_string()));
         env::remove_var("AVOCADO_RUNTIME");
     }
@@ -850,7 +1006,7 @@ runtimes:
     target_board: imx8mp-evk-rev3
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("env-board".to_string()));
         env::remove_var("AVOCADO_TARGET_BOARD");
     }
@@ -871,7 +1027,7 @@ runtimes:
     target: imx8mp-evk
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("top-level-board".to_string()));
     }
 
@@ -953,7 +1109,7 @@ runtimes:
     target: imx8mp-evk
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.runtime, Some("rev3".to_string()));
     }
 
@@ -975,7 +1131,7 @@ runtimes:
     target_board: imx8mp-evk-rev1
 "#,
         );
-        let ctx = AvocadoContext::from_main_config(&config, None);
+        let ctx = AvocadoContext::from_main_config(&config, None, None);
         assert_eq!(ctx.target_board, Some("top-level-board".to_string()));
     }
 

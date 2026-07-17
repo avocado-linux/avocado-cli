@@ -255,6 +255,9 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -338,6 +341,9 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -391,6 +397,9 @@ enum Commands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
@@ -1552,6 +1561,9 @@ enum SdkCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -1678,6 +1690,9 @@ enum RuntimeCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
@@ -1853,6 +1868,29 @@ fn resolve_runtime_at_path(config_path: &str, cli_runtime: Option<&str>) -> Resu
     let config = Config::load(config_path)
         .with_context(|| format!("Failed to load config: {config_path}"))?;
     crate::utils::runtime::validate_and_log_runtime(cli_runtime, &config)
+}
+
+/// Park the CLI `--target-board` value in the process-scoped interpolation
+/// override, then return it unchanged so the caller can keep threading it.
+///
+/// Parking is the load-bearing step: the override reaches the interpolation
+/// sites that compose config with a `None` board parameter (extension
+/// discovery, composed-config first pass), which the threaded parameter alone
+/// does not cover. The returned value only feeds the (now redundant) explicit
+/// threading; see [`crate::utils::interpolation::avocado`]'s override doc for
+/// the channel boundary. The dual role - mutate the global, pass the value
+/// through - is intentional so every dispatch arm routes its `--target-board`
+/// through one call.
+///
+/// INVARIANT: every command arm that accepts `--target-board` MUST route its
+/// value through this function. An arm that assigns `target_board` directly
+/// would leave the global unset and silently drop the flag on the
+/// `None`-threaded interpolation sites - the exact bug this design fixes.
+/// Passing `None` clears any prior value, keeping resolution on the env/config
+/// chain.
+fn park_target_board(target_board: Option<String>) -> Option<String> {
+    crate::utils::interpolation::set_cli_target_board_override(target_board.clone());
+    target_board
 }
 
 /// Parse environment variable arguments in the format "KEY=VALUE" into a HashMap
@@ -2084,6 +2122,7 @@ async fn main() -> Result<()> {
             sdk,
             no_save,
             target,
+            target_board,
             container_args,
             dnf_args,
             output,
@@ -2111,7 +2150,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
             } else {
                 // Packages specified: add to config and install into specified scope
@@ -2203,6 +2243,7 @@ async fn main() -> Result<()> {
             runtime,
             extension,
             target,
+            target_board,
             container_args,
             dnf_args,
             output,
@@ -2223,7 +2264,8 @@ async fn main() -> Result<()> {
             )
             .with_no_stamps(cli.no_stamps)
             .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-            .with_sdk_arch(cli.sdk_arch.clone());
+            .with_sdk_arch(cli.sdk_arch.clone())
+            .with_target_board(park_target_board(target_board));
             build_cmd.execute().await?;
             Ok(())
         }
@@ -2287,6 +2329,7 @@ async fn main() -> Result<()> {
             force,
             runtime,
             target,
+            target_board,
             provision_profile,
             env,
             out,
@@ -2327,6 +2370,7 @@ async fn main() -> Result<()> {
                     verbose,
                     force,
                     target: target.or(cli.target),
+                    target_board: park_target_board(target_board),
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     out,
@@ -2566,6 +2610,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 target,
+                target_board,
                 provision_profile,
                 env,
                 out,
@@ -2582,6 +2627,7 @@ async fn main() -> Result<()> {
                         verbose,
                         force,
                         target: target.or(cli.target),
+                        target_board: park_target_board(target_board),
                         provision_profile: provision_profile.clone(),
                         env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                         out,
@@ -2774,6 +2820,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 target,
+                target_board,
                 runtime,
                 container_args,
                 dnf_args,
@@ -2796,6 +2843,7 @@ async fn main() -> Result<()> {
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
                 .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(park_target_board(target_board))
                 .with_runtime(resolved_runtime);
                 build_cmd.execute().await?;
                 Ok(())
@@ -2965,6 +3013,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 target,
+                target_board,
                 container_args,
                 dnf_args,
             } => {
@@ -2978,7 +3027,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -3028,6 +3078,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 target,
+                target_board,
                 container_args,
                 dnf_args,
             } => {
@@ -3041,7 +3092,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -3275,6 +3327,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force,
                 target,
+                target_board,
                 container_args,
                 dnf_args,
             } => {
@@ -3288,7 +3341,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(park_target_board(target_board));
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -4251,6 +4305,9 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Runtime to build the extension against (kernel/rootfs context).
         /// Required when the project has multiple runtimes. Resolves from
         /// AVOCADO_RUNTIME / default_runtime / sole-runtime when omitted.
@@ -4449,6 +4506,9 @@ enum RootfsCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -4513,6 +4573,9 @@ enum InitramfsCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,

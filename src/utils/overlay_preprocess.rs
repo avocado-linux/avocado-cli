@@ -376,7 +376,7 @@ mod tests {
     use super::*;
 
     fn ctx() -> AvocadoContext {
-        AvocadoContext::from_main_config(&Value::Null, Some("qemux86-64"))
+        AvocadoContext::from_main_config(&Value::Null, Some("qemux86-64"), None)
     }
 
     #[test]

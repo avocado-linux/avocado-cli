@@ -41,6 +41,8 @@ pub struct BuildCommand {
     pub extension: Option<String>,
     /// Global target architecture
     pub target: Option<String>,
+    /// Global target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<String>,
     /// Additional arguments to pass to the container runtime
     pub container_args: Option<Vec<String>>,
     /// Additional arguments to pass to DNF commands
@@ -74,6 +76,7 @@ impl BuildCommand {
             runtime,
             extension,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -82,6 +85,12 @@ impl BuildCommand {
             sdk_arch: None,
             composed_config: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -116,9 +125,14 @@ impl BuildCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 
@@ -169,8 +183,9 @@ impl BuildCommand {
             let container_image = config.get_sdk_image().ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'")
             })?;
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(false);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(false)
+                .with_cli_target_board(self.target_board.clone());
 
             // Check that SDK install stamp exists (required for all builds).
             // Use Runtime/Install which just requires sdk_install().
@@ -280,6 +295,7 @@ impl BuildCommand {
             let runs_on = self.runs_on.clone();
             let nfs_port = self.nfs_port;
             let sdk_arch = self.sdk_arch.clone();
+            let target_board = self.target_board.clone();
             let composed2 = Arc::clone(&composed);
             let renderer2 = renderer.clone();
             // When the project resolves to a single runtime, propagate it so
@@ -306,6 +322,7 @@ impl BuildCommand {
                     let dnf_args = dnf_args.clone();
                     let runs_on = runs_on.clone();
                     let sdk_arch = sdk_arch.clone();
+                    let target_board = target_board.clone();
                     let composed = Arc::clone(&composed2);
                     let renderer = renderer2.clone();
                     let dual_write_runtime = dual_write_runtime.clone();
@@ -329,6 +346,7 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
+                                .with_target_board(target_board)
                                 .with_composed_config(composed)
                                 .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
@@ -348,6 +366,7 @@ impl BuildCommand {
                                 .with_no_stamps(no_stamps)
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
+                                .with_target_board(target_board)
                                 .with_composed_config(composed)
                                 .with_runtime(dual_write_runtime);
                                 if let Some(ctx) = tui_ctx {
@@ -632,6 +651,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
@@ -650,6 +670,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_build_cmd
                     .execute()
@@ -677,6 +698,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for extension '{ext_name}'")
@@ -694,6 +716,7 @@ impl BuildCommand {
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
                 .with_sdk_arch(self.sdk_arch.clone())
+                .with_target_board(self.target_board.clone())
                 .with_composed_config(Arc::clone(composed));
                 ext_image_cmd.execute().await.with_context(|| {
                     format!("Failed to create image for remote extension '{name}'")

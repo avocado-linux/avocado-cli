@@ -21,6 +21,9 @@ pub struct ExtImageCommand {
     config_path: String,
     verbose: bool,
     target: Option<String>,
+    /// Target board override for `{{ avocado.target.board }}` (feeds the
+    /// stamp input hash so a board switch invalidates the image).
+    target_board: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
@@ -52,6 +55,7 @@ impl ExtImageCommand {
             config_path,
             verbose,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -63,6 +67,12 @@ impl ExtImageCommand {
             composed_config: None,
             tui_context: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -247,8 +257,9 @@ impl ExtImageCommand {
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
-            let container_helper =
-                SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+            let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                .verbose(self.verbose)
+                .with_cli_target_board(self.target_board.clone());
 
             // Resolve required stamps for extension image
             let required = resolve_required_stamps(
@@ -295,6 +306,7 @@ impl ExtImageCommand {
                 &project_root,
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )
             .ok();
             let image_inputs = compute_ext_image_input_hash(
@@ -304,6 +316,7 @@ impl ExtImageCommand {
                 &project_root,
                 Some(target.as_str()),
                 self.runtime.as_deref(),
+                self.target_board.as_deref(),
             )
             .ok();
             let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
@@ -453,7 +466,12 @@ impl ExtImageCommand {
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
+                config.get_merged_ext_config_with_board(
+                    &self.extension,
+                    &target,
+                    config_path,
+                    self.target_board.as_deref(),
+                )?
             }
         }
         .ok_or_else(|| {
@@ -678,6 +696,7 @@ impl ExtImageCommand {
                     &config.project_root(&self.config_path),
                     Some(target.as_str()),
                     self.runtime.as_deref(),
+                    self.target_board.as_deref(),
                 )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);
@@ -700,8 +719,9 @@ impl ExtImageCommand {
                     ..Default::default()
                 };
 
-                let container_helper =
-                    SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+                let container_helper = SdkContainer::from_config(&self.config_path, config)?
+                    .verbose(self.verbose)
+                    .with_cli_target_board(self.target_board.clone());
                 container_helper.run_in_container(run_config).await?;
 
                 if self.verbose {

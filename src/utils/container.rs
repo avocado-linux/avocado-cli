@@ -487,6 +487,10 @@ pub struct SdkContainer {
     /// truth), so no separate persisted state can drift from it.
     pub config_path: Option<PathBuf>,
     pub verbose: bool,
+    /// CLI `--target-board` override, threaded into the interpolation context
+    /// so `type: path` extension `source.path` values referencing
+    /// `{{ avocado.target.board }}` mount from the flag's board.
+    pub cli_target_board: Option<String>,
 }
 
 impl Default for SdkContainer {
@@ -504,6 +508,7 @@ impl SdkContainer {
             src_dir: None,
             config_path: None,
             verbose: false,
+            cli_target_board: None,
         }
     }
 
@@ -516,7 +521,15 @@ impl SdkContainer {
             src_dir: None,
             config_path: None,
             verbose: false,
+            cli_target_board: None,
         }
+    }
+
+    /// Set the CLI `--target-board` override used when deriving `type: path`
+    /// extension mounts.
+    pub fn with_cli_target_board(mut self, cli_target_board: Option<String>) -> Self {
+        self.cli_target_board = cli_target_board;
+        self
     }
 
     /// Set the config file path (used to derive `type: path` extension mounts).
@@ -610,8 +623,11 @@ impl SdkContainer {
         // `{{ avocado.target/board/distro }}` resolve), then interpolate ONLY the
         // `extensions` subtree. Scoping the interpolation there means an error in
         // an unrelated top-level field can't drop every path mount.
-        let context =
-            crate::utils::interpolation::AvocadoContext::from_main_config(&value, Some(target));
+        let context = crate::utils::interpolation::AvocadoContext::from_main_config(
+            &value,
+            Some(target),
+            self.cli_target_board.as_deref(),
+        );
         let mut extensions = value.get("extensions").cloned()?;
         if let Err(e) =
             crate::utils::interpolation::interpolate_config_with_context(&mut extensions, &context)

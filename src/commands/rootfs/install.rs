@@ -92,6 +92,8 @@ pub struct SysrootInstallParams<'a> {
     pub container_helper: &'a SdkContainer,
     pub container_image: &'a str,
     pub target: &'a str,
+    /// CLI target board override for `{{ avocado.target.board }}`
+    pub target_board: Option<&'a str>,
     pub repo_url: Option<&'a str>,
     pub repo_release: Option<&'a str>,
     pub merged_container_args: Option<Vec<String>>,
@@ -676,6 +678,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                 let context = crate::utils::interpolation::AvocadoContext::from_main_config(
                     parsed,
                     Some(params.target),
+                    params.target_board,
                 );
                 match crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
                     params.src_dir,
@@ -841,12 +844,17 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             if let Some(parsed) = params.parsed {
                 let stamp_result = match params.sysroot_type {
                     SysrootType::Rootfs => {
-                        let inputs = compute_rootfs_input_hash(parsed, params.src_dir)?;
+                        let inputs =
+                            compute_rootfs_input_hash(parsed, params.src_dir, params.target_board)?;
                         let outputs = StampOutputs::default();
                         Ok(Stamp::rootfs_install(params.target, inputs, outputs))
                     }
                     SysrootType::Initramfs => {
-                        let inputs = compute_initramfs_input_hash(parsed, params.src_dir)?;
+                        let inputs = compute_initramfs_input_hash(
+                            parsed,
+                            params.src_dir,
+                            params.target_board,
+                        )?;
                         let outputs = StampOutputs::default();
                         Ok(Stamp::initramfs_install(params.target, inputs, outputs))
                     }
@@ -904,6 +912,7 @@ pub struct RootfsInstallCommand {
     verbose: bool,
     force: bool,
     target: Option<String>,
+    target_board: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
@@ -927,6 +936,7 @@ impl RootfsInstallCommand {
             verbose,
             force,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -935,6 +945,12 @@ impl RootfsInstallCommand {
             sdk_arch: None,
             composed_config: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
@@ -963,9 +979,14 @@ impl RootfsInstallCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
 
@@ -981,8 +1002,9 @@ impl RootfsInstallCommand {
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
 
-        let container_helper =
-            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .verbose(self.verbose)
+            .with_cli_target_board(self.target_board.clone());
 
         let mut runs_on_context: Option<RunsOnContext> = if let Some(ref runs_on) = self.runs_on {
             Some(
@@ -1007,6 +1029,7 @@ impl RootfsInstallCommand {
             container_helper: &container_helper,
             container_image,
             target: &target,
+            target_board: self.target_board.as_deref(),
             repo_url: repo_url.as_deref(),
             repo_release: repo_release.as_deref(),
             merged_container_args: merged_container_args.clone(),
