@@ -98,7 +98,6 @@ impl SdkInstallCommand {
         }
     }
 
-    /// Set the no_stamps flag
     /// Set the CLI target board override
     pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
         self.target_board = target_board;

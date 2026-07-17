@@ -670,9 +670,11 @@ impl ExtBuildCommand {
                                 Some(target.as_str()),
                                 self.target_board.as_deref(),
                             );
-                        // The selected runtime drives `{{ avocado.runtime }}` and
-                        // the runtime-scoped target board; from_main_config only
-                        // sees env/default, so override it when one was chosen.
+                        // Override `{{ avocado.runtime }}` with the selected
+                        // runtime; from_main_config only sees env/default. The
+                        // target board is left as from_main_config resolved it
+                        // (CLI flag > env > default_target_board) and is not
+                        // re-derived for the selected runtime here.
                         if let Some(rt) = self.runtime.as_deref() {
                             context.runtime = Some(rt.to_string());
                         }
