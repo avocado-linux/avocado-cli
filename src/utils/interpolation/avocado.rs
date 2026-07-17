@@ -28,12 +28,29 @@ use std::sync::RwLock;
 /// config composition re-derives the board at roughly a dozen call sites
 /// (`parse_config_value_with_interpolation`, `discover_remote_extensions`,
 /// `load_composed`'s first pass, and siblings), several of which pass `None`.
-/// Threading a parameter to each is exactly the discipline that already failed —
+/// Threading a parameter to each is exactly the discipline that already failed -
 /// the flag was silently dropped on the `sdk install` / `build` extension paths.
 /// Instead the resolved flag is stored here and read as the top tier of
 /// [`AvocadoContext::resolve_target_board_value`], through which every
 /// production context is built. Env (`AVOCADO_TARGET_BOARD`) already reaches
 /// every site the same way; this mirrors that channel for the flag.
+///
+/// Channel boundary: this global is the load-bearing channel in production - it
+/// reaches every interpolation site on its own, including the `None`-threaded
+/// ones. The explicit `cli_target_board` parameter (on `resolve_target_board_value`,
+/// `load_composed_with_board`, and the command builders) carries the *same*
+/// value and is therefore redundant at runtime; it is retained only so tests can
+/// inject a board hermetically without mutating this global (see the stamp-hash
+/// tests). Prefer the global; reach for the parameter only for isolated test
+/// injection.
+///
+/// Concurrency: parked exactly once, single-threaded, before any async work, so
+/// the write lock is never contended and cannot be poisoned - the `Ok`/`ok()`
+/// guards below are a deliberate consequence of that invariant, not a
+/// silent-failure hole. Unit tests share this one static across the whole test
+/// binary, so any test that sets it MUST carry `#[serial]` and set+clear around
+/// its assertion; a board-referencing test added without `#[serial]` could
+/// otherwise observe another test's value.
 static CLI_TARGET_BOARD_OVERRIDE: RwLock<Option<String>> = RwLock::new(None);
 
 /// Park (or clear with `None`) the process-scoped `--target-board` override.

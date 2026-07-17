@@ -104,6 +104,7 @@ impl SdkInstallCommand {
         self
     }
 
+    /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
         self

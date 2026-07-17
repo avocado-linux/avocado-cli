@@ -1871,13 +1871,23 @@ fn resolve_runtime_at_path(config_path: &str, cli_runtime: Option<&str>) -> Resu
 }
 
 /// Park the CLI `--target-board` value in the process-scoped interpolation
-/// override, then return it unchanged for the usual per-command threading.
+/// override, then return it unchanged so the caller can keep threading it.
 ///
-/// Wrapping each command's `--target-board` at the dispatch boundary guarantees
-/// the flag reaches the interpolation sites that compose config with a `None`
-/// board parameter (extension discovery, composed-config first pass), which the
-/// threaded parameter alone does not cover. Passing `None` clears any prior
-/// value, keeping resolution on the env/config chain.
+/// Parking is the load-bearing step: the override reaches the interpolation
+/// sites that compose config with a `None` board parameter (extension
+/// discovery, composed-config first pass), which the threaded parameter alone
+/// does not cover. The returned value only feeds the (now redundant) explicit
+/// threading; see [`crate::utils::interpolation::avocado`]'s override doc for
+/// the channel boundary. The dual role - mutate the global, pass the value
+/// through - is intentional so every dispatch arm routes its `--target-board`
+/// through one call.
+///
+/// INVARIANT: every command arm that accepts `--target-board` MUST route its
+/// value through this function. An arm that assigns `target_board` directly
+/// would leave the global unset and silently drop the flag on the
+/// `None`-threaded interpolation sites - the exact bug this design fixes.
+/// Passing `None` clears any prior value, keeping resolution on the env/config
+/// chain.
 fn park_target_board(target_board: Option<String>) -> Option<String> {
     crate::utils::interpolation::set_cli_target_board_override(target_board.clone());
     target_board
