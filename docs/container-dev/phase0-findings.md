@@ -40,6 +40,14 @@ Evidence provenance (recorded honestly, per the safety-critical tier):
 The GO rests on that attestation for 1.1-1.10; the two in-session results stand on their own
 tool output above.
 
+## 1.6 — default registry port (recorded for task 2.2)
+
+Task 1.6 chose a non-conflicting default port on stock macOS: **5599**. `5000` is
+avoided because the macOS AirPlay Receiver binds it. This is the literal the typed
+`container_dev` config uses as `RegistryConfig::DEFAULT_REGISTRY_PORT` when
+`registry.port` is omitted (task 2.2), and it matches the loopback registry port
+used in the 1.4 spike (`127.0.0.1:5599`).
+
 ## 1.4 — Native-Linux loopback push + CLI-injected credential — PARTIAL (docker arm GO)
 
 **Claim under test.** A2 (docker treats a `127.0.0.0/8` registry as trust-free, no cert

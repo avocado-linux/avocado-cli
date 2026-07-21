@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::utils::container_dev::config::ContainerDevConfig;
 use crate::utils::kernel_version::KernelVersionSpec;
 use crate::utils::output::{print_warning, OutputLevel};
 
@@ -679,6 +680,9 @@ pub struct RuntimeConfig {
     pub initramfs: Option<ImageRef>,
     /// Var partition configuration: default compression, subvolume definitions.
     pub var: Option<VarConfig>,
+    /// Container Dev Mode configuration. Presence of this block enables the
+    /// feature for this runtime; an absent block means the feature is off.
+    pub container_dev: Option<ContainerDevConfig>,
 }
 
 /// SDK configuration section
@@ -2368,7 +2372,9 @@ impl Config {
     /// - `ext.<name>.dependencies.<dep>.config`
     ///
     /// Returns a list of (extension_name, config_path) tuples.
-    fn discover_external_config_refs(config: &serde_yaml::Value) -> Vec<(String, String)> {
+    pub(crate) fn discover_external_config_refs(
+        config: &serde_yaml::Value,
+    ) -> Vec<(String, String)> {
         let mut refs = Vec::new();
         let mut visited = std::collections::HashSet::new();
 
@@ -2394,6 +2400,7 @@ impl Config {
                                 "signing",
                                 "var_files",
                                 "var",
+                                "container_dev",
                             ]
                             .contains(&key_str)
                             {
@@ -3510,6 +3517,7 @@ impl Config {
             rootfs: rootfs_ref,
             initramfs: initramfs_ref,
             var: None,
+            container_dev: None,
         };
         let mut map = self.runtimes.take().unwrap_or_default();
         map.insert("default".to_string(), synth);
