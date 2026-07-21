@@ -100,6 +100,33 @@ pub fn collect_for_runtime(
     Ok(out)
 }
 
+/// Names of the active extensions that declare at least one device-tree overlay.
+///
+/// Unlike [`collect_for_runtime`], which scopes to a single runtime's enabled
+/// extensions, this scans the whole active-extension set: the SDK install spans
+/// every runtime, so the overlay build wrapper and delivery hook must be
+/// provisioned whenever any active extension declares overlays. Returns the
+/// declaring extension names sorted; an empty result means the feature is inert.
+pub fn active_extensions_declaring_overlays(
+    parsed: &Value,
+    active_extensions: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = active_extensions
+        .iter()
+        .filter(|ext| {
+            parsed
+                .get("extensions")
+                .and_then(|e| e.get(ext.as_str()))
+                .and_then(|e| e.get("device_tree_overlays"))
+                .and_then(|d| d.as_sequence())
+                .is_some_and(|s| !s.is_empty())
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
 fn parse_entry(entry: &Value, ext_name: &str, idx: usize) -> Result<DeviceTreeOverlay> {
     let name = entry
         .get("name")
@@ -189,6 +216,17 @@ fn scalar_to_string(v: &Value) -> Option<String> {
 /// are present in a given machine build, exactly one is ever installed. The CLI
 /// runs this exact path - it never scans a directory.
 pub const DELIVERY_HOOK_RELATIVE: &str = "usr/libexec/avocado/device-tree-overlay-deliver";
+
+/// nativesdk package providing the `avocado-dtc-overlay` SDK build wrapper.
+/// Its RDEPENDS pulls `nativesdk-dtc`, and `stone` is a baseline SDK package
+/// (stone bundle runs on every runtime build), so neither is provisioned
+/// separately.
+pub const SDK_OVERLAY_PACKAGE: &str = "nativesdk-avocado-dtc-overlay";
+
+/// Target package providing the per-BSP `device-tree-overlay-deliver` hook
+/// (the executable at [`DELIVERY_HOOK_RELATIVE`]). Installed into the
+/// target-sysroot so the runtime build can invoke it.
+pub const DELIVERY_HOOK_PACKAGE: &str = "avocado-dtc-overlay-deliver";
 
 // In-container guard: fail the build if the hook staged overlays but left any
 // unclaimed (declared and compiled, yet not delivered to the boot medium).
@@ -488,5 +526,49 @@ extensions:
             v["overlays"][0]["claimed_by"].is_null(),
             "claimed_by must start null so the hook must set it"
         );
+    }
+
+    #[test]
+    fn declaring_overlays_scans_active_set_not_per_runtime() {
+        let parsed = cfg(r#"
+extensions:
+  board-a:
+    device_tree_overlays:
+      - name: spi
+        src: a.dtso
+  board-b:
+    packages:
+      - vim
+  board-c:
+    device_tree_overlays:
+      - name: gpio
+        src: c.dtso
+"#);
+        let active: std::collections::HashSet<String> = ["board-a", "board-b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // board-a declares and is active -> included; board-b active but declares
+        // none -> excluded; board-c declares but is inactive -> excluded.
+        assert_eq!(
+            active_extensions_declaring_overlays(&parsed, &active),
+            vec!["board-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn declaring_overlays_empty_when_none_active_declare() {
+        let parsed = cfg("extensions:\n  a:\n    packages:\n      - vim\n");
+        let active: std::collections::HashSet<String> =
+            ["a"].iter().map(|s| s.to_string()).collect();
+        assert!(active_extensions_declaring_overlays(&parsed, &active).is_empty());
+    }
+
+    #[test]
+    fn declaring_overlays_ignores_empty_declaration_list() {
+        let parsed = cfg("extensions:\n  a:\n    device_tree_overlays: []\n");
+        let active: std::collections::HashSet<String> =
+            ["a"].iter().map(|s| s.to_string()).collect();
+        assert!(active_extensions_declaring_overlays(&parsed, &active).is_empty());
     }
 }
