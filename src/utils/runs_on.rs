@@ -442,6 +442,54 @@ impl RunsOnContext {
         env_vars: HashMap<String, String>,
         extra_docker_args: &[String],
     ) -> Result<Option<String>> {
+        // Surface the failure before collapsing to None — otherwise callers
+        // convert it into misleading errors like "missing stamps" or
+        // "produced no output". The printed detail is a bounded stderr tail
+        // and never includes the docker command, which carries -e KEY=value
+        // pairs.
+        match self
+            .run_container_command_captured(image, command, env_vars, extra_docker_args)
+            .await
+        {
+            Ok(out) if out.success => Ok(Some(out.stdout)),
+            Ok(out) => {
+                if self.verbose {
+                    crate::utils::container::print_failure_notice(&format!(
+                        "Remote container command failed:\n{}",
+                        out.stderr
+                    ));
+                } else {
+                    crate::utils::container::print_failure_notice(
+                        &crate::utils::container::container_failure_message(
+                            "Remote container command failed",
+                            &out.stderr,
+                        ),
+                    );
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                // ssh itself could not run; this error carries no remote
+                // command line.
+                crate::utils::container::print_failure_notice(&format!(
+                    "Remote container command failed: {e:#}"
+                ));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Run a container command on the remote and return the full captured
+    /// result (exit success plus both streams; stderr mixes ssh's own output
+    /// with the container's). For callers that must put the failure detail
+    /// into their own error instead of relying on printing side effects.
+    pub async fn run_container_command_captured(
+        &self,
+        image: &str,
+        command: &str,
+        env_vars: HashMap<String, String>,
+        extra_docker_args: &[String],
+    ) -> Result<crate::utils::remote::RemoteCommandOutput> {
         let docker_cmd = self.build_docker_command(image, command, &env_vars, extra_docker_args)?;
 
         if self.verbose {
@@ -451,11 +499,7 @@ impl RunsOnContext {
             );
         }
 
-        // Execute on remote and capture output
-        match self.ssh.run_command(&docker_cmd).await {
-            Ok(output) => Ok(Some(output)),
-            Err(_) => Ok(None),
-        }
+        self.ssh.run_command_captured(&docker_cmd).await
     }
 
     /// Build the docker run command string

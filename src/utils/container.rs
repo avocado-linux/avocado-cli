@@ -301,6 +301,123 @@ fn docker_daemon_hint(stderr: &str) -> Option<String> {
     None
 }
 
+/// Full result of a captured container run. Unlike
+/// `run_in_container_with_output`, a non-zero exit keeps both streams so
+/// callers can surface the script's own diagnostics instead of guessing
+/// why the output is missing.
+#[derive(Debug)]
+pub struct ContainerRunOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Default number of trailing stderr lines surfaced when a captured
+/// container command fails.
+pub const STDERR_TAIL_LINES: usize = 15;
+
+/// Byte ceiling on the detail string, so a single enormous stderr line
+/// can't balloon error messages or the JSON step_error events built
+/// from them.
+const STDERR_TAIL_MAX_BYTES: usize = 4096;
+
+/// Distill captured stderr into the lines most likely to explain a container
+/// failure: the last `max_lines` non-empty lines, annotated when earlier
+/// output was omitted, capped at `STDERR_TAIL_MAX_BYTES` (keeping the end,
+/// where the diagnostic usually is). Returns `None` when stderr has no
+/// non-empty lines.
+pub fn container_failure_detail(stderr: &str, max_lines: usize) -> Option<String> {
+    // Allocations stay bounded by ~max_lines * STDERR_TAIL_MAX_BYTES no
+    // matter how large stderr is: line refs are capped at max_lines and each
+    // pathological line is pre-trimmed to its tail before joining. The final
+    // detail may exceed STDERR_TAIL_MAX_BYTES only by the small constant
+    // annotation lines below.
+    let total = stderr.lines().filter(|l| !l.trim().is_empty()).count();
+    if total == 0 {
+        return None;
+    }
+    let keep = total.min(max_lines);
+    let omitted = total - keep;
+    let mut pretrimmed = false;
+    let mut kept: Vec<&str> = stderr
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .take(keep)
+        .map(|l| {
+            let t = str_tail(l, STDERR_TAIL_MAX_BYTES);
+            pretrimmed |= t.len() != l.len();
+            t
+        })
+        .collect();
+    kept.reverse();
+    let mut tail = kept.join("\n");
+    if tail.len() > STDERR_TAIL_MAX_BYTES {
+        tail = format!(
+            "… (output truncated)\n{}",
+            str_tail(&tail, STDERR_TAIL_MAX_BYTES)
+        );
+    } else if pretrimmed {
+        tail = format!("… (output truncated)\n{tail}");
+    }
+    if omitted > 0 {
+        Some(format!("… ({omitted} earlier line(s) omitted)\n{tail}"))
+    } else {
+        Some(tail)
+    }
+}
+
+/// The trailing `max_bytes` of `s`, snapped forward to a char boundary.
+fn str_tail(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// Compose a failure message that carries the container script's own
+/// stderr diagnostics plus any recognized Docker daemon hint. Used for
+/// errors that must explain themselves in every output mode (TUI, JSON
+/// events, plain human) rather than relying on printing side effects.
+pub fn container_failure_message(context: &str, stderr: &str) -> String {
+    let mut msg = match container_failure_detail(stderr, STDERR_TAIL_LINES) {
+        Some(detail) => format!("{context}:\n{detail}"),
+        None => format!("{context} (no stderr output from the container)"),
+    };
+    if let Some(hint) = docker_daemon_hint(stderr) {
+        msg.push('\n');
+        msg.push_str(&hint);
+    }
+    msg
+}
+
+/// Best-effort surface of a failure notice in whatever output mode is
+/// active: TUI renderers queue it above the task region, JSON mode (with
+/// or without a renderer) keeps it on stderr off the NDJSON stdout
+/// stream, and plain human mode uses the standard error print. Exists
+/// because print_error is a no-op in TUI/JSON modes, which would silently
+/// eat container failure diagnostics.
+pub(crate) fn print_failure_notice(msg: &str) {
+    if let Some(renderer) = crate::utils::tui::get_active_renderer() {
+        renderer.print_above(msg);
+    } else if crate::utils::output_format::is_json_output_active() {
+        eprintln!("{msg}");
+    } else {
+        print_error(msg, OutputLevel::Normal);
+    }
+}
+
+/// Convert captured output bytes to a String without an extra copy for
+/// the (overwhelmingly common) valid-UTF-8 case.
+pub(crate) fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 pub fn normalize_sdk_arch(sdk_arch: &str) -> Result<String> {
     match sdk_arch.to_lowercase().as_str() {
         "aarch64" | "arm64" => Ok("aarch64".to_string()),
@@ -1327,6 +1444,32 @@ impl SdkContainer {
 
     /// Run a command in the container and capture its output
     pub async fn run_in_container_with_output(&self, config: RunConfig) -> Result<Option<String>> {
+        let verbose = config.verbose || self.verbose;
+        let out = self.run_in_container_capture(config).await?;
+        if out.success {
+            return Ok(Some(out.stdout.trim().to_string()));
+        }
+        // Surface the failure. The script's stderr usually names the real
+        // problem, so print its tail instead of hiding it behind --verbose —
+        // otherwise callers convert `None` into misleading errors like
+        // "missing stamps" or "produced no output".
+        if verbose {
+            print_failure_notice(&format!("Container execution failed: {}", out.stderr));
+        } else if let Some(detail) = container_failure_detail(&out.stderr, STDERR_TAIL_LINES) {
+            print_failure_notice(&format!("Container command failed:\n{detail}"));
+        } else if !out.stderr.is_empty() || !out.stdout.is_empty() {
+            print_failure_notice("Container command failed. Run with --verbose to see details.");
+        }
+        if let Some(hint) = docker_daemon_hint(&out.stderr) {
+            print_failure_notice(&hint);
+        }
+        Ok(None)
+    }
+
+    /// Run a command in the container and capture its full result: exit
+    /// success plus stdout and stderr. Prints nothing on failure — callers
+    /// own the error presentation (see `container_failure_detail`).
+    pub async fn run_in_container_capture(&self, config: RunConfig) -> Result<ContainerRunOutput> {
         // Ensure QEMU binfmt_misc is registered when cross-arch emulation is needed
         if let Some(ref arch) = config.sdk_arch {
             ensure_cross_arch_emulation(&self.container_tool, arch).await?;
@@ -1443,31 +1586,21 @@ impl SdkContainer {
             .await
             .with_context(|| "Failed to execute container command")?;
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(Some(stdout))
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Always log the error for debugging - this helps diagnose container failures
-            // that might otherwise be silently converted to "missing stamps" errors
-            if config.verbose || self.verbose {
-                print_error(
-                    &format!("Container execution failed: {stderr}"),
-                    OutputLevel::Normal,
-                );
-            } else if !stderr.is_empty() || !stdout.is_empty() {
-                // Even in non-verbose mode, print a hint about the failure
-                print_error(
-                    "Container command failed. Run with --verbose to see details.",
-                    OutputLevel::Normal,
-                );
-            }
-            if let Some(hint) = docker_daemon_hint(&stderr) {
-                print_error(&hint, OutputLevel::Normal);
-            }
-            Ok(None)
+        // Trim stdout in place, matching the remote counterpart
+        // (`run_command_captured`) so `ContainerRunOutput.stdout` carries
+        // the same whitespace contract on both execution paths. stderr
+        // stays raw on both.
+        let mut stdout = bytes_to_string(output.stdout);
+        stdout.truncate(stdout.trim_end().len());
+        let leading = stdout.len() - stdout.trim_start().len();
+        if leading > 0 {
+            stdout.drain(..leading);
         }
+        Ok(ContainerRunOutput {
+            success: output.status.success(),
+            stdout,
+            stderr: bytes_to_string(output.stderr),
+        })
     }
 
     /// Query installed package versions from a sysroot using rpm -q
@@ -1598,6 +1731,54 @@ impl SdkContainer {
         config: &RunConfig,
         context: &crate::utils::runs_on::RunsOnContext,
     ) -> Result<Option<String>> {
+        let (full_command, env_vars, extra_args) = self.build_remote_run_parts(config, context)?;
+        context
+            .run_container_command_with_output(
+                &config.container_image,
+                &full_command,
+                env_vars,
+                &extra_args,
+            )
+            .await
+    }
+
+    /// Remote counterpart of `run_in_container_capture`: run the command via
+    /// the provided RunsOnContext and return the full result (stderr mixes
+    /// ssh's own output with the container's). Prints nothing on failure —
+    /// callers own the error presentation.
+    pub async fn run_in_container_capture_remote(
+        &self,
+        config: &RunConfig,
+        context: &crate::utils::runs_on::RunsOnContext,
+    ) -> Result<ContainerRunOutput> {
+        let (full_command, env_vars, extra_args) = self.build_remote_run_parts(config, context)?;
+        let out = context
+            .run_container_command_captured(
+                &config.container_image,
+                &full_command,
+                env_vars,
+                &extra_args,
+            )
+            .await?;
+        Ok(ContainerRunOutput {
+            success: out.success,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+
+    /// Assemble the (command, env, docker args) triple shared by the remote
+    /// execution variants above.
+    #[allow(clippy::type_complexity)]
+    fn build_remote_run_parts(
+        &self,
+        config: &RunConfig,
+        context: &crate::utils::runs_on::RunsOnContext,
+    ) -> Result<(
+        String,
+        std::collections::HashMap<String, String>,
+        Vec<String>,
+    )> {
         if !context.is_active() {
             anyhow::bail!("RunsOnContext is not active (already torn down)");
         }
@@ -1680,15 +1861,7 @@ impl SdkContainer {
             extra_args.extend(args.clone());
         }
 
-        // Run the container on the remote and capture output
-        context
-            .run_container_command_with_output(
-                &config.container_image,
-                &full_command,
-                env_vars,
-                &extra_args,
-            )
-            .await
+        Ok((full_command, env_vars, extra_args))
     }
 
     /// Execute the container command
@@ -2930,6 +3103,60 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_detail_none_for_blank_stderr() {
+        assert_eq!(container_failure_detail("", 10), None);
+        assert_eq!(container_failure_detail("\n  \n\t\n", 10), None);
+    }
+
+    #[test]
+    fn failure_detail_keeps_short_output_verbatim() {
+        let stderr = "ERROR: No root.json found at /path\n       Set 'signing.key' and rebuild.\n";
+        let detail = container_failure_detail(stderr, 10).unwrap();
+        assert_eq!(
+            detail,
+            "ERROR: No root.json found at /path\n       Set 'signing.key' and rebuild."
+        );
+    }
+
+    #[test]
+    fn failure_detail_tails_long_output_and_notes_omission() {
+        let stderr = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = container_failure_detail(&stderr, 5).unwrap();
+        assert!(detail.starts_with("… (15 earlier line(s) omitted"));
+        assert!(detail.ends_with("line 16\nline 17\nline 18\nline 19\nline 20"));
+        assert!(!detail.contains("line 15\n"));
+    }
+
+    #[test]
+    fn failure_detail_caps_total_bytes_keeping_the_end() {
+        // One enormous line must not balloon the detail (and thus error
+        // messages / JSON events) past the byte ceiling.
+        let huge = format!("padding-{}END-OF-STDERR", "x".repeat(64 * 1024));
+        let detail = container_failure_detail(&huge, 15).unwrap();
+        assert!(detail.len() < STDERR_TAIL_MAX_BYTES + 64);
+        assert!(detail.starts_with("… (output truncated)\n"));
+        assert!(detail.ends_with("END-OF-STDERR"));
+    }
+
+    #[test]
+    fn failure_detail_byte_cap_respects_char_boundaries() {
+        let huge = format!("{}…", "é".repeat(8 * 1024));
+        let detail = container_failure_detail(&huge, 15).unwrap();
+        assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn failure_detail_drops_blank_lines_before_tailing() {
+        let stderr = "first\n\n\nsecond\n\nthird\n";
+        let detail = container_failure_detail(stderr, 2).unwrap();
+        assert!(detail.starts_with("… (1 earlier line(s) omitted"));
+        assert!(detail.ends_with("second\nthird"));
+    }
 
     #[test]
     fn test_sdk_container_creation() {

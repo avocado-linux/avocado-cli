@@ -789,7 +789,14 @@ impl RuntimeBuildCommand {
         }
 
         // Generate TUF delegation staging and write into the build volume.
-        // If signing keys are not configured this step is skipped with a warning.
+        // Deliberately nonfatal: many projects have no signing configuration,
+        // so build must succeed without staging; a Level-2 project whose
+        // staging fails here surfaces a self-explaining error at deploy or
+        // upload time instead. The skip notice routes through the active
+        // renderer when one exists — print_* is suppressed in TUI/JSON
+        // modes, so it would otherwise vanish exactly where builds usually
+        // run. TUI queues it above the task region; JSON mode writes it to
+        // stderr without corrupting the NDJSON stream.
         let project_dir = std::path::Path::new(&self.config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -807,10 +814,17 @@ impl RuntimeBuildCommand {
             )
             .await
         {
-            print_info(
-                &format!("Skipping TUF delegation staging: {e:#}"),
-                OutputLevel::Normal,
-            );
+            let msg = format!("Skipping TUF delegation staging: {e:#}");
+            if let Some(renderer) = crate::utils::tui::get_active_renderer() {
+                renderer.print_above(&msg);
+            } else if crate::utils::output_format::is_json_output_active() {
+                // Verbose JSON builds create no renderer, and print_info is
+                // suppressed in JSON mode — write to stderr directly so the
+                // notice survives without touching the NDJSON stdout stream.
+                eprintln!("{msg}");
+            } else {
+                print_info(&msg, OutputLevel::Normal);
+            }
         }
 
         Ok(())
@@ -1002,10 +1016,22 @@ echo -n '}}'
             env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
-        let hash_output =
-            run_container_command_with_output(container_helper, hash_run_config, runs_on_context)
-                .await?
-                .context("Hash collection script produced no output")?;
+        let hash_result =
+            run_container_command_capture(container_helper, hash_run_config, runs_on_context)
+                .await?;
+        if !hash_result.success {
+            if self.verbose {
+                crate::utils::container::print_failure_notice(&format!(
+                    "Full container stderr:\n{}",
+                    hash_result.stderr
+                ));
+            }
+            anyhow::bail!(crate::utils::container::container_failure_message(
+                "Hash collection failed in the SDK container",
+                &hash_result.stderr,
+            ));
+        }
+        let hash_output = hash_result.stdout.trim().to_string();
 
         let collection: update_repo::HashCollectionOutput =
             serde_json::from_str(&hash_output).context("Failed to parse hash collection output")?;
@@ -1110,10 +1136,22 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
-        let hash_output =
-            run_container_command_with_output(container_helper, hash_run_config, runs_on_context)
-                .await?
-                .context("Hash collection script produced no output")?;
+        let hash_result =
+            run_container_command_capture(container_helper, hash_run_config, runs_on_context)
+                .await?;
+        if !hash_result.success {
+            if self.verbose {
+                crate::utils::container::print_failure_notice(&format!(
+                    "Full container stderr:\n{}",
+                    hash_result.stderr
+                ));
+            }
+            anyhow::bail!(crate::utils::container::container_failure_message(
+                "Hash collection failed in the SDK container",
+                &hash_result.stderr,
+            ));
+        }
+        let hash_output = hash_result.stdout.trim().to_string();
 
         let collection: update_repo::HashCollectionOutput =
             serde_json::from_str(&hash_output).context("Failed to parse hash collection output")?;
@@ -2911,19 +2949,22 @@ async fn run_container_command(
     }
 }
 
-/// Helper function to run a container command and capture its output,
-/// using shared context if available.
-async fn run_container_command_with_output(
+/// Run a container command and keep the full result so callers can put the
+/// script's stderr into their own error — required wherever the error must
+/// self-explain in TUI/JSON modes, where printing side effects are
+/// suppressed. Dispatches to the remote capture variant when a
+/// RunsOnContext is active.
+async fn run_container_command_capture(
     container_helper: &SdkContainer,
     config: RunConfig,
     runs_on_context: Option<&RunsOnContext>,
-) -> Result<Option<String>> {
+) -> Result<crate::utils::container::ContainerRunOutput> {
     if let Some(context) = runs_on_context {
         container_helper
-            .run_in_container_with_output_remote(&config, context)
+            .run_in_container_capture_remote(&config, context)
             .await
     } else {
-        container_helper.run_in_container_with_output(config).await
+        container_helper.run_in_container_capture(config).await
     }
 }
 
