@@ -450,6 +450,443 @@ async fn run_engine(
     Ok(())
 }
 
+/// Cross-arch guard (task 4.3, design "cross-arch refusal").
+///
+/// A container image built for one CPU architecture cannot run on a device of
+/// another, so syncing an amd64 image to an arm64 device is a silent
+/// wrong-arch delivery the device engine would fail (or worse, a manifest that
+/// pulls but never runs). The guard sits IN the sync path as a [`Syncer`]
+/// decorator: it probes the image's platform architecture, compares it against
+/// every connected device's reported `hello.arch`, and REFUSES the sync (with
+/// actionable buildx guidance) before the wrapped syncer pushes or exports
+/// anything. Because a refused sync returns `Err`, [`do_sync_and_notify`] also
+/// skips the device notify — so a mismatch never reaches push OR notify.
+///
+/// The device architecture comes from the control-WS `hello` frame's `arch`
+/// field (task 5.1 records it into a [`DeviceArchBook`]); the guard only reads
+/// the snapshot, so it does not depend on the WS implementation.
+pub mod arch_guard {
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::{Context, Result};
+    use tokio::process::Command;
+
+    use super::super::engine::{EngineDriver, TagEvent};
+    use super::{SyncMode, Syncer};
+
+    /// A CPU architecture canonicalized to the OCI/GOARCH spelling.
+    ///
+    /// A device reports `hello.arch` in `uname -m` form (`x86_64`, `aarch64`),
+    /// while an image's platform architecture is GOARCH (`amd64`, `arm64`).
+    /// Normalizing both to one spelling lets them compare equal. An unrecognized
+    /// value is lowercased and compared verbatim, so two identical unknown
+    /// arches still match rather than spuriously refusing.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DeviceArch(String);
+
+    impl DeviceArch {
+        /// Canonicalize a raw arch string from an image platform or a device
+        /// `hello.arch`.
+        pub fn parse(raw: &str) -> Self {
+            let lowered = raw.trim().to_ascii_lowercase();
+            let canon = match lowered.as_str() {
+                "x86_64" | "amd64" | "x64" => "amd64",
+                "aarch64" | "arm64" | "arm64v8" => "arm64",
+                "armv7l" | "armv6l" | "armhf" | "arm" | "arm32v7" => "arm",
+                "i386" | "i486" | "i586" | "i686" | "386" | "x86" => "386",
+                "riscv64" => "riscv64",
+                "ppc64le" => "ppc64le",
+                "s390x" => "s390x",
+                _ => lowered.as_str(),
+            };
+            DeviceArch(canon.to_string())
+        }
+
+        /// The canonical GOARCH string (`amd64`, `arm64`, …).
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// A refused cross-arch sync: the image platform does not match a device.
+    ///
+    /// The `Display` is the user-facing refusal and carries buildx guidance that
+    /// names the device's target platform, so a developer can rebuild for the
+    /// right architecture without guessing the flag.
+    #[derive(Debug, thiserror::Error)]
+    #[error(
+        "refusing to sync image `{image}` (platform `{image_arch}`) to a device reporting arch \
+         `{device_arch}`: this would ship a wrong-architecture image the device cannot run. \
+         Rebuild for the device platform with buildx, e.g.:\n    \
+         docker buildx build --platform linux/{device_arch} -t {image} .\n  \
+         then re-run the sync."
+    )]
+    pub struct ArchMismatch {
+        /// The image reference that was refused.
+        pub image: String,
+        /// The image's platform architecture (canonical GOARCH).
+        pub image_arch: String,
+        /// The mismatched device's reported architecture (canonical GOARCH).
+        pub device_arch: String,
+    }
+
+    /// Refuse the sync unless `image_arch` matches EVERY connected device.
+    ///
+    /// A single mismatched device is a refusal — we never ship a wrong-arch
+    /// image to any device in a fleet. With no connected devices there is
+    /// nothing to mismatch, so the sync is allowed (it simply reaches no one).
+    pub fn check_arch(
+        image: &str,
+        image_arch: &DeviceArch,
+        device_arches: &[DeviceArch],
+    ) -> Result<(), ArchMismatch> {
+        for dev in device_arches {
+            if dev != image_arch {
+                return Err(ArchMismatch {
+                    image: image.to_string(),
+                    image_arch: image_arch.as_str().to_string(),
+                    device_arch: dev.as_str().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Probe an image's platform architecture (task 4.3 seam).
+    ///
+    /// The concrete host implementation is [`EngineArchProbe`]; tests substitute
+    /// a fixed double so the guard's refusal logic is asserted without a real
+    /// engine.
+    pub trait ImageArchProbe: Send + Sync {
+        /// Report the platform architecture of `event`'s image.
+        fn image_arch<'a>(
+            &'a self,
+            event: &'a TagEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<DeviceArch>> + Send + 'a>>;
+    }
+
+    /// A snapshot of the architectures of currently-connected devices, sourced
+    /// from their `hello.arch` control frames (task 5.1 populates it).
+    pub trait DeviceArchBook: Send + Sync {
+        /// The architectures of every device currently known from a `hello`.
+        fn device_arches(&self) -> Vec<DeviceArch>;
+    }
+
+    /// In-memory [`DeviceArchBook`] keyed by device id, populated from `hello`
+    /// frames. A reconnecting device overwrites its prior entry, so a snapshot
+    /// never double-counts one device.
+    #[derive(Default, Clone)]
+    pub struct HelloArchBook {
+        by_device: Arc<Mutex<BTreeMap<String, DeviceArch>>>,
+    }
+
+    impl HelloArchBook {
+        /// A book with no devices recorded yet.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Record a device's `hello.arch` (task 5.1 calls this on a hello frame).
+        pub fn record_hello(&self, device_id: &str, arch: &str) {
+            self.by_device
+                .lock()
+                .unwrap()
+                .insert(device_id.to_string(), DeviceArch::parse(arch));
+        }
+    }
+
+    impl DeviceArchBook for HelloArchBook {
+        fn device_arches(&self) -> Vec<DeviceArch> {
+            self.by_device.lock().unwrap().values().cloned().collect()
+        }
+    }
+
+    /// Probe the image architecture via `<engine> image inspect --format
+    /// {{.Architecture}} <ref>` — the engine CLI, consistent with the rest of
+    /// the driver (no API socket).
+    pub struct EngineArchProbe {
+        binary: &'static str,
+    }
+
+    impl EngineArchProbe {
+        /// Build a probe driving `driver`'s engine CLI binary.
+        pub fn new(driver: &dyn EngineDriver) -> Self {
+            Self {
+                binary: driver.binary(),
+            }
+        }
+    }
+
+    impl ImageArchProbe for EngineArchProbe {
+        fn image_arch<'a>(
+            &'a self,
+            event: &'a TagEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<DeviceArch>> + Send + 'a>> {
+            Box::pin(async move {
+                let output = Command::new(self.binary)
+                    .args([
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{.Architecture}}",
+                        &event.image,
+                    ])
+                    .output()
+                    .await
+                    .with_context(|| {
+                        format!("running `{} image inspect {}`", self.binary, event.image)
+                    })?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "`{} image inspect {}` failed: {}",
+                        self.binary,
+                        event.image,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if arch.is_empty() {
+                    anyhow::bail!(
+                        "`{} image inspect {}` reported an empty architecture",
+                        self.binary,
+                        event.image
+                    );
+                }
+                Ok(DeviceArch::parse(&arch))
+            })
+        }
+    }
+
+    /// A [`Syncer`] decorator that refuses a cross-arch sync BEFORE delegating.
+    ///
+    /// It probes the image architecture, compares it against the device book,
+    /// and returns [`ArchMismatch`] on a mismatch — so `inner` (the real
+    /// PUSH/INGEST syncer) is never invoked and the watcher skips notify.
+    pub struct ArchGuardSyncer {
+        inner: Arc<dyn Syncer>,
+        probe: Arc<dyn ImageArchProbe>,
+        devices: Arc<dyn DeviceArchBook>,
+    }
+
+    impl ArchGuardSyncer {
+        /// Wrap `inner`, guarding it with `probe` (image arch) and `devices`
+        /// (connected-device arches).
+        pub fn new(
+            inner: Arc<dyn Syncer>,
+            probe: Arc<dyn ImageArchProbe>,
+            devices: Arc<dyn DeviceArchBook>,
+        ) -> Self {
+            Self {
+                inner,
+                probe,
+                devices,
+            }
+        }
+    }
+
+    impl Syncer for ArchGuardSyncer {
+        fn sync<'a>(
+            &'a self,
+            mode: SyncMode,
+            event: &'a TagEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let image_arch = self.probe.image_arch(event).await?;
+                let device_arches = self.devices.device_arches();
+                // A mismatch refuses here, before the wrapped syncer pushes or
+                // exports anything.
+                check_arch(&event.image, &image_arch, &device_arches)?;
+                self.inner.sync(mode, event).await
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::super::{do_sync_and_notify, Notifier};
+
+        fn ev(image: &str) -> TagEvent {
+            TagEvent {
+                image: image.to_string(),
+                image_id: None,
+            }
+        }
+
+        struct FixedProbe(&'static str);
+        impl ImageArchProbe for FixedProbe {
+            fn image_arch<'a>(
+                &'a self,
+                _event: &'a TagEvent,
+            ) -> Pin<Box<dyn Future<Output = Result<DeviceArch>> + Send + 'a>> {
+                let arch = DeviceArch::parse(self.0);
+                Box::pin(async move { Ok(arch) })
+            }
+        }
+
+        #[derive(Default)]
+        struct CountingSyncer {
+            calls: AtomicUsize,
+        }
+        impl Syncer for CountingSyncer {
+            fn sync<'a>(
+                &'a self,
+                _mode: SyncMode,
+                _event: &'a TagEvent,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        #[derive(Default)]
+        struct CountingNotifier {
+            calls: AtomicUsize,
+        }
+        impl Notifier for CountingNotifier {
+            fn notify<'a>(
+                &'a self,
+                _event: &'a TagEvent,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        // ---- arch normalization ----
+
+        #[test]
+        fn parse_canonicalizes_uname_and_goarch_spellings() {
+            assert_eq!(DeviceArch::parse("x86_64"), DeviceArch::parse("amd64"));
+            assert_eq!(DeviceArch::parse("aarch64"), DeviceArch::parse("arm64"));
+            assert_eq!(DeviceArch::parse("armv7l"), DeviceArch::parse("arm"));
+            assert_eq!(DeviceArch::parse("AMD64"), DeviceArch::parse("amd64"));
+            assert_ne!(DeviceArch::parse("amd64"), DeviceArch::parse("arm64"));
+        }
+
+        // ---- pure check_arch logic ----
+
+        #[test]
+        fn a_matching_arch_passes_the_check() {
+            // uname `aarch64` device vs a GOARCH `arm64` image: equal after
+            // normalization.
+            assert!(check_arch(
+                "app:dev",
+                &DeviceArch::parse("arm64"),
+                &[DeviceArch::parse("aarch64")]
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn an_amd64_image_is_refused_on_an_arm64_device() {
+            let err = check_arch(
+                "my-app:dev",
+                &DeviceArch::parse("amd64"),
+                &[DeviceArch::parse("aarch64")],
+            )
+            .expect_err("an amd64 image must be refused for an arm64 device");
+            assert_eq!(err.image_arch, "amd64");
+            assert_eq!(err.device_arch, "arm64");
+        }
+
+        #[test]
+        fn any_single_mismatched_device_refuses_the_whole_sync() {
+            // A fleet with one arm64 and one amd64 device: an amd64 image cannot
+            // run on the arm64 one, so the whole sync is refused.
+            let devices = [DeviceArch::parse("arm64"), DeviceArch::parse("amd64")];
+            let err = check_arch("app:dev", &DeviceArch::parse("amd64"), &devices)
+                .expect_err("a mismatch on any device refuses the sync");
+            assert_eq!(err.device_arch, "arm64");
+        }
+
+        #[test]
+        fn no_connected_devices_is_not_a_mismatch() {
+            assert!(check_arch("app:dev", &DeviceArch::parse("amd64"), &[]).is_ok());
+        }
+
+        #[test]
+        fn the_refusal_names_buildx_and_the_device_target_platform() {
+            let err = check_arch(
+                "my-app:dev",
+                &DeviceArch::parse("amd64"),
+                &[DeviceArch::parse("aarch64")],
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("buildx"),
+                "the refusal must give buildx guidance, not a bare error: {msg}"
+            );
+            assert!(
+                msg.contains("linux/arm64"),
+                "the refusal must name the device's target platform: {msg}"
+            );
+        }
+
+        // ---- the guard sits in the sync path (via do_sync_and_notify) ----
+
+        #[tokio::test]
+        async fn an_amd64_image_is_refused_before_push_or_notify_on_an_arm64_device() {
+            let inner = Arc::new(CountingSyncer::default());
+            let notifier = CountingNotifier::default();
+            let book = HelloArchBook::new();
+            book.record_hello("dev-1", "aarch64"); // device reports arm64
+
+            let guard = ArchGuardSyncer::new(
+                inner.clone() as Arc<dyn Syncer>,
+                Arc::new(FixedProbe("amd64")),
+                Arc::new(book),
+            );
+
+            do_sync_and_notify(SyncMode::Push, &guard, &notifier, &ev("my-app:dev")).await;
+
+            assert_eq!(
+                inner.calls.load(Ordering::SeqCst),
+                0,
+                "a cross-arch image must be refused before the push runs"
+            );
+            assert_eq!(
+                notifier.calls.load(Ordering::SeqCst),
+                0,
+                "a refused sync must not notify the device"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_matching_arch_image_proceeds_to_push_and_notify() {
+            let inner = Arc::new(CountingSyncer::default());
+            let notifier = CountingNotifier::default();
+            let book = HelloArchBook::new();
+            book.record_hello("dev-1", "x86_64"); // amd64 device
+
+            let guard = ArchGuardSyncer::new(
+                inner.clone() as Arc<dyn Syncer>,
+                Arc::new(FixedProbe("amd64")),
+                Arc::new(book),
+            );
+
+            do_sync_and_notify(SyncMode::Push, &guard, &notifier, &ev("my-app:dev")).await;
+
+            assert_eq!(
+                inner.calls.load(Ordering::SeqCst),
+                1,
+                "a matching-arch image is pushed"
+            );
+            assert_eq!(
+                notifier.calls.load(Ordering::SeqCst),
+                1,
+                "a matching-arch image notifies the device after the push"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
