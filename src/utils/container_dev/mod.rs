@@ -9,6 +9,13 @@
 // (3.4).
 #[allow(dead_code)]
 pub mod auth;
+// Per-`up` device bootstrap, guaranteed write-listener teardown guard,
+// drain-based read/control token rotation, and `status` reporting (task 5.2).
+// The `up`/`down`/`status` glue in `commands::container::dev` binds these to the
+// live listeners; some helpers are exercised only from that glue, hence
+// dead_code here.
+#[allow(dead_code)]
+pub mod bootstrap;
 pub mod config;
 // The engine-driver trait + docker/podman drivers (4.1): tag events via the
 // engine CLI subprocess (never the API socket). The watcher (4.2/4.3) that
