@@ -28,3 +28,8 @@ pub mod store;
 // mint (3.6). Bound onto the bulk/WS listeners by 3.7/5.2, hence dead_code here.
 #[allow(dead_code)]
 pub mod tls;
+// Engine-driver watcher + sync orchestration (4.2): topology-selected PUSH/INGEST
+// on a debounced tag event, then notify over the control-WS seam. Wired into the
+// `up` orchestration (5.2) and the control WS (5.1) later, hence dead_code here.
+#[allow(dead_code)]
+pub mod watcher;
