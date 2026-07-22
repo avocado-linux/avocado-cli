@@ -11,6 +11,15 @@ use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_info, OutputLevel};
 
+/// Full result of a remotely-executed command captured via
+/// `SshClient::run_command_captured`.
+#[derive(Debug)]
+pub struct RemoteCommandOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// Represents a remote host in user@host or just host format
 #[derive(Debug, Clone)]
 pub struct RemoteHost {
@@ -289,6 +298,59 @@ impl SshClient {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Run a command on the remote host, returning the full result for the
+    /// caller to handle. Unlike `run_command`, failure does NOT embed the
+    /// command line in the error — remote docker commands carry `-e KEY=value`
+    /// environment values that must not leak into default (non-verbose)
+    /// output. `--verbose` deliberately still logs the full command line, as
+    /// it does across the CLI (the local path prints `Container command:`
+    /// with the same env values); redacting verbose output is a project-wide
+    /// policy question, not a per-call-site one.
+    pub async fn run_command_captured(&self, command: &str) -> Result<RemoteCommandOutput> {
+        if self.verbose {
+            print_info(
+                &format!("Running remote command: {command}"),
+                OutputLevel::Verbose,
+            );
+        }
+
+        let mut args = self.base_ssh_args();
+        args.extend([self.remote.ssh_target(), command.to_string()]);
+
+        let output = AsyncCommand::new("ssh")
+            .args(&args)
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to run command on remote {}",
+                    self.remote.ssh_target()
+                )
+            })?;
+
+        // Move the byte buffers into Strings (no copy for valid UTF-8) and
+        // trim stdout in place — captured streams can be large.
+        let mut stdout = crate::utils::container::bytes_to_string(output.stdout);
+        stdout.truncate(stdout.trim_end().len());
+        let leading = stdout.len() - stdout.trim_start().len();
+        if leading > 0 {
+            stdout.drain(..leading);
+        }
+        // Trimming shrinks the length but not the allocation; give the
+        // memory back when the waste is substantial both absolutely and
+        // relative to what's kept (shrinking copies the retained bytes, so
+        // reclaiming a small fraction of a huge buffer isn't worth it).
+        let waste = stdout.capacity() - stdout.len();
+        if waste > 64 * 1024 && waste >= stdout.len() {
+            stdout.shrink_to_fit();
+        }
+        Ok(RemoteCommandOutput {
+            success: output.status.success(),
+            stdout,
+            stderr: crate::utils::container::bytes_to_string(output.stderr),
+        })
     }
 
     /// Run a command on the remote host, inheriting stdin/stdout/stderr

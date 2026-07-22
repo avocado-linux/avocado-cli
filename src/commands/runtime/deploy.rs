@@ -183,6 +183,13 @@ impl RuntimeDeployCommand {
         }
     }
 
+    /// Compose a phase failure message that carries the container script's
+    /// own stderr diagnostics, so both the CLI error and the JSON step_error
+    /// event name the real problem.
+    fn container_failure_message(context: &str, stderr: &str) -> String {
+        crate::utils::container::container_failure_message(context, stderr)
+    }
+
     pub async fn execute(&self) -> Result<()> {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -267,11 +274,25 @@ impl RuntimeDeployCommand {
                 ..Default::default()
             };
 
-            let output = match container_helper
-                .run_in_container_with_output(run_config)
-                .await
-            {
-                Ok(o) => o,
+            // Capture the full result so a container failure is reported as
+            // such, not silently converted into a "missing stamps" error.
+            let output = match container_helper.run_in_container_capture(run_config).await {
+                Ok(out) if out.success => out.stdout,
+                Ok(out) => {
+                    if self.verbose {
+                        crate::utils::container::print_failure_notice(&format!(
+                            "Full container stderr:\n{}",
+                            out.stderr
+                        ));
+                    }
+                    let msg = Self::container_failure_message(
+                        "Reading build stamps failed in the SDK container",
+                        &out.stderr,
+                    );
+                    Self::emit_phase_error(PHASE_STAMPS, &msg);
+                    Self::emit_phase_status(PHASE_STAMPS, "failed");
+                    return Err(anyhow::anyhow!(msg));
+                }
                 Err(e) => {
                     Self::emit_phase_error(PHASE_STAMPS, &e.to_string());
                     Self::emit_phase_status(PHASE_STAMPS, "failed");
@@ -279,7 +300,7 @@ impl RuntimeDeployCommand {
                 }
             };
 
-            let validation = validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &[]);
+            let validation = validate_stamps_batch(&required, output.trim(), &[]);
 
             if !validation.is_satisfied() {
                 let msg = format!("Cannot deploy runtime '{}'", self.runtime_name);
@@ -318,14 +339,26 @@ impl RuntimeDeployCommand {
             ..Default::default()
         };
 
+        // Capture the full result so the script's own diagnostics (e.g. the
+        // signing-key prerequisite for --connect-sign) reach the user instead
+        // of a generic "produced no output" error.
         let hash_output = match container_helper
-            .run_in_container_with_output(hash_run_config)
+            .run_in_container_capture(hash_run_config)
             .await
         {
-            Ok(Some(out)) => out,
-            Ok(None) => {
-                let msg = "Hash collection script produced no output";
-                Self::emit_phase_error(PHASE_HASH, msg);
+            Ok(out) if out.success => out.stdout.trim().to_string(),
+            Ok(out) => {
+                if self.verbose {
+                    crate::utils::container::print_failure_notice(&format!(
+                        "Full container stderr:\n{}",
+                        out.stderr
+                    ));
+                }
+                let msg = Self::container_failure_message(
+                    "Hash collection failed in the SDK container",
+                    &out.stderr,
+                );
+                Self::emit_phase_error(PHASE_HASH, &msg);
                 Self::emit_phase_status(PHASE_HASH, "failed");
                 return Err(anyhow::anyhow!(msg));
             }
