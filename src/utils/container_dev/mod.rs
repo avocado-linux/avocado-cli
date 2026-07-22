@@ -6,3 +6,7 @@
 //! the `container-dev-mode` change.
 
 pub mod config;
+// Consumers (OCI read/write handlers, GC, sync orchestration) land in later
+// `container-dev-mode` tasks (3.2-3.5, 5.x); the store lands first.
+#[allow(dead_code)]
+pub mod store;
