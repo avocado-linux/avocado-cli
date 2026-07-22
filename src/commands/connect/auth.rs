@@ -431,22 +431,28 @@ enum OrgPick {
 /// Pure logic. No HTTP, no stdin, no stdout. The wrapper `resolve_org_for_login`
 /// adds the IO around this.
 fn pick_org(orgs: Vec<OrgInfo>, org_hint: Option<&str>, output: OutputFormat) -> Result<OrgPick> {
-    if orgs.is_empty() {
-        return Ok(OrgPick::None);
-    }
-
+    // An explicit `--org` must be honored or fail loudly — never silently
+    // dropped. Resolve it before the zero-orgs shortcut so a hint against an
+    // empty org list errors instead of falling through to an unscoped token.
     if let Some(hint) = org_hint {
         return match orgs.iter().find(|o| o.id == hint) {
             Some(o) => Ok(OrgPick::Resolved(o.clone())),
             None => {
-                let available = orgs
-                    .iter()
-                    .map(|o| format!("{} ({})", o.name, o.id))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let available = if orgs.is_empty() {
+                    "none".to_string()
+                } else {
+                    orgs.iter()
+                        .map(|o| format!("{} ({})", o.name, o.id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 anyhow::bail!("organization '{hint}' not found. Available: {available}");
             }
         };
+    }
+
+    if orgs.is_empty() {
+        return Ok(OrgPick::None);
     }
 
     if orgs.len() == 1 {
@@ -841,6 +847,20 @@ mod tests {
     fn pick_org_zero_orgs_returns_none() {
         let result = pick_org(vec![], None, OutputFormat::Human).unwrap();
         assert!(matches!(result, OrgPick::None));
+    }
+
+    #[test]
+    fn pick_org_explicit_hint_with_no_orgs_errors_not_dropped() {
+        // An explicit --org must never be silently dropped: an empty org
+        // list combined with a hint has to fail loudly rather than fall
+        // through to an unscoped token. Regression guard for the silent-drop
+        // login bug — the auth server returned zero orgs, so the hint was
+        // ignored and a bogus unscoped profile was minted while reporting
+        // success.
+        let result = pick_org(vec![], Some("uuid-x"), OutputFormat::Json);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("uuid-x"), "got: {err}");
+        assert!(err.contains("Available: none"), "got: {err}");
     }
 
     #[test]
