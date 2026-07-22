@@ -7,11 +7,13 @@
 //! from the design + threat model are realized here as unit-testable primitives:
 //!
 //! - **Bootstrap non-disclosure (design G-4 / D2 / D8).** [`DeviceBootstrap`]
-//!   carries EXACTLY the three things a device needs — the BULK-LISTENER endpoint,
-//!   the Bearer read/control token, and the per-project CA certificate. It has no
-//!   field for the host-only Basic write token or the write-listener address, so
-//!   a serialization can never leak either. [`write_bootstrap`] always lands the
-//!   file INSIDE the device writable partition (A7).
+//!   carries EXACTLY the four things a device needs — the BULK-LISTENER endpoint,
+//!   the control-WS endpoint, the Bearer read/control token, and the per-project
+//!   CA certificate. It has no field for the host-only Basic write token or the
+//!   write-listener address, so a serialization can never leak either — the
+//!   control-WS endpoint is a device-reachable control channel, NOT the write
+//!   listener whose address is never disclosed. [`write_bootstrap`] always lands
+//!   the file INSIDE the device writable partition (A7).
 //! - **Guaranteed write-listener teardown (design L-1).** [`WriteListenerGuard`]
 //!   runs its teardown from `Drop`, so an unclean exit (panic, early `?` return,
 //!   dropped `up` future) still tears down the routable write listener and its
@@ -54,18 +56,29 @@ pub const HOST_ENV: &str = "AVOCADO_CONTAINER_DEV_HOST";
 /// overrides the configured `registry.port`.
 pub const PORT_ENV: &str = "AVOCADO_CONTAINER_DEV_PORT";
 
+/// Environment override for the control WS port (design D9/L2), consistent with
+/// [`PORT_ENV`]. When set it overrides [`DEFAULT_WS_PORT`].
+pub const WS_PORT_ENV: &str = "AVOCADO_CONTAINER_DEV_WS_PORT";
+
+/// Default port the control WS binds when [`WS_PORT_ENV`] is unset. The control
+/// WS is a listener DISTINCT from the bulk read listener (design D9), so it
+/// takes its own port; the device dials it at the `ws_endpoint` from bootstrap.
+/// Kept off 5000 (macOS AirPlay, design 1.6).
+pub const DEFAULT_WS_PORT: u16 = 5600;
+
 /// The device-delivery bootstrap payload written once per `up` (design D5).
 ///
-/// It carries EXACTLY three fields — and deliberately no field for the host-only
-/// write token or the write-listener endpoint (design G-4/D2). A device is only
-/// ever handed the bulk-listener endpoint, so it cannot reach the write listener
-/// on any topology; and it never receives the Basic write secret, so a
-/// compromised device cannot forge a push. The absence is structural: there is
-/// no field to populate, so a serialization can never leak either value.
+/// It carries EXACTLY four fields — and deliberately no field for the host-only
+/// write token or the write-listener endpoint (design G-4/D2). A device is
+/// handed only the bulk read listener and control-WS endpoints, so it cannot
+/// reach the write listener on any topology; and it never receives the Basic
+/// write secret, so a compromised device cannot forge a push. The absence is
+/// structural: there is no field to populate, so a serialization can never leak
+/// either value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceBootstrap {
     /// The BULK read listener endpoint (`host:port`) the device pulls from — the
-    /// ONLY endpoint a device is ever handed (design G-4). NEVER the
+    /// only PULL endpoint a device is handed (design G-4). NEVER the
     /// write-listener address.
     pub bulk_endpoint: String,
     /// The Bearer read/control token the device authenticates pulls and the
@@ -74,6 +87,12 @@ pub struct DeviceBootstrap {
     /// The per-project CA certificate (PEM) the device pins the host TLS leaf
     /// against. NEVER the CA private key (design D8).
     pub ca_cert_pem: String,
+    /// The control-WS endpoint (`host:port`) the device agent dials for `sync`
+    /// notifications (design D9). A DISTINCT listener from both the bulk read
+    /// listener and the write listener; it carries only control frames, never
+    /// blob bytes and never write authority. NEVER the write-listener address
+    /// (design G-4).
+    pub ws_endpoint: String,
 }
 
 impl DeviceBootstrap {
@@ -82,15 +101,20 @@ impl DeviceBootstrap {
     ///
     /// The read token and CA cert come from the session's device-delivery subset
     /// ([`DevSession::bootstrap_payload`]), which by construction excludes the
-    /// write token and the CA private key. The bulk endpoint is supplied by the
-    /// caller (task 5.2 resolves it); it must be the bulk listener's address,
-    /// never the write listener's (design G-4).
-    pub fn from_session(session: &DevSession, bulk_endpoint: impl Into<String>) -> Self {
+    /// write token and the CA private key. The bulk and control-WS endpoints are
+    /// supplied by the caller (task 5.2 resolves them); each must be its own
+    /// listener's address, never the write listener's (design G-4).
+    pub fn from_session(
+        session: &DevSession,
+        bulk_endpoint: impl Into<String>,
+        ws_endpoint: impl Into<String>,
+    ) -> Self {
         let payload = session.bootstrap_payload();
         Self {
             bulk_endpoint: bulk_endpoint.into(),
             read_token: payload.read_token,
             ca_cert_pem: payload.ca_cert_pem,
+            ws_endpoint: ws_endpoint.into(),
         }
     }
 
@@ -150,6 +174,13 @@ pub fn host_override() -> Option<String> {
 /// The `AVOCADO_CONTAINER_DEV_PORT` override, if set and a valid port.
 pub fn port_override() -> Option<u16> {
     std::env::var(PORT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// The `AVOCADO_CONTAINER_DEV_WS_PORT` override, if set and a valid port.
+pub fn ws_port_override() -> Option<u16> {
+    std::env::var(WS_PORT_ENV)
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
@@ -353,6 +384,11 @@ mod tests {
 
     const RUNTIME: &str = "dev-runtime";
     const BULK_ENDPOINT: &str = "192.168.1.10:5599";
+    const WS_ENDPOINT: &str = "192.168.1.10:5600";
+    /// A representative write-listener address: loopback-only, its own ephemeral
+    /// port (design D9/G-4). The bootstrap must never carry it, and the disclosed
+    /// `ws_endpoint` must be distinct from it.
+    const WRITE_LISTENER_ADDR: &str = "127.0.0.1:34567";
 
     // ---- bootstrap payload: bulk endpoint + read token + CA, never the write
     //      token and never the write-listener address (design G-4/D2/D8) ----
@@ -360,9 +396,10 @@ mod tests {
     #[test]
     fn bootstrap_payload_carries_bulk_endpoint_read_token_and_ca_cert() {
         let session = DevSession::mint(RUNTIME).expect("session mints");
-        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT);
+        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
 
         assert_eq!(bootstrap.bulk_endpoint, BULK_ENDPOINT);
+        assert_eq!(bootstrap.ws_endpoint, WS_ENDPOINT);
         assert_eq!(bootstrap.read_token, session.read_token.secret());
         assert_eq!(bootstrap.ca_cert_pem, session.tls.ca_cert_pem());
 
@@ -370,6 +407,10 @@ mod tests {
         assert!(
             json.contains(BULK_ENDPOINT),
             "the payload must deliver the bulk-listener endpoint"
+        );
+        assert!(
+            json.contains(WS_ENDPOINT),
+            "the payload must deliver the control-WS endpoint"
         );
         assert!(
             json.contains(session.read_token.secret()),
@@ -384,7 +425,7 @@ mod tests {
     #[test]
     fn bootstrap_payload_never_carries_the_write_token() {
         let session = DevSession::mint(RUNTIME).expect("session mints");
-        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT);
+        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
         let json = bootstrap.to_json().expect("payload serializes");
         assert!(
             !json.contains(session.write_token.secret()),
@@ -395,7 +436,7 @@ mod tests {
     #[test]
     fn bootstrap_payload_never_carries_the_ca_private_key() {
         let session = DevSession::mint(RUNTIME).expect("session mints");
-        let json = DeviceBootstrap::from_session(&session, BULK_ENDPOINT)
+        let json = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT)
             .to_json()
             .expect("payload serializes");
         assert!(
@@ -406,13 +447,13 @@ mod tests {
 
     #[test]
     fn bootstrap_payload_has_no_field_for_a_write_endpoint() {
-        // Structural guarantee: the ONLY endpoint key is `bulk_endpoint`. A
-        // write-listener address has no field to land in, so it cannot leak
-        // (design G-4). Pin the exact key set.
+        // Structural guarantee: the only endpoint keys are `bulk_endpoint` (pull)
+        // and `ws_endpoint` (control). A write-listener address has no field to
+        // land in, so it cannot leak (design G-4). Pin the exact key set.
         let session = DevSession::mint(RUNTIME).expect("session mints");
+        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
         let value: serde_json::Value =
-            serde_json::to_value(DeviceBootstrap::from_session(&session, BULK_ENDPOINT))
-                .expect("payload serializes to a value");
+            serde_json::to_value(&bootstrap).expect("payload serializes to a value");
         let keys: std::collections::BTreeSet<&str> = value
             .as_object()
             .expect("payload is a JSON object")
@@ -421,11 +462,21 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["bulk_endpoint", "ca_cert_pem", "read_token"]
+            ["bulk_endpoint", "ca_cert_pem", "read_token", "ws_endpoint"]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
-            "the payload must expose exactly the bulk endpoint, read token, and CA cert - \
-             no write-listener endpoint field"
+            "the payload must expose exactly the bulk endpoint, control-WS endpoint, read token, \
+             and CA cert - no write-listener endpoint field"
+        );
+        // The disclosed control-WS endpoint must never be the write-listener
+        // address: it is a control channel, not a write route (design G-4/D9).
+        assert_ne!(
+            bootstrap.ws_endpoint, WRITE_LISTENER_ADDR,
+            "the control-WS endpoint must be distinct from the write-listener address"
+        );
+        assert_ne!(
+            bootstrap.bulk_endpoint, bootstrap.ws_endpoint,
+            "the bulk (pull) and control-WS endpoints are distinct listeners"
         );
     }
 
@@ -434,7 +485,7 @@ mod tests {
     #[test]
     fn write_bootstrap_lands_under_the_writable_partition_root() {
         let session = DevSession::mint(RUNTIME).expect("session mints");
-        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT);
+        let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
         let root = tempfile::tempdir().expect("tempdir");
 
         let path = write_bootstrap(root.path(), &bootstrap).expect("bootstrap writes");

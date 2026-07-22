@@ -34,8 +34,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::utils::config::{Config, RuntimeConfig};
 use crate::utils::container_dev::bootstrap::{
-    bootstrap_path, host_override, port_override, resolve_endpoint, DevStatus, DeviceBootstrap,
-    WriteListenerGuard, WRITABLE_PARTITION,
+    bootstrap_path, host_override, port_override, resolve_endpoint, ws_port_override, DevStatus,
+    DeviceBootstrap, WriteListenerGuard, DEFAULT_WS_PORT, WRITABLE_PARTITION,
 };
 use crate::utils::container_dev::commands::{prune_store, run_one_shot_sync};
 use crate::utils::container_dev::config::ContainerDevConfig;
@@ -222,7 +222,17 @@ impl DevUpCommand {
             DesiredState::default(),
             HelloArchBook::new(),
         );
-        let ws_listener = TcpListener::bind("0.0.0.0:0")
+        // Bind the control WS on a RESOLVED, discoverable port (design D9), NOT an
+        // ephemeral `0.0.0.0:0` the device could never learn: the device agent is
+        // handed `ws_endpoint` at bootstrap and must be able to dial it. The port
+        // is the configured/overridden WS port (AVOCADO_CONTAINER_DEV_WS_PORT),
+        // distinct from the bulk listener's port; the host component is the same
+        // device-reachable host the bulk endpoint resolves to.
+        let ws_port = ws_port_override().unwrap_or(DEFAULT_WS_PORT);
+        let ws_bind: SocketAddr = format!("0.0.0.0:{ws_port}")
+            .parse()
+            .expect("a ws port yields a valid bind address");
+        let ws_listener = TcpListener::bind(ws_bind)
             .await
             .context("binding the control WS listener")?;
         let ws_addr = ws_listener.local_addr()?;
@@ -283,12 +293,14 @@ impl DevUpCommand {
         // device-reachable address of the bulk listener), the read/control token,
         // and the CA cert — never the write token, never the write-listener
         // address (design G-4). Steady-state sync never re-opens SSH.
-        let device_bulk_endpoint = format!(
-            "{}:{}",
-            bulk_host(&bulk_endpoint, &auto_host),
-            bulk_addr.port()
-        );
-        let payload = DeviceBootstrap::from_session(&session, device_bulk_endpoint);
+        let device_host = bulk_host(&bulk_endpoint, &auto_host);
+        let device_bulk_endpoint = format!("{}:{}", device_host, bulk_addr.port());
+        // The control-WS endpoint the device dials: the same device-reachable host
+        // as the bulk endpoint, on the resolved WS port (design D9/G-4). NEVER the
+        // write-listener address, which is never disclosed to a device.
+        let device_ws_endpoint = format!("{}:{}", device_host, ws_addr.port());
+        let payload =
+            DeviceBootstrap::from_session(&session, device_bulk_endpoint, device_ws_endpoint);
         deliver_bootstrap(&device, &payload).await?;
 
         // Record the running session (with this process's pid) so `status`/`down`
