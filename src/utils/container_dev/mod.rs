@@ -1,14 +1,19 @@
 //! Container Dev Mode: embedded OCI Distribution registry and engine-driver
 //! dev loop for iterating on containers running on Avocado devices.
 //!
-//! Scaffolding only at this stage. TLS material, the remaining registry
-//! listeners, the engine-driver watcher, and sync orchestration are added by
-//! later tasks in the `container-dev-mode` change.
+//! Scaffolding at this stage. TLS material, the remaining registry listeners,
+//! the engine-driver watcher, and sync orchestration are added by later tasks
+//! in the `container-dev-mode` change.
 
+// The write-side Basic validator (3.3); the read/control Bearer validator lands
+// in 3.4.
+#[allow(dead_code)]
+pub mod auth;
 pub mod config;
-// Write handlers, GC, and sync orchestration land in later `container-dev-mode`
-// tasks (3.3-3.5, 5.x); the store (3.1) and the OCI read handlers (3.2) land
-// first. The read router is bound onto the dedicated bulk listener by task 3.7.
+// The store (3.1), OCI read handlers (3.2), and write handlers + auth layer
+// (3.3) land before the listeners that bind them: the read router is bound onto
+// the dedicated bulk listener by 3.7, the write router onto the distinct write
+// listener by 3.6/3.7.
 #[allow(dead_code)]
 pub mod registry;
 #[allow(dead_code)]
