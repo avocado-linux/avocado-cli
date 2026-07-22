@@ -10,9 +10,9 @@
 //!   request with a `206 Partial Content` response.
 //!
 //! Content is read from the per-project [`BlobStore`] built in task 3.1; this
-//! module never re-implements storage. The read routes are assembled into a
-//! [`Router`] here but are bound onto the dedicated bulk read listener by task
-//! 3.7.
+//! module never re-implements storage. The read routes are gated by the
+//! per-session Bearer read/control token (task 3.4) via [`read_router`] and
+//! bound onto the dedicated bulk read listener by task 3.7.
 //!
 //! Task 3.3 adds the write half — blob upload (`POST`/`PATCH`/`PUT
 //! .../blobs/uploads/...`), manifest `PUT`, and blob `HEAD` dedup — assembled
@@ -20,8 +20,7 @@
 //! ([`super::auth`]). Those write routes live on a DISTINCT write listener
 //! (design D9/H-1), bound by tasks 3.6/3.7; a device is only ever handed the
 //! bulk-listener endpoint, so it cannot reach a write route on any topology.
-//! The read/control Bearer validator (task 3.4) and TLS/listener sockets
-//! (tasks 3.6/3.7) remain out of scope here.
+//! The TLS/listener sockets (tasks 3.6/3.7) remain out of scope here.
 //!
 //! HEAD requests are served by the same handler as GET: axum routes HEAD to the
 //! GET handler and strips the response body while preserving the headers, so a
@@ -42,7 +41,7 @@ use axum::{
 };
 use uuid::Uuid;
 
-use super::auth::{require_basic_write, WriteToken};
+use super::auth::{require_basic_write, require_bearer_read, ReadToken, WriteToken};
 use super::store::{BlobStore, StoreError};
 
 /// Non-standard OCI response header carrying the content digest of the served
@@ -65,11 +64,13 @@ impl RegistryState {
     }
 }
 
-/// Build the OCI read router over `store`.
+/// Build the ungated OCI read route assembly over `store`.
 ///
-/// The returned router serves `GET /v2/`, manifest reads, and blob reads
-/// (GET + HEAD). It is merged onto the bulk read listener in task 3.7.
-pub fn read_router(store: Arc<BlobStore>) -> Router {
+/// These are the read handlers only — `GET /v2/`, manifest reads, and blob
+/// reads (GET + HEAD). It is a composition primitive: [`read_router`] wraps it
+/// with the Bearer read/control gate. The read-semantics tests exercise this
+/// assembly directly so they test handler behavior without auth noise.
+fn read_routes(store: Arc<BlobStore>) -> Router {
     Router::new()
         .route("/v2/", get(base))
         // A single wildcard route captures `<name>/manifests/<reference>` and
@@ -77,6 +78,22 @@ pub fn read_router(store: Arc<BlobStore>) -> Router {
         // cannot be a fixed path segment. The suffix is dispatched by hand.
         .route("/v2/{*rest}", get(read))
         .with_state(RegistryState::new(store))
+}
+
+/// Build the device-facing OCI read router over `store`, gated by the
+/// per-session Bearer `read_token` (task 3.4).
+///
+/// Every read route sits behind [`require_bearer_read`] — the SAME validator
+/// the control-WS upgrade (task 5.1) authorizes through (G-5) — so an
+/// unauthenticated pull, or one presenting the Basic write token, is refused
+/// with a bare `Bearer` challenge before any handler runs (M-2). This is the
+/// only read entry point a device is handed; it is bound onto the dedicated
+/// bulk read listener in task 3.7.
+pub fn read_router(store: Arc<BlobStore>, read_token: ReadToken) -> Router {
+    read_routes(store).layer(middleware::from_fn_with_state(
+        read_token,
+        require_bearer_read,
+    ))
 }
 
 /// In-flight chunked-upload sessions, keyed by upload UUID.
@@ -604,12 +621,16 @@ mod read {
         format!("sha256:{hex}")
     }
 
-    /// Start the read router over a fresh per-project store and return the
-    /// base URL plus a handle keeping the store's temp dir alive.
+    /// Start the ungated read route assembly over a fresh per-project store and
+    /// return the base URL plus a handle keeping the store's temp dir alive.
+    ///
+    /// These tests exercise read semantics (ranges, media types, dedup); the
+    /// Bearer read/control gate on the public [`read_router`] is covered by the
+    /// `container_dev::auth` tests, so the assembly is served ungated here.
     async fn spawn() -> (String, Arc<BlobStore>, TempDir) {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
-        let app = read_router(store.clone());
+        let app = read_routes(store.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

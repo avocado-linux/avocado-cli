@@ -5,8 +5,8 @@
 //! the engine-driver watcher, and sync orchestration are added by later tasks
 //! in the `container-dev-mode` change.
 
-// The write-side Basic validator (3.3); the read/control Bearer validator lands
-// in 3.4.
+// The write-side Basic validator (3.3) and the read/control Bearer validator
+// (3.4).
 #[allow(dead_code)]
 pub mod auth;
 pub mod config;
