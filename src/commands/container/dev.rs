@@ -30,6 +30,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 use crate::utils::config::{Config, RuntimeConfig};
 use crate::utils::container_dev::bootstrap::{
@@ -210,9 +211,12 @@ impl DevUpCommand {
         });
 
         // The control WS (task 5.1) shares the read/control-token validator with
-        // the bulk listener (design G-5). Its desired state is RE-DERIVED at `up`
-        // from the engine's current watched tags (design D5) — the watcher's first
-        // events populate it; we start empty and let hellos reconcile.
+        // the bulk listener (design G-5) AND terminates the SAME per-project
+        // pinned-CA TLS the bulk listener does (design D8/D9): the device agent
+        // dials `wss://` and pins the session CA, so the control channel is never
+        // plaintext. Its desired state is RE-DERIVED at `up` from the engine's
+        // current watched tags (design D5) — the watcher's first events populate
+        // it; we start empty and let hellos reconcile.
         let control = ControlServer::new(
             read_token.clone(),
             DesiredState::default(),
@@ -222,9 +226,15 @@ impl DevUpCommand {
             .await
             .context("binding the control WS listener")?;
         let ws_addr = ws_listener.local_addr()?;
+        // `tls_config` was moved into `BulkListener::bind` above; `server_config()`
+        // returns a fresh `Arc::clone` of the same leaf-backed config for the
+        // control acceptor.
+        let control_acceptor = TlsAcceptor::from(session.tls.server_config());
         let control_serve = Arc::clone(&control);
         let ws_task: JoinHandle<()> =
-            tokio::spawn(async move { control_serve.serve(ws_listener).await });
+            tokio::spawn(
+                async move { control_serve.serve_tls(ws_listener, control_acceptor).await },
+            );
 
         // The engine-driver watcher (task 4.x): tag events over the engine CLI
         // subprocess (never an API socket), topology-selected PUSH/INGEST, then a
