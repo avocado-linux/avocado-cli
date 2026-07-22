@@ -44,8 +44,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{header, StatusCode};
 use tokio_tungstenite::tungstenite::Message;
@@ -247,12 +248,45 @@ impl ControlServer {
         })
     }
 
-    /// Accept control-WS connections on `listener` until it errors.
+    /// Serve control-WS connections on `listener`, terminating TLS with
+    /// `acceptor` before any WebSocket byte is read (design D8/D9).
     ///
-    /// Each accepted TCP stream is upgraded (with auth) and served on its own
-    /// task. In production the stream is wrapped in the rustls server config
-    /// from task 3.6 before this point; the control logic is transport-agnostic,
-    /// so tests drive it over plain TCP exactly as the auth-module tests do.
+    /// This is the production entry point: the device agent connects over
+    /// `wss://` and pins the per-project session CA, so the control WS enforces
+    /// the same pinned-CA TLS guarantee the bulk listener does
+    /// ([`super::registry::BulkListener`]). Each accepted TCP stream is
+    /// handshaked with the per-project leaf (task 3.6) and, on success, upgraded
+    /// (with auth) and served on its own task over the resulting
+    /// [`tokio_rustls::server::TlsStream`]. A TLS handshake failure is a
+    /// per-connection concern (a client that does not trust the session CA, or a
+    /// probe): the connection is dropped and the accept loop keeps serving,
+    /// mirroring [`super::registry`]'s bulk `TlsListener`.
+    pub async fn serve_tls(self: Arc<Self>, listener: TcpListener, acceptor: TlsAcceptor) {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                // Drop a connection whose TLS handshake fails and keep serving;
+                // do not surface it, do not busy-spin.
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let _ = server.handle_connection(tls).await;
+            });
+        }
+    }
+
+    /// Accept control-WS connections on `listener` over PLAIN TCP.
+    ///
+    /// Test-only: production binds the control WS over pinned-CA TLS via
+    /// [`serve_tls`](Self::serve_tls). This entry exists so the transport-agnostic
+    /// control logic can be exercised over plain TCP exactly as the auth-module
+    /// tests do, without a TLS handshake in the loop. It is gated `#[cfg(test)]`
+    /// so no production path can ever bind the control WS in plaintext.
+    #[cfg(test)]
     pub async fn serve(self: Arc<Self>, listener: TcpListener) {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
@@ -267,7 +301,15 @@ impl ControlServer {
 
     /// Upgrade one stream (authenticating via the shared seam) then serve its
     /// control frames.
-    async fn handle_connection(self: Arc<Self>, stream: TcpStream) -> Result<()> {
+    ///
+    /// Generic over the transport `S` so the SAME connection-handling core drives
+    /// both the production TLS stream (`TlsStream<TcpStream>`) and the plain-TCP
+    /// stream tests use — the read/control-token validator seam is shared, never
+    /// duplicated per transport (design G-5).
+    async fn handle_connection<S>(self: Arc<Self>, stream: S) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let ws = self.accept_authenticated(stream).await?;
         self.run_session(ws).await
     }
@@ -283,10 +325,13 @@ impl ControlServer {
     // verbatim by tungstenite's `accept_hdr_async` contract, so the large-err
     // lint cannot be satisfied by boxing without breaking the trait bound.
     #[allow(clippy::result_large_err)]
-    async fn accept_authenticated(
+    async fn accept_authenticated<S>(
         &self,
-        stream: TcpStream,
-    ) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>> {
+        stream: S,
+    ) -> Result<tokio_tungstenite::WebSocketStream<S>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let token = self.read_token.clone();
         let callback =
             move |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
@@ -308,10 +353,13 @@ impl ControlServer {
 
     /// Serve one authenticated connection: reconcile on `hello`, fan out
     /// broadcast `sync` frames, and drain informational device frames.
-    async fn run_session(
+    async fn run_session<S>(
         self: Arc<Self>,
-        mut ws: tokio_tungstenite::WebSocketStream<TcpStream>,
-    ) -> Result<()> {
+        mut ws: tokio_tungstenite::WebSocketStream<S>,
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let mut broadcasts = self.tx.subscribe();
         loop {
             tokio::select! {
@@ -752,6 +800,115 @@ mod tests {
         assert!(
             current.is_empty(),
             "a device on the just-pushed digest needs no reconcile"
+        );
+    }
+
+    // ---- production TLS: the control WS runs over the pinned-CA leaf (D8/D9) ----
+
+    /// Spawn a control server over TLS with a fresh session's leaf-backed server
+    /// config; return its `wss://` base URL, the minted session (whose CA cert a
+    /// client pins and whose read/control token it presents), and the handle.
+    async fn spawn_tls_server(
+        desired: DesiredState,
+    ) -> (
+        String,
+        crate::utils::container_dev::tls::DevSession,
+        Arc<ControlServer>,
+    ) {
+        let session = crate::utils::container_dev::tls::DevSession::mint("dev-runtime")
+            .expect("session mints");
+        let server = ControlServer::new(session.read_token.clone(), desired, HelloArchBook::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(session.tls.server_config());
+        let serve = Arc::clone(&server);
+        tokio::spawn(async move { serve.serve_tls(listener, acceptor).await });
+        (format!("wss://{addr}/"), session, server)
+    }
+
+    /// A `tokio_tungstenite` TLS connector that trusts ONLY `ca_cert_pem`, so it
+    /// validates the leaf's `127.0.0.1` IP SAN and rejects any other chain —
+    /// the same pinned-CA discipline the bulk listener's client uses.
+    fn pinned_ca_connector(ca_cert_pem: &str) -> tokio_tungstenite::Connector {
+        use base64::Engine as _;
+        // Decode the single PEM cert body into DER without an extra dependency.
+        let body: String = ca_cert_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(body.trim())
+            .expect("session CA PEM base64 decodes");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der))
+            .expect("the session CA cert is a valid trust anchor");
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_tungstenite::Connector::Rustls(Arc::new(config))
+    }
+
+    #[tokio::test]
+    async fn a_pinned_ca_tls_upgrade_succeeds_and_reconciles_a_stale_hello() {
+        let desired = DesiredState::derive_from_watched_tags([(
+            "my-app".to_string(),
+            "dev".to_string(),
+            "sha256:new".to_string(),
+        )]);
+        let (url, session, _server) = spawn_tls_server(desired).await;
+
+        // A client that pins ONLY the session CA and presents the Bearer
+        // read/control token: the wss upgrade must succeed over TLS.
+        let connector = pinned_ca_connector(session.tls.ca_cert_pem());
+        let request = authed_request(&url, session.read_token.secret());
+        let (mut ws, resp) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .expect("a pinned-CA wss upgrade with the read/control token must succeed");
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        // A hello reporting a stale running_digest reconciles to the desired one.
+        ws.send(Message::Text(
+            serde_json::to_string(&DeviceFrame::Hello(hello("sha256:old")))
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        let msg = ws.next().await.expect("a reconcile sync over TLS").unwrap();
+        let frame: HostFrame = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        assert_eq!(
+            frame,
+            HostFrame::Sync {
+                image: "my-app".to_string(),
+                tag: "dev".to_string(),
+                digest: "sha256:new".to_string(),
+            },
+            "a stale hello over the pinned-CA TLS control WS must reconcile to the desired digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_does_not_trust_the_session_ca_fails_the_tls_handshake() {
+        let (url, _session, _server) = spawn_tls_server(DesiredState::default()).await;
+
+        // Pin a DIFFERENT session's CA: it did not sign the server leaf, so the
+        // TLS handshake must fail before any WebSocket upgrade is attempted.
+        let other = crate::utils::container_dev::tls::DevSession::mint("other-runtime")
+            .expect("a second session mints");
+        let connector = pinned_ca_connector(other.tls.ca_cert_pem());
+        let result = tokio_tungstenite::connect_async_tls_with_config(
+            url.into_client_request().unwrap(),
+            None,
+            false,
+            Some(connector),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a client that does not trust the session CA must fail the TLS handshake"
         );
     }
 }
