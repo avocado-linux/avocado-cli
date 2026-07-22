@@ -33,3 +33,9 @@ pub mod tls;
 // `up` orchestration (5.2) and the control WS (5.1) later, hence dead_code here.
 #[allow(dead_code)]
 pub mod watcher;
+// Control-only WebSocket channel (5.1): host->device `sync`, device->host
+// `hello`/`progress`/`status`; the WS upgrade authenticates through the shared
+// read/control-token validator (3.4). Wired into the `up` orchestration (5.2)
+// later, hence dead_code here.
+#[allow(dead_code)]
+pub mod ws;
