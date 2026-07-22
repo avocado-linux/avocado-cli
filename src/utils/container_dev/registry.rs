@@ -406,7 +406,7 @@ fn store_error(err: &StoreError) -> Response {
         StoreError::InvalidTag(_) => {
             oci_error(StatusCode::BAD_REQUEST, "TAG_INVALID", "invalid tag")
         }
-        StoreError::NoHome | StoreError::Io(_) => oci_error(
+        StoreError::NoHome | StoreError::Io(_) | StoreError::PruneWhilePulling => oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
             "registry storage error",
