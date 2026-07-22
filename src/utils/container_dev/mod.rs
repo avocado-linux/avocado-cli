@@ -18,3 +18,7 @@ pub mod config;
 pub mod registry;
 #[allow(dead_code)]
 pub mod store;
+// Per-project CA + leaf, the rustls server config, and the per-session token
+// mint (3.6). Bound onto the bulk/WS listeners by 3.7/5.2, hence dead_code here.
+#[allow(dead_code)]
+pub mod tls;
