@@ -28,6 +28,8 @@
 //! with an empty body.
 
 use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -39,6 +41,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use rustls::ServerConfig;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 use super::auth::{require_basic_write, require_bearer_read, ReadToken, WriteToken};
@@ -94,6 +101,105 @@ pub fn read_router(store: Arc<BlobStore>, read_token: ReadToken) -> Router {
         read_token,
         require_bearer_read,
     ))
+}
+
+/// A TLS-terminating [`axum::serve::Listener`] over a bound [`TcpListener`].
+///
+/// Every accepted TCP connection is handshaked with the per-project leaf
+/// (task 3.6) before the OCI read router sees a byte, so the dedicated bulk
+/// listener speaks only TLS. The axum `Listener` contract forbids surfacing an
+/// accept error, so a failed TCP accept or TLS handshake is dropped and the
+/// loop continues; a persistent TCP accept error backs off briefly to avoid a
+/// busy-spin.
+struct TlsListener {
+    tcp: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.tcp.accept().await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    // Transient accept errors (e.g. fd exhaustion) must not be
+                    // surfaced; back off so we do not busy-spin on a persistent
+                    // one, then retry.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            // A handshake failure is a per-connection concern (a client that
+            // does not trust the CA, or a probe); drop it and keep serving.
+            if let Ok(tls) = self.acceptor.accept(stream).await {
+                return (tls, addr);
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
+
+/// A bound, running bulk read listener: the dedicated TLS socket that serves the
+/// OCI read router (task 3.2) gated by the Bearer read/control token (task 3.4).
+///
+/// This is the bulk-read leg of the three-listener model (design D9/H-1). A
+/// listener's identity IS a socket, so bulk pulls live on their OWN socket,
+/// separate from the write listener (task 3.3, [`write_router`]) and the control
+/// WebSocket (task 5.1). Bulk transfers therefore never share the control WS
+/// byte stream: a blob GET is an ordinary HTTP request on this dedicated TLS
+/// socket, so a large pull can never head-of-line-block a control frame. A
+/// device is only ever handed this listener's endpoint (task 5.2), so it cannot
+/// reach the write listener on any topology.
+pub struct BulkListener {
+    local_addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl BulkListener {
+    /// Bind the dedicated bulk read listener at `addr` and start serving the
+    /// token-gated OCI read router over TLS with the session leaf.
+    ///
+    /// Pass a `0` port to let the OS choose one; [`local_addr`](Self::local_addr)
+    /// then reports the concrete socket. The server runs on a spawned task that
+    /// is aborted when the returned handle is dropped.
+    pub async fn bind(
+        addr: SocketAddr,
+        store: Arc<BlobStore>,
+        read_token: ReadToken,
+        tls_config: Arc<ServerConfig>,
+    ) -> io::Result<Self> {
+        let tcp = TcpListener::bind(addr).await?;
+        let local_addr = tcp.local_addr()?;
+        let listener = TlsListener {
+            tcp,
+            acceptor: TlsAcceptor::from(tls_config),
+        };
+        let router = read_router(store, read_token);
+        let task = tokio::spawn(async move {
+            // `axum::serve` only returns on shutdown; the dev session drops the
+            // handle (aborting this task) when the registry is torn down.
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok(Self { local_addr, task })
+    }
+
+    /// The socket this bulk listener is bound to — its listener identity
+    /// (design H-1), distinct from the write listener's and the control WS's.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl Drop for BulkListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// In-flight chunked-upload sessions, keyed by upload UUID.
@@ -1116,6 +1222,230 @@ mod write_auth {
             authed.status().as_u16(),
             200,
             "an authenticated dedup probe must report an existing blob present"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bulk_listener {
+    use super::*;
+    use crate::utils::container_dev::store::BlobStore;
+    use crate::utils::container_dev::tls::DevSession;
+    use sha2::{Digest as _, Sha256};
+    use std::net::SocketAddr;
+    use tempfile::TempDir;
+
+    const RUNTIME: &str = "dev-runtime";
+
+    /// Compute the OCI digest (`sha256:<hex>`) of `bytes`.
+    fn digest_of(bytes: &[u8]) -> String {
+        let hex: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("sha256:{hex}")
+    }
+
+    /// Bind the dedicated bulk read listener over a fresh session's TLS material
+    /// and a per-project store seeded with `blob`.
+    ///
+    /// Returns the loopback `https://` base URL, the minted session (whose CA
+    /// cert the client pins and whose read/control token it presents), the live
+    /// listener handle (kept alive by the caller), the seeded blob digest, and
+    /// the temp-dir guard.
+    async fn spawn_bulk(blob: &[u8]) -> (String, DevSession, BulkListener, String, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
+        let digest = digest_of(blob);
+        store.write_blob(&digest, blob).unwrap();
+
+        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let listener = BulkListener::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            store,
+            session.read_token.clone(),
+            session.tls.server_config(),
+        )
+        .await
+        .expect("bulk listener binds");
+        let base = format!("https://127.0.0.1:{}", listener.local_addr().port());
+        (base, session, listener, digest, dir)
+    }
+
+    /// A reqwest client that trusts ONLY the session CA, so it validates the
+    /// leaf's `127.0.0.1` IP SAN and rejects any other chain.
+    fn tls_client(session: &DevSession) -> reqwest::Client {
+        let ca = reqwest::Certificate::from_pem(session.tls.ca_cert_pem().as_bytes())
+            .expect("session CA cert parses");
+        reqwest::Client::builder()
+            .add_root_certificate(ca)
+            .build()
+            .expect("TLS client builds")
+    }
+
+    #[tokio::test]
+    async fn token_gated_pull_succeeds_over_the_dedicated_bulk_tls_listener() {
+        let blob: Vec<u8> = (0u8..=255).collect();
+        let (base, session, listener, digest, _dir) = spawn_bulk(&blob).await;
+
+        // The listener owns a real bound loopback socket (its listener identity,
+        // design H-1): port 0 was resolved to a concrete port.
+        assert_ne!(
+            listener.local_addr().port(),
+            0,
+            "the bulk listener must bind a concrete socket"
+        );
+
+        let resp = tls_client(&session)
+            .get(format!("{base}/v2/my-app/blobs/{digest}"))
+            .bearer_auth(session.read_token.secret())
+            .send()
+            .await
+            .expect("bulk pull request completes");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "a Bearer-token-gated blob pull must succeed over the dedicated bulk TLS listener"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("docker-content-digest")
+                .and_then(|h| h.to_str().ok()),
+            Some(digest.as_str()),
+        );
+        // The exact blob bytes come back over the dedicated socket.
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), blob.as_slice());
+    }
+
+    #[tokio::test]
+    async fn bulk_pull_without_the_read_token_is_refused_before_any_bytes() {
+        let blob = b"a-container-layer".to_vec();
+        let (base, session, _listener, digest, _dir) = spawn_bulk(&blob).await;
+
+        let resp = tls_client(&session)
+            .get(format!("{base}/v2/my-app/blobs/{digest}"))
+            .send()
+            .await
+            .expect("anonymous bulk pull request completes");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "an anonymous pull on the bulk listener must be refused (fail-closed pre-stream)"
+        );
+        // Fail-closed: the challenge is a bare Bearer, and no blob body leaks.
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            challenge.starts_with("bearer"),
+            "the bulk listener must challenge with Bearer, got {challenge:?}"
+        );
+        assert_ne!(
+            resp.bytes().await.unwrap().as_ref(),
+            blob.as_slice(),
+            "a refused pull must not stream the blob body"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_bytes_travel_as_http_not_a_control_websocket_frame() {
+        let blob: Vec<u8> = (0u8..200).collect();
+        let (base, session, _listener, digest, _dir) = spawn_bulk(&blob).await;
+
+        // Attempt a WebSocket upgrade on the bulk socket while pulling a blob.
+        // The dedicated bulk listener carries ONLY the OCI read router (no WS /
+        // control route), so the engine gets the blob as a plain HTTP body and
+        // NEVER a `101 Switching Protocols` control stream. This is the D9/H-1
+        // guarantee: bulk transfers never share the control WS byte stream, so a
+        // large pull cannot head-of-line-block a control frame.
+        let resp = tls_client(&session)
+            .get(format!("{base}/v2/my-app/blobs/{digest}"))
+            .bearer_auth(session.read_token.secret())
+            .header(reqwest::header::CONNECTION, "Upgrade")
+            .header(reqwest::header::UPGRADE, "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .expect("bulk pull with upgrade headers completes");
+
+        assert_ne!(
+            resp.status().as_u16(),
+            101,
+            "the bulk listener must NEVER switch to a WebSocket/control stream"
+        );
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "the blob must be served as an ordinary HTTP body on the bulk socket"
+        );
+        assert_eq!(
+            resp.bytes().await.unwrap().as_ref(),
+            blob.as_slice(),
+            "the full blob must arrive over HTTP, not a WS frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_listener_binds_a_socket_distinct_from_the_write_listener() {
+        // The bulk read listener seeded with a blob.
+        let blob = b"layer-bytes".to_vec();
+        let (bulk_base, session, bulk, digest, _dir) = spawn_bulk(&blob).await;
+
+        // A separate WRITE listener (task 3.3) on its own socket. The three-
+        // listener model (design D9/H-1) gives each route class its OWN socket:
+        // this is the write leg, distinct from the bulk read leg.
+        let write_dir = TempDir::new().unwrap();
+        let write_store = Arc::new(BlobStore::at(write_dir.path(), "wproj").expect("store opens"));
+        let write_app = write_router(write_store, session.write_token.clone());
+        let write_tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let write_addr = write_tcp.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(write_tcp, write_app).await.unwrap();
+        });
+
+        // Distinct sockets: the bulk read listener and the write listener never
+        // share a socket, so a device handed only the bulk endpoint cannot reach
+        // the write listener.
+        assert_ne!(
+            bulk.local_addr(),
+            write_addr,
+            "the bulk read listener and the write listener must be distinct sockets"
+        );
+
+        // The bulk socket serves the token-gated read.
+        let bulk_ok = tls_client(&session)
+            .get(format!("{bulk_base}/v2/my-app/blobs/{digest}"))
+            .bearer_auth(session.read_token.secret())
+            .send()
+            .await
+            .expect("bulk read completes");
+        assert_eq!(bulk_ok.status().as_u16(), 200);
+
+        // The write socket is a different route class: it refuses an anonymous
+        // request with a Basic challenge, never a Bearer read/control token.
+        let write_anon = reqwest::get(format!("http://{write_addr}/v2/"))
+            .await
+            .expect("write listener responds");
+        assert_eq!(
+            write_anon.status().as_u16(),
+            401,
+            "the write listener gates on the Basic write token, not the read token"
+        );
+        let write_challenge = write_anon
+            .headers()
+            .get("www-authenticate")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            write_challenge.starts_with("basic"),
+            "the write listener must issue a Basic challenge, got {write_challenge:?}"
         );
     }
 }
