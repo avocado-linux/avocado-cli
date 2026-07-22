@@ -16,6 +16,10 @@ pub mod auth;
 // dead_code here.
 #[allow(dead_code)]
 pub mod bootstrap;
+// One-shot `sync` (re-push + notify, no watcher loop) and `prune` (per-project
+// store GC only) command cores (task 5.3); wired to the live listeners/syncer/WS
+// by the `commands::container::dev` glue.
+pub mod commands;
 pub mod config;
 // The engine-driver trait + docker/podman drivers (4.1): tag events via the
 // engine CLI subprocess (never the API socket). The watcher (4.2/4.3) that

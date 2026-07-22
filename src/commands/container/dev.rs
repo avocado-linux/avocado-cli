@@ -36,13 +36,14 @@ use crate::utils::container_dev::bootstrap::{
     bootstrap_path, host_override, port_override, resolve_endpoint, DevStatus, DeviceBootstrap,
     WriteListenerGuard, WRITABLE_PARTITION,
 };
+use crate::utils::container_dev::commands::{prune_store, run_one_shot_sync};
 use crate::utils::container_dev::config::ContainerDevConfig;
-use crate::utils::container_dev::engine::{driver_for, watch_tag_events};
+use crate::utils::container_dev::engine::{driver_for, watch_tag_events, TagEvent};
 use crate::utils::container_dev::registry::{write_router, BulkListener};
 use crate::utils::container_dev::store::BlobStore;
 use crate::utils::container_dev::tls::DevSession;
 use crate::utils::container_dev::watcher::{
-    arch_guard::HelloArchBook, run_watcher, EngineSyncer, HostTopology, DEBOUNCE,
+    arch_guard::HelloArchBook, run_watcher, EngineSyncer, HostTopology, SyncMode, DEBOUNCE,
 };
 use crate::utils::container_dev::ws::{ControlServer, DesiredState};
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
@@ -247,8 +248,25 @@ impl DevUpCommand {
             .await
             .context("starting the engine event watcher")?;
         let notifier = Arc::clone(&control);
+        // The watcher and the manual `sync` trigger share the SAME push+notify
+        // primitives (design D5): clone the syncer + control for the trigger
+        // before the watcher takes ownership of its copies.
+        let trigger_syncer = Arc::clone(&syncer);
+        let trigger_notifier = Arc::clone(&control);
         let watcher_task: JoinHandle<()> = tokio::spawn(async move {
             run_watcher(events_rx, mode, syncer, notifier, DEBOUNCE).await;
+        });
+
+        // The `container dev sync` trigger (task 5.3): a separate `sync`
+        // invocation signals this process (SIGUSR1), and each signal drives ONE
+        // re-push + notify of every configured watched image through the SAME
+        // pipeline the watcher uses — exactly once per signal, never a second
+        // watch loop. Reusing the running session's syncer + control WS is what
+        // lets the notify reach a connected device with no extra SSH.
+        let watched_images: Vec<String> =
+            ctx.dev.images.iter().map(|i| i.image_ref.clone()).collect();
+        let sync_trigger_task: JoinHandle<()> = tokio::spawn(async move {
+            run_sync_trigger(mode, trigger_syncer, trigger_notifier, watched_images).await;
         });
 
         // Deliver the bootstrap ONCE per `up` (design D5): the bulk endpoint (the
@@ -300,6 +318,7 @@ impl DevUpCommand {
         write_guard.teardown();
         ws_task.abort();
         watcher_task.abort();
+        sync_trigger_task.abort();
         let _ = events_child.kill().await;
         drop(bulk);
         let _ = std::fs::remove_file(&state_path);
@@ -313,8 +332,34 @@ impl DevUpCommand {
 }
 
 impl DevSyncCommand {
+    /// One-shot re-push + notify of the current watched tag (task 5.3, design
+    /// M4): NO long-running watcher. `sync` finds the running `up` session and
+    /// signals it (SIGUSR1) to drive ONE pass of the same push+notify pipeline
+    /// the watcher uses — reusing the session's registry write listener, engine
+    /// syncer, and control WS so the notify reaches a connected device with no
+    /// extra SSH. With no active session there is nothing holding those
+    /// listeners, so `sync` reports that `up` must run first rather than silently
+    /// doing nothing.
     pub async fn execute(self) -> Result<()> {
-        bail!("`avocado container dev sync` is not implemented yet")
+        let ctx = load_dev_context()?;
+        let store = BlobStore::for_project(&ctx.project)
+            .with_context(|| format!("opening the dev store for project `{}`", ctx.project))?;
+        let state_path = session_state_path(&store);
+
+        let Some(state) = read_session_state(&state_path)? else {
+            bail!(
+                "container dev: no active `up` session to sync; run `avocado container dev up` \
+                 first, then `sync` re-pushes the current watched image"
+            );
+        };
+
+        // Trigger exactly one re-push + notify in the running `up` process.
+        signal_sync(state.pid);
+        print_info(
+            "container dev sync: triggered a one-shot re-push + notify of the watched image(s).",
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 }
 
@@ -389,8 +434,33 @@ impl DevDownCommand {
 }
 
 impl DevPruneCommand {
+    /// Garbage-collect THIS project's Container Dev Mode store only (task 5.3,
+    /// design M4): sweep blobs no currently-tagged manifest references, via the
+    /// group-3.5 GC ([`prune_store`]). It touches only store blobs — never the
+    /// per-session token or the per-project CA material — and refuses while a
+    /// device is mid-pull rather than sweeping a blob a pull still needs.
     pub async fn execute(self) -> Result<()> {
-        bail!("`avocado container dev prune` is not implemented yet")
+        let ctx = load_dev_context()?;
+        let store = BlobStore::for_project(&ctx.project)
+            .with_context(|| format!("opening the dev store for project `{}`", ctx.project))?;
+
+        let swept = prune_store(&store).with_context(|| {
+            format!(
+                "pruning the Container Dev Mode store for project `{}`",
+                ctx.project
+            )
+        })?;
+
+        print_success(
+            &format!(
+                "container dev prune: swept {} unreferenced blob(s) from the `{}` store; the \
+                 session token and CA material are left intact.",
+                swept.len(),
+                ctx.project
+            ),
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 }
 
@@ -496,6 +566,66 @@ fn signal_shutdown(pid: u32) {
 
 #[cfg(not(unix))]
 fn signal_shutdown(_pid: u32) {}
+
+/// Serve the `container dev sync` trigger: each SIGUSR1 (sent by a separate
+/// `sync` invocation, [`signal_sync`]) drives ONE re-push + notify of every
+/// configured watched image through the shared push+notify pipeline
+/// ([`run_one_shot_sync`]) — exactly one pass per signal, never a second watch
+/// loop. Runs until the task is aborted on teardown. A per-image failure is
+/// surfaced as a warning and does not stop the trigger (a later `sync` retries).
+#[cfg(unix)]
+async fn run_sync_trigger(
+    mode: SyncMode,
+    syncer: Arc<EngineSyncer>,
+    notifier: Arc<ControlServer>,
+    images: Vec<String>,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut usr1 = match signal(SignalKind::user_defined1()) {
+        Ok(s) => s,
+        // No SIGUSR1 handler available: the trigger is simply inert.
+        Err(_) => return,
+    };
+    while usr1.recv().await.is_some() {
+        for image in &images {
+            let event = TagEvent {
+                image: image.clone(),
+                image_id: None,
+            };
+            if let Err(e) =
+                run_one_shot_sync(mode, syncer.as_ref(), notifier.as_ref(), &event).await
+            {
+                print_warning(
+                    &format!("container dev sync of `{image}` failed: {e:#}"),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_sync_trigger(
+    _mode: SyncMode,
+    _syncer: Arc<EngineSyncer>,
+    _notifier: Arc<ControlServer>,
+    _images: Vec<String>,
+) {
+}
+
+/// Signal the recorded `up` process to perform one manual sync (SIGUSR1),
+/// driving its [`run_sync_trigger`] through a single re-push + notify pass.
+#[cfg(unix)]
+fn signal_sync(pid: u32) {
+    // SAFETY: `kill` with a plain signal number has no memory-safety hazard; a
+    // stale pid simply yields ESRCH, which is ignored (the process already exited).
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGUSR1);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_sync(_pid: u32) {}
 
 /// The port component of a `host:port` endpoint.
 fn endpoint_port(endpoint: &str) -> Result<u16> {
