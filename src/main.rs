@@ -45,6 +45,9 @@ use commands::connect::trust::{
     ConnectTrustPromoteRootCommand, ConnectTrustRotateServerKeyCommand, ConnectTrustStatusCommand,
 };
 use commands::connect::upload::ConnectUploadCommand;
+use commands::container::dev::{
+    DevDownCommand, DevPruneCommand, DevStatusCommand, DevSyncCommand, DevUpCommand,
+};
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
     ExtFetchCommand, ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
@@ -189,6 +192,11 @@ enum Commands {
     Vm {
         #[command(subcommand)]
         command: VmCommands,
+    },
+    /// Container Dev Mode: iterate on containers running on a device.
+    Container {
+        #[command(subcommand)]
+        command: ContainerCommands,
     },
     /// Project configuration introspection (read-only).
     Config {
@@ -3173,6 +3181,15 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Container { command } => match command {
+            ContainerCommands::Dev { command } => match command {
+                ContainerDevCommands::Up => DevUpCommand.execute().await,
+                ContainerDevCommands::Sync => DevSyncCommand.execute().await,
+                ContainerDevCommands::Status => DevStatusCommand.execute().await,
+                ContainerDevCommands::Down => DevDownCommand.execute().await,
+                ContainerDevCommands::Prune => DevPruneCommand.execute().await,
+            },
+        },
         Commands::Vm { command } => match command {
             VmCommands::Start {
                 vm_source,
@@ -4791,6 +4808,30 @@ enum VmCommands {
         #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
         output: crate::utils::output_format::OutputFormat,
     },
+}
+
+#[derive(Subcommand)]
+enum ContainerCommands {
+    /// Layer-aware hot-reload loop for a container running on a device.
+    Dev {
+        #[command(subcommand)]
+        command: ContainerDevCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContainerDevCommands {
+    /// Start the dev registry + watcher and bootstrap the device.
+    Up,
+    /// One-shot re-push of the current watched image + notify the device.
+    Sync,
+    /// Report registry/watcher/last-sync state for the dev loop.
+    Status,
+    /// Stop the dev registry + watcher and tear down listeners.
+    Down,
+    /// Garbage-collect this project's Container Dev Mode registry store
+    /// (distinct from the top-level `prune`, which removes Docker volumes).
+    Prune,
 }
 
 #[derive(Subcommand)]
