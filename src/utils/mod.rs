@@ -1,6 +1,7 @@
 pub mod config;
 pub mod config_edit;
 pub mod container;
+pub mod container_dev;
 #[cfg(target_os = "macos")]
 pub mod disk_writer;
 pub mod ext_fetch;

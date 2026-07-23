@@ -247,6 +247,7 @@ mod tests {
                 rootfs: None,
                 initramfs: None,
                 var: None,
+                container_dev: None,
             },
         )
     }
