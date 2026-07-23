@@ -37,8 +37,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::auth::ReadToken;
-use super::tls::DevSession;
+use super::auth::{ReadToken, WRITE_USERNAME};
+use super::engine::WriteCredential;
+use super::tls::{DevSession, VM_HOST_IP};
 
 /// The device writable-partition root the bootstrap file lands under (design D5,
 /// assumption A7: the dev runtime mounts this rw before bootstrap runs).
@@ -183,6 +184,104 @@ pub fn ws_port_override() -> Option<u16> {
     std::env::var(WS_PORT_ENV)
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated VM write path + CA delivery (task 7.1, design D2/H4).
+//
+// On the avocado-vm fast path the container engine runs INSIDE the VM and pushes
+// to the host's write listener over HTTPS. Two host-authorable pieces make that
+// work: the guest engine must trust the per-project CA (delivered per-connection
+// into its `certs.d`), and the push must target the routable write registry with
+// the Basic WRITE token. This section is the pure, testable core; the thin SSH
+// glue that drops the CA into the guest lives in
+// [`crate::commands::container::dev`].
+//
+// Per design D1 the VM PUSH path is docker-only: a podman-machine takes INGEST
+// (which never reaches the write listener), and the avocado-vm runs dockerd — so
+// there is no podman variant here.
+// ---------------------------------------------------------------------------
+
+/// Environment override for the write-listener port on the VM path.
+///
+/// On the VM path the port must be KNOWN (not ephemeral) so the guest's
+/// `certs.d` trust dir and the pushed image tag can BOTH be keyed byte-identically
+/// on `10.0.2.2:<port>` (design H-3). Native-Linux loopback push keeps an
+/// ephemeral port.
+pub const WRITE_PORT_ENV: &str = "AVOCADO_CONTAINER_DEV_WRITE_PORT";
+
+/// Default write-listener port on the VM path when [`WRITE_PORT_ENV`] is unset.
+/// Distinct from the bulk-listener default (`config::DEFAULT_REGISTRY_PORT` =
+/// 5599) and the control-WS default ([`DEFAULT_WS_PORT`] = 5600); kept off 5000
+/// (macOS AirPlay, design 1.6).
+pub const DEFAULT_WRITE_PORT: u16 = 5601;
+
+/// The `AVOCADO_CONTAINER_DEV_WRITE_PORT` override, if set and a valid port.
+pub fn write_port_override() -> Option<u16> {
+    std::env::var(WRITE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// The routable write registry `host:port` the VM guest engine pushes to: the
+/// QEMU user-networking host alias `10.0.2.2` (a leaf IP SAN, [`VM_HOST_IP`]) on
+/// the known write port (design D2/H4, phase-0 task 1.8).
+///
+/// NEVER `127.0.0.1`: the guest is a separate network namespace and reaches the
+/// host's loopback-bound write listener through the `10.0.2.2` alias (QEMU SLIRP
+/// maps it to the host loopback), so the tag host, the delivered CA's SAN, and
+/// the injected `DOCKER_CONFIG` auth key all agree on the one IP (design H-3).
+pub fn vm_write_registry(write_port: u16) -> String {
+    format!("{VM_HOST_IP}:{write_port}")
+}
+
+/// The in-guest docker per-connection CA trust path for `registry`:
+/// `/etc/docker/certs.d/<registry>/ca.crt`.
+///
+/// docker reads this fresh per connection, so dropping the CA here needs NO
+/// daemon reload (phase-0 task 1.8) — the reload IS specified: none.
+pub fn docker_ca_trust_path(registry: &str) -> String {
+    format!("/etc/docker/certs.d/{registry}/ca.crt")
+}
+
+/// The pure, testable plan for the docker avocado-vm write path (task 7.1).
+///
+/// It composes the routable write `registry`, the guest CA trust path the
+/// per-project CA is delivered to, the CA PEM itself, and the Basic write
+/// credential the push authenticates with — the host-only WRITE token, NEVER the
+/// device-delivered read/control token (design D2). The CA travels here to be
+/// delivered at `up`; it is NEVER baked into the VM overlay (design D8/H4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmWriteSetup {
+    /// The routable write registry `10.0.2.2:<write-port>` the guest pushes to.
+    pub registry: String,
+    /// The in-guest path the per-project CA is delivered to (docker `certs.d`).
+    pub ca_trust_path: String,
+    /// The per-project CA certificate (PEM) delivered into the guest trust store.
+    pub ca_cert_pem: String,
+    /// The Basic write credential (fixed username + host-only write token) the
+    /// guest push authenticates with — never the read/control token (design D2).
+    pub credential: WriteCredential,
+}
+
+impl VmWriteSetup {
+    /// Compose the docker VM write-path plan from a minted session and the known
+    /// write port.
+    pub fn docker(session: &DevSession, write_port: u16) -> Self {
+        let registry = vm_write_registry(write_port);
+        let ca_trust_path = docker_ca_trust_path(&registry);
+        let credential = WriteCredential::DockerConfigEnv {
+            registry: registry.clone(),
+            username: WRITE_USERNAME.to_string(),
+            token: session.write_token.secret().to_string(),
+        };
+        Self {
+            registry,
+            ca_trust_path,
+            ca_cert_pem: session.tls.ca_cert_pem().to_string(),
+            credential,
+        }
+    }
 }
 
 /// A guaranteed-cleanup guard for the routable write listener + its `0.0.0.0`
@@ -728,6 +827,91 @@ mod tests {
         assert!(
             !clean.needs_rebootstrap(),
             "a status with only accepted-token devices must not signal a re-bootstrap"
+        );
+    }
+
+    // ---- authenticated VM write path + CA delivery (task 7.1, design D2/H4) ----
+
+    #[test]
+    fn vm_write_registry_targets_10_0_2_2_on_the_known_write_port() {
+        assert_eq!(vm_write_registry(5601), "10.0.2.2:5601");
+        assert_eq!(vm_write_registry(6001), "10.0.2.2:6001");
+        // NEVER a loopback target: the guest reaches the host via the 10.0.2.2
+        // alias, not 127.0.0.1 (a distinct network namespace).
+        assert!(!vm_write_registry(5601).starts_with("127.0.0.1"));
+    }
+
+    #[test]
+    fn docker_ca_trust_path_is_the_per_connection_certs_d_ca() {
+        // docker reads this per connection — no reload needed (phase-0 1.8).
+        assert_eq!(
+            docker_ca_trust_path("10.0.2.2:5601"),
+            "/etc/docker/certs.d/10.0.2.2:5601/ca.crt"
+        );
+    }
+
+    #[test]
+    fn vm_write_setup_uses_the_write_token_not_the_read_token() {
+        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let setup = VmWriteSetup::docker(&session, 5601);
+
+        assert_eq!(
+            setup.registry, "10.0.2.2:5601",
+            "the target is the routable registry"
+        );
+        assert_eq!(
+            setup.ca_trust_path, "/etc/docker/certs.d/10.0.2.2:5601/ca.crt",
+            "the CA is delivered to the docker per-connection trust path"
+        );
+        match &setup.credential {
+            WriteCredential::DockerConfigEnv {
+                registry,
+                username,
+                token,
+            } => {
+                // H-3: the auth-entry key is byte-identical to the routable registry.
+                assert_eq!(registry, "10.0.2.2:5601");
+                assert_eq!(username, WRITE_USERNAME);
+                // The Basic WRITE token gates the guest push...
+                assert_eq!(token, session.write_token.secret());
+                // ...NEVER the device-delivered read/control token (design D2).
+                assert_ne!(
+                    token.as_str(),
+                    session.read_token.secret(),
+                    "the VM guest push must authenticate with the host-only write token"
+                );
+            }
+            other => panic!("the VM write path must use a Basic write credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_write_ca_is_delivered_material_never_the_private_key() {
+        // The CA PEM is carried in the plan to be delivered at `up` (design H4),
+        // NOT a baked overlay file. It is real cert material, and never the CA
+        // private key (design D8).
+        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let setup = VmWriteSetup::docker(&session, 5601);
+        assert!(
+            setup.ca_cert_pem.contains("BEGIN CERTIFICATE"),
+            "the delivered CA must be real certificate material"
+        );
+        assert!(
+            !setup.ca_cert_pem.contains("PRIVATE KEY"),
+            "the VM CA delivery must NEVER carry CA private key material (design D8)"
+        );
+    }
+
+    #[test]
+    fn default_write_port_is_distinct_from_the_ws_and_bulk_defaults() {
+        assert_ne!(DEFAULT_WRITE_PORT, DEFAULT_WS_PORT);
+        assert_ne!(
+            DEFAULT_WRITE_PORT, 5599,
+            "the write port must not collide with the bulk-listener default"
+        );
+        assert_ne!(
+            DEFAULT_WRITE_PORT, 5000,
+            "the write port must not be 5000 (AirPlay)"
         );
     }
 }
