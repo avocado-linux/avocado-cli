@@ -1236,6 +1236,14 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                 )
             })?;
 
+        // Device-tree overlays declared by this runtime's extensions (ENG-2134).
+        // Empty section - and no build-time work - unless at least one is declared.
+        let device_tree_overlay_section = {
+            let overlays =
+                crate::utils::device_tree_overlay::collect_for_runtime(&merged_runtime, parsed)?;
+            crate::utils::device_tree_overlay::render_build_section(&overlays)?
+        };
+
         // Extract extension names from the `extensions` array
         let mut required_extensions = HashSet::new();
         let _extension_type_overrides: HashMap<String, Vec<String>> = HashMap::new();
@@ -2449,6 +2457,8 @@ if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
 fi
 STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
 
+STONE_OVERLAY_FLAG=""
+{device_tree_overlay_section}
 echo -e "\033[94m[INFO]\033[0m Running stone bundle."
 echo -e "  Manifest:  $STONE_MANIFEST"
 echo -e "  Output:    $STONE_AOS_OUTPUT"
@@ -2465,6 +2475,7 @@ stone bundle \
     $STONE_INITRD_FLAG \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
+    $STONE_OVERLAY_FLAG \
     --partition-size "var=$FINAL_SIZE" \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
@@ -2566,6 +2577,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             manifest_section = manifest_section,
             update_authority_section = update_authority_section,
             docker_section = docker_section,
+            device_tree_overlay_section = device_tree_overlay_section,
         );
 
         Ok(script)
@@ -3082,6 +3094,9 @@ runtimes:
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
         assert!(script.contains("stone bundle"));
         assert!(script.contains("mkfs.btrfs"));
+        // No overlays declared: the device-tree overlay section is inert.
+        assert!(!script.contains("device-tree overlays (ENG-2134)"));
+        assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
     }
 
     #[test]
@@ -3127,6 +3142,61 @@ extensions:
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
         assert!(script.contains("$RUNTIME_EXT_DIR/test-ext-1.0.0.raw"));
         assert!(!script.contains("$VAR_DIR/lib/avocado/extensions/"));
+    }
+
+    #[test]
+    fn test_create_build_script_with_device_tree_overlays() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - test-ext
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+    device_tree_overlays:
+      - name: my-spi
+        src: overlays/my-spi.dtso
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .unwrap();
+
+        // The overlay section is emitted, builds the declared overlay via the
+        // SDK wrapper, and wires the delivery hook + stone --overlay before the
+        // bundle call.
+        assert!(script.contains("device-tree overlays (ENG-2134)"));
+        assert!(script.contains(
+            "avocado-dtc-overlay --name \"my-spi\" --src \"/opt/src/overlays/my-spi.dtso\""
+        ));
+        assert!(script.contains("device-tree-overlay-deliver"));
+        assert!(script.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""));
+        // And the bundle call consumes the flag.
+        assert!(script.contains("$STONE_OVERLAY_FLAG \\"));
     }
 
     #[test]
