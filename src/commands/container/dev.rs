@@ -34,13 +34,14 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::utils::config::{Config, RuntimeConfig};
 use crate::utils::container_dev::bootstrap::{
-    bootstrap_path, host_override, port_override, resolve_endpoint, ws_port_override, DevStatus,
-    DeviceBootstrap, WriteListenerGuard, DEFAULT_WS_PORT, WRITABLE_PARTITION,
+    bootstrap_path, host_override, port_override, resolve_endpoint, write_port_override,
+    ws_port_override, DevStatus, DeviceBootstrap, VmWriteSetup, WriteListenerGuard,
+    DEFAULT_WRITE_PORT, DEFAULT_WS_PORT, WRITABLE_PARTITION,
 };
 use crate::utils::container_dev::commands::{prune_store, run_one_shot_sync};
 use crate::utils::container_dev::config::ContainerDevConfig;
 use crate::utils::container_dev::engine::{driver_for, watch_tag_events, TagEvent};
-use crate::utils::container_dev::registry::{write_router, BulkListener};
+use crate::utils::container_dev::registry::{serve_write_router_tls, write_router, BulkListener};
 use crate::utils::container_dev::store::BlobStore;
 use crate::utils::container_dev::tls::DevSession;
 use crate::utils::container_dev::watcher::{
@@ -58,6 +59,12 @@ const DEFAULT_CONFIG: &str = "avocado.yaml";
 /// subcommands take no positional arguments (task 2.3), so the device is sourced
 /// here.
 const DEVICE_ENV: &str = "AVOCADO_CONTAINER_DEV_DEVICE";
+
+/// The avocado-vm engine guest SSH target the per-project CA is delivered into on
+/// the VM write path (design D2/H4, task 7.1). Only consulted when the host
+/// topology selects the avocado-vm push path; the native-Linux loopback push
+/// never uses it.
+const VM_ENV: &str = "AVOCADO_CONTAINER_DEV_VM";
 
 /// The default engine CLI when none is configured.
 const DEFAULT_ENGINE: &str = "docker";
@@ -190,18 +197,81 @@ impl DevUpCommand {
         .context("binding the dedicated bulk read listener")?;
         let bulk_addr = bulk.local_addr();
 
-        // The DISTINCT write listener: loopback-only on native Linux so a device
-        // (handed only the bulk endpoint) can never reach a write route (design
-        // D9/H-1). Its address is NEVER disclosed to a device.
-        let write_bind: SocketAddr = "127.0.0.1:0".parse().expect("loopback write bind is valid");
+        // Detect the host topology once (design D1): it selects PUSH vs INGEST AND,
+        // on the avocado-vm push path, drives the write listener onto a KNOWN port
+        // with a routable 10.0.2.2 registry + guest CA delivery (task 7.1).
+        let topo = HostTopology::detect();
+
+        // On the VM push path the per-project CA must be delivered into the
+        // avocado-vm engine guest's trust store; require its SSH target up front so
+        // `up` fails fast rather than after binding listeners (design H4).
+        let vm_target = if topo.vm_routing {
+            let spec = std::env::var(VM_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the host topology selected the avocado-vm push path; set \
+                         {VM_ENV}=<user@host> to the avocado-vm engine guest so `up` can deliver \
+                         the per-project CA into its docker trust store"
+                    )
+                })?;
+            Some(RemoteHost::parse(&spec)?)
+        } else {
+            None
+        };
+
+        // The DISTINCT write listener: loopback-BOUND (design D9/H-1) so a device
+        // (handed only the bulk endpoint) can never reach a write route; its
+        // address is NEVER disclosed to a device. On the avocado-vm push path the
+        // port must be KNOWN (not ephemeral) so the guest's certs.d dir and the
+        // pushed tag are both keyed on 10.0.2.2:<port> (H-3) — a QEMU-SLIRP guest
+        // reaches this loopback listener through the 10.0.2.2 host alias. Native
+        // Linux keeps an ephemeral loopback port.
+        let write_port = write_port_override().unwrap_or(DEFAULT_WRITE_PORT);
+        let write_bind: SocketAddr = if topo.vm_routing {
+            format!("127.0.0.1:{write_port}")
+                .parse()
+                .expect("a known write port yields a valid loopback bind")
+        } else {
+            "127.0.0.1:0".parse().expect("loopback write bind is valid")
+        };
         let write_listener = TcpListener::bind(write_bind)
             .await
             .context("binding the loopback write listener")?;
         let write_addr = write_listener.local_addr()?;
-        let write_router = write_router(Arc::clone(&store), write_token.clone());
-        let write_task: JoinHandle<()> = tokio::spawn(async move {
-            let _ = axum::serve(write_listener, write_router).await;
-        });
+
+        // On the VM push path compose the guest write-path plan (task 7.1): the
+        // routable 10.0.2.2:<port> registry the guest daemon connects to, plus the
+        // CA to deliver into its trust store. Native Linux pushes to the loopback
+        // listener directly, so no guest plan is needed.
+        let vm_setup = topo
+            .vm_routing
+            .then(|| VmWriteSetup::docker(&session, write_addr.port()));
+        // The registry the syncer tags + authenticates against: the routable VM
+        // registry on the VM path, else the loopback write listener itself.
+        let syncer_registry = match &vm_setup {
+            Some(setup) => setup.registry.clone(),
+            None => write_addr.to_string(),
+        };
+        // On the VM push path the guest reaches this listener via 10.0.2.2 — not a
+        // docker-trusted 127.0.0.0/8 loopback — so it must terminate the same
+        // per-project leaf TLS the bulk and control listeners do; the guest's
+        // delivered certs.d CA pins it (design A2/H4). The native loopback path
+        // keeps plain HTTP under docker's built-in 127.0.0.0/8 insecure exemption.
+        let write_task: JoinHandle<()> = if topo.vm_routing {
+            serve_write_router_tls(
+                write_listener,
+                session.tls.server_config(),
+                Arc::clone(&store),
+                write_token.clone(),
+            )
+        } else {
+            let write_router = write_router(Arc::clone(&store), write_token.clone());
+            tokio::spawn(async move {
+                let _ = axum::serve(write_listener, write_router).await;
+            })
+        };
 
         // Guaranteed-cleanup guard for the routable write listener + its `0.0.0.0`
         // forward (design L-1): aborting the serve task tears the listener down on
@@ -252,7 +322,7 @@ impl DevUpCommand {
         let engine = DEFAULT_ENGINE;
         let driver =
             driver_for(engine).with_context(|| format!("no engine driver for `{engine}`"))?;
-        let mode = HostTopology::detect().sync_mode();
+        let mode = topo.sync_mode();
         let project_dir = store
             .root()
             .parent()
@@ -260,7 +330,7 @@ impl DevUpCommand {
             .to_path_buf();
         let syncer = Arc::new(EngineSyncer::new(
             driver_for(engine).expect("engine driver resolves"),
-            write_addr.to_string(),
+            syncer_registry,
             write_token.clone(),
             project_dir,
         ));
@@ -302,6 +372,15 @@ impl DevUpCommand {
         let payload =
             DeviceBootstrap::from_session(&session, device_bulk_endpoint, device_ws_endpoint);
         deliver_bootstrap(&device, &payload).await?;
+
+        // On the VM push path, deliver the per-project CA into the avocado-vm
+        // engine guest's docker trust store so its daemon trusts the host write
+        // listener's leaf per connection (design H4). Delivered at `up` over SSH,
+        // NEVER baked into the VM overlay (design D8). `vm_setup` and `vm_target`
+        // are both `Some` iff the topology selected the VM push path.
+        if let (Some(setup), Some(vm)) = (&vm_setup, &vm_target) {
+            deliver_vm_ca(vm, setup).await?;
+        }
 
         // Record the running session (with this process's pid) so `status`/`down`
         // in a separate invocation can find and signal it.
@@ -510,6 +589,34 @@ async fn deliver_bootstrap(device: &RemoteHost, payload: &DeviceBootstrap) -> Re
     ssh.run_command(&command)
         .await
         .context("writing the bootstrap file to the device writable partition")?;
+    Ok(())
+}
+
+/// Deliver the per-project CA into the avocado-vm engine guest's docker trust
+/// store over SSH (task 7.1, design H4).
+///
+/// Base64-decodes the CA PEM into the guest's `certs.d/<registry>/ca.crt` so its
+/// docker daemon trusts the host write listener's leaf per connection (no daemon
+/// reload — phase-0 task 1.8). The CA cert is public material (mode 0644); the CA
+/// private key is never delivered (design D8), and only the CA *cert* travels in
+/// [`VmWriteSetup`]. Delivered at `up`, NEVER baked into the VM overlay.
+async fn deliver_vm_ca(vm: &RemoteHost, setup: &VmWriteSetup) -> Result<()> {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(setup.ca_cert_pem.as_bytes());
+    let ca_path = &setup.ca_trust_path;
+    let ca_dir = std::path::Path::new(ca_path)
+        .parent()
+        .expect("the CA trust path has a parent directory")
+        .to_string_lossy();
+
+    let ssh = SshClient::new(vm.clone());
+    let command = format!(
+        "mkdir -p {ca_dir} && printf %s '{encoded}' | base64 -d > {ca_path} && chmod 0644 {ca_path}"
+    );
+    ssh.run_command(&command)
+        .await
+        .context("delivering the per-project CA into the avocado-vm engine trust store")?;
     Ok(())
 }
 

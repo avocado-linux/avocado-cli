@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
@@ -251,7 +251,40 @@ pub fn write_router(store: Arc<BlobStore>, write_token: WriteToken) -> Router {
             write_token,
             require_basic_write,
         ))
+        // Blob and manifest uploads carry image layers that routinely exceed
+        // axum's 2 MiB default body limit; buffering them as `Bytes` under that
+        // cap makes any real `docker push` 413 mid-stream. Blobs are written to
+        // the on-disk store, so lift the cap on the write path.
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
+}
+
+/// Serve the write router over TLS with the per-project session leaf, spawned on
+/// its own task (aborted when the returned handle is dropped).
+///
+/// Used for the VM push path only: a QEMU-SLIRP guest reaches the loopback write
+/// listener through the `10.0.2.2` host alias, which is NOT inside docker's
+/// built-in `127.0.0.0/8` insecure exemption (design A2). The guest daemon is
+/// therefore configured for HTTPS via a delivered `certs.d/<registry>/ca.crt`
+/// (design H4), so the listener must terminate the same leaf TLS the bulk and
+/// control listeners do. The native loopback path keeps plain HTTP under docker's
+/// exemption and does not call this.
+pub fn serve_write_router_tls(
+    tcp: TcpListener,
+    tls_config: Arc<ServerConfig>,
+    store: Arc<BlobStore>,
+    write_token: WriteToken,
+) -> JoinHandle<()> {
+    let listener = TlsListener {
+        tcp,
+        acceptor: TlsAcceptor::from(tls_config),
+    };
+    let router = write_router(store, write_token);
+    tokio::spawn(async move {
+        // `axum::serve` only returns on shutdown; the session aborts this task
+        // via the returned handle when the write listener is torn down.
+        let _ = axum::serve(listener, router).await;
+    })
 }
 
 /// `POST /v2/<name>/blobs/uploads/[?digest=<digest>]` — open a chunked upload,
@@ -1071,6 +1104,41 @@ mod write_auth {
     }
 
     #[tokio::test]
+    async fn a_blob_larger_than_the_default_body_limit_is_accepted() {
+        // A real image layer exceeds axum's 2 MiB DefaultBodyLimit. The write
+        // listener buffers the body as `Bytes`, so without lifting the cap every
+        // `docker push` of a non-trivial image 413s ("Failed to buffer the request
+        // body: length limit exceeded") and the push fails mid-stream. The store
+        // persists blobs to disk, so a large upload must be accepted.
+        let (base, store, _dir) = spawn().await;
+        let blob = vec![0x5au8; 3 * 1024 * 1024]; // 3 MiB > the 2 MiB default
+        let digest = compute_digest(&blob);
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v2/my-app/blobs/uploads/?digest={digest}"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .body(blob.clone())
+            .send()
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp.status().as_u16(),
+            413,
+            "a >2 MiB blob must not be rejected with 413 by the default body limit"
+        );
+        assert_eq!(
+            resp.status().as_u16(),
+            201,
+            "a monolithic blob upload with a valid write credential must be created"
+        );
+        assert!(
+            store.has_blob(&digest).unwrap(),
+            "the oversized blob must be persisted to the on-disk store"
+        );
+    }
+
+    #[tokio::test]
     async fn bearer_read_control_token_is_rejected_on_a_write_route() {
         let (base, store, _dir) = spawn().await;
         let body = manifest();
@@ -1446,6 +1514,53 @@ mod bulk_listener {
         assert!(
             write_challenge.starts_with("basic"),
             "the write listener must issue a Basic challenge, got {write_challenge:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_write_listener_terminates_tls_not_plaintext() {
+        // On the VM push path the guest reaches the write listener via the QEMU
+        // host alias 10.0.2.2 (NOT a docker-trusted 127.0.0.0/8 loopback), so the
+        // listener MUST terminate the per-project leaf TLS its delivered certs.d
+        // CA pins (design A2/H4). A plaintext HTTP write listener there is a bug:
+        // the guest daemon, configured for HTTPS via certs.d, could not push.
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlobStore::at(dir.path(), "wproj").expect("store opens"));
+        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let _task = serve_write_router_tls(
+            tcp,
+            session.tls.server_config(),
+            store,
+            session.write_token.clone(),
+        );
+
+        // HTTPS with the session CA: the TLS handshake succeeds and an
+        // unauthenticated write is refused with a Basic challenge (not a
+        // transport error).
+        let resp = tls_client(&session)
+            .get(format!("https://127.0.0.1:{port}/v2/"))
+            .send()
+            .await
+            .expect("an HTTPS request over the TLS write listener completes");
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "the TLS write listener must gate an unauthenticated write with 401"
+        );
+
+        // A plaintext HTTP request to the same port must fail at the transport
+        // layer, proving the listener speaks TLS. Before the fix the write
+        // listener served plaintext and this would return an HTTP status.
+        let plain = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/v2/"))
+            .send()
+            .await;
+        assert!(
+            plain.is_err(),
+            "a plaintext HTTP request to the TLS write listener must fail at the transport, \
+             got {plain:?}"
         );
     }
 }
