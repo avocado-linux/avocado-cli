@@ -1,0 +1,16 @@
+# Minimal config for the Container Dev Mode VM-write-path lab (task 7.1).
+#
+# A runtime carrying a `container_dev` block is all that enables the feature
+# (see src/utils/container_dev/config.rs). The watched image ref must match the
+# image the verify script builds on the VM engine (TEST_IMAGE, default
+# my-app:dev). `registry.port` is the bulk *read* listener; the authenticated
+# *write* listener uses AVOCADO_CONTAINER_DEV_WRITE_PORT (default 5601).
+runtimes:
+  dev:
+    target: qemux86-64
+    container_dev:
+      images:
+        - ref: my-app:dev
+          service: app
+      registry:
+        port: 5599
