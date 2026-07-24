@@ -421,48 +421,17 @@ impl ExtImageCommand {
         // For local extensions, this uses get_merged_ext_config which reads from the file
         let ext_config = match &extension_location {
             ExtensionLocation::Remote { .. } => {
-                // Use the already-merged config from `parsed` which contains remote extension configs
-                // Then apply target-specific overrides manually
-                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
-                let ext_section = find_ext_in_mapping(parsed, &self.extension, &target);
-
                 if self.verbose {
-                    if let Some(all_ext) = parsed.get("extensions") {
-                        if let Some(ext_map) = all_ext.as_mapping() {
-                            let ext_names: Vec<_> =
-                                ext_map.keys().filter_map(|k| k.as_str()).collect();
-                            eprintln!(
-                                "[DEBUG] Available extensions in composed config: {ext_names:?}"
-                            );
-                        }
-                    }
-                    eprintln!(
-                        "[DEBUG] Looking for extension '{}' in composed config, found: {}",
-                        self.extension,
-                        ext_section.is_some()
-                    );
-                    if let Some(ext_val) = &ext_section {
-                        eprintln!(
-                            "[DEBUG] Extension '{}' config:\n{}",
-                            self.extension,
-                            serde_yaml::to_string(ext_val).unwrap_or_default()
-                        );
+                    if let Some(ext_map) = parsed.get("extensions").and_then(|e| e.as_mapping()) {
+                        let ext_names: Vec<_> = ext_map.keys().filter_map(|k| k.as_str()).collect();
+                        eprintln!("[DEBUG] Available extensions in composed config: {ext_names:?}");
                     }
                 }
-
-                if let Some(ext_val) = ext_section {
-                    let base_ext = ext_val.clone();
-                    // Check for target-specific override within this extension
-                    let target_override = ext_val.get(&target).cloned();
-                    if let Some(override_val) = target_override {
-                        // Merge target override into base, filtering out other target sections
-                        Some(config.merge_target_override(base_ext, override_val, &target))
-                    } else {
-                        Some(base_ext)
-                    }
-                } else {
-                    None
-                }
+                // Resolve the remote/path-sourced ext's config from the composed
+                // value, honoring its `target-<name>:` overrides (overlay + `--tag`)
+                // — the same result the Local path gets via get_merged_ext_config.
+                // Shared with `ext build`.
+                super::resolve_remote_ext_config(config, parsed, &self.extension, &target)
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging
