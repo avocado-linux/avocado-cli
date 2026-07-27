@@ -7,9 +7,8 @@ use tokio::process::Command as AsyncCommand;
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
-use crate::utils::stamps::{
-    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
-};
+use crate::utils::prerequisites::read_stamps_batch;
+use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
 use crate::utils::volume::VolumeManager;
 
@@ -115,28 +114,23 @@ impl ExtCheckoutCommand {
                     StampRequirement::ext_install(&self.extension),
                 ];
 
-                let batch_script = generate_batch_read_stamps_script(&requirements);
-                let run_config = RunConfig {
-                    container_image: container_image.to_string(),
-                    target: target.clone(),
-                    command: batch_script,
-                    verbose: false,
-                    source_environment: true,
-                    interactive: false,
-                    repo_url: config.get_sdk_repo_url(),
-                    repo_release: config.get_sdk_repo_release(),
-                    container_args: config.merge_sdk_container_args(None),
-                    sdk_arch: self.sdk_arch.clone(),
-                    env_vars: self.runtime_env_vars(),
-                    ..Default::default()
-                };
-
-                let output = container_helper
-                    .run_in_container_with_output(run_config)
-                    .await?;
-
-                let validation =
-                    validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
+                let validation = read_stamps_batch(
+                    &requirements,
+                    &container_helper,
+                    RunConfig {
+                        container_image: container_image.to_string(),
+                        target: target.clone(),
+                        repo_url: config.get_sdk_repo_url(),
+                        repo_release: config.get_sdk_repo_release(),
+                        container_args: config.merge_sdk_container_args(None),
+                        sdk_arch: self.sdk_arch.clone(),
+                        env_vars: self.runtime_env_vars(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await?
+                .validate(&requirements, &[]);
 
                 if !validation.is_satisfied() {
                     validation

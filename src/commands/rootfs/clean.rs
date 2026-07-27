@@ -11,8 +11,14 @@ use crate::utils::{
 };
 
 /// Generate the shell command to clean a sysroot (rootfs or initramfs).
+///
+/// Removes the install stamp along with the sysroot. Without this, `rootfs
+/// clean && sdk install` would see a current stamp against an empty sysroot
+/// and skip the reinstall (see the short-circuit in
+/// [`install_sysroot`](super::install::install_sysroot)) — mirroring how
+/// `ext clean` drops `.stamps/ext/<name>`.
 pub fn clean_sysroot_command(sysroot_dir: &str) -> String {
-    format!(r#"rm -rf "$AVOCADO_PREFIX/{sysroot_dir}""#)
+    format!(r#"rm -rf "$AVOCADO_PREFIX/{sysroot_dir}" "$AVOCADO_PREFIX/.stamps/{sysroot_dir}""#)
 }
 
 /// Implementation of the 'rootfs clean' command.

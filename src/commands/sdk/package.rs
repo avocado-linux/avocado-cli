@@ -12,7 +12,8 @@ use crate::utils::{
     config::{Config, PackageConfig, SplitPackageConfig},
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
-    stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
+    prerequisites::read_stamps_batch,
+    stamps::StampRequirement,
     target::resolve_target_required,
 };
 
@@ -102,28 +103,23 @@ impl SdkPackageCommand {
                 SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
             let requirements = vec![StampRequirement::sdk_install()];
-            let batch_script = generate_batch_read_stamps_script(&requirements);
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.clone(),
-                command: batch_script,
-                verbose: false,
-                source_environment: true,
-                interactive: false,
-                repo_url: config.get_sdk_repo_url(),
-                repo_release: config.get_sdk_repo_release(),
-                container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
-                dnf_args: self.dnf_args.clone(),
-                sdk_arch: self.sdk_arch.clone(),
-                ..Default::default()
-            };
-
-            let output = container_helper
-                .run_in_container_with_output(run_config)
-                .await?;
-
-            let validation =
-                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
+            let validation = read_stamps_batch(
+                &requirements,
+                &container_helper,
+                RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.clone(),
+                    repo_url: config.get_sdk_repo_url(),
+                    repo_release: config.get_sdk_repo_release(),
+                    container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
+                    dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .validate(&requirements, &[]);
 
             if !validation.is_satisfied() {
                 validation

@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     lockfile::{LockFile, SysrootType},
     output::{print_error, OutputLevel},
     runs_on::RunsOnContext,
     target::validate_and_log_target,
 };
 
-use crate::commands::rootfs::install::{install_sysroot, SysrootInstallParams};
+use crate::commands::rootfs::install::{
+    install_sysroot, read_sysroot_install_stamp, SysrootInstallParams,
+};
 
 /// Implementation of the 'initramfs install' command.
 pub struct InitramfsInstallCommand {
@@ -128,6 +130,24 @@ impl InitramfsInstallCommand {
             .unwrap_or(std::path::Path::new("."));
         let mut lock_file = LockFile::load(src_dir)?;
 
+        let prefetched_stamp = read_sysroot_install_stamp(
+            &SysrootType::Initramfs,
+            self.no_stamps,
+            &container_helper,
+            RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                verbose: self.verbose,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            },
+            runs_on_context.as_ref(),
+        )
+        .await?;
+
         let result = install_sysroot(&mut SysrootInstallParams {
             sysroot_type: SysrootType::Initramfs,
             config,
@@ -147,9 +167,16 @@ impl InitramfsInstallCommand {
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            prefetched_stamp,
             tui_context: None,
         })
         .await;
+
+        // Persist the lockfile the install updated — `install_sysroot` leaves
+        // saving to its caller.
+        if result.is_ok() {
+            lock_file.save(src_dir)?;
+        }
 
         if let Some(ref mut context) = runs_on_context {
             if let Err(e) = context.teardown().await {

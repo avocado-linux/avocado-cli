@@ -1,7 +1,7 @@
 //! Rootfs sysroot install command and shared install logic for rootfs/initramfs.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -75,13 +75,16 @@ use crate::utils::{
     kernel_version::substitute_kernel_version,
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
+    prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
         compute_initramfs_input_hash, compute_rootfs_input_hash, generate_write_stamp_script,
-        Stamp, StampOutputs,
+        Stamp, StampInputs, StampOutputs, StampRequirement, SysrootStampInputs,
     },
     target::validate_and_log_target,
 };
+
+use super::clean::clean_sysroot_command;
 
 /// Parameters for the shared sysroot install function.
 pub struct SysrootInstallParams<'a> {
@@ -102,12 +105,57 @@ pub struct SysrootInstallParams<'a> {
     pub force: bool,
     pub runs_on_context: Option<&'a RunsOnContext>,
     pub sdk_arch: Option<&'a String>,
-    /// Skip stamp writing when true.
+    /// Skip stamp reading and writing when true — the escape hatch that
+    /// forces a full reinstall.
     pub no_stamps: bool,
     /// Parsed (merged) YAML config — needed for stamp hash computation.
     pub parsed: Option<&'a serde_yaml::Value>,
+    /// This sysroot's install stamp, read by the caller. `avocado sdk install`
+    /// batches both sysroots' stamps into one container invocation; the
+    /// standalone commands read their own. `None` means no stamp was found
+    /// (or none was read), which always installs.
+    pub prefetched_stamp: Option<Stamp>,
     /// TUI context for output capture (if TUI is active).
     pub tui_context: Option<crate::utils::container::TuiContext>,
+}
+
+impl SysrootInstallParams<'_> {
+    /// The `SysrootType`-appropriate stamp requirement, or `None` for a
+    /// sysroot type that has no install stamp.
+    fn stamp_requirement(sysroot_type: &SysrootType) -> Option<StampRequirement> {
+        match sysroot_type {
+            SysrootType::Rootfs => Some(StampRequirement::rootfs_install()),
+            SysrootType::Initramfs => Some(StampRequirement::initramfs_install()),
+            _ => None,
+        }
+    }
+}
+
+/// Read one sysroot's install stamp for the standalone `avocado rootfs
+/// install` / `avocado initramfs install` entry points, which have no
+/// sibling task to batch with. Returns `None` when stamps are disabled, the
+/// stamp is absent, or it can't be parsed.
+pub async fn read_sysroot_install_stamp(
+    sysroot_type: &SysrootType,
+    no_stamps: bool,
+    container_helper: &SdkContainer,
+    base_run_config: RunConfig,
+    runs_on_context: Option<&RunsOnContext>,
+) -> Result<Option<Stamp>> {
+    if no_stamps {
+        return Ok(None);
+    }
+    let Some(requirement) = SysrootInstallParams::stamp_requirement(sysroot_type) else {
+        return Ok(None);
+    };
+    let batch = read_stamps_batch(
+        std::slice::from_ref(&requirement),
+        container_helper,
+        base_run_config,
+        runs_on_context,
+    )
+    .await?;
+    Ok(batch.stamp_for(&requirement))
 }
 
 /// Stage the kernel `Image` from the rootfs sysroot into the per-target
@@ -134,7 +182,6 @@ async fn stage_kernel_sysroot_from_rootfs(
     rootfs_image_pkg_name: &str,
     rootfs_image_pkg_version: &str,
     lock_file: &mut LockFile,
-    src_dir: &Path,
     repo_url: Option<&str>,
     repo_release: Option<&str>,
     merged_container_args: Option<Vec<String>>,
@@ -230,7 +277,6 @@ fi
     );
     let kernel_sysroot = SysrootType::Kernel(kver.to_string());
     lock_file.update_sysroot_versions(target, &kernel_sysroot, versions);
-    lock_file.save(src_dir)?;
 
     print_success(
         &format!("Staged kernel sysroot at $AVOCADO_PREFIX/kernel/{kver}."),
@@ -240,49 +286,116 @@ fi
     Ok(())
 }
 
-/// Detect package removals by comparing config packages against lock file.
-/// Returns true if the sysroot needs to be cleaned and reinstalled from scratch.
+/// Detect package removals by comparing the **effective** package set for
+/// this sysroot against what the lockfile recorded. A non-empty result means
+/// the sysroot must be cleaned and reinstalled from scratch, because dnf
+/// install is additive-only and cannot remove packages.
+///
+/// `effective_names` is the config-declared packages *plus* the packages
+/// [`install_sysroot`] auto-appends: the per-kernel module packagegroup and,
+/// for rootfs, `kernel-image-<kver>`. Deriving the reference set from config
+/// alone — as this did before — reads those auto-appended lock entries as
+/// removals on every run after the first, which wipes both sysroots and,
+/// via `remove_packages_from_sysroot`, drops their version pins so dnf
+/// resolves newest-available instead of the locked NVR.
+///
+/// Returns the removed names sorted, or empty when the sysroot is consistent.
 fn detect_sysroot_package_removals(
-    config: &Config,
+    effective_names: &HashSet<String>,
     sysroot_type: &SysrootType,
     target: &str,
-    lock_file: &mut LockFile,
-) -> bool {
+    lock_file: &LockFile,
+) -> Vec<String> {
     let locked_names = lock_file.get_locked_package_names(target, sysroot_type);
 
     if locked_names.is_empty() {
-        return false;
+        return Vec::new();
     }
 
-    let config_names: HashSet<String> = match sysroot_type {
-        SysrootType::Rootfs => config.get_rootfs_packages().keys().cloned().collect(),
-        SysrootType::Initramfs => config.get_initramfs_packages().keys().cloned().collect(),
-        _ => return false,
+    let mut removed: Vec<String> = locked_names.difference(effective_names).cloned().collect();
+    removed.sort();
+    removed
+}
+
+/// `rm -rf` a sysroot (and its stamp) inside the SDK container.
+///
+/// Shares [`clean_sysroot_command`] with `avocado rootfs clean` so the
+/// mid-install clean and the user-facing clean can't drift.
+///
+/// Best-effort by design, matching the inline copies this replaced: an
+/// absent sysroot is the normal case on a first install and must not fail
+/// the run.
+async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) {
+    let clean_config = RunConfig {
+        container_image: params.container_image.to_string(),
+        target: params.target.to_string(),
+        command: clean_sysroot_command(sysroot_dir),
+        verbose: params.verbose,
+        source_environment: true,
+        interactive: false,
+        repo_url: params.repo_url.map(|s| s.to_string()),
+        repo_release: params.repo_release.map(|s| s.to_string()),
+        container_args: params.merged_container_args.clone(),
+        sdk_arch: params.sdk_arch.cloned(),
+        tui_context: params.tui_context.clone(),
+        ..Default::default()
     };
 
-    let removed: Vec<String> = locked_names.difference(&config_names).cloned().collect();
-
-    if removed.is_empty() {
-        return false;
+    if let Some(context) = params.runs_on_context {
+        params
+            .container_helper
+            .run_in_container_with_context(&clean_config, context)
+            .await
+            .ok();
+    } else {
+        params
+            .container_helper
+            .run_in_container(clean_config)
+            .await
+            .ok();
     }
+}
 
-    let label = match sysroot_type {
-        SysrootType::Rootfs => "rootfs",
-        SysrootType::Initramfs => "initramfs",
-        _ => "sysroot",
+/// Compute this sysroot's install-stamp inputs from the config, the SDK feed
+/// identity, and the lockfile pins **as they stand at call time**.
+///
+/// Called twice per install: once up front to compare against the stamp on
+/// record, and once after a successful install to write the stamp the next
+/// run will compare against. The second call has to see the post-install
+/// lock (the install re-pins packages), which is why this reads the lock
+/// each time instead of caching a single value.
+///
+/// Returns `None` when there is no parsed config to hash, or for a sysroot
+/// type that has no install stamp.
+fn compute_install_stamp_inputs(
+    params: &SysrootInstallParams<'_>,
+    packages: &HashMap<String, serde_yaml::Value>,
+) -> Result<Option<StampInputs>> {
+    let Some(parsed) = params.parsed else {
+        return Ok(None);
     };
-    print_info(
-        &format!(
-            "Packages removed from {label}: {}. Cleaning sysroot for fresh install.",
-            removed.join(", ")
-        ),
-        OutputLevel::Normal,
-    );
 
-    // Remove only the stale entries, preserving version pins for remaining packages
-    lock_file.remove_packages_from_sysroot(target, sysroot_type, &removed);
+    let resolved = SysrootStampInputs {
+        packages,
+        repo_url: params.repo_url,
+        repo_release: params.repo_release,
+        disable_weak_dependencies: params.config.get_sdk_disable_weak_dependencies(),
+        locked_packages: params
+            .lock_file
+            .get_sysroot_versions(params.target, &params.sysroot_type),
+    };
 
-    true
+    let inputs = match params.sysroot_type {
+        SysrootType::Rootfs => {
+            compute_rootfs_input_hash(parsed, params.src_dir, params.target_board, &resolved)?
+        }
+        SysrootType::Initramfs => {
+            compute_initramfs_input_hash(parsed, params.src_dir, params.target_board, &resolved)?
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(inputs))
 }
 
 /// Install a sysroot (rootfs or initramfs) via DNF into the SDK container volume.
@@ -347,56 +460,37 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         _ => return Err(anyhow::anyhow!("Unsupported sysroot type for install")),
     };
 
-    print_info(&format!("Installing {label} sysroot."), OutputLevel::Normal);
-
-    // Detect package removals: compare current config packages with lock file.
-    // If packages were removed, we must clean the sysroot and reinstall from scratch
-    // because DNF install is additive-only and cannot remove packages.
-    let needs_clean_reinstall = detect_sysroot_package_removals(
-        params.config,
-        &params.sysroot_type,
-        params.target,
-        params.lock_file,
-    );
-
-    if needs_clean_reinstall {
-        let clean_command = format!(r#"rm -rf "$AVOCADO_PREFIX/{sysroot_dir}""#);
-        let clean_config = RunConfig {
-            container_image: params.container_image.to_string(),
-            target: params.target.to_string(),
-            command: clean_command,
-            verbose: params.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: params.repo_url.map(|s| s.to_string()),
-            repo_release: params.repo_release.map(|s| s.to_string()),
-            container_args: params.merged_container_args.clone(),
-            sdk_arch: params.sdk_arch.cloned(),
-            tui_context: params.tui_context.clone(),
-            ..Default::default()
-        };
-
-        if let Some(context) = params.runs_on_context {
-            params
-                .container_helper
-                .run_in_container_with_context(&clean_config, context)
-                .await
-                .ok();
-        } else {
-            params
-                .container_helper
-                .run_in_container(clean_config)
-                .await
-                .ok();
-        }
-    }
-
-    // Get packages from config
+    // Get packages from config (the effective set — absent config yields the
+    // default meta-package).
     let packages = match params.sysroot_type {
         SysrootType::Rootfs => params.config.get_rootfs_packages(),
         SysrootType::Initramfs => params.config.get_initramfs_packages(),
         _ => unreachable!(),
     };
+
+    // Short-circuit: nothing to do when the stamp on record still matches the
+    // current inputs. This is checked before any container call, so an
+    // unchanged project pays nothing here — no kernel repoquery, no dnf
+    // transaction, no lock rewrite.
+    //
+    // Escape hatches: `--no-stamps` skips the read (and the write) so it
+    // always reinstalls, and `avocado {rootfs,initramfs} clean` removes the
+    // stamp along with the sysroot, so a cleaned sysroot never skips.
+    if !params.no_stamps {
+        if let Some(stamp) = params.prefetched_stamp.as_ref() {
+            if let Some(inputs) = compute_install_stamp_inputs(params, &packages)? {
+                if stamp.is_current(&inputs) {
+                    print_success(
+                        &format!("{label} sysroot is up to date."),
+                        OutputLevel::Normal,
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    print_info(&format!("Installing {label} sysroot."), OutputLevel::Normal);
 
     // Resolve (or reuse a pinned) KERNEL_VERSION before building package specs
     // so kernel/kernel-module-*/kernel-devsrc-* names get suffixed to exactly
@@ -435,77 +529,6 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         };
         (kver, excludes)
     };
-
-    // Detect kernel pin change vs lockfile. dnf install is additive, so if
-    // the resolved kver differs from what the lockfile recorded for this
-    // sysroot, a plain re-install would land the new kernel-image and
-    // module packagegroup *alongside* the prior pin's packages — leaving
-    // /lib/modules/<old-kver>/, the old kernel-image, and stale module
-    // packages in the sysroot. Force a clean+reinstall so the new pin is
-    // the only thing present.
-    if let Some(new_kver) = resolved_kver.as_deref() {
-        if let Some(prev) = prev_pinned_kver {
-            if prev != new_kver {
-                print_info(
-                    &format!(
-                        "{label}: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
-                    ),
-                    OutputLevel::Normal,
-                );
-
-                let clean_command = format!(r#"rm -rf "$AVOCADO_PREFIX/{sysroot_dir}""#);
-                let clean_config = RunConfig {
-                    container_image: params.container_image.to_string(),
-                    target: params.target.to_string(),
-                    command: clean_command,
-                    verbose: params.verbose,
-                    source_environment: true,
-                    interactive: false,
-                    repo_url: params.repo_url.map(|s| s.to_string()),
-                    repo_release: params.repo_release.map(|s| s.to_string()),
-                    container_args: params.merged_container_args.clone(),
-                    sdk_arch: params.sdk_arch.cloned(),
-                    tui_context: params.tui_context.clone(),
-                    ..Default::default()
-                };
-                if let Some(context) = params.runs_on_context {
-                    params
-                        .container_helper
-                        .run_in_container_with_context(&clean_config, context)
-                        .await
-                        .ok();
-                } else {
-                    params
-                        .container_helper
-                        .run_in_container(clean_config)
-                        .await
-                        .ok();
-                }
-
-                // Wipe the package state for this sysroot so a failed
-                // re-install can't leave a stale package map pointing at a
-                // now-empty sysroot.
-                match params.sysroot_type {
-                    SysrootType::Rootfs => params.lock_file.clear_rootfs(params.target),
-                    SysrootType::Initramfs => params.lock_file.clear_initramfs(params.target),
-                    _ => {}
-                }
-                // Remove and immediately re-pin the new kver. Remove first so
-                // the entry is correct even if the install below fails (empty
-                // sysroot + correct kver = retry without re-clean). Re-pin
-                // so the sdk/install.rs merge site can see the new kver after
-                // a successful install — without it the `if let Some(kver)`
-                // check in that merge finds nothing and the old kver from the
-                // initial clone bleeds through into the saved lockfile.
-                params
-                    .lock_file
-                    .remove_kernel_version(params.target, &params.sysroot_type);
-                params
-                    .lock_file
-                    .set_kernel_version(params.target, &params.sysroot_type, new_kver);
-            }
-        }
-    }
 
     // Build package specs for all configured packages. When we have a
     // resolved kernel version, substitute any `{{ avocado.kernel.version }}`
@@ -593,6 +616,97 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         _ => None,
     };
 
+    // The set of names a completed install of this sysroot is expected to
+    // have recorded in the lockfile: config-declared packages plus whatever
+    // was auto-appended above. Used as the reference set for removal
+    // detection and, after the install, as the lock query list.
+    let mut effective_names: Vec<String> = if packages.is_empty() {
+        vec![default_pkg.to_string()]
+    } else {
+        packages.keys().cloned().collect()
+    };
+    effective_names.extend(auto_module_pkg.iter().cloned());
+    effective_names.extend(auto_kernel_image_pkg.iter().cloned());
+    effective_names.sort();
+    effective_names.dedup();
+    let effective_name_set: HashSet<String> = effective_names.iter().cloned().collect();
+
+    // Decide whether this install has to start from an empty sysroot. dnf
+    // install is additive-only, so anything that makes the *existing*
+    // sysroot contents wrong — rather than merely incomplete — needs a wipe
+    // first. Two things qualify, and both resolve to the same single clean.
+    let kernel_pin_change = resolved_kver.as_deref().and_then(|new_kver| {
+        prev_pinned_kver
+            .filter(|prev| prev != new_kver)
+            .map(|prev| (prev, new_kver))
+    });
+    let removed_packages = if kernel_pin_change.is_some() {
+        // Moot: the whole package map is about to be cleared below.
+        Vec::new()
+    } else {
+        detect_sysroot_package_removals(
+            &effective_name_set,
+            &params.sysroot_type,
+            params.target,
+            params.lock_file,
+        )
+    };
+
+    let needs_clean_reinstall = kernel_pin_change.is_some() || !removed_packages.is_empty();
+
+    if let Some((prev, new_kver)) = kernel_pin_change {
+        // A plain re-install would land the new kernel-image and module
+        // packagegroup *alongside* the prior pin's packages, leaving
+        // /lib/modules/<old-kver>/, the old kernel-image and stale module
+        // packages behind.
+        print_info(
+            &format!(
+                "{label}: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+            ),
+            OutputLevel::Normal,
+        );
+
+        // Wipe the package state for this sysroot so a failed re-install
+        // can't leave a stale package map pointing at a now-empty sysroot.
+        match params.sysroot_type {
+            SysrootType::Rootfs => params.lock_file.clear_rootfs(params.target),
+            SysrootType::Initramfs => params.lock_file.clear_initramfs(params.target),
+            _ => {}
+        }
+        // Remove and immediately re-pin the new kver. Remove first so the
+        // entry is correct even if the install below fails (empty sysroot +
+        // correct kver = retry without re-clean). Re-pin so the
+        // sdk/install.rs merge site can see the new kver after a successful
+        // install — without it the `if let Some(kver)` check in that merge
+        // finds nothing and the old kver from the initial clone bleeds
+        // through into the saved lockfile.
+        params
+            .lock_file
+            .remove_kernel_version(params.target, &params.sysroot_type);
+        params
+            .lock_file
+            .set_kernel_version(params.target, &params.sysroot_type, new_kver);
+    } else if !removed_packages.is_empty() {
+        print_info(
+            &format!(
+                "Packages removed from {label}: {}. Cleaning sysroot for fresh install.",
+                removed_packages.join(", ")
+            ),
+            OutputLevel::Normal,
+        );
+        // Drop only the stale entries, preserving version pins for the
+        // packages that remain.
+        params.lock_file.remove_packages_from_sysroot(
+            params.target,
+            &params.sysroot_type,
+            &removed_packages,
+        );
+    }
+
+    if needs_clean_reinstall {
+        clean_sysroot(params, sysroot_dir).await;
+    }
+
     let mut pkg_specs: Vec<String> = if packages.is_empty() {
         vec![build_package_spec_with_lock(
             params.lock_file,
@@ -635,19 +749,6 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         ));
     }
     let pkg = pkg_specs.join(" ");
-
-    // Collect all package names for lock file queries
-    let mut all_package_names: Vec<String> = if packages.is_empty() {
-        vec![default_pkg.to_string()]
-    } else {
-        packages.keys().cloned().collect()
-    };
-    if let Some(ref name) = auto_module_pkg {
-        all_package_names.push(name.clone());
-    }
-    if let Some(ref name) = auto_kernel_image_pkg {
-        all_package_names.push(name.clone());
-    }
 
     let yes = if params.force { "-y" } else { "" };
     let dnf_args_str = if let Some(args) = &params.dnf_args {
@@ -764,7 +865,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             .container_helper
             .query_installed_packages(
                 &params.sysroot_type,
-                &all_package_names,
+                &effective_names,
                 params.container_image,
                 params.target,
                 params.repo_url.map(|s| s.to_string()),
@@ -788,7 +889,10 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                     OutputLevel::Normal,
                 );
             }
-            params.lock_file.save(params.src_dir)?;
+            // Persisting is the caller's job. The rootfs and initramfs tasks
+            // run concurrently on separate lockfile clones, so saving a clone
+            // here is last-writer-wins against the sibling task; the caller
+            // merges both and saves once.
         }
 
         // Stage the kernel sysroot from the rootfs (Phase 2c). Only when:
@@ -817,7 +921,6 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                     kernel_image_pkg,
                     &pkg_version,
                     params.lock_file,
-                    params.src_dir,
                     params.repo_url,
                     params.repo_release,
                     params.merged_container_args.clone(),
@@ -839,63 +942,56 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             }
         }
 
-        // Write install stamp (unless --no-stamps or no parsed config available)
+        // Write install stamp (unless --no-stamps or no parsed config available).
+        //
+        // Computed fresh rather than reusing the value the skip check above
+        // derived: the install just re-pinned this sysroot's packages, and the
+        // stamp has to record the lock state the *next* run will compare
+        // against.
         if !params.no_stamps {
-            if let Some(parsed) = params.parsed {
-                let stamp_result = match params.sysroot_type {
+            if let Some(inputs) = compute_install_stamp_inputs(params, &packages)? {
+                let stamp = match params.sysroot_type {
                     SysrootType::Rootfs => {
-                        let inputs =
-                            compute_rootfs_input_hash(parsed, params.src_dir, params.target_board)?;
-                        let outputs = StampOutputs::default();
-                        Ok(Stamp::rootfs_install(params.target, inputs, outputs))
+                        Stamp::rootfs_install(params.target, inputs, StampOutputs::default())
                     }
                     SysrootType::Initramfs => {
-                        let inputs = compute_initramfs_input_hash(
-                            parsed,
-                            params.src_dir,
-                            params.target_board,
-                        )?;
-                        let outputs = StampOutputs::default();
-                        Ok(Stamp::initramfs_install(params.target, inputs, outputs))
+                        Stamp::initramfs_install(params.target, inputs, StampOutputs::default())
                     }
-                    _ => Err(anyhow::anyhow!("Unsupported sysroot type for stamps")),
+                    _ => unreachable!("sysroot type was validated at entry"),
                 };
 
-                if let Ok(stamp) = stamp_result {
-                    let stamp_script = generate_write_stamp_script(&stamp)?;
-                    let stamp_config = RunConfig {
-                        container_image: params.container_image.to_string(),
-                        target: params.target.to_string(),
-                        command: stamp_script,
-                        verbose: params.verbose,
-                        source_environment: true,
-                        interactive: false,
-                        repo_url: params.repo_url.map(|s| s.to_string()),
-                        repo_release: params.repo_release.map(|s| s.to_string()),
-                        container_args: params.merged_container_args.clone(),
-                        sdk_arch: params.sdk_arch.cloned(),
-                        tui_context: params.tui_context.clone(),
-                        ..Default::default()
-                    };
+                let stamp_config = RunConfig {
+                    container_image: params.container_image.to_string(),
+                    target: params.target.to_string(),
+                    command: generate_write_stamp_script(&stamp)?,
+                    verbose: params.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: params.repo_url.map(|s| s.to_string()),
+                    repo_release: params.repo_release.map(|s| s.to_string()),
+                    container_args: params.merged_container_args.clone(),
+                    sdk_arch: params.sdk_arch.cloned(),
+                    tui_context: params.tui_context.clone(),
+                    ..Default::default()
+                };
 
-                    if let Some(context) = params.runs_on_context {
-                        params
-                            .container_helper
-                            .run_in_container_with_context(&stamp_config, context)
-                            .await?;
-                    } else {
-                        params
-                            .container_helper
-                            .run_in_container(stamp_config)
-                            .await?;
-                    }
+                if let Some(context) = params.runs_on_context {
+                    params
+                        .container_helper
+                        .run_in_container_with_context(&stamp_config, context)
+                        .await?;
+                } else {
+                    params
+                        .container_helper
+                        .run_in_container(stamp_config)
+                        .await?;
+                }
 
-                    if params.verbose {
-                        print_info(
-                            &format!("Wrote install stamp for {label}."),
-                            OutputLevel::Normal,
-                        );
-                    }
+                if params.verbose {
+                    print_info(
+                        &format!("Wrote install stamp for {label}."),
+                        OutputLevel::Normal,
+                    );
                 }
             }
         }
@@ -1021,6 +1117,24 @@ impl RootfsInstallCommand {
             .unwrap_or(std::path::Path::new("."));
         let mut lock_file = LockFile::load(src_dir)?;
 
+        let prefetched_stamp = read_sysroot_install_stamp(
+            &SysrootType::Rootfs,
+            self.no_stamps,
+            &container_helper,
+            RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                verbose: self.verbose,
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            },
+            runs_on_context.as_ref(),
+        )
+        .await?;
+
         let result = install_sysroot(&mut SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,
@@ -1040,9 +1154,17 @@ impl RootfsInstallCommand {
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            prefetched_stamp,
             tui_context: None,
         })
         .await;
+
+        // Persist the lockfile the install updated. `install_sysroot` no
+        // longer saves for itself — under `avocado sdk install` it runs on a
+        // clone that the caller merges and saves once.
+        if result.is_ok() {
+            lock_file.save(src_dir)?;
+        }
 
         // Always teardown runs_on context
         if let Some(ref mut context) = runs_on_context {
@@ -1060,7 +1182,139 @@ impl RootfsInstallCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::build_overlay_script;
+    use super::{build_overlay_script, detect_sysroot_package_removals};
+    use crate::utils::lockfile::{LockFile, SysrootType};
+    use std::collections::{HashMap, HashSet};
+
+    const KVER: &str = "6.8.12-l4t-r39.2.0-1021.21";
+    const TARGET: &str = "jetson-agx-thor";
+
+    fn lock_with(sysroot: &SysrootType, names: &[&str]) -> LockFile {
+        let mut lock = LockFile::new();
+        let versions: HashMap<String, String> = names
+            .iter()
+            .map(|n| (n.to_string(), "2026.9-r0.0".to_string()))
+            .collect();
+        lock.update_sysroot_versions(TARGET, sysroot, versions);
+        lock
+    }
+
+    fn name_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn removal_detection_ignores_auto_appended_kernel_packages() {
+        // Regression test for the bug that made `avocado sdk install` wipe and
+        // reinstall both sysroots on every run. The lock shape below is
+        // verbatim from references/jetson-trt/avocado.lock: a default config
+        // (which declares only the meta-package) plus the two packages
+        // install_sysroot auto-appends for a pinned kernel. Comparing the lock
+        // against *config* names alone reads those two as removed forever.
+        let rootfs_lock = lock_with(
+            &SysrootType::Rootfs,
+            &[
+                "avocado-pkg-rootfs",
+                &format!("kernel-image-{KVER}"),
+                &format!("packagegroup-avocado-rootfs-modules-{KVER}"),
+            ],
+        );
+        let rootfs_effective = name_set(&[
+            "avocado-pkg-rootfs",
+            &format!("kernel-image-{KVER}"),
+            &format!("packagegroup-avocado-rootfs-modules-{KVER}"),
+        ]);
+        assert!(
+            detect_sysroot_package_removals(
+                &rootfs_effective,
+                &SysrootType::Rootfs,
+                TARGET,
+                &rootfs_lock,
+            )
+            .is_empty(),
+            "steady-state rootfs must not report removals"
+        );
+
+        // Initramfs gets the module packagegroup but no kernel-image.
+        let initramfs_lock = lock_with(
+            &SysrootType::Initramfs,
+            &[
+                "avocado-pkg-initramfs",
+                &format!("packagegroup-avocado-initramfs-modules-{KVER}"),
+            ],
+        );
+        let initramfs_effective = name_set(&[
+            "avocado-pkg-initramfs",
+            &format!("packagegroup-avocado-initramfs-modules-{KVER}"),
+        ]);
+        assert!(
+            detect_sysroot_package_removals(
+                &initramfs_effective,
+                &SysrootType::Initramfs,
+                TARGET,
+                &initramfs_lock,
+            )
+            .is_empty(),
+            "steady-state initramfs must not report removals"
+        );
+    }
+
+    #[test]
+    fn removal_detection_flags_genuinely_dropped_config_package() {
+        let lock = lock_with(
+            &SysrootType::Rootfs,
+            &["avocado-pkg-rootfs", "vim", &format!("kernel-image-{KVER}")],
+        );
+        // `vim` was removed from rootfs.packages; the auto-appends still apply.
+        let effective = name_set(&["avocado-pkg-rootfs", &format!("kernel-image-{KVER}")]);
+
+        assert_eq!(
+            detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock),
+            vec!["vim".to_string()],
+        );
+    }
+
+    #[test]
+    fn removal_detection_flags_stale_kernel_auto_appends() {
+        // A kernel repin leaves the previous kver's auto-appended packages in
+        // the lock. Those genuinely are stale and must force a clean, so the
+        // new pin isn't installed alongside the old one.
+        let lock = lock_with(
+            &SysrootType::Rootfs,
+            &[
+                "avocado-pkg-rootfs",
+                &format!("kernel-image-{KVER}"),
+                &format!("packagegroup-avocado-rootfs-modules-{KVER}"),
+            ],
+        );
+        let new_kver = "6.8.12-l4t-r39.2.0-9999.99";
+        let effective = name_set(&[
+            "avocado-pkg-rootfs",
+            &format!("kernel-image-{new_kver}"),
+            &format!("packagegroup-avocado-rootfs-modules-{new_kver}"),
+        ]);
+
+        assert_eq!(
+            detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock),
+            vec![
+                format!("kernel-image-{KVER}"),
+                format!("packagegroup-avocado-rootfs-modules-{KVER}"),
+            ],
+        );
+    }
+
+    #[test]
+    fn removal_detection_is_noop_on_first_install() {
+        // Nothing locked yet — every config package is about to be installed,
+        // not removed.
+        let lock = LockFile::new();
+        let effective = name_set(&["avocado-pkg-rootfs"]);
+
+        assert!(
+            detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn overlay_script_uses_cp_a_in_merge_mode() {
