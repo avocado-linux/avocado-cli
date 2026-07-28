@@ -16,8 +16,9 @@
 //!   the file INSIDE the device writable partition (A7).
 //! - **Guaranteed write-listener teardown (design L-1).** [`WriteListenerGuard`]
 //!   runs its teardown from `Drop`, so an unclean exit (panic, early `?` return,
-//!   dropped `up` future) still tears down the routable write listener and its
-//!   `0.0.0.0` forward — no authenticated LAN write port survives the process.
+//!   dropped `up` future) still tears down the write listener — no authenticated
+//!   write port survives the process. The listener is loopback-bound, so this is
+//!   about not stranding a port for the next `up`, not about a LAN exposure.
 //! - **Drain-based read/control rotation (design D5 / G-2 / H-2).**
 //!   [`TokenRegistry`] keeps a rotated-out token valid until its in-flight bulk
 //!   pulls drain to zero OR a hard ceiling elapses — NOT a fixed timer, which
@@ -284,23 +285,22 @@ impl VmWriteSetup {
     }
 }
 
-/// A guaranteed-cleanup guard for the routable write listener + its `0.0.0.0`
-/// hostfwd forward (design L-1).
+/// A guaranteed-cleanup guard for the write listener (design L-1).
 ///
-/// `down` calls [`teardown`](Self::teardown) to stop the write listener and
-/// remove its LAN forward on the clean path. But an UNCLEAN exit — a panic, an
-/// early `?` return, or a dropped `up` future — would skip that call, leaving an
-/// authenticated LAN write port bound after the process is gone. Running the
-/// teardown from `Drop` closes that hole: whether `up` returns normally or
-/// unwinds, the closure runs exactly once, so no authenticated write port
-/// survives the process.
+/// `down` calls [`teardown`](Self::teardown) to stop the write listener on the
+/// clean path. But an UNCLEAN exit — a panic, an early `?` return, or a dropped
+/// `up` future — would skip that call, leaving an authenticated write port bound
+/// after the process is gone. The listener binds `127.0.0.1` only, so the
+/// exposure is device-local rather than LAN-wide, but a stale bound port still
+/// collides with the next `up`. Running the teardown from `Drop` closes that
+/// hole: whether `up` returns normally or unwinds, the closure runs exactly
+/// once, so no authenticated write port survives the process.
 pub struct WriteListenerGuard {
     on_teardown: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl WriteListenerGuard {
-    /// Wrap a teardown closure that stops the write listener and removes its
-    /// `0.0.0.0` forward.
+    /// Wrap a teardown closure that stops the write listener.
     pub fn new<F: FnOnce() + Send + 'static>(teardown: F) -> Self {
         Self {
             on_teardown: Some(Box::new(teardown)),

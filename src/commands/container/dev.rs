@@ -11,10 +11,13 @@
 //! CA certificate. Steady-state sync then rides the control WS with no further
 //! SSH (design D5).
 //!
-//! `down` stops all listeners AND tears down the routable write listener + its
-//! `0.0.0.0` forward through a guaranteed-cleanup guard
+//! `down` stops all listeners AND tears down the write listener through a
+//! guaranteed-cleanup guard
 //! ([`crate::utils::container_dev::bootstrap::WriteListenerGuard`]), so an unclean
-//! exit never leaves an authenticated LAN write port bound (design L-1).
+//! exit never leaves an authenticated write port bound (design L-1). The write
+//! listener binds `127.0.0.1` only; the VM push path reaches it through QEMU's
+//! `10.0.2.2` host alias rather than a routable bind, so there is no LAN-facing
+//! write port to leak.
 //!
 //! `status` reports registry/watcher/last-sync state and surfaces a "re-run
 //! `up`/bootstrap" state when a device presents a stale token (design H-2), using
@@ -273,9 +276,9 @@ impl DevUpCommand {
             })
         };
 
-        // Guaranteed-cleanup guard for the routable write listener + its `0.0.0.0`
-        // forward (design L-1): aborting the serve task tears the listener down on
-        // ANY exit path, clean or unclean, so no authenticated write port lingers.
+        // Guaranteed-cleanup guard for the loopback write listener (design L-1):
+        // aborting the serve task tears the listener down on ANY exit path, clean
+        // or unclean, so no authenticated write port lingers.
         let mut write_guard = WriteListenerGuard::new(move || {
             write_task.abort();
         });
@@ -411,9 +414,8 @@ impl DevUpCommand {
 
         // Run foreground until interrupted by Ctrl-C (SIGINT) or by a separate
         // `down` (SIGTERM). On ANY exit — including a panic or early return — the
-        // write guard tears down the routable write listener + its `0.0.0.0`
-        // forward via Drop (design L-1); the other listeners' tasks are aborted
-        // and the state file is cleared.
+        // write guard tears down the write listener via Drop (design L-1); the
+        // other listeners' tasks are aborted and the state file is cleared.
         wait_for_shutdown().await;
 
         write_guard.teardown();
@@ -518,9 +520,9 @@ impl DevDownCommand {
         };
 
         // Signal the foreground `up` process to shut down. It handles SIGTERM the
-        // same as Ctrl-C, tearing down ALL listeners — and the routable write
-        // listener + its `0.0.0.0` forward via the guaranteed-cleanup guard
-        // (design L-1) — so no authenticated LAN write port survives `down`.
+        // same as Ctrl-C, tearing down ALL listeners — including the write
+        // listener via the guaranteed-cleanup guard (design L-1) — so no
+        // authenticated write port survives `down`.
         signal_shutdown(state.pid);
         // The `up` process removes its own state file on graceful exit; remove it
         // here too so a `down` against an already-dead process still clears stale
