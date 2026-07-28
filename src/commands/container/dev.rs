@@ -19,12 +19,21 @@
 //! `10.0.2.2` host alias rather than a routable bind, so there is no LAN-facing
 //! write port to leak.
 //!
-//! `status` reports registry/watcher/last-sync state and surfaces a "re-run
-//! `up`/bootstrap" state when a device presents a stale token (design H-2), using
-//! the drain-based [`crate::utils::container_dev::bootstrap::TokenRegistry`] — the
-//! rotated-out read/control token stays valid until its in-flight bulk pulls
-//! drain to zero OR a hard ceiling elapses, so a mid-pull rotation of the largest
-//! image on a throttled link never 401s the in-flight pull.
+//! `status` reports the registry/watcher/last-sync state recorded at `up` time,
+//! and reports "not running" when no live `up` owns the session (proved by the
+//! session lock, not by the recorded pid).
+//!
+//! NOT YET LIVE, despite being implemented and tested in `bootstrap.rs`: the
+//! per-device `status.devices` list and the drain-based
+//! [`crate::utils::container_dev::bootstrap::TokenRegistry`] rotation behind
+//! `needs_rebootstrap()` (design H-2). `up` writes `session.json` once and never
+//! updates it, so `devices` stays empty and `needs_rebootstrap()` is
+//! structurally false; token rotation cannot cross an `up` either, because
+//! `TokenRegistry::rotate` needs `&mut self` and a re-`up` is a NEW process that
+//! starts from a fresh registry. Making both live needs `up` to keep publishing
+//! session state while it runs, which is a change in its own right rather than a
+//! missing call here. Until then `status` reports a live-or-not answer and the
+//! per-device detail is absent, not stale.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -414,6 +423,8 @@ impl DevUpCommand {
                 registry_running: true,
                 watcher_running: true,
                 last_sync: None,
+                // Empty for as long as `up` writes this record once and never
+                // revisits it; see the per-device caveat in the module docs.
                 devices: Vec::new(),
             },
         };
@@ -718,6 +729,9 @@ struct SessionLock {
     _file: std::fs::File,
 }
 
+#[cfg(not(unix))]
+struct SessionLock;
+
 #[cfg(unix)]
 impl SessionLock {
     /// Lock the session file for this `up`. Fails when another `up` holds it.
@@ -736,9 +750,6 @@ impl SessionLock {
         Ok(Self { _file: file })
     }
 }
-
-#[cfg(not(unix))]
-struct SessionLock;
 
 #[cfg(not(unix))]
 impl SessionLock {
