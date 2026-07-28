@@ -419,6 +419,10 @@ impl DevUpCommand {
         };
         let state_path = session_state_path(&store);
         write_session_state(&state_path, &state)?;
+        // Hold the session lock for the rest of `up`. It outlives an unclean exit
+        // in a way the state file does not, so `down`/`sync` can tell a live
+        // session from a stale record before they signal the recorded pid.
+        let _session_lock = SessionLock::acquire(&state_path)?;
 
         print_success(
             &format!(
@@ -470,14 +474,24 @@ impl DevSyncCommand {
             .with_context(|| format!("opening the dev store for project `{}`", ctx.project))?;
         let state_path = session_state_path(&store);
 
-        let Some(state) = read_session_state(&state_path)? else {
+        let stale = !session_is_live(&state_path)?;
+        let session = read_session_state(&state_path)?.filter(|_| !stale);
+        let Some(state) = session else {
+            if stale {
+                // A record with no live owner: clear it rather than leaving the
+                // next invocation to re-derive the same answer.
+                let _ = std::fs::remove_file(&state_path);
+            }
             bail!(
                 "container dev: no active `up` session to sync; run `avocado container dev up` \
                  first, then `sync` re-pushes the current watched image"
             );
         };
 
-        // Trigger exactly one re-push + notify in the running `up` process.
+        // Trigger exactly one re-push + notify in the running `up` process. The
+        // liveness check above is what makes this safe: signalling a stale pid
+        // would deliver SIGUSR1 to whatever process recycled that number, and
+        // SIGUSR1 terminates by default.
         signal_sync(state.pid);
         print_info(
             "container dev sync: triggered a one-shot re-push + notify of the watched image(s).",
@@ -494,7 +508,14 @@ impl DevStatusCommand {
             .with_context(|| format!("opening the dev store for project `{}`", ctx.project))?;
         let state_path = session_state_path(&store);
 
-        let Some(state) = read_session_state(&state_path)? else {
+        // A session file whose owner is gone would otherwise be reported verbatim,
+        // i.e. registry_running=true for listeners that died with the process.
+        let stale = !session_is_live(&state_path)?;
+        let session = read_session_state(&state_path)?.filter(|_| !stale);
+        let Some(state) = session else {
+            if stale {
+                let _ = std::fs::remove_file(&state_path);
+            }
             print_info(
                 "container dev: not running (no active `up` session).",
                 OutputLevel::Normal,
@@ -532,7 +553,12 @@ impl DevDownCommand {
             .with_context(|| format!("opening the dev store for project `{}`", ctx.project))?;
         let state_path = session_state_path(&store);
 
-        let Some(state) = read_session_state(&state_path)? else {
+        let stale = !session_is_live(&state_path)?;
+        let session = read_session_state(&state_path)?.filter(|_| !stale);
+        let Some(state) = session else {
+            if stale {
+                let _ = std::fs::remove_file(&state_path);
+            }
             print_info(
                 "container dev: nothing to tear down (no active `up` session).",
                 OutputLevel::Normal,
@@ -652,6 +678,99 @@ struct SessionState {
     pid: u32,
     /// The status `status` reports.
     status: DevStatus,
+}
+
+/// Take the flag `flock` needs, returning `true` when the exclusive lock was
+/// acquired and `false` when another process already holds it.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &std::fs::File) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `flock` takes a raw fd plus a flag word and has no memory-safety
+    // hazard; `file` owns a valid open fd for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    // EWOULDBLOCK (== EAGAIN on Linux and macOS) is the "someone else holds it"
+    // answer, which is a result here rather than a failure.
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(false),
+        _ => Err(err).context("locking the session state file"),
+    }
+}
+
+/// An advisory exclusive lock on the session file, held for the whole life of
+/// the foreground `up` process.
+///
+/// `up` removes `session.json` only on the graceful teardown path, so a panic or
+/// a SIGKILL leaves the file behind carrying a pid that is no longer `up`.
+/// Signalling that pid is not harmless: pids get recycled, so `sync` would
+/// deliver SIGUSR1 — whose default disposition is *terminate* — to whatever
+/// unrelated process inherited the number, and `down` would SIGTERM it. A
+/// liveness check on the pid alone cannot tell a recycled pid from the original.
+///
+/// The kernel releases this lock when the holder dies by ANY route, including
+/// SIGKILL, so "can I take the lock?" answers the question the pid cannot: no
+/// live `up` owns this file. It doubles as the guard against two concurrent
+/// `up`s on one project.
+#[cfg(unix)]
+struct SessionLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl SessionLock {
+    /// Lock the session file for this `up`. Fails when another `up` holds it.
+    fn acquire(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening the session state at {path:?} to lock it"))?;
+        if !try_lock_exclusive(&file)? {
+            bail!(
+                "another `avocado container dev up` is already running for this project; \
+                 run `avocado container dev down` first"
+            );
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(not(unix))]
+struct SessionLock;
+
+#[cfg(not(unix))]
+impl SessionLock {
+    fn acquire(_path: &std::path::Path) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+/// Whether a live `up` process still owns `path`'s session.
+///
+/// Acquiring the lock proves the recorded pid is gone, because the kernel would
+/// still be holding it otherwise; the lock is dropped immediately since only the
+/// answer was wanted. A missing file is equally "not live".
+#[cfg(unix)]
+fn session_is_live(path: &std::path::Path) -> Result<bool> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("opening the session state at {path:?}")),
+    };
+    Ok(!try_lock_exclusive(&file)?)
+}
+
+/// Without `flock` there is no ownership proof — but `signal_shutdown` and
+/// `signal_sync` are no-ops off unix, so nothing can be mis-signalled either.
+#[cfg(not(unix))]
+fn session_is_live(path: &std::path::Path) -> Result<bool> {
+    Ok(path.exists())
 }
 
 /// Persist the session state so `status`/`down` in a separate invocation can find
@@ -793,5 +912,62 @@ fn bulk_host<'a>(endpoint: &'a str, auto_host: &'a str) -> &'a str {
     match endpoint.rsplit_once(':') {
         Some((host, _)) if !host.is_empty() => host,
         _ => auto_host,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A session file with no live owner must be reported dead, so `down`/`sync`
+    /// never signal the recorded pid. Without the lock, `session.json` surviving
+    /// an unclean exit is indistinguishable from a running `up` - and the pid it
+    /// carries may since have been recycled onto an unrelated process, which
+    /// SIGUSR1 would terminate.
+    #[test]
+    fn an_unlocked_session_file_is_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        assert!(
+            !session_is_live(&path).unwrap(),
+            "a session file nobody holds the lock on must read as dead"
+        );
+    }
+
+    /// The lock is what proves liveness, and it is held for as long as the
+    /// process that took it lives.
+    #[test]
+    fn a_locked_session_file_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        let held = SessionLock::acquire(&path).expect("the first acquire succeeds");
+        assert!(
+            session_is_live(&path).unwrap(),
+            "a held session lock must read as live"
+        );
+
+        // A second `up` on the same project must be refused rather than racing
+        // the first one's listeners.
+        assert!(
+            SessionLock::acquire(&path).is_err(),
+            "a second acquire must be refused while the first is held"
+        );
+
+        drop(held);
+        assert!(
+            !session_is_live(&path).unwrap(),
+            "releasing the lock must make the session read as dead again"
+        );
+    }
+
+    /// A missing file is simply "no session", not an error.
+    #[test]
+    fn a_missing_session_file_is_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!session_is_live(&dir.path().join("absent.json")).unwrap());
     }
 }
