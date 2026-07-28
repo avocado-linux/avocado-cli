@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use sha2::{Digest as _, Sha256};
+
 use directories::BaseDirs;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -108,6 +110,24 @@ impl BlobStore {
         tmp.flush()?;
         tmp.persist(&path).map_err(|e| e.error)?;
         Ok(true)
+    }
+
+    /// Begin a streaming blob upload.
+    ///
+    /// The returned [`BlobUpload`] writes straight to a temp file under the
+    /// store and hashes as it goes, so a layer never has to exist in memory. It
+    /// is what lets the write path accept a multi-gigabyte layer without a body
+    /// limit standing in for a memory bound - the OCI upload protocol is
+    /// chunked, so the same handle spans the `POST`/`PATCH`/`PUT` sequence.
+    pub fn begin_blob_upload(&self) -> Result<BlobUpload, StoreError> {
+        let dir = self.root.join("uploads");
+        fs::create_dir_all(&dir)?;
+        Ok(BlobUpload {
+            file: NamedTempFile::new_in(&dir)?,
+            hasher: Sha256::new(),
+            written: 0,
+            blobs_root: self.root.clone(),
+        })
     }
 
     /// Report whether a blob with `digest` is present (the registry HEAD path).
@@ -318,6 +338,69 @@ impl BlobStore {
 
 /// Split an OCI digest into its `(algorithm, hex)` components, rejecting
 /// anything that could traverse the filesystem.
+/// An in-progress blob upload, streamed to disk and hashed as it arrives.
+///
+/// Spans one OCI upload session: `POST` opens it, each `PATCH` appends, and
+/// `PUT` finishes it. Nothing is buffered - the bytes go to a temp file under
+/// the store and the digest is computed incrementally, so the peak memory of a
+/// push is a chunk rather than a layer.
+///
+/// Dropping without [`BlobUpload::finish`] discards the temp file, so an
+/// abandoned upload leaves nothing behind.
+pub struct BlobUpload {
+    file: NamedTempFile,
+    hasher: Sha256,
+    written: u64,
+    blobs_root: PathBuf,
+}
+
+impl BlobUpload {
+    /// Append a chunk.
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        self.file.write_all(bytes)?;
+        self.hasher.update(bytes);
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Bytes accepted so far (the OCI `Range` header the client expects).
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Verify the streamed content hashes to `expected` and move it into place.
+    ///
+    /// The digest is checked against what was actually written rather than
+    /// trusted from the client, exactly as the buffered path did - the
+    /// difference is only where the bytes lived while it was computed. A
+    /// mismatch discards the temp file and reports `false`.
+    pub fn finish(mut self, expected: &str) -> Result<bool, StoreError> {
+        self.file.flush()?;
+        let hex: String = self
+            .hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if format!("sha256:{hex}") != expected {
+            return Ok(false);
+        }
+        let (algorithm, hex) = parse_digest(expected)?;
+        let path = self.blobs_root.join("blobs").join(algorithm).join(hex);
+        if path.exists() {
+            // Already stored: dedup, and let the temp file drop.
+            return Ok(true);
+        }
+        let dir = path
+            .parent()
+            .expect("blob path always has a parent under the store root");
+        fs::create_dir_all(dir)?;
+        self.file.persist(&path).map_err(|e| e.error)?;
+        Ok(true)
+    }
+}
+
 fn parse_digest(digest: &str) -> Result<(&str, &str), StoreError> {
     let invalid = || StoreError::InvalidDigest(digest.to_string());
     let (algorithm, hex) = digest.split_once(':').ok_or_else(invalid)?;

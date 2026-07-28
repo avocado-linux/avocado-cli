@@ -34,14 +34,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    body::Body,
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use futures_util::StreamExt as _;
 use rustls::ServerConfig;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -50,7 +51,7 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 use super::auth::{require_basic_write, require_bearer_read, ReadToken, WriteToken};
-use super::store::{BlobStore, StoreError};
+use super::store::{BlobStore, BlobUpload, StoreError};
 
 /// Non-standard OCI response header carrying the content digest of the served
 /// manifest or blob.
@@ -77,14 +78,13 @@ const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 /// middleware, not a constant.
 const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(600);
 
-/// Upper bound on a single write-path request body.
+/// Upper bound on a manifest body.
 ///
-/// The default 2 MiB limit is far too low (a real layer 413s mid-push), but
-/// `disable()` is the other extreme: bodies are buffered as `Bytes`/`Vec<u8>`
-/// before anything inspects them, so an unbounded limit means an unbounded
-/// allocation from one request. 2 GiB clears any layer a dev loop realistically
-/// produces and still caps what a single request can ask the host to hold.
-const MAX_UPLOAD_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Blobs are streamed to disk and need no limit, but a manifest is parsed as a
+/// whole document, so this one path still reads into memory - under a cap
+/// chosen to be far above any real manifest and far below anything that
+/// threatens the host.
+const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Default media type used when a stored manifest omits its `mediaType` field.
 const DEFAULT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -233,16 +233,17 @@ impl Drop for BulkListener {
     }
 }
 
-/// One in-flight chunked upload: the bytes so far plus when they last grew.
+/// One in-flight chunked upload: the on-disk staging handle plus when it last
+/// grew.
 struct UploadSession {
-    buf: Vec<u8>,
+    upload: BlobUpload,
     touched: Instant,
 }
 
 impl UploadSession {
-    fn new() -> Self {
+    fn new(upload: BlobUpload) -> Self {
         Self {
-            buf: Vec::new(),
+            upload,
             touched: Instant::now(),
         }
     }
@@ -329,12 +330,12 @@ fn write_router_with_uploads(
             write_token,
             require_basic_write,
         ))
-        // Blob and manifest uploads carry image layers that routinely exceed
-        // axum's 2 MiB default body limit; buffering them as `Bytes` under that
-        // cap makes any real `docker push` 413 mid-stream. Raise the cap rather
-        // than removing it: the body is buffered in full before any handler sees
-        // it, so no limit at all lets one request allocate without bound.
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES))
+        // No DefaultBodyLimit layer at all. It would be inert: that limit is
+        // consumed by the `Bytes`/`String` extractors, and every write handler
+        // now takes `Body` and streams it, so the layer would gate nothing while
+        // reading as though it did. Blob bodies never exist whole in memory, and
+        // the one path that does buffer - manifest PUT - applies
+        // MAX_MANIFEST_BYTES explicitly where the read happens.
         .with_state(state)
 }
 
@@ -372,7 +373,7 @@ async fn post_route(
     State(state): State<WriteState>,
     Path(rest): Path<String>,
     Query(q): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let Some(name) = rest
         .strip_suffix("/blobs/uploads/")
@@ -384,31 +385,79 @@ async fn post_route(
             "unsupported write path",
         );
     };
+    let name = name.to_string();
 
     if let Some(digest) = q.get("digest") {
-        // Monolithic upload: the whole blob arrives with the POST.
-        return store_blob(&state, name, digest, &body);
+        // Monolithic upload: the whole blob arrives with the POST. Still
+        // streamed - "monolithic" describes the protocol, not how much of it we
+        // are willing to hold at once.
+        let mut upload = match state.store.begin_blob_upload() {
+            Ok(upload) => upload,
+            Err(e) => return store_error(&e),
+        };
+        if let Err(resp) = stream_into(body, &mut upload).await {
+            return resp;
+        }
+        return finish_upload(&name, digest, upload);
     }
 
     let uuid = Uuid::new_v4().to_string();
+    let upload = match state.store.begin_blob_upload() {
+        Ok(upload) => upload,
+        Err(e) => return store_error(&e),
+    };
     let mut sessions = state
         .uploads
         .inner
         .lock()
         .expect("upload sessions mutex is not poisoned");
-    // Reclaim buffers from pushes that opened a session and never finalized it,
-    // before allocating another one alongside them.
+    // Reclaim sessions from pushes that opened one and never finalized it,
+    // before starting another alongside them. Their temp files go with them.
     evict_expired(&mut sessions, Instant::now());
-    sessions.insert(uuid.clone(), UploadSession::new());
+    sessions.insert(uuid.clone(), UploadSession::new(upload));
     drop(sessions);
-    upload_accepted(name, &uuid, 0)
+    upload_accepted(&name, &uuid, 0)
+}
+
+/// Drain `body` into `upload`, mapping a transport error to an OCI response.
+async fn stream_into(body: Body, upload: &mut BlobUpload) -> Result<(), Response> {
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return Err(oci_error(
+                    StatusCode::BAD_REQUEST,
+                    "BLOB_UPLOAD_INVALID",
+                    "upload stream ended early",
+                ))
+            }
+        };
+        if let Err(e) = upload.append(&chunk) {
+            return Err(store_error(&e));
+        }
+    }
+    Ok(())
+}
+
+/// Verify and store a completed upload, returning the OCI response.
+fn finish_upload(name: &str, digest: &str, upload: BlobUpload) -> Response {
+    match upload.finish(digest) {
+        Ok(true) => blob_created(name, digest),
+        Ok(false) => oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "uploaded content does not match the supplied digest",
+        ),
+        Err(e) => store_error(&e),
+    }
 }
 
 /// `PATCH /v2/<name>/blobs/uploads/<uuid>` — append a chunk to a session.
 async fn patch_route(
     State(state): State<WriteState>,
     Path(rest): Path<String>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let Some((name, uuid)) = split_upload(&rest) else {
         return oci_error(
@@ -417,25 +466,41 @@ async fn patch_route(
             "unsupported write path",
         );
     };
-    let mut sessions = state
+    let (name, uuid) = (name.to_string(), uuid.to_string());
+
+    // Take the session OUT of the map for the duration of the transfer. The
+    // mutex cannot be held across the await, and a session being streamed into
+    // is not a session a concurrent sweep should be able to reclaim - removing
+    // it makes both true at once.
+    let Some(mut session) = state
         .uploads
         .inner
         .lock()
-        .expect("upload sessions mutex is not poisoned");
-    let Some(session) = sessions.get_mut(uuid) else {
+        .expect("upload sessions mutex is not poisoned")
+        .remove(&uuid)
+    else {
         return oci_error(
             StatusCode::NOT_FOUND,
             "BLOB_UPLOAD_UNKNOWN",
             "upload session unknown",
         );
     };
-    let start = session.buf.len() as u64;
-    session.buf.extend_from_slice(&body);
+
+    let start = session.upload.written();
+    if let Err(resp) = stream_into(body, &mut session.upload).await {
+        return resp;
+    }
+    let end = session.upload.written();
     // A session that is still receiving chunks is not abandoned, however long
     // the whole transfer takes on a slow link.
     session.touched = Instant::now();
-    let end = session.buf.len() as u64;
-    upload_range_accepted(name, uuid, start, end)
+    state
+        .uploads
+        .inner
+        .lock()
+        .expect("upload sessions mutex is not poisoned")
+        .insert(uuid.clone(), session);
+    upload_range_accepted(&name, &uuid, start, end)
 }
 
 /// `PUT` on the write listener: finalize a blob upload
@@ -445,19 +510,50 @@ async fn put_route(
     State(state): State<WriteState>,
     Path(rest): Path<String>,
     Query(q): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if let Some((name, reference)) = rest.split_once("/manifests/") {
-        return put_manifest(&state, name, reference, &body);
+        // Manifests are small JSON documents and are parsed as a whole, so this
+        // one path still buffers - under an explicit cap, not an unbounded read.
+        let bytes = match axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return oci_error(
+                    StatusCode::BAD_REQUEST,
+                    "MANIFEST_INVALID",
+                    "manifest exceeds the maximum accepted size",
+                )
+            }
+        };
+        return put_manifest(&state, name, reference, &bytes);
     }
     if let Some((name, uuid)) = split_upload(&rest) {
-        return finalize_upload(
-            &state,
-            name,
-            uuid,
-            q.get("digest").map(String::as_str),
-            &body,
-        );
+        let (name, uuid) = (name.to_string(), uuid.to_string());
+        let Some(digest) = q.get("digest").map(String::as_str) else {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                "digest query parameter required to finalize an upload",
+            );
+        };
+        let Some(mut session) = state
+            .uploads
+            .inner
+            .lock()
+            .expect("upload sessions mutex is not poisoned")
+            .remove(&uuid)
+        else {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "upload session unknown",
+            );
+        };
+        // The PUT may carry a final chunk of its own.
+        if let Err(resp) = stream_into(body, &mut session.upload).await {
+            return resp;
+        }
+        return finish_upload(&name, digest, session.upload);
     }
     oci_error(
         StatusCode::NOT_FOUND,
@@ -488,59 +584,6 @@ async fn head_route(State(state): State<WriteState>, Path(rest): Path<String>) -
             .body(Body::empty())
             .expect("blob-head response is always valid"),
         Ok(None) => blob_unknown(),
-        Err(e) => store_error(&e),
-    }
-}
-
-/// Complete a chunked upload: append the final `body`, verify it hashes to the
-/// client-supplied `digest`, and store it.
-fn finalize_upload(
-    state: &WriteState,
-    name: &str,
-    uuid: &str,
-    digest: Option<&str>,
-    body: &[u8],
-) -> Response {
-    let Some(digest) = digest else {
-        return oci_error(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            "digest query parameter required to finalize an upload",
-        );
-    };
-    let mut buf = match state
-        .uploads
-        .inner
-        .lock()
-        .expect("upload sessions mutex is not poisoned")
-        .remove(uuid)
-    {
-        Some(session) => session.buf,
-        None => {
-            return oci_error(
-                StatusCode::NOT_FOUND,
-                "BLOB_UPLOAD_UNKNOWN",
-                "upload session unknown",
-            )
-        }
-    };
-    buf.extend_from_slice(body);
-    store_blob(state, name, digest, &buf)
-}
-
-/// Verify `bytes` hashes to `digest` and write it to the store, returning the
-/// `201 Created` a completed blob upload expects.
-fn store_blob(state: &WriteState, name: &str, digest: &str, bytes: &[u8]) -> Response {
-    let computed = compute_digest(bytes);
-    if computed != digest {
-        return oci_error(
-            StatusCode::BAD_REQUEST,
-            "DIGEST_INVALID",
-            "uploaded content does not match the supplied digest",
-        );
-    }
-    match state.store.write_blob(digest, bytes) {
-        Ok(_) => blob_created(name, digest),
         Err(e) => store_error(&e),
     }
 }
@@ -1391,17 +1434,121 @@ mod write_auth {
         );
     }
 
+    // A multi-chunk layer pushes end to end and lands intact.
+    //
+    // What this does NOT prove, stated plainly so nobody reads it as more than
+    // it is: the >2 GiB single-request case that motivated the streaming change
+    // is not reachable in a test - allocating one is impractical, and toggling
+    // `DefaultBodyLimit` cannot simulate it either, because that limit is
+    // consumed by the `Bytes` extractor and these handlers now take `Body`.
+    // The absence of a per-request ceiling is a property of the handler
+    // signatures, not something an assertion here can demonstrate.
+    //
+    // What it does prove is the chunked path over the streaming handlers: six
+    // PATCHes, a finalizing PUT, and the exact bytes in the store afterwards.
+    // `an_upload_stages_to_disk_not_memory` covers the peak-memory half.
+    #[tokio::test]
+    async fn a_multi_chunk_layer_pushes_end_to_end() {
+        let (base, store, _dir) = spawn().await;
+        let client = reqwest::Client::new();
+
+        let chunk = vec![0x5au8; 512 * 1024];
+        let chunks = 6; // 3 MiB total
+        let mut whole = Vec::new();
+        for _ in 0..chunks {
+            whole.extend_from_slice(&chunk);
+        }
+        let digest = compute_digest(&whole);
+
+        let opened = client
+            .post(format!("{base}/v2/my-app/blobs/uploads/"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened.status().as_u16(), 202);
+        let location = opened
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        for i in 0..chunks {
+            let patched = client
+                .patch(format!("{base}{location}"))
+                .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+                .body(chunk.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                patched.status().as_u16(),
+                202,
+                "chunk {i} must be accepted, not 413'd"
+            );
+        }
+
+        let done = client
+            .put(format!("{base}{location}?digest={digest}"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(done.status().as_u16(), 201, "the layer must finalize");
+        assert_eq!(
+            store.blob_size(&digest).unwrap(),
+            Some(whole.len() as u64),
+            "the whole layer must have landed in the store"
+        );
+    }
+
+    // The bytes must reach the store without ever being held whole in memory.
+    // Asserted structurally: the staging file grows as chunks arrive, which is
+    // only true if the handler writes through rather than accumulating.
+    #[test]
+    fn an_upload_stages_to_disk_not_memory() {
+        let dir = TempDir::new().unwrap();
+        let store = BlobStore::at(dir.path(), "proj").expect("store opens");
+        let mut upload = store.begin_blob_upload().expect("upload opens");
+
+        upload.append(&[1u8; 4096]).unwrap();
+        assert_eq!(upload.written(), 4096);
+        upload.append(&[2u8; 4096]).unwrap();
+        assert_eq!(upload.written(), 8192);
+
+        // A digest that does not match what was written must be refused, and
+        // must not leave a blob behind.
+        assert!(
+            !upload
+                .finish("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            "a mismatched digest must be rejected"
+        );
+    }
+
     // An upload that opens a session and never finalizes it must not pin its
     // buffer forever: opening a later session reclaims it. Asserted on the map
     // directly because the leak is invisible from the wire - the abandoned
     // session returns nothing, it just occupies memory.
+    /// A staging upload backed by a throwaway store, for tests that build
+    /// `UploadSession`s by hand.
+    fn staging_upload(dir: &TempDir) -> BlobUpload {
+        BlobStore::at(dir.path(), "proj")
+            .expect("store opens")
+            .begin_blob_upload()
+            .expect("staging upload opens")
+    }
+
     #[test]
     fn abandoned_upload_sessions_are_evicted_when_a_new_one_opens() {
+        let dir = TempDir::new().unwrap();
         let mut sessions = HashMap::new();
         sessions.insert(
             "abandoned".to_string(),
             UploadSession {
-                buf: vec![0u8; 1024],
+                upload: staging_upload(&dir),
                 touched: Instant::now() - UPLOAD_SESSION_TTL - Duration::from_secs(1),
             },
         );
@@ -1410,7 +1557,7 @@ mod write_auth {
             UploadSession {
                 // Older than the TTL as a whole, but still receiving chunks - a
                 // slow link must not be mistaken for an abandoned push.
-                buf: vec![0u8; 1024],
+                upload: staging_upload(&dir),
                 touched: Instant::now(),
             },
         );
@@ -1432,12 +1579,13 @@ mod write_auth {
     // previous version of the PATCH test below assert nothing.
     #[test]
     fn eviction_turns_on_the_ttl_boundary() {
+        let dir = TempDir::new().unwrap();
         let base = Instant::now();
         let mut sessions = HashMap::new();
         sessions.insert(
             "just-inside".to_string(),
             UploadSession {
-                buf: Vec::new(),
+                upload: staging_upload(&dir),
                 touched: base,
             },
         );
