@@ -52,7 +52,9 @@ use crate::utils::container_dev::bootstrap::{
 };
 use crate::utils::container_dev::commands::{prune_store, run_one_shot_sync};
 use crate::utils::container_dev::config::ContainerDevConfig;
-use crate::utils::container_dev::engine::{driver_for, watch_tag_events, TagEvent};
+use crate::utils::container_dev::engine::{
+    driver_for, resolve_image_id, watch_tag_events, TagEvent,
+};
 use crate::utils::container_dev::registry::{serve_write_router_tls, write_router, BulkListener};
 use crate::utils::container_dev::store::BlobStore;
 use crate::utils::container_dev::tls::DevSession;
@@ -415,7 +417,14 @@ impl DevUpCommand {
         let watched_images: Vec<String> =
             ctx.dev.images.iter().map(|i| i.image_ref.clone()).collect();
         let sync_trigger_task: JoinHandle<()> = tokio::spawn(async move {
-            run_sync_trigger(mode, trigger_syncer, trigger_notifier, watched_images).await;
+            run_sync_trigger(
+                mode,
+                trigger_syncer,
+                trigger_notifier,
+                watched_images,
+                engine,
+            )
+            .await;
         });
 
         // Deliver the bootstrap ONCE per `up` (design D5): the bulk endpoint (the
@@ -913,6 +922,7 @@ async fn run_sync_trigger(
     syncer: Arc<dyn Syncer>,
     notifier: Arc<ControlServer>,
     images: Vec<String>,
+    engine: &'static str,
 ) {
     use tokio::signal::unix::{signal, SignalKind};
     let mut usr1 = match signal(SignalKind::user_defined1()) {
@@ -922,9 +932,35 @@ async fn run_sync_trigger(
     };
     while usr1.recv().await.is_some() {
         for image in &images {
+            // Ask the engine for the image id. A signal carries no event, so
+            // unlike the watcher this path has nothing to read it from - and
+            // passing `None` here is not harmless: the notifier turns it into an
+            // empty desired digest, which then compares equal to the empty
+            // `running_digest` a device reports before its first pull, so the
+            // device is silently never told to pull.
+            let image_id = match resolve_image_id(engine, image).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    print_warning(
+                        &format!(
+                            "container dev sync: `{engine}` does not know image `{image}`; \
+                             build it first"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    print_warning(
+                        &format!("container dev sync: resolving `{image}` failed: {e:#}"),
+                        OutputLevel::Normal,
+                    );
+                    continue;
+                }
+            };
             let event = TagEvent {
                 image: image.clone(),
-                image_id: None,
+                image_id: Some(image_id),
             };
             if let Err(e) =
                 run_one_shot_sync(mode, syncer.as_ref(), notifier.as_ref(), &event).await
@@ -944,6 +980,7 @@ async fn run_sync_trigger(
     _syncer: Arc<dyn Syncer>,
     _notifier: Arc<ControlServer>,
     _images: Vec<String>,
+    _engine: &'static str,
 ) {
 }
 

@@ -335,6 +335,30 @@ pub async fn watch_tag_events(
     Ok((rx, child))
 }
 
+/// Resolve an image reference to the engine's content ID for it.
+///
+/// The watcher reads `image_id` off the event stream, but a manual `sync` has
+/// no event to read - it is driven by a signal, not by the engine. Without this
+/// it would build a `TagEvent` with `image_id: None`, which the notifier turns
+/// into an empty digest and records as the desired state, and an empty desired
+/// digest matches the empty `running_digest` a fresh device reports - so the
+/// device is never told to pull anything.
+///
+/// Returns `None` when the engine does not know the image, which the caller
+/// treats as "nothing to sync" rather than as a digest.
+pub async fn resolve_image_id(binary: &str, image: &str) -> Result<Option<String>> {
+    let output = Command::new(binary)
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .await
+        .with_context(|| format!("running `{binary} image inspect {image}`"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if id.is_empty() { None } else { Some(id) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

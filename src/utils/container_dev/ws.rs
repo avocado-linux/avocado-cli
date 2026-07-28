@@ -415,6 +415,18 @@ impl Notifier for ControlServer {
         Box::pin(async move {
             let (image, tag) = split_image_tag(&event.image);
             let digest = event.image_id.clone().unwrap_or_default();
+            // An empty digest must never enter the desired state. `reconcile`
+            // compares it against the device's `running_digest`, which is also
+            // empty before the device's first pull - so an empty desired digest
+            // compares EQUAL and the device is silently never told to pull. A
+            // caller with no digest has nothing to desire; record nothing.
+            if digest.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "refusing to notify `{}` with no image digest: the engine did not \
+                     report an id for it",
+                    event.image
+                ));
+            }
             self.desired
                 .lock()
                 .unwrap()
@@ -800,6 +812,45 @@ mod tests {
         assert!(
             current.is_empty(),
             "a device on the just-pushed digest needs no reconcile"
+        );
+    }
+
+    // A digest-less event must be refused rather than recorded as "".
+    //
+    // The empty string is not an inert placeholder here: `reconcile` filters on
+    // `digest != hello.running_digest`, and a device that has never pulled
+    // reports an empty `running_digest` - so an empty desired digest compares
+    // EQUAL, yields no Sync frame, and the device is silently never told to
+    // pull. Recording nothing is the only safe response.
+    #[tokio::test]
+    async fn notify_refuses_an_event_with_no_image_id() {
+        let (_url, server) = spawn_server(DesiredState::default()).await;
+        let event = TagEvent {
+            image: "my-app:dev".to_string(),
+            image_id: None,
+        };
+
+        let result = server.notify(&event).await;
+        assert!(
+            result.is_err(),
+            "an event with no image id must be refused, not recorded as an empty digest"
+        );
+
+        // The decisive assertion: a fresh device (empty running_digest) must not
+        // be left with nothing to do because of a planted empty entry.
+        let frames = server.desired.lock().unwrap().reconcile(&hello(""));
+        assert!(
+            frames.is_empty(),
+            "no desired entry should exist at all: {frames:?}"
+        );
+        assert!(
+            server
+                .desired
+                .lock()
+                .unwrap()
+                .digest_for("my-app", "dev")
+                .is_none(),
+            "the refused event must leave no entry behind"
         );
     }
 
