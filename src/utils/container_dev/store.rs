@@ -115,6 +115,22 @@ impl BlobStore {
         Ok(self.blob_path(digest)?.exists())
     }
 
+    /// Report the size in bytes of the blob under `digest`, or `None` when
+    /// absent.
+    ///
+    /// The registry's HEAD dedup probe needs only the length, and `docker push`
+    /// issues one HEAD per layer before uploading anything. Answering that from
+    /// the directory entry keeps a multi-hundred-MB layer off the heap on the
+    /// hot push path, which `read_blob` could not.
+    pub fn blob_size(&self, digest: &str) -> Result<Option<u64>, StoreError> {
+        let path = self.blob_path(digest)?;
+        match fs::metadata(&path) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Read the bytes stored under `digest`, or `None` when absent.
     pub fn read_blob(&self, digest: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let path = self.blob_path(digest)?;

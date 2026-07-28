@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::{Body, Bytes},
@@ -54,6 +55,23 @@ use super::store::{BlobStore, StoreError};
 /// Non-standard OCI response header carrying the content digest of the served
 /// manifest or blob.
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
+
+/// How long an upload session may sit untouched before it is evicted.
+///
+/// Generous enough that a slow link pushing a large layer is never mistaken for
+/// an abandoned session - only the gap BETWEEN chunks counts, not the total
+/// transfer time - while still bounding how long a killed `docker push` can pin
+/// its buffer in host memory.
+const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(600);
+
+/// Upper bound on a single write-path request body.
+///
+/// The default 2 MiB limit is far too low (a real layer 413s mid-push), but
+/// `disable()` is the other extreme: bodies are buffered as `Bytes`/`Vec<u8>`
+/// before anything inspects them, so an unbounded limit means an unbounded
+/// allocation from one request. 2 GiB clears any layer a dev loop realistically
+/// produces and still caps what a single request can ask the host to hold.
+const MAX_UPLOAD_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Default media type used when a stored manifest omits its `mediaType` field.
 const DEFAULT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -202,6 +220,21 @@ impl Drop for BulkListener {
     }
 }
 
+/// One in-flight chunked upload: the bytes so far plus when they last grew.
+struct UploadSession {
+    buf: Vec<u8>,
+    touched: Instant,
+}
+
+impl UploadSession {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            touched: Instant::now(),
+        }
+    }
+}
+
 /// In-flight chunked-upload sessions, keyed by upload UUID.
 ///
 /// The OCI blob-upload protocol is stateful: `POST` opens a session, `PATCH`
@@ -209,9 +242,25 @@ impl Drop for BulkListener {
 /// bytes live here until finalization writes them into the content-addressed
 /// store. Dev-loop scale (a handful of layers per push) keeps in-memory
 /// buffering acceptable.
+///
+/// Nothing in the protocol obliges a client to finish what it starts, though: a
+/// `POST` followed by `PATCH`es and no `PUT` — an interrupted push, a killed
+/// `docker` — abandons its buffer here. Without eviction those accumulate for
+/// the whole life of an `up` session, so repeated interrupted pushes grow host
+/// memory without bound. [`UploadSessions::evict_expired`] reclaims them.
 #[derive(Default)]
 struct UploadSessions {
-    inner: Mutex<HashMap<String, Vec<u8>>>,
+    inner: Mutex<HashMap<String, UploadSession>>,
+}
+
+/// Drop sessions untouched for longer than [`UPLOAD_SESSION_TTL`].
+///
+/// Called when a new session opens, which is both the moment a fresh buffer is
+/// about to be allocated and the only point an abandoned one can be noticed - no
+/// client ever tells us it gave up.
+fn evict_expired(sessions: &mut HashMap<String, UploadSession>) {
+    let now = Instant::now();
+    sessions.retain(|_uuid, session| now.duration_since(session.touched) < UPLOAD_SESSION_TTL);
 }
 
 /// Shared state for the write handlers: the backing store plus upload sessions.
@@ -253,9 +302,10 @@ pub fn write_router(store: Arc<BlobStore>, write_token: WriteToken) -> Router {
         ))
         // Blob and manifest uploads carry image layers that routinely exceed
         // axum's 2 MiB default body limit; buffering them as `Bytes` under that
-        // cap makes any real `docker push` 413 mid-stream. Blobs are written to
-        // the on-disk store, so lift the cap on the write path.
-        .layer(DefaultBodyLimit::disable())
+        // cap makes any real `docker push` 413 mid-stream. Raise the cap rather
+        // than removing it: the body is buffered in full before any handler sees
+        // it, so no limit at all lets one request allocate without bound.
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES))
         .with_state(state)
 }
 
@@ -312,12 +362,16 @@ async fn post_route(
     }
 
     let uuid = Uuid::new_v4().to_string();
-    state
+    let mut sessions = state
         .uploads
         .inner
         .lock()
-        .expect("upload sessions mutex is not poisoned")
-        .insert(uuid.clone(), Vec::new());
+        .expect("upload sessions mutex is not poisoned");
+    // Reclaim buffers from pushes that opened a session and never finalized it,
+    // before allocating another one alongside them.
+    evict_expired(&mut sessions);
+    sessions.insert(uuid.clone(), UploadSession::new());
+    drop(sessions);
     upload_accepted(name, &uuid, 0)
 }
 
@@ -339,16 +393,19 @@ async fn patch_route(
         .inner
         .lock()
         .expect("upload sessions mutex is not poisoned");
-    let Some(buf) = sessions.get_mut(uuid) else {
+    let Some(session) = sessions.get_mut(uuid) else {
         return oci_error(
             StatusCode::NOT_FOUND,
             "BLOB_UPLOAD_UNKNOWN",
             "upload session unknown",
         );
     };
-    let start = buf.len() as u64;
-    buf.extend_from_slice(&body);
-    let end = buf.len() as u64;
+    let start = session.buf.len() as u64;
+    session.buf.extend_from_slice(&body);
+    // A session that is still receiving chunks is not abandoned, however long
+    // the whole transfer takes on a slow link.
+    session.touched = Instant::now();
+    let end = session.buf.len() as u64;
     upload_range_accepted(name, uuid, start, end)
 }
 
@@ -390,10 +447,14 @@ async fn head_route(State(state): State<WriteState>, Path(rest): Path<String>) -
             "unsupported write path",
         );
     };
-    match state.store.read_blob(digest) {
-        Ok(Some(bytes)) => Response::builder()
+    // `blob_size` stats the entry instead of reading it: the probe reports only
+    // a length, and an engine HEADs every layer before pushing, so reading each
+    // existing layer into memory to discard it would put the whole image on the
+    // heap just to answer "do you already have this?".
+    match state.store.blob_size(digest) {
+        Ok(Some(len)) => Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+            .header(header::CONTENT_LENGTH, len.to_string())
             .header(DOCKER_CONTENT_DIGEST, digest)
             .body(Body::empty())
             .expect("blob-head response is always valid"),
@@ -425,7 +486,7 @@ fn finalize_upload(
         .expect("upload sessions mutex is not poisoned")
         .remove(uuid)
     {
-        Some(b) => b,
+        Some(session) => session.buf,
         None => {
             return oci_error(
                 StatusCode::NOT_FOUND,
@@ -1290,6 +1351,108 @@ mod write_auth {
             authed.status().as_u16(),
             200,
             "an authenticated dedup probe must report an existing blob present"
+        );
+        assert_eq!(
+            authed
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(blob.len().to_string().as_str()),
+            "the probe must report the blob's real size, statted rather than read"
+        );
+    }
+
+    // An upload that opens a session and never finalizes it must not pin its
+    // buffer forever: opening a later session reclaims it. Asserted on the map
+    // directly because the leak is invisible from the wire - the abandoned
+    // session returns nothing, it just occupies memory.
+    #[test]
+    fn abandoned_upload_sessions_are_evicted_when_a_new_one_opens() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "abandoned".to_string(),
+            UploadSession {
+                buf: vec![0u8; 1024],
+                touched: Instant::now() - UPLOAD_SESSION_TTL - Duration::from_secs(1),
+            },
+        );
+        sessions.insert(
+            "in-progress".to_string(),
+            UploadSession {
+                // Older than the TTL as a whole, but still receiving chunks - a
+                // slow link must not be mistaken for an abandoned push.
+                buf: vec![0u8; 1024],
+                touched: Instant::now(),
+            },
+        );
+
+        evict_expired(&mut sessions);
+
+        assert!(
+            !sessions.contains_key("abandoned"),
+            "a session untouched past the TTL must be reclaimed"
+        );
+        assert!(
+            sessions.contains_key("in-progress"),
+            "a session still receiving chunks must survive eviction"
+        );
+    }
+
+    // A PATCH must refresh the session clock, so a transfer that runs longer
+    // than the TTL is never evicted out from under an active client.
+    #[tokio::test]
+    async fn patching_a_session_keeps_it_alive_past_the_ttl() {
+        let (base, _store, _dir) = spawn().await;
+        let client = reqwest::Client::new();
+
+        let opened = client
+            .post(format!("{base}/v2/my-app/blobs/uploads/"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened.status().as_u16(), 202);
+        let location = opened
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let patched = client
+            .patch(format!("{base}{location}"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .body(b"chunk".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.status().as_u16(),
+            202,
+            "an in-flight chunk must be accepted"
+        );
+
+        // Opening a second session runs the sweep; the first is mid-transfer and
+        // must survive it.
+        client
+            .post(format!("{base}/v2/other-app/blobs/uploads/"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .send()
+            .await
+            .unwrap();
+
+        let still_there = client
+            .patch(format!("{base}{location}"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .body(b"more".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            still_there.status().as_u16(),
+            202,
+            "the sweep must not evict a session that is still being patched"
         );
     }
 }
