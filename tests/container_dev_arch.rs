@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use base64::Engine as _;
 
 use avocado_cli::utils::container_dev::engine::TagEvent;
 use avocado_cli::utils::container_dev::watcher::arch_guard::{
@@ -235,4 +236,136 @@ fn check_arch_allows_a_uname_vs_goarch_match() {
         &[DeviceArch::parse("aarch64")],
     )
     .expect("a uname/GOARCH-equivalent arch must pass the guard");
+}
+
+// ---- assertion 4: `up`'s wiring shares ONE book between the control server
+//      that fills it and the guard that reads it ----
+
+/// Trust the session CA the way the device agent does, so the control-WS
+/// upgrade is exercised over the real pinned-CA TLS rather than plaintext.
+fn pinned_ca_connector(ca_cert_pem: &str) -> tokio_tungstenite::Connector {
+    let body: String = ca_cert_pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .expect("session CA PEM base64 decodes");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("the session CA cert is a valid trust anchor");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tokio_tungstenite::Connector::Rustls(Arc::new(config))
+}
+
+/// The guard only works because the book the `ControlServer` writes and the book
+/// the `ArchGuardSyncer` reads are the SAME map. Every other test in this file
+/// hands the guard a book it populated by hand, so all of them would still pass
+/// with the two sides disconnected - which is exactly how the guard sat
+/// unreachable before it was wired into `up`.
+///
+/// This drives the real path: a device sends a `Hello` over the control WS, the
+/// server records its arch, and the guard - holding only a clone of the book it
+/// was constructed with - refuses a mismatched image it never saw recorded.
+/// Making `HelloArchBook::clone` a deep clone, or unwiring the guard in `up`,
+/// fails here.
+#[tokio::test]
+async fn a_hello_recorded_by_the_control_server_is_visible_to_the_guard() {
+    use avocado_cli::utils::container_dev::tls::DevSession;
+    use avocado_cli::utils::container_dev::ws::{ControlServer, DesiredState, DeviceFrame, Hello};
+    use futures_util::SinkExt as _;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let session = DevSession::mint("dev-runtime").expect("session mints");
+
+    // One book, cloned into both halves — exactly what `up` does.
+    let book = HelloArchBook::new();
+    let server = ControlServer::new(
+        session.read_token.clone(),
+        DesiredState::default(),
+        book.clone(),
+    );
+    let inner = Arc::new(ShipRecorder::default());
+    // A third handle on the same book, used only to observe when the server has
+    // processed the hello - so the poll below does not itself drive syncs.
+    let observer = book.clone();
+    let guard = ArchGuardSyncer::new(
+        inner.clone() as Arc<dyn Syncer>,
+        Arc::new(FixedProbe("amd64")), // image built for x86_64
+        Arc::new(book) as Arc<dyn DeviceArchBook>,
+    );
+
+    // Nothing recorded yet: the guard has no device to disagree with.
+    guard
+        .sync(SyncMode::Push, &ev("my-app:dev"))
+        .await
+        .expect("an empty book has nobody to mismatch");
+    assert_eq!(inner.ship_count(), 1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(session.tls.server_config());
+    tokio::spawn(async move { server.serve_tls(listener, acceptor).await });
+
+    let mut request = format!("wss://127.0.0.1:{}/", addr.port())
+        .into_client_request()
+        .expect("ws request builds");
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        format!("Bearer {}", session.read_token.secret())
+            .parse()
+            .unwrap(),
+    );
+    let connector = pinned_ca_connector(session.tls.ca_cert_pem());
+    let (mut ws, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+            .await
+            .expect("authenticated control-WS upgrade succeeds");
+
+    // An aarch64 device announces itself. Only the SERVER touches the book here.
+    let hello = DeviceFrame::Hello(Hello {
+        device_id: "dev-arm64".to_string(),
+        arch: "aarch64".to_string(),
+        running_digest: String::new(),
+    });
+    ws.send(Message::text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .expect("hello sends");
+
+    // Wait for the server to record it, bounded so a regression fails rather
+    // than hangs. Observing the book directly keeps the wait from driving syncs
+    // of its own, so the ship count below means exactly one thing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while observer.device_arches().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the control server's hello never reached the guard's book: the two halves \
+             are not sharing one map"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let before = inner.ship_count();
+    let refused = guard
+        .sync(SyncMode::Push, &ev("my-app:dev"))
+        .await
+        .expect_err("an amd64 image must be refused once an arm64 device has said hello");
+
+    let mismatch = refused
+        .downcast_ref::<ArchMismatch>()
+        .expect("the refusal must be an ArchMismatch");
+    assert_eq!(mismatch.device_arch, "arm64");
+    assert_eq!(mismatch.image_arch, "amd64");
+    assert_eq!(
+        inner.ship_count(),
+        before,
+        "the refused sync must not have shipped anything"
+    );
 }
