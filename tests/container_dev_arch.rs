@@ -29,7 +29,7 @@ use base64::Engine as _;
 use avocado_cli::utils::container_dev::engine::TagEvent;
 use avocado_cli::utils::container_dev::watcher::arch_guard::{
     check_arch, ArchGuardSyncer, ArchMismatch, DeviceArch, DeviceArchBook, HelloArchBook,
-    ImageArchProbe,
+    ImageArchBook, ImageArchProbe,
 };
 use avocado_cli::utils::container_dev::watcher::{SyncMode, Syncer};
 
@@ -91,6 +91,7 @@ async fn a_mismatched_arch_image_is_refused_and_never_ships() {
         inner.clone() as Arc<dyn Syncer>,
         Arc::new(FixedProbe("amd64")), // image built for x86_64
         Arc::new(book) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
     );
 
     let err = guard
@@ -123,6 +124,7 @@ async fn a_matching_arch_image_is_shipped() {
         inner.clone() as Arc<dyn Syncer>,
         Arc::new(FixedProbe("amd64")), // image built for x86_64: matches
         Arc::new(book) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
     );
 
     guard
@@ -155,6 +157,7 @@ async fn any_single_mismatched_device_in_a_fleet_refuses_the_whole_sync() {
         inner.clone() as Arc<dyn Syncer>,
         Arc::new(FixedProbe("amd64")),
         Arc::new(book) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
     );
 
     let err = guard
@@ -185,6 +188,7 @@ async fn a_homogeneous_matching_fleet_is_shipped() {
         inner.clone() as Arc<dyn Syncer>,
         Arc::new(FixedProbe("arm64")), // image matches every device
         Arc::new(book) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
     );
 
     guard
@@ -291,6 +295,7 @@ async fn a_hello_recorded_by_the_control_server_is_visible_to_the_guard() {
         session.read_token.clone(),
         DesiredState::default(),
         book.clone(),
+        ImageArchBook::new(),
     );
     let inner = Arc::new(ShipRecorder::default());
     // A third handle on the same book, used only to observe when the server has
@@ -300,6 +305,7 @@ async fn a_hello_recorded_by_the_control_server_is_visible_to_the_guard() {
         inner.clone() as Arc<dyn Syncer>,
         Arc::new(FixedProbe("amd64")), // image built for x86_64
         Arc::new(book) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
     );
 
     // Nothing recorded yet: the guard has no device to disagree with.

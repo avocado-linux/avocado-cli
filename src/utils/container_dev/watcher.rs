@@ -604,6 +604,44 @@ pub mod arch_guard {
         }
     }
 
+    /// The architecture last probed for each image reference.
+    ///
+    /// The guard already knows an image's arch - it probes it on every sync -
+    /// but that knowledge died with the call. `reconcile` runs later, on a
+    /// device's `hello`, and had no way to ask what architecture the digest it
+    /// is about to hand out was built for. With an empty device book at push
+    /// time the guard allows the sync, so a wrong-arch digest could reach the
+    /// desired state and be shipped to the first device that connected.
+    ///
+    /// Recording it here lets the arch outlive the probe, so the check can
+    /// happen at the moment a device is actually known. Deliberately mirrors
+    /// [`HelloArchBook`]: same shared-`Arc` clone semantics, same "one map, two
+    /// halves" wiring.
+    #[derive(Default, Clone)]
+    pub struct ImageArchBook {
+        by_image: Arc<Mutex<BTreeMap<String, DeviceArch>>>,
+    }
+
+    impl ImageArchBook {
+        /// A book with no images recorded yet.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Record the architecture probed for `image`.
+        pub fn record_image(&self, image: &str, arch: DeviceArch) {
+            self.by_image
+                .lock()
+                .unwrap()
+                .insert(image.to_string(), arch);
+        }
+
+        /// The architecture last probed for `image`, if any.
+        pub fn arch_for(&self, image: &str) -> Option<DeviceArch> {
+            self.by_image.lock().unwrap().get(image).cloned()
+        }
+    }
+
     /// Probe the image architecture via `<engine> image inspect --format
     /// {{.Architecture}} <ref>` — the engine CLI, consistent with the rest of
     /// the driver (no API socket).
@@ -669,20 +707,28 @@ pub mod arch_guard {
         inner: Arc<dyn Syncer>,
         probe: Arc<dyn ImageArchProbe>,
         devices: Arc<dyn DeviceArchBook>,
+        images: ImageArchBook,
     }
 
     impl ArchGuardSyncer {
         /// Wrap `inner`, guarding it with `probe` (image arch) and `devices`
-        /// (connected-device arches).
+        /// (connected-device arches), recording each probe into `images`.
+        ///
+        /// `images` is what makes the guard useful after the fact: an empty
+        /// device book means there is nobody to disagree with yet, so the sync
+        /// is allowed, and only the recorded arch lets a later `reconcile`
+        /// refuse to hand that digest to a device of the wrong architecture.
         pub fn new(
             inner: Arc<dyn Syncer>,
             probe: Arc<dyn ImageArchProbe>,
             devices: Arc<dyn DeviceArchBook>,
+            images: ImageArchBook,
         ) -> Self {
             Self {
                 inner,
                 probe,
                 devices,
+                images,
             }
         }
     }
@@ -699,6 +745,10 @@ pub mod arch_guard {
                 // A mismatch refuses here, before the wrapped syncer pushes or
                 // exports anything.
                 check_arch(&event.image, &image_arch, &device_arches)?;
+                // Record BEFORE delegating, so the arch is available to a later
+                // reconcile even for the allowed-because-nobody-was-connected
+                // case - which is precisely the case the record exists for.
+                self.images.record_image(&event.image, image_arch);
                 self.inner.sync(mode, event).await
             })
         }
@@ -842,6 +892,7 @@ pub mod arch_guard {
                 inner.clone() as Arc<dyn Syncer>,
                 Arc::new(FixedProbe("amd64")),
                 Arc::new(book),
+                ImageArchBook::new(),
             );
 
             do_sync_and_notify(SyncMode::Push, &guard, &notifier, &ev("my-app:dev")).await;
@@ -869,6 +920,7 @@ pub mod arch_guard {
                 inner.clone() as Arc<dyn Syncer>,
                 Arc::new(FixedProbe("amd64")),
                 Arc::new(book),
+                ImageArchBook::new(),
             );
 
             do_sync_and_notify(SyncMode::Push, &guard, &notifier, &ev("my-app:dev")).await;

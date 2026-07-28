@@ -27,7 +27,7 @@ use avocado_cli::utils::container_dev::auth::WRITE_USERNAME;
 use avocado_cli::utils::container_dev::registry::{write_router, BulkListener};
 use avocado_cli::utils::container_dev::store::BlobStore;
 use avocado_cli::utils::container_dev::tls::DevSession;
-use avocado_cli::utils::container_dev::watcher::arch_guard::HelloArchBook;
+use avocado_cli::utils::container_dev::watcher::arch_guard::{HelloArchBook, ImageArchBook};
 use avocado_cli::utils::container_dev::ws::ControlServer;
 use avocado_cli::utils::container_dev::ws::{DesiredState, DeviceFrame, Hello, HostFrame};
 
@@ -291,7 +291,12 @@ async fn a_stale_device_is_synced_to_the_new_digest_over_the_control_ws() {
         TAG.to_string(),
         v2_digest.clone(),
     )]);
-    let server = ControlServer::new(session.read_token.clone(), desired, HelloArchBook::new());
+    let server = ControlServer::new(
+        session.read_token.clone(),
+        desired,
+        HelloArchBook::new(),
+        ImageArchBook::new(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let acceptor = TlsAcceptor::from(session.tls.server_config());

@@ -23,7 +23,7 @@ use avocado_cli::utils::container_dev::auth::WRITE_USERNAME;
 use avocado_cli::utils::container_dev::registry::{write_router, BulkListener};
 use avocado_cli::utils::container_dev::store::BlobStore;
 use avocado_cli::utils::container_dev::tls::DevSession;
-use avocado_cli::utils::container_dev::watcher::arch_guard::HelloArchBook;
+use avocado_cli::utils::container_dev::watcher::arch_guard::{HelloArchBook, ImageArchBook};
 use avocado_cli::utils::container_dev::ws::{ControlServer, DesiredState};
 
 use base64::Engine as _;
@@ -106,6 +106,7 @@ async fn spawn_ws_tls(session: &DevSession) -> String {
         session.read_token.clone(),
         DesiredState::default(),
         HelloArchBook::new(),
+        ImageArchBook::new(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

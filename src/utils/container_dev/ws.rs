@@ -53,7 +53,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::auth::{read_request_authorized, ReadToken};
 use super::engine::TagEvent;
-use super::watcher::arch_guard::HelloArchBook;
+use crate::utils::output::{print_warning, OutputLevel};
+
+use super::watcher::arch_guard::{DeviceArch, HelloArchBook, ImageArchBook};
 use super::watcher::Notifier;
 
 /// A host -> device control frame.
@@ -150,7 +152,22 @@ fn split_image_tag(image: &str) -> (String, String) {
 /// state cannot be silently loaded from a stale snapshot across a host restart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DesiredState {
-    by_tag: BTreeMap<(String, String), String>,
+    by_tag: BTreeMap<(String, String), DesiredEntry>,
+}
+
+/// One desired `(image, tag)` entry: the digest to run, and the architecture it
+/// was built for when that is known.
+///
+/// The arch rides alongside the digest rather than being looked up later
+/// because it is only knowable at push time, when the guard probes the image.
+/// `None` means "not probed" - entries derived from the engine's watched tags at
+/// `up` have never been through the guard - and an unknown arch is never treated
+/// as a mismatch, so this can only refuse deliveries it positively knows are
+/// wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesiredEntry {
+    digest: String,
+    arch: Option<DeviceArch>,
 }
 
 impl DesiredState {
@@ -166,30 +183,45 @@ impl DesiredState {
     {
         let by_tag = watched
             .into_iter()
-            .map(|(image, tag, digest)| ((image, tag), digest))
+            .map(|(image, tag, digest)| {
+                (
+                    (image, tag),
+                    DesiredEntry {
+                        digest,
+                        // Never probed: these come from the engine's current
+                        // tags, not from a guarded sync.
+                        arch: None,
+                    },
+                )
+            })
             .collect();
         Self { by_tag }
     }
 
     /// Record a fresh `(image, tag) -> digest` after a new sync so a later
     /// reconcile compares against the just-pushed digest.
-    pub fn record_sync(&mut self, image: &str, tag: &str, digest: &str) {
-        self.by_tag
-            .insert((image.to_string(), tag.to_string()), digest.to_string());
+    pub fn record_sync(&mut self, image: &str, tag: &str, digest: &str, arch: Option<DeviceArch>) {
+        self.by_tag.insert(
+            (image.to_string(), tag.to_string()),
+            DesiredEntry {
+                digest: digest.to_string(),
+                arch,
+            },
+        );
     }
 
     /// The desired digest for `(image, tag)`, if watched.
     pub fn digest_for(&self, image: &str, tag: &str) -> Option<&str> {
         self.by_tag
             .get(&(image.to_string(), tag.to_string()))
-            .map(String::as_str)
+            .map(|entry| entry.digest.as_str())
     }
 
     /// The desired entries as `(image, tag, digest)` triples.
     pub fn entries(&self) -> Vec<(String, String, String)> {
         self.by_tag
             .iter()
-            .map(|((image, tag), digest)| (image.clone(), tag.clone(), digest.clone()))
+            .map(|((image, tag), entry)| (image.clone(), tag.clone(), entry.digest.clone()))
             .collect()
     }
 
@@ -200,14 +232,39 @@ impl DesiredState {
     /// NOT match what the device runs — driving a device that reconnected with a
     /// stale digest back to current. A device already on the desired digest
     /// yields no sync.
+    ///
+    /// An entry whose recorded architecture disagrees with the device's is never
+    /// sent. The cross-arch guard cannot cover this on its own: at push time the
+    /// device book may be empty (the device is still booting, or hours away), so
+    /// the guard has nobody to disagree with and allows the sync. This is the
+    /// second half of that check, made at the only moment the device's own arch
+    /// is known. An entry with no recorded arch is passed through unchanged - the
+    /// filter refuses only what it positively knows is wrong.
     pub fn reconcile(&self, hello: &Hello) -> Vec<HostFrame> {
+        let device_arch = DeviceArch::parse(&hello.arch);
         self.by_tag
             .iter()
-            .filter(|(_, digest)| digest.as_str() != hello.running_digest)
-            .map(|((image, tag), digest)| HostFrame::Sync {
+            .filter(|(_, entry)| entry.digest != hello.running_digest)
+            .filter(|((image, _), entry)| match &entry.arch {
+                Some(image_arch) if *image_arch != device_arch => {
+                    print_warning(
+                        &format!(
+                            "refusing to sync `{image}` (built for {}) to device `{}` \
+                             (reports {}): rebuild for the device platform",
+                            image_arch.as_str(),
+                            hello.device_id,
+                            device_arch.as_str(),
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    false
+                }
+                _ => true,
+            })
+            .map(|((image, tag), entry)| HostFrame::Sync {
                 image: image.clone(),
                 tag: tag.clone(),
-                digest: digest.clone(),
+                digest: entry.digest.clone(),
             })
             .collect()
     }
@@ -227,23 +284,30 @@ pub struct ControlServer {
     desired: Mutex<DesiredState>,
     /// The cross-arch guard's device-arch book, populated from `hello.arch`.
     arch_book: HelloArchBook,
+    /// Image architectures recorded by the cross-arch guard, read by `notify` so
+    /// the arch is stored alongside the digest it describes.
+    image_arches: ImageArchBook,
     /// Host -> device fan-out of `sync` frames; each connection subscribes.
     tx: broadcast::Sender<HostFrame>,
 }
 
 impl ControlServer {
     /// Build a server over `read_token`, the up-time `desired` state, and the
-    /// cross-arch guard's `arch_book`.
+    /// cross-arch guard's two books: `arch_book` (device arches, which this
+    /// server fills from `hello` frames) and `image_arches` (image arches, which
+    /// the guard fills and `notify` reads).
     pub fn new(
         read_token: ReadToken,
         desired: DesiredState,
         arch_book: HelloArchBook,
+        image_arches: ImageArchBook,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(64);
         Arc::new(Self {
             read_token,
             desired: Mutex::new(desired),
             arch_book,
+            image_arches,
             tx,
         })
     }
@@ -427,10 +491,16 @@ impl Notifier for ControlServer {
                     event.image
                 ));
             }
+            // The arch the guard probed for this image, if it went through the
+            // guard at all. Recorded with the digest so a later reconcile can
+            // refuse to hand it to a device of another architecture - the guard
+            // itself cannot, because at push time there may be no device
+            // connected to compare against.
+            let arch = self.image_arches.arch_for(&event.image);
             self.desired
                 .lock()
                 .unwrap()
-                .record_sync(&image, &tag, &digest);
+                .record_sync(&image, &tag, &digest, arch);
             let frame = HostFrame::Sync { image, tag, digest };
             // A send with no connected devices is not an error (nobody to notify
             // yet); a later `hello` reconciles them.
@@ -619,7 +689,21 @@ mod tests {
     /// Spawn a control server over plain TCP; return its `ws://` base URL and the
     /// server handle so a test can also drive its notify path.
     async fn spawn_server(desired: DesiredState) -> (String, Arc<ControlServer>) {
-        let server = ControlServer::new(ReadToken::new(READ_TOKEN), desired, HelloArchBook::new());
+        spawn_server_with_images(desired, ImageArchBook::new()).await
+    }
+
+    /// [`spawn_server`] over a caller-supplied image-arch book, so a test can
+    /// stage what the guard would have recorded at push time.
+    async fn spawn_server_with_images(
+        desired: DesiredState,
+        images: ImageArchBook,
+    ) -> (String, Arc<ControlServer>) {
+        let server = ControlServer::new(
+            ReadToken::new(READ_TOKEN),
+            desired,
+            HelloArchBook::new(),
+            images,
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let serve = Arc::clone(&server);
@@ -815,6 +899,78 @@ mod tests {
         );
     }
 
+    // The pre-hello window: the guard allowed this push because no device was
+    // connected to disagree with, so a wrong-arch digest reached desired state.
+    // `reconcile` is the second half of the check and must refuse it at the one
+    // moment the device's own arch is finally known.
+    //
+    // Deleting the arch filter in `reconcile` fails this: the Sync frame goes
+    // out and the device is handed an image it cannot run.
+    #[tokio::test]
+    async fn reconcile_refuses_a_wrong_arch_entry_recorded_before_any_device_connected() {
+        let images = ImageArchBook::new();
+        // What the guard records when it probes an amd64 image and finds no
+        // devices to compare against.
+        images.record_image("my-app:dev", DeviceArch::parse("amd64"));
+
+        let (_url, server) = spawn_server_with_images(DesiredState::default(), images).await;
+        let event = TagEvent {
+            image: "my-app:dev".to_string(),
+            image_id: Some("sha256:amd64only".to_string()),
+        };
+        server.notify(&event).await.unwrap();
+
+        // An arm64 device connects afterwards, running nothing yet.
+        let arm = Hello {
+            device_id: "dev-arm64".to_string(),
+            arch: "aarch64".to_string(),
+            running_digest: String::new(),
+        };
+        let frames = server.desired.lock().unwrap().reconcile(&arm);
+        assert!(
+            frames.is_empty(),
+            "an amd64 image must not be reconciled to an aarch64 device: {frames:?}"
+        );
+
+        // The same entry must still reach a device that CAN run it, or the
+        // filter is just breaking sync.
+        let x86 = Hello {
+            device_id: "dev-amd64".to_string(),
+            arch: "x86_64".to_string(),
+            running_digest: String::new(),
+        };
+        let frames = server.desired.lock().unwrap().reconcile(&x86);
+        assert_eq!(
+            frames.len(),
+            1,
+            "a matching-arch device must still be synced: {frames:?}"
+        );
+    }
+
+    // An entry with no recorded arch is passed through: entries derived from the
+    // engine's watched tags at `up` never went through the guard, and treating
+    // "unknown" as "mismatch" would stop reconciling them entirely.
+    #[tokio::test]
+    async fn reconcile_passes_through_an_entry_with_no_recorded_arch() {
+        let desired = DesiredState::derive_from_watched_tags([(
+            "my-app".to_string(),
+            "dev".to_string(),
+            "sha256:unprobed".to_string(),
+        )]);
+        let (_url, server) = spawn_server(desired).await;
+
+        let frames = server.desired.lock().unwrap().reconcile(&Hello {
+            device_id: "dev-1".to_string(),
+            arch: "aarch64".to_string(),
+            running_digest: String::new(),
+        });
+        assert_eq!(
+            frames.len(),
+            1,
+            "an unprobed entry must still reconcile: {frames:?}"
+        );
+    }
+
     // A digest-less event must be refused rather than recorded as "".
     //
     // The empty string is not an inert placeholder here: `reconcile` filters on
@@ -868,7 +1024,12 @@ mod tests {
     ) {
         let session = crate::utils::container_dev::tls::DevSession::mint("dev-runtime")
             .expect("session mints");
-        let server = ControlServer::new(session.read_token.clone(), desired, HelloArchBook::new());
+        let server = ControlServer::new(
+            session.read_token.clone(),
+            desired,
+            HelloArchBook::new(),
+            ImageArchBook::new(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let acceptor = TlsAcceptor::from(session.tls.server_config());

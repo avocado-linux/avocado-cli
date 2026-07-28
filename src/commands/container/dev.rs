@@ -59,7 +59,7 @@ use crate::utils::container_dev::registry::{serve_write_router_tls, write_router
 use crate::utils::container_dev::store::BlobStore;
 use crate::utils::container_dev::tls::DevSession;
 use crate::utils::container_dev::watcher::{
-    arch_guard::{ArchGuardSyncer, EngineArchProbe, HelloArchBook},
+    arch_guard::{ArchGuardSyncer, EngineArchProbe, HelloArchBook, ImageArchBook},
     run_watcher, EngineSyncer, HostTopology, SyncMode, Syncer, DEBOUNCE,
 };
 use crate::utils::container_dev::ws::{ControlServer, DesiredState};
@@ -332,10 +332,17 @@ impl DevUpCommand {
         // `hello.arch` into it, and the cross-arch guard below reads the snapshot
         // before every sync.
         let arch_book = HelloArchBook::new();
+        // The image-arch book runs the other direction: the guard writes what it
+        // probed, the control server reads it in `notify` so the arch is stored
+        // beside the digest and a later `reconcile` can refuse a wrong-arch
+        // delivery the guard could not, having had no connected device to
+        // compare against at push time.
+        let image_arches = ImageArchBook::new();
         let control = ControlServer::new(
             read_token.clone(),
             DesiredState::default(),
             arch_book.clone(),
+            image_arches.clone(),
         );
         // Bind the control WS on a RESOLVED, discoverable port (design D9), NOT an
         // ephemeral `0.0.0.0:0` the device could never learn: the device agent is
@@ -398,6 +405,7 @@ impl DevUpCommand {
                 driver_for(engine).expect("engine driver resolves").as_ref(),
             )),
             Arc::new(arch_book),
+            image_arches,
         ));
         // The watcher and the manual `sync` trigger share the SAME push+notify
         // primitives (design D5): clone the syncer + control for the trigger
