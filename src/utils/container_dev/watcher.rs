@@ -580,7 +580,7 @@ pub mod arch_guard {
     /// never double-counts one device.
     #[derive(Default, Clone)]
     pub struct HelloArchBook {
-        by_device: Arc<Mutex<BTreeMap<String, DeviceArch>>>,
+        by_device: Arc<Mutex<BTreeMap<String, LeasedArch>>>,
     }
 
     impl HelloArchBook {
@@ -590,17 +590,90 @@ pub mod arch_guard {
         }
 
         /// Record a device's `hello.arch` (task 5.1 calls this on a hello frame).
+        ///
+        /// Prefer [`HelloArchBook::record_session`], which ties the entry to the
+        /// connection that produced it. A bare insert outlives the device: the
+        /// book is consulted by `check_arch`, which refuses on ANY mismatch, so a
+        /// device that is unplugged and replaced by one of another architecture
+        /// leaves an entry that refuses every later sync for the rest of the
+        /// session - naming, in its buildx guidance, an architecture no connected
+        /// device reports.
         pub fn record_hello(&self, device_id: &str, arch: &str) {
-            self.by_device
-                .lock()
-                .unwrap()
-                .insert(device_id.to_string(), DeviceArch::parse(arch));
+            self.by_device.lock().unwrap().insert(
+                device_id.to_string(),
+                LeasedArch {
+                    arch: DeviceArch::parse(arch),
+                    // No connection behind it; only record_session refcounts.
+                    holders: 1,
+                },
+            );
+        }
+
+        /// Record `device_id`'s arch for as long as the returned guard lives.
+        ///
+        /// The book is trying to answer "what is connected right now", which is
+        /// something the connection set already knows - so derive it from the
+        /// connection rather than accumulating it. Dropping the guard removes the
+        /// entry, and because that runs on every exit path (clean close, error,
+        /// panic, early return) the book cannot drift from reality the way a
+        /// remove-on-disconnect call placed at one exit would.
+        ///
+        /// Re-recording the same device (a reconnect that overlaps its own
+        /// previous session) refcounts rather than replacing, so the older
+        /// session's guard dropping cannot evict the newer session's entry.
+        pub fn record_session(&self, device_id: &str, arch: &str) -> DeviceArchLease {
+            let mut by_device = self.by_device.lock().unwrap();
+            let entry = by_device
+                .entry(device_id.to_string())
+                .or_insert_with(|| LeasedArch {
+                    arch: DeviceArch::parse(arch),
+                    holders: 0,
+                });
+            entry.arch = DeviceArch::parse(arch);
+            entry.holders += 1;
+            DeviceArchLease {
+                book: self.by_device.clone(),
+                device_id: device_id.to_string(),
+            }
+        }
+    }
+
+    /// One device's architecture plus how many live connections claim it.
+    #[derive(Debug, Clone)]
+    pub(crate) struct LeasedArch {
+        arch: DeviceArch,
+        holders: usize,
+    }
+
+    /// Keeps a device in the [`HelloArchBook`] until dropped.
+    ///
+    /// Held by the control server's per-connection task, so the entry's lifetime
+    /// is exactly the session's.
+    pub struct DeviceArchLease {
+        book: Arc<Mutex<BTreeMap<String, LeasedArch>>>,
+        device_id: String,
+    }
+
+    impl Drop for DeviceArchLease {
+        fn drop(&mut self) {
+            let mut by_device = self.book.lock().unwrap();
+            if let Some(entry) = by_device.get_mut(&self.device_id) {
+                entry.holders = entry.holders.saturating_sub(1);
+                if entry.holders == 0 {
+                    by_device.remove(&self.device_id);
+                }
+            }
         }
     }
 
     impl DeviceArchBook for HelloArchBook {
         fn device_arches(&self) -> Vec<DeviceArch> {
-            self.by_device.lock().unwrap().values().cloned().collect()
+            self.by_device
+                .lock()
+                .unwrap()
+                .values()
+                .map(|entry| entry.arch.clone())
+                .collect()
         }
     }
 

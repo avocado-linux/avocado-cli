@@ -55,7 +55,7 @@ use super::auth::{read_request_authorized, ReadToken};
 use super::engine::TagEvent;
 use crate::utils::output::{print_warning, OutputLevel};
 
-use super::watcher::arch_guard::{DeviceArch, HelloArchBook, ImageArchBook};
+use super::watcher::arch_guard::{DeviceArch, DeviceArchLease, HelloArchBook, ImageArchBook};
 use super::watcher::Notifier;
 
 /// A host -> device control frame.
@@ -425,11 +425,22 @@ impl ControlServer {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let mut broadcasts = self.tx.subscribe();
+        // Holds this device in the arch book for exactly as long as the session
+        // lasts. Declared here so it drops on EVERY exit from this function -
+        // clean close, send error, or unwind - rather than at one hand-placed
+        // removal that a later `return` could route around.
+        let mut _arch_lease: Option<DeviceArchLease> = None;
         loop {
             tokio::select! {
                 incoming = ws.next() => match incoming {
                     Some(Ok(msg)) => {
-                        if let Some(frames) = self.on_device_message(&msg) {
+                        if let Some((frames, lease)) = self.on_device_message(&msg) {
+                            // A reconnecting device re-leases; replacing the old
+                            // guard here drops it, which is correct because it
+                            // belonged to this same session.
+                            if lease.is_some() {
+                                _arch_lease = lease;
+                            }
                             for frame in frames {
                                 ws.send(encode(&frame)?).await?;
                             }
@@ -450,15 +461,24 @@ impl ControlServer {
 
     /// Handle one device -> host frame, returning any host -> device frames to
     /// send in response (the reconcile syncs for a `hello`).
-    fn on_device_message(&self, msg: &Message) -> Option<Vec<HostFrame>> {
+    /// Returns the frames to send, plus a lease the caller must hold for the
+    /// rest of the session when this frame put a device in the arch book.
+    fn on_device_message(
+        &self,
+        msg: &Message,
+    ) -> Option<(Vec<HostFrame>, Option<DeviceArchLease>)> {
         let text = msg.to_text().ok()?;
         let frame: DeviceFrame = serde_json::from_str(text).ok()?;
         match frame {
             DeviceFrame::Hello(hello) => {
-                // Record the device arch for the cross-arch guard (task 4.3).
-                self.arch_book.record_hello(&hello.device_id, &hello.arch);
+                // Record the device arch for the cross-arch guard (task 4.3),
+                // scoped to this connection: the guard refuses on ANY mismatch,
+                // so an entry that outlived its device would refuse every later
+                // sync for an architecture nothing connected reports.
+                let lease = self.arch_book.record_session(&hello.device_id, &hello.arch);
                 // Reconcile the reported running_digest against the desired state.
-                Some(self.desired.lock().unwrap().reconcile(&hello))
+                let frames = self.desired.lock().unwrap().reconcile(&hello);
+                Some((frames, Some(lease)))
             }
             // Progress/Status are informational; no host response.
             DeviceFrame::Progress(_) | DeviceFrame::Status(_) => None,

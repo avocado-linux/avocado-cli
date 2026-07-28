@@ -245,6 +245,79 @@ fn check_arch_allows_a_uname_vs_goarch_match() {
 // ---- assertion 4: `up`'s wiring shares ONE book between the control server
 //      that fills it and the guard that reads it ----
 
+// ---- assertion 5: a device that disconnects stops constraining the guard ----
+
+/// Within one `up`, a developer tests against an aarch64 board, unplugs it, and
+/// attaches an amd64 one. The arch book must not still be refusing amd64 syncs
+/// on behalf of a board that is gone - `check_arch` refuses on ANY mismatch, so
+/// a stale entry blocks the rest of the session and its buildx guidance names an
+/// architecture nothing connected reports.
+///
+/// Asserted through the guard rather than by inspecting the book, because the
+/// property that matters is "the sync goes through", not "the map is empty".
+#[tokio::test]
+async fn a_disconnected_device_no_longer_blocks_a_sync() {
+    let book = HelloArchBook::new();
+    let inner = Arc::new(ShipRecorder::default());
+    let guard = ArchGuardSyncer::new(
+        inner.clone() as Arc<dyn Syncer>,
+        Arc::new(FixedProbe("amd64")), // the image the developer now builds
+        Arc::new(book.clone()) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
+    );
+
+    // The arm64 board is connected: an amd64 sync is correctly refused.
+    let arm_session = book.record_session("dev-arm64", "aarch64");
+    guard
+        .sync(SyncMode::Push, &ev("my-app:dev"))
+        .await
+        .expect_err("an amd64 image must be refused while an arm64 board is attached");
+    assert_eq!(inner.ship_count(), 0);
+
+    // The board is unplugged - its session ends.
+    drop(arm_session);
+
+    guard
+        .sync(SyncMode::Push, &ev("my-app:dev"))
+        .await
+        .expect("the departed board must not keep refusing syncs");
+    assert_eq!(
+        inner.ship_count(),
+        1,
+        "the sync must actually ship once nothing disagrees with it"
+    );
+}
+
+/// Two overlapping connections from one device must not evict each other: the
+/// older session ending cannot remove an entry the newer one still needs, or a
+/// reconnect would silently disarm the guard.
+#[tokio::test]
+async fn overlapping_sessions_for_one_device_refcount() {
+    let book = HelloArchBook::new();
+    let inner = Arc::new(ShipRecorder::default());
+    let guard = ArchGuardSyncer::new(
+        inner.clone() as Arc<dyn Syncer>,
+        Arc::new(FixedProbe("amd64")),
+        Arc::new(book.clone()) as Arc<dyn DeviceArchBook>,
+        ImageArchBook::new(),
+    );
+
+    let first = book.record_session("dev-arm64", "aarch64");
+    let second = book.record_session("dev-arm64", "aarch64");
+
+    drop(first);
+    guard
+        .sync(SyncMode::Push, &ev("my-app:dev"))
+        .await
+        .expect_err("the device is still connected on its second session");
+
+    drop(second);
+    guard
+        .sync(SyncMode::Push, &ev("my-app:dev"))
+        .await
+        .expect("with every session closed the guard must stop refusing");
+}
+
 /// Trust the session CA the way the device agent does, so the control-WS
 /// upgrade is exercised over the real pinned-CA TLS rather than plaintext.
 fn pinned_ca_connector(ca_cert_pem: &str) -> tokio_tungstenite::Connector {
