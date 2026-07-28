@@ -48,7 +48,8 @@ use crate::utils::container_dev::registry::{serve_write_router_tls, write_router
 use crate::utils::container_dev::store::BlobStore;
 use crate::utils::container_dev::tls::DevSession;
 use crate::utils::container_dev::watcher::{
-    arch_guard::HelloArchBook, run_watcher, EngineSyncer, HostTopology, SyncMode, DEBOUNCE,
+    arch_guard::{ArchGuardSyncer, EngineArchProbe, HelloArchBook},
+    run_watcher, EngineSyncer, HostTopology, SyncMode, Syncer, DEBOUNCE,
 };
 use crate::utils::container_dev::ws::{ControlServer, DesiredState};
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
@@ -290,10 +291,14 @@ impl DevUpCommand {
         // plaintext. Its desired state is RE-DERIVED at `up` from the engine's
         // current watched tags (design D5) — the watcher's first events populate
         // it; we start empty and let hellos reconcile.
+        // The arch book is shared: the control server writes each device's
+        // `hello.arch` into it, and the cross-arch guard below reads the snapshot
+        // before every sync.
+        let arch_book = HelloArchBook::new();
         let control = ControlServer::new(
             read_token.clone(),
             DesiredState::default(),
-            HelloArchBook::new(),
+            arch_book.clone(),
         );
         // Bind the control WS on a RESOLVED, discoverable port (design D9), NOT an
         // ephemeral `0.0.0.0:0` the device could never learn: the device agent is
@@ -331,7 +336,7 @@ impl DevUpCommand {
             .parent()
             .expect("store root has a per-project parent")
             .to_path_buf();
-        let syncer = Arc::new(EngineSyncer::new(
+        let engine_syncer = Arc::new(EngineSyncer::new(
             driver_for(engine).expect("engine driver resolves"),
             syncer_registry,
             write_token.clone(),
@@ -341,6 +346,22 @@ impl DevUpCommand {
             .await
             .context("starting the engine event watcher")?;
         let notifier = Arc::clone(&control);
+        // Wrap the real syncer in the cross-arch guard (task 4.3) BEFORE anything
+        // can push through it. `control` already records every device's
+        // `hello.arch` into `arch_book`; without this decorator nothing ever reads
+        // that book, so an amd64 host targeting an aarch64 device would build,
+        // push and notify a wrong-arch image the device cannot run — the exact
+        // silent delivery the guard exists to refuse. A refusal returns `Err`, so
+        // the notify is skipped too.
+        let syncer: Arc<dyn Syncer> = Arc::new(ArchGuardSyncer::new(
+            engine_syncer,
+            // A fresh driver handle: `driver` itself was moved into the event
+            // watcher above. The probe keeps only the engine binary name.
+            Arc::new(EngineArchProbe::new(
+                driver_for(engine).expect("engine driver resolves").as_ref(),
+            )),
+            Arc::new(arch_book),
+        ));
         // The watcher and the manual `sync` trigger share the SAME push+notify
         // primitives (design D5): clone the syncer + control for the trigger
         // before the watcher takes ownership of its copies.
@@ -707,7 +728,7 @@ fn signal_shutdown(_pid: u32) {}
 #[cfg(unix)]
 async fn run_sync_trigger(
     mode: SyncMode,
-    syncer: Arc<EngineSyncer>,
+    syncer: Arc<dyn Syncer>,
     notifier: Arc<ControlServer>,
     images: Vec<String>,
 ) {
@@ -738,7 +759,7 @@ async fn run_sync_trigger(
 #[cfg(not(unix))]
 async fn run_sync_trigger(
     _mode: SyncMode,
-    _syncer: Arc<EngineSyncer>,
+    _syncer: Arc<dyn Syncer>,
     _notifier: Arc<ControlServer>,
     _images: Vec<String>,
 ) {
