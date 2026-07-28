@@ -58,10 +58,23 @@ const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
 /// How long an upload session may sit untouched before it is evicted.
 ///
-/// Generous enough that a slow link pushing a large layer is never mistaken for
-/// an abandoned session - only the gap BETWEEN chunks counts, not the total
-/// transfer time - while still bounding how long a killed `docker push` can pin
-/// its buffer in host memory.
+/// Bounds how long a killed `docker push` can pin its buffer in host memory.
+///
+/// What "untouched" means here is narrower than it looks, and the earlier
+/// wording of this comment was wrong about it. `touched` is refreshed by
+/// [`patch_route`], which runs only AFTER axum's `Bytes` extractor has buffered
+/// that chunk in full - so the clock advances between chunks, not during one.
+/// A push that sends a layer as a single large PATCH keeps `touched` pinned at
+/// the POST timestamp for the whole transfer, and [`evict_expired`] sweeps the
+/// whole map rather than one repo, so a concurrent layer's POST can evict it
+/// mid-flight; the PATCH then finds its session gone and returns
+/// `404 BLOB_UPLOAD_UNKNOWN` after the client already paid for the transfer.
+///
+/// The residual is bounded but real: reaching it needs a single request slower
+/// than this TTL, i.e. roughly 28 Mbit/s for a 2 GiB layer, which is well under
+/// loopback and normally under SLIRP. Closing it properly needs the session
+/// marked in-flight at request receipt rather than after buffering, which is a
+/// middleware, not a constant.
 const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(600);
 
 /// Upper bound on a single write-path request body.
@@ -253,14 +266,20 @@ struct UploadSessions {
     inner: Mutex<HashMap<String, UploadSession>>,
 }
 
-/// Drop sessions untouched for longer than [`UPLOAD_SESSION_TTL`].
+/// Drop sessions untouched for longer than [`UPLOAD_SESSION_TTL`] as of `now`.
 ///
 /// Called when a new session opens, which is both the moment a fresh buffer is
 /// about to be allocated and the only point an abandoned one can be noticed - no
 /// client ever tells us it gave up.
-fn evict_expired(sessions: &mut HashMap<String, UploadSession>) {
-    let now = Instant::now();
-    sessions.retain(|_uuid, session| now.duration_since(session.touched) < UPLOAD_SESSION_TTL);
+///
+/// `now` is a parameter rather than a call to `Instant::now()` inside so a test
+/// can place a session at a chosen distance from the TTL boundary. Reading the
+/// clock internally left the only available test a sweep milliseconds after the
+/// POST, which passes whether or not the mechanism works at all.
+fn evict_expired(sessions: &mut HashMap<String, UploadSession>, now: Instant) {
+    sessions.retain(|_uuid, session| {
+        now.saturating_duration_since(session.touched) < UPLOAD_SESSION_TTL
+    });
 }
 
 /// Shared state for the write handlers: the backing store plus upload sessions.
@@ -280,10 +299,20 @@ struct WriteState {
 /// DISTINCT write listener (design D9); it is never merged onto the bulk read
 /// listener.
 pub fn write_router(store: Arc<BlobStore>, write_token: WriteToken) -> Router {
-    let state = WriteState {
-        store,
-        uploads: Arc::new(UploadSessions::default()),
-    };
+    write_router_with_uploads(store, write_token, Arc::new(UploadSessions::default()))
+}
+
+/// [`write_router`], but over a caller-supplied session map.
+///
+/// Exists so a test can hold the same `Arc` the handlers mutate and place a
+/// session at a chosen age. Without it the TTL is only reachable through a real
+/// 10-minute wait, which is why the first attempt at a TTL test asserted nothing.
+fn write_router_with_uploads(
+    store: Arc<BlobStore>,
+    write_token: WriteToken,
+    uploads: Arc<UploadSessions>,
+) -> Router {
+    let state = WriteState { store, uploads };
     Router::new()
         .route("/v2/", get(base))
         .route(
@@ -369,7 +398,7 @@ async fn post_route(
         .expect("upload sessions mutex is not poisoned");
     // Reclaim buffers from pushes that opened a session and never finalized it,
     // before allocating another one alongside them.
-    evict_expired(&mut sessions);
+    evict_expired(&mut sessions, Instant::now());
     sessions.insert(uuid.clone(), UploadSession::new());
     drop(sessions);
     upload_accepted(name, &uuid, 0)
@@ -1386,7 +1415,7 @@ mod write_auth {
             },
         );
 
-        evict_expired(&mut sessions);
+        evict_expired(&mut sessions, Instant::now());
 
         assert!(
             !sessions.contains_key("abandoned"),
@@ -1398,11 +1427,71 @@ mod write_auth {
         );
     }
 
-    // A PATCH must refresh the session clock, so a transfer that runs longer
-    // than the TTL is never evicted out from under an active client.
+    // The TTL boundary itself: one tick either side must decide differently.
+    // Without an injected clock this is unreachable, which is what let the
+    // previous version of the PATCH test below assert nothing.
+    #[test]
+    fn eviction_turns_on_the_ttl_boundary() {
+        let base = Instant::now();
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "just-inside".to_string(),
+            UploadSession {
+                buf: Vec::new(),
+                touched: base,
+            },
+        );
+        evict_expired(
+            &mut sessions,
+            base + UPLOAD_SESSION_TTL - Duration::from_millis(1),
+        );
+        assert!(
+            sessions.contains_key("just-inside"),
+            "a session one tick inside the TTL must survive"
+        );
+
+        evict_expired(&mut sessions, base + UPLOAD_SESSION_TTL);
+        assert!(
+            sessions.is_empty(),
+            "a session at the TTL must be reclaimed"
+        );
+    }
+
+    /// Serve the write router over a session map the test also holds, so it can
+    /// age a live session to the TTL boundary instead of waiting ten minutes.
+    async fn spawn_with_uploads() -> (String, Arc<UploadSessions>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
+        let uploads = Arc::new(UploadSessions::default());
+        let app = write_router_with_uploads(store, WriteToken::new(WRITE_TOKEN), uploads.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), uploads, dir)
+    }
+
+    /// Backdate every live session by `age`, simulating time passing without
+    /// spending it.
+    fn age_sessions(uploads: &UploadSessions, age: Duration) {
+        let mut sessions = uploads.inner.lock().unwrap();
+        for session in sessions.values_mut() {
+            session.touched -= age;
+        }
+    }
+
+    // A PATCH must refresh the session clock, so a multi-chunk transfer spanning
+    // more than the TTL is not evicted out from under an active client.
+    //
+    // The falsifier is the backdating: the session is pushed past the TTL, then
+    // PATCHed, then swept. It survives ONLY if patch_route actually rewrote
+    // `touched`. Deleting that one line fails this test - which the previous
+    // version of it did not, because its sweep ran milliseconds after the POST
+    // and would have passed with the mechanism removed entirely.
     #[tokio::test]
-    async fn patching_a_session_keeps_it_alive_past_the_ttl() {
-        let (base, _store, _dir) = spawn().await;
+    async fn patching_a_session_refreshes_its_ttl() {
+        let (base, uploads, _dir) = spawn_with_uploads().await;
         let client = reqwest::Client::new();
 
         let opened = client
@@ -1420,6 +1509,8 @@ mod write_auth {
             .unwrap()
             .to_string();
 
+        // Push the session past the eviction boundary, then send a chunk.
+        age_sessions(&uploads, UPLOAD_SESSION_TTL + Duration::from_secs(60));
         let patched = client
             .patch(format!("{base}{location}"))
             .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
@@ -1433,8 +1524,8 @@ mod write_auth {
             "an in-flight chunk must be accepted"
         );
 
-        // Opening a second session runs the sweep; the first is mid-transfer and
-        // must survive it.
+        // Opening a second session runs the sweep. The first is only safe if the
+        // PATCH above reset its clock.
         client
             .post(format!("{base}/v2/other-app/blobs/uploads/"))
             .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
@@ -1452,7 +1543,53 @@ mod write_auth {
         assert_eq!(
             still_there.status().as_u16(),
             202,
-            "the sweep must not evict a session that is still being patched"
+            "the PATCH must have refreshed the TTL, so the sweep must not evict it"
+        );
+    }
+
+    // The other half: a session that is NOT patched past the boundary really is
+    // swept, and the client learns via 404 rather than silently succeeding.
+    // Together with the test above this pins both directions of the mechanism.
+    #[tokio::test]
+    async fn an_aged_session_is_swept_and_its_next_chunk_404s() {
+        let (base, uploads, _dir) = spawn_with_uploads().await;
+        let client = reqwest::Client::new();
+
+        let opened = client
+            .post(format!("{base}/v2/my-app/blobs/uploads/"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .send()
+            .await
+            .unwrap();
+        let location = opened
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        age_sessions(&uploads, UPLOAD_SESSION_TTL + Duration::from_secs(60));
+
+        // No PATCH this time - the sweep on the next POST should reclaim it.
+        client
+            .post(format!("{base}/v2/other-app/blobs/uploads/"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .send()
+            .await
+            .unwrap();
+
+        let gone = client
+            .patch(format!("{base}{location}"))
+            .basic_auth(WRITE_USERNAME, Some(WRITE_TOKEN))
+            .body(b"chunk".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            gone.status().as_u16(),
+            404,
+            "an abandoned session must be reclaimed, and its next chunk rejected"
         );
     }
 }
