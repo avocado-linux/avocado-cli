@@ -487,12 +487,16 @@ async fn patch_route(
     };
 
     let start = session.upload.written();
-    if let Err(resp) = stream_into(body, &mut session.upload).await {
-        return resp;
-    }
+    let streamed = stream_into(body, &mut session.upload).await;
+    // Re-insert on BOTH paths. Taking the session out of the map is what keeps a
+    // concurrent sweep from reclaiming it mid-transfer, but returning early on an
+    // error would drop the `BlobUpload` here - unlinking the staging file and
+    // every chunk already accepted. The buffered implementation got resumability
+    // for free: the `Bytes` extractor rejected a truncated body before the
+    // handler ran, so the session and its bytes survived and `Range` told the
+    // client where to continue. Streaming has to restore that explicitly, or a
+    // dropped connection on chunk 6 of 8 restarts the layer from byte 0.
     let end = session.upload.written();
-    // A session that is still receiving chunks is not abandoned, however long
-    // the whole transfer takes on a slow link.
     session.touched = Instant::now();
     state
         .uploads
@@ -500,6 +504,9 @@ async fn patch_route(
         .lock()
         .expect("upload sessions mutex is not poisoned")
         .insert(uuid.clone(), session);
+    if let Err(resp) = streamed {
+        return resp;
+    }
     upload_range_accepted(&name, &uuid, start, end)
 }
 
@@ -549,8 +556,17 @@ async fn put_route(
                 "upload session unknown",
             );
         };
-        // The PUT may carry a final chunk of its own.
+        // The PUT may carry a final chunk of its own. On a truncated one, put the
+        // session back rather than discarding every previously accepted chunk -
+        // the client can retry the finalize against the same Location.
         if let Err(resp) = stream_into(body, &mut session.upload).await {
+            session.touched = Instant::now();
+            state
+                .uploads
+                .inner
+                .lock()
+                .expect("upload sessions mutex is not poisoned")
+                .insert(uuid.clone(), session);
             return resp;
         }
         return finish_upload(&name, digest, session.upload);
@@ -678,6 +694,14 @@ fn store_error(err: &StoreError) -> Response {
         StoreError::InvalidTag(_) => {
             oci_error(StatusCode::BAD_REQUEST, "TAG_INVALID", "invalid tag")
         }
+        // A real OCI error the engine can act on, not a bare axum rejection:
+        // 413 with BLOB_UPLOAD_INVALID tells the client the layer is too big
+        // rather than leaving it to guess from a closed connection.
+        StoreError::BlobTooLarge { .. } => oci_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BLOB_UPLOAD_INVALID",
+            "blob exceeds the registry's size ceiling",
+        ),
         StoreError::NoHome | StoreError::Io(_) | StoreError::PruneWhilePulling => oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
@@ -1525,6 +1549,117 @@ mod write_auth {
                 .finish("sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap(),
             "a mismatched digest must be rejected"
+        );
+    }
+
+    // A mid-transfer failure must leave the session resumable.
+    //
+    // The buffered implementation got this for free: the `Bytes` extractor
+    // rejected a truncated body before the handler ran, so the session and its
+    // accepted chunks survived and `Range` told the client where to resume.
+    // Streaming takes the session OUT of the map to protect it from a concurrent
+    // sweep, which means an early return drops it - unlinking the staging file and
+    // every chunk already accepted, so the layer restarts from byte 0. Fails if
+    // the error-path re-insert is removed.
+    //
+    // Driven through `oneshot` with a body stream that errors, rather than a real
+    // truncated request: a short HTTP body just makes the server wait for bytes
+    // that never arrive, which hangs instead of failing.
+    #[tokio::test]
+    async fn a_failed_chunk_stream_leaves_the_session_resumable() {
+        use axum::body::Bytes;
+        use base64::Engine as _;
+        use tower::ServiceExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
+        let uploads = Arc::new(UploadSessions::default());
+        let router =
+            write_router_with_uploads(store, WriteToken::new(WRITE_TOKEN), uploads.clone());
+
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("{WRITE_USERNAME}:{WRITE_TOKEN}"));
+        let auth = format!("Basic {creds}");
+
+        // Open a session and land one good chunk.
+        let opened = router
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/v2/my-app/blobs/uploads/")
+                    .header(header::AUTHORIZATION, &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(opened.status().as_u16(), 202);
+        let location = opened
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let first = router
+            .clone()
+            .oneshot(
+                axum::http::Request::patch(&location)
+                    .header(header::AUTHORIZATION, &auth)
+                    .body(Body::from(vec![0x11u8; 4096]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status().as_u16(), 202);
+        assert_eq!(
+            uploads.inner.lock().unwrap().len(),
+            1,
+            "the session should be live after a good chunk"
+        );
+
+        // Now a chunk whose stream fails partway - the transport failure this
+        // guards against.
+        let failing = Body::from_stream(futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(&[0x22u8; 2048])),
+            Err(std::io::Error::other("connection reset mid-chunk")),
+        ]));
+        let broken = router
+            .clone()
+            .oneshot(
+                axum::http::Request::patch(&location)
+                    .header(header::AUTHORIZATION, &auth)
+                    .body(failing)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            broken.status().as_u16(),
+            400,
+            "a failed stream should be reported to the client"
+        );
+
+        // The decisive assertion: the session survived, so the client can resume
+        // instead of restarting the layer.
+        assert_eq!(
+            uploads.inner.lock().unwrap().len(),
+            1,
+            "the session must survive a failed chunk stream, not be discarded"
+        );
+        let resumed = router
+            .oneshot(
+                axum::http::Request::patch(&location)
+                    .header(header::AUTHORIZATION, &auth)
+                    .body(Body::from(vec![0x33u8; 4096]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.status().as_u16(),
+            202,
+            "a resumed chunk must be accepted, not 404 BLOB_UPLOAD_UNKNOWN"
         );
     }
 

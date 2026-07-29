@@ -40,10 +40,25 @@ pub enum StoreError {
     /// `prune` was invoked while a device pull was still in flight.
     #[error("prune refused: a device is mid-pull")]
     PruneWhilePulling,
+    /// A streamed blob grew past [`MAX_BLOB_BYTES`].
+    #[error("blob exceeds the {limit}-byte ceiling (reached {attempted} bytes)")]
+    BlobTooLarge { limit: u64, attempted: u64 },
     /// An underlying filesystem operation failed.
     #[error(transparent)]
     Io(#[from] io::Error),
 }
+
+/// Ceiling on a single streamed blob.
+///
+/// Not a memory bound - blobs stream to disk and are never held whole. This
+/// bounds DISK, which streaming otherwise left completely unbounded: without it
+/// a write-token holder can PATCH forever, or an accidental oversized layer can
+/// fill the filesystem and take down every process on the host. 32 GiB is far
+/// above any layer a dev loop produces and far below a disk-filling one.
+///
+/// It also bounds the read side as a side effect: `serve_blob` still loads a blob
+/// whole to serve it, so a blob that cannot be stored cannot later OOM the pull.
+pub const MAX_BLOB_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 /// A per-project content-addressed blob store.
 ///
@@ -245,7 +260,42 @@ impl BlobStore {
         if self.pulls_in_flight() > 0 {
             return Err(StoreError::PruneWhilePulling);
         }
+        // Sweep abandoned staging files too. `collect_garbage` walks `blobs/`
+        // only, so nothing in the tree ever looked at `uploads/`. A `NamedTempFile`
+        // unlinks itself on drop, which covers a clean exit and nothing else: an
+        // `up` SIGKILLed mid-push (OOM reaper, power loss) leaves its partial
+        // layer there permanently, and `prune` used to report "swept 0" while
+        // gigabytes sat in a directory the user had to find by hand.
+        // Callers that want to report the reclaimed count call `sweep_uploads`
+        // directly; `prune`'s return stays a digest list, since a staging file was
+        // never content-addressed and has no digest to name.
+        self.sweep_uploads()?;
         self.collect_garbage()
+    }
+
+    /// Remove every staged upload file, returning how many were reclaimed.
+    ///
+    /// Safe to call from `prune` because `prune` already refused to run with a
+    /// pull in flight, and a staging file belonging to a live upload is held by a
+    /// session in the write router's map - which only exists while `up` is
+    /// running, the same process that would be serving that pull.
+    pub fn sweep_uploads(&self) -> Result<usize, StoreError> {
+        let dir = self.root.join("uploads");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Never opened an upload in this project: nothing to sweep.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// The set of blob digests reachable from any currently-set tag.
@@ -355,8 +405,28 @@ pub struct BlobUpload {
 }
 
 impl BlobUpload {
-    /// Append a chunk.
+    /// Append a chunk, refusing to grow the staged blob past
+    /// [`MAX_BLOB_BYTES`].
+    ///
+    /// Streaming removed the accidental ceiling the old buffered path had - a
+    /// request over the body limit was rejected with nothing written - and
+    /// replaced it with none at all. Without a cap, a holder of the write token
+    /// (on the VM push path, the QEMU guest) can PATCH indefinitely across as
+    /// many sessions as it likes and fill the filesystem, taking every process
+    /// on the host down with it. An honest oversized layer from a bad `COPY`
+    /// reaches the same place by accident.
+    ///
+    /// Enforced here rather than in the handler because this is the one funnel
+    /// every write goes through: monolithic POST, chunked PATCH, and the final
+    /// PUT chunk all land on `append`.
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let would_be = self.written.saturating_add(bytes.len() as u64);
+        if would_be > MAX_BLOB_BYTES {
+            return Err(StoreError::BlobTooLarge {
+                limit: MAX_BLOB_BYTES,
+                attempted: would_be,
+            });
+        }
         self.file.write_all(bytes)?;
         self.hasher.update(bytes);
         self.written += bytes.len() as u64;
@@ -479,6 +549,61 @@ mod tests {
 
     fn store_in(dir: &TempDir, project: &str) -> BlobStore {
         BlobStore::at(dir.path(), project).expect("store opens")
+    }
+
+    // Streaming removed the accidental size ceiling the buffered path had and
+    // replaced it with none at all, so a write-token holder - or an accidental
+    // oversized layer - could fill the filesystem. Fails if the cap in `append`
+    // is removed.
+    #[test]
+    fn append_refuses_to_grow_a_blob_past_the_ceiling() {
+        let dir = TempDir::new().unwrap();
+        let store = store_in(&dir, "proj");
+        let mut upload = store.begin_blob_upload().expect("upload opens");
+
+        // Pretend most of the ceiling is already staged so one ordinary chunk
+        // crosses it, asserting the boundary without writing 32 GiB.
+        upload.written = MAX_BLOB_BYTES - 8;
+        upload
+            .append(&[0u8; 8])
+            .expect("landing exactly on the ceiling is allowed");
+        assert_eq!(upload.written(), MAX_BLOB_BYTES);
+
+        let err = upload
+            .append(&[0u8; 1])
+            .expect_err("one byte past the ceiling must be refused");
+        assert!(
+            matches!(err, StoreError::BlobTooLarge { .. }),
+            "expected BlobTooLarge, got {err:?}"
+        );
+    }
+
+    // Nothing in the tree ever looked at `uploads/`, so an `up` killed mid-push
+    // left its partial layer on disk permanently while `prune` reported sweeping
+    // nothing. Fails if the sweep is removed from `prune`.
+    #[test]
+    fn prune_reclaims_a_staging_file_left_by_a_killed_upload() {
+        let dir = TempDir::new().unwrap();
+        let store = store_in(&dir, "proj");
+
+        // An upload that never finished and never dropped cleanly - leaking the
+        // handle stops `NamedTempFile`'s unlink-on-drop, which is what SIGKILL
+        // does.
+        let mut upload = store.begin_blob_upload().expect("upload opens");
+        upload.append(&[0xabu8; 4096]).unwrap();
+        std::mem::forget(upload);
+
+        let uploads = store.root().join("uploads");
+        let staged = std::fs::read_dir(&uploads).unwrap().count();
+        assert_eq!(staged, 1, "the staging file should be on disk");
+
+        store.prune().expect("prune succeeds");
+
+        let left = std::fs::read_dir(&uploads).unwrap().count();
+        assert_eq!(
+            left, 0,
+            "prune must reclaim abandoned staging files, {left} left"
+        );
     }
 
     /// Count regular files under the store's `blobs/` tree.

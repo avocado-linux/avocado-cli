@@ -179,6 +179,30 @@ impl DevUpCommand {
         let lock_path = session_lock_path(&store);
         let _session_lock = SessionLock::acquire(&lock_path)?;
 
+        // Publish OUR pid the instant the lock is ours, before any of the slow
+        // work below. Moving the lock to the top of `up` decoupled it from the
+        // state file, and that reopened the hazard the lock exists to close: a
+        // predecessor SIGKILLed before its teardown leaves its pid in
+        // `session.json`, so between acquiring the lock here and writing the
+        // record after the binds and the SSH, `load_live_session` would report
+        // the session live while handing out a DEAD pid. `sync` would then send
+        // SIGUSR1 - default disposition terminate - to whatever recycled that
+        // number. Overwriting the record now restores the invariant that a live
+        // lock implies the recorded pid is the holder's; the fuller status is
+        // written again once the listeners are up.
+        write_session_state(
+            &state_path,
+            &SessionState {
+                pid: std::process::id(),
+                status: DevStatus {
+                    registry_running: false,
+                    watcher_running: false,
+                    last_sync: None,
+                    devices: Vec::new(),
+                },
+            },
+        )?;
+
         // Source the device SSH target: needed to deliver the bootstrap and, when
         // no host override is set, to auto-detect the reachable host IP.
         let device_spec = std::env::var(DEVICE_ENV)

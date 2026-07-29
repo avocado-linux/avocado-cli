@@ -86,5 +86,9 @@ rcgen = { version = "0.13", default-features = false, features = [
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
+# `oneshot` drives the write router directly, so a body stream that ERRORS can be
+# injected deterministically - a truncated real HTTP body just makes the server
+# wait for bytes that never arrive.
+tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 serial_test = "3.0"
