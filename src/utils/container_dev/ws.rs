@@ -430,16 +430,26 @@ impl ControlServer {
         // clean close, send error, or unwind - rather than at one hand-placed
         // removal that a later `return` could route around.
         let mut _arch_lease: Option<DeviceArchLease> = None;
+        // This connection's device architecture, learned from its `hello`. The
+        // broadcast arm below needs it: `reconcile` filters on arch, but a frame
+        // fanned out by `notify` never goes through `reconcile`, so without this
+        // the pre-hello hole stays open for any device that connects DURING a
+        // push - the guard snapshots an empty device book before pushing, and the
+        // device that arrives mid-push receives the Sync on its broadcast arm.
+        let mut device_arch: Option<DeviceArch> = None;
         loop {
             tokio::select! {
                 incoming = ws.next() => match incoming {
                     Some(Ok(msg)) => {
-                        if let Some((frames, lease)) = self.on_device_message(&msg) {
+                        if let Some((frames, lease, arch)) = self.on_device_message(&msg) {
                             // A reconnecting device re-leases; replacing the old
                             // guard here drops it, which is correct because it
                             // belonged to this same session.
                             if lease.is_some() {
                                 _arch_lease = lease;
+                            }
+                            if arch.is_some() {
+                                device_arch = arch;
                             }
                             for frame in frames {
                                 ws.send(encode(&frame)?).await?;
@@ -450,12 +460,53 @@ impl ControlServer {
                     Some(Err(_)) | None => return Ok(()),
                 },
                 host = broadcasts.recv() => match host {
-                    Ok(frame) => ws.send(encode(&frame)?).await?,
+                    Ok(frame) => {
+                        if self.frame_suits_device(&frame, device_arch.as_ref()) {
+                            ws.send(encode(&frame)?).await?;
+                        }
+                    }
                     // Lagged past the buffer: skip the missed frames, keep serving.
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 },
             }
+        }
+    }
+
+    /// Whether `frame` may be sent to a device reporting `device_arch`.
+    ///
+    /// The arch check has to happen on the FAN-OUT, not only in `reconcile`.
+    /// `notify` broadcasts to every subscriber, and a device that connects during
+    /// a push reconciles against a desired map the push has not written yet - so
+    /// it gets no reconcile frames, then receives the broadcast one directly. That
+    /// is the same pre-hello window the recorded image arch exists to close,
+    /// reached by the other path.
+    ///
+    /// Refuses only a positive mismatch: an unrecorded image arch, or a device
+    /// that has not said hello yet, passes through unchanged.
+    fn frame_suits_device(&self, frame: &HostFrame, device_arch: Option<&DeviceArch>) -> bool {
+        let HostFrame::Sync { image, tag, .. } = frame;
+        let Some(device_arch) = device_arch else {
+            return true;
+        };
+        let reference = if tag.is_empty() {
+            image.clone()
+        } else {
+            format!("{image}:{tag}")
+        };
+        match self.image_arches.arch_for(&reference) {
+            Some(image_arch) if image_arch != *device_arch => {
+                print_warning(
+                    &format!(
+                        "not broadcasting `{reference}` (built for {}) to a device reporting {}",
+                        image_arch.as_str(),
+                        device_arch.as_str(),
+                    ),
+                    OutputLevel::Normal,
+                );
+                false
+            }
+            _ => true,
         }
     }
 
@@ -466,7 +517,7 @@ impl ControlServer {
     fn on_device_message(
         &self,
         msg: &Message,
-    ) -> Option<(Vec<HostFrame>, Option<DeviceArchLease>)> {
+    ) -> Option<(Vec<HostFrame>, Option<DeviceArchLease>, Option<DeviceArch>)> {
         let text = msg.to_text().ok()?;
         let frame: DeviceFrame = serde_json::from_str(text).ok()?;
         match frame {
@@ -478,7 +529,8 @@ impl ControlServer {
                 let lease = self.arch_book.record_session(&hello.device_id, &hello.arch);
                 // Reconcile the reported running_digest against the desired state.
                 let frames = self.desired.lock().unwrap().reconcile(&hello);
-                Some((frames, Some(lease)))
+                let arch = DeviceArch::parse(&hello.arch);
+                Some((frames, Some(lease), Some(arch)))
             }
             // Progress/Status are informational; no host response.
             DeviceFrame::Progress(_) | DeviceFrame::Status(_) => None,
@@ -965,6 +1017,62 @@ mod tests {
             1,
             "a matching-arch device must still be synced: {frames:?}"
         );
+    }
+
+    // The broadcast leg needs the same arch filter `reconcile` has.
+    //
+    // `reconcile` only runs on a `hello`. A device that connects DURING a push
+    // reconciles against a desired map the push has not written yet - so it gets
+    // no frames - and then receives the pushed Sync directly on its broadcast
+    // arm. That reaches the same pre-hello hole from the other side. Fails if
+    // `frame_suits_device` stops filtering.
+    #[test]
+    fn a_broadcast_frame_is_withheld_from_a_wrong_arch_device() {
+        let images = ImageArchBook::new();
+        images.record_image("my-app:dev", DeviceArch::parse("amd64"));
+        let server = ControlServer::new(
+            ReadToken::new(READ_TOKEN),
+            DesiredState::default(),
+            HelloArchBook::new(),
+            images,
+        );
+
+        let frame = HostFrame::Sync {
+            image: "my-app".to_string(),
+            tag: "dev".to_string(),
+            digest: "sha256:amd64only".to_string(),
+        };
+
+        assert!(
+            !server.frame_suits_device(&frame, Some(&DeviceArch::parse("aarch64"))),
+            "an amd64 image must not be broadcast to an aarch64 device"
+        );
+        assert!(
+            server.frame_suits_device(&frame, Some(&DeviceArch::parse("x86_64"))),
+            "a matching device must still receive it"
+        );
+        assert!(
+            server.frame_suits_device(&frame, None),
+            "a device that has not said hello yet must not be filtered out"
+        );
+    }
+
+    // An image the guard never probed must still fan out, or an unprobed entry
+    // would silently stop reaching every device.
+    #[test]
+    fn a_broadcast_frame_for_an_unprobed_image_is_sent() {
+        let server = ControlServer::new(
+            ReadToken::new(READ_TOKEN),
+            DesiredState::default(),
+            HelloArchBook::new(),
+            ImageArchBook::new(),
+        );
+        let frame = HostFrame::Sync {
+            image: "my-app".to_string(),
+            tag: "dev".to_string(),
+            digest: "sha256:unprobed".to_string(),
+        };
+        assert!(server.frame_suits_device(&frame, Some(&DeviceArch::parse("aarch64"))));
     }
 
     // An entry with no recorded arch is passed through: entries derived from the
