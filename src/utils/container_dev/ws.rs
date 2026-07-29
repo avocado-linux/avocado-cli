@@ -251,9 +251,9 @@ impl DesiredState {
                         &format!(
                             "refusing to sync `{image}` (built for {}) to device `{}` \
                              (reports {}): rebuild for the device platform",
-                            image_arch.as_str(),
-                            hello.device_id,
-                            device_arch.as_str(),
+                            sanitize_device_text(image_arch.as_str()),
+                            sanitize_device_text(&hello.device_id),
+                            sanitize_device_text(device_arch.as_str()),
                         ),
                         OutputLevel::Normal,
                     );
@@ -268,6 +268,37 @@ impl DesiredState {
             })
             .collect()
     }
+}
+
+/// Render device-supplied text safe to print to a terminal.
+///
+/// `print_warning` is a bare `println!` with an ANSI prefix and no escaping, and
+/// both `device_id` and `arch` come straight off the wire - `DeviceArch::parse`
+/// falls through to the raw lowercased input for anything it does not recognize.
+/// A device holding the read token (every device does) could put `ESC[2K\r` and a
+/// forged green success line in its `device_id` and overwrite the refusal warning
+/// on the operator's terminal, so a refused sync would read as a completed one.
+///
+/// Keeps printable ASCII and replaces everything else, so the warning stays
+/// readable while carrying no control sequence. Truncated because the field is
+/// attacker-sized as well as attacker-valued.
+fn sanitize_device_text(raw: &str) -> String {
+    const MAX: usize = 64;
+    let mut out: String = raw
+        .chars()
+        .take(MAX)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    if raw.chars().count() > MAX {
+        out.push('…');
+    }
+    out
 }
 
 /// The control-WS server: authenticates each upgrade through the shared
@@ -499,8 +530,8 @@ impl ControlServer {
                 print_warning(
                     &format!(
                         "not broadcasting `{reference}` (built for {}) to a device reporting {}",
-                        image_arch.as_str(),
-                        device_arch.as_str(),
+                        sanitize_device_text(image_arch.as_str()),
+                        sanitize_device_text(device_arch.as_str()),
                     ),
                     OutputLevel::Normal,
                 );
@@ -1016,6 +1047,34 @@ mod tests {
             frames.len(),
             1,
             "a matching-arch device must still be synced: {frames:?}"
+        );
+    }
+
+    // A device controls both `device_id` and (via the parse fall-through) `arch`,
+    // and the warning path is a bare println with an ANSI prefix. Control bytes
+    // must not survive into it: a forged `ESC[2K\r` plus a green success line
+    // would overwrite the refusal on the operator's terminal, so a refused sync
+    // would read as a completed one. Fails if the sanitizer stops stripping.
+    #[test]
+    fn device_supplied_text_cannot_carry_control_sequences() {
+        let forged = "dev\x1b[2K\r\x1b[32m[OK] synced successfully";
+        let safe = sanitize_device_text(forged);
+
+        assert!(!safe.contains('\x1b'), "ESC must not survive: {safe:?}");
+        assert!(!safe.contains('\r'), "CR must not survive: {safe:?}");
+        assert!(!safe.contains('\n'), "LF must not survive: {safe:?}");
+        assert!(
+            safe.starts_with("dev"),
+            "printable text should still be readable: {safe:?}"
+        );
+
+        // Attacker-sized as well as attacker-valued.
+        let long = "a".repeat(500);
+        let capped = sanitize_device_text(&long);
+        assert!(
+            capped.chars().count() <= 65,
+            "must be truncated, got {} chars",
+            capped.chars().count()
         );
     }
 

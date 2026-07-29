@@ -59,23 +59,24 @@ const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
 /// How long an upload session may sit untouched before it is evicted.
 ///
-/// Bounds how long a killed `docker push` can pin its buffer in host memory.
+/// Bounds how long an abandoned push can hold a staging file open. An upload that
+/// is never finalized - an interrupted push, a killed `docker` - leaves a session
+/// in the map with a `NamedTempFile` behind it; eviction drops the session, which
+/// unlinks the file.
 ///
-/// What "untouched" means here is narrower than it looks, and the earlier
-/// wording of this comment was wrong about it. `touched` is refreshed by
-/// [`patch_route`], which runs only AFTER axum's `Bytes` extractor has buffered
-/// that chunk in full - so the clock advances between chunks, not during one.
-/// A push that sends a layer as a single large PATCH keeps `touched` pinned at
-/// the POST timestamp for the whole transfer, and [`evict_expired`] sweeps the
-/// whole map rather than one repo, so a concurrent layer's POST can evict it
-/// mid-flight; the PATCH then finds its session gone and returns
-/// `404 BLOB_UPLOAD_UNKNOWN` after the client already paid for the transfer.
+/// What "untouched" means, precisely: `touched` is refreshed on every `PATCH` and
+/// on the finalizing `PUT`. Both handlers take the session OUT of the map for the
+/// duration of the transfer, so `evict_expired` cannot see a session that is
+/// actively being streamed into at all - a slow transfer is not evictable, however
+/// long it runs, and the only sessions the sweep can reach are ones no request is
+/// touching.
 ///
-/// The residual is bounded but real: reaching it needs a single request slower
-/// than this TTL, i.e. roughly 28 Mbit/s for a 2 GiB layer, which is well under
-/// loopback and normally under SLIRP. Closing it properly needs the session
-/// marked in-flight at request receipt rather than after buffering, which is a
-/// middleware, not a constant.
+/// This replaces an earlier comment describing the buffered implementation, whose
+/// premises this path no longer has: there is no `Bytes` extractor buffering a
+/// chunk before the handler runs, no in-flight session visible to the sweep, and
+/// no request-size limit to derive a throughput bound from. The resource at risk
+/// is disk, not memory - see [`crate::utils::container_dev::store::MAX_BLOB_BYTES`]
+/// for the ceiling that bounds it.
 const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(600);
 
 /// Upper bound on a manifest body.
@@ -252,16 +253,15 @@ impl UploadSession {
 /// In-flight chunked-upload sessions, keyed by upload UUID.
 ///
 /// The OCI blob-upload protocol is stateful: `POST` opens a session, `PATCH`
-/// appends chunks, and `PUT` finalizes with the expected digest. The buffered
-/// bytes live here until finalization writes them into the content-addressed
-/// store. Dev-loop scale (a handful of layers per push) keeps in-memory
-/// buffering acceptable.
+/// appends chunks, and `PUT` finalizes with the expected digest. A session holds a
+/// [`BlobUpload`] staging the bytes on disk and hashing them incrementally, so no
+/// layer is ever held whole in memory.
 ///
-/// Nothing in the protocol obliges a client to finish what it starts, though: a
-/// `POST` followed by `PATCH`es and no `PUT` — an interrupted push, a killed
-/// `docker` — abandons its buffer here. Without eviction those accumulate for
-/// the whole life of an `up` session, so repeated interrupted pushes grow host
-/// memory without bound. [`UploadSessions::evict_expired`] reclaims them.
+/// Nothing in the protocol obliges a client to finish what it starts: a `POST`
+/// followed by `PATCH`es and no `PUT` - an interrupted push, a killed `docker` -
+/// abandons its staging file here. [`evict_expired`] reclaims those, and
+/// `BlobStore::sweep_uploads` catches the ones whose process died before any
+/// eviction could run.
 #[derive(Default)]
 struct UploadSessions {
     inner: Mutex<HashMap<String, UploadSession>>,
@@ -1528,27 +1528,70 @@ mod write_auth {
         );
     }
 
-    // The bytes must reach the store without ever being held whole in memory.
-    // Asserted structurally: the staging file grows as chunks arrive, which is
-    // only true if the handler writes through rather than accumulating.
+    // The bytes must reach DISK as chunks arrive, not accumulate in memory.
+    //
+    // The previous version of this asserted `upload.written()` - a plain u64
+    // counter incremented in `append` - and claimed that proved write-through. It
+    // did not: rewriting `BlobUpload` to accumulate into a `Vec<u8>` and only
+    // `write_all` inside `finish()` reintroduces exactly the whole-layer-in-memory
+    // behaviour this round removed, and `written`/`hasher` update identically, so
+    // the assertion passed unchanged.
+    //
+    // Stat the staging file mid-upload instead. That is the property, and it is
+    // the one a Vec-accumulating implementation cannot fake.
     #[test]
-    fn an_upload_stages_to_disk_not_memory() {
+    fn an_upload_writes_each_chunk_through_to_disk() {
         let dir = TempDir::new().unwrap();
         let store = BlobStore::at(dir.path(), "proj").expect("store opens");
         let mut upload = store.begin_blob_upload().expect("upload opens");
 
-        upload.append(&[1u8; 4096]).unwrap();
-        assert_eq!(upload.written(), 4096);
-        upload.append(&[2u8; 4096]).unwrap();
-        assert_eq!(upload.written(), 8192);
+        let uploads = store.root().join("uploads");
+        let staged = || -> u64 {
+            std::fs::read_dir(&uploads)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|e| e.metadata().ok())
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
 
-        // A digest that does not match what was written must be refused, and
-        // must not leave a blob behind.
+        upload.append(&[1u8; 4096]).unwrap();
+        let after_first = staged();
+        assert_eq!(
+            after_first, 4096,
+            "the first chunk must be on disk before finish(), found {after_first} bytes"
+        );
+
+        upload.append(&[2u8; 4096]).unwrap();
+        let after_second = staged();
+        assert_eq!(
+            after_second, 8192,
+            "the staging file must GROW as chunks arrive, found {after_second} bytes"
+        );
+    }
+
+    // A mismatched digest must be refused AND leave no blob behind. Split from the
+    // test above, which previously asserted both in one body.
+    #[test]
+    fn a_mismatched_digest_is_refused_and_stores_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = BlobStore::at(dir.path(), "proj").expect("store opens");
+        let mut upload = store.begin_blob_upload().expect("upload opens");
+        upload.append(&[7u8; 128]).unwrap();
+
+        let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         assert!(
-            !upload
-                .finish("sha256:0000000000000000000000000000000000000000000000000000000000000000")
-                .unwrap(),
+            !upload.finish(wrong).unwrap(),
             "a mismatched digest must be rejected"
+        );
+        assert_eq!(
+            store.blob_size(wrong).unwrap(),
+            None,
+            "the rejected upload must leave no blob behind"
         );
     }
 

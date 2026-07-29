@@ -242,9 +242,6 @@ fn check_arch_allows_a_uname_vs_goarch_match() {
     .expect("a uname/GOARCH-equivalent arch must pass the guard");
 }
 
-// ---- assertion 4: `up`'s wiring shares ONE book between the control server
-//      that fills it and the guard that reads it ----
-
 // ---- assertion 5: a device that disconnects stops constraining the guard ----
 
 /// Within one `up`, a developer tests against an aarch64 board, unplugs it, and
@@ -347,8 +344,13 @@ fn pinned_ca_connector(ca_cert_pem: &str) -> tokio_tungstenite::Connector {
 /// This drives the real path: a device sends a `Hello` over the control WS, the
 /// server records its arch, and the guard - holding only a clone of the book it
 /// was constructed with - refuses a mismatched image it never saw recorded.
-/// Making `HelloArchBook::clone` a deep clone, or unwiring the guard in `up`,
-/// fails here.
+/// Making `HelloArchBook::clone` a deep clone fails here.
+///
+/// Unwiring the guard in `up` does NOT - this test builds the `ControlServer` and
+/// `ArchGuardSyncer` itself and clones the book by hand, so it verifies the
+/// sharing semantics the wiring depends on, not the wiring. Nothing in the suite
+/// exercises `DevUpCommand`, so changing `up` to hand the guard a fresh book
+/// would leave every test green. That gap is real and unclosed.
 #[tokio::test]
 async fn a_hello_recorded_by_the_control_server_is_visible_to_the_guard() {
     use avocado_cli::utils::container_dev::tls::DevSession;

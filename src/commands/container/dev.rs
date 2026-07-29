@@ -38,6 +38,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpListener;
@@ -757,6 +758,14 @@ fn try_flock(file: &std::fs::File, flag: libc::c_int) -> Result<bool> {
     }
 }
 
+/// How long `up` waits for the session lock before declaring a competing `up`.
+///
+/// Long enough to outlast the liveness probe's shared hold (microseconds), short
+/// enough that a genuine collision is reported promptly rather than hanging.
+const LOCK_ACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Gap between acquire attempts within [`LOCK_ACQUIRE_WAIT`].
+const LOCK_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Take the exclusive lock (`up`'s ownership claim).
 #[cfg(unix)]
 fn try_lock_exclusive(file: &std::fs::File) -> Result<bool> {
@@ -810,13 +819,30 @@ impl SessionLock {
             .truncate(false)
             .open(path)
             .with_context(|| format!("opening the session lock at {path:?}"))?;
-        if !try_lock_exclusive(&file)? {
-            bail!(
-                "another `avocado container dev up` is already running for this project; \
-                 run `avocado container dev down` first"
-            );
+        // Retry briefly instead of failing on the first EWOULDBLOCK. `LOCK_EX`
+        // conflicts with a held `LOCK_SH` just as it does with another `LOCK_EX`,
+        // so the read-only liveness probe - which holds a shared lock for
+        // microseconds - could make a legitimate `up` abort with "another `up` is
+        // already running" when none was. Switching the probe to shared fixed
+        // probe-vs-probe only; this is what fixes probe-vs-up.
+        //
+        // The wait separates the two cases on duration rather than guessing: a
+        // probe's hold is over almost immediately, while a real competing `up`
+        // holds the lock for its entire lifetime and will still be holding it
+        // when the window expires.
+        let deadline = Instant::now() + LOCK_ACQUIRE_WAIT;
+        loop {
+            if try_lock_exclusive(&file)? {
+                return Ok(Self { _file: file });
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "another `avocado container dev up` is already running for this project; \
+                     run `avocado container dev down` first"
+                );
+            }
+            std::thread::sleep(LOCK_ACQUIRE_POLL);
         }
-        Ok(Self { _file: file })
     }
 }
 
@@ -1105,21 +1131,116 @@ mod tests {
         assert!(!session_is_live(&dir.path().join("absent.lock")).unwrap());
     }
 
-    /// The probe must not disturb the thing it observes. An exclusive probe
-    /// would make a concurrent `up`'s own acquire fail with "another `up` is
-    /// already running", and would serialize two concurrent probes.
+    /// The probe must not disturb the thing it observes.
+    ///
+    /// This needs TWO CONCURRENT holders to mean anything, which is what the
+    /// earlier version of this test lacked: it ran two sequential probes plus an
+    /// acquire on one thread, and `session_is_live` drops its `File` (releasing
+    /// the flock) on every return - so every assertion passed with `LOCK_EX`
+    /// restored, leaving the whole shared-lock mechanism unverified.
+    ///
+    /// Holds a real shared lock open across the acquire instead. `LOCK_EX`
+    /// conflicts with a held `LOCK_SH`, so without the bounded retry in
+    /// `acquire` this is exactly the case that made a legitimate `up` abort while
+    /// an IDE task polled `status`.
     #[test]
-    fn probing_does_not_block_a_subsequent_acquire() {
+    fn a_concurrent_probe_does_not_make_up_abort() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("session.lock");
         std::fs::write(&lock, "").unwrap();
 
-        // Two probes in a row, then an acquire: none of them may be refused.
-        assert!(!session_is_live(&lock).unwrap());
-        assert!(!session_is_live(&lock).unwrap());
-        let held = SessionLock::acquire(&lock)
-            .expect("a probe must not leave a lock behind that blocks `up`");
-        drop(held);
+        // Two concurrent shared holders coexist - the half that switching the
+        // probe to LOCK_SH did fix.
+        let probe = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        assert!(try_lock_shared(&probe).unwrap());
+        let probe2 = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        assert!(
+            try_lock_shared(&probe2).unwrap(),
+            "two concurrent probes must not block each other"
+        );
+        drop(probe);
+        drop(probe2);
+
+        // Now the half it did NOT fix. A probe holds its shared lock briefly, as
+        // `session_is_live` does - open, flock, drop - and `up` starts while it is
+        // held. `LOCK_EX` conflicts with a held `LOCK_SH`, so without the bounded
+        // retry `acquire` fails on the first EWOULDBLOCK and reports a competing
+        // `up` that does not exist.
+        let holding = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        assert!(try_lock_shared(&holding).unwrap());
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            drop(holding);
+        });
+
+        let held = SessionLock::acquire(&lock);
+        releaser.join().unwrap();
+        assert!(
+            held.is_ok(),
+            "a transient probe must not make `up` report a competing `up`: {:?}",
+            held.err()
+        );
+    }
+
+    /// `session_is_live` must not report a live session merely because ANOTHER
+    /// probe is reading at the same instant.
+    ///
+    /// This is the assertion that actually distinguishes `LOCK_SH` from
+    /// `LOCK_EX`, and its absence is why the mechanism went unverified: with an
+    /// exclusive probe, a concurrent shared holder makes the flock fail, and
+    /// `session_is_live` maps that failure to "someone holds it" - a FALSE
+    /// POSITIVE. `status` would report a session running with no `up` alive, and
+    /// `down`/`sync` would then signal whatever pid the stale record carried.
+    #[test]
+    fn a_concurrent_probe_does_not_make_the_session_look_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("session.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        // Another probe reading concurrently - nobody owns the session.
+        let other = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        assert!(try_lock_shared(&other).unwrap());
+
+        assert!(
+            !session_is_live(&lock).unwrap(),
+            "a concurrent reader must not be mistaken for a live `up`"
+        );
+
+        drop(other);
+        // And the true-positive direction still holds.
+        let _held = SessionLock::acquire(&lock).expect("acquire succeeds");
+        assert!(
+            session_is_live(&lock).unwrap(),
+            "a genuinely held lock must still read as live"
+        );
+    }
+
+    /// The retry must not paper over a REAL collision: a live `up` holds the lock
+    /// for its whole lifetime, so a second `up` must still be refused - promptly,
+    /// not after a hang.
+    #[test]
+    fn a_live_up_still_excludes_a_second_up_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("session.lock");
+
+        let _first = SessionLock::acquire(&lock).expect("the first acquire succeeds");
+
+        let started = Instant::now();
+        let second = SessionLock::acquire(&lock);
+        let waited = started.elapsed();
+
+        assert!(
+            second.is_err(),
+            "a second `up` must be refused while the first holds the lock"
+        );
+        assert!(
+            waited >= LOCK_ACQUIRE_WAIT,
+            "it must actually wait out the window before giving up, waited {waited:?}"
+        );
+        assert!(
+            waited < LOCK_ACQUIRE_WAIT * 4,
+            "it must give up promptly rather than hang, waited {waited:?}"
+        );
     }
 
     /// Mutual exclusion has to survive a `down`. The teardown paths unlink
