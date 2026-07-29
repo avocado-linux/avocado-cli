@@ -673,10 +673,28 @@ impl DevPruneCommand {
     }
 }
 
+/// The remote shell command that writes the bootstrap file at mode 0600.
+///
+/// Split out of [`deliver_bootstrap`] so the one property that matters here is
+/// assertable rather than reviewed by eye: this file carries the Bearer
+/// read/control token, and the token must never exist world-readable.
+///
+/// The umask is in force when the redirect creates the file, so the mode is
+/// right from the first byte. Writing the file and then correcting it with
+/// `chmod 0600` - which is what this did before - leaves the token on disk at
+/// the remote shell's umask (0644 under a default 0022) for the width of two
+/// commands, readable by any local user on the device. A subshell keeps the
+/// umask change from leaking into anything else `run_command` might later chain.
+fn bootstrap_delivery_command(remote_dir: &str, remote_path: &str, encoded: &str) -> String {
+    format!(
+        "mkdir -p {remote_dir} && (umask 077 && printf %s '{encoded}' | base64 -d > {remote_path})"
+    )
+}
+
 /// Deliver the bootstrap payload to the device writable partition ONCE (design
 /// D5). Renders the JSON, base64-encodes it, and decodes it into
 /// `WRITABLE_PARTITION/container-dev/bootstrap.json` over SSH so the payload
-/// survives shell quoting untouched.
+/// survives shell quoting untouched, at mode 0600 from creation.
 async fn deliver_bootstrap(device: &RemoteHost, payload: &DeviceBootstrap) -> Result<()> {
     use base64::Engine as _;
 
@@ -690,10 +708,7 @@ async fn deliver_bootstrap(device: &RemoteHost, payload: &DeviceBootstrap) -> Re
     let remote_dir = remote_dir.to_string_lossy();
 
     let ssh = SshClient::new(device.clone());
-    let command = format!(
-        "mkdir -p {remote_dir} && printf %s '{encoded}' | base64 -d > {remote_path} && \
-         chmod 0600 {remote_path}"
-    );
+    let command = bootstrap_delivery_command(&remote_dir, &remote_path, &encoded);
     ssh.run_command(&command)
         .await
         .context("writing the bootstrap file to the device writable partition")?;
@@ -1076,6 +1091,70 @@ fn bulk_host<'a>(endpoint: &'a str, auto_host: &'a str) -> &'a str {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The bootstrap file carries the Bearer read/control token, so it must never
+    /// exist world-readable - not even briefly.
+    ///
+    /// The delivery used to write the file and then `chmod 0600` it, which leaves
+    /// the token on disk at the remote shell's umask (0644 on a default 0022) for
+    /// the width of two commands. The window cannot be observed from a test
+    /// without racing the shell, so this asserts the shape that makes it
+    /// impossible instead: the mode is established by a umask in force when the
+    /// file is created, and there is no separate correcting step afterwards.
+    #[test]
+    fn bootstrap_delivery_never_creates_a_world_readable_token() {
+        let command = bootstrap_delivery_command("/tmp/d", "/tmp/d/bootstrap.json", "YWJj");
+
+        assert!(
+            command.contains("umask 077"),
+            "the mode must be set by a umask in force at creation: {command}"
+        );
+        // A chmod means the file existed at some other mode first, which is the
+        // whole defect - so its absence is the assertion, not a style preference.
+        assert!(
+            !command.contains("chmod"),
+            "a correcting chmod means the file was created at the wrong mode: {command}"
+        );
+        // The umask has to precede the redirect to govern it at all.
+        let umask_at = command.find("umask 077").expect("umask present");
+        let redirect_at = command.find('>').expect("redirect present");
+        assert!(
+            umask_at < redirect_at,
+            "the umask must be in force before the write: {command}"
+        );
+    }
+
+    /// The generated command is plain POSIX shell, so running it locally proves
+    /// the mode it actually produces rather than only its shape.
+    #[test]
+    fn bootstrap_delivery_command_produces_a_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("container-dev").join("bootstrap.json");
+        let command = bootstrap_delivery_command(
+            &dir.path().join("container-dev").to_string_lossy(),
+            &target.to_string_lossy(),
+            // base64 of `{"t":1}`
+            "eyJ0IjoxfQ==",
+        );
+
+        // A permissive umask in the parent: if the command relied on inheriting a
+        // strict one, this would catch it.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("umask 0022 && {command}"))
+            .status()
+            .expect("running the delivery command");
+        assert!(status.success(), "delivery command failed: {command}");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the token file must be created 0600, got {mode:o}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"t\":1}");
+    }
 
     /// A lock nobody holds must read as dead, so `down`/`sync` never signal the
     /// recorded pid. Without this, a `session.json` surviving an unclean exit is
