@@ -48,6 +48,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use super::auth::{require_basic_write, require_bearer_read, ReadToken, WriteToken};
@@ -731,7 +732,7 @@ async fn read(
     if let Some((_name, reference)) = rest.split_once("/manifests/") {
         serve_manifest(&state, reference)
     } else if let Some((_name, digest)) = rest.split_once("/blobs/") {
-        serve_blob(&state, &headers, digest)
+        serve_blob(&state, &headers, digest).await
     } else {
         oci_error(
             StatusCode::NOT_FOUND,
@@ -768,17 +769,32 @@ fn serve_manifest(state: &RegistryState, reference: &str) -> Response {
 }
 
 /// Serve a blob by `digest`, honoring a single `Range:` request.
-fn serve_blob(state: &RegistryState, headers: &HeaderMap, digest: &str) -> Response {
-    let bytes = match state.store.read_blob(digest) {
-        Ok(Some(b)) => b,
+///
+/// Streamed off disk rather than read whole. Uploads land on disk without ever
+/// existing complete in memory, so the store can hold a layer larger than host
+/// RAM - and a read that sized one allocation by the blob turned a single
+/// oversized push into an OOM on every later pull, taking every listener and the
+/// session's TLS material with it. Reading incrementally makes the served size
+/// independent of available memory, and a ranged read serves its window from the
+/// same handle instead of copying the slice back out of a full-blob buffer.
+async fn serve_blob(state: &RegistryState, headers: &HeaderMap, digest: &str) -> Response {
+    let (file, total) = match state.store.open_blob(digest) {
+        Ok(Some(open)) => open,
         _ => return blob_unknown(),
     };
-    let total = bytes.len() as u64;
+    let mut file = tokio::fs::File::from_std(file);
 
     if let Some(range) = headers.get(header::RANGE) {
         return match parse_range(range, total) {
             Some((start, end)) => {
-                let slice = bytes[start as usize..=end as usize].to_vec();
+                if tokio::io::AsyncSeekExt::seek(&mut file, io::SeekFrom::Start(start))
+                    .await
+                    .is_err()
+                {
+                    return blob_unknown();
+                }
+                // `end` is inclusive, matching Content-Range.
+                let window = tokio::io::AsyncReadExt::take(file, end - start + 1);
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -788,7 +804,7 @@ fn serve_blob(state: &RegistryState, headers: &HeaderMap, digest: &str) -> Respo
                         format!("bytes {start}-{end}/{total}"),
                     )
                     .header(DOCKER_CONTENT_DIGEST, digest)
-                    .body(Body::from(slice))
+                    .body(Body::from_stream(ReaderStream::new(window)))
                     .expect("range response is always valid")
             }
             None => Response::builder()
@@ -803,8 +819,9 @@ fn serve_blob(state: &RegistryState, headers: &HeaderMap, digest: &str) -> Respo
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, total)
         .header(DOCKER_CONTENT_DIGEST, digest)
-        .body(Body::from(bytes))
+        .body(Body::from_stream(ReaderStream::new(file)))
         .expect("full-blob response is always valid")
 }
 
@@ -1155,6 +1172,109 @@ mod read {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 416);
+    }
+
+    /// Collect a response body, returning how many data frames it arrived in.
+    ///
+    /// Frame count is the discriminator these two tests need: a `Body` built from
+    /// one `Vec<u8>` carries exactly one data frame however large it is, while a
+    /// body streamed off disk carries one per read. Driven through `oneshot`
+    /// rather than a real request on purpose - over TCP the chunk boundaries a
+    /// client observes come from coalescing, not from how the handler built the
+    /// body, so counting socket reads would prove nothing about buffering.
+    async fn collect_frames(body: Body) -> (usize, Vec<u8>) {
+        use futures_util::StreamExt as _;
+
+        let mut frames = 0usize;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("body stream must not error");
+            frames += 1;
+            bytes.extend_from_slice(&chunk);
+        }
+        (frames, bytes)
+    }
+
+    /// A blob is read off disk incrementally, never sized into one allocation.
+    ///
+    /// The store accepts a layer larger than host RAM (the upload streams
+    /// straight to disk), so a read path that buffers the whole object turns one
+    /// oversized push into an OOM on every subsequent pull. Fails with `1 frame`
+    /// if `serve_blob` returns to reading the blob whole.
+    #[tokio::test]
+    async fn a_large_blob_is_streamed_in_many_frames_not_one_allocation() {
+        use tower::ServiceExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
+        // Comfortably more than one read, small enough to keep the test fast.
+        let blob: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        let digest = digest_of(&blob);
+        store.write_blob(&digest, &blob).unwrap();
+
+        let resp = read_routes(store)
+            .oneshot(
+                axum::http::Request::get(format!("/v2/my-app/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let (frames, collected) = collect_frames(resp.into_body()).await;
+        assert!(
+            frames > 1,
+            "a {}-byte blob must arrive in more than one frame; got {frames}, \
+             so the whole blob was buffered into a single allocation",
+            blob.len()
+        );
+        assert_eq!(collected, blob, "streaming must deliver the blob unchanged");
+    }
+
+    /// A ranged read streams the requested window instead of copying it.
+    ///
+    /// Slicing a buffered blob allocated the window a second time on top of the
+    /// whole object, so this covers the doubling specifically rather than only
+    /// the full-body path.
+    #[tokio::test]
+    async fn a_large_range_is_streamed_rather_than_copied() {
+        use tower::ServiceExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
+        let blob: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        let digest = digest_of(&blob);
+        store.write_blob(&digest, &blob).unwrap();
+
+        let resp = read_routes(store)
+            .oneshot(
+                axum::http::Request::get(format!("/v2/my-app/blobs/{digest}"))
+                    .header(header::RANGE, "bytes=1024-401023")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 206);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|h| h.to_str().ok()),
+            Some("bytes 1024-401023/524288"),
+        );
+
+        let (frames, collected) = collect_frames(resp.into_body()).await;
+        assert!(
+            frames > 1,
+            "a 400000-byte range must arrive in more than one frame; got {frames}"
+        );
+        assert_eq!(
+            collected,
+            &blob[1024..=401023],
+            "the range must be byte-exact"
+        );
     }
 
     #[tokio::test]

@@ -176,6 +176,29 @@ impl BlobStore {
         }
     }
 
+    /// Open a stored blob for incremental reading, with its size.
+    ///
+    /// The counterpart to [`Self::read_blob`] for objects whose size is not
+    /// bounded by anything the host chose. An upload streams to disk without
+    /// buffering, so the store can hold a layer larger than host RAM; reading one
+    /// back with [`Self::read_blob`] would then size a single allocation by the
+    /// blob and take the process down on every pull. Manifests keep using
+    /// `read_blob` - they are capped, and the media-type sniff needs the bytes.
+    ///
+    /// Returns a plain [`std::fs::File`] rather than an async handle so the store
+    /// stays synchronous; the caller wraps it for whichever runtime it serves on.
+    pub fn open_blob(&self, digest: &str) -> Result<Option<(fs::File, u64)>, StoreError> {
+        let path = self.blob_path(digest)?;
+        match fs::File::open(&path) {
+            Ok(file) => {
+                let len = file.metadata()?.len();
+                Ok(Some((file, len)))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Point `tag` at the manifest identified by `manifest_digest`.
     ///
     /// The pointer is written atomically and overwrites any previous target

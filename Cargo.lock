@@ -170,6 +170,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-test",
  "tokio-tungstenite",
+ "tokio-util",
  "tough",
  "tower",
  "uuid",

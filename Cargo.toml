@@ -31,10 +31,15 @@ tokio = { version = "1.0", features = [
     "rt-multi-thread",
     "process",
     "io-util",
+    "fs",
     "signal",
     "time",
     "sync",
 ] }
+# `io` only, for ReaderStream: the registry streams stored blobs off disk instead
+# of sizing an allocation by the blob. Already in the tree transitively (axum,
+# tokio-tungstenite), so this adds an explicit edge rather than a new dependency.
+tokio-util = { version = "0.7", features = ["io"] }
 thiserror = "2.0"
 directories = "6.0"
 reqwest = { version = "0.13", default-features = false, features = [
