@@ -1201,11 +1201,15 @@ pub fn resolve_subvolumes(
         .collect();
     resolved.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // Validate: lib/avocado must not be disabled
+    // lib/avocado holds the manifest + images. Disabling it as a *subvolume*
+    // is allowed -- runtime build still creates the directory (see the manifest
+    // section), so you only forgo btrfs snapshot/rollback of that path.
     if !resolved.iter().any(|s| s.path == "lib/avocado") {
-        return Err(anyhow::anyhow!(
-            "subvolume 'lib/avocado' cannot be disabled; it is required for manifest and images"
-        ));
+        warnings.push(
+            "subvolume 'lib/avocado' is disabled; it will be a plain directory \
+             (no btrfs snapshot/rollback of manifest and images)"
+                .to_string(),
+        );
     }
 
     Ok((resolved, warnings))
@@ -10976,7 +10980,7 @@ var:
     }
 
     #[test]
-    fn test_resolve_subvolumes_lib_avocado_cannot_be_disabled() {
+    fn test_resolve_subvolumes_lib_avocado_can_be_disabled() {
         let parsed: serde_yaml::Value = serde_yaml::from_str("extensions: {}").unwrap();
         let runtime: serde_yaml::Value = serde_yaml::from_str(
             r#"
@@ -10989,9 +10993,11 @@ var:
         )
         .unwrap();
         let ext_list: Vec<&str> = vec![];
-        let result = resolve_subvolumes(&ext_list, &parsed, &runtime);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("lib/avocado"));
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        // Disabling lib/avocado is allowed: the subvolume is dropped (flat /var) ...
+        assert!(!resolved.iter().any(|s| s.path == "lib/avocado"));
+        // ... and a warning is emitted instead of a hard error.
+        assert!(warnings.iter().any(|w| w.contains("lib/avocado")));
     }
 
     #[test]
