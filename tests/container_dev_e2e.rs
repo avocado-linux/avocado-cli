@@ -296,6 +296,7 @@ async fn a_stale_device_is_synced_to_the_new_digest_over_the_control_ws() {
         desired,
         HelloArchBook::new(),
         ImageArchBook::new(),
+        None,
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

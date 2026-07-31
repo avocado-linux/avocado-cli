@@ -371,6 +371,7 @@ async fn a_hello_recorded_by_the_control_server_is_visible_to_the_guard() {
         DesiredState::default(),
         book.clone(),
         ImageArchBook::new(),
+        None,
     );
     let inner = Arc::new(ShipRecorder::default());
     // A third handle on the same book, used only to observe when the server has

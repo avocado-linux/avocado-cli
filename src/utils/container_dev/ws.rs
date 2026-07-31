@@ -53,6 +53,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::auth::{read_request_authorized, ReadToken};
 use super::engine::TagEvent;
+use super::store::BlobStore;
 use crate::utils::output::{print_warning, OutputLevel};
 
 use super::watcher::arch_guard::{DeviceArch, DeviceArchLease, HelloArchBook, ImageArchBook};
@@ -320,6 +321,12 @@ pub struct ControlServer {
     image_arches: ImageArchBook,
     /// Host -> device fan-out of `sync` frames; each connection subscribes.
     tx: broadcast::Sender<HostFrame>,
+    /// The registry store the bulk listener serves, used by `notify` to resolve a
+    /// tag to the MANIFEST digest the device must pull by.
+    ///
+    /// `None` only in unit tests that assert fan-out and reconciliation without a
+    /// registry; production (`container dev up`) always supplies it.
+    store: Option<Arc<BlobStore>>,
 }
 
 impl ControlServer {
@@ -332,6 +339,7 @@ impl ControlServer {
         desired: DesiredState,
         arch_book: HelloArchBook,
         image_arches: ImageArchBook,
+        store: Option<Arc<BlobStore>>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(64);
         Arc::new(Self {
@@ -340,6 +348,7 @@ impl ControlServer {
             arch_book,
             image_arches,
             tx,
+            store,
         })
     }
 
@@ -581,7 +590,23 @@ impl Notifier for ControlServer {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let (image, tag) = split_image_tag(&event.image);
-            let digest = event.image_id.clone().unwrap_or_default();
+            // The device pulls `<bulk>/<image>@<digest>`, so this MUST be the
+            // registry MANIFEST digest. `event.image_id` is the engine's LOCAL
+            // image id (a config digest) and names nothing the registry can
+            // serve: pulling by it fails, so every sync would no-op while the
+            // control frame looked correct. Resolve the tag against the store the
+            // bulk listener actually serves.
+            let digest = match self.store.as_ref() {
+                Some(store) => store.resolve_tag(&tag).ok().flatten().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "refusing to notify `{}`: the registry has no manifest for tag `{}` \
+                             yet (the push must land before the notify)",
+                        event.image,
+                        tag
+                    )
+                })?,
+                None => event.image_id.clone().unwrap_or_default(),
+            };
             // An empty digest must never enter the desired state. `reconcile`
             // compares it against the device's `running_digest`, which is also
             // empty before the device's first pull - so an empty desired digest
@@ -806,6 +831,7 @@ mod tests {
             desired,
             HelloArchBook::new(),
             images,
+            None,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1094,6 +1120,7 @@ mod tests {
             DesiredState::default(),
             HelloArchBook::new(),
             images,
+            None,
         );
 
         let frame = HostFrame::Sync {
@@ -1125,6 +1152,7 @@ mod tests {
             DesiredState::default(),
             HelloArchBook::new(),
             ImageArchBook::new(),
+            None,
         );
         let frame = HostFrame::Sync {
             image: "my-app".to_string(),
@@ -1216,6 +1244,7 @@ mod tests {
             desired,
             HelloArchBook::new(),
             ImageArchBook::new(),
+            None,
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

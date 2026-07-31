@@ -368,6 +368,8 @@ impl DevUpCommand {
             DesiredState::default(),
             arch_book.clone(),
             image_arches.clone(),
+            // The notify path resolves a tag to the registry manifest digest here.
+            Some(store.clone()),
         );
         // Bind the control WS on a RESOLVED, discoverable port (design D9), NOT an
         // ephemeral `0.0.0.0:0` the device could never learn: the device agent is
