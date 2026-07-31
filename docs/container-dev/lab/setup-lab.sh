@@ -40,8 +40,18 @@ WORK="${AVOCADO_CDM_LAB_WORK:-$HOME/.cache/avocado-cdm-lab}"
 # is the crate root. Override with AVOCADO_CLI when running from elsewhere.
 AVOCADO_CLI="${AVOCADO_CLI:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 # The meta-avocado base-files bbappend the verify script's overlay check targets
-# (task 7.1 deliverable). Optional: empty skips that check in the verify script.
-BBAPPEND="${BBAPPEND:-}"
+# (task 7.1 deliverable).
+#
+# Do NOT default this to empty. verify-vm-write-path.sh does
+# BBAPPEND="${BBAPPEND:-<its own default>}", so an empty value does not skip the
+# check - it falls through to that default, which points into a build workspace
+# holding a DIFFERENT base-files bbappend, and the overlay check then FAILS with
+# "the overlay does not provision /etc/container-dev" (7/8 instead of 8/8).
+# Default to a copy kept alongside the other generated lab state; extract it with
+#   git -C <meta-avocado> show \
+#     container-dev-mode:meta-avocado-qemu/recipes-core/base-files/base-files_%.bbappend \
+#     > "$WORK/base-files.bbappend"
+BBAPPEND="${BBAPPEND:-$WORK/base-files.bbappend}"
 
 mkdir -p "$WORK"
 KEY="$WORK/id_lab"
@@ -175,9 +185,24 @@ else
 fi
 
 # 7. env file for the verify script
+#
+# AVOCADO_BIN resolves to the `avocado` on PATH, not to a local `target/debug`
+# build. Two binaries reporting the same `--version` string is ambiguous, and the
+# host deliberately keeps only the packaged one (avocado-cli-dev, built from the
+# working branch). Override AVOCADO_BIN to point somewhere else deliberately.
+AVOCADO_BIN="${AVOCADO_BIN:-$(command -v avocado || true)}"
+[ -n "$AVOCADO_BIN" ] || {
+  echo "no 'avocado' on PATH and AVOCADO_BIN unset - install the CLI (or set AVOCADO_BIN) first" >&2
+  exit 1
+}
+"$AVOCADO_BIN" container dev --help >/dev/null 2>&1 || {
+  echo "$AVOCADO_BIN has no 'container dev' subcommand - it predates Container Dev Mode; rebuild it from the working branch" >&2
+  exit 1
+}
+
 cat >"$WORK/env.sh" <<EOF
 # source this before running docs/container-dev/verify-vm-write-path.sh
-export AVOCADO_BIN=$AVOCADO_CLI/target/debug/avocado
+export AVOCADO_BIN=$AVOCADO_BIN
 export DOCKER_HOST=unix://$DOCK_SOCK
 export AVOCADO_CONTAINER_DEV_VM=$SSH_ALIAS
 export AVOCADO_CONTAINER_DEV_DEVICE=$SSH_ALIAS
