@@ -79,6 +79,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AVOCADO_CLI="${AVOCADO_CLI:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 LAB="${AVOCADO_CDM_LAB_WORK:-$HOME/repos/work/peridio-container-dev/lab}"
 SSH_ALIAS="${SSH_ALIAS:-avocado-vm-lab}"
+# The lab alias uses UserKnownHostsFile=/dev/null, so ssh prints "Permanently
+# added ..." on every connection. That noise ends up inside captured command output
+# and reads as if it came from the app, so quiet it at the source.
+SSH_Q=(ssh -o LogLevel=ERROR)
 TEST_IMAGE="${TEST_IMAGE:-my-app:dev}"
 APP_SERVICE="${APP_SERVICE:-app.service}"
 CONTAINER="${APP_SERVICE%.service}"
@@ -86,6 +90,8 @@ BUILD_CTX="${BUILD_CTX:-/tmp/cdm-app}"
 DOCK_SOCK="${DOCK_SOCK:-$HOME/.avocado/vm/docker.sock}"
 UP_LOG="${UP_LOG:-/tmp/cdm-up.log}"
 MODE="${MODE:-native}"
+TARGET_PLATFORM="${TARGET_PLATFORM:-}"
+LAB_VM="${LAB_VM:-1}"
 case "$MODE" in native|vm) ;; *) echo "MODE must be native or vm, got '$MODE'" >&2; exit 1 ;; esac
 
 B=$'\033[1m'; R=$'\033[0m'
@@ -126,7 +132,7 @@ build_engine() {
 # native has no forwarded socket by design, so it goes over ssh.
 target_engine() {
   if [ "$MODE" = native ]; then
-    ssh "$SSH_ALIAS" docker "$@"
+    "${SSH_Q[@]}" "$SSH_ALIAS" docker "$@"
   else
     [ -S "$DOCK_SOCK" ] || die "no forwarded target engine socket at $DOCK_SOCK - run: $0 setup"
     local name; name="$(daemon_name "unix://$DOCK_SOCK")"
@@ -136,6 +142,16 @@ target_engine() {
 }
 
 # Human-readable description of where each engine lives, for the ctx headers.
+# Which builder build_image will pick, and why - for the context header.
+build_desc() {
+  if [ -n "$TARGET_PLATFORM" ]; then echo "buildx cross-arch -> no tag event, sync triggered explicitly"; return; fi
+  local srv major
+  srv="$(build_engine version --format '{{.Server.Version}}' 2>/dev/null || echo 0)"
+  major="${srv%%.*}"; case "$major" in ''|*[!0-9]*) major=0 ;; esac
+  if [ "$major" -ge 23 ]; then echo "BuildKit (docker $srv emits the tag event the watcher needs)"
+  else echo "classic, DOCKER_BUILDKIT=0 (docker $srv emits no event for BuildKit builds)"; fi
+}
+
 build_engine_where() {
   if [ "$MODE" = native ]; then echo "THIS WORKSTATION's engine ($(env -u DOCKER_HOST docker info --format '{{.Name}}' 2>/dev/null || echo unreachable))"
   else echo "the HITL TARGET's engine ($SSH_ALIAS) via $DOCK_SOCK"; fi
@@ -161,13 +177,27 @@ EOF
 build_image() {
   local version="$1"
   write_ctx "$version"
+  # Whether the build engine emits an `image tag` event for a BuildKit build is a
+  # DAEMON-VERSION question, not a BuildKit one. Measured: docker 20.10.24 emits
+  # nothing (so the watcher is blind and the classic builder is required); docker
+  # 29.6.2 emits `image tag` normally. Gate on the major version rather than always
+  # forcing the classic builder, which Docker has deprecated.
+  local srv major
+  srv="$(build_engine version --format '{{.Server.Version}}' 2>/dev/null || echo 0)"
+  major="${srv%%.*}"; case "$major" in ''|*[!0-9]*) major=0 ;; esac
+
   if [ -n "$TARGET_PLATFORM" ]; then
     # Cross-arch needs buildx, which is BuildKit and emits no image tag event.
     EMITS_TAG_EVENT=0
     build_engine buildx build --platform "$TARGET_PLATFORM" --load \
       -q -t "$TEST_IMAGE" "$BUILD_CTX" >/dev/null || die "cross-build for $TARGET_PLATFORM failed (is buildx + binfmt set up?)"
+  elif [ "$major" -ge 23 ]; then
+    # Modern daemon: BuildKit is fine, and the watcher sees the tag event.
+    EMITS_TAG_EVENT=1
+    build_engine build -q -t "$TEST_IMAGE" "$BUILD_CTX" >/dev/null || die "build failed"
   else
-    # Same arch: the classic builder DOES emit a tag event, so the watcher fires.
+    # Old daemon (<23): BuildKit emits no image event at all, so fall back to the
+    # classic builder, which does.
     EMITS_TAG_EVENT=1
     DOCKER_BUILDKIT=0 build_engine build -q -t "$TEST_IMAGE" "$BUILD_CTX" >/dev/null || die "build failed"
   fi
@@ -233,7 +263,7 @@ cmd_app() {
     "mode|$MODE" \
     "builds on|$(build_engine_where)" \
     "image|$TEST_IMAGE   version=$version${TARGET_PLATFORM:+   platform=$TARGET_PLATFORM}" \
-    "builder|$([ -n "$TARGET_PLATFORM" ] && echo "buildx (cross-arch; emits no tag event)" || echo "classic, DOCKER_BUILDKIT=0 (emits the tag event the watcher needs)")" \
+    "builder|$(build_desc)" \
     "runs on|$(target_engine_where)"
 
   build_image "$version"
