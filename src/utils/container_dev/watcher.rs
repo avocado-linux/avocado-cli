@@ -30,6 +30,7 @@
 //! implementation ([`EngineSyncer`]) that reuses the per-engine write-credential
 //! injection from [`super::engine`].
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -146,12 +147,17 @@ pub trait Syncer: Send + Sync {
 /// `down`): a pending debounce or an in-flight sync completes first, then the
 /// loop exits. Sync/notify errors are surfaced as warnings and do not abort the
 /// watcher — a later rebuild retries.
+///
+/// Only events for an image in `watch` are acted on. The engine reports every tag
+/// applied on the daemon, including this watcher's own registry retag, so without
+/// that filter the sync path feeds itself (see [`WatchSet`]).
 pub async fn run_watcher(
     mut rx: mpsc::Receiver<TagEvent>,
     mode: SyncMode,
     syncer: Arc<dyn Syncer>,
     notifier: Arc<dyn Notifier>,
     debounce: Duration,
+    watch: WatchSet,
 ) {
     // An event carried over from a supersede that cancelled the previous sync.
     let mut pending: Option<TagEvent> = None;
@@ -168,9 +174,14 @@ pub async fn run_watcher(
                 if closed {
                     return;
                 }
-                match rx.recv().await {
-                    Some(e) => e,
-                    None => return,
+                // Drain unwatched tags (the watcher's own registry retag among
+                // them) without waking the sync path.
+                loop {
+                    match rx.recv().await {
+                        Some(e) if watch.is_watched(&e.image) => break e,
+                        Some(_) => continue,
+                        None => return,
+                    }
                 }
             }
         };
@@ -182,7 +193,9 @@ pub async fn run_watcher(
                 tokio::select! {
                     _ = sleep(debounce) => break,
                     got = rx.recv() => match got {
-                        Some(e) => latest = e,   // supersede within the window
+                        // supersede within the window
+                        Some(e) if watch.is_watched(&e.image) => latest = e,
+                        Some(_) => {}
                         None => { closed = true; break; }
                     }
                 }
@@ -202,7 +215,12 @@ pub async fn run_watcher(
                     () = &mut work => break,
                     got = rx.recv(), if !closed => match got {
                         // Supersede: dropping `work` cancels the in-flight push.
-                        Some(e) => { pending = Some(e); break; }
+                        Some(e) if watch.is_watched(&e.image) => { pending = Some(e); break; }
+                        // An unwatched tag is not a rebuild — never cancel a push
+                        // for one. The retag `work` itself is performing lands
+                        // here, and cancelling on it is what orphaned the push
+                        // against a deleted DOCKER_CONFIG.
+                        Some(_) => {}
                         // Channel closed mid-work: stop listening, finish `work`.
                         None => { closed = true; }
                     }
@@ -273,6 +291,49 @@ fn repo_and_tag(image: &str) -> String {
             rest.to_string()
         }
         _ => image.to_string(),
+    }
+}
+
+/// The image refs `container_dev.images` declares as watched.
+///
+/// The engine's tag-event stream carries EVERY tag applied on the host daemon,
+/// including the `<registry>/<repo>:<tag>` retag [`EngineSyncer::push`] performs
+/// itself on the way to every push. A watcher that acts on all of them re-enters
+/// its own sync path: retag emits an event, that event drives a sync, that sync
+/// retags. So the declared list is a filter the watcher must apply, not merely
+/// documentation of intent.
+#[derive(Clone, Debug, Default)]
+pub struct WatchSet(HashSet<String>);
+
+impl WatchSet {
+    /// Build the set from the configured refs.
+    ///
+    /// Applies docker's own default-tag rule, because the engine always reports a
+    /// fully tagged ref in a tag event: without it a legal tagless `ref: my-app`
+    /// would match no event and silently stop syncing.
+    pub fn new(refs: impl IntoIterator<Item = String>) -> Self {
+        Self(refs.into_iter().map(|r| with_default_tag(&r)).collect())
+    }
+
+    /// Whether `image`, as reported by an engine tag event, is watched.
+    ///
+    /// The event ref is normalized the same way the configured refs were, so the
+    /// two sides cannot disagree about an implicit `:latest`.
+    pub fn is_watched(&self, image: &str) -> bool {
+        self.0.contains(&with_default_tag(image))
+    }
+}
+
+/// `repo` -> `repo:latest`, leaving an already-tagged ref alone.
+///
+/// Only a colon AFTER the last `/` is a tag separator; a colon before it belongs
+/// to a registry host:port (`host:5601/repo`).
+fn with_default_tag(image: &str) -> String {
+    let name_start = image.rfind('/').map_or(0, |i| i + 1);
+    if image[name_start..].contains(':') {
+        image.to_string()
+    } else {
+        format!("{image}:latest")
     }
 }
 
@@ -437,6 +498,13 @@ async fn run_engine(
 ) -> Result<()> {
     let mut cmd = Command::new(binary);
     cmd.args(argv);
+    // A supersede cancels an in-flight sync by dropping its future, which also
+    // drops the ephemeral DOCKER_CONFIG tempdir the push authenticates with. Left
+    // to tokio's default the child outlives that drop and keeps pushing against a
+    // credential dir that no longer exists — docker then sends no credential and
+    // the write listener answers 401 "no basic auth credentials". Tie the child's
+    // lifetime to the future so cancelling a sync actually cancels its push.
+    cmd.kill_on_drop(true);
     if let Some((key, val)) = env {
         cmd.env(key, val);
     }
@@ -1205,6 +1273,7 @@ mod tests {
             rec.clone() as Arc<dyn Syncer>,
             rec.clone() as Arc<dyn Notifier>,
             DEBOUNCE,
+            WatchSet::new(["my-app:dev".to_string()]),
         ));
 
         tx.send(ev("my-app:dev")).await.unwrap();
@@ -1239,6 +1308,7 @@ mod tests {
             rec.clone() as Arc<dyn Syncer>,
             rec.clone() as Arc<dyn Notifier>,
             DEBOUNCE,
+            WatchSet::new(["v1".to_string(), "v2".to_string()]),
         ));
 
         // Two events well inside the 300 ms window.
@@ -1282,6 +1352,7 @@ mod tests {
             rec.clone() as Arc<dyn Syncer>,
             rec.clone() as Arc<dyn Notifier>,
             DEBOUNCE,
+            WatchSet::new(["v1".to_string(), "v2".to_string()]),
         ));
 
         // v1 settles through the debounce and starts a (blocking) push.
@@ -1324,8 +1395,131 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_event_for_an_unwatched_image_is_ignored() {
+        let rec = Recorder::arc();
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run_watcher(
+            rx,
+            SyncMode::Push,
+            rec.clone() as Arc<dyn Syncer>,
+            rec.clone() as Arc<dyn Notifier>,
+            DEBOUNCE,
+            WatchSet::new(["my-app:dev".to_string()]),
+        ));
+
+        tx.send(ev("some-other-image:latest")).await.unwrap();
+        sleep(DEBOUNCE + Duration::from_millis(200)).await;
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            rec.started.lock().unwrap().is_empty(),
+            "an image absent from `container_dev.images` must never sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_watchers_own_registry_retag_does_not_feed_back_as_a_rebuild() {
+        // `EngineSyncer::push` runs `docker tag <img> <registry>/<img>` before
+        // every push, and the engine emits a tag event for that retag. Acting on
+        // it re-enters the sync path, whose own retag emits the next event — an
+        // unbounded push loop. Each iteration also cancels the previous push
+        // mid-flight, which orphans it against a deleted DOCKER_CONFIG and yields
+        // a 401. Measured at 1281 failed pushes from ONE real rebuild.
+        let rec = Recorder::arc();
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run_watcher(
+            rx,
+            SyncMode::Push,
+            rec.clone() as Arc<dyn Syncer>,
+            rec.clone() as Arc<dyn Notifier>,
+            DEBOUNCE,
+            WatchSet::new(["my-app:dev".to_string()]),
+        ));
+
+        tx.send(ev("10.0.2.2:5601/my-app:dev")).await.unwrap();
+        sleep(DEBOUNCE + Duration::from_millis(200)).await;
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            rec.started.lock().unwrap().is_empty(),
+            "the registry-qualified retag is the watcher's own side effect, not a rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untagged_watched_ref_matches_the_latest_tag() {
+        // `ref: my-app` (no tag) is a legal config; docker's tag events always
+        // carry an explicit tag, so the watch set must apply docker's own
+        // default-tag rule or such a config would silently stop syncing.
+        let rec = Recorder::arc();
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run_watcher(
+            rx,
+            SyncMode::Push,
+            rec.clone() as Arc<dyn Syncer>,
+            rec.clone() as Arc<dyn Notifier>,
+            DEBOUNCE,
+            WatchSet::new(["my-app".to_string()]),
+        ));
+
+        tx.send(ev("my-app:latest")).await.unwrap();
+        sleep(DEBOUNCE + Duration::from_millis(200)).await;
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            rec.started.lock().unwrap().clone(),
+            vec!["my-app:latest".to_string()],
+            "an untagged watched ref must match the `:latest` tag event"
+        );
+    }
+
     #[test]
     fn debounce_default_is_300ms() {
         assert_eq!(DEBOUNCE, Duration::from_millis(300));
+    }
+
+    // ---- cancelling a sync must not orphan the engine subprocess ----
+
+    #[tokio::test]
+    async fn cancelling_run_engine_kills_the_child_rather_than_orphaning_it() {
+        // A supersede cancels an in-flight push by dropping its future. That drop
+        // also removes the ephemeral DOCKER_CONFIG tempdir the push authenticates
+        // with, so an engine child that outlives the cancellation keeps running
+        // against a deleted credential dir and 401s ("no basic auth credentials").
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-survived");
+        let argv = vec![
+            "-c".to_string(),
+            format!("sleep 3; touch {}", marker.display()),
+        ];
+
+        {
+            // Same shape as the supersede path: pin, poll so the child is
+            // genuinely spawned, then cancel by letting the future drop. The
+            // scope is what drops it — `tokio::pin!` keeps the future in a hidden
+            // local, so dropping the `Pin` binding alone would cancel nothing.
+            let work = run_engine("sh", &argv, None);
+            tokio::pin!(work);
+            let _ = timeout(Duration::from_millis(300), &mut work).await;
+        }
+
+        sleep(Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "a cancelled sync must kill its engine child, not leave it running"
+        );
     }
 }

@@ -61,7 +61,7 @@ use crate::utils::container_dev::store::BlobStore;
 use crate::utils::container_dev::tls::DevSession;
 use crate::utils::container_dev::watcher::{
     arch_guard::{ArchGuardSyncer, EngineArchProbe, HelloArchBook, ImageArchBook},
-    run_watcher, EngineSyncer, HostTopology, SyncMode, Syncer, DEBOUNCE,
+    run_watcher, EngineSyncer, HostTopology, SyncMode, Syncer, WatchSet, DEBOUNCE,
 };
 use crate::utils::container_dev::ws::{ControlServer, DesiredState};
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
@@ -439,8 +439,15 @@ impl DevUpCommand {
         // before the watcher takes ownership of its copies.
         let trigger_syncer = Arc::clone(&syncer);
         let trigger_notifier = Arc::clone(&control);
+        // The declared watch list scopes the watcher too, not just the manual
+        // `sync` trigger below: the engine reports every tag on the daemon,
+        // including the registry retag each push performs, so an unscoped watcher
+        // syncs in response to its own side effect (see `WatchSet`).
+        let watched_images: Vec<String> =
+            ctx.dev.images.iter().map(|i| i.image_ref.clone()).collect();
+        let watch_set = WatchSet::new(watched_images.clone());
         let watcher_task: JoinHandle<()> = tokio::spawn(async move {
-            run_watcher(events_rx, mode, syncer, notifier, DEBOUNCE).await;
+            run_watcher(events_rx, mode, syncer, notifier, DEBOUNCE, watch_set).await;
         });
 
         // The `container dev sync` trigger (task 5.3): a separate `sync`
@@ -449,8 +456,6 @@ impl DevUpCommand {
         // pipeline the watcher uses — exactly once per signal, never a second
         // watch loop. Reusing the running session's syncer + control WS is what
         // lets the notify reach a connected device with no extra SSH.
-        let watched_images: Vec<String> =
-            ctx.dev.images.iter().map(|i| i.image_ref.clone()).collect();
         let sync_trigger_task: JoinHandle<()> = tokio::spawn(async move {
             run_sync_trigger(
                 mode,
