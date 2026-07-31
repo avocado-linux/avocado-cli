@@ -54,14 +54,6 @@
 #   TEST_IMAGE            watched image ref     (default: my-app:dev)
 #   APP_SERVICE           unit owning it        (default: app.service)
 #
-# KNOWN GAP, native mode: the agent pulls `127.0.0.1:<port>/<image>@<digest>` and
-# never tags it, so the pulled image lands on the target as a dangling <none> image
-# and the unit's `docker run <image>:<tag>` cannot resolve it. vm mode hides this,
-# because there the image is BUILT on the target and the tag already exists locally
-# - which also means vm mode never actually exercised the delivery path. Until the
-# agent tags what it pulls, native mode delivers the layers correctly and the
-# restart still runs the old (or no) image. Verified 2026-07-31; see the runbook.
-#
 # Pointing this at a Raspberry Pi 5 (or any real board) is env only:
 #
 #   export LAB_VM=0                              # no VM to boot or verify
