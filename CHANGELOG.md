@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Build commit in `avocado --version`.** The version line now reports the
+  commit the binary was built from and its date, following rustc's shape:
+  `avocado 1.0.0-rc.1 (abc1234 2026-03-05)`. A bug report now identifies the
+  exact build. Builds made outside a git checkout - or inside an unrelated
+  one, such as a vendored copy in another repository - keep reporting the bare
+  version rather than embedding a commit that is not this binary's. Anything
+  parsing this line must read the **second** whitespace-separated field, since
+  the last field is now a date.
+
+  **Rollout note.** That instruction only reaches parsers written from here
+  on. Every already-released `avocado` reads the remote's version with
+  `.last()` over the whole `--version` output, so during the window where an
+  older local CLI talks to a newer remote it takes `2026-03-05)` as the remote
+  version, fails to parse it, and - on those releases - falls open rather than
+  refusing: the minimum-remote-version check is skipped and a date is printed
+  as the version. Nothing can be shipped that fixes those binaries
+  retroactively, so upgrade the local side first. Moving the build detail to a
+  second output line would not have avoided this: the shipped parser splits the
+  entire stdout blob, not its first line, so `.last()` still reaches it.
+  `avocado-desktop` is not affected - its parser already reads the first line's
+  second field.
+
 ### Fixed
 - **`--connect-sign` guidance.** The deploy help text and the Level 2 setup
   messages now reference `avocado connect trust promote-root --key <KEY>` with

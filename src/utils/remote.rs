@@ -242,11 +242,7 @@ impl SshClient {
             );
         }
 
-        // Parse version from output like "avocado 0.20.0"
-        let remote_version = version_output
-            .split_whitespace()
-            .last()
-            .unwrap_or(&version_output);
+        let remote_version = parse_reported_version(&version_output);
 
         // Compare versions
         if !is_version_compatible(local_version, remote_version) {
@@ -963,6 +959,57 @@ pub async fn get_local_ip_for_remote(remote_host: &str) -> Result<IpAddr> {
         .unwrap_or_else(|| anyhow::anyhow!("No valid addresses found for remote host")))
 }
 
+/// Extract the version from `avocado --version` output.
+///
+/// The line reads `avocado <version> (<short-sha> <commit-date>)`, so the
+/// version is the second field and the last one is a date.
+///
+/// The input is the whole stdout blob, not a single line: the remote command
+/// sources `~/.profile` and `~/.bashrc` first, so anything they echo arrives
+/// ahead of the version. A fixed field index reads that banner instead - for
+/// `"Welcome to the board!\navocado 1.0.0-rc.1 (...)"`, the second field is
+/// `to`. So anchor on the line the CLI actually prints rather than counting
+/// fields from the start of the blob.
+///
+/// Falls back to the first version-shaped token so a remote on an older CLI
+/// that prints a bare version still resolves behind a banner, which the
+/// previous `.last()` handled and a positional read does not.
+fn parse_reported_version(output: &str) -> &str {
+    const PROGRAM: &str = "avocado";
+
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some(PROGRAM) {
+            if let Some(version) = fields.next() {
+                return version;
+            }
+        }
+    }
+
+    for token in output.split_whitespace() {
+        if is_version_shaped(token) {
+            return token;
+        }
+    }
+
+    output.trim()
+}
+
+/// Whether `token` could be a version: a numeric leading segment, after an
+/// optional `v` and ignoring any pre-release or build suffix.
+///
+/// Deliberately shallow. It only has to separate a version from a word in a
+/// login banner, not validate semver - `0.40.0-dev` and `1.0.0-rc.1` both have
+/// to keep passing.
+fn is_version_shaped(token: &str) -> bool {
+    let token = token.strip_prefix('v').unwrap_or(token);
+    let core = token.split(['-', '+']).next().unwrap_or(token);
+    match core.split('.').next() {
+        Some(segment) => !segment.is_empty() && segment.parse::<u64>().is_ok(),
+        None => false,
+    }
+}
+
 /// Check if a remote version is compatible with the local version
 ///
 /// The remote version must be equal to or greater than the local version.
@@ -1063,6 +1110,78 @@ mod tests {
         assert!(!is_version_compatible("0.21.0", "0.20.0"));
         assert!(!is_version_compatible("1.0.0", "0.20.0"));
         assert!(!is_version_compatible("0.20.1", "0.20.0"));
+    }
+
+    #[test]
+    fn test_parse_reported_version_reads_the_version_field() {
+        // The build detail is a trailing parenthetical, so the last field is a
+        // date. Taking it would feed a date into the compatibility check.
+        assert_eq!(
+            parse_reported_version("avocado 1.0.0-rc.1 (abc1234 2026-03-05)"),
+            "1.0.0-rc.1"
+        );
+        // A remote on an older CLI prints just the version.
+        assert_eq!(parse_reported_version("avocado 0.41.2"), "0.41.2");
+        // Nothing to split on: fall back rather than drop the value.
+        assert_eq!(parse_reported_version("0.41.2"), "0.41.2");
+    }
+
+    #[test]
+    fn test_parse_reported_version_skips_a_login_banner() {
+        // The remote command sources ~/.profile and ~/.bashrc before running
+        // avocado, so whatever they echo lands ahead of the version and the
+        // input is a multi-line blob. Counting fields from the start of that
+        // blob reads the banner: the second field here is "to".
+        assert_eq!(
+            parse_reported_version(
+                "Welcome to the board!\navocado 1.0.0-rc.1 (abc1234 2026-03-05)"
+            ),
+            "1.0.0-rc.1"
+        );
+        // Same shape, older remote printing a bare version. The `.last()` parser
+        // this replaced got this one right, so a positional read would be a
+        // regression for the combination rather than a carried-forward weakness.
+        assert_eq!(
+            parse_reported_version("Welcome to the board!\n0.41.2"),
+            "0.41.2"
+        );
+    }
+
+    #[test]
+    fn test_parse_reported_version_does_not_invent_a_version_from_prose() {
+        // Negative path: nothing version-shaped anywhere. The value returned has
+        // to stay something the compatibility check will reject, not a word that
+        // happens to sit in the second position.
+        let parsed = parse_reported_version("bash: avocado: command not found");
+        assert!(
+            !is_version_shaped(parsed),
+            "prose parsed as a version: {parsed:?}"
+        );
+        assert_ne!(parsed, "avocado:");
+    }
+
+    #[test]
+    fn test_parse_reported_version_ignores_a_different_program() {
+        // A same-named binary earlier on the remote's PATH answers with its own
+        // name, so the anchor must not match it.
+        let parsed = parse_reported_version("Python 3.11.2");
+        assert_eq!(
+            parsed, "3.11.2",
+            "expected the version-shaped fallback, not a field index"
+        );
+    }
+
+    #[test]
+    fn test_is_version_shaped_separates_versions_from_words() {
+        for token in ["0.41.2", "1.0.0-rc.1", "v0.40.0", "0.20", "2026"] {
+            assert!(is_version_shaped(token), "{token} should be version-shaped");
+        }
+        for token in ["to", "avocado:", "command", "not-installed", "", "dev"] {
+            assert!(
+                !is_version_shaped(token),
+                "{token:?} should not be version-shaped"
+            );
+        }
     }
 
     #[test]
