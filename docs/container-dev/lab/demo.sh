@@ -50,7 +50,7 @@
 #                         rather than trying to boot or test a VM that is not there.
 #   AVOCADO_CDM_LAB_WORK  generated lab state   (default: ~/repos/work/peridio-container-dev/lab)
 #   AVOCADO_CLI           avocado-cli checkout  (default: derived from this script's path)
-#   SSH_ALIAS             ssh alias for the target (default: avocado-vm-lab)
+#   SSH_ALIAS             ssh alias for the target (default: avocado-hitl)
 #   TEST_IMAGE            watched image ref     (default: my-app:dev)
 #   APP_SERVICE           unit owning it        (default: app.service)
 #
@@ -77,8 +77,20 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AVOCADO_CLI="${AVOCADO_CLI:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-LAB="${AVOCADO_CDM_LAB_WORK:-$HOME/repos/work/peridio-container-dev/lab}"
-SSH_ALIAS="${SSH_ALIAS:-avocado-vm-lab}"
+# Generated lab state, matching setup-lab.sh's own default. It lives outside any
+# repo checkout because the target's disk image is ~1 GB.
+LAB="${AVOCADO_CDM_LAB_WORK:-$HOME/.cache/avocado-cdm-lab}"
+# Where the bootable target artifacts and its qemu pidfile live.
+VMDIR="${VMDIR:-$LAB/hitl-vm}"
+SSH_ALIAS="${SSH_ALIAS:-avocado-hitl}"
+# The agent ships in the runtime as a real unit (avocado-ext-container-agent-dev),
+# so there is nothing to cross-compile and copy any more. It used to be started as
+# a transient `cdm-agent` via systemd-run against a hand-placed binary.
+AGENT_UNIT="${AGENT_UNIT:-container-agent-dev}"
+# The target's docker daemon reports its own hostname, which is the Avocado image's
+# hostname (avocado-<target>) and NOT the ssh alias. setup-lab.sh exports the real
+# value; fall back to asking the target so a bare run still works.
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
 # The lab alias uses UserKnownHostsFile=/dev/null, so ssh prints "Permanently
 # added ..." on every connection. That noise ends up inside captured command output
 # and reads as if it came from the app, so quiet it at the source.
@@ -113,8 +125,18 @@ die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
 count_in() { local n; n="$(grep -c "$1" "$2" 2>/dev/null)"; echo "${n:-0}"; }
 
 # Which daemon does a given DOCKER_HOST answer as? The name is the daemon's own
-# hostname, so `avocado-vm-lab` means the target and anything else means this box.
+# hostname, so matching it against the target's hostname says which box answered.
 daemon_name() { DOCKER_HOST="$1" docker info --format '{{.Name}}' 2>/dev/null || true; }
+
+# The target's own hostname, resolved once and cached. NOT the ssh alias: an
+# Avocado OS image is named avocado-<target>, so comparing a daemon's reported
+# name against the alias would never match and every socket check would fail.
+target_hostname() {
+  if [ -z "$TARGET_HOSTNAME" ]; then
+    TARGET_HOSTNAME="$("${SSH_Q[@]}" "$SSH_ALIAS" hostname 2>/dev/null || true)"
+  fi
+  echo "$TARGET_HOSTNAME"
+}
 
 # The two engines, as two named functions. Every docker call in this script goes
 # through one of them, so no command can quietly land on the wrong machine.
@@ -135,8 +157,8 @@ target_engine() {
     "${SSH_Q[@]}" "$SSH_ALIAS" docker "$@"
   else
     [ -S "$DOCK_SOCK" ] || die "no forwarded target engine socket at $DOCK_SOCK - run: $0 setup"
-    local name; name="$(daemon_name "unix://$DOCK_SOCK")"
-    [ "$name" = "$SSH_ALIAS" ] || die "socket $DOCK_SOCK answers as '$name', expected '$SSH_ALIAS'"
+    local name want; name="$(daemon_name "unix://$DOCK_SOCK")"; want="$(target_hostname)"
+    [ "$name" = "$want" ] || die "socket $DOCK_SOCK answers as '$name', expected the target '$want'"
     DOCKER_HOST="unix://$DOCK_SOCK" docker "$@"
   fi
 }
@@ -203,14 +225,8 @@ build_image() {
   fi
 }
 
-# In native mode the image is built on the workstation, so the target cannot see it
-# until the loop ships it. `app` therefore has to push once before the unit starts,
-# or the first `docker run` on the target fails on a missing image.
-seed_target_image() {
-  [ "$MODE" = native ] || return 0
-  session_running || return 0
-  ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) || true
-}
+# Is the watched image present on the TARGET's engine?
+target_has_image() { target_engine image inspect "$TEST_IMAGE" >/dev/null 2>&1; }
 
 # Find the running `container dev up` session.
 #
@@ -228,10 +244,27 @@ session_pids() {
 }
 session_running() { [ -n "$(session_pids)" ]; }
 
+# The write listener's actual host:port, read from what the session reported.
+#
+# It is NOT the configured port: the session binds an EPHEMERAL loopback port
+# (37633 and 41753 across two observed runs). It is also not the guest-facing
+# 10.0.2.2 - the push goes to 127.0.0.1, which is what the pushed tag shows
+# (`The push refers to repository [127.0.0.1:41753/my-app]`). Both were previously
+# hardcoded as 10.0.2.2:5601, which described a path that never existed. This
+# matters beyond cosmetics: the push credential is keyed on the tagged host:port
+# byte-for-byte, so a reader debugging an auth failure needs the real pair.
+write_endpoint() {
+  local wport
+  wport="$(sed -n 's/.*write listener loopback-only on 127\.0\.0\.1:\([0-9]\+\).*/\1/p' \
+    "$UP_LOG" 2>/dev/null | tail -1)"
+  if [ -n "$wport" ]; then echo "127.0.0.1:$wport"
+  else echo "127.0.0.1:${AVOCADO_CONTAINER_DEV_WRITE_PORT:-5601} (configured; no session has bound one yet)"; fi
+}
+
 registry_endpoints() {
   local host="${AVOCADO_CONTAINER_DEV_HOST:-10.0.2.2}"
-  printf 'bulk read %s:5599 (target pulls) | write %s:5601 (host pushes, loopback-bound) | control WS %s:5600' \
-    "$host" "127.0.0.1" "$host"
+  printf 'bulk read %s:5599 (target pulls) | write %s (host pushes, loopback-bound) | control WS %s:5600' \
+    "$host" "$(write_endpoint)" "$host"
 }
 
 # ---------------------------------------------------------------------------
@@ -241,7 +274,7 @@ cmd_setup() {
   ctx "SETUP the lab VM" \
     "runs on|this workstation" \
     "creates|QEMU VM '$SSH_ALIAS', ssh 127.0.0.1:2222, forwarded engine socket $DOCK_SOCK" \
-    "note|with no engine.qcow2 the first boot runs cloud-init (installs docker.io): minutes, needs network"
+    "note|first run builds and provisions a real Avocado OS runtime: minutes, needs network"
   AVOCADO_CDM_LAB_WORK="$LAB" AVOCADO_CLI="$AVOCADO_CLI" bash "$SCRIPT_DIR/setup-lab.sh" || die "setup-lab.sh failed"
 }
 
@@ -267,7 +300,6 @@ cmd_app() {
     "runs on|$(target_engine_where)"
 
   build_image "$version"
-  seed_target_image
 
   ctx "INSTALL the owning service" \
     "installs on|the HITL TARGET ($SSH_ALIAS), over ssh" \
@@ -293,14 +325,60 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-  ssh "$SSH_ALIAS" "systemctl daemon-reload && systemctl enable $APP_SERVICE >/dev/null 2>&1; systemctl restart $APP_SERVICE" \
-    || die "could not start $APP_SERVICE on $SSH_ALIAS"
+  ssh "$SSH_ALIAS" "systemctl daemon-reload && systemctl enable $APP_SERVICE >/dev/null 2>&1" \
+    || die "could not install $APP_SERVICE on $SSH_ALIAS"
 
+  # In native mode the image was built HERE, so on a virgin target there is nothing
+  # for `docker run` to resolve yet - and nothing can put it there until the session
+  # and the agent both exist, because delivery IS the loop. So do not start the unit
+  # and assert a baseline here; that ordering only ever worked when the image was
+  # already on the target (vm mode builds it there, which is exactly what hid the
+  # agent's missing-tag bug). `seed` starts it once the image has landed.
+  if [ "$MODE" = vm ] || target_has_image; then
+    ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
+    sleep 4
+    local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
+    ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
+    case "$line" in
+      *"$version"*) printf '   %-11s %s\n' "result" "baseline $version confirmed on the target" ;;
+      *) die "app is not reporting '$version' - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
+    esac
+  else
+    printf '   %-11s %s\n' "unit" "installed and enabled, NOT started"
+    printf '   %-11s %s\n' "why" "$TEST_IMAGE is not on the target yet - '$0 seed' delivers it via the loop"
+  fi
+}
+
+# Deliver the built image to the target through the real path, then start the unit.
+#
+# This is the step that proves delivery works at all. It needs a live session AND a
+# running agent, because the push goes to the host's write listener and only the
+# agent can pull it back down over the control WS.
+cmd_seed() {
+  local version="${1:-v1}"
+  session_running || die "no session - run '$0 up' first"
+  ctx "SEED the target with the baseline image" \
+    "runs on|this workstation, then the target pulls" \
+    "path|host build -> write listener $(write_endpoint) -> control WS -> agent pulls by digest -> $APP_SERVICE" \
+    "why|native mode builds HERE, so the target has no image until the loop ships one"
+
+  ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
+    || die "container dev sync failed - is a session up? ($0 up)"
+
+  printf '   %-11s ' "waiting"
+  for _ in $(seq 1 30); do
+    sleep 2; printf '.'
+    target_has_image && break
+  done
+  printf '\n'
+  target_has_image || die "image never reached the target - check: $0 logs session ; $0 logs agent"
+
+  ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
   sleep 4
   local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
   ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
   case "$line" in
-    *"$version"*) printf '   %-11s %s\n' "result" "baseline $version confirmed on the target" ;;
+    *"$version"*) printf '   %-11s %s\n' "result" "baseline $version delivered over the loop and running" ;;
     *) die "app is not reporting '$version' - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
   esac
 }
@@ -322,9 +400,19 @@ cmd_up() {
     # through the target's engine - the topology native mode exists to avoid.
     unset DOCKER_HOST
   fi
-  # setsid + </dev/null fully detaches: without closing stdin the background
-  # session keeps the caller's pipeline open and `demo.sh up` never returns.
-  ( cd "$SCRIPT_DIR" && setsid nohup "$AVOCADO_BIN" container dev up >"$UP_LOG" 2>&1 </dev/null & )
+  # `setsid --fork`, with no trailing `&` and no subshell job.
+  #
+  # The previous form was `( setsid nohup CMD ... & )`. setsid execs in place when
+  # it can, so the session stayed a child of this script and a bash job; the script
+  # then blocked at exit waiting on it. Every step of `up` ran and printed, but the
+  # script never returned - and when its output is piped (`demo.sh up | tail`) the
+  # reader sees NOTHING at all, because the pipe's write end is still held. That
+  # reads as "up hangs" when the session is in fact healthy.
+  #
+  # --fork makes setsid fork unconditionally, so the session is reparented away and
+  # is never a job of this shell. Redirecting all three streams is still required:
+  # an inherited stdout would keep the caller's pipe open on its own.
+  ( cd "$SCRIPT_DIR" && setsid --fork "$AVOCADO_BIN" container dev up >"$UP_LOG" 2>&1 </dev/null )
   sleep 15
   grep -qE "bulk listener" "$UP_LOG" || { tail -5 "$UP_LOG"; die "session did not come up - see $UP_LOG"; }
   sed -e 's/^/   /' <(tail -2 "$UP_LOG")
@@ -333,16 +421,25 @@ cmd_up() {
 cmd_agent() {
   ctx "START the device agent" \
     "runs on|the HITL TARGET ($SSH_ALIAS), over ssh" \
+    "unit|$AGENT_UNIT, shipped in the runtime by avocado-ext-container-agent-dev" \
     "pulls via|its own loopback proxy 127.0.0.1:15151 -> the host's bulk listener" \
-    "restarts|$APP_SERVICE (AVOCADO_CONTAINER_DEV_SERVICE)" \
-    "note|stopped first: systemd-run refuses silently if active, leaving a stale-CA agent"
-  ssh "$SSH_ALIAS" 'systemctl stop cdm-agent 2>/dev/null; true'
-  ssh "$SSH_ALIAS" "systemd-run --unit=cdm-agent --collect \
-    --setenv=AVOCADO_CONTAINER_DEV_SERVICE=$APP_SERVICE \
-    /usr/local/bin/avocado-container-agent-dev" >/dev/null 2>&1 \
-    || die "could not start the agent - is /usr/local/bin/avocado-container-agent-dev present? (runbook B1)"
+    "restarts|$APP_SERVICE (AVOCADO_CONTAINER_DEV_SERVICE, from the setup-lab drop-in)" \
+    "gate|ConditionPathExists=/var/lib/avocado/container-dev/bootstrap.json, so '$0 up' must run first"
+
+  # The unit stays inert until `container dev up` has delivered the bootstrap, so a
+  # start before that is not an error - it is the condition doing its job. Say so
+  # rather than reporting a failure the operator cannot act on.
+  ssh "$SSH_ALIAS" "test -f /var/lib/avocado/container-dev/bootstrap.json" 2>/dev/null \
+    || die "no bootstrap on the target yet - run '$0 up' first (the unit's ConditionPathExists gates on it)"
+
+  # Restart rather than start: a re-run after a new session must not keep an agent
+  # holding the previous session's pinned CA.
+  ssh "$SSH_ALIAS" "systemctl restart $AGENT_UNIT" \
+    || die "could not start $AGENT_UNIT - ssh $SSH_ALIAS 'journalctl -u $AGENT_UNIT -n 30'"
   sleep 5
-  ssh "$SSH_ALIAS" 'journalctl -u cdm-agent --no-pager -n 3 -o cat' 2>/dev/null | sed -e 's/^/   /'
+  local active; active="$(ssh "$SSH_ALIAS" "systemctl is-active $AGENT_UNIT" 2>/dev/null || echo unknown)"
+  [ "$active" = active ] || die "$AGENT_UNIT is '$active' - ssh $SSH_ALIAS 'journalctl -u $AGENT_UNIT -n 30'"
+  ssh "$SSH_ALIAS" "journalctl -u $AGENT_UNIT --no-pager -n 3 -o cat" 2>/dev/null | sed -e 's/^/   /'
 }
 
 cmd_reload() {
@@ -352,7 +449,7 @@ cmd_reload() {
     "mode|$MODE" \
     "builds on|$(build_engine_where)" \
     "version|$version${TARGET_PLATFORM:+   platform=$TARGET_PLATFORM}" \
-    "pushes to|the host's write listener 127.0.0.1:5601, tagged 10.0.2.2:5601/${TEST_IMAGE%%:*}" \
+    "pushes to|the host's write listener $(write_endpoint), tagged $(write_endpoint)/${TEST_IMAGE%%:*}" \
     "then|control WS notifies the target, which pulls by digest and restarts $APP_SERVICE" \
     "note|the unit is NOT touched here, so only the watcher path can move the container" \
     "before|$before"
@@ -411,12 +508,17 @@ cmd_status() {
     "log|$UP_LOG" \
     "pushes|$(count_in 'The push refers' "$UP_LOG"), auth failures $(count_in 'no basic auth credentials' "$UP_LOG")"
 
-  if [ "$target_daemon" = "$SSH_ALIAS" ]; then
-    ctx "TARGET ($SSH_ALIAS)" \
-      "agent|$(ssh "$SSH_ALIAS" 'systemctl is-active cdm-agent' 2>/dev/null || echo unknown)" \
+  # Gate on ssh, not on the forwarded socket. Native mode has no forwarded socket by
+  # design, so keying this block on the socket hid the target's whole state in the
+  # default topology.
+  if "${SSH_Q[@]}" -o ConnectTimeout=5 "$SSH_ALIAS" true 2>/dev/null; then
+    ctx "TARGET ($SSH_ALIAS = $(target_hostname))" \
+      "agent|$AGENT_UNIT $(ssh "$SSH_ALIAS" "systemctl is-active $AGENT_UNIT" 2>/dev/null || echo unknown)" \
       "service|$APP_SERVICE $(ssh "$SSH_ALIAS" "systemctl is-active $APP_SERVICE" 2>/dev/null || echo unknown)" \
       "app says|$(target_engine logs --tail 1 "$CONTAINER" 2>&1 | tail -1)" \
       "running|$(ssh "$SSH_ALIAS" 'cat /var/lib/avocado/container-dev/active-image.json 2>/dev/null | tr -d "\n " ' 2>/dev/null || echo '(no pointer yet)')"
+  else
+    ctx "TARGET ($SSH_ALIAS)" "state|unreachable over ssh - run '$0 setup'"
   fi
 }
 
@@ -426,8 +528,8 @@ cmd_logs() {
       ctx "SESSION LOG" "from|this workstation" "file|$UP_LOG"
       tail -30 "$UP_LOG" ;;
     agent)
-      ctx "AGENT LOG" "from|the HITL TARGET ($SSH_ALIAS)" "source|journalctl -u cdm-agent"
-      ssh "$SSH_ALIAS" 'journalctl -u cdm-agent --no-pager -n 30 -o cat' ;;
+      ctx "AGENT LOG" "from|the HITL TARGET ($SSH_ALIAS)" "source|journalctl -u $AGENT_UNIT"
+      ssh "$SSH_ALIAS" "journalctl -u $AGENT_UNIT --no-pager -n 30 -o cat" ;;
     app)
       ctx "APP LOG" "from|the HITL TARGET's engine ($SSH_ALIAS) via $DOCK_SOCK" "source|docker logs $CONTAINER"
       target_engine logs --tail 30 "$CONTAINER" ;;
@@ -441,26 +543,25 @@ cmd_down() {
   [ -f "$LAB/env.sh" ] && source "$LAB/env.sh"
   ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev down 2>/dev/null | sed -e 's/^/   /' ) || true
   session_pids | while read -r p; do kill "$p" 2>/dev/null; done
-  ssh "$SSH_ALIAS" "systemctl stop cdm-agent $APP_SERVICE 2>/dev/null; docker stop $CONTAINER 2>/dev/null; docker rm $CONTAINER 2>/dev/null; true" >/dev/null 2>&1
+  ssh "$SSH_ALIAS" "systemctl stop $AGENT_UNIT $APP_SERVICE 2>/dev/null; docker stop $CONTAINER 2>/dev/null; docker rm $CONTAINER 2>/dev/null; true" >/dev/null 2>&1
   printf '   %-11s %s\n' "done" "session, agent and app stopped"
 }
 
 cmd_reset() {
   ctx "RESET to a pre-demo state" \
-    "deletes|the guest disk (engine.qcow2) and every generated seed artifact" \
+    "deletes|the HITL target's disk image and u-boot.rom under $VMDIR" \
     "deletes|the host registry store and the demo build context" \
-    "keeps|debian12.qcow2 and id_lab* - inputs, not state"
+    "keeps|the built runtime in the SDK volume - 'setup' reprovisions from it without a rebuild"
   session_pids | while read -r p; do kill "$p" 2>/dev/null; done
   sleep 2
   pkill -f "$DOCK_SOCK:" 2>/dev/null; rm -f "$DOCK_SOCK"
-  if [ -f "$LAB/qemu.pid" ]; then
-    local qp; qp="$(cat "$LAB/qemu.pid")"
+  if [ -f "$VMDIR/qemu.pid" ]; then
+    local qp; qp="$(cat "$VMDIR/qemu.pid")"
     kill "$qp" 2>/dev/null
     for _ in $(seq 1 10); do kill -0 "$qp" 2>/dev/null || break; sleep 1; done
     kill -9 "$qp" 2>/dev/null
-    rm -f "$LAB/qemu.pid"
   fi
-  rm -f "$LAB/engine.qcow2" "$LAB/seed.iso" "$LAB/user-data" "$LAB/meta-data" "$LAB/console.log" "$LAB/curl.log"
+  rm -f "$VMDIR/avocado-os-"*.img "$VMDIR/u-boot.rom" "$VMDIR/console.log" "$VMDIR/qemu.pid"
   rm -rf "$HOME/.avocado/container-dev" "$BUILD_CTX"
   printf '   %-11s %s\n' "done" "start again with: $0 all"
 }
@@ -468,9 +569,13 @@ cmd_reset() {
 cmd_all() {
   local v1="${1:-v1}" v2="${2:-v2-RELOADED}"
   [ "${LAB_VM:-1}" = 1 ] && cmd_setup
+  # Order matters and is not arbitrary: the unit can only run an image the target
+  # actually has, and in native mode only the session+agent can put one there. So
+  # build and install first, bring the loop up, then seed through it, then reload.
   cmd_app "$v1"
   cmd_up
   cmd_agent
+  cmd_seed "$v1"
   cmd_reload "$v2"
   cmd_status
 }
@@ -479,6 +584,7 @@ case "${1:-}" in
   setup)  shift; cmd_setup "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   app)    shift; cmd_app "$@" ;;
+  seed)   shift; cmd_seed "$@" ;;
   up)     shift; cmd_up "$@" ;;
   agent)  shift; cmd_agent "$@" ;;
   reload) shift; cmd_reload "$@" ;;
