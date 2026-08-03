@@ -2,6 +2,7 @@ pub mod build;
 pub mod clean;
 pub mod config_show;
 pub mod connect;
+pub mod cve;
 pub mod ext;
 pub mod fetch;
 pub mod hitl;

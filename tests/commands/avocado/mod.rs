@@ -1,6 +1,7 @@
 //! Tests for avocado command.
 
 pub mod clean;
+pub mod cve;
 pub mod ext;
 pub mod fetch;
 pub mod hitl;

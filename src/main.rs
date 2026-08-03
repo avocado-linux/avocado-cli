@@ -45,6 +45,7 @@ use commands::connect::trust::{
     ConnectTrustPromoteRootCommand, ConnectTrustRotateServerKeyCommand, ConnectTrustStatusCommand,
 };
 use commands::connect::upload::ConnectUploadCommand;
+use commands::cve::report::CveReportCommand;
 use commands::ext::{
     ExtBuildCommand, ExtCheckoutCommand, ExtCleanCommand, ExtDepsCommand, ExtDnfCommand,
     ExtFetchCommand, ExtImageCommand, ExtInstallCommand, ExtListCommand, ExtPackageCommand,
@@ -142,6 +143,11 @@ enum Commands {
     Kernel {
         #[command(subcommand)]
         command: KernelCommands,
+    },
+    /// CVE correlation commands
+    Cve {
+        #[command(subcommand)]
+        command: CveCommands,
     },
     /// Initialize a new avocado project
     Init {
@@ -1347,6 +1353,46 @@ enum ConnectClaimTokensCommands {
 }
 
 #[derive(Subcommand)]
+enum CveCommands {
+    /// Report which CVEs affect the packages installed in this project
+    Report {
+        /// Path to the CVE report published by the Yocto build
+        /// (`bitbake avocado-cve-report`)
+        #[arg(short = 'f', long)]
+        file: String,
+        /// Path to avocado.yaml (defaults to ./avocado.yaml)
+        #[arg(short = 'C', long, default_value = "./avocado.yaml")]
+        config: String,
+        /// Target architecture
+        #[arg(short = 't', long)]
+        target: Option<String>,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+        /// Exit non-zero if any CVE scores at or above this CVSS value, for
+        /// use as a release gate. The report is still printed. CVEs carrying
+        /// no CVSS score cannot match any threshold; the report counts them
+        /// separately as cves_unscored.
+        ///
+        /// Range-checked against the CVSS scale: `--fail-on-score 99` is the
+        /// 0-100 confusion, and without a parser it silently matches nothing
+        /// and exits 0 on a report full of 9.8s. `nan` and `inf` do the same.
+        #[arg(
+            long,
+            value_name = "SCORE",
+            value_parser = commands::cve::report::parse_cvss_score
+        )]
+        fail_on_score: Option<f64>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommands {
     /// Show the parsed avocado.yaml in a stable JSON or YAML-ish summary.
     Show {
@@ -2006,6 +2052,9 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Initramfs { .. }
             | Commands::Kernel { .. }
             | Commands::Runtime { .. }
+            // Reads every sysroot's RPM database, which only exists inside the
+            // SDK container's state volume.
+            | Commands::Cve { .. }
             | Commands::Hitl { .. }
             | Commands::Prune { .. }
             | Commands::Clean { .. }
@@ -3155,6 +3204,31 @@ async fn main() -> Result<()> {
                 .with_sdk_arch(cli.sdk_arch.clone())
                 .with_output_dir(out_dir);
                 image_cmd.execute().await?;
+                Ok(())
+            }
+        },
+        Commands::Cve { command } => match command {
+            CveCommands::Report {
+                file,
+                config,
+                target,
+                verbose,
+                container_args,
+                output,
+                fail_on_score,
+            } => {
+                let cmd = CveReportCommand::new(
+                    config,
+                    file,
+                    target.or(cli.target.clone()),
+                    verbose,
+                    container_args,
+                    output,
+                    fail_on_score,
+                )
+                .with_runs_on(cli.runs_on.clone())
+                .with_sdk_arch(cli.sdk_arch.clone());
+                cmd.execute().await?;
                 Ok(())
             }
         },

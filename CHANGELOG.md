@@ -30,6 +30,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `avocado-desktop` is not affected - its parser already reads the first line's
   second field.
 
+- **`avocado cve report`.** Correlates the packages installed in a project with
+  the CVEs of the recipes that produced them, reading the per-machine JSON a
+  Yocto build publishes (`--file`) and every sysroot's RPM database. Results are
+  broken down by scope — `sdk`, `rootfs`, `initramfs`, `target-sysroot`,
+  `includes`, `includes:<name>` for legacy-layout remote extensions, which hold
+  a database of their own, `runtime:<name>`, `ext:<runtime>/<name>`, and
+  `ext:<name>` for extensions outside a runtime. `--fail-on-score <SCORE>` exits
+  non-zero when any CVE reaches that CVSS value, for use as a release gate; the
+  JSON document carries the resolved `score` and `score_source` the command
+  itself ranks by, so a consumer gating on severity does not have to re-derive
+  them, and `counts.cves_unscored` for the CVEs no threshold can match. Each
+  affected package also carries `report_version_rpm`, the report's version put
+  through the `-` → `+` rewrite RPM packaging applies, so a consumer can diff it
+  against `installed_version` without reimplementing that rule.
+
+  `--fail-on-score` is range-checked against the CVSS scale, so `99` — the
+  0-100 confusion — is a startup error rather than a threshold that silently
+  matches nothing. The JSON also carries `source.machine_mismatch`, the verdict
+  behind the human warning, which `--output json` suppresses; and
+  `packages_baseline_divergent`, for packages an extension or runtime holds at a
+  version the rootfs holds differently, which its one-time seeded RPM database
+  cannot distinguish from a package the scope installed itself.
+
+  A sysroot whose `rpm -qa` fails is reported as a failed scan rather than as an
+  empty one. `rpm -qa` over a wiped database exits 0 with no output instead, so
+  emptiness is checked too: the command refuses to report when no sysroot
+  yielded a package, and an existing-but-empty `rootfs` is kept as a scope —
+  `scopes.rootfs.packages_scanned: 0` — rather than dropped, since dropping it
+  left extension and runtime counts silently measured against no baseline. When
+  either check fires, the tail of rpm's own stderr is quoted in the failure:
+  the container exits 0 by design, so that diagnosis had nowhere else to go.
+  `--runs-on` is refused rather than ignored, since the container helper this
+  command uses reads the local volume.
+
 ### Fixed
 - **`--connect-sign` guidance.** The deploy help text and the Level 2 setup
   messages now reference `avocado connect trust promote-root --key <KEY>` with
