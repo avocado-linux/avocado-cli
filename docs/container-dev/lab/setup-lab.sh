@@ -113,6 +113,7 @@ runtimes:
       - avocado-ext-dev
       - avocado-ext-sshd-dev
       - avocado-bsp-{{ avocado.target.board }}
+      - avocado-ext-ca-certificates
       - avocado-ext-docker
       - avocado-ext-container-agent-dev
       - config
@@ -121,6 +122,14 @@ runtimes:
 
 extensions:
   avocado-ext-dev:
+    source: {type: package, version: "*"}
+
+  # Public root CAs. Without these the target's engine cannot verify TLS to any
+  # public registry: a guest-side `docker build FROM busybox:latest` dies with
+  # `x509: certificate signed by unknown authority`, which is what took Part A to
+  # 7/8. Container Dev Mode's own traffic does not need this - it pins the
+  # per-project CA - but anything that pulls a public base image does.
+  avocado-ext-ca-certificates:
     source: {type: package, version: "*"}
 
   avocado-ext-sshd-dev:
