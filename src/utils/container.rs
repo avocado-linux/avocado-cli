@@ -3270,7 +3270,10 @@ extensions:
         assert!(container.verbose);
     }
 
+    // Serial because `build_container_command` reads AVOCADO_SIGNING_KEYS_DIR,
+    // which config.rs's SigningKeysRegistryFixture tests mutate.
     #[test]
+    #[serial_test::serial]
     fn test_build_container_command() {
         use crate::utils::volume::VolumeState;
         let container = SdkContainer::new();

@@ -127,34 +127,18 @@ impl SdkRunCommand {
         config: &Config,
         runtime_name: &str,
     ) -> Result<Option<(PathBuf, PathBuf, String, String)>> {
-        // Check if runtime has signing configuration
-        let signing_key_name = match config.get_runtime_signing_key(runtime_name) {
-            Some(keyid) => {
-                // Get the key name from signing_keys mapping
-                let signing_keys = config.get_signing_keys();
-                signing_keys
-                    .and_then(|keys| {
-                        keys.iter()
-                            .find(|(_, v)| *v == &keyid)
-                            .map(|(k, _)| k.clone())
-                    })
-                    .context("Signing key ID not found in signing_keys mapping")?
+        // An unresolvable declared key aborts rather than warning: without the
+        // signing service the container skips signing and exits 0 unsigned.
+        let Some((signing_key_name, keyid)) = config.resolve_runtime_signing_key(runtime_name)?
+        else {
+            if self.verbose {
+                print_info(
+                    "No signing key configured for runtime. Signing service will not be started.",
+                    OutputLevel::Verbose,
+                );
             }
-            None => {
-                // No signing configured for this runtime
-                if self.verbose {
-                    print_info(
-                        "No signing key configured for runtime. Signing service will not be started.",
-                        OutputLevel::Verbose,
-                    );
-                }
-                return Ok(None);
-            }
+            return Ok(None);
         };
-
-        let keyid = config
-            .get_runtime_signing_key(runtime_name)
-            .context("Failed to get signing key ID")?;
 
         // Get checksum algorithm (defaults to sha256)
         let checksum_str = config
@@ -214,13 +198,32 @@ impl SdkRunCommand {
         )))
     }
 
-    /// Setup signing service stub for non-Unix platforms
+    /// The signing service needs Unix domain sockets, so it cannot run here:
+    /// runs on this platform are unsigned regardless of key resolvability.
+    /// Warns rather than failing; both conditions are said out loud so a
+    /// typo'd key does not pass with no output at all.
     #[cfg(not(unix))]
     async fn setup_signing_service(
         &mut self,
-        _config: &Config,
-        _runtime_name: &str,
+        config: &Config,
+        runtime_name: &str,
     ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf, String, String)>> {
+        use crate::utils::output::print_warning;
+
+        match config.resolve_runtime_signing_key(runtime_name) {
+            Ok(Some((declared, _))) => print_warning(
+                &format!(
+                    "Runtime '{runtime_name}' declares signing key '{declared}', but the signing \
+                     service is unavailable on this platform. It will not be started."
+                ),
+                OutputLevel::Normal,
+            ),
+            Ok(None) => {}
+            Err(e) => print_warning(
+                &format!("{e}. The signing service is unavailable on this platform anyway."),
+                OutputLevel::Normal,
+            ),
+        }
         Ok(None)
     }
 

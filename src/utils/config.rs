@@ -539,7 +539,8 @@ pub enum ConfigError {
 /// Signing configuration for runtime
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SigningConfig {
-    /// Name of the signing key to use (references a key from signing_keys section).
+    /// Name of the signing key to use: an entry in the `signing_keys` mapping,
+    /// or a key name in the machine's global signing-key registry.
     /// Required for Level 2 (user-controlled root). Optional at Level 1 (content-only).
     #[serde(default)]
     pub key: Option<String>,
@@ -3967,18 +3968,74 @@ impl Config {
             return Some((reference.to_string(), entry.keyid.clone()));
         }
 
-        // If not found by name, check if it's a valid key ID that exists in the registry
-        for (name, entry) in &registry.keys {
-            if entry.keyid == reference {
-                return Some((name.clone(), entry.keyid.clone()));
-            }
-        }
-
-        None
+        // Reverse lookup by key ID. Several names can hold the same key, so
+        // which alias comes back is unspecified.
+        registry
+            .keys
+            .iter()
+            .find(|(_, entry)| entry.keyid == reference)
+            .map(|(name, entry)| (name.clone(), entry.keyid.clone()))
     }
 
-    /// Get the declared signing key name for a runtime (without resolving it).
+    /// Resolve a runtime's signing configuration to `(declared name, key ID)`.
     ///
+    /// The declared name — what the user wrote in `signing.key` — is what
+    /// `.sig` files record and what build/deploy resolve against the registry,
+    /// so it is never recovered by reverse lookup from the key ID.
+    ///
+    /// - `Ok(None)` — the runtime does not exist or declares no signing key.
+    /// - `Err` — a key is declared but does not resolve on this host, or the
+    ///   `signing_keys` mapping and the key registry disagree about which key
+    ///   the declared name refers to.
+    pub fn resolve_runtime_signing_key(
+        &self,
+        runtime_name: &str,
+    ) -> Result<Option<(String, String)>> {
+        let Some(declared) = self.get_runtime_signing_key_name(runtime_name) else {
+            return Ok(None);
+        };
+        // Re-check resolvability: `get_runtime_signing_key` hands back an
+        // unresolved mapping value as-is, and the signing service loads key
+        // files by key ID.
+        let resolved = self
+            .get_runtime_signing_key(runtime_name)
+            .filter(|keyid| Self::resolve_signing_key_reference(keyid).is_some());
+        match resolved {
+            Some(keyid) => {
+                // The declared name can resolve two ways: through the
+                // `signing_keys` mapping and directly in the key registry.
+                // build/deploy use only the registry, so if the two disagree
+                // this command would sign with a different key than they do.
+                if let Some((_, direct)) = Self::resolve_signing_key_reference(&declared) {
+                    if direct != keyid {
+                        anyhow::bail!(
+                            "Signing key '{declared}' for runtime '{runtime_name}' is \
+                             ambiguous: the signing_keys mapping resolves it to key ID \
+                             {keyid}, but the key registry resolves '{declared}' to \
+                             {direct}. Remove or update the signing_keys entry so both \
+                             agree"
+                        );
+                    }
+                }
+                Ok(Some((declared, keyid)))
+            }
+            None => {
+                // Name the mapping value when the declared name is an alias:
+                // `signing-keys list` will never show the alias.
+                let via = self
+                    .get_signing_key_id(&declared)
+                    .filter(|value| *value != &declared)
+                    .map(|value| format!(" (signing_keys maps it to '{value}')"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "Signing key '{declared}'{via} is configured for runtime \
+                     '{runtime_name}' but could not be resolved; run `avocado signing-keys \
+                     list` to view available keys"
+                )
+            }
+        }
+    }
+
     /// Get the declared version for a runtime, if any.
     /// Returns None if the runtime doesn't exist or has no version field.
     pub fn get_runtime_version(&self, runtime_name: &str) -> Option<String> {
@@ -3987,11 +4044,18 @@ impl Config {
     }
 
     /// Returns Some(key_name) if the runtime has a signing configuration declared,
-    /// None if the runtime doesn't exist or has no signing section.
+    /// None if the runtime doesn't exist or has no signing section. An empty or
+    /// whitespace-only key (e.g. an env interpolation that expanded to nothing)
+    /// is treated as undeclared, not as an unresolvable key.
     #[allow(dead_code)] // Public API for future use
     pub fn get_runtime_signing_key_name(&self, runtime_name: &str) -> Option<String> {
         let runtime_config = self.runtimes.as_ref()?.get(runtime_name)?;
-        runtime_config.signing.as_ref()?.key.clone()
+        runtime_config
+            .signing
+            .as_ref()?
+            .key
+            .clone()
+            .filter(|key| !key.trim().is_empty())
     }
 
     /// Get the declared content key name for a runtime (for signing delegated-targets only).
@@ -5703,8 +5767,43 @@ pub fn find_active_compile_sections(
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::ffi::OsString;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
+
+    struct SigningKeysRegistryFixture {
+        _temp_dir: TempDir,
+        previous_dir: Option<OsString>,
+    }
+
+    impl SigningKeysRegistryFixture {
+        fn new(registry: crate::utils::signing_keys::KeysRegistry) -> Self {
+            let temp_dir = TempDir::new().unwrap();
+            let previous_dir = std::env::var_os("AVOCADO_SIGNING_KEYS_DIR");
+            // Construct the guard BEFORE anything that can panic, so a
+            // failing `save()` still restores the env var on unwind. Set it
+            // last inside the guarded window: if `save()` panicked with the
+            // var set and no guard alive, every later registry read in this
+            // test binary would silently see an empty registry.
+            let guard = Self {
+                _temp_dir: temp_dir,
+                previous_dir,
+            };
+            std::env::set_var("AVOCADO_SIGNING_KEYS_DIR", guard._temp_dir.path());
+            registry.save().unwrap();
+            guard
+        }
+    }
+
+    impl Drop for SigningKeysRegistryFixture {
+        fn drop(&mut self) {
+            if let Some(previous_dir) = &self.previous_dir {
+                std::env::set_var("AVOCADO_SIGNING_KEYS_DIR", previous_dir);
+            } else {
+                std::env::remove_var("AVOCADO_SIGNING_KEYS_DIR");
+            }
+        }
+    }
 
     #[test]
     fn test_load_valid_config() {
@@ -9043,6 +9142,7 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_signing_keys_parsing() {
         // Key IDs are now full 64-char hex-encoded SHA-256 hashes
         let production_keyid = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1";
@@ -9136,6 +9236,277 @@ runtimes:
     }
 
     #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_uses_the_declared_alias() {
+        // The name this returns lands in `.sig` files, so picking the wrong
+        // alias silently disagrees with what build/deploy record.
+        //
+        // The registry has to hold the key: two aliases naming the same key ID
+        // are only distinguishable once that ID resolves, and an unresolvable
+        // one is now rejected outright.
+        use crate::utils::signing_keys::{KeyEntry, KeysRegistry};
+
+        let keyid = "1111111111111111111111111111111111111111111111111111111111111111";
+        let mut registry = KeysRegistry::default();
+        registry.keys.insert(
+            "registry-name".to_string(),
+            KeyEntry {
+                keyid: keyid.to_string(),
+                algorithm: "ed25519".to_string(),
+                created_at: chrono::Utc::now(),
+                uri: "file:///tmp/registry-name".to_string(),
+            },
+        );
+        let _registry = SigningKeysRegistryFixture::new(registry);
+
+        let config = Config::load_from_yaml_str(&format!(
+            r#"
+signing_keys:
+  - alpha-alias: "{keyid}"
+  - zeta-alias: "{keyid}"
+runtimes:
+  prod:
+    signing:
+      key: zeta-alias
+"#
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.resolve_runtime_signing_key("prod").unwrap(),
+            Some(("zeta-alias".to_string(), keyid.to_string()))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_resolves_registry_name_alongside_a_mapping() {
+        // The headline shape: a `signing_keys` mapping exists but the runtime's
+        // own key is resolvable only through the global registry. Gating the
+        // registry path on "no mapping at all" would regress exactly this.
+        use crate::utils::signing_keys::{KeyEntry, KeysRegistry};
+
+        let keyid = "2222222222222222222222222222222222222222222222222222222222222222";
+        let mut registry = KeysRegistry::default();
+        registry.keys.insert(
+            "prod-key".to_string(),
+            KeyEntry {
+                keyid: keyid.to_string(),
+                algorithm: "ed25519".to_string(),
+                created_at: chrono::Utc::now(),
+                uri: "file:///tmp/prod-key".to_string(),
+            },
+        );
+        let _registry = SigningKeysRegistryFixture::new(registry);
+
+        let config = Config::load_from_yaml_str(
+            r#"
+signing_keys:
+  - unrelated: "9999999999999999999999999999999999999999999999999999999999999999"
+runtimes:
+  dev:
+    signing:
+      key: prod-key
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.resolve_runtime_signing_key("dev").unwrap(),
+            Some((
+                "prod-key".to_string(),
+                "2222222222222222222222222222222222222222222222222222222222222222".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_errors_on_unresolvable_mapping_value() {
+        // Bridge form where the mapping value is a registry name this host
+        // does not have. `get_runtime_signing_key` hands the raw value back as
+        // if it were a key ID, so without the resolvability check this would
+        // look configured and every in-container sign request would fail
+        // instead.
+        use crate::utils::signing_keys::KeysRegistry;
+
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
+        let config = Config::load_from_yaml_str(
+            r#"
+signing_keys:
+  - release: machine-prod
+runtimes:
+  prod:
+    signing:
+      key: release
+"#,
+        )
+        .unwrap();
+
+        let err = config
+            .resolve_runtime_signing_key("prod")
+            .expect_err("an unresolvable mapping value must not read as configured");
+        let msg = err.to_string();
+        assert!(msg.contains("release"), "message was {msg:?}");
+        assert!(msg.contains("for runtime 'prod'"), "message was {msg:?}");
+        assert!(msg.contains("signing-keys list"), "message was {msg:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_rejects_an_absent_key_id_via_alias() {
+        // A key ID absent from this host's registry, reached through a
+        // `signing_keys` alias. Accepting the aliased form made the outcome
+        // depend on spelling and deferred the real failure to sign time.
+        use crate::utils::signing_keys::KeysRegistry;
+
+        let keyid = "3333333333333333333333333333333333333333333333333333333333333333";
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
+        let config = Config::load_from_yaml_str(&format!(
+            r#"
+signing_keys:
+  - legacy-key: "{keyid}"
+runtimes:
+  dev:
+    signing:
+      key: legacy-key
+"#
+        ))
+        .unwrap();
+        let err = config
+            .resolve_runtime_signing_key("dev")
+            .expect_err("a key ID absent from the registry is not usable");
+        let msg = err.to_string();
+        assert!(msg.contains("legacy-key"), "message was {msg:?}");
+        assert!(
+            msg.contains(keyid),
+            "the alias resolves to the key ID, so the error must name it: {msg:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_rejects_an_absent_key_id_written_directly() {
+        // The same key ID written straight into `signing.key` must fail
+        // identically to the aliased spelling above.
+        use crate::utils::signing_keys::KeysRegistry;
+
+        let keyid = "3333333333333333333333333333333333333333333333333333333333333333";
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
+        let config = Config::load_from_yaml_str(&format!(
+            r#"
+runtimes:
+  dev:
+    signing:
+      key: "{keyid}"
+"#
+        ))
+        .unwrap();
+        config
+            .resolve_runtime_signing_key("dev")
+            .expect_err("a key ID absent from the registry is not usable");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_rejects_alias_registry_disagreement() {
+        // Bridge form where the declared name is also a registry name for a
+        // *different* key: `signing_keys` maps `prod` to `machine-a`'s key,
+        // while the registry resolves `prod` to its own key. build/deploy use
+        // the registry, so accepting the mapping's answer would sign with a
+        // different key than they do — this must be an error, not a choice.
+        use crate::utils::signing_keys::{KeyEntry, KeysRegistry};
+
+        let keyid_a = "4444444444444444444444444444444444444444444444444444444444444444";
+        let keyid_p = "5555555555555555555555555555555555555555555555555555555555555555";
+        let mut registry = KeysRegistry::default();
+        registry.keys.insert(
+            "machine-a".to_string(),
+            KeyEntry {
+                keyid: keyid_a.to_string(),
+                algorithm: "ed25519".to_string(),
+                created_at: chrono::Utc::now(),
+                uri: "file:///tmp/machine-a".to_string(),
+            },
+        );
+        registry.keys.insert(
+            "prod".to_string(),
+            KeyEntry {
+                keyid: keyid_p.to_string(),
+                algorithm: "ed25519".to_string(),
+                created_at: chrono::Utc::now(),
+                uri: "file:///tmp/prod".to_string(),
+            },
+        );
+        let _registry = SigningKeysRegistryFixture::new(registry);
+
+        let config = Config::load_from_yaml_str(
+            r#"
+signing_keys:
+  - prod: machine-a
+runtimes:
+  dev:
+    signing:
+      key: prod
+"#,
+        )
+        .unwrap();
+
+        let err = config
+            .resolve_runtime_signing_key("dev")
+            .expect_err("mapping and registry disagreeing on 'prod' must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "message was {msg:?}");
+        assert!(msg.contains(keyid_a), "message was {msg:?}");
+        assert!(msg.contains(keyid_p), "message was {msg:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_treats_an_empty_key_as_undeclared() {
+        // `key: ""` — e.g. an env interpolation that expanded to nothing —
+        // reads as "no signing declared", matching pre-registry behaviour,
+        // rather than an unresolvable key named '' in the error.
+        use crate::utils::signing_keys::KeysRegistry;
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
+        let config = Config::load_from_yaml_str(
+            r#"
+runtimes:
+  dev:
+    signing:
+      key: ""
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.resolve_runtime_signing_key("dev").unwrap(), None);
+        assert_eq!(config.get_runtime_signing_key_name("dev"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_runtime_signing_key_is_none_without_a_signing_section() {
+        use crate::utils::signing_keys::KeysRegistry;
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
+        let config = Config::load_from_yaml_str(
+            r#"
+runtimes:
+  dev:
+    version: "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.resolve_runtime_signing_key("dev").unwrap(), None);
+        assert_eq!(config.resolve_runtime_signing_key("missing").unwrap(), None);
+    }
+
+    #[test]
     fn test_signing_keys_empty() {
         let config_content = r#"
 default_target: qemux86-64
@@ -9155,9 +9526,14 @@ sdk:
     }
 
     #[test]
+    #[serial]
     fn test_get_runtime_signing_key_name() {
         // Test that get_runtime_signing_key_name returns the declared key name
-        // even when the key cannot be resolved (e.g., signing_keys section missing)
+        // even when the key cannot be resolved (e.g., signing_keys section missing).
+        // Empty registry: these key names must resolve nowhere on any host.
+        use crate::utils::signing_keys::KeysRegistry;
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
         let config_content = r#"
 default_target: qemux86-64
 
@@ -9201,9 +9577,14 @@ runtimes:
     }
 
     #[test]
+    #[serial]
     fn test_runtime_signing_key_declared_but_not_in_signing_keys() {
         // Test scenario where runtime references a key that exists in signing_keys
-        // but uses a different name
+        // but uses a different name.
+        // Empty registry: `missing-key` must resolve nowhere on any host.
+        use crate::utils::signing_keys::KeysRegistry;
+        let _registry = SigningKeysRegistryFixture::new(KeysRegistry::default());
+
         let keyid = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1";
 
         let config_content = format!(
