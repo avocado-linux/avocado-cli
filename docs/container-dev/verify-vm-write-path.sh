@@ -14,7 +14,7 @@
 #   2. A guest push to 10.0.2.2:<write-port> over authenticated HTTPS SUCCEEDS.
 #   3. An unauthenticated write to that listener is REFUSED (401), so the write
 #      path is not anonymous. (falsifier: guest write path unauthenticated / A3)
-#   4. The avocado-vm overlay bakes NO CA - it only provisions /etc/container-dev.
+#   4. The avocado-vm overlay bakes NO CA. (falsifier: a cert in the image)
 #
 # Every step prints PASS/FAIL; a non-zero exit means the verify failed.
 
@@ -31,8 +31,8 @@ WRITE_PORT="${AVOCADO_CONTAINER_DEV_WRITE_PORT:-5601}"
 CONFIG="${AVOCADO_CONFIG:-avocado.yaml}"
 # A trivial watched image whose ref matches runtimes.<name>.container_dev.images[].ref
 TEST_IMAGE="${TEST_IMAGE:-my-app:dev}"
-# Path to the meta-avocado base-files bbappend that provisions the trust-store dir
-# (used only for the "no static CA baked" source check). Adjust to your checkout.
+# Path to the meta-avocado base-files bbappend, read only for the "no static CA
+# baked" source check. Adjust to your checkout.
 BBAPPEND="${BBAPPEND:-$HOME/repos/work/peridio-scarthgap-build/meta-avocado/meta-avocado-qemu/recipes-core/base-files/base-files_%.bbappend}"
 
 VM_REGISTRY="10.0.2.2:${WRITE_PORT}"
@@ -89,18 +89,20 @@ fi
 # ---------------------------------------------------------------------------
 step "4. No static CA baked into the avocado-vm overlay (design D8/H4)"
 # ---------------------------------------------------------------------------
-# The overlay must only provision the trust-store LOCATION - never a CA. Check the
-# base-files bbappend source: it must create /etc/container-dev and install no cert.
+# A source check, and deliberately a negative one: the overlay must install no
+# cert. Where the CA actually lands is asserted at run time by step 1/4 against
+# the live guest, not by reading build metadata.
+#
+# There is no positive counterpart here on purpose. A grep for a path string in
+# this same file only proves the file contains that string - it passes for a
+# typo'd path, for the wrong directory tree, and for a comment with the install
+# line deleted. The CLI creates the trust dir itself with `mkdir -p` at `up`
+# time, so there is nothing for the image to provision in the first place.
 if [ -f "$BBAPPEND" ]; then
   if grep -Eq 'install .*(\.crt|\.pem|ca-cert|ca\.crt)' "$BBAPPEND"; then
     bad "the base-files bbappend installs a certificate - a CA is baked ($BBAPPEND)"
   else
-    ok "the base-files bbappend bakes no CA (provisions the location only)"
-  fi
-  if grep -q 'container-dev' "$BBAPPEND"; then
-    ok "the overlay provisions the /etc/container-dev trust-store location"
-  else
-    bad "the overlay does not provision /etc/container-dev"
+    ok "the base-files bbappend bakes no CA"
   fi
 else
   echo "  SKIP: bbappend not found at $BBAPPEND (set BBAPPEND to your checkout)"
