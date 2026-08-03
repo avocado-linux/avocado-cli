@@ -13,9 +13,10 @@ use crate::utils::nfs_server::{
     find_available_port, get_docker_volume_mountpoint, is_port_available, NfsExport, NfsServer,
     NfsServerConfig, DEFAULT_NFS_PORT_RANGE,
 };
-use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::output::{print_info, print_success, print_warning_above, OutputLevel};
 use crate::utils::remote::{
-    get_local_ip_for_remote, RemoteHost, RemoteVolumeManager, SshClient, SshControlMaster,
+    get_local_ip_for_remote, RemoteHost, RemoteVersionCheck, RemoteVolumeManager, SshClient,
+    SshControlMaster,
 };
 
 #[cfg(unix)]
@@ -119,11 +120,17 @@ impl RunsOnContext {
 
         // Check remote CLI version compatibility
         print_info("Checking remote avocado version...", OutputLevel::Normal);
-        let remote_version = ssh.check_cli_version().await?;
-        print_success(
-            &format!("Remote avocado version: {remote_version}"),
-            OutputLevel::Normal,
-        );
+        match ssh.check_cli_version().await? {
+            RemoteVersionCheck::Verified(remote_version) => print_success(
+                &format!("Remote avocado version: {remote_version}"),
+                OutputLevel::Normal,
+            ),
+            // Never a green success line here: the check did not run. The notice
+            // goes through `print_warning_above` because `print_warning` is
+            // suppressed whenever a renderer or `--json` is active, which is the
+            // default for most of these commands.
+            RemoteVersionCheck::Skipped { warning, .. } => print_warning_above(&warning),
+        }
 
         // Determine which port to use
         let port = match nfs_port {

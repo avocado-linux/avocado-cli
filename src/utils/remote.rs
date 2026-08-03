@@ -174,13 +174,22 @@ impl SshClient {
         Ok(())
     }
 
-    /// Check that the remote avocado CLI version is compatible
+    /// Check that the remote avocado CLI version is compatible.
     ///
-    /// The remote version must be equal to or greater than the local version.
-    /// Returns the remote version string if compatible.
+    /// Returns [`RemoteVersionCheck::Verified`] when the remote reported a
+    /// parseable version at least as new as the local one, and
+    /// [`RemoteVersionCheck::Skipped`] when its `--version` output could not be
+    /// read, so no comparison happened. Errors when the remote is genuinely
+    /// older, or when the CLI is missing there entirely.
+    ///
+    /// The two `Ok` cases stay distinct all the way to the caller on purpose. A
+    /// `Result<String>` collapsed them back into one indistinguishable value, so
+    /// the caller printed the same green success line for a skipped check as for
+    /// a passed one - which is the failure this whole three-valued path exists
+    /// to prevent.
     ///
     /// For localhost/127.0.0.1, this check is skipped since it's the same machine.
-    pub async fn check_cli_version(&self) -> Result<String> {
+    pub async fn check_cli_version(&self) -> Result<RemoteVersionCheck> {
         let local_version = env!("CARGO_PKG_VERSION");
 
         // Skip version check for localhost - it's the same machine
@@ -191,7 +200,7 @@ impl SshClient {
                     OutputLevel::Normal,
                 );
             }
-            return Ok(local_version.to_string());
+            return Ok(RemoteVersionCheck::Verified(local_version.to_string()));
         }
 
         if self.verbose {
@@ -244,17 +253,7 @@ impl SshClient {
 
         let remote_version = parse_reported_version(&version_output);
 
-        // Compare versions
-        if !is_version_compatible(local_version, remote_version) {
-            anyhow::bail!(
-                "Remote avocado version '{}' is older than local version '{}'. \
-                 Please upgrade avocado on '{}' to version {} or later.",
-                remote_version,
-                local_version,
-                self.remote.ssh_target(),
-                local_version
-            );
-        }
+        let gate = version_gate_outcome(local_version, remote_version, &self.remote.ssh_target());
 
         if self.verbose {
             print_info(
@@ -263,7 +262,17 @@ impl SshClient {
             );
         }
 
-        Ok(remote_version.to_string())
+        match gate {
+            VersionGate::Compatible => Ok(RemoteVersionCheck::Verified(remote_version.to_string())),
+            VersionGate::TooOld(message) => anyhow::bail!(message),
+            // Proceed, but hand the caller the notice rather than swallowing it.
+            // Refusing here would break a working setup whose remote merely
+            // prints an unusual version string.
+            VersionGate::Unreadable(warning) => Ok(RemoteVersionCheck::Skipped {
+                reported: remote_version.to_string(),
+                warning,
+            }),
+        }
     }
 
     /// Run a command on the remote host and return the output
@@ -959,6 +968,59 @@ pub async fn get_local_ip_for_remote(remote_host: &str) -> Result<IpAddr> {
         .unwrap_or_else(|| anyhow::anyhow!("No valid addresses found for remote host")))
 }
 
+/// What [`SshClient::check_cli_version`] concluded about the remote CLI.
+///
+/// Kept distinct rather than flattened back to a `String` so a caller can tell a
+/// verified-compatible remote from one whose version was never readable, and
+/// present them differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteVersionCheck {
+    /// The remote reported a parseable version at least as new as the local one.
+    Verified(String),
+    /// The remote's `--version` output could not be parsed, so no comparison
+    /// happened. Carries what it reported and the notice to show for it.
+    Skipped { reported: String, warning: String },
+}
+
+/// The three ways the version gate can land, with the prose for the two that
+/// have something to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionGate {
+    Compatible,
+    /// The remote is genuinely older; the caller should refuse to proceed.
+    TooOld(String),
+    /// Neither version parsed, so the check did not run.
+    Unreadable(String),
+}
+
+/// Decide the version gate from the two version strings.
+///
+/// Pure, and separate from [`SshClient::check_cli_version`], because the three
+/// arms were otherwise reachable only through a live ssh boundary that nothing
+/// fakes. The warn-and-proceed arm in particular had no test at all: replacing
+/// its whole body with `None => {}` left both `cargo test --lib` and
+/// `tests/runs_on_integration.rs` passing, which is how a silent skip got
+/// through review in the first place.
+pub fn version_gate_outcome(
+    local_version: &str,
+    remote_version: &str,
+    ssh_target: &str,
+) -> VersionGate {
+    match is_version_compatible(local_version, remote_version) {
+        Some(true) => VersionGate::Compatible,
+        Some(false) => VersionGate::TooOld(format!(
+            "Remote avocado version '{remote_version}' is older than local version \
+             '{local_version}'. Please upgrade avocado on '{ssh_target}' to version \
+             {local_version} or later."
+        )),
+        None => VersionGate::Unreadable(format!(
+            "Could not read the avocado version on '{ssh_target}' from \
+             '{remote_version}', so the version check was skipped. If this command \
+             fails oddly, confirm the remote has avocado {local_version} or later."
+        )),
+    }
+}
+
 /// Extract the version from `avocado --version` output.
 ///
 /// The line reads `avocado <version> (<short-sha> <commit-date>)`, so the
@@ -1014,7 +1076,18 @@ fn is_version_shaped(token: &str) -> bool {
 ///
 /// The remote version must be equal to or greater than the local version.
 /// Uses semantic versioning comparison.
-pub fn is_version_compatible(local_version: &str, remote_version: &str) -> bool {
+///
+/// `Some(true)` compatible, `Some(false)` the remote is older, and `None` when
+/// either version could not be parsed.
+///
+/// `None` used to be `true`: an unreadable version was indistinguishable from a
+/// verified-compatible one, so the check passed silently and the user never
+/// learned it had been skipped. Proceeding on `None` is still the right default
+/// for the caller to choose - refusing to run because a remote printed an odd
+/// version string would break working setups to guard against a hypothetical -
+/// but that is the caller's call to make and to announce, not something this
+/// function should decide by returning the same answer as success.
+pub fn is_version_compatible(local_version: &str, remote_version: &str) -> Option<bool> {
     let parse_version = |v: &str| -> Option<(u32, u32, u32)> {
         let parts: Vec<&str> = v.split('.').collect();
         if parts.len() >= 3 {
@@ -1031,14 +1104,11 @@ pub fn is_version_compatible(local_version: &str, remote_version: &str) -> bool 
     };
 
     match (parse_version(local_version), parse_version(remote_version)) {
-        (Some(local), Some(remote)) => {
-            // Remote must be >= local
-            remote >= local
-        }
-        _ => {
-            // If we can't parse versions, assume compatible (fail open)
-            true
-        }
+        // Remote must be >= local
+        (Some(local), Some(remote)) => Some(remote >= local),
+        // Unparseable on either side: report that rather than answering the
+        // question we could not actually evaluate.
+        _ => None,
     }
 }
 
@@ -1094,22 +1164,22 @@ mod tests {
 
     #[test]
     fn test_version_compatible_equal() {
-        assert!(is_version_compatible("0.20.0", "0.20.0"));
-        assert!(is_version_compatible("1.0.0", "1.0.0"));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.0"), Some(true));
+        assert_eq!(is_version_compatible("1.0.0", "1.0.0"), Some(true));
     }
 
     #[test]
     fn test_version_compatible_remote_newer() {
-        assert!(is_version_compatible("0.20.0", "0.21.0"));
-        assert!(is_version_compatible("0.20.0", "1.0.0"));
-        assert!(is_version_compatible("0.20.0", "0.20.1"));
+        assert_eq!(is_version_compatible("0.20.0", "0.21.0"), Some(true));
+        assert_eq!(is_version_compatible("0.20.0", "1.0.0"), Some(true));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.1"), Some(true));
     }
 
     #[test]
     fn test_version_incompatible_remote_older() {
-        assert!(!is_version_compatible("0.21.0", "0.20.0"));
-        assert!(!is_version_compatible("1.0.0", "0.20.0"));
-        assert!(!is_version_compatible("0.20.1", "0.20.0"));
+        assert_eq!(is_version_compatible("0.21.0", "0.20.0"), Some(false));
+        assert_eq!(is_version_compatible("1.0.0", "0.20.0"), Some(false));
+        assert_eq!(is_version_compatible("0.20.1", "0.20.0"), Some(false));
     }
 
     #[test]
@@ -1186,21 +1256,79 @@ mod tests {
 
     #[test]
     fn test_version_compatible_major_minor_only() {
-        assert!(is_version_compatible("0.20", "0.20.0"));
-        assert!(is_version_compatible("0.20.0", "0.21"));
+        assert_eq!(is_version_compatible("0.20", "0.20.0"), Some(true));
+        assert_eq!(is_version_compatible("0.20.0", "0.21"), Some(true));
     }
 
     #[test]
     fn test_version_compatible_with_prerelease() {
         // Pre-release versions should still compare by numbers
-        assert!(is_version_compatible("0.20.0-beta", "0.20.0"));
-        assert!(is_version_compatible("0.20.0", "0.20.1-rc1"));
+        assert_eq!(is_version_compatible("0.20.0-beta", "0.20.0"), Some(true));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.1-rc1"), Some(true));
     }
 
     #[test]
-    fn test_version_compatible_unparseable() {
-        // Unparseable versions should fail open (assume compatible)
-        assert!(is_version_compatible("unparseable", "0.20.0"));
-        assert!(is_version_compatible("0.20.0", "unparseable"));
+    fn test_version_unparseable_is_reported_as_unknown_not_compatible() {
+        // Was `assert!(is_version_compatible(..))`, pinning a silent fail-open:
+        // an unreadable version returned the same `true` as a genuinely
+        // compatible one, so the caller could not tell "verified compatible"
+        // from "gave up" and said nothing either way. Proceeding is still the
+        // right call - blocking a working deploy over an odd version string
+        // would be a worse failure than the one being fixed - but it has to be
+        // distinguishable so the caller can say so.
+        assert_eq!(is_version_compatible("unparseable", "0.20.0"), None);
+        assert_eq!(is_version_compatible("0.20.0", "unparseable"), None);
+    }
+
+    #[test]
+    fn test_version_gate_compatible_says_nothing() {
+        // A passed check carries no prose: anything it emitted would compete
+        // with the caller's own success line.
+        assert_eq!(
+            version_gate_outcome("0.20.0", "0.21.0", "user@host"),
+            VersionGate::Compatible
+        );
+    }
+
+    #[test]
+    fn test_version_gate_too_old_names_both_versions_and_the_target() {
+        let VersionGate::TooOld(message) =
+            version_gate_outcome("0.21.0", "0.20.0", "user@board.local")
+        else {
+            panic!("an older remote must not pass the gate");
+        };
+        // The user has to know which host to upgrade and to what, so all three
+        // facts belong in the one line they will see.
+        assert!(message.contains("0.20.0"), "{message}");
+        assert!(message.contains("0.21.0"), "{message}");
+        assert!(message.contains("user@board.local"), "{message}");
+    }
+
+    #[test]
+    fn test_version_gate_unreadable_warns_instead_of_staying_silent() {
+        // The arm that had no test at all, and the one this whole three-valued
+        // path exists for. Deleting its body left every suite green, so what is
+        // pinned here is that it produces a notice, not merely that it proceeds.
+        let VersionGate::Unreadable(warning) =
+            version_gate_outcome("0.20.0", "avocado (dev build)", "user@board.local")
+        else {
+            panic!("an unparseable remote version must not read as verified");
+        };
+        // "skipped", not "failed": the run continues, and the wording is the
+        // only thing telling the user the check did not happen.
+        assert!(warning.contains("skipped"), "{warning}");
+        assert!(warning.contains("avocado (dev build)"), "{warning}");
+        assert!(warning.contains("user@board.local"), "{warning}");
+    }
+
+    #[test]
+    fn test_version_gate_does_not_treat_unreadable_as_too_old() {
+        // Both non-compatible arms would satisfy a test that only checked "not
+        // Compatible", but one bails and the other proceeds - collapsing them
+        // would either block working setups or restore the silent pass.
+        let unreadable = version_gate_outcome("0.20.0", "not-a-version", "user@host");
+        let too_old = version_gate_outcome("0.21.0", "0.20.0", "user@host");
+        assert!(matches!(unreadable, VersionGate::Unreadable(_)));
+        assert!(matches!(too_old, VersionGate::TooOld(_)));
     }
 }
