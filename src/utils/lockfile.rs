@@ -185,7 +185,44 @@ pub struct RpmQueryConfig {
     pub root_path: Option<String>,
 }
 
+/// `--qf` for a whole-sysroot listing: NAME<tab>VERSION-RELEASE<tab>ARCH, where
+/// VERSION-RELEASE matches the PKGV-PKGR a Yocto build records.
+///
+/// Public because callers that discover sysroots at run time have to build the
+/// rpm invocation in shell rather than here; sharing this constant keeps the
+/// output format, which their parser depends on, defined in one place.
+pub const RPM_QUERY_ALL_FORMAT: &str = r#"--qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n'"#;
+
 impl RpmQueryConfig {
+    /// Build an `rpm -qa` command listing every installed package in the sysroot.
+    ///
+    /// `build_query_command` asks about a known package list; the CVE report
+    /// needs the full dependency closure instead, since a vulnerable package is
+    /// usually one nothing declared.
+    ///
+    /// Unlike `build_query_command` this does not append `|| true`. That guard
+    /// exists there because `rpm -q` returns non-zero merely when a named
+    /// package is absent; `rpm -qa` has no such case, so a non-zero exit is
+    /// always a real error and the caller must be able to see it.
+    ///
+    /// `root_path` is deliberately not honoured: the only caller is the SDK
+    /// query, for which `get_rpm_query_config` pins it to `None`, and the
+    /// per-root queries are built in shell as the constant above describes. A
+    /// `--root` branch here would be production code no build ever runs, kept
+    /// honest only by a test that hand-constructs the config.
+    pub fn build_query_all_command(&self) -> String {
+        let qf = RPM_QUERY_ALL_FORMAT;
+        let mut cmd = String::new();
+        if let Some(ref etcconfigdir) = self.rpm_etcconfigdir {
+            cmd.push_str(&format!("RPM_ETCCONFIGDIR=\"{etcconfigdir}\" "));
+        }
+        if let Some(ref configdir) = self.rpm_configdir {
+            cmd.push_str(&format!("RPM_CONFIGDIR=\"{configdir}\" "));
+        }
+        cmd.push_str(&format!("rpm -qa {qf}"));
+        cmd
+    }
+
     /// Build the rpm -q command with proper environment and flags
     pub fn build_query_command(&self, packages: &[String]) -> String {
         // Build rpm command with query format
@@ -1705,6 +1742,67 @@ wget 1.21-r0.core2_64
         );
         assert_eq!(result.get("wget"), Some(&"1.21-r0.core2_64".to_string()));
         assert_eq!(result.get("package-xyz"), None);
+    }
+
+    /// `RPM_QUERY_ALL_FORMAT` is shared with `commands::cve::report`, whose
+    /// parser splits on tabs and reads exactly three fields in this order. A
+    /// change here that is not mirrored there makes every line fail to parse
+    /// and every scope come back empty, so the contract is pinned.
+    #[test]
+    fn test_rpm_query_all_format_is_three_tab_separated_fields() {
+        assert_eq!(
+            RPM_QUERY_ALL_FORMAT,
+            r#"--qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n'"#
+        );
+    }
+
+    #[test]
+    fn test_build_query_all_command_ignores_root_path() {
+        // Per-root queries are built in shell, not here, so a root_path that
+        // somehow reaches this must not silently produce a second, divergent
+        // way of spelling the same query.
+        let cfg = RpmQueryConfig {
+            rpm_etcconfigdir: None,
+            rpm_configdir: None,
+            root_path: Some("$AVOCADO_PREFIX/rootfs".to_string()),
+        };
+        let cmd = cfg.build_query_all_command();
+
+        assert_eq!(cmd, format!("rpm -qa {RPM_QUERY_ALL_FORMAT}"));
+        // rpm -qa never exits non-zero for a benign reason, so the caller has
+        // to be able to observe the failure.
+        assert!(!cmd.contains("|| true"));
+    }
+
+    #[test]
+    fn test_build_query_all_command_sdk_has_no_root() {
+        // The SDK database is found through RPM_CONFIGDIR macros, not --root.
+        let cfg = SysrootType::Sdk("x86_64".to_string()).get_rpm_query_config();
+        let cmd = cfg.build_query_all_command();
+
+        assert_eq!(
+            cmd,
+            format!(
+                "RPM_ETCCONFIGDIR=\"$AVOCADO_SDK_PREFIX\" \
+                 RPM_CONFIGDIR=\"$AVOCADO_SDK_PREFIX/usr/lib/rpm\" \
+                 rpm -qa {RPM_QUERY_ALL_FORMAT}"
+            )
+        );
+        assert!(!cmd.contains("--root"));
+        assert!(!cmd.contains("|| true"));
+    }
+
+    /// The SDK query config discards the target it is constructed with, so no
+    /// caller-supplied value reaches the generated shell string.
+    #[test]
+    fn test_sdk_query_config_ignores_target_value() {
+        let benign = SysrootType::Sdk("x86_64".to_string()).get_rpm_query_config();
+        let hostile = SysrootType::Sdk("$(id); \"".to_string()).get_rpm_query_config();
+
+        assert_eq!(
+            benign.build_query_all_command(),
+            hostile.build_query_all_command()
+        );
     }
 
     #[test]
