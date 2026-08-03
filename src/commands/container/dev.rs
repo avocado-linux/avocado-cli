@@ -692,31 +692,34 @@ impl DevPruneCommand {
 /// the remote shell's umask (0644 under a default 0022) for the width of two
 /// commands, readable by any local user on the device. A subshell keeps the
 /// umask change from leaking into anything else `run_command` might later chain.
-fn bootstrap_delivery_command(remote_dir: &str, remote_path: &str, encoded: &str) -> String {
-    format!(
-        "mkdir -p {remote_dir} && (umask 077 && printf %s '{encoded}' | base64 -d > {remote_path})"
-    )
+///
+/// The payload arrives on stdin rather than embedded in the command. It used to
+/// be base64 in argv, decoded with `base64 -d` on the device - which assumes
+/// coreutils. Avocado OS has no `base64`, so this failed on a real device with
+/// `sh: base64: not found`. Reading stdin needs nothing but the shell, and it
+/// also keeps the token out of the device's process list.
+fn bootstrap_delivery_command(remote_dir: &str, remote_path: &str) -> String {
+    format!("mkdir -p {remote_dir} && (umask 077 && cat > {remote_path})")
 }
 
 /// Deliver the bootstrap payload to the device writable partition ONCE (design
-/// D5). Renders the JSON, base64-encodes it, and decodes it into
-/// `WRITABLE_PARTITION/container-dev/bootstrap.json` over SSH so the payload
-/// survives shell quoting untouched, at mode 0600 from creation.
+/// D5). Renders the JSON and streams it over SSH stdin into
+/// `WRITABLE_PARTITION/container-dev/bootstrap.json`, at mode 0600 from creation.
+///
+/// Streaming rather than encoding into the command keeps the device free of any
+/// decoder dependency and keeps the Bearer token out of its argv.
 async fn deliver_bootstrap(device: &RemoteHost, payload: &DeviceBootstrap) -> Result<()> {
-    use base64::Engine as _;
-
     let json = payload
         .to_json()
         .context("rendering the bootstrap payload")?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
     let remote_path = bootstrap_path(std::path::Path::new(WRITABLE_PARTITION));
     let remote_path = remote_path.to_string_lossy();
     let remote_dir = std::path::Path::new(WRITABLE_PARTITION).join("container-dev");
     let remote_dir = remote_dir.to_string_lossy();
 
     let ssh = SshClient::new(device.clone());
-    let command = bootstrap_delivery_command(&remote_dir, &remote_path, &encoded);
-    ssh.run_command(&command)
+    let command = bootstrap_delivery_command(&remote_dir, &remote_path);
+    ssh.run_command_with_stdin(&command, json.as_bytes())
         .await
         .context("writing the bootstrap file to the device writable partition")?;
     Ok(())
@@ -731,9 +734,6 @@ async fn deliver_bootstrap(device: &RemoteHost, payload: &DeviceBootstrap) -> Re
 /// private key is never delivered (design D8), and only the CA *cert* travels in
 /// [`VmWriteSetup`]. Delivered at `up`, NEVER baked into the VM overlay.
 async fn deliver_vm_ca(vm: &RemoteHost, setup: &VmWriteSetup) -> Result<()> {
-    use base64::Engine as _;
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(setup.ca_cert_pem.as_bytes());
     let ca_path = &setup.ca_trust_path;
     let ca_dir = std::path::Path::new(ca_path)
         .parent()
@@ -741,10 +741,11 @@ async fn deliver_vm_ca(vm: &RemoteHost, setup: &VmWriteSetup) -> Result<()> {
         .to_string_lossy();
 
     let ssh = SshClient::new(vm.clone());
-    let command = format!(
-        "mkdir -p {ca_dir} && printf %s '{encoded}' | base64 -d > {ca_path} && chmod 0644 {ca_path}"
-    );
-    ssh.run_command(&command)
+    // Streamed over stdin for the same reason as the bootstrap: `base64 -d` is not
+    // present on an Avocado OS engine guest, and the PEM never needs to survive
+    // shell quoting if it never enters the command.
+    let command = format!("mkdir -p {ca_dir} && cat > {ca_path} && chmod 0644 {ca_path}");
+    ssh.run_command_with_stdin(&command, setup.ca_cert_pem.as_bytes())
         .await
         .context("delivering the per-project CA into the avocado-vm engine trust store")?;
     Ok(())
@@ -1108,9 +1109,39 @@ mod tests {
     /// without racing the shell, so this asserts the shape that makes it
     /// impossible instead: the mode is established by a umask in force when the
     /// file is created, and there is no separate correcting step afterwards.
+    /// The delivery must not require ANY decoder on the device.
+    ///
+    /// It used to `printf %s '<base64>' | base64 -d`, which assumes coreutils on the
+    /// target. Avocado OS - the OS this feature ships on - has no `base64`, so
+    /// `container dev up` failed at bootstrap on a real device with
+    /// `sh: base64: not found`. A Debian stand-in hid it because Debian has
+    /// coreutils. The payload now travels over ssh stdin, so the device needs no
+    /// decoder and the JSON never passes through argv or shell quoting.
+    #[test]
+    fn bootstrap_delivery_needs_no_decoder_on_the_device() {
+        let command = bootstrap_delivery_command("/tmp/d", "/tmp/d/bootstrap.json");
+
+        assert!(
+            !command.contains("base64"),
+            "the device may not need a base64 decoder: {command}"
+        );
+        // Nor any other decoder that is absent from a minimal target.
+        for tool in ["openssl", "xxd", "python3", "perl", "uudecode", "od"] {
+            assert!(
+                !command.contains(tool),
+                "the device may not need `{tool}`: {command}"
+            );
+        }
+        // The payload arrives on stdin, so the command only redirects it into place.
+        assert!(
+            command.contains("cat >"),
+            "the payload must be piped from stdin: {command}"
+        );
+    }
+
     #[test]
     fn bootstrap_delivery_never_creates_a_world_readable_token() {
-        let command = bootstrap_delivery_command("/tmp/d", "/tmp/d/bootstrap.json", "YWJj");
+        let command = bootstrap_delivery_command("/tmp/d", "/tmp/d/bootstrap.json");
 
         assert!(
             command.contains("umask 077"),
@@ -1137,22 +1168,31 @@ mod tests {
     fn bootstrap_delivery_command_produces_a_0600_file() {
         use std::os::unix::fs::PermissionsExt;
 
+        use std::io::Write as _;
+
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("container-dev").join("bootstrap.json");
         let command = bootstrap_delivery_command(
             &dir.path().join("container-dev").to_string_lossy(),
             &target.to_string_lossy(),
-            // base64 of `{"t":1}`
-            "eyJ0IjoxfQ==",
         );
 
         // A permissive umask in the parent: if the command relied on inheriting a
-        // strict one, this would catch it.
-        let status = std::process::Command::new("sh")
+        // strict one, this would catch it. The payload goes in on stdin, exactly as
+        // `deliver_bootstrap` feeds it to ssh.
+        let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("umask 0022 && {command}"))
-            .status()
-            .expect("running the delivery command");
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning the delivery command");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(b"{\"t\":1}")
+            .expect("writing the payload");
+        let status = child.wait().expect("running the delivery command");
         assert!(status.success(), "delivery command failed: {command}");
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;

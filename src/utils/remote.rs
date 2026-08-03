@@ -353,6 +353,74 @@ impl SshClient {
         })
     }
 
+    /// Run a command on the remote host, feeding `stdin_data` to its stdin.
+    ///
+    /// For delivering file content to a device without depending on a decoder
+    /// being present there. Embedding a payload in the command means either
+    /// solving shell quoting for arbitrary bytes or base64-encoding it and
+    /// decoding on the far side - and `base64` is absent from a minimal target
+    /// such as Avocado OS, where `printf %s '<b64>' | base64 -d` fails with
+    /// `sh: base64: not found`. A payload on stdin needs nothing but the remote
+    /// shell, and it also keeps secrets out of the remote process list.
+    pub async fn run_command_with_stdin(&self, command: &str, stdin_data: &[u8]) -> Result<String> {
+        use tokio::io::AsyncWriteExt as _;
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Running remote command (stdin {} bytes): {command}",
+                    stdin_data.len()
+                ),
+                OutputLevel::Verbose,
+            );
+        }
+
+        let mut args = self.base_ssh_args();
+        args.extend([self.remote.ssh_target(), command.to_string()]);
+
+        let mut child = AsyncCommand::new("ssh")
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to run command on remote: {command}"))?;
+
+        // Write and close stdin before waiting: the remote `cat` will not see EOF
+        // until the pipe closes, so holding it open past the write deadlocks both
+        // sides. Taking the handle drops it at the end of this block.
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("ssh stdin was not piped as requested")?;
+            stdin
+                .write_all(stdin_data)
+                .await
+                .with_context(|| format!("Failed to write stdin for remote command: {command}"))?;
+            stdin
+                .shutdown()
+                .await
+                .with_context(|| format!("Failed to close stdin for remote command: {command}"))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .with_context(|| format!("Failed to run command on remote: {command}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Remote command failed: {}\nError: {}",
+                command,
+                stderr.trim()
+            );
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Run a command on the remote host, inheriting stdin/stdout/stderr
     ///
     /// This method properly forwards Ctrl+C and other signals to the remote process
