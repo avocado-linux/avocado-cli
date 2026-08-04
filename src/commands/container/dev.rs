@@ -57,7 +57,7 @@ use crate::utils::container_dev::engine::{
     driver_for, resolve_image_id, watch_tag_events, TagEvent,
 };
 use crate::utils::container_dev::registry::{serve_write_router_tls, write_router, BulkListener};
-use crate::utils::container_dev::store::BlobStore;
+use crate::utils::container_dev::store::{BlobStore, SessionActivity};
 use crate::utils::container_dev::tls::DevSession;
 use crate::utils::container_dev::watcher::{
     arch_guard::{ArchGuardSyncer, EngineArchProbe, HelloArchBook, ImageArchBook},
@@ -179,6 +179,24 @@ impl DevUpCommand {
         let state_path = session_state_path(&store);
         let lock_path = session_lock_path(&store);
         let _session_lock = SessionLock::acquire(&lock_path)?;
+        // Register the signal handlers BEFORE the pid is published, not where
+        // the tasks that consume them are spawned.
+        //
+        // Publishing the pid is what makes this process a signalable target:
+        // liveness is proved by the flock, held since above, so from the moment
+        // the record lands a concurrent `sync` or `down` will signal it. The
+        // default disposition of both SIGUSR1 and SIGTERM is Term, and the work
+        // between here and the spawns below is slow and observable - a TLS mint,
+        // a DNS plus UDP host probe that takes seconds when the device is a
+        // hostname, three binds, and a `docker events` fork - so a `sync` in that
+        // window killed `up` mid-startup with no error and no teardown. The
+        // SIGTERM window ran further still, past both SSH round trips, so a
+        // `down` skipped WriteListenerGuard::drop, the write-guard teardown, and
+        // the events child kill.
+        //
+        // tokio registers the handler when the stream is created, so creating
+        // both here closes the window; the tasks below just consume them.
+        let early_signals = register_early_signals();
 
         // Publish OUR pid the instant the lock is ours, before any of the slow
         // work below. Moving the lock to the top of `up` decoupled it from the
@@ -217,13 +235,6 @@ impl DevUpCommand {
         };
         let device = RemoteHost::parse(&device_spec)?;
 
-        // Mint fresh TLS material + BOTH tokens for this `up` (design D2/D8).
-        let session = DevSession::mint(&ctx.project)
-            .with_context(|| format!("minting the dev session for `{}`", ctx.project))?;
-        let tls_config = session.tls.server_config();
-        let read_token = session.read_token.clone();
-        let write_token = session.write_token.clone();
-
         // Resolve the BULK-LISTENER endpoint the device pulls from (design L2):
         // AVOCADO_CONTAINER_DEV_HOST overrides host auto-detection;
         // AVOCADO_CONTAINER_DEV_PORT overrides the configured port.
@@ -246,6 +257,29 @@ impl DevUpCommand {
             port_override(),
             configured_port,
         );
+
+        // The host the device will actually dial, and therefore the name its TLS
+        // stack verifies against. `bulk_host` reads it back off the resolved
+        // endpoint so this is the same value the bootstrap carries rather than a
+        // second derivation that could drift from it.
+        let device_facing_host = bulk_host(&bulk_endpoint, &auto_host).to_string();
+
+        // Mint fresh TLS material + BOTH tokens for this `up` (design D2/D8).
+        //
+        // Minted AFTER the endpoint is resolved, not before, because the leaf has
+        // to carry the address the bootstrap advertises. The device agent builds
+        // a rustls ClientConfig with the pinned CA and no custom verifier, so
+        // `ServerName::try_from(<advertised host>)` demands a matching SAN; with
+        // only {runtime, 10.0.2.2, 127.0.0.1} in the set, a real board on a LAN
+        // failed hostname verification with NotValidForName on both the bulk
+        // listener and the control WS. The lab never caught it because
+        // `setup-lab.sh` pins AVOCADO_CONTAINER_DEV_HOST=10.0.2.2, the one
+        // address that was already in the set.
+        let session = DevSession::mint(&ctx.project, std::slice::from_ref(&device_facing_host))
+            .with_context(|| format!("minting the dev session for `{}`", ctx.project))?;
+        let tls_config = session.tls.server_config();
+        let read_token = session.read_token.clone();
+        let write_token = session.write_token.clone();
 
         // The bulk read listener binds the resolved port on all interfaces so the
         // device (or its loopback proxy) can reach it over TLS. The write listener
@@ -456,6 +490,7 @@ impl DevUpCommand {
         // pipeline the watcher uses — exactly once per signal, never a second
         // watch loop. Reusing the running session's syncer + control WS is what
         // lets the notify reach a connected device with no extra SSH.
+        let sync_signal = early_signals.sync;
         let sync_trigger_task: JoinHandle<()> = tokio::spawn(async move {
             run_sync_trigger(
                 mode,
@@ -463,6 +498,7 @@ impl DevUpCommand {
                 trigger_notifier,
                 watched_images,
                 engine,
+                sync_signal,
             )
             .await;
         });
@@ -524,7 +560,7 @@ impl DevUpCommand {
         // `down` (SIGTERM). On ANY exit — including a panic or early return — the
         // write guard tears down the write listener via Drop (design L-1); the
         // other listeners' tasks are aborted and the state file is cleared.
-        wait_for_shutdown().await;
+        wait_for_shutdown(early_signals.shutdown).await;
 
         write_guard.teardown();
         ws_task.abort();
@@ -653,14 +689,26 @@ impl DevPruneCommand {
     /// Garbage-collect THIS project's Container Dev Mode store only (task 5.3,
     /// design M4): sweep blobs no currently-tagged manifest references, via the
     /// group-3.5 GC ([`prune_store`]). It touches only store blobs — never the
-    /// per-session token or the per-project CA material — and refuses while a
-    /// device is mid-pull rather than sweeping a blob a pull still needs.
+    /// per-session token or the per-project CA material — and refuses while an
+    /// `up` session is live rather than sweeping a blob a transfer still needs.
     pub async fn execute(self) -> Result<()> {
         let ctx = load_dev_context()?;
         let store = BlobStore::for_project(&ctx.project)
             .with_context(|| format!("opening the dev store for project `{}`", ctx.project))?;
 
-        let swept = prune_store(&store).with_context(|| {
+        // The flock is the only cross-process proof there is. `prune` runs in a
+        // different process from `up`, so anything the store counted for itself
+        // was always zero here - the store now takes this as an argument for
+        // exactly that reason. A live `up` may be streaming a blob to a device
+        // or holding an upload's staging file open, and `sweep_uploads` unlinks
+        // that file by path.
+        let session = if session_is_live(&session_lock_path(&store))? {
+            SessionActivity::Live
+        } else {
+            SessionActivity::Idle
+        };
+
+        let swept = prune_store(&store, session).with_context(|| {
             format!(
                 "pruning the Container Dev Mode store for project `{}`",
                 ctx.project
@@ -951,30 +999,67 @@ fn read_session_state(path: &std::path::Path) -> Result<Option<SessionState>> {
     }
 }
 
+/// The SIGUSR1 and SIGTERM streams, registered before the pid is published.
+///
+/// Both are created up front and carried to the tasks that consume them rather
+/// than created where those tasks are spawned. Registration is what changes the
+/// signal's disposition away from Term, and the pid becomes signalable the
+/// moment `up` writes its session record - so creating them at the point of use
+/// left a window in which a concurrent `sync` or `down` killed `up` outright.
+///
+/// Either may be `None`: a platform that refuses the handler leaves the
+/// corresponding path inert rather than failing `up`, which is what the previous
+/// per-task `Err(_) => return` did.
+#[cfg(unix)]
+struct EarlySignals {
+    sync: Option<tokio::signal::unix::Signal>,
+    shutdown: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+fn register_early_signals() -> EarlySignals {
+    use tokio::signal::unix::{signal, SignalKind};
+    EarlySignals {
+        sync: signal(SignalKind::user_defined1()).ok(),
+        shutdown: signal(SignalKind::terminate()).ok(),
+    }
+}
+
+/// Off unix there is nothing to register: `signal_shutdown` and `signal_sync`
+/// are both no-ops, so no process can be signalled into the window either.
+#[cfg(not(unix))]
+struct EarlySignals {
+    sync: (),
+    shutdown: (),
+}
+
+#[cfg(not(unix))]
+fn register_early_signals() -> EarlySignals {
+    EarlySignals {
+        sync: (),
+        shutdown: (),
+    }
+}
+
 /// Block until the process receives SIGINT (Ctrl-C) or SIGTERM (a separate
 /// `down`), so both a foreground Ctrl-C and `down` reach the same graceful
 /// teardown path.
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            // No SIGTERM handler available: fall back to Ctrl-C only.
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
+#[cfg(unix)]
+async fn wait_for_shutdown(term: Option<tokio::signal::unix::Signal>) {
+    let Some(mut term) = term else {
+        // No SIGTERM handler was available at registration: fall back to Ctrl-C.
         let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
     }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown(_shutdown: ()) {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Signal the recorded `up` process to shut down (SIGTERM), driving its graceful
@@ -1004,12 +1089,12 @@ async fn run_sync_trigger(
     notifier: Arc<ControlServer>,
     images: Vec<String>,
     engine: &'static str,
+    usr1: Option<tokio::signal::unix::Signal>,
 ) {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut usr1 = match signal(SignalKind::user_defined1()) {
-        Ok(s) => s,
-        // No SIGUSR1 handler available: the trigger is simply inert.
-        Err(_) => return,
+    // Registered in `register_early_signals` before the pid was published; a
+    // platform that refused the handler leaves the trigger inert.
+    let Some(mut usr1) = usr1 else {
+        return;
     };
     while usr1.recv().await.is_some() {
         for image in &images {
@@ -1062,6 +1147,7 @@ async fn run_sync_trigger(
     _notifier: Arc<ControlServer>,
     _images: Vec<String>,
     _engine: &'static str,
+    _usr1: (),
 ) {
 }
 

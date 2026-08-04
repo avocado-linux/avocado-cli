@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn bootstrap_payload_carries_bulk_endpoint_read_token_and_ca_cert() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
 
         assert_eq!(bootstrap.bulk_endpoint, BULK_ENDPOINT);
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn bootstrap_payload_never_carries_the_write_token() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
         let json = bootstrap.to_json().expect("payload serializes");
         assert!(
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn bootstrap_payload_never_carries_the_ca_private_key() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let json = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT)
             .to_json()
             .expect("payload serializes");
@@ -549,7 +549,7 @@ mod tests {
         // Structural guarantee: the only endpoint keys are `bulk_endpoint` (pull)
         // and `ws_endpoint` (control). A write-listener address has no field to
         // land in, so it cannot leak (design G-4). Pin the exact key set.
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
         let value: serde_json::Value =
             serde_json::to_value(&bootstrap).expect("payload serializes to a value");
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn write_bootstrap_lands_under_the_writable_partition_root() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let bootstrap = DeviceBootstrap::from_session(&session, BULK_ENDPOINT, WS_ENDPOINT);
         let root = tempfile::tempdir().expect("tempdir");
 
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn vm_write_setup_uses_the_write_token_not_the_read_token() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let setup = VmWriteSetup::docker(&session, 5601);
 
         assert_eq!(
@@ -890,7 +890,7 @@ mod tests {
         // The CA PEM is carried in the plan to be delivered at `up` (design H4),
         // NOT a baked overlay file. It is real cert material, and never the CA
         // private key (design D8).
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let setup = VmWriteSetup::docker(&session, 5601);
         assert!(
             setup.ca_cert_pem.contains("BEGIN CERTIFICATE"),

@@ -362,7 +362,7 @@ async fn a_hello_recorded_by_the_control_server_is_visible_to_the_guard() {
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
     use tokio_tungstenite::tungstenite::Message;
 
-    let session = DevSession::mint("dev-runtime").expect("session mints");
+    let session = DevSession::mint("dev-runtime", &[]).expect("session mints");
 
     // One book, cloned into both halves — exactly what `up` does.
     let book = HelloArchBook::new();

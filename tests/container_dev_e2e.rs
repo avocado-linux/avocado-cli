@@ -93,7 +93,7 @@ struct Harness {
 async fn harness() -> Harness {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(BlobStore::at(dir.path(), "proj").expect("store opens"));
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
 
     let write_app = write_router(Arc::clone(&store), session.write_token.clone());
     let write_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -279,7 +279,7 @@ async fn a_one_line_change_pulls_only_the_changed_layer() {
 
 #[tokio::test]
 async fn a_stale_device_is_synced_to_the_new_digest_over_the_control_ws() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
 
     let v1_digest = digest_of(b"running-image-v1");
     let v2_digest = digest_of(b"running-image-v2");

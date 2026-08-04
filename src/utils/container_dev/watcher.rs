@@ -45,6 +45,7 @@ use tokio::time::sleep;
 
 use super::auth::WriteToken;
 use super::engine::{EngineDriver, TagEvent, WriteCredential};
+use super::image_ref::{strip_registry, with_default_tag};
 use crate::utils::container::{is_docker_desktop, is_vm_routing_active};
 use crate::utils::output::{print_warning, OutputLevel};
 
@@ -277,23 +278,6 @@ pub struct IngestPlan {
     pub export_argv: Vec<String>,
 }
 
-/// Strip a leading registry component (`localhost/…`, `host.tld/…`,
-/// `host:port/…`) from an image reference, leaving `repo[:tag]`.
-///
-/// podman qualifies a local ref as `localhost/my-app:dev`; docker leaves it
-/// `my-app:dev`. Both normalize to `my-app:dev` so the embedded-registry target
-/// is `<registry>/my-app:dev` regardless of engine.
-fn repo_and_tag(image: &str) -> String {
-    match image.split_once('/') {
-        Some((first, rest))
-            if first == "localhost" || first.contains('.') || first.contains(':') =>
-        {
-            rest.to_string()
-        }
-        _ => image.to_string(),
-    }
-}
-
 /// The image refs `container_dev.images` declares as watched.
 ///
 /// The engine's tag-event stream carries EVERY tag applied on the host daemon,
@@ -324,19 +308,6 @@ impl WatchSet {
     }
 }
 
-/// `repo` -> `repo:latest`, leaving an already-tagged ref alone.
-///
-/// Only a colon AFTER the last `/` is a tag separator; a colon before it belongs
-/// to a registry host:port (`host:5601/repo`).
-fn with_default_tag(image: &str) -> String {
-    let name_start = image.rfind('/').map_or(0, |i| i + 1);
-    if image[name_start..].contains(':') {
-        image.to_string()
-    } else {
-        format!("{image}:latest")
-    }
-}
-
 /// Build the PUSH plan for `event` targeting `registry` (`host:port`).
 pub fn build_push_plan(
     driver: &dyn EngineDriver,
@@ -344,7 +315,7 @@ pub fn build_push_plan(
     event: &TagEvent,
     token: &WriteToken,
 ) -> PushPlan {
-    let target_ref = format!("{registry}/{}", repo_and_tag(&event.image));
+    let target_ref = format!("{registry}/{}", strip_registry(&event.image));
     let tag_argv = vec!["tag".to_string(), event.image.clone(), target_ref.clone()];
     let push_argv = vec!["push".to_string(), target_ref.clone()];
     let credential = driver.write_credential(registry, token);
@@ -357,6 +328,10 @@ pub fn build_push_plan(
 }
 
 /// Build the INGEST plan for `event`: a full-image export.
+/// NOTE: nothing calls this today. [`EngineSyncer::ingest`] used to run the plan
+/// and drop the resulting tar on the floor; it now fails with the remedy
+/// instead, so the plan is kept as the shape a real INGEST implementation needs
+/// (export, transfer, load) rather than deleted and re-derived later.
 pub fn build_ingest_plan(event: &TagEvent) -> IngestPlan {
     IngestPlan {
         source_ref: event.image.clone(),
@@ -440,15 +415,28 @@ impl EngineSyncer {
         Ok(())
     }
 
+    /// The INGEST fallback is not wired up, and says so instead of pretending.
+    ///
+    /// It used to run `save -o <project_dir>/ingest.tar <image>` and return
+    /// `Ok`. Nothing in the tree ever read that tar - no transfer, no load, no
+    /// import - so the sync reported success, `notify` then failed with
+    /// "the registry has no manifest for tag `dev` yet (the push must land
+    /// before the notify)", and the message pointed at a push that was never
+    /// attempted. The device never updated and the tar was rewritten on every
+    /// rebuild forever.
+    ///
+    /// Every Docker-Desktop and podman-machine user without the avocado-vm
+    /// routed lands here, so failing at the point the path is taken - with the
+    /// remedy - beats a success that unravels one layer down.
     async fn ingest(&self, event: &TagEvent) -> Result<()> {
-        let plan = build_ingest_plan(event);
-        let tar = self.project_dir.join("ingest.tar");
-        // A full-image export: `save -o <tar> <image>`, O(full image) by design —
-        // the fallback where PUSH is unreachable, never on a PUSH-capable endpoint.
-        let mut argv = plan.export_argv.clone();
-        argv.insert(1, "-o".to_string());
-        argv.insert(2, tar.to_string_lossy().into_owned());
-        run_engine(self.driver.binary(), &argv, None).await
+        anyhow::bail!(
+            "container dev cannot sync `{}` on this host yet: the container engine runs inside a \
+             VM whose loopback is not the host's, so the registry push path is unreachable, and \
+             the INGEST fallback that would replace it is not implemented (it exports a tar \
+             nothing transfers). Start the avocado-vm and route it (`avocado vm start`) so the \
+             push path becomes reachable, or run the dev loop from a host whose engine is native.",
+            event.image
+        )
     }
 }
 
@@ -889,7 +877,15 @@ pub mod arch_guard {
                 // Record BEFORE delegating, so the arch is available to a later
                 // reconcile even for the allowed-because-nobody-was-connected
                 // case - which is precisely the case the record exists for.
-                self.images.record_image(&event.image, image_arch);
+                // Key on the canonical form, which is what `frame_suits_device`
+                // looks up. Recording the raw event ref meant a podman user's
+                // `localhost/my-app:dev` was never found under `my-app:dev`, so
+                // the cross-arch broadcast filter fell through to its permissive
+                // arm for every registry-qualified ref.
+                self.images.record_image(
+                    &super::super::image_ref::canonical(&event.image),
+                    image_arch,
+                );
                 self.inner.sync(mode, event).await
             })
         }
@@ -1047,6 +1043,49 @@ pub mod arch_guard {
                 notifier.calls.load(Ordering::SeqCst),
                 0,
                 "a refused sync must not notify the device"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_arch_is_recorded_under_the_key_the_broadcast_filter_reads() {
+            // The two halves of the guard used different keys. This recorded
+            // `event.image` verbatim; `ControlServer::frame_suits_device` rebuilt
+            // its key from the registry-stripped `(image, tag)` of the Sync frame.
+            // For any registry-qualified ref the lookup missed, `arch_for`
+            // returned None, and the filter's permissive arm let the frame
+            // through - an amd64 image to an aarch64 device.
+            //
+            // podman writes local refs as `localhost/my-app:dev` and
+            // `WatchSet::is_watched` is an exact match, so a podman user has to
+            // configure the qualified ref for the watcher to fire at all. That
+            // made this every ref on that engine, not an edge case.
+            let inner = Arc::new(CountingSyncer::default());
+            let notifier = CountingNotifier::default();
+            let images = ImageArchBook::new();
+            let observed = images.clone();
+
+            let guard = ArchGuardSyncer::new(
+                inner.clone() as Arc<dyn Syncer>,
+                Arc::new(FixedProbe("amd64")),
+                // No devices connected: the allowed-because-nobody-was-looking
+                // case, which is exactly the one the record exists to cover.
+                Arc::new(HelloArchBook::new()),
+                images,
+            );
+
+            do_sync_and_notify(
+                SyncMode::Push,
+                &guard,
+                &notifier,
+                &ev("localhost/my-app:dev"),
+            )
+            .await;
+
+            assert_eq!(
+                observed.arch_for("my-app:dev"),
+                Some(DeviceArch::parse("amd64")),
+                "the arch must be findable under the canonical key the broadcast \
+                 filter looks up, not only under the raw event ref"
             );
         }
 

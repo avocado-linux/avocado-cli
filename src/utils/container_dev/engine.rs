@@ -30,6 +30,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::auth::{WriteToken, WRITE_USERNAME};
+use crate::utils::output::{print_warning, OutputLevel};
 
 /// A parsed image *tag* event from the engine's CLI event stream.
 ///
@@ -320,9 +321,10 @@ pub async fn watch_tag_events(
         .context("engine events subprocess produced no stdout handle")?;
 
     let (tx, rx) = mpsc::channel(64);
+    let engine_binary = driver.binary();
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
-        let _ = forward_tag_events(driver.as_ref(), reader, |event| {
+        let outcome = forward_tag_events(driver.as_ref(), reader, |event| {
             // A closed receiver means the watcher stopped; blocking_send is not
             // available in async, so use try_send and drop on a full/closed
             // channel — the watcher (task 4.2) debounces, so a dropped burst
@@ -330,6 +332,33 @@ pub async fn watch_tag_events(
             let _ = tx.try_send(event);
         })
         .await;
+
+        // Say so when the stream ends. Swallowing this made a dead watcher
+        // indistinguishable from an idle one: restarting the engine daemon
+        // (`systemctl restart docker`, or Docker Desktop) kills the `events`
+        // child, the forwarder ends, `run_watcher` returns - and `up` stays in
+        // the foreground still printing "Watching for image rebuilds..." while
+        // every later rebuild goes undetected. Manual `sync` keeps working, so
+        // it reads as "auto-reload broke" rather than as a stopped watcher.
+        match outcome {
+            Ok(()) => print_warning(
+                &format!(
+                    "container dev: the `{engine_binary} events` stream ended, so image rebuilds \
+                     are no longer detected automatically. This usually means the engine daemon \
+                     restarted. Run `avocado container dev down` and `up` again to resume \
+                     watching; `avocado container dev sync` still works in the meantime."
+                ),
+                OutputLevel::Normal,
+            ),
+            Err(e) => print_warning(
+                &format!(
+                    "container dev: reading the `{engine_binary} events` stream failed ({e}), so \
+                     image rebuilds are no longer detected automatically. Run `avocado container \
+                     dev down` and `up` again to resume watching."
+                ),
+                OutputLevel::Normal,
+            ),
+        }
     });
 
     Ok((rx, child))

@@ -152,7 +152,7 @@ fn pinned_ca_connector(ca_cert_pem: &str) -> tokio_tungstenite::Connector {
 
 #[tokio::test]
 async fn unauthenticated_read_is_rejected_with_401() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
     let (base, _listener, digest, _dir) = spawn_bulk(&session, b"a-container-layer").await;
     let client = tls_client(&session);
 
@@ -186,7 +186,7 @@ async fn unauthenticated_read_is_rejected_with_401() {
 
 #[tokio::test]
 async fn unauthenticated_ws_upgrade_is_rejected_with_401() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
     let url = spawn_ws_tls(&session).await;
     let connector = pinned_ca_connector(session.tls.ca_cert_pem());
 
@@ -210,7 +210,7 @@ async fn unauthenticated_ws_upgrade_is_rejected_with_401() {
 
 #[tokio::test]
 async fn unauthenticated_write_is_refused_on_both_interfaces() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
     let body = manifest_bytes();
 
     // (a) the write listener: manifest PUT, blob-upload POST, and the gated
@@ -273,7 +273,7 @@ async fn unauthenticated_write_is_refused_on_both_interfaces() {
 
 #[tokio::test]
 async fn bearer_read_control_token_is_refused_on_every_write_route() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
     let (write_base, _wdir) = spawn_write(&session).await;
     let read = session.read_token.secret();
     let client = reqwest::Client::new();
@@ -327,7 +327,7 @@ async fn bearer_read_control_token_is_refused_on_every_write_route() {
 
 #[tokio::test]
 async fn wrong_password_basic_credential_is_refused_on_a_write_route() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
     let (write_base, _wdir) = spawn_write(&session).await;
 
     // The correct username but a password that is not the session write token.
@@ -349,7 +349,7 @@ async fn wrong_password_basic_credential_is_refused_on_a_write_route() {
 
 #[tokio::test]
 async fn basic_write_token_is_refused_on_a_read_route() {
-    let session = DevSession::mint(RUNTIME).expect("session mints");
+    let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
     let (base, _listener, digest, _dir) = spawn_bulk(&session, b"layer-bytes").await;
 
     // The host-only write token presented in its Basic transport form on the

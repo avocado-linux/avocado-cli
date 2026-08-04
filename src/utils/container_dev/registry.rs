@@ -613,7 +613,7 @@ fn put_manifest(state: &WriteState, name: &str, reference: &str, body: &[u8]) ->
         return store_error(&e);
     }
     if !looks_like_digest(reference) {
-        if let Err(e) = state.store.set_tag(reference, &digest) {
+        if let Err(e) = state.store.set_tag(name, reference, &digest) {
             return store_error(&e);
         }
     }
@@ -703,7 +703,10 @@ fn store_error(err: &StoreError) -> Response {
             "BLOB_UPLOAD_INVALID",
             "blob exceeds the registry's size ceiling",
         ),
-        StoreError::NoHome | StoreError::Io(_) | StoreError::PruneWhilePulling => oci_error(
+        StoreError::NoHome
+        | StoreError::Io(_)
+        | StoreError::InvalidName(_)
+        | StoreError::PruneWhileSessionLive => oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
             "registry storage error",
@@ -729,8 +732,11 @@ async fn read(
     headers: HeaderMap,
     Path(rest): Path<String>,
 ) -> Response {
-    if let Some((_name, reference)) = rest.split_once("/manifests/") {
-        serve_manifest(&state, reference)
+    if let Some((name, reference)) = rest.split_once("/manifests/") {
+        // `name` is part of the tag key, not just the Location header: two
+        // watched images sharing a tag resolve to each other's manifest in a
+        // flat namespace.
+        serve_manifest(&state, name, reference)
     } else if let Some((_name, digest)) = rest.split_once("/blobs/") {
         serve_blob(&state, &headers, digest).await
     } else {
@@ -744,11 +750,11 @@ async fn read(
 
 /// Serve a manifest identified by `reference`, which is either a digest
 /// (`<algorithm>:<hex>`) or a tag that resolves to a manifest digest.
-fn serve_manifest(state: &RegistryState, reference: &str) -> Response {
+fn serve_manifest(state: &RegistryState, name: &str, reference: &str) -> Response {
     let digest = if looks_like_digest(reference) {
         reference.to_string()
     } else {
-        match state.store.resolve_tag(reference) {
+        match state.store.resolve_tag(name, reference) {
             Ok(Some(d)) => d,
             _ => return manifest_unknown(),
         }
@@ -1009,7 +1015,7 @@ mod read {
         let manifest = image_manifest();
         let digest = digest_of(&manifest);
         store.write_blob(&digest, &manifest).unwrap();
-        store.set_tag("dev", &digest).unwrap();
+        store.set_tag("my-app", "dev", &digest).unwrap();
 
         let resp = reqwest::get(format!("{base}/v2/my-app/manifests/dev"))
             .await
@@ -1057,7 +1063,7 @@ mod read {
         let index = image_index();
         let digest = digest_of(&index);
         store.write_blob(&digest, &index).unwrap();
-        store.set_tag("multi", &digest).unwrap();
+        store.set_tag("my-app", "multi", &digest).unwrap();
 
         let resp = reqwest::get(format!("{base}/v2/my-app/manifests/multi"))
             .await
@@ -1283,7 +1289,7 @@ mod read {
         let manifest = image_manifest();
         let digest = digest_of(&manifest);
         store.write_blob(&digest, &manifest).unwrap();
-        store.set_tag("dev", &digest).unwrap();
+        store.set_tag("my-app", "dev", &digest).unwrap();
 
         let resp = reqwest::Client::new()
             .head(format!("{base}/v2/my-app/manifests/dev"))
@@ -1375,7 +1381,7 @@ mod write_auth {
         // Observable side effect: the manifest is stored and the tag points at it.
         assert!(store.has_blob(&digest).unwrap());
         assert_eq!(
-            store.resolve_tag("dev").unwrap().as_deref(),
+            store.resolve_tag("my-app", "dev").unwrap().as_deref(),
             Some(digest.as_str())
         );
     }
@@ -1441,7 +1447,7 @@ mod write_auth {
             !store.has_blob(&digest).unwrap(),
             "a rejected write must not persist any content"
         );
-        assert_eq!(store.resolve_tag("dev").unwrap(), None);
+        assert_eq!(store.resolve_tag("my-app", "dev").unwrap(), None);
     }
 
     #[tokio::test]
@@ -1463,7 +1469,7 @@ mod write_auth {
             "an anonymous write must be refused"
         );
         assert!(!store.has_blob(&digest).unwrap());
-        assert_eq!(store.resolve_tag("dev").unwrap(), None);
+        assert_eq!(store.resolve_tag("my-app", "dev").unwrap(), None);
     }
 
     #[tokio::test]
@@ -2073,7 +2079,7 @@ mod bulk_listener {
         let digest = digest_of(blob);
         store.write_blob(&digest, blob).unwrap();
 
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let listener = BulkListener::bind(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             store,
@@ -2272,7 +2278,7 @@ mod bulk_listener {
         // the guest daemon, configured for HTTPS via certs.d, could not push.
         let dir = TempDir::new().unwrap();
         let store = Arc::new(BlobStore::at(dir.path(), "wproj").expect("store opens"));
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
         let _task = serve_write_router_tls(

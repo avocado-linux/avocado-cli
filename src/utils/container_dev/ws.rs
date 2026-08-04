@@ -53,6 +53,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::auth::{read_request_authorized, ReadToken};
 use super::engine::TagEvent;
+use super::image_ref::canonical;
 use super::store::BlobStore;
 use crate::utils::output::{print_warning, OutputLevel};
 
@@ -129,21 +130,11 @@ pub struct Status {
 
 /// Split an image reference (`[registry/]repo[:tag]`) into `(repo, tag)`.
 ///
-/// Strips a leading registry qualifier (podman writes `localhost/my-app:dev`)
-/// and defaults a missing tag to `latest`, matching engine semantics.
+/// Delegates to [`super::image_ref::split`] so this and the watcher cannot drift
+/// apart again - they already had, which is how the arch book ended up keyed one
+/// way and read the other.
 fn split_image_tag(image: &str) -> (String, String) {
-    let without_registry = match image.split_once('/') {
-        Some((first, rest))
-            if first == "localhost" || first.contains('.') || first.contains(':') =>
-        {
-            rest
-        }
-        _ => image,
-    };
-    match without_registry.rsplit_once(':') {
-        Some((repo, tag)) => (repo.to_string(), tag.to_string()),
-        None => (without_registry.to_string(), "latest".to_string()),
-    }
+    super::image_ref::split(image)
 }
 
 /// The host's desired container state: `(image, tag) -> digest`.
@@ -367,8 +358,21 @@ impl ControlServer {
     /// mirroring [`super::registry`]'s bulk `TlsListener`.
     pub async fn serve_tls(self: Arc<Self>, listener: TcpListener, acceptor: TlsAcceptor) {
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                return;
+            let stream = match listener.accept().await {
+                Ok((stream, _peer)) => stream,
+                Err(_) => {
+                    // Back off and keep serving, matching the bulk listener
+                    // (`super::registry::TlsListener::accept`). Returning here
+                    // ended the control WS for the rest of the session on a
+                    // single transient error - a client that RSTs between SYN
+                    // and accept gives ECONNABORTED, and EMFILE is transient
+                    // too - while `up` kept running and `status` kept reporting
+                    // the session live, so no device could reconnect and
+                    // nothing said why. The sleep is what stops a persistent
+                    // error becoming a busy-spin.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
             };
             let acceptor = acceptor.clone();
             let server = Arc::clone(&self);
@@ -534,7 +538,9 @@ impl ControlServer {
         } else {
             format!("{image}:{tag}")
         };
-        match self.image_arches.arch_for(&reference) {
+        // Canonical, matching what `ArchGuardSyncer` records. Looking up the
+        // reference as broadcast found nothing for any registry-qualified ref.
+        match self.image_arches.arch_for(&canonical(&reference)) {
             Some(image_arch) if image_arch != *device_arch => {
                 print_warning(
                     &format!(
@@ -597,14 +603,18 @@ impl Notifier for ControlServer {
             // control frame looked correct. Resolve the tag against the store the
             // bulk listener actually serves.
             let digest = match self.store.as_ref() {
-                Some(store) => store.resolve_tag(&tag).ok().flatten().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "refusing to notify `{}`: the registry has no manifest for tag `{}` \
+                Some(store) => store
+                    .resolve_tag(&image, &tag)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "refusing to notify `{}`: the registry has no manifest for tag `{}` \
                              yet (the push must land before the notify)",
-                        event.image,
-                        tag
-                    )
-                })?,
+                            event.image,
+                            tag
+                        )
+                    })?,
                 None => event.image_id.clone().unwrap_or_default(),
             };
             // An empty digest must never enter the desired state. `reconcile`
@@ -624,7 +634,7 @@ impl Notifier for ControlServer {
             // refuse to hand it to a device of another architecture - the guard
             // itself cannot, because at push time there may be no device
             // connected to compare against.
-            let arch = self.image_arches.arch_for(&event.image);
+            let arch = self.image_arches.arch_for(&canonical(&event.image));
             self.desired
                 .lock()
                 .unwrap()
@@ -1076,6 +1086,44 @@ mod tests {
         );
     }
 
+    // The regression this pins is a KEY MISMATCH, not a missing filter: the guard
+    // recorded the arch under the raw event ref while the filter looked it up
+    // under the registry-stripped one, so `arch_for` answered None and the
+    // permissive `_ => true` arm passed every frame through. podman qualifies
+    // local refs as `localhost/…` and `WatchSet::is_watched` is an exact match, so
+    // a podman user MUST configure the qualified ref for the watcher to fire -
+    // making this every ref on that engine, and the amd64-to-aarch64 broadcast the
+    // guard exists to stop.
+    //
+    // Recording under the raw ref again fails this and nothing else, which is
+    // exactly what made the drift survivable for so long.
+    #[tokio::test]
+    async fn a_registry_qualified_ref_is_still_arch_filtered_on_the_broadcast() {
+        let images = ImageArchBook::new();
+        // What ArchGuardSyncer records for a podman user's `localhost/my-app:dev`.
+        images.record_image(
+            &super::super::image_ref::canonical("localhost/my-app:dev"),
+            DeviceArch::parse("amd64"),
+        );
+
+        let (_url, server) = spawn_server_with_images(DesiredState::default(), images).await;
+
+        let frame = HostFrame::Sync {
+            image: "my-app".to_string(),
+            tag: "dev".to_string(),
+            digest: "sha256:amd64only".to_string(),
+        };
+        assert!(
+            !server.frame_suits_device(&frame, Some(&DeviceArch::parse("aarch64"))),
+            "an amd64 image recorded from a registry-qualified ref must not reach an \
+             aarch64 device"
+        );
+        assert!(
+            server.frame_suits_device(&frame, Some(&DeviceArch::parse("x86_64"))),
+            "the same frame must still reach a device that can run it"
+        );
+    }
+
     // A device controls both `device_id` and (via the parse fall-through) `arch`,
     // and the warning path is a bare println with an ANSI prefix. Control bytes
     // must not survive into it: a forged `ESC[2K\r` plus a green success line
@@ -1237,7 +1285,7 @@ mod tests {
         crate::utils::container_dev::tls::DevSession,
         Arc<ControlServer>,
     ) {
-        let session = crate::utils::container_dev::tls::DevSession::mint("dev-runtime")
+        let session = crate::utils::container_dev::tls::DevSession::mint("dev-runtime", &[])
             .expect("session mints");
         let server = ControlServer::new(
             session.read_token.clone(),
@@ -1324,7 +1372,7 @@ mod tests {
 
         // Pin a DIFFERENT session's CA: it did not sign the server leaf, so the
         // TLS handshake must fail before any WebSocket upgrade is attempted.
-        let other = crate::utils::container_dev::tls::DevSession::mint("other-runtime")
+        let other = crate::utils::container_dev::tls::DevSession::mint("other-runtime", &[])
             .expect("a second session mints");
         let connector = pinned_ca_connector(other.tls.ca_cert_pem());
         let result = tokio_tungstenite::connect_async_tls_with_config(

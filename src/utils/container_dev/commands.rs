@@ -21,7 +21,7 @@
 use anyhow::{Context, Result};
 
 use super::engine::TagEvent;
-use super::store::{BlobStore, StoreError};
+use super::store::{BlobStore, SessionActivity, StoreError};
 use super::watcher::{Notifier, SyncMode, Syncer};
 
 /// Perform ONE re-push + notify of a watched tag and return — the `container dev
@@ -61,13 +61,16 @@ pub async fn run_one_shot_sync(
 ///
 /// This delegates to [`BlobStore::prune`], reusing the single GC policy verbatim:
 /// it retains every blob a currently-tagged manifest references, sweeps the rest,
-/// and refuses (rather than sweeping a blob a pull still needs) while a device is
-/// mid-pull. It operates ONLY on blobs under the store's `registry/` tree, so it
-/// never removes the per-session read/control or write token, nor the per-project
-/// CA material — those are session state, not store blobs, and prune has no path
-/// to them.
-pub fn prune_store(store: &BlobStore) -> Result<Vec<String>, StoreError> {
-    store.prune()
+/// and refuses (rather than sweeping a blob a transfer still needs) while an `up`
+/// session is live. It operates ONLY on blobs under the store's `registry/` tree,
+/// so it never removes the per-session read/control or write token, nor the
+/// per-project CA material — those are session state, not store blobs, and prune
+/// has no path to them.
+///
+/// `session` comes from the caller because only the command layer can probe the
+/// session flock, and that flock is the sole cross-process proof of liveness.
+pub fn prune_store(store: &BlobStore, session: SessionActivity) -> Result<Vec<String>, StoreError> {
+    store.prune(session)
 }
 
 #[cfg(test)]
@@ -245,7 +248,7 @@ mod tests {
         store
             .write_blob(MANIFEST, &image_manifest(CONFIG, LAYER))
             .unwrap();
-        store.set_tag("dev", MANIFEST).unwrap();
+        store.set_tag("my-app", "dev", MANIFEST).unwrap();
         store.write_blob(ORPHAN, b"unreferenced").unwrap();
         store
     }
@@ -255,7 +258,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = store_with_tagged_image_and_orphan(&dir);
 
-        let swept = prune_store(&store).expect("prune succeeds with no pull in flight");
+        let swept = prune_store(&store, SessionActivity::Idle)
+            .expect("prune succeeds with no live session");
 
         assert_eq!(
             swept,
@@ -293,7 +297,7 @@ mod tests {
         std::fs::write(&read_token, "read-secret").unwrap();
         std::fs::write(&write_token, "write-secret").unwrap();
 
-        let swept = prune_store(&store).expect("prune succeeds");
+        let swept = prune_store(&store, SessionActivity::Idle).expect("prune succeeds");
         assert_eq!(swept, vec![ORPHAN.to_string()], "prune only sweeps blobs");
 
         // The token and CA material must be byte-for-byte intact after prune.
@@ -316,23 +320,22 @@ mod tests {
     }
 
     #[test]
-    fn prune_refuses_while_a_device_is_mid_pull() {
+    fn prune_refuses_while_an_up_session_is_live() {
         let dir = TempDir::new().unwrap();
         let store = store_with_tagged_image_and_orphan(&dir);
 
-        let guard = store.begin_pull();
-        let result = prune_store(&store);
+        let result = prune_store(&store, SessionActivity::Live);
         assert!(
-            matches!(result, Err(StoreError::PruneWhilePulling)),
-            "prune must refuse while a device is mid-pull, got {result:?}"
+            matches!(result, Err(StoreError::PruneWhileSessionLive)),
+            "prune must refuse while an `up` session is live, got {result:?}"
         );
         assert!(
             store.has_blob(ORPHAN).unwrap(),
             "a refused prune must not sweep anything"
         );
 
-        drop(guard);
-        let swept = prune_store(&store).expect("prune proceeds once the pull drains");
+        let swept =
+            prune_store(&store, SessionActivity::Idle).expect("prune proceeds once `up` is down");
         assert_eq!(swept, vec![ORPHAN.to_string()]);
     }
 }

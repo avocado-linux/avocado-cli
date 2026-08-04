@@ -27,6 +27,9 @@ pub mod config;
 // are added later, hence dead_code here.
 #[allow(dead_code)]
 pub mod engine;
+// The single normal form for an image reference, shared by the watcher and the
+// control WS so a key recorded on one path is found on the other.
+pub mod image_ref;
 // The store (3.1), OCI read handlers (3.2), and write handlers + auth layer
 // (3.3) land before the listeners that bind them: the read router is bound onto
 // the dedicated bulk listener by 3.7, the write router onto the distinct write

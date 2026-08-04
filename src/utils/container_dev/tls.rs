@@ -82,10 +82,11 @@ pub struct TlsMaterial {
 
 impl TlsMaterial {
     /// Generate a per-project CA, a CA-signed server leaf carrying the
-    /// `{runtime-name, 10.0.2.2, 127.0.0.1}` SANs and a backdated `notBefore`,
-    /// and the rustls server config that serves TLS with the leaf.
-    pub fn generate(runtime_name: &str) -> Result<Self, TlsError> {
-        let chain = CertChain::build(runtime_name)?;
+    /// `{runtime-name, 10.0.2.2, 127.0.0.1}` SANs plus every entry in
+    /// `extra_hosts`, a backdated `notBefore`, and the rustls server config that
+    /// serves TLS with the leaf.
+    pub fn generate(runtime_name: &str, extra_hosts: &[String]) -> Result<Self, TlsError> {
+        let chain = CertChain::build(runtime_name, extra_hosts)?;
 
         let cert_der = chain.leaf_cert.der().clone();
         let key_der =
@@ -132,9 +133,13 @@ impl DevSession {
     /// Called once per `up`; the write token rotates hard and the read/control
     /// token is what the bootstrap payload delivers to the device (design D5;
     /// rotation orchestration lives in task 5.2).
-    pub fn mint(runtime_name: &str) -> Result<Self, TlsError> {
+    /// `extra_hosts` are the addresses the bootstrap will advertise to the
+    /// device. They MUST be in the leaf's SAN set: the agent pins the CA and uses
+    /// rustls' stock verifier, so an advertised address absent from the set fails
+    /// hostname verification outright.
+    pub fn mint(runtime_name: &str, extra_hosts: &[String]) -> Result<Self, TlsError> {
         Ok(Self {
-            tls: TlsMaterial::generate(runtime_name)?,
+            tls: TlsMaterial::generate(runtime_name, extra_hosts)?,
             write_token: WriteToken::new(mint_token()),
             read_token: ReadToken::new(mint_token()),
         })
@@ -181,7 +186,7 @@ struct CertChain {
 }
 
 impl CertChain {
-    fn build(runtime_name: &str) -> Result<Self, TlsError> {
+    fn build(runtime_name: &str, extra_hosts: &[String]) -> Result<Self, TlsError> {
         let not_before = rcgen::date_time_ymd(NOT_BEFORE_YMD.0, NOT_BEFORE_YMD.1, NOT_BEFORE_YMD.2);
         let not_after = rcgen::date_time_ymd(NOT_AFTER_YMD.0, NOT_AFTER_YMD.1, NOT_AFTER_YMD.2);
 
@@ -200,11 +205,32 @@ impl CertChain {
         let mut leaf_params = CertificateParams::new(Vec::<String>::new())?;
         leaf_params.not_before = not_before;
         leaf_params.not_after = not_after;
-        leaf_params.subject_alt_names = vec![
+        // The fixed three cover the runtime name, the QEMU user-net host alias
+        // and loopback. `extra_hosts` adds whatever address THIS `up` is about to
+        // advertise - typically the auto-detected LAN address of a real board's
+        // host, which none of the three ever matched.
+        let mut sans = vec![
             SanType::DnsName(Ia5String::try_from(runtime_name)?),
             SanType::IpAddress(IpAddr::V4(VM_HOST_IP)),
             SanType::IpAddress(IpAddr::V4(LOOPBACK_IP)),
         ];
+        for host in extra_hosts {
+            let host = host.trim();
+            if host.is_empty() {
+                continue;
+            }
+            // An IP literal needs an iPAddress SAN; rustls will not match one
+            // against a dNSName, so classifying by parse rather than by shape is
+            // what makes both an override hostname and a probed address work.
+            let san = match host.parse::<IpAddr>() {
+                Ok(ip) => SanType::IpAddress(ip),
+                Err(_) => SanType::DnsName(Ia5String::try_from(host)?),
+            };
+            if !sans.contains(&san) {
+                sans.push(san);
+            }
+        }
+        leaf_params.subject_alt_names = sans;
         leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         leaf_params
@@ -244,7 +270,7 @@ mod tests {
 
     #[test]
     fn leaf_carries_the_10_0_2_2_ip_san_and_loopback_and_runtime_name() {
-        let chain = CertChain::build(RUNTIME).expect("cert chain builds");
+        let chain = CertChain::build(RUNTIME, &[]).expect("cert chain builds");
         let sans = &chain.leaf_cert.params().subject_alt_names;
 
         assert!(
@@ -264,8 +290,66 @@ mod tests {
     }
 
     #[test]
+    fn the_advertised_lan_address_is_in_the_leafs_san_set() {
+        // The device pins the CA and uses rustls' stock verifier, so the address
+        // the bootstrap advertises must be a SAN or the handshake fails
+        // NotValidForName on both listeners. The fixed three never covered a real
+        // board's host address; the lab only ever exercised 10.0.2.2, which was
+        // already in the set, so nothing here failed.
+        let chain =
+            CertChain::build(RUNTIME, &["192.168.1.50".to_string()]).expect("cert chain builds");
+        let sans = &chain.leaf_cert.params().subject_alt_names;
+
+        assert!(
+            sans.contains(&SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(
+                192, 168, 1, 50
+            )))),
+            "the advertised LAN address MUST be an iPAddress SAN, got {sans:?}"
+        );
+    }
+
+    #[test]
+    fn an_advertised_hostname_becomes_a_dns_san_not_an_ip_one() {
+        // AVOCADO_CONTAINER_DEV_HOST may be a name rather than a literal, and
+        // rustls will not match a hostname against an iPAddress SAN - so the
+        // classification has to be by parse, not by shape.
+        let chain =
+            CertChain::build(RUNTIME, &["dev-host.lan".to_string()]).expect("cert chain builds");
+        let sans = &chain.leaf_cert.params().subject_alt_names;
+
+        assert!(
+            sans.contains(&SanType::DnsName(
+                Ia5String::try_from("dev-host.lan").expect("valid DNS SAN")
+            )),
+            "an advertised hostname MUST be a dNSName SAN, got {sans:?}"
+        );
+    }
+
+    #[test]
+    fn extra_hosts_do_not_displace_the_fixed_sans_or_duplicate_them() {
+        // 10.0.2.2 is what the QEMU lab advertises, so it arrives as an extra
+        // host on that path too; adding it twice would be harmless but sloppy,
+        // and dropping the fixed set would break the VM path outright.
+        let chain = CertChain::build(RUNTIME, &["10.0.2.2".to_string(), String::new()])
+            .expect("cert chain builds");
+        let sans = &chain.leaf_cert.params().subject_alt_names;
+
+        let vm_host = SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2)));
+        assert_eq!(
+            sans.iter().filter(|s| **s == vm_host).count(),
+            1,
+            "10.0.2.2 must appear exactly once, got {sans:?}"
+        );
+        assert!(
+            sans.contains(&SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))),
+            "loopback must survive, got {sans:?}"
+        );
+        assert_eq!(sans.len(), 3, "an empty extra host must add nothing");
+    }
+
+    #[test]
     fn not_before_is_backdated_strictly_before_now() {
-        let chain = CertChain::build(RUNTIME).expect("cert chain builds");
+        let chain = CertChain::build(RUNTIME, &[]).expect("cert chain builds");
         let now = now_unix();
 
         let leaf_not_before = chain.leaf_cert.params().not_before.unix_timestamp();
@@ -282,7 +366,7 @@ mod tests {
 
     #[test]
     fn both_tokens_are_non_empty_and_distinct() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         assert!(
             !session.write_token.secret().is_empty(),
             "the write token must be non-empty"
@@ -300,8 +384,8 @@ mod tests {
 
     #[test]
     fn each_mint_produces_fresh_tokens() {
-        let a = DevSession::mint(RUNTIME).expect("first session mints");
-        let b = DevSession::mint(RUNTIME).expect("second session mints");
+        let a = DevSession::mint(RUNTIME, &[]).expect("first session mints");
+        let b = DevSession::mint(RUNTIME, &[]).expect("second session mints");
         assert_ne!(
             a.read_token.secret(),
             b.read_token.secret(),
@@ -316,7 +400,7 @@ mod tests {
 
     #[test]
     fn bootstrap_payload_carries_the_ca_cert_but_not_the_ca_private_key() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let payload = session.bootstrap_payload();
         let json = serde_json::to_string(&payload).expect("payload serializes");
 
@@ -340,7 +424,7 @@ mod tests {
 
     #[test]
     fn payload_ca_cert_matches_the_session_ca_cert() {
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         assert_eq!(
             session.bootstrap_payload().ca_cert_pem,
             session.tls.ca_cert_pem(),
@@ -352,7 +436,7 @@ mod tests {
     fn mint_builds_a_server_config_from_the_leaf() {
         // A successful mint means `with_single_cert` accepted the leaf and its
         // key, i.e. the rustls server config is backed by the CA-signed leaf.
-        let session = DevSession::mint(RUNTIME).expect("session mints");
+        let session = DevSession::mint(RUNTIME, &[]).expect("session mints");
         let _config = session.tls.server_config();
         assert!(
             session.tls.ca_cert_pem().contains("BEGIN CERTIFICATE"),
