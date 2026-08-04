@@ -226,7 +226,23 @@ build_image() {
 }
 
 # Is the watched image present on the TARGET's engine?
-target_has_image() { target_engine image inspect "$TEST_IMAGE" >/dev/null 2>&1; }
+# Does the TARGET hold exactly the image the HOST currently has under the watched
+# tag? Presence of the tag is NOT the question, and testing it was a real bug: a
+# tag left behind by an earlier run points at a different image, passes a presence
+# check, and makes the demo assert a version that was never delivered.
+#
+# Comparing image IDs is sound here because an ID is the digest of the image
+# config, which a push/pull round trip preserves - verified by finding the
+# target's running image present on the host under the previous session's
+# registry tags, same ID.
+host_image_id() { build_engine image inspect "$TEST_IMAGE" --format '{{.Id}}' 2>/dev/null; }
+target_image_id() { target_engine image inspect "$TEST_IMAGE" --format '{{.Id}}' 2>/dev/null; }
+target_has_host_image() {
+  local h t
+  h="$(host_image_id)"
+  t="$(target_image_id)"
+  [ -n "$h" ] && [ "$h" = "$t" ]
+}
 
 # Find the running `container dev up` session.
 #
@@ -328,13 +344,16 @@ EOF
   ssh "$SSH_ALIAS" "systemctl daemon-reload && systemctl enable $APP_SERVICE >/dev/null 2>&1" \
     || die "could not install $APP_SERVICE on $SSH_ALIAS"
 
-  # In native mode the image was built HERE, so on a virgin target there is nothing
-  # for `docker run` to resolve yet - and nothing can put it there until the session
-  # and the agent both exist, because delivery IS the loop. So do not start the unit
-  # and assert a baseline here; that ordering only ever worked when the image was
-  # already on the target (vm mode builds it there, which is exactly what hid the
-  # agent's missing-tag bug). `seed` starts it once the image has landed.
-  if [ "$MODE" = vm ] || target_has_image; then
+  # In native mode the image was built HERE, so nothing on the target is that image
+  # until `seed` ships it - delivery IS the loop. Starting the unit and asserting a
+  # baseline here can only work in vm mode, where the build happened on the target.
+  #
+  # There is deliberately no "unless the target already has it" escape. That escape
+  # existed and was wrong: it tested whether the TAG was present, which a previous
+  # run leaves behind pointing at a DIFFERENT image, so the demo restarted the unit
+  # on a stale image and then failed asserting the version it had just built but
+  # never delivered.
+  if [ "$MODE" = vm ]; then
     ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
     sleep 4
     local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
@@ -345,7 +364,10 @@ EOF
     esac
   else
     printf '   %-11s %s\n' "unit" "installed and enabled, NOT started"
-    printf '   %-11s %s\n' "why" "$TEST_IMAGE is not on the target yet - '$0 seed' delivers it via the loop"
+    printf '   %-11s %s\n' "why" "the host built $TEST_IMAGE; '$0 seed' delivers it over the loop"
+    if [ -n "$(target_image_id)" ]; then
+      printf '   %-11s %s\n' "note" "the target holds an older $TEST_IMAGE from a previous run; seed replaces it"
+    fi
   fi
 }
 
@@ -365,13 +387,17 @@ cmd_seed() {
   ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
     || die "container dev sync failed - is a session up? ($0 up)"
 
+  # Wait for the target to hold the HOST's image, not merely a tag of that name.
+  # A stale tag from a previous run satisfies a presence check instantly, so this
+  # loop used to fall through on the first tick and then restart the unit on the
+  # old image.
   printf '   %-11s ' "waiting"
   for _ in $(seq 1 30); do
     sleep 2; printf '.'
-    target_has_image && break
+    target_has_host_image && break
   done
   printf '\n'
-  target_has_image || die "image never reached the target - check: $0 logs session ; $0 logs agent"
+  target_has_host_image || die "the host's $TEST_IMAGE never reached the target (host $(host_image_id | cut -c8-19), target $(target_image_id | cut -c8-19 || echo none)) - check: $0 logs session ; $0 logs agent"
 
   ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
   sleep 4
