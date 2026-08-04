@@ -2026,6 +2026,25 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Connect {
                 command: ConnectCommands::Upload { .. }
             }
+            // `container dev` drives the engine directly: `up` watches
+            // `docker events` and pushes to the embedded registry, `sync`
+            // re-pushes, `down` and `prune` inspect and remove. Without an arm
+            // here `ensure_routed_for_process` never ran for them, so DOCKER_HOST
+            // was never set and `HostTopology::sync_mode` could not select the VM
+            // push path no matter how many times the user started the VM — the
+            // ingest error told them to start it and routing never followed.
+            //
+            // `status` is deliberately excluded: it only reads the session record
+            // written by `up`, and routing may AUTO-START the VM, so gating it
+            // here would make a read-only status query boot a virtual machine.
+            | Commands::Container {
+                command: ContainerCommands::Dev {
+                    command: ContainerDevCommands::Up
+                        | ContainerDevCommands::Sync
+                        | ContainerDevCommands::Down
+                        | ContainerDevCommands::Prune
+                }
+            }
     )
 }
 
@@ -5048,5 +5067,38 @@ mod tests {
             "--target",
             "qemux86-64",
         ])));
+    }
+
+    /// The engine-driving `container dev` subcommands must route, or
+    /// `ensure_routed_for_process` never runs for them, `DOCKER_HOST` is never
+    /// set, and `HostTopology::sync_mode` cannot select the VM push path however
+    /// many times the operator starts the VM. That made the ingest error's own
+    /// remedy ("start the avocado-vm and route it") unreachable: following it
+    /// produced the identical error, and the only escape was a manual
+    /// `DOCKER_HOST` export.
+    ///
+    /// `status` must NOT route: it only reads the record `up` published, and
+    /// routing may auto-start the VM, so gating it would make a read-only query
+    /// boot a virtual machine.
+    #[test]
+    fn needs_vm_routing_gates_engine_driving_container_dev_subcommands() {
+        let cmd = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("args should parse")
+                .command
+        };
+
+        for sub in ["up", "sync", "down", "prune"] {
+            assert!(
+                needs_vm_routing(&cmd(&["avocado", "container", "dev", sub])),
+                "`container dev {sub}` drives the engine and must route"
+            );
+        }
+
+        assert!(
+            !needs_vm_routing(&cmd(&["avocado", "container", "dev", "status"])),
+            "`container dev status` only reads the session record; routing it \
+             would let a status query auto-start the VM"
+        );
     }
 }

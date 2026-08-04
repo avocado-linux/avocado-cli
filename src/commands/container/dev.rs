@@ -37,6 +37,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -447,9 +448,13 @@ impl DevUpCommand {
             write_token.clone(),
             project_dir,
         ));
-        let (events_rx, mut events_child) = watch_tag_events(driver)
-            .await
-            .context("starting the engine event watcher")?;
+        // Set just before teardown kills the events child, so the EOF that kill
+        // produces is not reported as a watcher that died on its own.
+        let watcher_shutdown = Arc::new(AtomicBool::new(false));
+        let (events_rx, mut events_child, watcher_ended) =
+            watch_tag_events(driver, Arc::clone(&watcher_shutdown))
+                .await
+                .context("starting the engine event watcher")?;
         let notifier = Arc::clone(&control);
         // Wrap the real syncer in the cross-arch guard (task 4.3) BEFORE anything
         // can push through it. `control` already records every device's
@@ -560,8 +565,36 @@ impl DevUpCommand {
         // `down` (SIGTERM). On ANY exit — including a panic or early return — the
         // write guard tears down the write listener via Drop (design L-1); the
         // other listeners' tasks are aborted and the state file is cleared.
-        wait_for_shutdown(early_signals.shutdown).await;
+        // A watcher that dies mid-session has to correct the record it published,
+        // or `status` from a second terminal - which is how anyone actually
+        // checks - keeps reporting `watcher_running=true`. The warning from the
+        // forwarder reaches only the terminal holding `up`, which is the one
+        // place the operator is not looking.
+        let shutdown_fut = wait_for_shutdown(early_signals.shutdown);
+        tokio::pin!(shutdown_fut);
+        tokio::select! {
+            () = &mut shutdown_fut => {}
+            _ = watcher_ended => {
+                if let Err(e) = mark_watcher_stopped(&state_path) {
+                    print_warning(
+                        &format!(
+                            "container dev: the watcher stopped, but recording that in the \
+                             session file failed ({e}); `avocado container dev status` may \
+                             still report it running"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                // Keep serving: the registry, the control WS and manual `sync`
+                // all still work without the event stream, so this is a degraded
+                // session rather than a finished one.
+                shutdown_fut.await;
+            }
+        }
 
+        // Before the kill below, not after: the kill is what closes the child's
+        // stdout, so the forwarder can observe this flag only if it is already set.
+        watcher_shutdown.store(true, Ordering::SeqCst);
         write_guard.teardown();
         ws_task.abort();
         watcher_task.abort();
@@ -986,6 +1019,22 @@ fn write_session_state(path: &std::path::Path, state: &SessionState) -> Result<(
     Ok(())
 }
 
+/// Rewrite the published record with `watcher_running: false`.
+///
+/// Read-modify-write rather than reconstructing the record, so the pid and
+/// everything else `status` reports survive - rebuilding it here would silently
+/// reset `last_sync` and the per-device token state.
+///
+/// A missing file is not an error: `down` removes it, so losing the race with a
+/// concurrent teardown just means there is nothing left to correct.
+fn mark_watcher_stopped(path: &std::path::Path) -> Result<()> {
+    let Some(mut state) = read_session_state(path)? else {
+        return Ok(());
+    };
+    state.status.watcher_running = false;
+    write_session_state(path, &state)
+}
+
 /// Read the session state, or `None` when no `up` session is recorded.
 fn read_session_state(path: &std::path::Path) -> Result<Option<SessionState>> {
     match std::fs::read_to_string(path) {
@@ -1185,6 +1234,61 @@ fn bulk_host<'a>(endpoint: &'a str, auto_host: &'a str) -> &'a str {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn session_with_watcher(running: bool) -> SessionState {
+        SessionState {
+            pid: 4242,
+            status: DevStatus {
+                registry_running: true,
+                watcher_running: running,
+                last_sync: Some("sha256:abc".to_string()),
+                devices: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_stopped_watcher_is_recorded_where_status_reads_it() {
+        // `up` wrote `watcher_running: true` once and never revisited it, so
+        // after the watcher died a `status` from a second terminal - which is how
+        // anyone actually checks - still reported a live watcher. The forwarder's
+        // warning only reaches the terminal holding `up`, which is the one place
+        // the operator is not looking.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        write_session_state(&path, &session_with_watcher(true)).unwrap();
+
+        mark_watcher_stopped(&path).unwrap();
+
+        let after = read_session_state(&path)
+            .unwrap()
+            .expect("the record must still exist");
+        assert!(
+            !after.status.watcher_running,
+            "status must report the watcher as stopped"
+        );
+        // Read-modify-write, not a rebuild: reconstructing the record here would
+        // silently reset everything else `status` reports.
+        assert_eq!(after.pid, 4242, "the pid must survive the correction");
+        assert_eq!(
+            after.status.last_sync.as_deref(),
+            Some("sha256:abc"),
+            "last_sync must survive the correction"
+        );
+        assert!(after.status.registry_running, "the registry is still up");
+    }
+
+    #[test]
+    fn recording_a_stopped_watcher_tolerates_a_removed_record() {
+        // `down` removes the file, so a watcher dying concurrently with teardown
+        // finds nothing to correct. That is a race with no consequence, not an
+        // error worth surfacing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.json");
+
+        mark_watcher_stopped(&path).expect("a missing record must not be an error");
+        assert!(read_session_state(&path).unwrap().is_none());
+    }
 
     /// The bootstrap file carries the Bearer read/control token, so it must never
     /// exist world-readable - not even briefly.

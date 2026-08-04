@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use directories::BaseDirs;
 use tempfile::NamedTempFile;
@@ -91,10 +92,34 @@ pub const MAX_BLOB_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// A per-project content-addressed blob store.
 ///
 /// Rooted at `<avocado_dir>/container-dev/<project>/registry/` with a
-/// `blobs/<algorithm>/<hex>` layout for content and `manifests/tags/<tag>`
-/// pointers holding the digest of the tagged manifest.
+/// `blobs/<algorithm>/<hex>` layout for content and
+/// `manifests/tags/<name>/<tag>` pointers holding the digest of the tagged
+/// manifest. See [`BlobStore::tag_path`] for why the name is escaped into a
+/// single segment.
+///
+/// # Upgrading over an existing store
+///
+/// Tags used to live flat at `manifests/tags/<tag>`, with no repository name.
+/// There is no migration and none is possible: the name is exactly the
+/// information the old layout did not record, so a flat `dev` cannot be placed
+/// under the repository it belonged to. [`Self::list_tags`] skips non-directory
+/// entries, so pre-existing flat tags are invisible to it - which means the
+/// first `prune`/`down` after upgrading sweeps their manifests and layers as
+/// unreferenced.
+///
+/// That is a deliberate wipe rather than an oversight. It costs one re-push,
+/// which `up` and `sync` both perform anyway, and the alternative - guessing a
+/// name for an orphaned tag - would resurrect it under the wrong repository.
 pub struct BlobStore {
     root: PathBuf,
+    /// Count of [`Self::read_blob`] calls.
+    ///
+    /// Exists for one test: the GC must decide a layer-sized blob has no
+    /// children WITHOUT reading it, and the outcome is identical either way -
+    /// the layer stays reachable because the manifest's `layers` array already
+    /// put it on the worklist. Asserting on the outcome therefore passes with
+    /// the size guard deleted, so the mechanism needs its own witness.
+    blob_reads: AtomicUsize,
 }
 
 impl BlobStore {
@@ -118,7 +143,10 @@ impl BlobStore {
             .join("registry");
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("manifests").join("tags"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            blob_reads: AtomicUsize::new(0),
+        })
     }
 
     /// The registry root directory backing this store.
@@ -191,11 +219,21 @@ impl BlobStore {
     /// Read the bytes stored under `digest`, or `None` when absent.
     pub fn read_blob(&self, digest: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let path = self.blob_path(digest)?;
+        self.blob_reads.fetch_add(1, Ordering::Relaxed);
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// How many times [`Self::read_blob`] has been called on this store.
+    ///
+    /// Lets a test assert that the GC never pulled a layer-sized blob into
+    /// memory, which no assertion on the swept set can distinguish.
+    #[cfg(test)]
+    pub fn blob_read_count(&self) -> usize {
+        self.blob_reads.load(Ordering::Relaxed)
     }
 
     /// Open a stored blob for incremental reading, with its size.
@@ -1212,10 +1250,23 @@ mod gc {
             .unwrap();
         store.set_tag("my-app", "dev", &manifest_digest).unwrap();
 
+        let reads_before = store.blob_read_count();
         let swept = store.collect_garbage().unwrap();
+        let reads = store.blob_read_count() - reads_before;
 
-        // Both stay reachable: the point is that the layer was never read to
-        // find that out, and that skipping the read did not lose the edge.
+        // THE assertion. Both blobs stay reachable either way - the layer is on
+        // the worklist from the manifest's `layers` array, and with the guard
+        // deleted `serde_json` merely fails on its NUL bytes and yields no
+        // children - so `swept.is_empty()` plus both-present holds with the guard
+        // gone. Only the read count separates "decided without reading" from
+        // "read 4 MiB to decide the same thing".
+        assert_eq!(
+            reads, 1,
+            "the GC must read the manifest and NOT the layer-sized blob; {reads} reads"
+        );
+
+        // Still assert the outcome, so a guard that skipped the manifest too -
+        // losing the edge and sweeping a reachable layer - cannot pass.
         assert!(
             swept.is_empty(),
             "nothing tagged should be swept, got {swept:?}"

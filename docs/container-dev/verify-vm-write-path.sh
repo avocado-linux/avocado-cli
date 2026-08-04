@@ -173,7 +173,12 @@ echo "  running: $AVOCADO_BIN container dev sync"
 tag="${TEST_IMAGE##*:}"
 landed=0
 for _ in $(seq 1 25); do
-  if find "$STORE_ROOT" -path "*/registry/manifests/tags/$tag" 2>/dev/null | grep -q .; then
+  # `*/tags/*/$tag`, not `*/tags/$tag`: tags are stored under the repository
+  # name (`manifests/tags/<name>/<tag>`), so a pattern ending in `/tags/$tag`
+  # matches nothing and this loop reports failure on a run where the push
+  # actually succeeded - the one script that would catch a regression on this
+  # path failing on a healthy one.
+  if find "$STORE_ROOT" -path "*/registry/manifests/tags/*/$tag" 2>/dev/null | grep -q .; then
     landed=1
     break
   fi

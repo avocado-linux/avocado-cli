@@ -22,6 +22,8 @@
 //! push wiring and watcher orchestration (tasks 4.2/4.3) reuse it unchanged.
 
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -304,9 +306,17 @@ where
 /// socket is opened — so a rootless podman without `podman.socket` works. The
 /// caller owns the returned [`tokio::process::Child`] and kills it to stop
 /// watching (e.g. on `down`); dropping the receiver ends the forwarding task.
+/// `shutting_down` must be set by the caller BEFORE it kills the returned child,
+/// so an expected EOF during teardown is not reported as a dead watcher. The
+/// third return value resolves when the forwarder stops, for whatever reason.
 pub async fn watch_tag_events(
     driver: Box<dyn EngineDriver>,
-) -> Result<(mpsc::Receiver<TagEvent>, tokio::process::Child)> {
+    shutting_down: Arc<AtomicBool>,
+) -> Result<(
+    mpsc::Receiver<TagEvent>,
+    tokio::process::Child,
+    tokio::sync::oneshot::Receiver<()>,
+)> {
     let argv = driver.events_argv();
     let mut child = Command::new(driver.binary())
         .args(&argv)
@@ -321,6 +331,7 @@ pub async fn watch_tag_events(
         .context("engine events subprocess produced no stdout handle")?;
 
     let (tx, rx) = mpsc::channel(64);
+    let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
     let engine_binary = driver.binary();
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
@@ -333,35 +344,62 @@ pub async fn watch_tag_events(
         })
         .await;
 
-        // Say so when the stream ends. Swallowing this made a dead watcher
-        // indistinguishable from an idle one: restarting the engine daemon
-        // (`systemctl restart docker`, or Docker Desktop) kills the `events`
-        // child, the forwarder ends, `run_watcher` returns - and `up` stays in
-        // the foreground still printing "Watching for image rebuilds..." while
-        // every later rebuild goes undetected. Manual `sync` keeps working, so
-        // it reads as "auto-reload broke" rather than as a stopped watcher.
-        match outcome {
-            Ok(()) => print_warning(
-                &format!(
-                    "container dev: the `{engine_binary} events` stream ended, so image rebuilds \
-                     are no longer detected automatically. This usually means the engine daemon \
-                     restarted. Run `avocado container dev down` and `up` again to resume \
-                     watching; `avocado container dev sync` still works in the meantime."
-                ),
-                OutputLevel::Normal,
-            ),
-            Err(e) => print_warning(
-                &format!(
-                    "container dev: reading the `{engine_binary} events` stream failed ({e}), so \
-                     image rebuilds are no longer detected automatically. Run `avocado container \
-                     dev down` and `up` again to resume watching."
-                ),
-                OutputLevel::Normal,
-            ),
+        if let Some(message) = stream_end_report(
+            &outcome,
+            shutting_down.load(Ordering::SeqCst),
+            engine_binary,
+        ) {
+            print_warning(&message, OutputLevel::Normal);
         }
+        // Signal regardless of whether anything was printed. The warning reaches
+        // only the terminal holding `up`; the caller uses this to correct the
+        // published session record, which is what a `status` from a second
+        // terminal actually reads.
+        let _ = ended_tx.send(());
     });
 
-    Ok((rx, child))
+    Ok((rx, child, ended_rx))
+}
+
+/// What to tell the operator when the event stream ends, or `None` when the end
+/// was expected.
+///
+/// Say so when the stream ends unexpectedly. Swallowing it made a dead watcher
+/// indistinguishable from an idle one: restarting the engine daemon
+/// (`systemctl restart docker`, or Docker Desktop) kills the `events` child, the
+/// forwarder ends, `run_watcher` returns - and `up` stays in the foreground still
+/// printing "Watching for image rebuilds..." while every later rebuild goes
+/// undetected. Manual `sync` keeps working, so it reads as "auto-reload broke"
+/// rather than as a stopped watcher.
+///
+/// `shutting_down` is the caller's own teardown flag, and without it this warned
+/// on every clean `down`. Teardown kills the events child, and that kill is
+/// precisely what closes the child's stdout and makes the forwarder runnable - so
+/// the EOF arrives mid-teardown and is byte-for-byte identical to a daemon
+/// restart. Nothing in the stream can tell them apart; only the caller knows
+/// which one it did.
+///
+/// An `Err` is always reported. A read failure is not what a kill produces, so it
+/// is news even during teardown.
+pub(crate) fn stream_end_report(
+    outcome: &std::io::Result<()>,
+    shutting_down: bool,
+    engine_binary: &str,
+) -> Option<String> {
+    match outcome {
+        Ok(()) if shutting_down => None,
+        Ok(()) => Some(format!(
+            "container dev: the `{engine_binary} events` stream ended, so image rebuilds \
+             are no longer detected automatically. This usually means the engine daemon \
+             restarted. Run `avocado container dev down` and `up` again to resume \
+             watching; `avocado container dev sync` still works in the meantime."
+        )),
+        Err(e) => Some(format!(
+            "container dev: reading the `{engine_binary} events` stream failed ({e}), so \
+             image rebuilds are no longer detected automatically. Run `avocado container \
+             dev down` and `up` again to resume watching."
+        )),
+    }
 }
 
 /// Resolve an image reference to the engine's content ID for it.
@@ -392,6 +430,42 @@ pub async fn resolve_image_id(binary: &str, image: &str) -> Result<Option<String
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn a_stream_end_during_teardown_is_not_reported() {
+        // `down` kills the events child, and that kill is exactly what closes
+        // the child's stdout and makes the forwarder runnable - so a clean
+        // teardown produced an EOF indistinguishable from a daemon restart, and
+        // the warning told the operator to run the `down` they were already
+        // running.
+        assert_eq!(stream_end_report(&Ok(()), true, "docker"), None);
+    }
+
+    #[test]
+    fn a_stream_end_outside_teardown_is_reported() {
+        // The mirror: the whole point is still to surface a watcher that died on
+        // its own. Without this, silencing the teardown case could silence
+        // everything and both tests would pass.
+        let message = stream_end_report(&Ok(()), false, "docker")
+            .expect("an unexpected stream end must be reported");
+        assert!(message.contains("docker events"), "{message}");
+        assert!(
+            message.contains("no longer detected automatically"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_read_failure_is_reported_even_during_teardown() {
+        // A kill produces EOF, not an error - so an Err arriving during teardown
+        // is news either way, and suppressing it would hide a real fault behind
+        // an unrelated flag.
+        let err = std::io::Error::other("boom");
+        let message = stream_end_report(&Err(err), true, "podman")
+            .expect("a read failure must be reported regardless of teardown");
+        assert!(message.contains("podman events"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+    }
 
     // ---- docker fixtures (captured `docker events --format '{{json .}}'`) ----
 
