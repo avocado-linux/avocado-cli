@@ -57,6 +57,7 @@ use crate::utils::container_dev::config::ContainerDevConfig;
 use crate::utils::container_dev::engine::{
     driver_for, resolve_image_id, watch_tag_events, TagEvent,
 };
+use crate::utils::container_dev::image_ref;
 use crate::utils::container_dev::registry::{serve_write_router_tls, write_router, BulkListener};
 use crate::utils::container_dev::store::{BlobStore, SessionActivity};
 use crate::utils::container_dev::tls::DevSession;
@@ -398,9 +399,19 @@ impl DevUpCommand {
         // delivery the guard could not, having had no connected device to
         // compare against at push time.
         let image_arches = ImageArchBook::new();
+        // The unit that consumes each watched image, keyed the way the push path
+        // keys it: `image_ref::split` strips any registry prefix and defaults the
+        // tag, which is what `build_push_plan`'s retag and `notify`'s own key
+        // both land on. Keying by the raw config `ref` instead would miss for any
+        // entry written as `localhost/my-app:dev`.
+        let mut desired = DesiredState::default();
+        desired.set_services(ctx.dev.images.iter().map(|image| {
+            let (repo, tag) = image_ref::split(&image.image_ref);
+            ((repo, tag), image.service.clone())
+        }));
         let control = ControlServer::new(
             read_token.clone(),
-            DesiredState::default(),
+            desired,
             arch_book.clone(),
             image_arches.clone(),
             // The notify path resolves a tag to the registry manifest digest here.

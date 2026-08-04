@@ -344,6 +344,9 @@ async fn a_stale_device_is_synced_to_the_new_digest_over_the_control_ws() {
             image: NAME.to_string(),
             tag: TAG.to_string(),
             digest: v2_digest.clone(),
+            // This harness builds its DesiredState directly, without a config,
+            // so no service is declared for the image.
+            service: None,
         },
         "a device reporting the stale digest must be told to move to the new digest"
     );

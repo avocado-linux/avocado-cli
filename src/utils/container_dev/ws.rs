@@ -78,6 +78,22 @@ pub enum HostFrame {
         tag: String,
         /// Content digest (`sha256:…`) the device should be running.
         digest: String,
+        /// The device systemd unit that consumes this image, from the matching
+        /// `container_dev.images[].service`.
+        ///
+        /// The device needs it to make the sync take effect at all: `docker
+        /// restart <container>` re-executes the existing container object, which
+        /// stays bound to its create-time image id, so a freshly pulled image for
+        /// the same tag is ignored. Restarting the owning unit re-runs
+        /// `docker run` and re-resolves the tag. The field was declared in config
+        /// and never sent, so every device fell back to restarting the container
+        /// and every sync silently no-opped.
+        ///
+        /// Optional on the wire so an older device still parses the frame; it
+        /// then falls back to its own `AVOCADO_CONTAINER_DEV_SERVICE` and finally
+        /// to the container restart, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
     },
 }
 
@@ -145,6 +161,14 @@ fn split_image_tag(image: &str) -> (String, String) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DesiredState {
     by_tag: BTreeMap<(String, String), DesiredEntry>,
+    /// `(image, tag) -> owning systemd unit`, from the project's
+    /// `container_dev.images[].service`.
+    ///
+    /// Kept beside the desired map rather than inside [`DesiredEntry`] because it
+    /// is static project configuration, not something a push discovers: an entry
+    /// derived from the engine's watched tags and one recorded after a sync must
+    /// resolve to the same unit.
+    services: BTreeMap<(String, String), String>,
 }
 
 /// One desired `(image, tag)` entry: the digest to run, and the architecture it
@@ -187,7 +211,30 @@ impl DesiredState {
                 )
             })
             .collect();
-        Self { by_tag }
+        Self {
+            by_tag,
+            services: BTreeMap::new(),
+        }
+    }
+
+    /// Record which systemd unit consumes each `(image, tag)`.
+    ///
+    /// Called once at `up` from the project's `container_dev.images`. The keys
+    /// must be derived the same way the push path derives them (through
+    /// `image_ref::split`), or a lookup silently misses and the device falls back
+    /// to restarting the container - which is the no-op this exists to end.
+    pub fn set_services<I>(&mut self, services: I)
+    where
+        I: IntoIterator<Item = ((String, String), String)>,
+    {
+        self.services = services.into_iter().collect();
+    }
+
+    /// The unit consuming `(image, tag)`, if the project declared one.
+    fn service_for(&self, image: &str, tag: &str) -> Option<String> {
+        self.services
+            .get(&(image.to_string(), tag.to_string()))
+            .cloned()
     }
 
     /// Record a fresh `(image, tag) -> digest` after a new sync so a later
@@ -257,8 +304,47 @@ impl DesiredState {
                 image: image.clone(),
                 tag: tag.clone(),
                 digest: entry.digest.clone(),
+                service: self.service_for(image, tag),
             })
             .collect()
+    }
+}
+
+/// Print a device `Status` report to the operator.
+///
+/// Every field is device-supplied and goes through [`sanitize_device_text`] for
+/// the same reason the arch-refusal warning does: `print_warning` is a bare
+/// `println!` with an ANSI prefix and no escaping, so a device holding the read
+/// token could otherwise forge a success line over its own failure report.
+///
+/// `sync_failed` and `needs_rebootstrap` are the two the device raises today;
+/// anything else is printed verbatim rather than dropped, so a new device-side
+/// state is visible before the host learns to special-case it.
+fn report_device_status(status: &Status) {
+    print_warning(&device_status_message(status), OutputLevel::Normal);
+}
+
+/// The operator-facing text for a device `Status`, split out so it is assertable
+/// without capturing stdout.
+fn device_status_message(status: &Status) -> String {
+    let device = sanitize_device_text(&status.device_id);
+    let state = sanitize_device_text(&status.state);
+    let detail = status
+        .detail
+        .as_deref()
+        .map(sanitize_device_text)
+        .unwrap_or_default();
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    match status.state.as_str() {
+        "needs_rebootstrap" => format!(
+            "device `{device}` rejected its read/control token{suffix}. Re-run \
+             `avocado container dev up` to mint a fresh one."
+        ),
+        _ => format!("device `{device}` reports {state}{suffix}"),
     }
 }
 
@@ -578,8 +664,19 @@ impl ControlServer {
                 let arch = DeviceArch::parse(&hello.arch);
                 Some((frames, Some(lease), Some(arch)))
             }
-            // Progress/Status are informational; no host response.
-            DeviceFrame::Progress(_) | DeviceFrame::Status(_) => None,
+            // A device report needs no host response, but it does need to reach
+            // the operator. Dropping `Status` silently meant the device could
+            // report `sync_failed` or `needs_rebootstrap` and nothing surfaced
+            // anywhere: `Hello` is re-sent only on reconnect, so a healthy link
+            // showed a device synced at the old digest with no error surface at
+            // all, and the only evidence lived in the device journal.
+            DeviceFrame::Status(status) => {
+                report_device_status(&status);
+                None
+            }
+            // Progress is informational and high-frequency; printing every one
+            // would bury the Status lines above it.
+            DeviceFrame::Progress(_) => None,
         }
     }
 }
@@ -635,11 +732,17 @@ impl Notifier for ControlServer {
             // itself cannot, because at push time there may be no device
             // connected to compare against.
             let arch = self.image_arches.arch_for(&canonical(&event.image));
-            self.desired
-                .lock()
-                .unwrap()
-                .record_sync(&image, &tag, &digest, arch);
-            let frame = HostFrame::Sync { image, tag, digest };
+            let service = {
+                let mut desired = self.desired.lock().unwrap();
+                desired.record_sync(&image, &tag, &digest, arch);
+                desired.service_for(&image, &tag)
+            };
+            let frame = HostFrame::Sync {
+                image,
+                tag,
+                digest,
+                service,
+            };
             // A send with no connected devices is not an error (nobody to notify
             // yet); a later `hello` reconciles them.
             let _ = self.tx.send(frame);
@@ -657,10 +760,142 @@ fn encode(frame: &HostFrame) -> Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::container_dev::image_ref;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
     const READ_TOKEN: &str = "read-control-token";
+
+    /// A `DesiredState` whose services are keyed exactly the way `up` keys them,
+    /// so the tests exercise the real derivation rather than a hand-built key.
+    fn desired_with_service(config_ref: &str, service: &str, digest: &str) -> DesiredState {
+        let (repo, tag) = image_ref::split(config_ref);
+        let mut desired = DesiredState::derive_from_watched_tags([(
+            repo.clone(),
+            tag.clone(),
+            digest.to_string(),
+        )]);
+        desired.set_services([((repo, tag), service.to_string())]);
+        desired
+    }
+
+    #[test]
+    fn reconcile_tells_the_device_which_unit_consumes_the_image() {
+        // Without this the device restarts the container, which stays bound to
+        // its create-time image id, so the pulled image never runs and every sync
+        // no-ops while reporting success.
+        let desired = desired_with_service("my-app:dev", "app.service", "sha256:new");
+
+        let frames = desired.reconcile(&hello(""));
+
+        assert_eq!(
+            frames,
+            vec![HostFrame::Sync {
+                image: "my-app".to_string(),
+                tag: "dev".to_string(),
+                digest: "sha256:new".to_string(),
+                service: Some("app.service".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_service_key_survives_a_registry_prefixed_config_ref() {
+        // THE key-agreement test. `image_ref::split` strips the registry, so a
+        // config `ref` of `localhost/my-app:dev` must still resolve against the
+        // stripped `my-app` the frame carries. Keying the service map by the raw
+        // config string instead looks correct and silently misses here, and a
+        // missed lookup is indistinguishable from "no service declared" - which
+        // falls back to the container restart this exists to replace.
+        let desired = desired_with_service("localhost/my-app:dev", "app.service", "sha256:new");
+
+        let frames = desired.reconcile(&hello(""));
+
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let HostFrame::Sync { image, service, .. } = &frames[0];
+        assert_eq!(image, "my-app", "the frame carries the stripped repo");
+        assert_eq!(
+            service.as_deref(),
+            Some("app.service"),
+            "the service must resolve against the stripped repo, not the raw ref"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_image_carries_no_service() {
+        // The mirror: a project with no `service:` must send None rather than an
+        // arbitrary unit, so the device keeps its previous behaviour. Without
+        // this, a lookup that returned some default would pass the tests above.
+        let desired = DesiredState::derive_from_watched_tags([(
+            "other-app".to_string(),
+            "dev".to_string(),
+            "sha256:new".to_string(),
+        )]);
+
+        let frames = desired.reconcile(&hello(""));
+
+        let HostFrame::Sync { service, .. } = &frames[0];
+        assert_eq!(service.as_deref(), None);
+    }
+
+    #[test]
+    fn a_frame_without_a_service_omits_the_key_on_the_wire() {
+        // `skip_serializing_if` keeps the frame byte-identical to what older
+        // devices already parse, so shipping this host does not require every
+        // device to be upgraded first.
+        let frame = HostFrame::Sync {
+            image: "my-app".to_string(),
+            tag: "dev".to_string(),
+            digest: "sha256:new".to_string(),
+            service: None,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(!json.contains("service"), "{json}");
+    }
+
+    #[test]
+    fn a_device_status_report_is_surfaced_and_sanitized() {
+        // Dropping Status silently meant a device could report sync_failed and
+        // nothing appeared anywhere on the host: Hello is re-sent only on
+        // reconnect, so a healthy link showed the device synced at the old digest
+        // with the only evidence in the device journal.
+        let message = device_status_message(&Status {
+            device_id: "dev-1".to_string(),
+            state: "sync_failed".to_string(),
+            detail: Some("my-app:dev @ sha256:new: boom".to_string()),
+        });
+        assert!(message.contains("dev-1"), "{message}");
+        assert!(message.contains("sync_failed"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+
+        // Device-supplied text reaches a bare println! with an ANSI prefix, so a
+        // device holding the read token could otherwise overwrite its own failure
+        // line with a forged success one.
+        let forged = device_status_message(&Status {
+            device_id: "\x1b[2K\rdev-1".to_string(),
+            state: "sync_failed".to_string(),
+            detail: None,
+        });
+        assert!(
+            !forged.contains('\x1b') && !forged.contains('\r'),
+            "control characters must not survive: {forged:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_token_report_names_the_remedy() {
+        // needs_rebootstrap has no renewal endpoint - the operator must re-run
+        // `up` - so the generic "reports <state>" line would leave them stuck.
+        let message = device_status_message(&Status {
+            device_id: "dev-1".to_string(),
+            state: "needs_rebootstrap".to_string(),
+            detail: None,
+        });
+        assert!(
+            message.contains("avocado container dev up"),
+            "the only remedy must be named: {message}"
+        );
+    }
 
     fn hello(running_digest: &str) -> Hello {
         Hello {
@@ -678,6 +913,7 @@ mod tests {
             image: "my-app".to_string(),
             tag: "dev".to_string(),
             digest: "sha256:abc".to_string(),
+            service: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         // The wire form is tagged and carries a digest *reference*, never bytes.
@@ -698,6 +934,7 @@ mod tests {
             image: "a".into(),
             tag: "b".into(),
             digest: "sha256:c".into(),
+            service: None,
         };
         match frame {
             HostFrame::Sync { .. } => {}
@@ -788,6 +1025,7 @@ mod tests {
                 image: "my-app".to_string(),
                 tag: "dev".to_string(),
                 digest: "sha256:new".to_string(),
+                service: None,
             }],
             "a stale running_digest must produce a reconcile sync to the desired digest"
         );
@@ -935,6 +1173,7 @@ mod tests {
                 image: "my-app".to_string(),
                 tag: "dev".to_string(),
                 digest: "sha256:new".to_string(),
+                service: None,
             },
             "a reconnect with a stale running_digest must reconcile to the desired digest"
         );
@@ -1008,6 +1247,7 @@ mod tests {
                 image: "my-app".to_string(),
                 tag: "dev".to_string(),
                 digest: "sha256:fresh".to_string(),
+                service: None,
             }
         );
     }
@@ -1112,6 +1352,7 @@ mod tests {
             image: "my-app".to_string(),
             tag: "dev".to_string(),
             digest: "sha256:amd64only".to_string(),
+            service: None,
         };
         assert!(
             !server.frame_suits_device(&frame, Some(&DeviceArch::parse("aarch64"))),
@@ -1175,6 +1416,7 @@ mod tests {
             image: "my-app".to_string(),
             tag: "dev".to_string(),
             digest: "sha256:amd64only".to_string(),
+            service: None,
         };
 
         assert!(
@@ -1206,6 +1448,7 @@ mod tests {
             image: "my-app".to_string(),
             tag: "dev".to_string(),
             digest: "sha256:unprobed".to_string(),
+            service: None,
         };
         assert!(server.frame_suits_device(&frame, Some(&DeviceArch::parse("aarch64"))));
     }
@@ -1361,6 +1604,7 @@ mod tests {
                 image: "my-app".to_string(),
                 tag: "dev".to_string(),
                 digest: "sha256:new".to_string(),
+                service: None,
             },
             "a stale hello over the pinned-CA TLS control WS must reconcile to the desired digest"
         );
