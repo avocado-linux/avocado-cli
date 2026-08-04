@@ -320,12 +320,7 @@ impl DesiredState {
 /// `sync_failed` and `needs_rebootstrap` are the two the device raises today;
 /// anything else is printed verbatim rather than dropped, so a new device-side
 /// state is visible before the host learns to special-case it.
-fn report_device_status(status: &Status) {
-    print_warning(&device_status_message(status), OutputLevel::Normal);
-}
-
-/// The operator-facing text for a device `Status`, split out so it is assertable
-/// without capturing stdout.
+/// The operator-facing text for a device `Status`.
 fn device_status_message(status: &Status) -> String {
     let device = sanitize_device_text(&status.device_id);
     let state = sanitize_device_text(&status.state);
@@ -404,7 +399,18 @@ pub struct ControlServer {
     /// `None` only in unit tests that assert fan-out and reconciliation without a
     /// registry; production (`container dev up`) always supplies it.
     store: Option<Arc<BlobStore>>,
+    /// Where a device `Status` report goes.
+    ///
+    /// Injectable purely so the WIRING is testable: a test that calls
+    /// `device_status_message` directly proves the wording and nothing else, so
+    /// re-dropping the `Status` arm in `on_device_message` would leave it green -
+    /// the same defect this PR is fixing elsewhere. Production always passes
+    /// `print_warning`.
+    reporter: Reporter,
 }
+
+/// Sink for operator-facing device reports; see [`ControlServer::reporter`].
+type Reporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl ControlServer {
     /// Build a server over `read_token`, the up-time `desired` state, and the
@@ -426,7 +432,18 @@ impl ControlServer {
             image_arches,
             tx,
             store,
+            reporter: Arc::new(|message| print_warning(message, OutputLevel::Normal)),
         })
+    }
+
+    /// Replace the device-report sink. Test-only; see [`Self::reporter`].
+    #[cfg(test)]
+    fn with_reporter(self: Arc<Self>, reporter: Reporter) -> Arc<Self> {
+        let Ok(mut server) = Arc::try_unwrap(self) else {
+            panic!("with_reporter must be called while the Arc is still sole-owned");
+        };
+        server.reporter = reporter;
+        Arc::new(server)
     }
 
     /// Serve control-WS connections on `listener`, terminating TLS with
@@ -671,7 +688,7 @@ impl ControlServer {
             // showed a device synced at the old digest with no error surface at
             // all, and the only evidence lived in the device journal.
             DeviceFrame::Status(status) => {
-                report_device_status(&status);
+                (self.reporter)(&device_status_message(&status));
                 None
             }
             // Progress is informational and high-frequency; printing every one
@@ -851,6 +868,76 @@ mod tests {
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(!json.contains("service"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_status_frame_reaches_the_operator_through_on_device_message() {
+        // The WIRING, not the wording. Re-dropping the `Status` arm in
+        // `on_device_message` leaves every assertion on `device_status_message`
+        // green while the host goes back to swallowing the report - which is the
+        // exact defect being fixed. Nothing but observing the sink catches it.
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = ControlServer::new(
+            ReadToken::new(READ_TOKEN),
+            DesiredState::default(),
+            HelloArchBook::new(),
+            ImageArchBook::new(),
+            None,
+        )
+        .with_reporter({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |message: &str| seen.lock().unwrap().push(message.to_string()))
+        });
+
+        let frame = DeviceFrame::Status(Status {
+            device_id: "dev-1".to_string(),
+            state: "sync_failed".to_string(),
+            detail: Some("my-app:dev @ sha256:new: boom".to_string()),
+        });
+        let text = serde_json::to_string(&frame).unwrap();
+
+        let response = server.on_device_message(&Message::Text(text.into()));
+
+        assert!(
+            response.is_none(),
+            "a report needs no host response, only to be surfaced"
+        );
+        let reports = seen.lock().unwrap().clone();
+        assert_eq!(reports.len(), 1, "exactly one report: {reports:?}");
+        assert!(reports[0].contains("sync_failed"), "{:?}", reports[0]);
+        assert!(reports[0].contains("boom"), "{:?}", reports[0]);
+    }
+
+    #[tokio::test]
+    async fn a_progress_frame_is_not_reported() {
+        // The mirror: Progress is high-frequency and would bury the Status lines.
+        // Without this, a reporter wired to every device frame would pass above.
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = ControlServer::new(
+            ReadToken::new(READ_TOKEN),
+            DesiredState::default(),
+            HelloArchBook::new(),
+            ImageArchBook::new(),
+            None,
+        )
+        .with_reporter({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |message: &str| seen.lock().unwrap().push(message.to_string()))
+        });
+
+        let frame = DeviceFrame::Progress(Progress {
+            image: "my-app:dev".to_string(),
+            bytes_pulled: 4096,
+        });
+        let text = serde_json::to_string(&frame).unwrap();
+
+        server.on_device_message(&Message::Text(text.into()));
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "progress must stay silent: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     #[test]

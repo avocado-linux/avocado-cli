@@ -405,10 +405,7 @@ impl DevUpCommand {
         // both land on. Keying by the raw config `ref` instead would miss for any
         // entry written as `localhost/my-app:dev`.
         let mut desired = DesiredState::default();
-        desired.set_services(ctx.dev.images.iter().map(|image| {
-            let (repo, tag) = image_ref::split(&image.image_ref);
-            ((repo, tag), image.service.clone())
-        }));
+        desired.set_services(service_map(&ctx.dev.images));
         let control = ControlServer::new(
             read_token.clone(),
             desired,
@@ -1030,6 +1027,31 @@ fn write_session_state(path: &std::path::Path, state: &SessionState) -> Result<(
     Ok(())
 }
 
+/// The `(image, tag) -> owning unit` map for a project's watched images.
+///
+/// Keyed through `image_ref::split`, which strips any registry prefix and
+/// defaults the tag - the same derivation `build_push_plan`'s retag and
+/// `notify`'s own key both land on. Keying by the raw config `ref` instead looks
+/// correct and silently misses for an entry written `localhost/my-app:dev`, and a
+/// missed lookup is indistinguishable from "no service declared": the device
+/// falls back to restarting the container, which is the no-op sending the unit
+/// exists to end.
+///
+/// A function rather than an inline closure at the call site so that agreement
+/// has a test. Inline, the only test possible was one that re-derived the key
+/// itself and so passed with the production keying broken.
+fn service_map(
+    images: &[crate::utils::container_dev::config::ContainerDevImage],
+) -> Vec<((String, String), String)> {
+    images
+        .iter()
+        .map(|image| {
+            let (repo, tag) = image_ref::split(&image.image_ref);
+            ((repo, tag), image.service.clone())
+        })
+        .collect()
+}
+
 /// Rewrite the published record with `watcher_running: false`.
 ///
 /// Read-modify-write rather than reconstructing the record, so the pid and
@@ -1256,6 +1278,44 @@ mod tests {
                 devices: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn the_service_map_is_keyed_the_way_the_push_path_keys_it() {
+        // The mutation this exists for: keying by the raw config `ref` passes
+        // any test that derives the key itself, and silently misses in production
+        // for a registry-prefixed entry - which reads as "no service declared"
+        // and falls back to the container restart that never adopts the image.
+        use crate::utils::container_dev::config::ContainerDevImage;
+
+        let images = vec![
+            ContainerDevImage {
+                image_ref: "localhost/my-app:dev".to_string(),
+                service: "app.service".to_string(),
+            },
+            ContainerDevImage {
+                image_ref: "sidecar".to_string(),
+                service: "sidecar.service".to_string(),
+            },
+        ];
+
+        let map = service_map(&images);
+
+        assert_eq!(
+            map,
+            vec![
+                (
+                    ("my-app".to_string(), "dev".to_string()),
+                    "app.service".to_string()
+                ),
+                (
+                    ("sidecar".to_string(), "latest".to_string()),
+                    "sidecar.service".to_string()
+                ),
+            ],
+            "the registry prefix must be stripped and a missing tag defaulted, \
+             matching what the frame carries"
+        );
     }
 
     #[test]
