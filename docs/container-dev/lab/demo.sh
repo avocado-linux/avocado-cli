@@ -5,6 +5,7 @@
 #   demo.sh setup             boot the lab VM (delegates to setup-lab.sh)
 #   demo.sh verify            run the Part A push-path verify (8 checks)
 #   demo.sh app [version]     build the demo app on the TARGET engine + install its unit
+#   demo.sh seed              ship what the host holds; reads the version off the image
 #   demo.sh up                start `container dev up`, backgrounded
 #   demo.sh agent             (re)start the device agent on the target
 #   demo.sh reload [version]  rebuild only, then wait for the hot reload to land
@@ -193,6 +194,11 @@ write_ctx() {
 FROM busybox:latest
 RUN yes avocado | head -c 524288 > /base.bin
 RUN printf '$version\\n' > /version
+# Same version as a label so \`seed\` can read it with \`image inspect\`, which does
+# not execute the image. A cross-arch build (TARGET_PLATFORM) is not runnable on
+# the build host unless binfmt is registered there, so reading /version by running
+# the image would break the very flow this lab advertises.
+LABEL org.avocado.demo.version="$version"
 CMD ["sh","-c","while true; do echo \\"app \$(cat /version) base=\$(wc -c </base.bin)B running-on=\$(hostname) image=$TEST_IMAGE\\"; sleep 2; done"]
 EOF
 }
@@ -359,7 +365,7 @@ EOF
     local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
     ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
     case "$line" in
-      *"$version"*) printf '   %-11s %s\n' "result" "baseline $version confirmed on the target" ;;
+      "app $version "*) printf '   %-11s %s\n' "result" "baseline $version confirmed on the target" ;;
       *) die "app is not reporting '$version' - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
     esac
   else
@@ -383,18 +389,41 @@ cmd_seed() {
   # `seed v1` after a `reload v2` failed with "app is not reporting 'v1'" while
   # delivery had in fact worked perfectly. The version is a property of the
   # artifact, so read it out of the artifact instead.
-  [ $# -gt 0 ] && printf '   %-11s %s\n' "note" "ignoring '$1' - seed ships what the host holds and reads the version from it"
+  # Gate first, then note. Printing the note before the session check emitted a
+  # contextless line and then died, so `demo.sh seed v1` with no session led with
+  # advice about an argument instead of the actual problem.
   session_running || die "no session - run '$0 up' first"
+  local ignored="${1:-}"
 
+  # Read the version from the image's LABEL, not by running the image. `seed` is a
+  # ship-only step and must stay build-only: with TARGET_PLATFORM set the image is
+  # a foreign architecture, and a `docker-container` buildx driver carries its
+  # emulation inside the builder - so `demo.sh app v1` succeeds while `docker run`
+  # of that same image fails "exec format error" unless binfmt/qemu-user happens to
+  # be registered on the host. `image inspect` never executes anything, is cheaper,
+  # and works over the forwarded socket in MODE=vm.
   local want
-  want="$(build_engine run --rm --entrypoint cat "$TEST_IMAGE" /version 2>/dev/null | tr -d '\r\n')"
-  [ -n "$want" ] || die "cannot read /version out of $TEST_IMAGE on the build engine - run '$0 app <version>' first"
+  want="$(build_engine image inspect --format '{{index .Config.Labels "org.avocado.demo.version"}}' "$TEST_IMAGE" 2>/dev/null | tr -d '\r\n')"
+  # Both empty and the literal `<no value>` mean "no such label". Measured on docker
+  # 29.7.1: a missing key yields EMPTY, whether or not the image carries other
+  # labels, and an absent image exits non-zero with empty stdout - so the empty arm
+  # is the one that fires here. `<no value>` is text/template's older output for a
+  # missing map key; it is kept because this script deliberately supports daemons
+  # back to 20.10 (see the builder-version gate in build_image), and it is NOT
+  # verified on one. Do not drop it on the strength of a 29.x run alone.
+  case "$want" in
+    ''|'<no value>')
+      die "$TEST_IMAGE on the build engine carries no org.avocado.demo.version label - rebuild it with '$0 app <version>'" ;;
+  esac
 
   ctx "SEED the target with the baseline image" \
     "runs on|this workstation, then the target pulls" \
     "shipping|$TEST_IMAGE containing version $want" \
     "path|host build -> write listener $(write_endpoint) -> control WS -> agent pulls by digest -> $APP_SERVICE" \
     "why|native mode builds HERE, so the target has no image until the loop ships one"
+  if [ -n "$ignored" ]; then
+    printf '   %-11s %s\n' "note" "ignoring '$ignored' - seed ships what the host holds and reads the version off the image"
+  fi
 
   ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
     || die "container dev sync failed - is a session up? ($0 up)"
@@ -417,10 +446,14 @@ cmd_seed() {
   ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
   # Still a real check even though the image IDs already match: it is the
   # difference between the image having landed and the SERVICE having adopted it.
-  # The expectation comes from the shipped artifact, so it cannot disagree with
-  # what was actually sent.
+  #
+  # Anchor on the leading `app <version> ` field rather than substring-matching the
+  # whole line. write_ctx puts `image=$TEST_IMAGE` into the same line, so a bare
+  # `*"$want"*` passes whenever the version is a substring of the image ref - and
+  # TEST_IMAGE defaults to my-app:dev, so `want=dev` matched unconditionally. It
+  # also let a prefix satisfy its own extension (v1 accepted while v10 ran).
   case "$line" in
-    *"$want"*) printf '   %-11s %s\n' "result" "$want delivered over the loop and running on the target" ;;
+    "app $want "*) printf '   %-11s %s\n' "result" "$want delivered over the loop and running on the target" ;;
     *) die "the target holds the host's image but its container still reports something else - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
   esac
 }
@@ -460,7 +493,14 @@ cmd_up() {
   # --fork makes setsid fork unconditionally, so the session is reparented away and
   # is never a job of this shell. Redirecting all three streams is still required:
   # an inherited stdout would keep the caller's pipe open on its own.
-  ( cd "$SCRIPT_DIR" && setsid --fork "$AVOCADO_BIN" container dev up >"$UP_LOG" 2>&1 </dev/null )
+  # `${AVOCADO_BIN:-avocado}`, matching every other call site. Bare "$AVOCADO_BIN"
+  # was an unbound variable under `set -u` whenever $LAB/env.sh was absent (its
+  # source above is `[ -f ]`-guarded), and bash aborts the subshell BEFORE
+  # performing the >"$UP_LOG" redirection - so the log kept a PREVIOUS session's
+  # contents, and the `bulk listener` grep below then passed for a session that
+  # never started. Verified: the redirect does not run, and with no `set -e` the
+  # failing subshell does not stop the script either.
+  ( cd "$SCRIPT_DIR" && setsid --fork "${AVOCADO_BIN:-avocado}" container dev up >"$UP_LOG" 2>&1 </dev/null )
   sleep 15
   grep -qE "bulk listener" "$UP_LOG" || { tail -5 "$UP_LOG"; die "session did not come up - see $UP_LOG"; }
   sed -e 's/^/   /' <(tail -2 "$UP_LOG")
@@ -514,7 +554,7 @@ cmd_reload() {
   for _ in $(seq 1 30); do
     sleep 2; printf '.'
     line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
-    case "$line" in *"$version"*) break ;; esac
+    case "$line" in "app $version "*) break ;; esac
   done
   printf '\n'
 
@@ -523,7 +563,7 @@ cmd_reload() {
     "after|$line" \
     "pushes|$(count_in 'The push refers' "$UP_LOG") in $UP_LOG, $(count_in 'no basic auth credentials' "$UP_LOG") auth failures"
   case "$line" in
-    *"$version"*) printf '   %-11s %s\n' "result" "hot reload landed: the watcher moved the target to $version" ;;
+    "app $version "*) printf '   %-11s %s\n' "result" "hot reload landed: the watcher moved the target to $version" ;;
     *) die "no reload after 60s - check: $0 logs session ; $0 logs agent" ;;
   esac
 }
