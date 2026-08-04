@@ -411,6 +411,12 @@ cmd_seed() {
 
 cmd_up() {
   session_running && die "a session is already running - $0 down first"
+  # Clear the log BEFORE the header reads it. write_endpoint() parses the bound
+  # write port out of this file, and the session below truncates it on start - so
+  # on a second run the header was reporting the PREVIOUS session's port as though
+  # it were current. Truncating here makes write_endpoint fall back to saying no
+  # session has bound one yet, which is the truth at this point in the run.
+  : >"$UP_LOG"
   ctx "START the dev session" \
     "runs on|this workstation" \
     "serves|$(registry_endpoints)" \
