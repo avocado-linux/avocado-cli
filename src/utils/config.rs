@@ -2997,29 +2997,6 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
-    /// Merge a target-specific override into a base config value.
-    ///
-    /// Callers in ext lifecycle commands (build/clean/image/package) discover
-    /// the override section themselves (often via `find_ext_in_mapping`) and
-    /// pass it in alongside the base. The dispatcher path is preferred for
-    /// new code (handles `target-<name>:` and `kernel-<spec>:` uniformly), but
-    /// keeping this helper lets the explicit-override flow stay terse.
-    ///
-    /// We still funnel the base through `resolve_overrides_in_value` first to
-    /// strip any sibling `target-<other>:` / `kernel-<spec>:` / legacy bare-
-    /// target keys so they don't leak as content. `resolved_kver: None` keeps
-    /// kernel overrides stripped without applying them — the install paths
-    /// re-apply with `Some(kver)` after kernel resolution.
-    pub fn merge_target_override(
-        &self,
-        base: serde_yaml::Value,
-        target_override: serde_yaml::Value,
-        current_target: &str,
-    ) -> serde_yaml::Value {
-        let cleaned = self.resolve_overrides_in_value(base, current_target, None, "<override>");
-        self.merge_values(cleaned, target_override)
-    }
-
     /// Pull a top-level image section (`rootfs` / `initramfs` / `kernel`) out of
     /// a composed value and fold in its `target-<name>:` overrides for `target`.
     ///
@@ -3077,11 +3054,12 @@ impl Config {
     ///   3. `target-<name>:` match
     ///   4. `kernel-<spec>:` matches (in source order)
     ///
-    /// A matched `target-<name>:` (and legacy bare-target) block is resolved
-    /// RECURSIVELY with the same target + resolved kernel before being merged,
-    /// so override keys nested inside it — notably `kernel-<spec>:` — compose
-    /// (per-board × per-kernel). Without this a nested `kernel-<spec>:` would
-    /// leak through as a literal key instead of being applied/stripped.
+    /// Every matched block — `target-<name>:`, legacy bare-target, and
+    /// `kernel-<spec>:` alike — is resolved RECURSIVELY with the same target +
+    /// resolved kernel before being merged, so override keys nested inside it
+    /// compose in either direction (per-board × per-kernel). Without this a
+    /// nested override key would leak through as a literal key instead of being
+    /// applied/stripped, and the block it guards would be silently dropped.
     ///
     /// `section_path` is for diagnostic context only.
     pub fn resolve_overrides_in_value(
@@ -3179,6 +3157,10 @@ impl Config {
             merged = self.merge_values(merged, v);
         }
         for v in kernel_matches {
+            // Same recursion as the target blocks above: a matched kernel block
+            // may nest its own override keys (target-<name>:, or a narrower
+            // kernel-<spec>:), which must resolve rather than leak.
+            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
             merged = self.merge_values(merged, v);
         }
         merged
@@ -8259,6 +8241,86 @@ target-raspberrypi5:
         assert!(!pnone.contains_key("rpi-hevc-dec"));
         assert!(!pnone.contains_key("rpivid-hevc"));
         assert!(!pnone.contains_key("kernel-6.12.*"));
+    }
+
+    #[test]
+    fn test_nested_target_under_kernel_resolves() {
+        // The mirror of test_nested_kernel_under_target_resolves: a kernel-first
+        // layout, with per-board blocks NESTED inside the kernel block. Matched
+        // kernel blocks must recurse just like matched target blocks, otherwise
+        // the nested target- key leaks through as a literal package name and the
+        // board packages it guards are dropped.
+        let config =
+            Config::load_from_str("supported_targets: [\"raspberrypi4\", \"raspberrypi5\"]\n")
+                .unwrap();
+
+        let ext: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  common-pkg: '*'
+kernel-6.12.*:
+  packages:
+    kernel-pkg: '*'
+  target-raspberrypi5:
+    packages:
+      rpi5-only: '*'
+  target-raspberrypi4:
+    packages:
+      rpi4-only: '*'
+"#,
+        )
+        .unwrap();
+
+        // rpi5 on 6.12 -> base + kernel block + its nested rpi5 block.
+        let r = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi5",
+            Some("6.12.25"),
+            "extensions.avocado-bsp",
+        );
+        let pkgs = r
+            .get("packages")
+            .and_then(|p| p.as_mapping())
+            .expect("packages");
+        assert!(pkgs.contains_key("common-pkg"));
+        assert!(pkgs.contains_key("kernel-pkg"));
+        assert!(
+            pkgs.contains_key("rpi5-only"),
+            "target- block nested in a matched kernel- block was dropped"
+        );
+        assert!(!pkgs.contains_key("rpi4-only"));
+        // No override key leaks, at the section level or inside packages.
+        assert!(r.get("kernel-6.12.*").is_none());
+        assert!(
+            r.get("target-raspberrypi5").is_none(),
+            "target- key nested in a matched kernel- block leaked as content"
+        );
+        assert!(!pkgs.contains_key("target-raspberrypi5"));
+        assert!(!pkgs.contains_key("target-raspberrypi4"));
+
+        // Same kernel, other board -> the sibling nested block instead.
+        let r4 = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi4",
+            Some("6.12.25"),
+            "extensions.avocado-bsp",
+        );
+        let p4 = r4.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(p4.contains_key("rpi4-only"));
+        assert!(!p4.contains_key("rpi5-only"));
+
+        // Kernel doesn't match -> whole subtree discarded, nothing hoisted.
+        let rmiss = config.resolve_overrides_in_value(
+            ext,
+            "raspberrypi5",
+            Some("6.6.90"),
+            "extensions.avocado-bsp",
+        );
+        let pmiss = rmiss.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(pmiss.contains_key("common-pkg"));
+        assert!(!pmiss.contains_key("kernel-pkg"));
+        assert!(!pmiss.contains_key("rpi5-only"));
+        assert!(rmiss.get("kernel-6.12.*").is_none());
     }
 
     #[test]

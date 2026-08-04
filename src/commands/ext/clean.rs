@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::find_ext_in_mapping;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
@@ -130,21 +129,15 @@ impl ExtCleanCommand {
     ) -> Result<serde_yaml::Value> {
         match extension_location {
             ExtensionLocation::Remote { .. } => {
-                // Use the already-merged config from `parsed` which contains remote extension configs
-                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
-                let ext_section = find_ext_in_mapping(parsed, &self.extension, target);
-                if let Some(ext_val) = ext_section {
-                    let base_ext = ext_val.clone();
-                    // Check for target-specific override within this extension
-                    let target_override = ext_val.get(target).cloned();
-                    if let Some(override_val) = target_override {
-                        Ok(config.merge_target_override(base_ext, override_val, target))
-                    } else {
-                        Ok(base_ext)
-                    }
-                } else {
-                    Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
-                }
+                // Resolve the remote/path-sourced ext's config from the composed
+                // value, honoring its `target-<name>:` overrides — the same result
+                // the Local path gets via get_merged_ext_config. Shared with
+                // `ext build` / `ext image` / `ext package`. Absent extension keeps
+                // this command's empty-mapping fallback (clean is best-effort).
+                Ok(
+                    super::resolve_remote_ext_config(config, parsed, &self.extension, target)
+                        .unwrap_or_else(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new())),
+                )
             }
             ExtensionLocation::Local { config_path, .. } => config
                 .get_merged_ext_config(&self.extension, target, config_path)?
@@ -473,6 +466,84 @@ rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `target-<name>:` override on a remote/path-sourced extension must be
+    /// applied when resolving the config `clean_compile_dependencies` walks —
+    /// otherwise compile deps declared under a `target-<name>:` block are never
+    /// cleaned, and the key leaks through as literal content.
+    #[test]
+    fn test_target_prefix_override_applied_for_remote_ext() {
+        let cmd = ExtCleanCommand::new(
+            "kos-layer-boardconf".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+
+        let config =
+            Config::load_from_yaml_str("supported_targets: [qemux86-64, raspberrypi4]\n").unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  kos-layer-boardconf:
+    version: 2026.7.0
+    target-qemux86-64:
+      version: 2026.7.1
+    target-raspberrypi4:
+      version: 2026.7.2
+"#,
+        )
+        .unwrap();
+        let location = ExtensionLocation::Remote {
+            name: "kos-layer-boardconf".to_string(),
+            source: crate::utils::config::ExtensionSource::Path {
+                path: "extension-kabs/kos-layer-boardconf".to_string(),
+                include: None,
+            },
+        };
+
+        let resolved = cmd
+            .get_extension_config(&config, &parsed, &location, "qemux86-64")
+            .unwrap();
+
+        assert_eq!(
+            resolved.get("version").and_then(|v| v.as_str()),
+            Some("2026.7.1"),
+            "per-target override must be applied"
+        );
+        assert!(resolved.get("target-qemux86-64").is_none());
+        assert!(resolved.get("target-raspberrypi4").is_none());
+    }
+
+    /// Absent extension keeps this command's empty-mapping fallback rather than
+    /// erroring — clean is best-effort.
+    #[test]
+    fn test_missing_remote_ext_yields_empty_mapping() {
+        let cmd = ExtCleanCommand::new(
+            "does-not-exist".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load_from_yaml_str("supported_targets: [qemux86-64]\n").unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str("extensions: {}\n").unwrap();
+        let location = ExtensionLocation::Remote {
+            name: "does-not-exist".to_string(),
+            source: crate::utils::config::ExtensionSource::Path {
+                path: "nowhere".to_string(),
+                include: None,
+            },
+        };
+
+        let resolved = cmd
+            .get_extension_config(&config, &parsed, &location, "qemux86-64")
+            .unwrap();
+        assert!(resolved.as_mapping().is_some_and(|m| m.is_empty()));
+    }
 
     #[test]
     fn test_new() {
