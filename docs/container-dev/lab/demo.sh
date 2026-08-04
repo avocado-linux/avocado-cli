@@ -377,10 +377,22 @@ EOF
 # running agent, because the push goes to the host's write listener and only the
 # agent can pull it back down over the control WS.
 cmd_seed() {
-  local version="${1:-v1}"
+  # No version argument. It used to take one and assert it, but `seed` does not
+  # build - it ships whatever the host holds under the watched tag - so the
+  # argument was a claim about content that this step never established. Passing
+  # `seed v1` after a `reload v2` failed with "app is not reporting 'v1'" while
+  # delivery had in fact worked perfectly. The version is a property of the
+  # artifact, so read it out of the artifact instead.
+  [ $# -gt 0 ] && printf '   %-11s %s\n' "note" "ignoring '$1' - seed ships what the host holds and reads the version from it"
   session_running || die "no session - run '$0 up' first"
+
+  local want
+  want="$(build_engine run --rm --entrypoint cat "$TEST_IMAGE" /version 2>/dev/null | tr -d '\r\n')"
+  [ -n "$want" ] || die "cannot read /version out of $TEST_IMAGE on the build engine - run '$0 app <version>' first"
+
   ctx "SEED the target with the baseline image" \
     "runs on|this workstation, then the target pulls" \
+    "shipping|$TEST_IMAGE containing version $want" \
     "path|host build -> write listener $(write_endpoint) -> control WS -> agent pulls by digest -> $APP_SERVICE" \
     "why|native mode builds HERE, so the target has no image until the loop ships one"
 
@@ -403,9 +415,13 @@ cmd_seed() {
   sleep 4
   local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
   ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
+  # Still a real check even though the image IDs already match: it is the
+  # difference between the image having landed and the SERVICE having adopted it.
+  # The expectation comes from the shipped artifact, so it cannot disagree with
+  # what was actually sent.
   case "$line" in
-    *"$version"*) printf '   %-11s %s\n' "result" "baseline $version delivered over the loop and running" ;;
-    *) die "app is not reporting '$version' - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
+    *"$want"*) printf '   %-11s %s\n' "result" "$want delivered over the loop and running on the target" ;;
+    *) die "the target holds the host's image but its container still reports something else - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
   esac
 }
 
@@ -607,7 +623,8 @@ cmd_all() {
   cmd_app "$v1"
   cmd_up
   cmd_agent
-  cmd_seed "$v1"
+  # No version passed: seed reads it out of the image cmd_app just built.
+  cmd_seed
   cmd_reload "$v2"
   cmd_status
 }
