@@ -1,6 +1,20 @@
 use anyhow::{Context, Result};
 use semver::{Version, VersionReq};
 
+/// Validate an extension's `version`, naming the config file it came from.
+///
+/// The bare [`validate_semver`] message names the extension but not the file,
+/// which is little help when the value was merged in from a remote extension's
+/// own `avocado.yaml` several hops away.
+pub fn validate_ext_version(ext_name: &str, version: &str, source_path: &str) -> Result<()> {
+    validate_semver(version).with_context(|| {
+        format!(
+            "Extension '{ext_name}' has invalid version '{version}' (from {source_path}). \
+             Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')"
+        )
+    })
+}
+
 /// Validate semantic versioning format (X.Y.Z where X, Y, Z are non-negative integers).
 ///
 /// Accepts standard semver with optional pre-release and build metadata

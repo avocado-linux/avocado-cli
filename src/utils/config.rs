@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::utils::container_dev::config::ContainerDevConfig;
+use crate::utils::ext_source_reader::{DirOrigin, ExtSourceReader};
+use crate::utils::ext_version_source::{ExtFileReader, VersionSource};
 use crate::utils::kernel_version::KernelVersionSpec;
 use crate::utils::output::{print_warning, OutputLevel};
 
@@ -416,6 +418,17 @@ impl RuntimeExtDep {
     }
 }
 
+/// What [`Config::merge_installed_remote_extensions`] learned about each remote
+/// extension it merged.
+#[derive(Debug, Default)]
+struct RemoteExtensionMerge {
+    /// Extension name → the config file it was read from.
+    extension_sources: std::collections::HashMap<String, String>,
+    /// Extension name → a reader rooted at its source tree, for reading further
+    /// files out of it (e.g. a `version: { file, key }` provider's target).
+    ext_readers: std::collections::HashMap<String, ExtSourceReader>,
+}
+
 /// A composed configuration that merges the main config with external extension configs.
 ///
 /// This struct provides a unified view where:
@@ -439,6 +452,13 @@ pub struct ComposedConfig {
     /// Extensions from the main config will map to the main config path.
     /// Extensions from remote/external sources will map to their respective config paths.
     pub extension_sources: std::collections::HashMap<String, String>,
+    /// How each extension's `version` was derived, for those that used the
+    /// `version: { file, key }` form.
+    ///
+    /// Resolution overwrites the mapping in `merged_value` with the resolved
+    /// string, so this is the only remaining record that a version came from a
+    /// file. Packaging needs it to guarantee that file ships in the RPM payload.
+    pub ext_version_sources: std::collections::HashMap<String, VersionSource>,
 }
 
 impl ComposedConfig {
@@ -1554,10 +1574,24 @@ impl Config {
         )
         .with_context(|| "Failed to interpolate configuration values")?;
 
-        let base_section = match self.get_nested_section(&parsed, section_path) {
+        let mut base_section = match self.get_nested_section(&parsed, section_path) {
             Some(v) => v.clone(),
             None => return Ok(None),
         };
+
+        // This path re-reads the file directly rather than going through
+        // `load_composed`, so it has to resolve `version: { file, key }` itself.
+        // `ext package` reaches a *local* extension this way — miss it and an
+        // in-source extension packages with an unresolved mapping.
+        if let Some(ext_name) = section_path.strip_prefix("extensions.") {
+            let root = Path::new(config_path).parent().unwrap_or(Path::new("."));
+            let reader = ExtSourceReader::dir(root, DirOrigin::LocalConfig);
+            crate::utils::ext_version_source::resolve_in_ext_value(
+                &mut base_section,
+                ext_name,
+                &reader,
+            )?;
+        }
 
         // Apply target-merge and strip override sub-keys. kernel-merge is a
         // no-op here — get_merged_section runs without a resolved kernel
@@ -1647,11 +1681,23 @@ impl Config {
         // deserializer sees it.
         Self::merge_path_based_image_sections(&mut main_config, path)?;
 
+        // Readers rooted at each extension's source tree, used to resolve a
+        // `version: { file, key }` provider once everything is merged.
+        let mut ext_readers: HashMap<String, ExtSourceReader> = HashMap::new();
+        let main_config_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
         // Record extensions from the main config
         if let Some(ext_section) = main_config.get("extensions").and_then(|e| e.as_mapping()) {
             for (ext_key, _) in ext_section {
                 if let Some(ext_name) = ext_key.as_str() {
                     extension_sources.insert(ext_name.to_string(), config_path_str.clone());
+                    // An extension defined in place is rooted alongside the
+                    // config that defines it. A remote source overwrites this
+                    // below with a reader for the fetched tree.
+                    ext_readers.insert(
+                        ext_name.to_string(),
+                        ExtSourceReader::dir(main_config_dir.clone(), DirOrigin::LocalConfig),
+                    );
                 }
             }
         }
@@ -1659,9 +1705,9 @@ impl Config {
         // Discover and merge installed remote extension configs
         // Remote extensions are those with a 'source' field that have been fetched
         // to $AVOCADO_PREFIX/includes/<ext_name>/
-        let remote_ext_sources =
-            Self::merge_installed_remote_extensions(&mut main_config, path, target)?;
-        extension_sources.extend(remote_ext_sources);
+        let remote = Self::merge_installed_remote_extensions(&mut main_config, path, target)?;
+        extension_sources.extend(remote.extension_sources);
+        ext_readers.extend(remote.ext_readers);
 
         // Discover all external config references
         let external_refs = Self::discover_external_config_refs(&main_config);
@@ -1712,6 +1758,17 @@ impl Config {
             let resolved_path_str = resolved_path.to_string_lossy().to_string();
             extension_sources.insert(ext_name.clone(), resolved_path_str.clone());
 
+            // An extension pulled in by a legacy `config: <path>` ref is rooted
+            // beside that file, not beside the main config.
+            let external_dir = resolved_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            ext_readers.insert(
+                ext_name.clone(),
+                ExtSourceReader::dir(external_dir.clone(), DirOrigin::LocalConfig),
+            );
+
             // Also record any extensions defined within this external config
             if let Some(nested_ext_section) = external_config
                 .get("extensions")
@@ -1721,10 +1778,29 @@ impl Config {
                     if let Some(nested_ext_name) = nested_ext_key.as_str() {
                         extension_sources
                             .insert(nested_ext_name.to_string(), resolved_path_str.clone());
+                        ext_readers.insert(
+                            nested_ext_name.to_string(),
+                            ExtSourceReader::dir(external_dir.clone(), DirOrigin::LocalConfig),
+                        );
                     }
                 }
             }
         }
+
+        // Resolve `version: { file, key }` providers before the final
+        // interpolation pass, so every downstream consumer sees `version` as a
+        // plain string exactly as if it had been written literally.
+        let readers: HashMap<String, Box<dyn ExtFileReader>> = ext_readers
+            .iter()
+            .map(|(name, reader)| {
+                (
+                    name.clone(),
+                    Box::new(reader.clone()) as Box<dyn ExtFileReader>,
+                )
+            })
+            .collect();
+        let ext_version_sources =
+            crate::utils::ext_version_source::resolve_in_config(&mut main_config, &readers)?;
 
         // Apply interpolation to the composed model
         crate::utils::interpolation::interpolate_config(&mut main_config, target, cli_target_board)
@@ -1745,6 +1821,7 @@ impl Config {
             merged_value: main_config,
             config_path: config_path_str,
             extension_sources,
+            ext_version_sources,
         })
     }
 
@@ -1896,13 +1973,17 @@ impl Config {
     /// For each extension with a `source` field that has been installed to
     /// `$AVOCADO_PREFIX/includes/<ext_name>/`, load and merge its avocado.yaml
     ///
-    /// Returns a HashMap mapping extension names to their source config file paths.
+    /// Returns the source config path for each extension, plus the reader that
+    /// found it — the reader is kept so a `version: { file, key }` provider can
+    /// later read the version file out of the very same tree.
     fn merge_installed_remote_extensions(
         main_config: &mut serde_yaml::Value,
         config_path: &Path,
         target: Option<&str>,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<RemoteExtensionMerge> {
         let mut extension_sources: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut ext_readers: std::collections::HashMap<String, ExtSourceReader> =
             std::collections::HashMap::new();
 
         // Get the src_dir and target to find the extensions directory
@@ -1939,7 +2020,7 @@ impl Config {
             Some(t) => t,
             None => {
                 // No target available - can't locate extensions, skip merging
-                return Ok(extension_sources);
+                return Ok(RemoteExtensionMerge::default());
             }
         };
 
@@ -1949,7 +2030,7 @@ impl Config {
         let remote_extensions = Self::discover_remote_extensions_from_value(main_config)?;
 
         if remote_extensions.is_empty() {
-            return Ok(extension_sources);
+            return Ok(RemoteExtensionMerge::default());
         }
 
         // Get src_dir for loading volume state
@@ -1975,217 +2056,27 @@ impl Config {
             );
         }
 
-        // For each remote extension, try to read its config
+        // For each remote extension, locate its source tree and read its config.
+        // `ExtSourceReader` owns the strategy ladder (host source path, in-container
+        // includes dir, SDK volume, dev fallback); the reader it hands back is kept
+        // so a `version: { file, key }` provider can read the version file out of
+        // that same tree later, by that same route.
         for (ext_name, source) in remote_extensions {
-            // For a `type: path` source, resolve its host dir directly from the
-            // config declaration (relative to src_dir) — the config is the
-            // source of truth, so no separate state file is consulted.
-            let path_source_dir: Option<PathBuf> = match &source {
-                ExtensionSource::Path { path, .. } => {
-                    let p = if Path::new(path).is_absolute() {
-                        PathBuf::from(path)
-                    } else {
-                        src_dir.join(path)
-                    };
-                    Some(p.canonicalize().unwrap_or(p))
-                }
-                _ => None,
+            let Some(discovered) = ExtSourceReader::discover(
+                &ext_name,
+                &source,
+                &src_dir,
+                &resolved_target,
+                volume_state.as_ref(),
+                verbose,
+            ) else {
+                // Not fetched yet (or unreadable). Skip it — the missing
+                // definition surfaces later with a better diagnostic.
+                continue;
             };
-
-            // Try multiple methods to read the extension config:
-            // 0. Path-based extension: read directly from source path (for source: { type: path })
-            // 1. Direct container path (when running inside a container)
-            // 2. Via container command (when running on host)
-            // 3. Local fallback path (for development)
-
-            let ext_content = {
-                // Method 0: path-based extension (source: { type: path }) — read
-                // its config directly from the declared source path on the host.
-                if let Some(ref source_path) = path_source_dir {
-                    let config_path_yaml = source_path.join("avocado.yaml");
-                    let config_path_yml = source_path.join("avocado.yml");
-
-                    if verbose {
-                        eprintln!(
-                            "[DEBUG] Extension '{}' is path-based, checking: {}",
-                            ext_name,
-                            config_path_yaml.display()
-                        );
-                    }
-
-                    if config_path_yaml.exists() {
-                        match fs::read_to_string(&config_path_yaml) {
-                            Ok(content) => {
-                                if verbose {
-                                    eprintln!(
-                                        "[DEBUG]   Read {} bytes from path-based source",
-                                        content.len()
-                                    );
-                                }
-                                content
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    eprintln!("[DEBUG]   Failed to read: {e}");
-                                }
-                                continue;
-                            }
-                        }
-                    } else if config_path_yml.exists() {
-                        match fs::read_to_string(&config_path_yml) {
-                            Ok(content) => {
-                                if verbose {
-                                    eprintln!(
-                                        "[DEBUG]   Read {} bytes from path-based source (.yml)",
-                                        content.len()
-                                    );
-                                }
-                                content
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    eprintln!("[DEBUG]   Failed to read: {e}");
-                                }
-                                continue;
-                            }
-                        }
-                    } else {
-                        if verbose {
-                            eprintln!(
-                                "[DEBUG]   Path-based source path has no avocado.yaml/yml: {}",
-                                source_path.display()
-                            );
-                        }
-                        continue;
-                    }
-                } else {
-                    // package/git — fall through to other methods
-                    "".to_string()
-                }
-            };
-
-            // If we got content from path-based source, skip other methods
-            let ext_content = if !ext_content.is_empty() {
-                ext_content
-            } else {
-                // Method 1: Check if we're inside a container and can read directly
-                // The standard container path is /opt/_avocado/<target>/includes/<ext>/avocado.yaml
-                let container_direct_path =
-                    format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml");
-                let container_path = Path::new(&container_direct_path);
-
-                if verbose {
-                    eprintln!(
-                        "[DEBUG] Checking for remote extension '{ext_name}' config at: {container_direct_path}"
-                    );
-                    eprintln!("[DEBUG]   Path exists: {}", container_path.exists());
-                }
-
-                if container_path.exists() {
-                    // We're inside a container, read directly
-                    match fs::read_to_string(container_path) {
-                        Ok(content) => {
-                            if verbose {
-                                eprintln!(
-                                    "[DEBUG]   Read {} bytes from container path",
-                                    content.len()
-                                );
-                            }
-                            content
-                        }
-                        Err(e) => {
-                            if verbose {
-                                eprintln!("[DEBUG]   Failed to read: {e}");
-                            }
-                            continue;
-                        }
-                    }
-                } else if let Some(vs) = &volume_state {
-                    // Method 2: Read directly from the Docker volume's host mountpoint.
-                    // This is fast and reliable — no throwaway container needed.
-                    // Falls back to Method 3 if the mountpoint isn't accessible (e.g. permission denied).
-                    let host_content =
-                        Self::get_volume_mountpoint_sync(vs)
-                            .ok()
-                            .and_then(|mountpoint| {
-                                let p = mountpoint
-                                    .join(&resolved_target)
-                                    .join("includes")
-                                    .join(&ext_name)
-                                    .join("avocado.yaml");
-                                if verbose {
-                                    eprintln!("[DEBUG]   Trying host volume path: {}", p.display());
-                                }
-                                fs::read_to_string(&p).ok()
-                            });
-
-                    if let Some(content) = host_content {
-                        if verbose {
-                            eprintln!(
-                                "[DEBUG]   Read {} bytes from host volume mountpoint",
-                                content.len()
-                            );
-                        }
-                        content
-                    } else {
-                        // Method 3: Fall back to spinning up a container to read from the volume.
-                        // Used when the host mountpoint isn't directly accessible.
-                        if verbose {
-                            eprintln!(
-                                "[DEBUG]   Host path not accessible, trying via container command (volume: {})",
-                                vs.volume_name
-                            );
-                        }
-                        match Self::read_extension_config_via_container(
-                            vs,
-                            &resolved_target,
-                            &ext_name,
-                        ) {
-                            Ok(content) => {
-                                if verbose {
-                                    eprintln!(
-                                        "[DEBUG]   Read {} bytes via container",
-                                        content.len()
-                                    );
-                                }
-                                content
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    eprintln!("[DEBUG]   Container read failed: {e}");
-                                }
-                                // Extension not installed yet or config not found, skip
-                                continue;
-                            }
-                        }
-                    }
-                } else {
-                    // Method 3: Fallback to local path (for development)
-                    let fallback_dir = src_dir
-                        .join(".avocado")
-                        .join(&resolved_target)
-                        .join("includes")
-                        .join(&ext_name);
-                    let config_path_local = fallback_dir.join("avocado.yaml");
-                    if verbose {
-                        eprintln!(
-                            "[DEBUG]   Trying fallback path: {}",
-                            config_path_local.display()
-                        );
-                    }
-                    if config_path_local.exists() {
-                        match fs::read_to_string(&config_path_local) {
-                            Ok(content) => content,
-                            Err(_) => continue,
-                        }
-                    } else {
-                        if verbose {
-                            eprintln!("[DEBUG]   No config found for '{ext_name}', skipping");
-                        }
-                        continue;
-                    }
-                }
-            };
+            let config_name = discovered.config_name;
+            let ext_content = discovered.config_content;
+            let reader = discovered.reader;
 
             // Use a .yaml extension so parse_config_value knows to parse as YAML
             let ext_config_path = format!("{ext_name}/avocado.yaml");
@@ -2228,24 +2119,14 @@ impl Config {
                 }
             };
 
-            // Record this extension's source path
-            // For path-based extensions, use the actual host path — recording
-            // the config file that actually exists (avocado.yml is a valid
-            // alternative to avocado.yaml) so downstream relative-path
-            // resolution reads the real file.
-            // For other remote extensions, use the container path.
-            let ext_config_path_str = if let Some(ref source_path) = path_source_dir {
-                let yml = source_path.join("avocado.yml");
-                let config_file = if yml.exists() {
-                    yml
-                } else {
-                    source_path.join("avocado.yaml")
-                };
-                config_file.to_string_lossy().to_string()
-            } else {
-                format!("/opt/_avocado/{resolved_target}/includes/{ext_name}/avocado.yaml")
-            };
+            // Record this extension's source path. The reader reports the real
+            // location of the config it actually read — the host path for a
+            // path-based extension (under its real name, since avocado.yml is a
+            // valid alternative), the container path otherwise — so downstream
+            // relative-path resolution reads the same file we did.
+            let ext_config_path_str = reader.config_path(&config_name);
             extension_sources.insert(ext_name.clone(), ext_config_path_str.clone());
+            ext_readers.insert(ext_name.clone(), reader.clone());
 
             // Also record any extensions defined within this remote extension's config
             if let Some(nested_ext_section) =
@@ -2255,6 +2136,9 @@ impl Config {
                     if let Some(nested_ext_name) = nested_ext_key.as_str() {
                         extension_sources
                             .insert(nested_ext_name.to_string(), ext_config_path_str.clone());
+                        // A nested extension ships inside the same tree, so it
+                        // resolves its version file through the same reader.
+                        ext_readers.insert(nested_ext_name.to_string(), reader.clone());
                     }
                 }
             }
@@ -2307,66 +2191,10 @@ impl Config {
             }
         }
 
-        Ok(extension_sources)
-    }
-
-    /// Read a remote extension's config file by running a container command.
-    ///
-    /// This runs a lightweight container to cat the extension's avocado.yaml from
-    /// the Docker volume, avoiding permission issues with direct host access.
-    fn read_extension_config_via_container(
-        volume_state: &crate::utils::volume::VolumeState,
-        target: &str,
-        ext_name: &str,
-    ) -> Result<String> {
-        // The extension config path inside the container
-        let container_config_path =
-            format!("/opt/_avocado/{target}/includes/{ext_name}/avocado.yaml");
-
-        // Run a minimal container to cat the config file
-        // We use busybox as a lightweight image, but fall back to alpine if needed
-        let images_to_try = [
-            "busybox:latest",
-            "alpine:latest",
-            "docker.io/library/busybox:latest",
-        ];
-
-        for image in &images_to_try {
-            let output = std::process::Command::new(&volume_state.container_tool)
-                .args([
-                    "run",
-                    "--rm",
-                    "-v",
-                    &format!("{}:/opt/_avocado:ro", volume_state.volume_name),
-                    image,
-                    "cat",
-                    &container_config_path,
-                ])
-                .output();
-
-            match output {
-                Ok(out) if out.status.success() => {
-                    let content = String::from_utf8_lossy(&out.stdout).to_string();
-                    if content.is_empty() {
-                        anyhow::bail!("Extension config file is empty");
-                    }
-                    return Ok(content);
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    // If file not found, bail immediately (no point trying other images)
-                    if stderr.contains("No such file") || stderr.contains("not found") {
-                        anyhow::bail!("Extension config not found: {container_config_path}");
-                    }
-                    // Otherwise, continue to try next image
-                }
-                Err(_) => {
-                    // Continue to try next image
-                }
-            }
-        }
-
-        anyhow::bail!("Failed to read extension config via container for '{ext_name}'")
+        Ok(RemoteExtensionMerge {
+            extension_sources,
+            ext_readers,
+        })
     }
 
     /// Discover all external config references in runtime and ext dependencies.
@@ -4572,7 +4400,9 @@ impl Config {
         // Try to load volume state and get the mountpoint
         if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_dir(&src_dir) {
             // Use synchronous Docker inspect to get the mountpoint
-            if let Ok(mountpoint) = Self::get_volume_mountpoint_sync(&volume_state) {
+            if let Ok(mountpoint) =
+                crate::utils::ext_source_reader::volume_mountpoint(&volume_state)
+            {
                 return mountpoint.join(target).join("includes");
             }
         }
@@ -4599,46 +4429,6 @@ impl Config {
     #[allow(dead_code)]
     pub fn get_extensions_container_path() -> &'static str {
         "$AVOCADO_PREFIX/includes"
-    }
-
-    /// Get the volume mountpoint synchronously (for use in non-async contexts)
-    fn get_volume_mountpoint_sync(
-        volume_state: &crate::utils::volume::VolumeState,
-    ) -> Result<PathBuf> {
-        let output = std::process::Command::new(&volume_state.container_tool)
-            .args([
-                "volume",
-                "inspect",
-                &volume_state.volume_name,
-                "--format",
-                "{{.Mountpoint}}",
-            ])
-            .output()
-            .with_context(|| {
-                format!(
-                    "Failed to inspect Docker volume '{}'",
-                    volume_state.volume_name
-                )
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "Failed to get mountpoint for volume '{}': {}",
-                volume_state.volume_name,
-                stderr
-            );
-        }
-
-        let mountpoint = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if mountpoint.is_empty() {
-            anyhow::bail!(
-                "Docker volume '{}' has no mountpoint",
-                volume_state.volume_name
-            );
-        }
-
-        Ok(PathBuf::from(mountpoint))
     }
 
     /// Check if a remote extension is already installed

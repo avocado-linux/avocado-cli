@@ -26,6 +26,40 @@ This is the one place a version is *not* the config's string, so it is confined 
 - A `-` *inside* a pre-release identifier (`1.0.0-rc-1`) is rejected rather than mapped: `~` is a precedence operator to RPM, so mapping it would invert ordering and dnf would refuse the upgrade. Use `.` to separate identifiers.
 
 So config remains the source of truth; the RPM form is a representation of it at one boundary, not a second version.
+### Version providers: reading the version from the source tree
+
+Some extensions wrap a program maintained in the same repo (avocado-cli, avocado-conn, avocado-rat) and want the extension version to track that program's version without a second place to bump. `version` therefore also accepts a mapping that names a file inside the **extension's own source tree**:
+
+```yaml
+extensions:
+  avocado-ext-cli:
+    version:
+      file: Cargo.toml        # relative to the extension root; no `..`, no absolute paths
+      key: package.version    # dot path; format inferred from the extension
+
+  some-other-ext:
+    version:
+      file: VERSION           # no `key` => whole file, trimmed
+```
+
+`key` is the discriminator. Absent means read the file and trim it, with no parsing and no format guessing — so `VERSION`, `version.txt`, and `.version` all work, and `file: Cargo.toml` with no `key` is a literal read (which then fails semver, as it should). Present means parse the file and navigate the dot path; `format` (`toml`/`json`/`yaml`) is inferred from the extension and can be set explicitly. Only the extension's direct-child `version:` supports the mapping form — a `target-*:`/`kernel-*:` override must use a literal.
+
+**Why a file and not `{{ env.VAR }}`.** These extensions previously declared `version: '{{ env.AVOCADO_EXT_VERSION }}'`, with CI reading Cargo.toml and exporting the variable. `version` is an *identity* field, but `env` binds it to the **caller's** environment — and the packaging job and a downstream consumer are by definition different environments. Consuming such an extension via `source: { type: git | path }` interpolated the version to `""` (a warning, not an error) and then failed semver validation, which is exactly the failure class listed in the Context above. A file inside the extension's own tree is present in every consumption mode — the working copy for `path`, the clone for `git`, the RPM payload for `package` — so the version is a pure function of the extension.
+
+`{{ avocado.* }}` and `{{ config.* }}` remain fine elsewhere in an extension config: those are consumer-context values that are *supposed* to differ per build. It is specifically `env` in an identity field that cannot work.
+
+**No baking, for providers.** The published `avocado.yaml` keeps the provider rather than a resolved literal: the RPM payload *is* the source tree, so the config resolves itself. `ext package` guarantees this by always adding the provider's file to the package payload, including when the extension declares an explicit `package_files` list.
+
+`config_edit::bake_extension_version` still exists for the legacy `{{ env.AVOCADO_EXT_VERSION }}` form, which genuinely cannot resolve downstream and must be baked. `ext package` skips the bake entirely for a provider-based extension — baking one would strand the provider's `file:`/`key:` lines under a replaced `version:` scalar (see `test_bake_extension_version_would_corrupt_a_provider_block`). The bake goes away once no extension uses the env form.
+
+### Rollout
+
+The provider cannot be adopted by an extension until a CLI that understands it has been *released*, because `setup-avocado-cli` installs `latest` and the release workflow for a program-tracking extension runs on the same tag that publishes the new CLI. Hence two steps:
+
+1. **This change** — the provider, the reader extraction, `config show --detail` reporting `version`. No extension migrates yet; `avocado-cli`, `avocado-conn`, and `avocado-rat` stay on `{{ env.AVOCADO_EXT_VERSION }}` and keep working through the bake.
+2. **After a CLI release carrying step 1** — migrate those three `avocado.yaml` files to `version: { file: Cargo.toml, key: package.version }`, drop `AVOCADO_EXT_VERSION` and the `ext-version` input from their workflows and from `avocado-linux/actions`, and delete the bake.
+
+**Compatibility, at step 2.** Publishing a provider-based extension is a payload format change. A CLI predating providers reads the mapping, coerces it to `"0"`, and fails with `invalid version '0'`. There is no graceful degradation: `cli_requirement` is a top-level field and is not merged from a remote extension's config, so an extension cannot declare a CLI floor a consumer will honor. Publish migrated extensions to `next` first and verify before promoting.
 
 ### Rename `distro.version` → `distro.release`
 
@@ -132,8 +166,11 @@ sdk:
 5. **Core packages use `"*"`** in `sdk/install.rs` — all four `get_distro_version()` calls replaced with `"*"`
 6. **Added `distro_release` to lock file** — `LockFile` struct, `check_distro_release_compat()` method, populated in sdk/ext/runtime install commands
 7. **Updated default config template** — `distro.release`, `"*"` for runtime and SDK packages
+8. **Version providers** — `version: { file, key }` in `src/utils/ext_version_source.rs`, resolved during composition (`load_composed_with_board`) and in `get_merged_section_with_board` (the path `ext package` takes for a local extension). Extracted the four-strategy extension-tree read ladder out of `config.rs` into `src/utils/ext_source_reader.rs` so the provider reads the version file by the same route the config was read. `get_package_files` always ships the provider's file; `ext package` skips the bake for provider-based extensions. `config show --detail` reports each extension's resolved `version`.
 
 ### Remaining (separate repos/PRs)
+
+0. **Adopt version providers** (after a CLI release carrying item 8): migrate `avocado-cli`, `avocado-conn`, `avocado-rat` to `version: { file: Cargo.toml, key: package.version }`; drop `AVOCADO_EXT_VERSION` / the `ext-version` input from their workflows and from `avocado-linux/actions`; have the reusable release workflow read the version via `avocado config show --detail --output json`; delete `bake_extension_version`. See Rollout above.
 
 8. **Tekton CI (iac repo)**: Remove `DISTRO_VERSION` param/env from build-extensions-machine.yaml; future rename of `distro-codename` param
 9. **avocado-os configs**: Remove `{{ avocado.distro.version }}` from extension versions, set concrete semver, change package specs to `"*"`, rename `distro.version` → `distro.release`
