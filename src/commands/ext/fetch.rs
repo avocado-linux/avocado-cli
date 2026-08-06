@@ -4,11 +4,12 @@
 //! and installs them to `$AVOCADO_PREFIX/includes/<ext_name>/`.
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::utils::config::{ComposedConfig, Config, ExtensionSource};
-use crate::utils::ext_fetch::ExtensionFetcher;
+use crate::utils::ext_fetch::{ExtensionFetcher, PackageFetchEntry};
 use crate::utils::lockfile::{ExtensionSourceLock, LockFile};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::target::resolve_target_required;
@@ -101,9 +102,19 @@ impl ExtFetchCommand {
             .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration"))?;
 
-        // Discover remote extensions (with target interpolation for extension names)
+        // Discover remote extensions from the **composed** value, not the raw
+        // consumer yaml. A dependency declared inside an already-fetched
+        // extension's own avocado.yaml only exists in the composed config;
+        // reading the raw file would make it permanently undiscoverable.
         let remote_extensions =
-            Config::discover_remote_extensions(&self.config_path, Some(&target))?;
+            Config::discover_remote_extensions_from_value(&composed.merged_value)?;
+
+        // Everything visible before we materialize anything. Later rounds fetch
+        // only what was *revealed* by a fetch, which is also what keeps a
+        // `--extension` filter meaningful: extensions the filter excluded were
+        // visible from the start and are never picked up by a later round.
+        let visible_at_start: HashSet<String> =
+            remote_extensions.iter().map(|(n, _)| n.clone()).collect();
 
         if remote_extensions.is_empty() {
             print_info(
@@ -187,93 +198,202 @@ impl ExtFetchCommand {
         let mut fetched_count = 0;
         let mut skipped_count = 0;
 
-        for (ext_name, source) in &extensions_to_fetch {
-            // Check if already installed
-            if !self.force && ExtensionFetcher::is_extension_installed(&extensions_dir, ext_name) {
-                if self.verbose {
-                    print_info(
+        // Materialization proceeds in rounds. Round 1 fetches what the config
+        // already shows; each later round picks up extensions that only became
+        // visible *because* of the previous round — a `git`/`path` dependency
+        // the depsolver cannot pull, or a sibling declaration merged in only
+        // once its parent's avocado.yaml became readable.
+        //
+        // In practice this settles in one round: package dependencies are
+        // resolved inside a single dnf transaction (see below), so there is
+        // usually nothing left to reveal.
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut round_targets = extensions_to_fetch;
+        let mut round = 0usize;
+
+        // Defensive bound. Termination is already guaranteed by `attempted`
+        // growing monotonically over a finite extension set; this only stops a
+        // pathological config from spinning.
+        const MAX_ROUNDS: usize = 10;
+
+        while !round_targets.is_empty() && round < MAX_ROUNDS {
+            round += 1;
+
+            // `--force` re-fetches what the user asked for, not extensions
+            // discovered on the way — those were just installed.
+            let force_this_round = self.force && round == 1;
+
+            // Package-source extensions are collected and installed in ONE dnf
+            // transaction rather than one container run each. That is what lets the
+            // depsolver pull in each package's `Requires: avocado-ext(<dep>)`
+            // closure — inter-extension dependencies are materialized by dnf, not
+            // by repeated fetch/recompose/discover rounds.
+            let mut package_batch: Vec<PackageFetchEntry> = Vec::new();
+
+            for (ext_name, source) in &round_targets {
+                if !attempted.insert(ext_name.clone()) {
+                    continue;
+                }
+                // Check if already installed
+                if !force_this_round
+                    && ExtensionFetcher::is_extension_installed(&extensions_dir, ext_name)
+                {
+                    if self.verbose {
+                        print_info(
                         &format!("Extension '{ext_name}' is already installed, skipping (use --force to re-fetch)"),
                         OutputLevel::Normal,
                     );
-                }
-                skipped_count += 1;
-                continue;
-            }
-
-            // For package-type sources, use locked version if available
-            let effective_source = if let ExtensionSource::Package {
-                version,
-                package,
-                repo_name,
-                include,
-            } = source
-            {
-                let effective_version = lock_file
-                    .get_extension_source(&target, ext_name)
-                    .and_then(|s| s.version.as_deref())
-                    .unwrap_or(version.as_str())
-                    .to_string();
-                ExtensionSource::Package {
-                    version: effective_version,
-                    package: package.clone(),
-                    repo_name: repo_name.clone(),
-                    include: include.clone(),
-                }
-            } else {
-                source.clone()
-            };
-
-            print_info(
-                &format!("Fetching extension '{ext_name}'..."),
-                OutputLevel::Normal,
-            );
-
-            match fetcher
-                .fetch(ext_name, &effective_source, &extensions_dir, self.force)
-                .await
-            {
-                Ok(install_path) => {
-                    print_success(
-                        &format!(
-                            "Successfully fetched extension '{ext_name}' to {}",
-                            install_path.display()
-                        ),
-                        OutputLevel::Normal,
-                    );
-
-                    // Record source metadata in lock file for package-type
-                    // extensions. Source metadata is intentionally global —
-                    // it describes "where this package came from" /
-                    // "what version anchors the build config," which is
-                    // a property of the fetch, not of any runtime that
-                    // later builds a sysroot from it. Runtime-scoping
-                    // applies to the built sysroots downstream, not to
-                    // source descriptors.
-                    if let ExtensionSource::Package {
-                        version, package, ..
-                    } = &effective_source
-                    {
-                        let pkg_name = package.as_deref().unwrap_or(ext_name).to_string();
-                        lock_file.set_extension_source(
-                            &target,
-                            ext_name,
-                            ExtensionSourceLock {
-                                source_type: "package".to_string(),
-                                package: Some(pkg_name),
-                                version: Some(version.clone()),
-                            },
-                        );
-                        lock_file_dirty = true;
                     }
-
-                    fetched_count += 1;
+                    skipped_count += 1;
+                    continue;
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to fetch extension '{ext_name}': {e}"
+
+                // For package-type sources, use locked version if available
+                let effective_source = if let ExtensionSource::Package {
+                    version,
+                    package,
+                    repo_name,
+                    include,
+                } = source
+                {
+                    let effective_version = lock_file
+                        .get_extension_source(&target, ext_name)
+                        .and_then(|s| s.version.as_deref())
+                        .unwrap_or(version.as_str())
+                        .to_string();
+                    ExtensionSource::Package {
+                        version: effective_version,
+                        package: package.clone(),
+                        repo_name: repo_name.clone(),
+                        include: include.clone(),
+                    }
+                } else {
+                    source.clone()
+                };
+
+                // Defer package sources to the batched transaction below; record
+                // their lock metadata now so the bookkeeping is identical either way.
+                if let ExtensionSource::Package {
+                    version,
+                    package,
+                    repo_name,
+                    ..
+                } = &effective_source
+                {
+                    let pkg_name = package.as_deref().unwrap_or(ext_name).to_string();
+                    package_batch.push(PackageFetchEntry::from_package_source(
+                        ext_name,
+                        package.as_deref(),
+                        version,
+                        repo_name.as_deref(),
                     ));
+                    lock_file.set_extension_source(
+                        &target,
+                        ext_name,
+                        ExtensionSourceLock {
+                            source_type: "package".to_string(),
+                            package: Some(pkg_name),
+                            version: Some(version.clone()),
+                        },
+                    );
+                    lock_file_dirty = true;
+                    fetched_count += 1;
+                    continue;
+                }
+
+                print_info(
+                    &format!("Fetching extension '{ext_name}'..."),
+                    OutputLevel::Normal,
+                );
+
+                match fetcher
+                    .fetch(ext_name, &effective_source, &extensions_dir, self.force)
+                    .await
+                {
+                    Ok(install_path) => {
+                        print_success(
+                            &format!(
+                                "Successfully fetched extension '{ext_name}' to {}",
+                                install_path.display()
+                            ),
+                            OutputLevel::Normal,
+                        );
+
+                        fetched_count += 1;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to fetch extension '{ext_name}': {e}"
+                        ));
+                    }
                 }
             }
+
+            // One transaction for every package-source extension. dnf resolves and
+            // installs any dependency extensions beyond those named here.
+            if !package_batch.is_empty() {
+                print_info(
+                    &format!(
+                        "Fetching {} package extension(s) and their dependencies...",
+                        package_batch.len()
+                    ),
+                    OutputLevel::Normal,
+                );
+                fetcher
+                    .fetch_packages(&package_batch, force_this_round)
+                    .await?;
+                print_success(
+                    &format!(
+                        "Successfully fetched {} package extension(s).",
+                        package_batch.len()
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+
+            // Recompose and see whether materializing the round revealed any
+            // remote extension that was not visible before we started.
+            let recomposed =
+                Config::load_composed(&self.config_path, Some(&target)).with_context(|| {
+                    format!(
+                        "Failed to reload config from {} after fetch",
+                        self.config_path
+                    )
+                })?;
+            round_targets =
+                Config::discover_remote_extensions_from_value(&recomposed.merged_value)?
+                    .into_iter()
+                    .filter(|(name, _)| {
+                        !visible_at_start.contains(name) && !attempted.contains(name)
+                    })
+                    .collect();
+
+            if !round_targets.is_empty() && self.verbose {
+                print_info(
+                    &format!(
+                        "Discovered {} additional remote extension(s) after fetching: {}",
+                        round_targets.len(),
+                        round_targets
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        if round >= MAX_ROUNDS && !round_targets.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Extension discovery did not settle after {MAX_ROUNDS} fetch rounds; \
+                 still pending: {}",
+                round_targets
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
 
         // Save lock file if we recorded any source metadata

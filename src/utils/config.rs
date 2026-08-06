@@ -1967,7 +1967,23 @@ impl Config {
         }
 
         // For each remote extension, try to read its config
-        for (ext_name, source) in remote_extensions {
+        // Worklist rather than a fixed list. The depsolver can install
+        // extensions the consumer never declared — `app-a` requiring
+        // `avocado-ext(weston-base)` lands weston-base in `includes/` on its
+        // own — and those arrive with no declaration anywhere in the config.
+        // Discovery driven purely by declarations would leave them physically
+        // present but invisible, so every `depends_on` seen while merging is
+        // queued and read from the installroot with the same machinery.
+        //
+        // Scoped to the dependency closure, not everything in `includes/`: a
+        // stale extension left on disk after being removed from the config
+        // must not resurrect itself.
+        let mut queue: std::collections::VecDeque<(String, ExtensionSource)> =
+            remote_extensions.into_iter().collect();
+        let mut queued: std::collections::HashSet<String> =
+            queue.iter().map(|(n, _)| n.clone()).collect();
+
+        while let Some((ext_name, source)) = queue.pop_front() {
             // For a `type: path` source, resolve its host dir directly from the
             // config declaration (relative to src_dir) — the config is the
             // source of truth, so no separate state file is consulted.
@@ -2218,6 +2234,50 @@ impl Config {
                     ));
                 }
             };
+
+            // Queue this extension's own `depends_on` targets. They may live in
+            // a different repo entirely, so they will not be found among its
+            // siblings — but if the depsolver installed them they are sitting
+            // in `includes/` and the next iteration reads them from there.
+            // A dependency that is not installed simply fails its read and is
+            // skipped; the resolver then reports it by name with the chain.
+            if let Some(this_ext) = ext_config
+                .get("extensions")
+                .and_then(|e| e.as_mapping())
+                .and_then(|m| m.get(serde_yaml::Value::String(ext_name.clone())))
+            {
+                for dep_name in crate::utils::ext_deps::dependency_names(this_ext) {
+                    if queued.contains(&dep_name) {
+                        continue;
+                    }
+                    // Already declared by the consumer — their declaration and
+                    // its own source win; nothing to discover.
+                    if main_config
+                        .get("extensions")
+                        .and_then(|e| e.as_mapping())
+                        .map(|m| Self::find_matching_ext_key(m, &dep_name).is_some())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if verbose {
+                        eprintln!(
+                            "[DEBUG] Queuing dependency '{dep_name}' of '{ext_name}' for discovery"
+                        );
+                    }
+                    queued.insert(dep_name.clone());
+                    // Version "*" — whatever the depsolver actually installed.
+                    queue.push_back((
+                        dep_name,
+                        ExtensionSource::Package {
+                            version: "*".to_string(),
+                            package: None,
+                            repo_name: None,
+                            include: None,
+                        },
+                    ));
+                }
+            }
 
             // Record this extension's source path
             // For path-based extensions, use the actual host path — recording
@@ -2490,6 +2550,67 @@ impl Config {
         }
     }
 
+    /// Pull in extension declarations that the just-merged extension
+    /// `depends_on`, when they are defined alongside it in the same external
+    /// config.
+    ///
+    /// A remote extension's `avocado.yaml` normally declares both itself and
+    /// the platform bases it binds to:
+    ///
+    /// ```yaml
+    /// extensions:
+    ///   app-a:
+    ///     depends_on: [weston-base]
+    ///   weston-base:
+    ///     source: { type: package, version: "1.2.0" }
+    /// ```
+    ///
+    /// [`Self::merge_external_config`] otherwise merges *only*
+    /// `extensions.app-a`, so `weston-base` would never appear in the composed
+    /// config — never be discovered as a remote extension, never be fetched,
+    /// and the dependency would be unresolvable no matter how many times
+    /// `avocado ext fetch` runs.
+    ///
+    /// Scoped deliberately to the `depends_on` closure rather than every
+    /// sibling: a remote repo may define a whole catalog of extensions, and
+    /// dumping all of them into the consumer's namespace would be a surprising
+    /// side effect of depending on one. Consumer declarations always win — an
+    /// extension already present in the main config is left untouched, so the
+    /// author keeps the final say on version and source.
+    fn merge_external_dependency_declarations(
+        main_ext_map: &mut serde_yaml::Mapping,
+        external_ext: &serde_yaml::Mapping,
+        root_ext_value: &serde_yaml::Value,
+    ) {
+        let mut queue: Vec<String> = crate::utils::ext_deps::dependency_names(root_ext_value);
+        let mut visited: std::collections::HashSet<String> = queue.iter().cloned().collect();
+
+        while let Some(dep_name) = queue.pop() {
+            // The dependency name and the sibling key come from the same file,
+            // so any `{{ … }}` templating is textually identical on both sides
+            // and a direct key match is sufficient — no interpolation needed.
+            let dep_key = serde_yaml::Value::String(dep_name.clone());
+            let Some(dep_value) = external_ext.get(&dep_key) else {
+                continue;
+            };
+
+            // Already declared by the consumer (possibly under a template
+            // key) — their declaration wins, and its own dependencies will be
+            // resolved from wherever they declared it.
+            if Self::find_matching_ext_key(main_ext_map, &dep_name).is_some() {
+                continue;
+            }
+
+            for next in crate::utils::ext_deps::dependency_names(dep_value) {
+                if visited.insert(next.clone()) {
+                    queue.push(next);
+                }
+            }
+
+            main_ext_map.insert(dep_key, dep_value.clone());
+        }
+    }
+
     /// Merge an external config into the main config.
     ///
     /// Always merges:
@@ -2571,6 +2692,8 @@ impl Config {
                     });
 
                 if let Some(ext_value) = ext_value {
+                    let ext_value = ext_value.clone();
+
                     // Try to find the existing key in main config that matches ext_name.
                     // This handles template keys like "avocado-bsp-{{ avocado.target }}"
                     // that interpolate to "avocado-bsp-raspberrypi4".
@@ -2581,12 +2704,18 @@ impl Config {
                         if let Some(existing_ext) = main_ext_map.get_mut(&existing_key) {
                             // Deep-merge: add fields from remote that don't exist in main
                             // Main config values take precedence on conflicts
-                            Self::deep_merge_ext_section(existing_ext, ext_value);
+                            Self::deep_merge_ext_section(existing_ext, &ext_value);
                         }
                     } else {
                         // Extension not in main config, just add it
                         main_ext_map.insert(ext_key, ext_value.clone());
                     }
+
+                    Self::merge_external_dependency_declarations(
+                        main_ext_map,
+                        external_ext,
+                        &ext_value,
+                    );
                 }
             }
         }
@@ -9327,6 +9456,186 @@ extensions:
         let ext_section = main_config.get("extensions").unwrap().as_mapping().unwrap();
         assert!(ext_section.contains_key(serde_yaml::Value::String("local-ext".to_string())));
         assert!(ext_section.contains_key(serde_yaml::Value::String("external-ext".to_string())));
+    }
+
+    /// Helper: run `merge_external_config` and return the resulting
+    /// `extensions:` mapping.
+    fn merge_and_get_ext_section(
+        main: &str,
+        external: &str,
+        ext_name: &str,
+    ) -> serde_yaml::Mapping {
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(main).unwrap();
+        let external_config: serde_yaml::Value = serde_yaml::from_str(external).unwrap();
+        Config::merge_external_config(&mut main_config, &external_config, ext_name, &[], &[]);
+        main_config
+            .get("extensions")
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .clone()
+    }
+
+    fn ext_entry<'a>(
+        section: &'a serde_yaml::Mapping,
+        name: &str,
+    ) -> Option<&'a serde_yaml::Value> {
+        section.get(serde_yaml::Value::String(name.to_string()))
+    }
+
+    #[test]
+    fn test_depends_on_target_declared_alongside_is_pulled_in() {
+        // A remote extension normally declares both itself and the platform
+        // base it binds to. Without pulling the base in, it never appears in
+        // the composed config, is never discovered as a remote extension, and
+        // is never fetched — the dependency stays unresolvable forever.
+        let external = r#"
+extensions:
+  app-a:
+    types: [sysext]
+    depends_on: [weston-base]
+  weston-base:
+    class: platform
+    source: { type: package, version: "1.2.0" }
+"#;
+        let section = merge_and_get_ext_section("extensions: {}\n", external, "app-a");
+
+        assert!(ext_entry(&section, "app-a").is_some());
+        let base = ext_entry(&section, "weston-base").expect("dependency should be pulled in");
+        assert_eq!(
+            base.get("source")
+                .and_then(|s| s.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("package")
+        );
+    }
+
+    #[test]
+    fn test_depends_on_pull_in_is_transitive_within_one_config() {
+        let external = r#"
+extensions:
+  app-a:
+    depends_on: [mid]
+  mid:
+    class: platform
+    depends_on: [base]
+    source: { type: package, version: "2.0.0" }
+  base:
+    class: platform
+    source: { type: package, version: "3.0.0" }
+"#;
+        let section = merge_and_get_ext_section("extensions: {}\n", external, "app-a");
+
+        assert!(ext_entry(&section, "mid").is_some());
+        assert!(
+            ext_entry(&section, "base").is_some(),
+            "transitive dep missing"
+        );
+    }
+
+    #[test]
+    fn test_unrelated_siblings_are_not_pulled_in() {
+        // A remote repo may define a whole catalog. Depending on one extension
+        // must not drag the rest into the consumer's namespace.
+        let external = r#"
+extensions:
+  app-a:
+    depends_on: [weston-base]
+  weston-base:
+    class: platform
+  unrelated-thing:
+    types: [sysext]
+  another-unrelated:
+    types: [confext]
+"#;
+        let section = merge_and_get_ext_section("extensions: {}\n", external, "app-a");
+
+        assert!(ext_entry(&section, "weston-base").is_some());
+        assert!(ext_entry(&section, "unrelated-thing").is_none());
+        assert!(ext_entry(&section, "another-unrelated").is_none());
+    }
+
+    #[test]
+    fn test_consumer_declaration_of_a_dependency_wins() {
+        // The author pinned their own version/source for the base. Pulling in
+        // the remote's declaration on top would silently override their pin.
+        let main = r#"
+extensions:
+  weston-base:
+    source: { type: package, version: "9.9.9" }
+"#;
+        let external = r#"
+extensions:
+  app-a:
+    depends_on: [weston-base]
+  weston-base:
+    source: { type: package, version: "1.2.0" }
+"#;
+        let section = merge_and_get_ext_section(main, external, "app-a");
+
+        let base = ext_entry(&section, "weston-base").unwrap();
+        assert_eq!(
+            base.get("source")
+                .and_then(|s| s.get("version"))
+                .and_then(|v| v.as_str()),
+            Some("9.9.9"),
+            "consumer's pin must survive"
+        );
+    }
+
+    #[test]
+    fn test_depends_on_pull_in_handles_all_entry_shapes() {
+        let external = r#"
+extensions:
+  app-a:
+    depends_on:
+      - plain-base
+      - { name: explicit-base, version: ">=1.0.0" }
+      - { shorthand-base: "^2" }
+  plain-base: { class: platform }
+  explicit-base: { class: platform }
+  shorthand-base: { class: platform }
+"#;
+        let section = merge_and_get_ext_section("extensions: {}\n", external, "app-a");
+
+        assert!(ext_entry(&section, "plain-base").is_some());
+        assert!(ext_entry(&section, "explicit-base").is_some());
+        assert!(ext_entry(&section, "shorthand-base").is_some());
+    }
+
+    #[test]
+    fn test_depends_on_naming_an_absent_sibling_is_not_an_error_here() {
+        // The dependency may legitimately live in the consumer's config or a
+        // different feed. Composition stays silent; the resolver produces the
+        // "not defined" diagnostic, where it can name the whole chain.
+        let external = r#"
+extensions:
+  app-a:
+    depends_on: [elsewhere-base]
+"#;
+        let section = merge_and_get_ext_section("extensions: {}\n", external, "app-a");
+
+        assert!(ext_entry(&section, "app-a").is_some());
+        assert!(ext_entry(&section, "elsewhere-base").is_none());
+    }
+
+    #[test]
+    fn test_depends_on_cycle_between_siblings_terminates() {
+        // Cycles are the resolver's diagnostic to produce, but composition
+        // must not hang or blow the stack on the way there.
+        let external = r#"
+extensions:
+  app-a:
+    depends_on: [b]
+  b:
+    depends_on: [c]
+  c:
+    depends_on: [b]
+"#;
+        let section = merge_and_get_ext_section("extensions: {}\n", external, "app-a");
+
+        assert!(ext_entry(&section, "b").is_some());
+        assert!(ext_entry(&section, "c").is_some());
     }
 
     #[test]
