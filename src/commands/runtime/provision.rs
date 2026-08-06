@@ -579,34 +579,17 @@ impl RuntimeProvisionCommand {
         &mut self,
         config: &crate::utils::config::Config,
     ) -> Result<Option<(PathBuf, PathBuf, String, String)>> {
-        // Check if runtime has signing configuration
-        let signing_key_name = match config.get_runtime_signing_key(&self.config.runtime_name) {
-            Some(keyid) => {
-                // Get the key name from signing_keys mapping
-                let signing_keys = config.get_signing_keys();
-                signing_keys
-                    .and_then(|keys| {
-                        keys.iter()
-                            .find(|(_, v)| *v == &keyid)
-                            .map(|(k, _)| k.clone())
-                    })
-                    .context("Signing key ID not found in signing_keys mapping")?
+        let Some((signing_key_name, keyid)) =
+            config.resolve_runtime_signing_key(&self.config.runtime_name)?
+        else {
+            if self.config.verbose {
+                print_info(
+                    "No signing key configured for runtime. Signing service will not be started.",
+                    OutputLevel::Verbose,
+                );
             }
-            None => {
-                // No signing configured for this runtime
-                if self.config.verbose {
-                    print_info(
-                        "No signing key configured for runtime. Signing service will not be started.",
-                        OutputLevel::Verbose,
-                    );
-                }
-                return Ok(None);
-            }
+            return Ok(None);
         };
-
-        let keyid = config
-            .get_runtime_signing_key(&self.config.runtime_name)
-            .context("Failed to get signing key ID")?;
 
         // Get checksum algorithm (defaults to sha256)
         let checksum_str = config
@@ -667,13 +650,23 @@ impl RuntimeProvisionCommand {
         )))
     }
 
-    /// Setup signing service stub for non-Unix platforms
-    /// Signing service requires Unix domain sockets and is not available on Windows
+    /// The signing service needs Unix domain sockets, so it cannot run here.
+    /// A runtime that asks for signing must fail rather than provision an
+    /// unsigned image.
     #[cfg(not(unix))]
     async fn setup_signing_service(
         &mut self,
-        _config: &crate::utils::config::Config,
+        config: &crate::utils::config::Config,
     ) -> Result<Option<(PathBuf, PathBuf, String, String)>> {
+        if let Some((declared, _)) =
+            config.resolve_runtime_signing_key(&self.config.runtime_name)?
+        {
+            anyhow::bail!(
+                "Runtime '{}' declares signing key '{declared}', but the signing service \
+                 requires Unix domain sockets and is unavailable on this platform",
+                self.config.runtime_name
+            );
+        }
         Ok(None)
     }
 

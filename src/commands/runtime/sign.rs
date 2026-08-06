@@ -396,36 +396,18 @@ impl RuntimeSignCommand {
         target_arch: &str,
         required_extensions: &HashSet<String>,
     ) -> Result<()> {
-        // Check if runtime has signing configuration
-        let runtime_signing_key_name = match config.get_runtime_signing_key(&self.runtime_name) {
-            Some(keyid) => {
-                // Get the key name from signing_keys mapping
-                let signing_keys = config.get_signing_keys();
-                signing_keys
-                    .and_then(|keys| {
-                        keys.iter()
-                            .find(|(_, v)| *v == &keyid)
-                            .map(|(k, _)| k.clone())
-                    })
-                    .context("Signing key ID not found in signing_keys mapping")?
-            }
-            None => {
-                // No signing configured for this runtime
-                print_warning(
-                    &format!(
-                        "No signing key configured for runtime '{}'. Skipping signing.",
-                        self.runtime_name
-                    ),
-                    OutputLevel::Normal,
-                );
-                return Ok(());
-            }
+        let Some((runtime_signing_key_name, keyid)) =
+            config.resolve_runtime_signing_key(&self.runtime_name)?
+        else {
+            print_warning(
+                &format!(
+                    "No signing key configured for runtime '{}'. Skipping signing.",
+                    self.runtime_name
+                ),
+                OutputLevel::Normal,
+            );
+            return Ok(());
         };
-
-        // Get the keyid for signing
-        let keyid = config
-            .get_runtime_signing_key(&self.runtime_name)
-            .context("Failed to get signing key ID")?;
 
         // Get checksum algorithm (defaults to sha256)
         let checksum_str = config
