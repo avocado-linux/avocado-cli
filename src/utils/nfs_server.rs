@@ -549,6 +549,7 @@ impl NfsServer {
 
             // Stop the container
             let _ = AsyncCommand::new(container_tool)
+                // stdio-flags-ok: docker stop timeout in seconds, not a tty
                 .args(["stop", "-t", "2", container_name])
                 .output()
                 .await;

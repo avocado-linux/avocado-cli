@@ -62,6 +62,27 @@ impl StdioCapabilities {
     }
 }
 
+/// Whether this process can meaningfully prompt the user *itself* — as
+/// opposed to handing stdio to a container.
+///
+/// Host-side prompts fail differently and more quietly than the container
+/// case. `stdin().read_line()` at EOF returns `Ok(0)` and leaves the buffer
+/// empty: no error, no signal, just an empty answer. A confirmation that
+/// treats empty as "no" degrades safely, but a `loop { read_line; complain }`
+/// spins forever printing to a log nobody is reading.
+///
+/// Anything that blocks on the user must check this first and take a defined
+/// path when it is false — usually erroring with a flag to pass instead.
+///
+/// Currently consulted only from the macOS-only disk writer, hence the
+/// targeted allow: it is genuinely unused elsewhere today, and a blanket
+/// `allow(dead_code)` would hide it going unused on macOS too.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn can_prompt_user() -> bool {
+    let caps = StdioCapabilities::detect();
+    caps.stdin_is_tty && !caps.json_active && !caps.forced_noninteractive
+}
+
 /// The stdio arrangement a container should be given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerStdio {

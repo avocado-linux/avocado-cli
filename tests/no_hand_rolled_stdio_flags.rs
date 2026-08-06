@@ -36,11 +36,23 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Opt-out for the handful of places where `-t` legitimately means something
+/// else — `docker stop -t <seconds>` is a timeout, not a terminal.
+///
+/// An explicit marker rather than pattern-matching on `"stop"`: it forces the
+/// author to state why, and it cannot silently widen to cover a real PTY flag
+/// that happens to sit on the same line.
+const ALLOW_MARKER: &str = "stdio-flags-ok";
+
 /// Flag spellings that hand a PTY or stdin to a container.
+///
+/// Deliberately catches the bare literals, not just `push(...)`. An earlier
+/// version only looked for `push("-t"` and `"-it"`, which let
+/// `.args(["run", "-i", "-t", img])` through untouched — the guard has to
+/// cover every way the argument list can be built, or it just moves the trap
+/// one refactor away.
 fn offending_snippets(line: &str) -> Option<&'static str> {
-    // Only flag string literals that *are* the switch, not prose mentioning
-    // it, and not unrelated uses like `docker stop -t 2`.
-    const NEEDLES: [&str; 3] = ["\"-it\"", "push(\"-t\"", "push(\"-i\""];
+    const NEEDLES: [&str; 3] = ["\"-it\"", "\"-t\"", "\"-i\""];
     NEEDLES.into_iter().find(|n| line.contains(n))
 }
 
@@ -64,10 +76,20 @@ fn container_stdio_flags_come_only_from_the_interactivity_module() {
         let Ok(text) = fs::read_to_string(&file) else {
             continue;
         };
-        for (i, line) in text.lines().enumerate() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             // Comments and doc comments may legitimately discuss the flags.
             if trimmed.starts_with("//") {
+                continue;
+            }
+            // The marker may sit on the line itself or, more readably, on the
+            // line above it.
+            let allowed_here = line.contains(ALLOW_MARKER);
+            let allowed_above = i
+                .checked_sub(1)
+                .is_some_and(|p| lines[p].contains(ALLOW_MARKER));
+            if allowed_here || allowed_above {
                 continue;
             }
             if let Some(needle) = offending_snippets(line) {

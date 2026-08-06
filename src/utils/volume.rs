@@ -478,6 +478,7 @@ impl VolumeManager {
         for container_id in &containers {
             // Stop the container gracefully with short timeout
             let _ = AsyncCommand::new(&self.container_tool)
+                // stdio-flags-ok: docker stop timeout in seconds, not a tty
                 .args(["stop", "-t", "1", container_id])
                 .output()
                 .await;

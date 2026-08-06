@@ -2025,6 +2025,7 @@ impl SdkContainer {
                         // Stop the container gracefully
                         if let Some(name) = container_name {
                             let stop_result = AsyncCommand::new(&self.container_tool)
+                                // stdio-flags-ok: docker stop timeout in seconds, not a tty
                                 .args(["stop", "-t", "2", name])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
@@ -2149,6 +2150,7 @@ impl SdkContainer {
                 // Stop the container gracefully
                 if let Some(name) = container_name {
                     let _ = AsyncCommand::new(&self.container_tool)
+                        // stdio-flags-ok: docker stop timeout in seconds, not a tty
                         .args(["stop", "-t", "2", name])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
