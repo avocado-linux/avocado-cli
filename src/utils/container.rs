@@ -1181,8 +1181,12 @@ impl SdkContainer {
             extra_args.extend(args.clone());
         }
 
-        if config.interactive {
-            extra_args.push("-it".to_string());
+        // Same intent-vs-capability rule as the local path: a remote container
+        // gets a PTY only if this process actually has one to forward.
+        for flag in
+            crate::utils::interactivity::ContainerStdio::for_intent(config.interactive).flags()
+        {
+            extra_args.push((*flag).to_string());
         }
 
         let extra_args_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
@@ -1253,17 +1257,20 @@ impl SdkContainer {
         // TTY) and skip -i too — dnf prompts would deadlock against
         // an empty stdin. Treat JSON mode as the same constraint set
         // as TUI mode.
-        let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
-        let json_active = crate::utils::output_format::is_json_output_active();
-        if config.interactive && !json_active {
-            // Explicit interactive mode (e.g. avocado shell): full -it
-            container_cmd.push("-i".to_string());
-            container_cmd.push("-t".to_string());
-        } else if config.tui_context.is_none() && !global_tui_active && !json_active {
-            // Non-TUI mode: keep stdin open for prompts, no PTY
-            container_cmd.push("-i".to_string());
+        // Intent (`config.interactive`) is combined with what the environment
+        // can actually provide by `ContainerStdio` — crucially including
+        // whether stdin is a terminal, which decides whether `-t` is even
+        // legal. See utils::interactivity for the full matrix and why this
+        // must not be decided here.
+        let mut caps = crate::utils::interactivity::StdioCapabilities::detect();
+        // A per-run TUI context counts as TUI-active even when no global
+        // renderer is registered.
+        caps.tui_active |= config.tui_context.is_some();
+
+        let stdio = crate::utils::interactivity::ContainerStdio::decide(config.interactive, &caps);
+        for flag in stdio.flags() {
+            container_cmd.push((*flag).to_string());
         }
-        // TUI mode / JSON mode: no -i, no -t (output is piped)
 
         // Add FUSE device and capability for bindfs support
         container_cmd.push("--device".to_string());
