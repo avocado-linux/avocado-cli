@@ -275,9 +275,24 @@ pub struct ExtensionSourceLock {
     /// RPM package name (may differ from extension name)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
-    /// Actual installed version
+    /// Actual installed version, as reported by the installroot's rpmdb after
+    /// the transaction — not the version that was *requested*.
+    ///
+    /// The distinction is the whole point of the field. Writing back the
+    /// request means a `version: "*"` declaration round-trips as `"*"` and
+    /// pins nothing, so two builds a week apart can resolve to different
+    /// extensions with a lock file that claims otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// True when this extension was pulled in by the depsolver rather than
+    /// declared in the config.
+    ///
+    /// Recorded so a clean checkout can reproduce the same closure: nothing
+    /// in `avocado.yaml` names these, so without the lock naming them there
+    /// is no way to pin them, and the first fetch on a fresh tree would
+    /// re-solve freely.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implied: bool,
 }
 
 /// Lock data for a single extension — unifies sysroot packages and source metadata
@@ -778,6 +793,9 @@ impl LockFile {
                                             source_type: "package".to_string(),
                                             package: Some(pkg_name.clone()),
                                             version: Some(ver_str.to_string()),
+                                            // Legacy-format migration: these came
+                                            // from a declared entry.
+                                            implied: false,
                                         });
                                     }
                                 }
@@ -1479,6 +1497,31 @@ impl LockFile {
             .and_then(|ext| ext.source.as_ref())
     }
 
+    /// Extensions the lock recorded as pulled in by the depsolver rather than
+    /// declared in the config, with their pinned sources.
+    ///
+    /// These are the entries nothing in `avocado.yaml` names, so the lock is
+    /// the only record that they belong to the closure at all. A fetch has to
+    /// seed them explicitly or a clean checkout will re-solve them freely.
+    ///
+    /// Returned owned and sorted so the caller can mutate the lock while
+    /// iterating, and so the resulting transaction is deterministic.
+    pub fn implied_extension_sources(&self, target: &str) -> Vec<(String, ExtensionSourceLock)> {
+        let Some(target_locks) = self.targets.get(target) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, ExtensionSourceLock)> = target_locks
+            .extensions
+            .iter()
+            .filter_map(|(name, ext)| {
+                let source = ext.source.as_ref()?;
+                source.implied.then(|| (name.clone(), source.clone()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Set the source metadata for a fetched extension
     pub fn set_extension_source(
         &mut self,
@@ -1614,6 +1657,63 @@ mod tests {
         let lock = LockFile::new();
         assert_eq!(lock.version, LOCKFILE_VERSION);
         assert!(lock.targets.is_empty());
+    }
+
+    // ---- implied (depsolver-pulled) extension pins ----------------------
+
+    fn src(pkg: &str, version: &str, implied: bool) -> ExtensionSourceLock {
+        ExtensionSourceLock {
+            source_type: "package".to_string(),
+            package: Some(pkg.to_string()),
+            version: Some(version.to_string()),
+            implied,
+        }
+    }
+
+    #[test]
+    fn implied_sources_are_separable_from_declared_ones() {
+        let mut lock = LockFile::new();
+        lock.set_extension_source("t", "app-a", src("app-a", "0.1.0-r0", false));
+        lock.set_extension_source("t", "base", src("base", "1.2.0-r0", true));
+        lock.set_extension_source("t", "mid", src("mid", "0.3.0-r0", true));
+
+        let implied = lock.implied_extension_sources("t");
+        let names: Vec<&str> = implied.iter().map(|(n, _)| n.as_str()).collect();
+        // Sorted, so the replayed transaction is deterministic.
+        assert_eq!(names, vec!["base", "mid"]);
+        assert_eq!(implied[0].1.version.as_deref(), Some("1.2.0-r0"));
+    }
+
+    #[test]
+    fn implied_sources_are_empty_for_an_unknown_target() {
+        let mut lock = LockFile::new();
+        lock.set_extension_source("t", "base", src("base", "1.2.0-r0", true));
+        assert!(lock.implied_extension_sources("other-target").is_empty());
+    }
+
+    #[test]
+    fn implied_defaults_to_false_and_is_omitted_when_false() {
+        // Additive field: existing locks deserialize with implied=false, and a
+        // declared entry must not start emitting a new key.
+        let json = r#"{"type":"package","package":"app-a","version":"0.1.0-r0"}"#;
+        let parsed: ExtensionSourceLock = serde_json::from_str(json).unwrap();
+        assert!(!parsed.implied);
+
+        let round = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !round.contains("implied"),
+            "declared entries must stay byte-identical: {round}"
+        );
+    }
+
+    #[test]
+    fn implied_true_survives_a_round_trip() {
+        let s = src("base", "1.2.0-r0", true);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("implied"));
+        let back: ExtensionSourceLock = serde_json::from_str(&json).unwrap();
+        assert!(back.implied);
+        assert_eq!(back.version.as_deref(), Some("1.2.0-r0"));
     }
 
     #[test]
@@ -2589,6 +2689,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
                 source_type: "package".to_string(),
                 package: Some("avocado-ext-remote".to_string()),
                 version: Some("1.0.0-1.el9.x86_64".to_string()),
+                implied: false,
             },
         );
 
@@ -2624,6 +2725,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
                 source_type: "package".to_string(),
                 package: None,
                 version: None,
+                implied: false,
             },
         );
         lock.clear_extension(target, ext_name);
