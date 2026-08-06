@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::utils::config::{ComposedConfig, Config, ExtensionSource};
 use crate::utils::ext_fetch::{ExtensionFetcher, PackageFetchEntry};
 use crate::utils::lockfile::{ExtensionSourceLock, LockFile};
-use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::target::resolve_target_required;
 
 /// Command to fetch remote extensions
@@ -34,6 +34,8 @@ pub struct ExtFetchCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
+    /// Refuse to update the lock; fail on dependency drift instead.
+    pub locked: bool,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -58,6 +60,7 @@ impl ExtFetchCommand {
             sdk_arch: None,
             runs_on: None,
             nfs_port: None,
+            locked: false,
             composed_config: None,
         }
     }
@@ -65,6 +68,13 @@ impl ExtFetchCommand {
     /// Set SDK container architecture for cross-arch emulation
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
+        self
+    }
+
+    /// Fail rather than update the lock when a locked dependency cannot
+    /// satisfy a new requirement.
+    pub fn with_locked(mut self, locked: bool) -> Self {
+        self.locked = locked;
         self
     }
 
@@ -334,6 +344,10 @@ impl ExtFetchCommand {
             // carrying the author's own constraint, which outranks the lock.
             let declared: HashSet<String> =
                 package_batch.iter().map(|e| e.ext_name.clone()).collect();
+            // Everything up to here is author-declared; pins are appended
+            // after, so the two groups can be separated again if the pinned
+            // solve has to be retried without them.
+            let declared_count = package_batch.len();
             for (name, pin) in lock_file.implied_extension_sources(&target) {
                 if declared.contains(&name) {
                     continue;
@@ -355,6 +369,8 @@ impl ExtFetchCommand {
                 ));
             }
 
+            let pinned_count = package_batch.len() - declared_count;
+
             // One transaction for every package-source extension. dnf resolves and
             // installs any dependency extensions beyond those named here.
             if !package_batch.is_empty() {
@@ -365,9 +381,100 @@ impl ExtFetchCommand {
                     ),
                     OutputLevel::Normal,
                 );
-                let resolved = fetcher
+                // Locked pins are handed to dnf as exact NEVRAs, so a
+                // dependent requiring a newer base does not silently win — the
+                // depsolve fails on contradictory requests. That failure is
+                // the drift signal.
+                //
+                // Default is to re-solve without the pins and report what
+                // moved: the conflict only arises because something the author
+                // changed invalidated the old solution, and recomputing it is
+                // the lock doing its job. `--locked` turns the same situation
+                // into an error, which is what CI wants.
+                let resolved = match fetcher
                     .fetch_packages(&package_batch, force_this_round)
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) if pinned_count > 0 && !self.locked => {
+                        print_warning(
+                            "Locked dependency versions could not satisfy current \
+                             requirements; re-resolving.",
+                            OutputLevel::Normal,
+                        );
+                        if self.verbose {
+                            print_info(&format!("Depsolve error was: {e}"), OutputLevel::Normal);
+                        }
+                        let unpinned: Vec<PackageFetchEntry> =
+                            package_batch.iter().take(declared_count).cloned().collect();
+                        fetcher
+                            .fetch_packages(&unpinned, force_this_round)
+                            .await
+                            .with_context(|| {
+                                "Re-resolving without locked dependency versions also failed"
+                            })?
+                    }
+                    Err(e) if pinned_count > 0 && self.locked => {
+                        return Err(e).with_context(|| {
+                            "avocado.lock pins dependency versions that cannot satisfy the \
+                             current requirements.\n\
+                             Re-run without --locked to update the lock, or align the \
+                             declared versions."
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                // Report any locked dependency whose version moved. Under
+                // --locked this is fatal; otherwise it is a loud warning
+                // backed by a reviewable diff in avocado.lock.
+                let mut drift: Vec<String> = Vec::new();
+                let mut downgrades: Vec<String> = Vec::new();
+                for (name, pin) in lock_file.implied_extension_sources(&target) {
+                    let pkg = pin.package.clone().unwrap_or_else(|| name.clone());
+                    let (Some(was), Some(now)) = (pin.version.as_deref(), resolved.get(&pkg))
+                    else {
+                        continue;
+                    };
+                    if was == now {
+                        continue;
+                    }
+                    let line = format!("  {name}: {was} -> {now}");
+                    if crate::utils::ext_deps::is_rpm_downgrade(was, now) {
+                        downgrades.push(line);
+                    } else {
+                        drift.push(line);
+                    }
+                }
+
+                // A constraint dragging a shared base *backwards* has no benign
+                // reading — it means something old was pinned against a newer
+                // platform. Refuse regardless of --locked.
+                if !downgrades.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Refusing to downgrade locked dependency extension(s):\n{}\n\
+                         A dependent is constraining a shared base to an older version. \
+                         Align the declared versions rather than moving the base back.",
+                        downgrades.join("\n")
+                    ));
+                }
+                if !drift.is_empty() {
+                    if self.locked {
+                        return Err(anyhow::anyhow!(
+                            "avocado.lock is out of date; --locked forbids updating it:\n{}\n\
+                             Re-run without --locked to update the lock.",
+                            drift.join("\n")
+                        ));
+                    }
+                    print_warning(
+                        &format!(
+                            "Updating locked dependency extension(s) in avocado.lock:\n{}\n\
+                             Review the avocado.lock diff before committing.",
+                            drift.join("\n")
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
 
                 // Record what the installroot actually holds — the only
                 // reproducible answer. It covers extensions the depsolver
