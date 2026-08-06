@@ -332,6 +332,100 @@ impl ExtensionDependency {
     }
 }
 
+/// Whether moving from `was` to `now` is a downgrade, by rpm version ordering.
+///
+/// Used to distinguish a dependency being pulled *forward* (routine — the lock
+/// records a solution, and a changed constraint means a new solution) from one
+/// being dragged *backward*, which has no benign reading: it means something
+/// old is constraining a shared base below what is already deployed.
+///
+/// Implements rpmvercmp's segment rule rather than semver: these are RPM
+/// `VERSION-RELEASE` strings, where `1.10 > 1.9` and a numeric segment always
+/// outranks an alphabetic one. A `~` segment sorts *before* everything, which
+/// is how pre-releases order.
+pub fn is_rpm_downgrade(was: &str, now: &str) -> bool {
+    rpm_vercmp(was, now) == std::cmp::Ordering::Greater
+}
+
+/// Compare two RPM version strings, rpmvercmp-style.
+fn rpm_vercmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a = a.chars().peekable();
+    let mut b = b.chars().peekable();
+
+    loop {
+        // `~` sorts before everything, including the empty string.
+        let a_tilde = a.peek() == Some(&'~');
+        let b_tilde = b.peek() == Some(&'~');
+        if a_tilde || b_tilde {
+            match (a_tilde, b_tilde) {
+                (true, true) => {
+                    a.next();
+                    b.next();
+                    continue;
+                }
+                (true, false) => return Ordering::Less,
+                (false, true) => return Ordering::Greater,
+                _ => unreachable!(),
+            }
+        }
+
+        // Skip separators.
+        while a.peek().is_some_and(|c| !c.is_alphanumeric() && *c != '~') {
+            a.next();
+        }
+        while b.peek().is_some_and(|c| !c.is_alphanumeric() && *c != '~') {
+            b.next();
+        }
+
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                let a_num = ca.is_ascii_digit();
+                let b_num = cb.is_ascii_digit();
+                // A numeric segment always outranks an alphabetic one.
+                if a_num != b_num {
+                    return if a_num {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    };
+                }
+
+                let take = |it: &mut std::iter::Peekable<std::str::Chars>, numeric: bool| {
+                    let mut s = String::new();
+                    while let Some(&c) = it.peek() {
+                        if numeric && c.is_ascii_digit() || !numeric && c.is_alphabetic() {
+                            s.push(c);
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    s
+                };
+                let sa = take(&mut a, a_num);
+                let sb = take(&mut b, b_num);
+
+                let ord = if a_num {
+                    // Strip leading zeros, then longer digit run wins.
+                    let ta = sa.trim_start_matches('0');
+                    let tb = sb.trim_start_matches('0');
+                    ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb))
+                } else {
+                    sa.cmp(&sb)
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
 /// Extract just the extension *names* from a `depends_on:` list, ignoring
 /// version constraints and tolerating malformed entries.
 ///
@@ -1156,6 +1250,65 @@ mod tests {
         let err = g.resolve(&roots(&["ghost"])).unwrap_err().to_string();
         assert!(err.contains("'ghost' is not defined"), "{err}");
         assert!(!err.contains("Required by"), "{err}");
+    }
+
+    // ---- rpm version ordering (downgrade detection) ----------------------
+
+    #[test]
+    fn forward_moves_are_not_downgrades() {
+        assert!(!is_rpm_downgrade("1.2.0-r0", "1.3.0-r0"));
+        assert!(!is_rpm_downgrade("1.2.0-r0", "2.0.0-r0"));
+        // Release bump only.
+        assert!(!is_rpm_downgrade("1.2.0-r0", "1.2.0-r1"));
+    }
+
+    #[test]
+    fn backward_moves_are_downgrades() {
+        assert!(is_rpm_downgrade("1.3.0-r0", "1.2.0-r0"));
+        assert!(is_rpm_downgrade("2.0.0-r0", "1.9.9-r0"));
+        assert!(is_rpm_downgrade("1.2.0-r1", "1.2.0-r0"));
+    }
+
+    #[test]
+    fn equal_versions_are_not_downgrades() {
+        assert!(!is_rpm_downgrade("1.2.0-r0", "1.2.0-r0"));
+    }
+
+    #[test]
+    fn numeric_segments_compare_numerically_not_lexically() {
+        // The classic rpm/semver trap: "1.10" > "1.9" despite sorting lower
+        // as a string. Getting this wrong would flag a routine upgrade as a
+        // downgrade and block the build.
+        assert!(!is_rpm_downgrade("1.9.0-r0", "1.10.0-r0"));
+        assert!(is_rpm_downgrade("1.10.0-r0", "1.9.0-r0"));
+    }
+
+    #[test]
+    fn leading_zeros_do_not_change_ordering() {
+        assert!(!is_rpm_downgrade("1.02.0-r0", "1.2.0-r0"));
+        assert!(!is_rpm_downgrade("1.2.0-r0", "1.02.0-r0"));
+    }
+
+    #[test]
+    fn tilde_sorts_before_its_release_like_a_prerelease() {
+        // rpm's `~` is how our caret expansion encodes pre-releases, so
+        // 1.2.0~rc.1 must precede 1.2.0 — moving rc -> final is an upgrade,
+        // and final -> rc is a downgrade.
+        assert!(!is_rpm_downgrade("1.2.0~rc.1-r0", "1.2.0-r0"));
+        assert!(is_rpm_downgrade("1.2.0-r0", "1.2.0~rc.1-r0"));
+    }
+
+    #[test]
+    fn numeric_outranks_alphabetic() {
+        // rpmvercmp: a digit segment beats a letter segment.
+        assert!(is_rpm_downgrade("1.2.1-r0", "1.2.a-r0"));
+        assert!(!is_rpm_downgrade("1.2.a-r0", "1.2.1-r0"));
+    }
+
+    #[test]
+    fn a_longer_version_with_equal_prefix_is_newer() {
+        assert!(!is_rpm_downgrade("1.2-r0", "1.2.1-r0"));
+        assert!(is_rpm_downgrade("1.2.1-r0", "1.2-r0"));
     }
 
     // ---- RPM realization -------------------------------------------------
