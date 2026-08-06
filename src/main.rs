@@ -80,7 +80,7 @@ use commands::upgrade::UpgradeCommand;
 #[derive(Parser)]
 #[command(name = "avocado")]
 #[command(about = "Avocado CLI - A command line interface for Avocado")]
-#[command(version)]
+#[command(version = env!("AVOCADO_CLI_VERSION"))]
 #[command(disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
