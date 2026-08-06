@@ -139,6 +139,23 @@ impl ContainerStdio {
         Self::decide(wants_interactive, &StdioCapabilities::detect())
     }
 
+    /// Whether a PTY is allocated. Prefer this to inspecting [`Self::flags`]
+    /// so callers and tests never have to spell `-t` themselves — which also
+    /// keeps them clear of the source guard that forbids those literals.
+    ///
+    /// Consumed by tests today; `allow(dead_code)` matches how the crate
+    /// already handles lib-public items the binary happens not to call.
+    #[allow(dead_code)]
+    pub fn allocates_tty(&self) -> bool {
+        matches!(self, Self::StdinAndTty)
+    }
+
+    /// Whether stdin is left open, with or without a PTY.
+    #[allow(dead_code)]
+    pub fn keeps_stdin(&self) -> bool {
+        matches!(self, Self::StdinOnly | Self::StdinAndTty)
+    }
+
     /// The docker/podman flags this arrangement implies.
     ///
     /// The single place `-i` and `-t` are spelled. Anything else pushing them
@@ -253,6 +270,68 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ---- the environment bridge ----------------------------------------
+    //
+    // `detect`, `for_intent`, and `can_prompt_user` read the real process
+    // environment, which is exactly where the original bug lived — the pure
+    // decision was never wrong, it simply was not asked about stdin. These
+    // assert invariants that hold whether the suite runs from a terminal or
+    // from CI, rather than hard-coding either, so they cannot pass in one
+    // place and fail in the other.
+
+    #[test]
+    fn for_intent_actually_consults_stdin() {
+        let caps = StdioCapabilities::detect();
+        let got = ContainerStdio::for_intent(true);
+        let expect_pty = caps.stdin_is_tty && !caps.json_active && !caps.forced_noninteractive;
+        assert_eq!(
+            got == ContainerStdio::StdinAndTty,
+            expect_pty,
+            "for_intent disagreed with detected capabilities {caps:?} -> {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_noninteractive_command_never_gets_a_pty_in_any_environment() {
+        assert_ne!(
+            ContainerStdio::for_intent(false),
+            ContainerStdio::StdinAndTty
+        );
+    }
+
+    #[test]
+    fn can_prompt_user_agrees_with_the_container_decision() {
+        // If we would give a container a PTY, we can also prompt ourselves,
+        // and vice versa. Divergence would mean the two halves of the module
+        // disagree about what "interactive" means.
+        assert_eq!(
+            can_prompt_user(),
+            ContainerStdio::for_intent(true) == ContainerStdio::StdinAndTty
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn forced_noninteractive_env_var_is_honored_end_to_end() {
+        let prev = std::env::var("AVOCADO_NONINTERACTIVE").ok();
+
+        std::env::set_var("AVOCADO_NONINTERACTIVE", "1");
+        assert!(StdioCapabilities::detect().forced_noninteractive);
+        assert_ne!(
+            ContainerStdio::for_intent(true),
+            ContainerStdio::StdinAndTty,
+            "AVOCADO_NONINTERACTIVE must suppress the PTY even on a terminal"
+        );
+        assert!(!can_prompt_user());
+
+        std::env::remove_var("AVOCADO_NONINTERACTIVE");
+        assert!(!StdioCapabilities::detect().forced_noninteractive);
+
+        if let Some(v) = prev {
+            std::env::set_var("AVOCADO_NONINTERACTIVE", v);
         }
     }
 

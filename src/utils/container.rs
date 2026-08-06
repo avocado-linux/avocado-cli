@@ -3113,6 +3113,112 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
+    /// Wiring tests for container stdio.
+    ///
+    /// `utils::interactivity` tests the *decision*; these test that the
+    /// decision is actually applied to the argv. That distinction matters:
+    /// the original bug was not a wrong decision, it was that the assembled
+    /// command never consulted stdin at all. Deleting the `stdio.flags()`
+    /// loop leaves every interactivity unit test green — only these fail.
+    mod stdio_wiring {
+        use super::*;
+        use crate::utils::volume::VolumeState;
+        use std::io::IsTerminal;
+
+        fn container() -> SdkContainer {
+            SdkContainer::new()
+        }
+
+        fn volume_state() -> VolumeState {
+            VolumeState::new(PathBuf::from("/tmp/avocado-test"), "docker".to_string())
+        }
+
+        fn argv(interactive: bool) -> Vec<String> {
+            let config = RunConfig {
+                container_image: "example/sdk:test".to_string(),
+                target: "qemux86-64".to_string(),
+                command: "true".to_string(),
+                interactive,
+                ..Default::default()
+            };
+            container()
+                .build_container_command(
+                    &config,
+                    &["true".to_string()],
+                    &HashMap::new(),
+                    &volume_state(),
+                )
+                .expect("command assembly should not fail")
+        }
+
+        /// Whether `-t` appears as a standalone argument (not as part of
+        /// `--platform` values or a path).
+        fn has_tty_flag(cmd: &[String]) -> bool {
+            // stdio-flags-ok: asserting on the assembled argv, not building it
+            cmd.iter().any(|a| a == "-t")
+        }
+
+        fn has_stdin_flag(cmd: &[String]) -> bool {
+            // stdio-flags-ok: asserting on the assembled argv, not building it
+            cmd.iter().any(|a| a == "-i")
+        }
+
+        #[test]
+        fn assembled_command_matches_the_stdio_decision() {
+            // Environment-independent: whatever the harness's stdin is, the
+            // argv must agree with what `interactivity` decided. This is the
+            // link that was missing, and it holds whether the suite runs from
+            // a terminal or from CI.
+            for interactive in [true, false] {
+                let expected = crate::utils::interactivity::ContainerStdio::for_intent(interactive);
+                let cmd = argv(interactive);
+                assert_eq!(
+                    has_tty_flag(&cmd),
+                    expected.allocates_tty(),
+                    "interactive={interactive}: tty flag in argv disagrees with {expected:?}"
+                );
+                assert_eq!(
+                    has_stdin_flag(&cmd),
+                    expected.keeps_stdin(),
+                    "interactive={interactive}: stdin flag in argv disagrees with {expected:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn never_requests_a_pty_without_a_terminal() {
+            // The original regression, asserted directly against the argv.
+            // Under CI (and any piped run) stdin is not a terminal, so an
+            // interactive command must still assemble without `-t` — Docker
+            // rejects that combination outright.
+            if std::io::stdin().is_terminal() {
+                // Running from a terminal; the precondition doesn't hold here.
+                // `assembled_command_matches_the_stdio_decision` still covers
+                // the linkage, and CI exercises this branch for real.
+                return;
+            }
+            let cmd = argv(true);
+            assert!(
+                !has_tty_flag(&cmd),
+                "asked for -t with no terminal on stdin; docker refuses this: {cmd:?}"
+            );
+            assert!(
+                has_stdin_flag(&cmd),
+                "stdin should stay open so piped answers still work: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn a_tty_flag_never_appears_without_stdin() {
+            for interactive in [true, false] {
+                let cmd = argv(interactive);
+                if has_tty_flag(&cmd) {
+                    assert!(has_stdin_flag(&cmd), "-t without -i in {cmd:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn failure_detail_none_for_blank_stderr() {
         assert_eq!(container_failure_detail("", 10), None);
