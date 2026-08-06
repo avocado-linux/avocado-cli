@@ -1124,7 +1124,6 @@ impl RootfsInstallCommand {
             RunConfig {
                 container_image: container_image.to_string(),
                 target: target.to_string(),
-                verbose: self.verbose,
                 repo_url: repo_url.clone(),
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),

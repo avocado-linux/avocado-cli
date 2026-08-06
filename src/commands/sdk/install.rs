@@ -433,7 +433,6 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 RunConfig {
                     container_image: container_image.to_string(),
                     target: target.to_string(),
-                    verbose: self.verbose,
                     repo_url: repo_url.map(|s| s.to_string()),
                     repo_release: repo_release.map(|s| s.to_string()),
                     container_args: merged_container_args.cloned(),
