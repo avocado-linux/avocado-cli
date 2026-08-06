@@ -5,6 +5,7 @@ pub mod container_dev;
 pub mod device_tree_overlay;
 #[cfg(target_os = "macos")]
 pub mod disk_writer;
+pub mod ext_deps;
 pub mod ext_fetch;
 pub mod ext_source_reader;
 pub mod ext_version_source;
