@@ -79,6 +79,15 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
 /// `1.0.0`, matching semver pre-release precedence — and `^` for post-release,
 /// so map the pre-release `-` to `~` and the build-metadata `+` to `^`. A plain
 /// release version (no `-`/`+`) is returned unchanged.
+///
+/// Every `-` is rewritten, not just the first. That is deliberate and not a
+/// shortcut: RPM rejects `-` anywhere in `Version:`, so a hyphen *inside* a
+/// pre-release identifier (`1.0.0-rc-1`, legal semver) has to go too. Rewriting
+/// only the leading separator would emit `1.0.0~rc-1`, which `rpmbuild` refuses
+/// outright. The cost is that the mapping is lossy — `1.0.0-rc-1` and
+/// `1.0.0~rc~1` do not round-trip back to semver — which is acceptable because
+/// the semver form is what gets baked into the payload's `avocado.yaml`; this
+/// value exists only to satisfy RPM's own grammar and ordering.
 pub fn to_rpm_version(version: &str) -> String {
     version.replace('-', "~").replace('+', "^")
 }
@@ -149,6 +158,41 @@ mod tests {
         assert_eq!(to_rpm_version("1.0.0-alpha.2"), "1.0.0~alpha.2");
         // Build metadata `+` becomes `^`.
         assert_eq!(to_rpm_version("1.0.0+build.5"), "1.0.0^build.5");
+    }
+
+    /// Semver permits `-` *inside* a pre-release or build identifier, and RPM
+    /// permits it nowhere in `Version:`. So every hyphen is rewritten, and the
+    /// result is intentionally not reversible back to the input semver.
+    #[test]
+    fn test_to_rpm_version_rewrites_hyphens_inside_identifiers() {
+        // `rc-1` is one pre-release identifier that happens to contain a
+        // hyphen. Leaving it would emit `1.0.0~rc-1`, which rpmbuild rejects,
+        // so the inner hyphen becomes `~` as well.
+        assert_eq!(to_rpm_version("1.0.0-rc-1"), "1.0.0~rc~1");
+        assert_eq!(to_rpm_version("1.0.0-pre-release-2"), "1.0.0~pre~release~2");
+        // Same rule inside build metadata.
+        assert_eq!(to_rpm_version("1.0.0+build-5"), "1.0.0^build~5");
+        // No `-` survives anywhere, whatever the shape. This is the property
+        // that actually matters: a surviving hyphen is a spec rpmbuild refuses.
+        for v in [
+            "1.0.0-rc-1",
+            "1.0.0+build-5",
+            "1.0.0-rc.1+build-5",
+            "2.0.0-a-b-c+d-e-f",
+        ] {
+            let mapped = to_rpm_version(v);
+            assert!(!mapped.contains('-'), "{v} -> {mapped} still has a hyphen");
+        }
+    }
+
+    #[test]
+    fn test_to_rpm_version_handles_prerelease_and_build_together() {
+        // Both separators present: `-` -> `~` and `+` -> `^` in one pass, with
+        // the pre-release still ordering before the release.
+        assert_eq!(to_rpm_version("1.0.0-rc.1+build.5"), "1.0.0~rc.1^build.5");
+        assert_eq!(to_rpm_version("1.0.0-rc-1+build-5"), "1.0.0~rc~1^build~5");
+        // The real shipping shape for this project.
+        assert_eq!(to_rpm_version("1.0.0-rc.1"), "1.0.0~rc.1");
     }
 
     #[test]
