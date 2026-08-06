@@ -4,7 +4,7 @@
 //! and installs them to `$AVOCADO_PREFIX/includes/<ext_name>/`.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -280,23 +280,15 @@ impl ExtFetchCommand {
                     ..
                 } = &effective_source
                 {
-                    let pkg_name = package.as_deref().unwrap_or(ext_name).to_string();
                     package_batch.push(PackageFetchEntry::from_package_source(
                         ext_name,
                         package.as_deref(),
                         version,
                         repo_name.as_deref(),
                     ));
-                    lock_file.set_extension_source(
-                        &target,
-                        ext_name,
-                        ExtensionSourceLock {
-                            source_type: "package".to_string(),
-                            package: Some(pkg_name),
-                            version: Some(version.clone()),
-                        },
-                    );
-                    lock_file_dirty = true;
+                    // Lock entries are written *after* the transaction, from
+                    // the installroot's rpmdb — see below. Recording the
+                    // requested version here would pin `"*"` as `"*"`.
                     fetched_count += 1;
                     continue;
                 }
@@ -329,6 +321,40 @@ impl ExtFetchCommand {
                 }
             }
 
+            // Replay dependencies the lock already recorded, pinned to the
+            // versions they resolved to last time.
+            //
+            // This is what makes a clean checkout reproducible. An implied
+            // dependency is named nowhere in `avocado.yaml` — only the lock
+            // knows it exists — so without seeding it here, the first fetch on
+            // a fresh tree lets the depsolver choose freely and quietly
+            // produces a different closure than the lock describes.
+            //
+            // Declared extensions are skipped: they are already in the batch
+            // carrying the author's own constraint, which outranks the lock.
+            let declared: HashSet<String> =
+                package_batch.iter().map(|e| e.ext_name.clone()).collect();
+            for (name, pin) in lock_file.implied_extension_sources(&target) {
+                if declared.contains(&name) {
+                    continue;
+                }
+                let Some(version) = pin.version.as_deref() else {
+                    continue;
+                };
+                if self.verbose {
+                    print_info(
+                        &format!("Pinning locked dependency '{name}' to {version}"),
+                        OutputLevel::Normal,
+                    );
+                }
+                package_batch.push(PackageFetchEntry::from_package_source(
+                    &name,
+                    pin.package.as_deref(),
+                    version,
+                    None,
+                ));
+            }
+
             // One transaction for every package-source extension. dnf resolves and
             // installs any dependency extensions beyond those named here.
             if !package_batch.is_empty() {
@@ -339,9 +365,39 @@ impl ExtFetchCommand {
                     ),
                     OutputLevel::Normal,
                 );
-                fetcher
+                let resolved = fetcher
                     .fetch_packages(&package_batch, force_this_round)
                     .await?;
+
+                // Record what the installroot actually holds — the only
+                // reproducible answer. It covers extensions the depsolver
+                // pulled in unasked, and resolves `version: "*"` to a real
+                // NEVRA instead of round-tripping the wildcard.
+                let requested: HashMap<&str, &PackageFetchEntry> = package_batch
+                    .iter()
+                    .map(|e| (e.package_name.as_str(), e))
+                    .collect();
+                for (pkg_name, version) in &resolved {
+                    let entry = requested.get(pkg_name.as_str());
+                    // An installed package nobody asked for is a dependency the
+                    // depsolver added. Its extension name is its package name —
+                    // only a declared entry can carry a `source.package` rename.
+                    let ext_name = entry
+                        .map(|e| e.ext_name.clone())
+                        .unwrap_or_else(|| pkg_name.clone());
+                    lock_file.set_extension_source(
+                        &target,
+                        &ext_name,
+                        ExtensionSourceLock {
+                            source_type: "package".to_string(),
+                            package: Some(pkg_name.clone()),
+                            version: Some(version.clone()),
+                            implied: entry.is_none(),
+                        },
+                    );
+                    lock_file_dirty = true;
+                }
+
                 print_success(
                     &format!(
                         "Successfully fetched {} package extension(s).",

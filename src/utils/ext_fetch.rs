@@ -60,6 +60,40 @@ impl PackageFetchEntry {
     }
 }
 
+/// Delimiters around the post-install rpmdb report, so it can be picked out of
+/// dnf's own chatter on stdout.
+const INSTALLED_REPORT_BEGIN: &str = "---avocado-installed-extensions-begin---";
+const INSTALLED_REPORT_END: &str = "---avocado-installed-extensions-end---";
+
+/// Parse the `NAME VERSION-RELEASE` block emitted after a batched install.
+///
+/// Returns package name -> resolved version. Anything outside the delimiters
+/// is dnf output and ignored.
+fn parse_installed_report(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut inside = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == INSTALLED_REPORT_BEGIN {
+            inside = true;
+            continue;
+        }
+        if line == INSTALLED_REPORT_END {
+            break;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((name, version)) = line.split_once(char::is_whitespace) {
+            let (name, version) = (name.trim(), version.trim());
+            if !name.is_empty() && !version.is_empty() {
+                out.insert(name.to_string(), version.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Extension fetcher for downloading and installing remote extensions
 pub struct ExtensionFetcher {
     /// Path to the main configuration file
@@ -209,7 +243,12 @@ impl ExtensionFetcher {
     /// grouped by `repo_name` and each group gets its own transaction. In the
     /// overwhelmingly common case every entry has `repo_name: None` and this is
     /// a single group.
-    pub async fn fetch_packages(&self, entries: &[PackageFetchEntry], force: bool) -> Result<()> {
+    pub async fn fetch_packages(
+        &self,
+        entries: &[PackageFetchEntry],
+        force: bool,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut resolved = std::collections::HashMap::new();
         let mut repos: Vec<Option<String>> = Vec::new();
         for e in entries {
             if !repos.contains(&e.repo_name) {
@@ -223,11 +262,13 @@ impl ExtensionFetcher {
                 .filter(|e| e.repo_name == repo)
                 .cloned()
                 .collect();
-            self.fetch_package_group(&group, repo.as_deref(), force)
-                .await?;
+            resolved.extend(
+                self.fetch_package_group(&group, repo.as_deref(), force)
+                    .await?,
+            );
         }
 
-        Ok(())
+        Ok(resolved)
     }
 
     async fn fetch_package_group(
@@ -235,9 +276,9 @@ impl ExtensionFetcher {
         entries: &[PackageFetchEntry],
         repo_name: Option<&str>,
         force: bool,
-    ) -> Result<()> {
+    ) -> Result<std::collections::HashMap<String, String>> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(std::collections::HashMap::new());
         }
 
         if self.verbose {
@@ -326,6 +367,7 @@ fi
 if [ -n "$NESTED_SPECS" ]; then
     echo "Installing nested extensions into shared includes installroot:$NESTED_SPECS"
     mkdir -p "$AVOCADO_PREFIX/includes"
+
     # One transaction: dnf resolves each package's `Requires: avocado-ext(...)`
     # and pulls in any dependency extensions not named explicitly here.
     RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
@@ -333,6 +375,15 @@ if [ -n "$NESTED_SPECS" ]; then
     $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {repo_arg} \
         --installroot="$AVOCADO_PREFIX/includes" -y install $NESTED_SPECS
 fi
+
+# Report what the installroot actually holds now. The requested spec is not
+# the answer: `version: "*"` requests nothing in particular, and the depsolver
+# may have pulled in extensions nobody named. Only the rpmdb knows the truth,
+# and the lock needs the truth to be reproducible.
+echo "{INSTALLED_REPORT_BEGIN}"
+rpm --root="$AVOCADO_PREFIX/includes" -qa \
+    --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}}\n' 2>/dev/null | sort
+echo "{INSTALLED_REPORT_END}"
 "#
         );
 
@@ -351,18 +402,33 @@ fi
             ..Default::default()
         };
 
-        if !container_helper.run_in_container(run_config).await? {
+        let out = container_helper
+            .run_in_container_capture(run_config)
+            .await?;
+        if !out.success {
             return Err(anyhow::anyhow!(
-                "Failed to fetch package extension(s): {}",
+                "Failed to fetch package extension(s): {}{}",
                 entries
                     .iter()
                     .map(|e| e.ext_name.as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                crate::utils::container::container_failure_detail(
+                    &out.stderr,
+                    crate::utils::container::STDERR_TAIL_LINES
+                )
+                .map(|d| format!("\n{d}"))
+                .unwrap_or_default()
             ));
         }
 
-        Ok(())
+        // The container's own progress output is suppressed by capture, so
+        // echo it when the user asked to see it.
+        if self.verbose && !out.stdout.is_empty() {
+            print_info(out.stdout.trim_end(), OutputLevel::Normal);
+        }
+
+        Ok(parse_installed_report(&out.stdout))
     }
 
     /// Fetch an extension from the avocado package repository
@@ -662,6 +728,70 @@ echo "Successfully fetched extension '{ext_name}' from git"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- post-install resolved-version report ---------------------------
+
+    #[test]
+    fn parses_the_delimited_report_and_ignores_dnf_chatter() {
+        let stdout = format!(
+            "Last metadata expiration check: 0:00:01 ago.\n\
+             Installing:\n\
+             \x20 avocado-ext-deptest-app-a  noarch  0.1.0-r0\n\
+             Complete!\n\
+             {INSTALLED_REPORT_BEGIN}\n\
+             avocado-ext-deptest-app-a 0.1.0-r0\n\
+             avocado-ext-deptest-base 1.2.0-r0\n\
+             avocado-ext-deptest-mid 0.3.0-r0\n\
+             {INSTALLED_REPORT_END}\n"
+        );
+        let got = parse_installed_report(&stdout);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got["avocado-ext-deptest-base"], "1.2.0-r0");
+        assert_eq!(got["avocado-ext-deptest-mid"], "0.3.0-r0");
+        // The "Installing:" table above must not be mistaken for the report.
+        assert!(!got.contains_key("Installing:"));
+    }
+
+    #[test]
+    fn report_absent_or_empty_yields_nothing_rather_than_garbage() {
+        assert!(parse_installed_report("").is_empty());
+        assert!(parse_installed_report("Complete!\nno markers here\n").is_empty());
+        assert!(parse_installed_report(&format!(
+            "{INSTALLED_REPORT_BEGIN}\n{INSTALLED_REPORT_END}\n"
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn report_tolerates_blank_and_malformed_lines() {
+        let stdout = format!(
+            "{INSTALLED_REPORT_BEGIN}\n\
+             \n\
+             no-version-here\n\
+             good-pkg 1.0.0-r0\n\
+             {INSTALLED_REPORT_END}\n"
+        );
+        let got = parse_installed_report(&stdout);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["good-pkg"], "1.0.0-r0");
+    }
+
+    #[test]
+    fn a_locked_version_produces_a_pinned_spec() {
+        // The round trip that makes a rebuild reproducible: whatever the rpmdb
+        // reported becomes the spec handed to the next depsolve.
+        let e = PackageFetchEntry::from_package_source(
+            "avocado-ext-deptest-base",
+            None,
+            "1.2.0-r0",
+            None,
+        );
+        assert_eq!(e.package_spec, "avocado-ext-deptest-base-1.2.0-r0");
+        assert_ne!(
+            e.package_spec, "avocado-ext-deptest-base",
+            "a pinned entry must not degrade to a bare name"
+        );
+    }
 
     #[test]
     fn test_package_entry_uses_extension_name_by_default() {
