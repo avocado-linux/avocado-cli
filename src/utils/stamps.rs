@@ -1058,7 +1058,57 @@ pub fn compute_ext_install_input_hash(
     config: &serde_yaml::Value,
     ext_name: &str,
 ) -> Result<StampInputs> {
+    compute_ext_install_input_hash_with_deps(config, ext_name, &[])
+}
+
+/// Like [`compute_ext_install_input_hash`], but folds in the state of the
+/// extensions this one was seeded from.
+///
+/// An extension de-duplicated against a dependency only ships the files that
+/// dependency does *not* provide, so its image is a function of the
+/// dependency's contents as well as its own config. Without that in the hash,
+/// changing a dependency leaves every dependent's stamp valid and their
+/// sysroots stale.
+///
+/// The dangerous direction is subtle: if a dependency **drops** a package, the
+/// dependency rebuilds correctly while the dependent keeps an image that
+/// omitted those files precisely because the dependency used to supply them.
+/// Nothing then provides them, and the gap only appears in the merged `/usr`
+/// on-device. Over-invalidating costs a rebuild; under-invalidating ships a
+/// broken image.
+///
+/// `dep_state` is `(dependency name, fingerprint)` — typically the
+/// dependency's resolved package versions plus its own source version, taken
+/// from the lock. Topological install order guarantees those are current
+/// before a dependent's hash is computed.
+///
+/// Known gap: a fingerprint built from the lock's declared packages does not
+/// move when a *transitive* rpm dependency drifts beneath the dependency (say
+/// openssl bumping under openssh while openssh's own version holds). Catching
+/// that needs the dependency's full sysroot NVRA set.
+pub fn compute_ext_install_input_hash_with_deps(
+    config: &serde_yaml::Value,
+    ext_name: &str,
+    dep_state: &[(String, String)],
+) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
+
+    if !dep_state.is_empty() {
+        // Sorted so the hash does not depend on map iteration order.
+        let mut sorted = dep_state.to_vec();
+        sorted.sort();
+        let mut deps = serde_yaml::Mapping::new();
+        for (name, fingerprint) in sorted {
+            deps.insert(
+                serde_yaml::Value::String(name),
+                serde_yaml::Value::String(fingerprint),
+            );
+        }
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.seeded_from")),
+            serde_yaml::Value::Mapping(deps),
+        );
+    }
 
     if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
         if let Some(deps) = ext.get("packages") {
@@ -3597,6 +3647,69 @@ extensions:
         compute_ext_install_input_hash(value, "my-ext")
             .unwrap()
             .config_hash
+    }
+
+    fn ext_install_hash_with_deps(value: &serde_yaml::Value, deps: &[(String, String)]) -> String {
+        compute_ext_install_input_hash_with_deps(value, "my-ext", deps)
+            .unwrap()
+            .config_hash
+    }
+
+    fn dep(name: &str, fingerprint: &str) -> (String, String) {
+        (name.to_string(), fingerprint.to_string())
+    }
+
+    #[test]
+    fn dependency_change_invalidates_the_dependent() {
+        // The reason this exists: a de-duplicated extension only ships what
+        // its dependency does not provide, so its image is a function of the
+        // dependency's contents. Without this the dependent's stamp stays
+        // valid, its sysroot stays seeded from the old dependency, and if the
+        // dependency *dropped* a package nothing provides those files at all.
+        let cfg = ext_with_extras("");
+        let before = ext_install_hash_with_deps(&cfg, &[dep("base", "1.2.0|openssh=9.6p1")]);
+        let after = ext_install_hash_with_deps(&cfg, &[dep("base", "1.2.0|openssh=9.7p1")]);
+        assert_ne!(
+            before, after,
+            "a dependency's package change must invalidate its dependent"
+        );
+    }
+
+    #[test]
+    fn dependency_version_bump_invalidates_the_dependent() {
+        let cfg = ext_with_extras("");
+        let before = ext_install_hash_with_deps(&cfg, &[dep("base", "1.2.0|openssh=9.6p1")]);
+        let after = ext_install_hash_with_deps(&cfg, &[dep("base", "1.3.0|openssh=9.6p1")]);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn identical_dependency_state_is_stable() {
+        // Over-invalidating costs a needless rebuild every run, which erodes
+        // trust in stamps as much as under-invalidating does.
+        let cfg = ext_with_extras("");
+        let a = ext_install_hash_with_deps(&cfg, &[dep("base", "1.2.0|openssh=9.6p1")]);
+        let b = ext_install_hash_with_deps(&cfg, &[dep("base", "1.2.0|openssh=9.6p1")]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dependency_order_does_not_affect_the_hash() {
+        let cfg = ext_with_extras("");
+        let a = ext_install_hash_with_deps(&cfg, &[dep("base", "1"), dep("mid", "2")]);
+        let b = ext_install_hash_with_deps(&cfg, &[dep("mid", "2"), dep("base", "1")]);
+        assert_eq!(a, b, "hash must not depend on iteration order");
+    }
+
+    #[test]
+    fn no_dependencies_matches_the_plain_hash() {
+        // Extensions without `depends_on` must keep their existing stamps —
+        // this change must not invalidate every extension in every project.
+        let cfg = ext_with_extras("");
+        assert_eq!(
+            ext_install_hash(&cfg),
+            ext_install_hash_with_deps(&cfg, &[])
+        );
     }
 
     fn ext_build_hash(value: &serde_yaml::Value) -> String {
