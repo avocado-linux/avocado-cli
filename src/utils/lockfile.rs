@@ -1486,6 +1486,17 @@ impl LockFile {
     }
 
     /// Get the source metadata for a fetched extension
+    /// Resolved package versions recorded for an extension's sysroot.
+    ///
+    /// Used to fingerprint a dependency so its dependents invalidate when its
+    /// contents change.
+    pub fn get_extension_packages(&self, target: &str, ext_name: &str) -> Option<&PackageVersions> {
+        self.targets
+            .get(target)
+            .and_then(|tl| tl.extensions.get(ext_name))
+            .map(|ext| &ext.packages)
+    }
+
     pub fn get_extension_source(
         &self,
         target: &str,
