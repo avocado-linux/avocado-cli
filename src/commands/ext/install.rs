@@ -683,7 +683,20 @@ impl ExtInstallCommand {
             lock_file,
         );
 
-        if needs_clean_reinstall {
+        // The rpmdb seed is applied only when the sysroot is created, so a
+        // surviving sysroot keeps whatever it was seeded from originally.
+        //
+        // That silently defeats de-duplication: an extension first built
+        // before it had a dependency — or before its dependency changed —
+        // keeps a rootfs-seeded rpmdb, dnf sees the shared packages as absent,
+        // and installs a private copy again. The seed source is part of the
+        // sysroot's identity, so any reason to re-seed is a reason to recreate.
+        //
+        // Reaching here at all means the stamp was already judged stale (or
+        // stamps are off), so rebuilding a dependent is not extra work in the
+        // steady state.
+        let reseed_required = !direct_deps.is_empty();
+        if needs_clean_reinstall || self.force || reseed_required {
             // Clean the sysroot so it will be recreated fresh below
             let clean_command = format!(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}""#);
 
