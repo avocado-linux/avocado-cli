@@ -75,20 +75,48 @@ pub fn print_warning(message: &str, _level: OutputLevel) {
 /// renderer but JSON output active, goes to stderr - stdout carries the NDJSON
 /// stream and prose would corrupt it.
 pub fn print_warning_above(message: &str) {
-    let formatted = format!("\x1b[93m[WARNING]\x1b[0m {message}");
-    match warning_sink(
-        crate::utils::tui::get_active_renderer().is_some(),
-        crate::utils::output_format::is_json_output_active(),
-    ) {
-        WarningSink::Renderer => {
-            // Unwrap is sound: the sink is Renderer only when one is active, and
-            // nothing clears it mid-call.
-            crate::utils::tui::get_active_renderer()
-                .expect("renderer active")
-                .print_above(&formatted)
-        }
-        WarningSink::Stderr => eprintln!("{formatted}"),
-        WarningSink::Stdout => println!("{formatted}"),
+    // stdout carries the NDJSON stream, so the human line goes to stderr under
+    // --json (see print_notice_above). Without an event too, a consumer reading
+    // only the stream sees nothing at all and renders an unqualified green run -
+    // which is the failure this whole notice exists to prevent, just moved.
+    if crate::utils::output_format::is_json_output_active() {
+        crate::utils::output_format::emit_json_event(
+            &serde_json::json!({"event": "warning", "message": message}),
+        );
+    }
+    print_notice_above(&format!("\x1b[93m[WARNING]\x1b[0m {message}"), |line| {
+        println!("{line}")
+    });
+}
+
+/// Emit `formatted` where neither an active renderer nor the NDJSON stream can
+/// swallow it.
+///
+/// The three-way routing had been open-coded four times (here,
+/// [`crate::utils::container::print_failure_notice`], and
+/// `commands/runtime/build.rs`), each copy re-deriving the same policy. This is
+/// the one implementation; [`warning_sink`] stays separate as the pure,
+/// testable statement of that policy.
+///
+/// `plain` is the emit for the neither-active case and is a parameter because
+/// severity genuinely differs there: a warning belongs on stdout, an error on
+/// stderr. Everything above that case is identical, which is the part worth
+/// sharing.
+///
+/// The renderer `Option` is bound once and matched alongside the sink rather
+/// than looked up a second time behind an `expect`. `get_active_renderer`
+/// returning `None` on the second call is reachable - `clear_active_renderer`
+/// is `pub` and is the first statement of `TaskRenderer::shutdown` - so the
+/// old shape could abort the process while printing an informational notice.
+/// Pairing the two makes that branch fall through to stderr instead of
+/// depending on the interleaving being impossible.
+pub fn print_notice_above(formatted: &str, plain: impl FnOnce(&str)) {
+    let renderer = crate::utils::tui::get_active_renderer();
+    let json_active = crate::utils::output_format::is_json_output_active();
+    match (warning_sink(renderer.is_some(), json_active), renderer) {
+        (WarningSink::Renderer, Some(active)) => active.print_above(formatted),
+        (WarningSink::Renderer, None) | (WarningSink::Stderr, _) => eprintln!("{formatted}"),
+        (WarningSink::Stdout, _) => plain(formatted),
     }
 }
 
@@ -191,16 +219,15 @@ mod tests {
         // and those are the two states `print_warning` drops the message in -
         // which is every interactive run and every JSON run. Each of the four
         // combinations has to reach a real sink.
-        for (renderer, json) in [(true, true), (true, false), (false, true), (false, false)] {
-            let sink = warning_sink(renderer, json);
-            assert!(
-                matches!(
-                    sink,
-                    WarningSink::Renderer | WarningSink::Stderr | WarningSink::Stdout
-                ),
-                "renderer={renderer} json={json} produced {sink:?}"
-            );
-        }
+        //
+        // Asserting the exact sink per combination, not merely that the result
+        // is one of the three variants: a three-variant enum makes that weaker
+        // form unfalsifiable, so it stayed green under a `warning_sink` forced
+        // to return a single arm.
+        assert_eq!(warning_sink(true, true), WarningSink::Renderer);
+        assert_eq!(warning_sink(true, false), WarningSink::Renderer);
+        assert_eq!(warning_sink(false, true), WarningSink::Stderr);
+        assert_eq!(warning_sink(false, false), WarningSink::Stdout);
     }
 
     #[test]

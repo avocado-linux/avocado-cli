@@ -403,13 +403,7 @@ pub fn container_failure_message(context: &str, stderr: &str) -> String {
 /// because print_error is a no-op in TUI/JSON modes, which would silently
 /// eat container failure diagnostics.
 pub(crate) fn print_failure_notice(msg: &str) {
-    if let Some(renderer) = crate::utils::tui::get_active_renderer() {
-        renderer.print_above(msg);
-    } else if crate::utils::output_format::is_json_output_active() {
-        eprintln!("{msg}");
-    } else {
-        print_error(msg, OutputLevel::Normal);
-    }
+    crate::utils::output::print_notice_above(msg, |line| print_error(line, OutputLevel::Normal));
 }
 
 /// Convert captured output bytes to a String without an extra copy for
