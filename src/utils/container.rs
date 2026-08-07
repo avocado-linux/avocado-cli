@@ -1181,10 +1181,16 @@ impl SdkContainer {
             extra_args.extend(args.clone());
         }
 
-        // Same intent-vs-capability rule as the local path: a remote container
-        // gets a PTY only if this process actually has one to forward.
+        // Same intent-vs-capability rule as the local path, including the
+        // per-run TUI context. Using `for_intent` here would consult only the
+        // global renderer, so a caller that set `tui_context` without
+        // registering one would get `-i`/`-t` on the remote path while its
+        // output is being captured — the exact local/remote divergence this
+        // module exists to remove.
+        let mut caps = crate::utils::interactivity::StdioCapabilities::detect();
+        caps.tui_active |= config.tui_context.is_some();
         for flag in
-            crate::utils::interactivity::ContainerStdio::for_intent(config.interactive).flags()
+            crate::utils::interactivity::ContainerStdio::decide(config.interactive, &caps).flags()
         {
             extra_args.push((*flag).to_string());
         }
@@ -3170,7 +3176,10 @@ mod tests {
             // link that was missing, and it holds whether the suite runs from
             // a terminal or from CI.
             for interactive in [true, false] {
-                let expected = crate::utils::interactivity::ContainerStdio::for_intent(interactive);
+                let expected = crate::utils::interactivity::ContainerStdio::decide(
+                    interactive,
+                    &crate::utils::interactivity::StdioCapabilities::detect(),
+                );
                 let cmd = argv(interactive);
                 assert_eq!(
                     has_tty_flag(&cmd),

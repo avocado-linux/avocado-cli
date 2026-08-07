@@ -134,11 +134,6 @@ impl ContainerStdio {
         }
     }
 
-    /// Detect the environment and decide in one step.
-    pub fn for_intent(wants_interactive: bool) -> Self {
-        Self::decide(wants_interactive, &StdioCapabilities::detect())
-    }
-
     /// Whether a PTY is allocated. Prefer this to inspecting [`Self::flags`]
     /// so callers and tests never have to spell `-t` themselves — which also
     /// keeps them clear of the source guard that forbids those literals.
@@ -285,7 +280,7 @@ mod tests {
     #[test]
     fn for_intent_actually_consults_stdin() {
         let caps = StdioCapabilities::detect();
-        let got = ContainerStdio::for_intent(true);
+        let got = ContainerStdio::decide(true, &StdioCapabilities::detect());
         let expect_pty = caps.stdin_is_tty && !caps.json_active && !caps.forced_noninteractive;
         assert_eq!(
             got == ContainerStdio::StdinAndTty,
@@ -297,7 +292,7 @@ mod tests {
     #[test]
     fn a_noninteractive_command_never_gets_a_pty_in_any_environment() {
         assert_ne!(
-            ContainerStdio::for_intent(false),
+            ContainerStdio::decide(false, &StdioCapabilities::detect()),
             ContainerStdio::StdinAndTty
         );
     }
@@ -309,7 +304,8 @@ mod tests {
         // disagree about what "interactive" means.
         assert_eq!(
             can_prompt_user(),
-            ContainerStdio::for_intent(true) == ContainerStdio::StdinAndTty
+            ContainerStdio::decide(true, &StdioCapabilities::detect())
+                == ContainerStdio::StdinAndTty
         );
     }
 
@@ -321,7 +317,7 @@ mod tests {
         std::env::set_var("AVOCADO_NONINTERACTIVE", "1");
         assert!(StdioCapabilities::detect().forced_noninteractive);
         assert_ne!(
-            ContainerStdio::for_intent(true),
+            ContainerStdio::decide(true, &StdioCapabilities::detect()),
             ContainerStdio::StdinAndTty,
             "AVOCADO_NONINTERACTIVE must suppress the PTY even on a terminal"
         );

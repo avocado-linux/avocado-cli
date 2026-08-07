@@ -13,14 +13,16 @@
 //! app driver. Reviewing for this by eye does not scale across ~100
 //! `RunConfig` construction sites, so it is checked here instead.
 //!
-//! If this fails: don't add an exemption. Call `ContainerStdio::for_intent`
-//! (or `::decide`) and push `.flags()`.
+//! If this fails: don't add an exemption. Call `ContainerStdio::decide`
+//! with detected capabilities and push `.flags()`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The one module allowed to spell these flags.
-const SANCTIONED: &str = "interactivity.rs";
+/// Compared against the full relative path, not just the file name: a
+/// name-only exemption would silently excuse any new `src/**/interactivity.rs`.
+const SANCTIONED: &str = "utils/interactivity.rs";
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -70,7 +72,8 @@ fn container_stdio_flags_come_only_from_the_interactivity_module() {
     let mut violations = Vec::new();
 
     for file in files {
-        if file.file_name().is_some_and(|n| n == SANCTIONED) {
+        let rel = file.strip_prefix(&src).unwrap_or(&file);
+        if rel.to_string_lossy().replace('\\', "/") == SANCTIONED {
             continue;
         }
         let Ok(text) = fs::read_to_string(&file) else {
@@ -79,7 +82,9 @@ fn container_stdio_flags_come_only_from_the_interactivity_module() {
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
-            // Comments and doc comments may legitimately discuss the flags.
+            // Line and doc comments (`//`, `///`, `//!`) may legitimately
+            // discuss the flags. Block comments are not skipped: no site uses
+            // them here, and matching them reliably would need real parsing.
             if trimmed.starts_with("//") {
                 continue;
             }
@@ -94,7 +99,7 @@ fn container_stdio_flags_come_only_from_the_interactivity_module() {
             }
             if let Some(needle) = offending_snippets(line) {
                 violations.push(format!(
-                    "{}:{}: {} — use ContainerStdio::for_intent(..).flags()",
+                    "{}:{}: {} — use ContainerStdio::decide(..).flags()",
                     file.display(),
                     i + 1,
                     needle
