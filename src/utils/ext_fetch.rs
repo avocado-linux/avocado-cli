@@ -32,7 +32,52 @@ pub struct PackageFetchEntry {
     pub repo_name: Option<String>,
 }
 
+/// Reject values that would be unsafe or ambiguous once interpolated into the
+/// fetch shell script.
+///
+/// The script builds `<ext>|<pkg>|<spec>` triples and splits them in shell, so
+/// a value containing whitespace, a quote, `|`, or a shell metacharacter would
+/// at best corrupt the split and at worst execute. Validating is better than
+/// escaping here: these are RPM package names and directory names under
+/// `includes/`, so none of those characters is ever legitimate — a value
+/// carrying one is a config error worth reporting, not something to quote and
+/// pass through.
+fn validate_shell_safe(field: &str, value: &str) -> Result<()> {
+    const FORBIDDEN: &[char] = &[
+        '|', '\'', '"', '`', '$', '\\', ';', '&', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?',
+        '!', '#', '~', '\n', '\r', '\t',
+    ];
+    if value.is_empty() {
+        anyhow::bail!("Extension {field} is empty.");
+    }
+    if let Some(bad) = value
+        .chars()
+        .find(|c| c.is_whitespace() || FORBIDDEN.contains(c))
+    {
+        anyhow::bail!(
+            "Extension {field} '{value}' contains the character {bad:?}, which is not \
+             valid in an RPM package name or an extension directory name."
+        );
+    }
+    Ok(())
+}
+
 impl PackageFetchEntry {
+    /// Check every value that reaches the fetch script.
+    ///
+    /// Called once per entry before the script is assembled, so a bad name is
+    /// reported by name rather than producing a confusing shell error inside
+    /// the container.
+    fn validate(&self) -> Result<()> {
+        validate_shell_safe("name", &self.ext_name)?;
+        validate_shell_safe("package name", &self.package_name)?;
+        validate_shell_safe("package spec", &self.package_spec)?;
+        if let Some(repo) = &self.repo_name {
+            validate_shell_safe("repo name", repo)?;
+        }
+        Ok(())
+    }
+
     /// Build an entry from a `source: { type: package }` declaration.
     ///
     /// `package` overrides the RPM name when the extension is published under
@@ -279,6 +324,12 @@ impl ExtensionFetcher {
     ) -> Result<std::collections::HashMap<String, String>> {
         if entries.is_empty() {
             return Ok(std::collections::HashMap::new());
+        }
+
+        // Everything below is interpolated into a shell script. Check it here,
+        // once, rather than trusting that config values are well-formed.
+        for entry in entries {
+            entry.validate()?;
         }
 
         if self.verbose {
@@ -791,6 +842,55 @@ mod tests {
             e.package_spec, "avocado-ext-deptest-base",
             "a pinned entry must not degrade to a bare name"
         );
+    }
+
+    // ---- shell-safety validation ----------------------------------------
+
+    #[test]
+    fn ordinary_names_validate() {
+        let e = PackageFetchEntry::from_package_source(
+            "avocado-ext-deptest-base",
+            None,
+            "1.2.0-r0",
+            Some("my-repo"),
+        );
+        assert!(e.validate().is_ok());
+    }
+
+    #[test]
+    fn shell_metacharacters_are_rejected() {
+        for bad in [
+            "ext;rm -rf /",
+            "ext$(whoami)",
+            "ext`id`",
+            "ext name",
+            "ext|other",
+            "ext'quote",
+            "ext\"quote",
+            "ext\nnewline",
+        ] {
+            let e = PackageFetchEntry::from_package_source(bad, None, "1.0.0", None);
+            assert!(
+                e.validate().is_err(),
+                "should have rejected {bad:?} before it reached the shell"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pipe_delimiter_is_rejected_in_every_field() {
+        // The script splits `<ext>|<pkg>|<spec>`, so a pipe anywhere corrupts
+        // the split even without being dangerous.
+        let e = PackageFetchEntry::from_package_source("app", Some("pkg|x"), "1.0.0", None);
+        assert!(e.validate().is_err());
+        let e = PackageFetchEntry::from_package_source("app", None, "1.0.0", Some("repo|x"));
+        assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn empty_values_are_rejected() {
+        let e = PackageFetchEntry::from_package_source("", None, "1.0.0", None);
+        assert!(e.validate().is_err());
     }
 
     #[test]

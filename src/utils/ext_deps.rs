@@ -818,7 +818,17 @@ impl DependencyGraph {
         // Validate the whole closure up front — reuses the cycle, missing-dep,
         // and unfetched-stub diagnostics rather than reimplementing them.
         self.resolve(authored)?;
+        Ok(self.order_runtime_list(authored))
+    }
 
+    /// Order an already-validated closure. Callers that resolved for another
+    /// reason (linting, diagnostics) use this to avoid walking the graph twice.
+    ///
+    /// Ordering only reads edges, so it cannot surface a cycle or a missing
+    /// dependency — passing an unvalidated set here would silently truncate
+    /// rather than report. Use [`Self::resolve_runtime_list`] unless a
+    /// successful [`Self::resolve`] is already in hand.
+    pub fn order_runtime_list(&self, authored: &[String]) -> Vec<RuntimeEntry> {
         let authored_set: HashSet<&str> = authored.iter().map(String::as_str).collect();
         let mut emitted: HashSet<String> = HashSet::new();
         let mut out: Vec<RuntimeEntry> = Vec::new();
@@ -835,7 +845,7 @@ impl DependencyGraph {
             self.push_implied(name, &authored_set, &mut emitted, &mut out);
         }
 
-        Ok(out)
+        out
     }
 
     fn push_implied(
