@@ -10,7 +10,9 @@ use crate::utils::kernel_resolver::{
 };
 use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
-use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::output::{
+    print_debug, print_error, print_info, print_success, print_warning, OutputLevel,
+};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
     compute_ext_install_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
@@ -255,6 +257,83 @@ impl ExtInstallCommand {
             return Ok(());
         }
 
+        // Direct `depends_on` edges per extension, used to pick each one's
+        // rpmdb seed source below.
+        let direct_deps: std::collections::HashMap<String, Vec<String>> =
+            match crate::utils::ext_deps::DependencyGraph::from_composed(&composed, &target) {
+                Ok(graph) => extensions_to_install
+                    .iter()
+                    .filter_map(|(name, _)| {
+                        let node = graph.get(name)?;
+                        if node.depends_on.is_empty() {
+                            return None;
+                        }
+                        Some((
+                            name.clone(),
+                            node.depends_on.iter().map(|d| d.name.clone()).collect(),
+                        ))
+                    })
+                    .collect(),
+                Err(_) => std::collections::HashMap::new(),
+            };
+
+        // Order dependencies before dependents.
+        //
+        // This is the *install* order, deliberately the opposite of the
+        // runtime manifest's parent-first merge order: a dependency's sysroot
+        // has to exist and be fully populated before a dependent can seed its
+        // rpmdb from it. Installing alphabetically would seed from an empty or
+        // half-built dependency and silently defeat de-duplication.
+        let extensions_to_install = {
+            let graph = crate::utils::ext_deps::DependencyGraph::from_composed(&composed, &target)?;
+            let requested: Vec<String> = extensions_to_install
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
+            match graph.resolve(&requested) {
+                Ok(closure) => {
+                    let position = |name: &str| {
+                        closure
+                            .order
+                            .iter()
+                            .position(|n| n == name)
+                            // Anything outside the graph keeps its relative
+                            // place after the ordered members.
+                            .unwrap_or(usize::MAX)
+                    };
+                    let mut ordered = extensions_to_install;
+                    ordered.sort_by_key(|(name, _)| position(name));
+                    if self.verbose {
+                        print_info(
+                            &format!(
+                                "Install order (dependencies first): {}",
+                                ordered
+                                    .iter()
+                                    .map(|(n, _)| n.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ")
+                            ),
+                            OutputLevel::Normal,
+                        );
+                    }
+                    ordered
+                }
+                // A graph that will not resolve is reported by the runtime
+                // build with full context. Installing extensions one by one
+                // still works, just without de-duplication, so do not block
+                // the whole command here.
+                Err(e) => {
+                    if self.verbose {
+                        print_info(
+                            &format!("Dependency ordering unavailable ({e}); installing as listed"),
+                            OutputLevel::Normal,
+                        );
+                    }
+                    extensions_to_install
+                }
+            }
+        };
+
         let ext_names: Vec<&str> = extensions_to_install
             .iter()
             .map(|(n, _)| n.as_str())
@@ -309,6 +388,7 @@ impl ExtInstallCommand {
                 config,
                 parsed,
                 &extensions_to_install,
+                &direct_deps,
                 &container_helper,
                 container_image,
                 &target,
@@ -346,6 +426,7 @@ impl ExtInstallCommand {
         config: &Config,
         parsed: &serde_yaml::Value,
         extensions_to_install: &[(String, ExtensionLocation)],
+        direct_deps: &std::collections::HashMap<String, Vec<String>>,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
@@ -403,6 +484,7 @@ impl ExtInstallCommand {
                     &src_dir,
                     runs_on_context,
                     effective_tui_context,
+                    direct_deps.get(ext_name).map(Vec::as_slice).unwrap_or(&[]),
                 )
                 .await?
             {
@@ -543,6 +625,7 @@ impl ExtInstallCommand {
         src_dir: &Path,
         runs_on_context: Option<&RunsOnContext>,
         effective_tui_context: &Option<TuiContext>,
+        direct_deps: &[String],
     ) -> Result<bool> {
         let sysroot = self.extension_sysroot(extension);
 
@@ -599,8 +682,48 @@ impl ExtInstallCommand {
 
         // Check if the sysroot exists (it may have just been cleaned above, or never created)
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
+
+        // Seed this extension's rpmdb — the mechanism that de-duplicates
+        // shared packages.
+        //
+        // An extension's image is the *net-new files* over whatever its rpmdb
+        // already claims is installed. Seeding from the rootfs alone means a
+        // dependency's packages look absent, so dnf installs a second private
+        // copy and both images ship it. Seeding from the dependency's sysroot
+        // instead makes those packages look present, and dnf omits them.
+        //
+        // A chain composes naturally: mid seeds from base (rootfs ∪ base),
+        // app-b then seeds from mid (rootfs ∪ base ∪ mid). Topological install
+        // order guarantees the dependency's sysroot is already populated.
+        let seed_source = match direct_deps {
+            [] => "$AVOCADO_PREFIX/rootfs".to_string(),
+            [only] => format!("$AVOCADO_EXT_SYSROOTS/{only}"),
+            [first, rest @ ..] => {
+                // True diamond. Seeding from one dependency still de-duplicates
+                // that branch; packages unique to the others are not yet
+                // subtracted, so they ship twice. Correct, just not optimal —
+                // say so rather than let it look fully deduplicated.
+                print_warning(
+                    &format!(
+                        "Extension '{extension}' depends on {} extensions; \
+                         de-duplicating against '{first}' only. Packages unique to {} \
+                         may be duplicated in this image.",
+                        direct_deps.len(),
+                        rest.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+                format!("$AVOCADO_EXT_SYSROOTS/{first}")
+            }
+        };
+        if self.verbose && !direct_deps.is_empty() {
+            print_info(
+                &format!("Seeding '{extension}' rpmdb from {seed_source}"),
+                OutputLevel::Normal,
+            );
+        }
         let setup_command = format!(
-            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf {seed_source}/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
         );
 
         let run_config = RunConfig {
