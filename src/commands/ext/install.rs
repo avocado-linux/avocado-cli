@@ -15,7 +15,7 @@ use crate::utils::output::{
 };
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
-    compute_ext_install_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
+    compute_ext_install_input_hash_with_deps, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -498,7 +498,34 @@ impl ExtInstallCommand {
                     ctx.renderer
                         .append_output(&ctx.task_id, "Writing install stamp...".to_string());
                 }
-                let inputs = compute_ext_install_input_hash(parsed, ext_name)?;
+                // Fold in the state of whatever this extension was seeded
+                // from, so changing a dependency invalidates its dependents.
+                // Read after the dependency installed — topological order
+                // guarantees its lock entry is already current.
+                let dep_state: Vec<(String, String)> = direct_deps
+                    .get(ext_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|dep| {
+                        let versions = lock_file
+                            .get_extension_packages(target, dep)
+                            .map(|pkgs| {
+                                let mut v: Vec<String> =
+                                    pkgs.iter().map(|(k, val)| format!("{k}={val:?}")).collect();
+                                v.sort();
+                                v.join(",")
+                            })
+                            .unwrap_or_default();
+                        let source = lock_file
+                            .get_extension_source(target, dep)
+                            .and_then(|s| s.version.clone())
+                            .unwrap_or_default();
+                        (dep.clone(), format!("{source}|{versions}"))
+                    })
+                    .collect();
+                let inputs =
+                    compute_ext_install_input_hash_with_deps(parsed, ext_name, &dep_state)?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;

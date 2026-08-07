@@ -4589,6 +4589,17 @@ impl Config {
     /// Find an extension in the full dependency tree (local and external)
     /// This is a comprehensive search that looks through all runtime dependencies
     /// and their transitive extension dependencies
+    /// Whether `extensions.<name>` exists in an already-interpolated value.
+    fn find_ext_key(parsed: &serde_yaml::Value, extension_name: &str) -> Option<()> {
+        parsed
+            .get("extensions")?
+            .as_mapping()?
+            .keys()
+            .filter_map(|k| k.as_str())
+            .any(|k| k == extension_name)
+            .then_some(())
+    }
+
     pub fn find_extension_in_dependency_tree(
         &self,
         config_path: &str,
@@ -4596,8 +4607,24 @@ impl Config {
         target: &str,
     ) -> Result<Option<ExtensionLocation>> {
         let content = std::fs::read_to_string(config_path)?;
-        let parsed =
+        let mut parsed =
             Self::parse_config_value_with_interpolation(config_path, &content, Some(target))?;
+
+        // Reading only the on-disk file misses extensions the depsolver pulled
+        // in: a `depends_on` target is named nowhere in the consumer's yaml, so
+        // `ext install <that name>` reported "not found in configuration" for
+        // an extension `ext list` had just shown. Fall back to the composed
+        // value, which merges the installroot.
+        //
+        // Composition is the slower path, so it is only consulted when the
+        // cheap lookup comes up empty.
+        if Self::find_ext_key(&parsed, extension_name).is_none() {
+            if let Ok(composed) = Self::load_composed(config_path, Some(target)) {
+                if Self::find_ext_key(&composed.merged_value, extension_name).is_some() {
+                    parsed = composed.merged_value;
+                }
+            }
+        }
 
         // First check if it's defined in the ext section.
         // Keys are already interpolated by parse_config_value_with_interpolation.
