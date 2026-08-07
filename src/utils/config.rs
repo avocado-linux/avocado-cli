@@ -2152,10 +2152,15 @@ impl Config {
             // in `includes/` and the next iteration reads them from there.
             // A dependency that is not installed simply fails its read and is
             // skipped; the resolver then reports it by name with the chain.
+            // Template-aware: a remote extension may key its own section with
+            // a template (`avocado-bsp-{{ avocado.target }}`) while `ext_name`
+            // is already interpolated. An exact-key lookup silently misses
+            // those, and their `depends_on` targets would never be queued —
+            // which is precisely the BSP-shaped case.
             if let Some(this_ext) = ext_config
                 .get("extensions")
                 .and_then(|e| e.as_mapping())
-                .and_then(|m| m.get(serde_yaml::Value::String(ext_name.clone())))
+                .and_then(|m| Self::find_matching_ext_key(m, &ext_name).and_then(|k| m.get(&k)))
             {
                 for dep_name in crate::utils::ext_deps::dependency_names(this_ext) {
                     if queued.contains(&dep_name) {
