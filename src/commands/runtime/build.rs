@@ -214,7 +214,6 @@ impl RuntimeBuildCommand {
 
     /// Internal implementation of the build logic
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn execute_build_internal(
         &self,
         config: &crate::utils::config::Config,
@@ -2720,7 +2719,9 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
                 print_warning(&warning, OutputLevel::Normal);
             }
 
-            let resolved = graph.resolve_runtime_list(&authored)?;
+            // `closure` above already validated the graph, so order without
+            // re-walking it.
+            let resolved = graph.order_runtime_list(&authored);
 
             if self.verbose {
                 let implied: Vec<&str> = resolved
