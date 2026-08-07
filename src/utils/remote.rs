@@ -200,7 +200,18 @@ impl SshClient {
                     OutputLevel::Normal,
                 );
             }
-            return Ok(RemoteVersionCheck::Verified(local_version.to_string()));
+            // Skipped, not Verified: no version was read, and returning Verified
+            // printed "[SUCCESS] Remote avocado version: <local>" for a check
+            // that never ran - the precise defect Skipped exists to remove.
+            //
+            // The warning is empty on purpose. Same machine, same binary, so
+            // there is nothing for the user to act on; an empty warning renders
+            // as no notice at all rather than a [WARNING] line on every
+            // `--runs-on localhost` run.
+            return Ok(RemoteVersionCheck::Skipped {
+                reported: local_version.to_string(),
+                warning: String::new(),
+            });
         }
 
         if self.verbose {
@@ -1001,6 +1012,37 @@ pub enum VersionGate {
 /// its whole body with `None => {}` left both `cargo test --lib` and
 /// `tests/runs_on_integration.rs` passing, which is how a silent skip got
 /// through review in the first place.
+/// What a caller should emit for a [`RemoteVersionCheck`].
+///
+/// Extracted from `runs_on`'s match arm so the routing is testable. That arm
+/// had no coverage at all: reverting it to the pre-gate
+/// `print_success("Remote avocado version: {reported}")` left the entire suite
+/// green, so the bug this PR fixes could have come straight back.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VersionNotice {
+    /// A real comparison happened - safe to report green.
+    Success(String),
+    /// The check did not run; say so where a renderer cannot swallow it.
+    Warning(String),
+    /// Skipped with nothing worth saying (localhost).
+    Silent,
+}
+
+/// Map a version-check outcome to the notice it deserves.
+///
+/// The load-bearing property is that [`RemoteVersionCheck::Skipped`] can never
+/// produce [`VersionNotice::Success`]: a skipped check must not render as a
+/// green version line.
+pub fn version_check_notice(check: &RemoteVersionCheck) -> VersionNotice {
+    match check {
+        RemoteVersionCheck::Verified(version) => {
+            VersionNotice::Success(format!("Remote avocado version: {version}"))
+        }
+        RemoteVersionCheck::Skipped { warning, .. } if warning.is_empty() => VersionNotice::Silent,
+        RemoteVersionCheck::Skipped { warning, .. } => VersionNotice::Warning(warning.clone()),
+    }
+}
+
 pub fn version_gate_outcome(
     local_version: &str,
     remote_version: &str,
@@ -1330,5 +1372,54 @@ mod tests {
         let too_old = version_gate_outcome("0.21.0", "0.20.0", "user@host");
         assert!(matches!(unreadable, VersionGate::Unreadable(_)));
         assert!(matches!(too_old, VersionGate::TooOld(_)));
+    }
+
+    #[test]
+    fn version_gate_reports_compatible_when_the_remote_is_new_enough() {
+        // The third arm. Its two siblings were covered and this one was not, so
+        // a gate that never returned Compatible would have gone unnoticed.
+        assert_eq!(
+            version_gate_outcome("0.20.0", "0.20.0", "user@host"),
+            VersionGate::Compatible
+        );
+        assert_eq!(
+            version_gate_outcome("0.20.0", "0.21.0", "user@host"),
+            VersionGate::Compatible
+        );
+    }
+
+    #[test]
+    fn a_skipped_check_never_renders_as_a_green_version_line() {
+        // The whole point of the Skipped variant. Reverting runs_on's arm to
+        // print_success left the suite green because nothing tested the
+        // mapping, so the bug this PR fixes could return unobserved.
+        let skipped = RemoteVersionCheck::Skipped {
+            reported: "avocado (dev build)".to_string(),
+            warning: "the version check was skipped".to_string(),
+        };
+        assert_eq!(
+            version_check_notice(&skipped),
+            VersionNotice::Warning("the version check was skipped".to_string())
+        );
+    }
+
+    #[test]
+    fn a_verified_check_renders_the_version_it_actually_read() {
+        assert_eq!(
+            version_check_notice(&RemoteVersionCheck::Verified("0.21.0".to_string())),
+            VersionNotice::Success("Remote avocado version: 0.21.0".to_string())
+        );
+    }
+
+    #[test]
+    fn a_skipped_check_with_no_warning_says_nothing() {
+        // The localhost path. It has no version to report and nothing to warn
+        // about, so it must produce neither a green line nor a [WARNING] on
+        // every `--runs-on localhost` run.
+        let localhost = RemoteVersionCheck::Skipped {
+            reported: "0.21.0".to_string(),
+            warning: String::new(),
+        };
+        assert_eq!(version_check_notice(&localhost), VersionNotice::Silent);
     }
 }
