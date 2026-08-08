@@ -70,9 +70,14 @@
 # therefore emits no tag event, so the watcher cannot see it; the script triggers
 # `container dev sync` itself in that case.
 #
-# Still manual for a real board: the agent binary must exist on it. Either it ships
-# in the runtime as avocado-ext-container-agent-dev, or cross-compile it for
-# aarch64-unknown-linux-musl (runbook B1, swapping the target triple) and copy it in.
+# The agent needs to be ON the board before any of this works, and the supported
+# way is the runtime: include avocado-ext-container-agent-dev and it ships as a
+# real unit, which is what AGENT_UNIT below expects. Verified on an FRDM-IMX93 -
+# `demo.sh agent` restarts that unit and nothing is hand-placed.
+#
+# Cross-compiling the binary for aarch64-unknown-linux-musl (runbook B1, swapping
+# the target triple) and copying it in still works, but it is the fallback for a
+# board whose runtime predates the extension, not the normal path.
 
 set -uo pipefail
 
