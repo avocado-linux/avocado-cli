@@ -342,7 +342,11 @@ ExecStartPre=-/usr/bin/docker rm -f $CONTAINER
 # container ID, which tells you nothing about which side of the loop you are on.
 ExecStart=/usr/bin/docker run --rm --name $CONTAINER --hostname %H $TEST_IMAGE
 ExecStop=-/usr/bin/docker stop $CONTAINER
-Restart=on-failure
+# always, not on-failure: --rm plus the default Type=simple means a container
+# that exits cleanly - the app stopping, or an external `docker stop` - leaves
+# the unit inactive with nothing to bring it back. on-failure covers only the
+# crash case, so the demo target silently stops running the thing being demoed.
+Restart=always
 
 [Install]
 WantedBy=multi-user.target
