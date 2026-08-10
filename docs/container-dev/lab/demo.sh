@@ -127,6 +127,22 @@ ctx() {
 
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
 
+# $LAB/env.sh is state written by setup-lab.sh and it describes THE LAB VM: its
+# ssh alias, its SLIRP host alias, its forwarded engine socket. Sourcing it uses
+# `export`, so it overrides whatever the caller set - which is silently wrong on
+# real hardware. A leftover env.sh from an earlier lab run sent an `up` aimed at
+# a board to 127.0.0.1:2222 instead, and the only symptom was ssh refusing a
+# connection to a VM that was not running.
+#
+# LAB_VM=0 means there is no lab VM, so there is nothing in that file worth
+# having. Skip it rather than letting it win.
+source_lab_env() {
+  [ "$LAB_VM" = 1 ] || return 0
+  [ -f "$LAB/env.sh" ] || return 0
+  # shellcheck source=/dev/null
+  source "$LAB/env.sh"
+}
+
 # `grep -c` prints 0 AND exits 1 on no-match, so a naive `|| echo 0` prints twice.
 count_in() { local n; n="$(grep -c "$1" "$2" 2>/dev/null)"; echo "${n:-0}"; }
 
@@ -348,7 +364,7 @@ ExecStartPre=-/usr/bin/docker rm -f $CONTAINER
 ExecStart=/usr/bin/docker run --rm --name $CONTAINER --hostname %H $TEST_IMAGE
 ExecStop=-/usr/bin/docker stop $CONTAINER
 # always, not on-failure: --rm plus the default Type=simple means a container
-# that exits cleanly - the app stopping, or an external `docker stop` - leaves
+# that exits cleanly - the app stopping, or an external "docker stop" - leaves
 # the unit inactive with nothing to bring it back. on-failure covers only the
 # crash case, so the demo target silently stops running the thing being demoed.
 Restart=always
@@ -482,8 +498,7 @@ cmd_up() {
     "reaches|$SSH_ALIAS once over ssh to bootstrap it, then never again" \
     "log|$UP_LOG (every push shows up here)"
   # The CLI reads ./avocado.yaml from the cwd, not $AVOCADO_CONFIG.
-  # shellcheck source=/dev/null
-  [ -f "$LAB/env.sh" ] && source "$LAB/env.sh"
+  source_lab_env
   if [ "$MODE" = native ]; then
     # env.sh points DOCKER_HOST at the VM socket, and is_vm_routing_active() keys
     # on exactly that. Unset it or the CLI takes the vm path and builds/pushes
@@ -582,8 +597,7 @@ cmd_sync() {
     "runs on|this workstation" \
     "pushes|whatever the BUILD engine currently holds under $TEST_IMAGE" \
     "caveat|if your image went to the other engine, this pushes the stale one and reports success"
-  # shellcheck source=/dev/null
-  [ -f "$LAB/env.sh" ] && source "$LAB/env.sh"
+  source_lab_env
   [ "$MODE" = native ] && unset DOCKER_HOST
   ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync ) || die "sync failed - is a session up?"
 }
@@ -636,8 +650,7 @@ cmd_logs() {
 
 cmd_down() {
   ctx "STOP the demo" "affects|this workstation (session) and the target (agent, app)" "keeps|the VM running and warm"
-  # shellcheck source=/dev/null
-  [ -f "$LAB/env.sh" ] && source "$LAB/env.sh"
+  source_lab_env
   ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev down 2>/dev/null | sed -e 's/^/   /' ) || true
   session_pids | while read -r p; do kill "$p" 2>/dev/null; done
   ssh "$SSH_ALIAS" "systemctl stop $AGENT_UNIT $APP_SERVICE 2>/dev/null; docker stop $CONTAINER 2>/dev/null; docker rm $CONTAINER 2>/dev/null; true" >/dev/null 2>&1
