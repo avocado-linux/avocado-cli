@@ -5,7 +5,7 @@
 //! - Git repositories (with optional sparse checkout)
 //! - Local filesystem paths (mounted via bindfs at runtime)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::utils::config::ExtensionSource;
@@ -166,11 +166,21 @@ impl ExtensionFetcher {
             );
         }
 
-        // Build the package spec using the package name (not extension name)
+        // Build the package spec using the package name (not extension name).
+        //
+        // dnf matches against the RPM's own `Version:`, which is the RPM form, so
+        // a pre-release has to be asked for as `1.0.0~rc.1` even though config
+        // (and the payload's avocado.yaml) spell it `1.0.0-rc.1`. Without this a
+        // published pre-release extension is uninstallable from config: the
+        // `repoquery --provides` layout probe and the install below both match
+        // nothing. Idempotent for a version that's already in RPM form, which is
+        // what the lockfile branch passes.
         let package_spec = if version == "*" {
             package_name.to_string()
         } else {
-            format!("{package_name}-{version}")
+            let rpm_version = crate::utils::version::to_rpm_version(version)
+                .with_context(|| format!("Cannot resolve extension '{ext_name}' from a repo"))?;
+            format!("{package_name}-{rpm_version}")
         };
 
         let repo_arg = repo_name.map(|r| format!("--repo={r}")).unwrap_or_default();

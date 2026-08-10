@@ -104,7 +104,14 @@ impl ExtPublishCommand {
 
         let (pn, pv, pr, pa) = parse_nevra(path).unwrap_or_default();
         let name = self.name.clone().unwrap_or(pn);
-        let version = self.version.clone().unwrap_or(pv);
+        // The version comes off the RPM's filename, so it is in RPM form. Invert
+        // it back to semver before recording it: clients compare the platform's
+        // version against the `avocado.yaml` baked into the payload, which is
+        // deliberately kept as semver. An explicit `--version` is taken as given.
+        let version = self
+            .version
+            .clone()
+            .unwrap_or_else(|| crate::utils::version::from_rpm_version(&pv));
         let release = self
             .release
             .clone()

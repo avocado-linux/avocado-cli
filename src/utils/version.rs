@@ -80,16 +80,60 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
 /// so map the pre-release `-` to `~` and the build-metadata `+` to `^`. A plain
 /// release version (no `-`/`+`) is returned unchanged.
 ///
-/// Every `-` is rewritten, not just the first. That is deliberate and not a
-/// shortcut: RPM rejects `-` anywhere in `Version:`, so a hyphen *inside* a
-/// pre-release identifier (`1.0.0-rc-1`, legal semver) has to go too. Rewriting
-/// only the leading separator would emit `1.0.0~rc-1`, which `rpmbuild` refuses
-/// outright. The cost is that the mapping is lossy — `1.0.0-rc-1` and
-/// `1.0.0~rc~1` do not round-trip back to semver — which is acceptable because
-/// the semver form is what gets baked into the payload's `avocado.yaml`; this
-/// value exists only to satisfy RPM's own grammar and ordering.
-pub fn to_rpm_version(version: &str) -> String {
-    version.replace('-', "~").replace('+', "^")
+/// The mapping is exact and reversible: semver's grammar admits only
+/// `[0-9A-Za-z.+-]`, so no `~` or `^` can occur in the input and
+/// [`from_rpm_version`] recovers the original string byte for byte.
+///
+/// A `-` *inside* a pre-release or build identifier (`1.0.0-rc-1`, legal semver)
+/// is **rejected** rather than rewritten. Leaving it is not an option — RPM
+/// forbids `-` anywhere in `Version:`, so `1.0.0~rc-1` is refused outright — but
+/// mapping it to `~` as well would silently invert ordering, because `~` is a
+/// precedence operator to RPM and an ordinary character to semver:
+///
+/// | semver                        | RPM after mapping             |
+/// |-------------------------------|-------------------------------|
+/// | `1.0.0-rc1 < 1.0.0-rc1-fix`   | `1.0.0~rc1` **>** `1.0.0~rc1~fix` |
+/// | `1.0.0-rc-1 > 1.0.0-rc.2`     | `1.0.0~rc~1` **<** `1.0.0~rc.2`   |
+///
+/// dnf would treat the newer version as the older one and refuse the upgrade. No
+/// substitute character rescues it either: `_` makes `1.0.0~rc_1` and
+/// `1.0.0~rc.1` compare equal, and `.` collides outright. Refusing the input is
+/// the only behavior that can't ship a wrong answer, and it costs only version
+/// strings nobody writes — this project ships `X.Y.Z` and `X.Y.Z-rc.N`.
+pub fn to_rpm_version(version: &str) -> Result<String> {
+    // Build metadata is whatever follows the first `+`; the pre-release is
+    // whatever follows the first `-` before it. A second `-` in either is inside
+    // an identifier rather than a separator.
+    let (core_pre, build) = match version.split_once('+') {
+        Some((core_pre, build)) => (core_pre, Some(build)),
+        None => (version, None),
+    };
+    let hyphen_in_identifier = core_pre
+        .split_once('-')
+        .is_some_and(|(_core, pre)| pre.contains('-'))
+        || build.is_some_and(|b| b.contains('-'));
+
+    if hyphen_in_identifier {
+        anyhow::bail!(
+            "Version '{version}' has a '-' inside a pre-release or build identifier. \
+             RPM forbids '-' in `Version:`, and rewriting it to '~' would invert version \
+             ordering — dnf would see the newer version as the older one and refuse the \
+             upgrade. Use '.' to separate identifiers instead (e.g. '1.0.0-rc.1')."
+        );
+    }
+
+    Ok(version.replace('-', "~").replace('+', "^"))
+}
+
+/// Invert [`to_rpm_version`], recovering the semver string from an RPM
+/// `Version:` value. Exact for anything `to_rpm_version` produced.
+///
+/// Everything in avocado outside the RPM spec and the NVR filename speaks
+/// semver — config, the payload's `avocado.yaml`, the version the platform
+/// records — so a version read back *out* of rpm (an rpmdb query, a parsed NVR)
+/// has to come back through here or it won't match the config it came from.
+pub fn from_rpm_version(rpm_version: &str) -> String {
+    rpm_version.replace('~', "-").replace('^', "+")
 }
 
 #[cfg(test)]
@@ -151,48 +195,84 @@ mod tests {
     #[test]
     fn test_to_rpm_version() {
         // Plain release versions are unchanged.
-        assert_eq!(to_rpm_version("1.0.0"), "1.0.0");
-        assert_eq!(to_rpm_version("2.1.3"), "2.1.3");
+        assert_eq!(to_rpm_version("1.0.0").unwrap(), "1.0.0");
+        assert_eq!(to_rpm_version("2.1.3").unwrap(), "2.1.3");
         // Pre-release `-` becomes `~` (sorts before the release in RPM).
-        assert_eq!(to_rpm_version("1.0.0-rc.1"), "1.0.0~rc.1");
-        assert_eq!(to_rpm_version("1.0.0-alpha.2"), "1.0.0~alpha.2");
+        assert_eq!(to_rpm_version("1.0.0-rc.1").unwrap(), "1.0.0~rc.1");
+        assert_eq!(to_rpm_version("1.0.0-alpha.2").unwrap(), "1.0.0~alpha.2");
         // Build metadata `+` becomes `^`.
-        assert_eq!(to_rpm_version("1.0.0+build.5"), "1.0.0^build.5");
-    }
-
-    /// Semver permits `-` *inside* a pre-release or build identifier, and RPM
-    /// permits it nowhere in `Version:`. So every hyphen is rewritten, and the
-    /// result is intentionally not reversible back to the input semver.
-    #[test]
-    fn test_to_rpm_version_rewrites_hyphens_inside_identifiers() {
-        // `rc-1` is one pre-release identifier that happens to contain a
-        // hyphen. Leaving it would emit `1.0.0~rc-1`, which rpmbuild rejects,
-        // so the inner hyphen becomes `~` as well.
-        assert_eq!(to_rpm_version("1.0.0-rc-1"), "1.0.0~rc~1");
-        assert_eq!(to_rpm_version("1.0.0-pre-release-2"), "1.0.0~pre~release~2");
-        // Same rule inside build metadata.
-        assert_eq!(to_rpm_version("1.0.0+build-5"), "1.0.0^build~5");
-        // No `-` survives anywhere, whatever the shape. This is the property
-        // that actually matters: a surviving hyphen is a spec rpmbuild refuses.
-        for v in [
-            "1.0.0-rc-1",
-            "1.0.0+build-5",
-            "1.0.0-rc.1+build-5",
-            "2.0.0-a-b-c+d-e-f",
-        ] {
-            let mapped = to_rpm_version(v);
-            assert!(!mapped.contains('-'), "{v} -> {mapped} still has a hyphen");
-        }
+        assert_eq!(to_rpm_version("1.0.0+build.5").unwrap(), "1.0.0^build.5");
     }
 
     #[test]
     fn test_to_rpm_version_handles_prerelease_and_build_together() {
         // Both separators present: `-` -> `~` and `+` -> `^` in one pass, with
         // the pre-release still ordering before the release.
-        assert_eq!(to_rpm_version("1.0.0-rc.1+build.5"), "1.0.0~rc.1^build.5");
-        assert_eq!(to_rpm_version("1.0.0-rc-1+build-5"), "1.0.0~rc~1^build~5");
+        assert_eq!(
+            to_rpm_version("1.0.0-rc.1+build.5").unwrap(),
+            "1.0.0~rc.1^build.5"
+        );
         // The real shipping shape for this project.
-        assert_eq!(to_rpm_version("1.0.0-rc.1"), "1.0.0~rc.1");
+        assert_eq!(to_rpm_version("1.0.0-rc.1").unwrap(), "1.0.0~rc.1");
+    }
+
+    /// A `-` inside an identifier can't be rewritten to `~` — `~` is a
+    /// precedence operator in RPM, so `1.0.0~rc1~fix` sorts *below* `1.0.0~rc1`
+    /// while semver puts `1.0.0-rc1-fix` above `1.0.0-rc1`. dnf would refuse the
+    /// upgrade. It can't be left alone either (rpmbuild rejects any `-`), so the
+    /// only answer that isn't silently wrong is to refuse the input.
+    #[test]
+    fn test_to_rpm_version_rejects_hyphen_inside_identifier() {
+        for v in [
+            "1.0.0-rc-1",          // hyphen in a pre-release identifier
+            "1.0.0-pre-release-2", // several
+            "1.0.0+build-5",       // hyphen in build metadata
+            "1.0.0-rc.1+build-5",  // valid pre-release, bad build metadata
+            "2.0.0-a-b-c+d-e-f",   // bad in both
+            "1.0.0-rc1-fix",       // the measured ordering inversion
+        ] {
+            let err = to_rpm_version(v).expect_err("{v} should be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains(v), "error should name the version: {msg}");
+            assert!(
+                msg.contains("invert version ordering"),
+                "error should explain why, got: {msg}"
+            );
+        }
+    }
+
+    /// The property the RPM spec actually depends on: whatever comes back out of
+    /// `to_rpm_version` carries no `-`, because a surviving hyphen is a spec
+    /// `rpmbuild` refuses outright.
+    #[test]
+    fn test_to_rpm_version_never_emits_a_hyphen() {
+        for v in ["1.0.0", "1.0.0-rc.1", "1.0.0+build.5", "1.0.0-rc.1+build.5"] {
+            let mapped = to_rpm_version(v).unwrap();
+            assert!(!mapped.contains('-'), "{v} -> {mapped} still has a hyphen");
+        }
+    }
+
+    /// The mapping is injective, so it inverts exactly — which is what the
+    /// publish and rpmdb-query paths rely on to get back to the config's semver.
+    #[test]
+    fn test_rpm_version_round_trips() {
+        for v in [
+            "1.0.0",
+            "2.1.3",
+            "1.0.0-rc.1",
+            "1.0.0-alpha.2",
+            "1.0.0+build.5",
+            "1.0.0-rc.1+build.5",
+        ] {
+            let rpm = to_rpm_version(v).unwrap();
+            assert_eq!(
+                from_rpm_version(&rpm),
+                v,
+                "{v} did not round-trip via {rpm}"
+            );
+        }
+        // A release version has nothing to invert.
+        assert_eq!(from_rpm_version("1.0.0"), "1.0.0");
     }
 
     #[test]
