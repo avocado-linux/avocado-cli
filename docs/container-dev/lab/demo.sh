@@ -469,7 +469,7 @@ cmd_app() {
     "builder|$(build_desc)" \
     "runs on|$(target_engine_where)"
 
-  pstep "1/4" "declare what to watch"
+  pstep "1/4" "declare what to watch - on the laptop"
   pblock <<'EOF'
 
   avocado.yaml
@@ -596,31 +596,74 @@ cmd_seed() {
     printf '   %-11s %s\n' "note" "ignoring '$ignored' - seed ships what the host holds and reads the version off the image"
   fi
 
-  pstep "3/4" "first deployment"
+  pstep "3/4" "first deployment - laptop to device"
   local _s0; _s0="$(store_bytes)"
 
-  ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
-    || die "container dev sync failed - is a session up? ($0 up)"
+  if present; then
+    p ""
+    # `sync` blocks with no output and the device-side pull that follows is a
+    # silent poll, so together they were ~15s of dead screen with nothing to
+    # tell the viewer the demo had not hung. Push in the background and report
+    # the blob store as it fills: that growth IS the wire transfer, so the
+    # progress line and the payoff number are the same measurement.
+    ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) &
+    local _sync=$!
+    while kill -0 "$_sync" 2>/dev/null; do
+      printf '\r  %-18s %s' "pushing" "$(human $(( $(store_bytes) - _s0 )))"
+      sleep 0.4
+    done
+    wait "$_sync" || die "container dev sync failed - is a session up? ($0 up)"
+    # Overwrite the live line in place. The green line is the longer of the two,
+    # so it covers the counter it replaces with no residue.
+    printf '\r'
+    pnum "pushed" "$(human $(( $(store_bytes) - _s0 )))" "the whole image, this one time"
+  else
+    ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
+      || die "container dev sync failed - is a session up? ($0 up)"
+  fi
 
   # Wait for the target to hold the HOST's image, not merely a tag of that name.
   # A stale tag from a previous run satisfies a presence check instantly, so this
   # loop used to fall through on the first tick and then restart the unit on the
   # old image.
   present || printf '   %-11s ' "waiting"
+  local _w=0
   for _ in $(seq 1 30); do
     sleep 2
-    present || printf '.'
+    _w=$(( _w + 2 ))
+    if present; then printf '\r  %-18s %ss' "device pulling" "$_w"; else printf '.'; fi
     target_has_host_image && break
   done
-  present || printf '\n'
+  if present; then printf '\r  %-18s %s\n' "device pulled" "in ${_w}s"; else printf '\n'; fi
   # Report the versions, not the image IDs: the two sides report different kinds
   # of digest (see target_has_host_image), so printing them here sent the reader
   # chasing a mismatch that is expected and not the fault.
   target_has_host_image || die "the host's $TEST_IMAGE never reached the target (host has '$want', target reports '$(target_demo_version)') - check: $0 logs session ; $0 logs agent"
 
+  # Label the wait before the ssh, not after: the restart call is itself a
+  # multi-second round trip, so printing afterwards leaves exactly the stretch
+  # of blank screen the label exists to cover.
+  present && printf '  %-18s %s' "device" "restarting $APP_SERVICE"
   ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
-  sleep 4
-  local line; line="$(app_line)"
+  local line=""
+  if present; then
+    # Poll the app's own output rather than sleeping blind. The restart and the
+    # settle ran to ~8s of motionless screen right before the payoff, which
+    # reads as a stall; counting up says the demo is waiting on the device and
+    # says how long it waited.
+    local _r=0
+    for _ in $(seq 1 30); do
+      printf '\r  %-18s %s' "device" "restarting $APP_SERVICE  ${_r}s"
+      line="$(app_line)"
+      case "$line" in "app $want "*) break ;; esac
+      _r=$(( _r + 1 ))
+      sleep 1
+    done
+    printf '\r  %-18s %s\n' "device" "restarted $APP_SERVICE in ${_r}s"
+  else
+    sleep 4
+    line="$(app_line)"
+  fi
   ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
   # Still a real check even though the image IDs already match: it is the
   # difference between the image having landed and the SERVICE having adopted it.
@@ -633,9 +676,9 @@ cmd_seed() {
   case "$line" in
     "app $want "*)
       if present; then
+        # The figure was already shown in green as it accumulated; keep it here
+        # only for the close, which contrasts it against the reload delta.
         FIRST_BYTES=$(( $(store_bytes) - _s0 ))
-        pnum "delivered" "$(human "$FIRST_BYTES")" "the whole image, this one time"
-        pkv  "device" "pulled it, started $APP_SERVICE"
         p ""
         # The app's own line, minus the image field: step 1 already declared the
         # ref, and keeping it pushes this past the 64-column limit.
@@ -709,7 +752,7 @@ cmd_up() {
   done
   grep -qE "bulk listener" "$UP_LOG" || { tail -5 "$UP_LOG"; die "session did not come up - see $UP_LOG"; }
 
-  pstep "2/4" "start dev mode"
+  pstep "2/4" "start dev mode - on the laptop"
   p ""
   p "  \$ avocado container dev up"
   pblock <<'EOF'
@@ -822,7 +865,7 @@ cmd_reload() {
     "note|the unit is NOT touched here, so only the watcher path can move the container" \
     "before|$before"
 
-  pstep "4/4" "change the code, rebuild"
+  pstep "4/4" "change the code, rebuild - on the laptop"
   p ""
   p "  \$ docker buildx build --platform linux/arm64 -t my-app:dev ."
   pblock <<'EOF'
