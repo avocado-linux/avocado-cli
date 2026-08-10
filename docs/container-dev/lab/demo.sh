@@ -275,11 +275,43 @@ app_line() {
   out="$(target_engine logs --tail 1 "$CONTAINER" 2>/dev/null)" || { printf 'not running yet'; return 0; }
   if [ -n "$out" ]; then printf '%s' "$out"; else printf 'running, no output yet'; fi
 }
+# Whether the target holds the image the host currently has under $TEST_IMAGE.
+#
+# Compared by the demo VERSION LABEL rather than by image ID, because the two
+# sides do not report the same kind of ID. A daemon using the containerd image
+# store reports `.Id` as the MANIFEST digest; a locally built image reports the
+# CONFIG digest. Measured between this workstation and an FRDM imx93 running the
+# docker extension: host b9a5390906 (config) against target 7c9b269170 (manifest,
+# confirmed by the target's own RepoDigests). Those never match, so an ID
+# comparison failed `seed` on every run whether or not delivery had worked.
+#
+# The label is content, so it survives the digest difference - and it still
+# rejects the stale-tag case this check exists for, because a tag left by an
+# earlier run carries that run's version.
+# The demo version label as the TARGET reports it, or empty.
+#
+# The format string must contain NO SPACES. target_engine runs
+# `ssh <alias> docker ...`, and ssh joins its arguments into one string that the
+# REMOTE shell re-splits on whitespace, so any space inside `{{...}}` arrives as
+# separate arguments. Measured against the board:
+#
+#   --format '{{json .Config.Labels}}'  -> template parsing error: unclosed action
+#   --format '{{.Config.Labels}}'       -> map[org.avocado.demo.version:v3]
+#
+# That also rules out `{{index .Config.Labels "..."}}`, which is why this parses
+# the map rendering instead of asking the template for one key. The same
+# constraint applies to every format passed through target_engine.
+target_demo_version() {
+  target_engine image inspect --format '{{.Config.Labels}}' "$TEST_IMAGE" 2>/dev/null \
+    | sed -n 's/.*org\.avocado\.demo\.version:\([^] ]*\).*/\1/p' | tr -d '\r\n'
+}
+
 target_has_host_image() {
-  local h t
-  h="$(host_image_id)"
-  t="$(target_image_id)"
-  [ -n "$h" ] && [ "$h" = "$t" ]
+  local want got
+  want="$(build_engine image inspect --format '{{index .Config.Labels "org.avocado.demo.version"}}' "$TEST_IMAGE" 2>/dev/null | tr -d '\r\n')"
+  got="$(target_demo_version)"
+  case "$want" in ''|'<no value>') return 1 ;; esac
+  [ "$want" = "$got" ]
 }
 
 # Find the running `container dev up` session.
@@ -486,7 +518,10 @@ cmd_seed() {
     target_has_host_image && break
   done
   printf '\n'
-  target_has_host_image || die "the host's $TEST_IMAGE never reached the target (host $(host_image_id | cut -c8-19), target $(target_image_id | cut -c8-19 || echo none)) - check: $0 logs session ; $0 logs agent"
+  # Report the versions, not the image IDs: the two sides report different kinds
+  # of digest (see target_has_host_image), so printing them here sent the reader
+  # chasing a mismatch that is expected and not the fault.
+  target_has_host_image || die "the host's $TEST_IMAGE never reached the target (host has '$want', target reports '$(target_demo_version)') - check: $0 logs session ; $0 logs agent"
 
   ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
   sleep 4
