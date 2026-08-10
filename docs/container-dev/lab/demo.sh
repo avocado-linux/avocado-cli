@@ -264,6 +264,17 @@ build_image() {
 # registry tags, same ID.
 host_image_id() { build_engine image inspect "$TEST_IMAGE" --format '{{.Id}}' 2>/dev/null; }
 target_image_id() { target_engine image inspect "$TEST_IMAGE" --format '{{.Id}}' 2>/dev/null; }
+
+# One line of the app's own output, or a plain statement that there is nothing to
+# read yet. `docker logs` on a container that does not exist writes an error to
+# stderr, and capturing that with 2>&1 put "Error response from daemon: No such
+# container: app" in the reload readout - which reads as a fault when it is just
+# the state before the first delivery, and is exactly what a demo should not show.
+app_line() {
+  local out
+  out="$(target_engine logs --tail 1 "$CONTAINER" 2>/dev/null)" || { printf 'not running yet'; return 0; }
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf 'running, no output yet'; fi
+}
 target_has_host_image() {
   local h t
   h="$(host_image_id)"
@@ -305,7 +316,19 @@ write_endpoint() {
 }
 
 registry_endpoints() {
-  local host="${AVOCADO_CONTAINER_DEV_HOST:-10.0.2.2}"
+  # 10.0.2.2 is the SLIRP alias every QEMU guest sees the host as, so it is the
+  # right default for the lab VM and wrong everywhere else. On real hardware the
+  # host address is whatever the CLI auto-detects as reachable from the board,
+  # which is not knowable before a session binds - printing the SLIRP literal
+  # there advertises an address nothing is listening on.
+  local host
+  if [ -n "${AVOCADO_CONTAINER_DEV_HOST:-}" ]; then
+    host="$AVOCADO_CONTAINER_DEV_HOST"
+  elif [ "$LAB_VM" = 1 ]; then
+    host="10.0.2.2"
+  else
+    host="<auto-detected>"
+  fi
   printf 'bulk read %s:5599 (target pulls) | write %s (host pushes, loopback-bound) | control WS %s:5600' \
     "$host" "$(write_endpoint)" "$host"
 }
@@ -387,7 +410,7 @@ EOF
   if [ "$MODE" = vm ]; then
     ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
     sleep 4
-    local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
+    local line; line="$(app_line)"
     ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
     case "$line" in
       "app $version "*) printf '   %-11s %s\n' "result" "baseline $version confirmed on the target" ;;
@@ -467,7 +490,7 @@ cmd_seed() {
 
   ssh "$SSH_ALIAS" "systemctl restart $APP_SERVICE" || die "could not start $APP_SERVICE"
   sleep 4
-  local line; line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
+  local line; line="$(app_line)"
   ctx "APP is up" "reading|$(target_engine_where)" "says|$line"
   # Still a real check even though the image IDs already match: it is the
   # difference between the image having landed and the SERVICE having adopted it.
@@ -535,7 +558,7 @@ cmd_agent() {
     "runs on|the HITL TARGET ($SSH_ALIAS), over ssh" \
     "unit|$AGENT_UNIT, shipped in the runtime by avocado-ext-container-agent-dev" \
     "pulls via|its own loopback proxy 127.0.0.1:15151 -> the host's bulk listener" \
-    "restarts|$APP_SERVICE (AVOCADO_CONTAINER_DEV_SERVICE, from the setup-lab drop-in)" \
+    "restarts|$APP_SERVICE, and verifies container '$CONTAINER' (both set in the drop-in below)" \
     "gate|ConditionPathExists=/var/lib/avocado/container-dev/bootstrap.json, so '$0 up' must run first"
 
   # The unit stays inert until `container dev up` has delivered the bootstrap, so a
@@ -543,6 +566,36 @@ cmd_agent() {
   # rather than reporting a failure the operator cannot act on.
   ssh "$SSH_ALIAS" "test -f /var/lib/avocado/container-dev/bootstrap.json" 2>/dev/null \
     || die "no bootstrap on the target yet - run '$0 up' first (the unit's ConditionPathExists gates on it)"
+
+  # The agent learns BOTH of these only from its environment - nothing in the
+  # bootstrap payload carries them.
+  #
+  # SERVICE is the unit that owns the container. Without it the agent falls back
+  # to `docker restart <container>`, which re-executes the pinned image ID, so a
+  # freshly pulled image is ignored while every layer reports success.
+  #
+  # CONTAINER is what the agent looks for AFTER restarting, to prove something is
+  # actually running the image it just pulled. It defaults to `avocado-dev`, so
+  # any deployment naming its container anything else - this lab names it after
+  # APP_SERVICE - fails that check on every sync: "container avocado-dev does not
+  # exist after 30s". The restart itself worked and the app is on the new image,
+  # but the agent reports failure, never writes active-image.json, and retries in
+  # a loop. setup-lab.sh installs the SERVICE half; this installs both, so it is
+  # right on real hardware too, where setup-lab.sh never runs.
+  #
+  # mkdir -p, not install -d: the target's coreutils are BusyBox, which has no
+  # `install`.
+  # shellcheck disable=SC2087  # client-side expansion is intended: bake the names in
+  ssh "$SSH_ALIAS" "mkdir -p /etc/systemd/system/$AGENT_UNIT.service.d && \
+    cat > /etc/systemd/system/$AGENT_UNIT.service.d/10-service.conf" <<EOF
+# Installed by demo.sh. Nothing in the bootstrap payload carries the owning unit
+# or the container name, so both must be set here.
+[Service]
+Environment=AVOCADO_CONTAINER_DEV_SERVICE=$APP_SERVICE
+Environment=AVOCADO_CONTAINER_DEV_CONTAINER=$CONTAINER
+EOF
+  ssh "$SSH_ALIAS" 'systemctl daemon-reload' \
+    || die "could not reload systemd on $SSH_ALIAS after installing the agent drop-in"
 
   # Restart rather than start: a re-run after a new session must not keep an agent
   # holding the previous session's pinned CA.
@@ -556,7 +609,7 @@ cmd_agent() {
 
 cmd_reload() {
   local version="${1:-v2-RELOADED}"
-  local before; before="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
+  local before; before="$(app_line)"
   ctx "RELOAD: rebuild only, let the loop do the rest" \
     "mode|$MODE" \
     "builds on|$(build_engine_where)" \
@@ -577,7 +630,7 @@ cmd_reload() {
   local line=""
   for _ in $(seq 1 30); do
     sleep 2; printf '.'
-    line="$(target_engine logs --tail 1 "$CONTAINER" 2>&1)"
+    line="$(app_line)"
     case "$line" in "app $version "*) break ;; esac
   done
   printf '\n'
@@ -605,11 +658,23 @@ cmd_sync() {
 cmd_status() {
   local host_daemon target_daemon
   host_daemon="$(env -u DOCKER_HOST docker info --format '{{.Name}}' 2>/dev/null || echo '(unreachable)')"
-  target_daemon="$(daemon_name "unix://$DOCK_SOCK")"; : "${target_daemon:=(unreachable)}"
+  # How the target's engine is reached depends on the topology, and reporting the
+  # wrong one reads as a fault. In native mode there is no forwarded socket at
+  # all - the engine is reached over ssh - so probing $DOCK_SOCK there always
+  # answered "(unreachable)" on a perfectly healthy board.
+  local target_via
+  if [ "$MODE" = native ]; then
+    target_daemon="$(target_engine info --format '{{.Name}}' 2>/dev/null || true)"
+    target_via="over ssh"
+  else
+    target_daemon="$(daemon_name "unix://$DOCK_SOCK")"
+    target_via="via $DOCK_SOCK"
+  fi
+  : "${target_daemon:=(unreachable)}"
 
   ctx "WHERE THINGS ARE" \
     "workstation|engine '$host_daemon'  <- your builds land here if DOCKER_HOST is unset" \
-    "HITL target|engine '$target_daemon' via $DOCK_SOCK, shell via 'ssh $SSH_ALIAS'" \
+    "HITL target|engine '$target_daemon' $target_via, shell via 'ssh $SSH_ALIAS'" \
     "registry|$(registry_endpoints)" \
     "store|$HOME/.avocado/container-dev/"
 
@@ -626,7 +691,7 @@ cmd_status() {
     ctx "TARGET ($SSH_ALIAS = $(target_hostname))" \
       "agent|$AGENT_UNIT $(ssh "$SSH_ALIAS" "systemctl is-active $AGENT_UNIT" 2>/dev/null || echo unknown)" \
       "service|$APP_SERVICE $(ssh "$SSH_ALIAS" "systemctl is-active $APP_SERVICE" 2>/dev/null || echo unknown)" \
-      "app says|$(target_engine logs --tail 1 "$CONTAINER" 2>&1 | tail -1)" \
+      "app says|$(app_line)" \
       "running|$(ssh "$SSH_ALIAS" 'cat /var/lib/avocado/container-dev/active-image.json 2>/dev/null | tr -d "\n " ' 2>/dev/null || echo '(no pointer yet)')"
   else
     ctx "TARGET ($SSH_ALIAS)" "state|unreachable over ssh - run '$0 setup'"
