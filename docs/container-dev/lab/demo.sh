@@ -120,12 +120,84 @@ B=$'\033[1m'; R=$'\033[0m'
 # ---------------------------------------------------------------------------
 
 ctx() {
+  # Silent in presentation mode: these blocks are the debugging instrument, and
+  # every one of them names a machine, a port or a path the viewer must not be
+  # asked to care about.
+  [ "${PRESENT:-0}" = 1 ] && return 0
   printf '\n%s== %s ==%s\n' "$B" "$1" "$R"
   shift
   while [ $# -gt 0 ]; do printf '   %-11s %s\n' "${1%%|*}" "${1#*|}"; shift; done
 }
 
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Presentation mode (PRESENT=1).
+#
+# Two disjoint output families rather than one mode-aware renderer, because the
+# two views need different DATA, not different formatting: the debug view wants
+# the ephemeral write port, the presentation view wants bytes on the wire. A
+# shared model would carry the union and serve neither. They are kept honest by
+# living side by side in the same cmd_* function, not by sharing plumbing.
+#
+# WIDTH IS 64 COLUMNS, HARD. The recording composites the logo, timer and
+# caption frameless into the bottom-right of the frame - measured at terminal
+# rows 35-40, columns 66-93 - and content scrolls up through those rows, so any
+# line wider than 64 eventually collides with the branding. The failure is
+# invisible until you watch the finished MP4, so p() checks it.
+# ---------------------------------------------------------------------------
+
+PRESENT="${PRESENT:-0}"
+_PW=64
+
+present() { [ "$PRESENT" = 1 ]; }
+
+# A horizontal rule padded to _PW, dim.
+prule() {
+  present || return 0
+  local s="${1:-}" n
+  n=$(( _PW - ${#s} )); [ "$n" -lt 0 ] && n=0
+  printf '\n\033[2m%s' "$s"
+  [ "$n" -gt 0 ] && printf '─%.0s' $(seq 1 "$n")
+  printf '\033[0m\n'
+}
+
+# A plain line. Warns to stderr if it would collide with the branding.
+p() {
+  present || return 0
+  local s="${1:-}"
+  [ "${#s}" -gt "$_PW" ] && printf 'warn: presentation line is %d cols (max %d): %s\n' "${#s}" "$_PW" "$s" >&2
+  printf '%s\n' "$s"
+}
+
+pkv()  { present || return 0; printf '  %-18s %s\n' "$1" "$2"; }
+# A payoff number in brand green - the only colour in presentation mode. The
+# trailing note is optional, and its space is dropped when absent so the line
+# carries no trailing whitespace.
+pnum() {
+  present || return 0
+  if [ -n "${3:-}" ]; then printf '  %-18s \033[32m%s\033[0m  %s\n' "$1" "$2" "$3"
+  else                     printf '  %-18s \033[32m%s\033[0m\n'     "$1" "$2"; fi
+}
+pstep(){ present || return 0; prule "──[ $1 ]── $2 "; }
+pbeat(){ present || return 0; sleep "${1:-2}"; }
+# Multi-line block from a heredoc. Consumes stdin even when disabled, so an
+# unread heredoc cannot confuse a later reader.
+pblock() { present || { cat >/dev/null; return 0; }; cat; }
+
+# Bytes as something a viewer can read at a glance.
+human() {
+  local b="${1:-0}"
+  if   [ "$b" -ge 1048576 ]; then awk -v b="$b" 'BEGIN{printf "%.1f MB", b/1048576}'
+  elif [ "$b" -ge 1024 ];    then awk -v b="$b" 'BEGIN{printf "%.1f KB", b/1024}'
+  else printf '%d B' "$b"; fi
+}
+
+# Total bytes in the session's blob store. The store IS the wire: the registry
+# writes each pushed blob once and has_blob() short-circuits a re-push, so the
+# growth across a delivery is exactly what crossed to the device.
+STORE_ROOT="$HOME/.avocado/container-dev"
+store_bytes() { du -sb "$STORE_ROOT" 2>/dev/null | awk '{print $1+0}'; }
 
 # $LAB/env.sh is state written by setup-lab.sh and it describes THE LAB VM: its
 # ssh alias, its SLIRP host alias, its forwarded engine socket. Sourcing it uses
@@ -397,7 +469,24 @@ cmd_app() {
     "builder|$(build_desc)" \
     "runs on|$(target_engine_where)"
 
+  pstep "1/4" "declare what to watch"
+  pblock <<'EOF'
+
+  avocado.yaml
+      container_dev:
+        images:
+          - ref: my-app:dev        # the image you build
+            service: app           # the unit that runs it
+
+  That is the whole opt-in. No agent config, no registry URL.
+EOF
+  p ""
+  p "  \$ docker buildx build --platform linux/arm64 -t my-app:dev ."
+
+  local _t0=$SECONDS
   build_image "$version"
+  BUILD_SECONDS=$(( SECONDS - _t0 ))
+  pkv "built" "my-app:dev (arm64, built on the laptop)"
 
   ctx "INSTALL the owning service" \
     "installs on|the HITL TARGET ($SSH_ALIAS), over ssh" \
@@ -448,7 +537,9 @@ EOF
       "app $version "*) printf '   %-11s %s\n' "result" "baseline $version confirmed on the target" ;;
       *) die "app is not reporting '$version' - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
     esac
-  else
+  elif ! present; then
+    # Harness bookkeeping: it names the next action to run, which is exactly the
+    # driver the recording must not show.
     printf '   %-11s %s\n' "unit" "installed and enabled, NOT started"
     printf '   %-11s %s\n' "why" "the host built $TEST_IMAGE; '$0 seed' delivers it over the loop"
     if [ -n "$(target_image_id)" ]; then
@@ -505,6 +596,9 @@ cmd_seed() {
     printf '   %-11s %s\n' "note" "ignoring '$ignored' - seed ships what the host holds and reads the version off the image"
   fi
 
+  pstep "3/4" "first deployment"
+  local _s0; _s0="$(store_bytes)"
+
   ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
     || die "container dev sync failed - is a session up? ($0 up)"
 
@@ -512,12 +606,13 @@ cmd_seed() {
   # A stale tag from a previous run satisfies a presence check instantly, so this
   # loop used to fall through on the first tick and then restart the unit on the
   # old image.
-  printf '   %-11s ' "waiting"
+  present || printf '   %-11s ' "waiting"
   for _ in $(seq 1 30); do
-    sleep 2; printf '.'
+    sleep 2
+    present || printf '.'
     target_has_host_image && break
   done
-  printf '\n'
+  present || printf '\n'
   # Report the versions, not the image IDs: the two sides report different kinds
   # of digest (see target_has_host_image), so printing them here sent the reader
   # chasing a mismatch that is expected and not the fault.
@@ -536,7 +631,29 @@ cmd_seed() {
   # TEST_IMAGE defaults to my-app:dev, so `want=dev` matched unconditionally. It
   # also let a prefix satisfy its own extension (v1 accepted while v10 ran).
   case "$line" in
-    "app $want "*) printf '   %-11s %s\n' "result" "$want delivered over the loop and running on the target" ;;
+    "app $want "*)
+      if present; then
+        FIRST_BYTES=$(( $(store_bytes) - _s0 ))
+        pnum "delivered" "$(human "$FIRST_BYTES")" "the whole image, this one time"
+        pkv  "device" "pulled it, started $APP_SERVICE"
+        p ""
+        # The app's own line, minus the image field: step 1 already declared the
+        # ref, and keeping it pushes this past the 64-column limit.
+        local shown="${line% image=*}"
+        p "  $shown"
+        # Point at the proof rather than leaving it to be noticed. The caret run
+        # is derived from the string so it stays aligned if the hostname changes.
+        # The carets must sit under the HOSTNAME, not under the `running-on=`
+        # label, so the prefix has to include the label itself.
+        local host="${shown#*running-on=}"
+        local pre="${shown%"$host"}"
+        printf '  %*s' "${#pre}" ""
+        printf '^%.0s' $(seq 1 "${#host}"); printf '\n'
+        printf '  %*s%s\n' "${#pre}" "" "the board's own hostname"
+        pbeat 2
+      else
+        printf '   %-11s %s\n' "result" "$want delivered over the loop and running on the target"
+      fi ;;
     *) die "the target holds the host's image but its container still reports something else - ssh $SSH_ALIAS 'journalctl -u $APP_SERVICE -n 20'" ;;
   esac
 }
@@ -583,9 +700,40 @@ cmd_up() {
   # never started. Verified: the redirect does not run, and with no `set -e` the
   # failing subshell does not stop the script either.
   ( cd "$SCRIPT_DIR" && setsid --fork "${AVOCADO_BIN:-avocado}" container dev up >"$UP_LOG" 2>&1 </dev/null )
-  sleep 15
+  # Poll for the listener line rather than sleeping a fixed 15s. The grep below
+  # is the real readiness test, so waiting on it directly is both correct and
+  # roughly 11s faster - which is a tenth of the recording's runtime.
+  for _ in $(seq 1 60); do
+    grep -qE "bulk listener" "$UP_LOG" && break
+    sleep 0.5
+  done
   grep -qE "bulk listener" "$UP_LOG" || { tail -5 "$UP_LOG"; die "session did not come up - see $UP_LOG"; }
-  sed -e 's/^/   /' <(tail -2 "$UP_LOG")
+
+  pstep "2/4" "start dev mode"
+  p ""
+  p "  \$ avocado container dev up"
+  pblock <<'EOF'
+
+  laptop (x86-64)                     device (arm64)
+  ┌──────────────────┐              ┌──────────────────┐
+  │ docker build     │              │ dev agent        │
+  │       │          │              │       │          │
+  │       ▼          │ changed layer│       ▼          │
+  │ layer store ─────┼─── over TLS ─┼──▶ pull it       │
+  │       │          │              │       │          │
+  │ file watcher ────┼──── notify ──┼──▶ restart app   │
+  └──────────────────┘              └──────────────────┘
+EOF
+  p ""
+  pkv "device" "bootstrapped over ssh, once"
+  pkv "registry" "on the laptop; the device never reaches out"
+  pbeat 3
+  # The CLI's own startup lines carry the listener ports, the loopback write
+  # port and the device IP on a single ~174-column line. Debug wants exactly
+  # that; the recording cannot show it without running through the branding.
+  if ! present; then
+    sed -e 's/^/   /' <(tail -2 "$UP_LOG")
+  fi
 }
 
 cmd_agent() {
@@ -632,14 +780,34 @@ EOF
   ssh "$SSH_ALIAS" 'systemctl daemon-reload' \
     || die "could not reload systemd on $SSH_ALIAS after installing the agent drop-in"
 
+  # Clear any start-limit counter before restarting. The unit widens systemd's
+  # limit on purpose (StartLimitIntervalSec=300, Burst=5) so a genuinely broken
+  # bootstrap lands in `failed` rather than looping invisibly - but this driver
+  # restarts the agent once per run by design, so a few demo cycles inside five
+  # minutes trip it and the next start is refused with "attempted too often".
+  # Resetting here clears the counter for a deliberate restart; it does not mask
+  # a failing unit, because the is-active poll below still has to pass.
+  ssh "$SSH_ALIAS" "systemctl reset-failed $AGENT_UNIT 2>/dev/null; true" >/dev/null 2>&1
+
   # Restart rather than start: a re-run after a new session must not keep an agent
   # holding the previous session's pinned CA.
   ssh "$SSH_ALIAS" "systemctl restart $AGENT_UNIT" \
     || die "could not start $AGENT_UNIT - ssh $SSH_ALIAS 'journalctl -u $AGENT_UNIT -n 30'"
-  sleep 5
-  local active; active="$(ssh "$SSH_ALIAS" "systemctl is-active $AGENT_UNIT" 2>/dev/null || echo unknown)"
+  # Poll instead of a fixed 5s: is-active below is the real test, and the unit
+  # is usually up in well under a second.
+  local active=unknown
+  for _ in $(seq 1 20); do
+    active="$(ssh "$SSH_ALIAS" "systemctl is-active $AGENT_UNIT" 2>/dev/null || echo unknown)"
+    [ "$active" = active ] && break
+    sleep 0.5
+  done
   [ "$active" = active ] || die "$AGENT_UNIT is '$active' - ssh $SSH_ALIAS 'journalctl -u $AGENT_UNIT -n 30'"
-  ssh "$SSH_ALIAS" "journalctl -u $AGENT_UNIT --no-pager -n 3 -o cat" 2>/dev/null | sed -e 's/^/   /'
+  # Raw tracing lines - module paths, timestamps, proxy ports - are the highest
+  # noise-per-pixel thing on screen and mean nothing to a viewer.
+  if ! present; then
+    ssh "$SSH_ALIAS" "journalctl -u $AGENT_UNIT --no-pager -n 3 -o cat" 2>/dev/null | sed -e 's/^/   /'
+  fi
+  pkv "agent" "connected, watching for changes"
 }
 
 cmd_reload() {
@@ -654,29 +822,80 @@ cmd_reload() {
     "note|the unit is NOT touched here, so only the watcher path can move the container" \
     "before|$before"
 
+  pstep "4/4" "change the code, rebuild"
+  p ""
+  p "  \$ docker buildx build --platform linux/arm64 -t my-app:dev ."
+  pblock <<'EOF'
+
+  That is the only command run. No push, no ssh, no device
+  command, and nothing restarted by hand.
+EOF
+  pbeat 1.5
+
+  local _s0; _s0="$(store_bytes)"
+  local _t0=$SECONDS
   build_image "$version"
+  BUILD_SECONDS=$(( SECONDS - _t0 ))
+
   if [ "$EMITS_TAG_EVENT" = 0 ]; then
-    printf '   %-11s %s\n' "trigger" "buildx emits no tag event, so triggering the sync explicitly"
+    # Debug-only: this explains a Docker quirk, not the feature.
+    if ! present; then
+      printf '   %-11s %s\n' "trigger" "buildx emits no tag event, so triggering the sync explicitly"
+    fi
     ( cd "$SCRIPT_DIR" && "${AVOCADO_BIN:-avocado}" container dev sync >/dev/null 2>&1 ) \
       || die "container dev sync failed - is a session up? ($0 up)"
   fi
 
-  printf '   %-11s ' "waiting"
   local line=""
-  for _ in $(seq 1 30); do
-    sleep 2; printf '.'
-    line="$(app_line)"
-    case "$line" in "app $version "*) break ;; esac
-  done
-  printf '\n'
+  _t0=$SECONDS
+  if present; then
+    # Stream the device's own log rather than printing progress dots. The app
+    # emits a line every 2s, so this simultaneously shows that it is running on
+    # the board (every line carries the board's hostname), that it was running
+    # before and after, and how long the round trip took - countable at 2s a
+    # line. Dots show none of that and cost the same wall time.
+    p ""
+    p "  the device's own log, live:"
+    p ""
+    local shown
+    for _ in $(seq 1 45); do
+      line="$(app_line)"
+      case "$line" in
+        # Repeats are the point - a line per tick is what shows the app running
+        # before and after, so print every one rather than deduplicating.
+        "app "*)
+          shown="${line% image=*}"
+          p "    $shown" ;;
+      esac
+      case "$line" in "app $version "*) break ;; esac
+      sleep 2
+    done
+    SHIP_SECONDS=$(( SECONDS - _t0 ))
+  else
+    printf '   %-11s ' "waiting"
+    for _ in $(seq 1 30); do
+      sleep 2; printf '.'
+      line="$(app_line)"
+      case "$line" in "app $version "*) break ;; esac
+    done
+    printf '\n'
+    SHIP_SECONDS=$(( SECONDS - _t0 ))
+  fi
+  RELOAD_BYTES=$(( $(store_bytes) - _s0 ))
 
   ctx "RESULT" \
     "reading|$(target_engine_where)" \
     "after|$line" \
     "pushes|$(count_in 'The push refers' "$UP_LOG") in $UP_LOG, $(count_in 'no basic auth credentials' "$UP_LOG") auth failures"
   case "$line" in
-    "app $version "*) printf '   %-11s %s\n' "result" "hot reload landed: the watcher moved the target to $version" ;;
-    *) die "no reload after 60s - check: $0 logs session ; $0 logs agent" ;;
+    "app $version "*)
+      if present; then
+        # The numbers land in the close block, which holds long enough to read.
+        cmd_close "${FIRST_BYTES:-0}" "$RELOAD_BYTES" "$BUILD_SECONDS" "$SHIP_SECONDS"
+      else
+        printf '   %-11s %s\n' "result" "hot reload landed: the watcher moved the target to $version"
+      fi ;;
+    *) die "no reload after 90s - check: $0 logs session ; $0 logs agent" ;;
   esac
 }
 
@@ -776,6 +995,84 @@ cmd_reset() {
   printf '   %-11s %s\n' "done" "start again with: $0 all"
 }
 
+# The thesis. With no narration a viewer who does not already know the feature
+# watches v1 become v2 and concludes nothing, so the framing has to be on screen.
+# The branded caption is a single ~38-char line and cannot carry it.
+cmd_intro() {
+  present || die "intro is presentation-only - run with PRESENT=1"
+  # The blob store is the wire measurement, and has_blob() means a blob left by
+  # an earlier run is never re-sent - so a second recording would report a first
+  # delivery of nearly nothing. Refuse rather than headline a false number.
+  local sz; sz="$(store_bytes)"
+  if [ "${sz:-0}" -gt 0 ]; then
+    die "the layer store is not empty ($(human "$sz")) - the delivery figures would understate the transfer. Clear $STORE_ROOT and re-run."
+  fi
+  # A recording harness leaves its own invocation on the first line of the frame.
+  # Wipe it: the viewer should open on the title card, not on the path to the
+  # script that drove the demo.
+  printf '\033[2J\033[H'
+  pblock <<'EOF'
+
+════════════════════════════════════════════════════════════════
+  AVOCADO OS  ·  CONTAINER DEV MODE
+
+  Change a container on a running device in seconds - with no
+  registry, and without reflashing the device.
+════════════════════════════════════════════════════════════════
+EOF
+  p ""
+  pkv "laptop" "x86-64 - Docker - where you already build"
+  pkv "device" "NXP FRDM-IMX93 v1.2 - arm64 - Avocado OS"
+  pkv "app" "run by app.service on the device"
+  pblock <<'EOF'
+
+  Normally a one-line change means: rebuild the image, push it
+  to a registry, pull all of it down again, restart. The cost
+  is set by the image size, not by the size of the change.
+EOF
+  pbeat 3
+}
+
+# The close carries the numbers. The branded end card carries the logo and the
+# caption; duplicating either here would waste the only screen the viewer is
+# likely to remember.
+cmd_close() {
+  present || die "close is presentation-only - run with PRESENT=1"
+  local first="${1:-0}" delta="${2:-0}" tbuild="${3:-0}" tship="${4:-0}"
+  prule "════════════════════════════════════════════════════════════════"
+  p "  LANDED"
+  p ""
+  pnum "changed layer" "$(human "$delta")" "moved over the wire"
+  pnum "already there" "$(human "$first")" "not re-sent"
+  p ""
+  # A cached rebuild genuinely takes under a second - only the top layer changes -
+  # but printing "0s" reads as a broken measurement rather than a fast one.
+  local b="${tbuild}s"; [ "${tbuild:-0}" -eq 0 ] && b="<1s"
+  pnum "build" "$b"
+  pnum "deliver + restart" "${tship}s"
+  p ""
+  p "  the device was never rebooted, and never reflashed"
+  prule "════════════════════════════════════════════════════════════════"
+  pbeat 4
+}
+
+# The whole recorded demo, in ONE process.
+#
+# Not a sequence of separate `demo.sh <step>` calls: the delivery figures are
+# measured in cmd_seed and reported in the close after cmd_reload, so they have
+# to share a shell. Running it as one action also keeps the harness off screen -
+# the recording shows a demo, not a driver invoking itself six times.
+cmd_present() {
+  present || die "run with PRESENT=1"
+  local v1="${1:-v1}" v2="${2:-v2}"
+  cmd_intro
+  cmd_app "$v1"
+  cmd_up
+  cmd_agent
+  cmd_seed          # no version: it reads the one cmd_app just built
+  cmd_reload "$v2"  # ends by printing the close block with the measured numbers
+}
+
 cmd_all() {
   local v1="${1:-v1}" v2="${2:-v2-RELOADED}"
   [ "${LAB_VM:-1}" = 1 ] && cmd_setup
@@ -805,6 +1102,9 @@ case "${1:-}" in
   down)   shift; cmd_down "$@" ;;
   reset)  shift; cmd_reset "$@" ;;
   all)    shift; cmd_all "$@" ;;
+  intro)  shift; cmd_intro "$@" ;;
+  present) shift; cmd_present "$@" ;;
+  close)  shift; cmd_close "$@" ;;
   ""|-h|--help|help)
     # Print the header comment block: from line 3 until the first non-comment line.
     awk 'NR>=3 && /^#/ { sub(/^# ?/, ""); print; next } NR>=3 { exit }' "${BASH_SOURCE[0]}"
