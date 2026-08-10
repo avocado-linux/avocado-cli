@@ -903,11 +903,17 @@ EOF
     local shown
     for _ in $(seq 1 45); do
       line="$(app_line)"
+      shown="${line% image=*}"
       case "$line" in
+        # The whole demo turns on this one line, and it arrives as the last of
+        # half a dozen visually identical ones - so mark it. Printed directly
+        # rather than through p(), which measures ${#s} and would count the
+        # escape sequences against the 64-column budget.
+        "app $version "*)
+          printf '    \033[1;32m%s\033[0m  \033[32m<- new\033[0m\n' "$shown" ;;
         # Repeats are the point - a line per tick is what shows the app running
         # before and after, so print every one rather than deduplicating.
         "app "*)
-          shown="${line% image=*}"
           p "    $shown" ;;
       esac
       case "$line" in "app $version "*) break ;; esac
