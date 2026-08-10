@@ -1583,7 +1583,12 @@ impl Config {
         // `load_composed`, so it has to resolve `version: { file, key }` itself.
         // `ext package` reaches a *local* extension this way — miss it and an
         // in-source extension packages with an unresolved mapping.
-        if let Some(ext_name) = section_path.strip_prefix("extensions.") {
+        // Only a direct `extensions.<name>` block is an extension; a deeper path
+        // would otherwise be read as an extension named `<name>.<sub>`.
+        if let Some(ext_name) = section_path
+            .strip_prefix("extensions.")
+            .filter(|name| !name.contains('.'))
+        {
             let root = Path::new(config_path).parent().unwrap_or(Path::new("."));
             let reader = ExtSourceReader::dir(root, DirOrigin::LocalConfig);
             crate::utils::ext_version_source::resolve_in_ext_value(

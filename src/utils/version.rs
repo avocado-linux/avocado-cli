@@ -10,7 +10,8 @@ pub fn validate_ext_version(ext_name: &str, version: &str, source_path: &str) ->
     validate_semver(version).with_context(|| {
         format!(
             "Extension '{ext_name}' has invalid version '{version}' (from {source_path}). \
-             Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')"
+             Version must be in semantic versioning format \
+             (e.g., '1.0.0', '2.1.3', '1.0.0-rc.1', '1.0.0+build.5')"
         )
     })
 }

@@ -202,7 +202,24 @@ impl ExtSourceReader {
         match self {
             Self::Dir { root, .. } => {
                 let path = root.join(rel);
-                std::fs::read_to_string(&path)
+
+                // `version.file` already rejects absolute paths and `..`, but a
+                // symlink *inside* the tree can still point out of it, and for a
+                // `type: git` extension the tree is third-party content. Resolve
+                // before reading and require the result to stay under the root.
+                let real = path
+                    .canonicalize()
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if !real.starts_with(&real_root) {
+                    anyhow::bail!(
+                        "'{rel}' resolves to {}, outside the extension root {}",
+                        real.display(),
+                        real_root.display()
+                    );
+                }
+
+                std::fs::read_to_string(&real)
                     .with_context(|| format!("Failed to read {}", path.display()))
             }
             Self::Volume {
@@ -360,6 +377,26 @@ mod tests {
         let reader = ExtSourceReader::dir(&dir, DirOrigin::SourcePath);
         assert_eq!(reader.read("VERSION").unwrap(), "1.2.3\n");
         assert!(reader.read("nope").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dir_reader_rejects_symlink_out_of_the_root() {
+        let dir = tmpdir("escape");
+        let outside = dir.join("outside");
+        let root = dir.join("ext");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "sekrit\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("VERSION")).unwrap();
+
+        let reader = ExtSourceReader::dir(&root, DirOrigin::SourcePath);
+        let err = reader.read("VERSION").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the extension root"),
+            "{err:#}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
