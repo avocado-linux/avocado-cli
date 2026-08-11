@@ -766,11 +766,51 @@ impl DependencyGraph {
         chain.push(&node.name);
         for dep in &node.depends_on {
             self.visit(&dep.name, marks, chain, order)?;
+            self.check_edge_version(&node.name, dep)?;
         }
         chain.pop();
         marks.insert(&node.name, Mark::Done);
         order.push(node.name.clone());
 
+        Ok(())
+    }
+
+    /// Reject an edge whose constraint cannot hold against the version its
+    /// target declares.
+    ///
+    /// Only RPM-backed edges are checked by anything else: `ext package`
+    /// emits `Requires: avocado-ext(base) >= …` and dnf enforces it at
+    /// install. An inline, `path`, or `git` extension never reaches a solver,
+    /// so `depends_on: { name: base, version: "^2" }` against a base
+    /// declaring `version: "1.0.0"` would otherwise resolve, install, and
+    /// ship — the constraint silently doing nothing.
+    ///
+    /// Two cases are deliberately not errors, because in both there is
+    /// nothing to compare against:
+    /// - the target declares no `version:` at all — most inline extensions
+    ///   don't, and it is `ext build` that requires one;
+    /// - the target's version is not parseable as strict semver.
+    ///   [`crate::utils::version::validate_semver`] is looser (it accepts a
+    ///   fourth component), so refusing here would reject configs that build
+    ///   fine today. RPM still compares them at install.
+    fn check_edge_version(&self, from: &str, dep: &ExtensionDependency) -> Result<()> {
+        let Some(req) = dep.version_req()? else {
+            return Ok(());
+        };
+        let Some(raw) = self.nodes.get(&dep.name).and_then(|n| n.version.as_deref()) else {
+            return Ok(());
+        };
+        let Ok(version) = semver::Version::parse(raw) else {
+            return Ok(());
+        };
+        if !req.matches(&version) {
+            bail!(
+                "Extension '{from}' requires '{}' {req}, but '{}' declares version {raw}.\n\
+                 Relax the `depends_on` constraint or update the dependency.",
+                dep.name,
+                dep.name,
+            );
+        }
         Ok(())
     }
 
@@ -1260,6 +1300,53 @@ mod tests {
         let err = g.resolve(&roots(&["ghost"])).unwrap_err().to_string();
         assert!(err.contains("'ghost' is not defined"), "{err}");
         assert!(!err.contains("Required by"), "{err}");
+    }
+
+    // ---- edge version constraints ----------------------------------------
+
+    #[test]
+    fn unsatisfiable_constraint_is_rejected() {
+        // Nothing else would catch this: only an RPM-backed edge gets a
+        // `Requires:` line for dnf to enforce.
+        let g = graph(
+            "extensions:\n\
+             \x20 base: { version: \"1.0.0\" }\n\
+             \x20 app-a:\n\
+             \x20   depends_on:\n\
+             \x20     - { name: base, version: \"^2\" }\n",
+        );
+        let err = g.resolve(&roots(&["app-a"])).unwrap_err().to_string();
+        assert!(err.contains("'app-a' requires 'base'"), "{err}");
+        assert!(err.contains("declares version 1.0.0"), "{err}");
+    }
+
+    #[test]
+    fn satisfied_constraint_resolves() {
+        let g = graph(
+            "extensions:\n\
+             \x20 base: { version: \"1.4.2\" }\n\
+             \x20 app-a:\n\
+             \x20   depends_on:\n\
+             \x20     - { name: base, version: \">=1.2.0\" }\n",
+        );
+        let c = g.resolve(&roots(&["app-a"])).unwrap();
+        assert_eq!(c.order, vec!["base", "app-a"]);
+    }
+
+    #[test]
+    fn unverifiable_versions_are_left_to_rpm() {
+        // No `version:` to compare against, and a version too loose for strict
+        // semver — neither is an error here (see `check_edge_version`).
+        let g = graph(
+            "extensions:\n\
+             \x20 base: {}\n\
+             \x20 four-part: { version: \"1.2.3.4\" }\n\
+             \x20 app-a:\n\
+             \x20   depends_on:\n\
+             \x20     - { name: base, version: \"^2\" }\n\
+             \x20     - { name: four-part, version: \"^9\" }\n",
+        );
+        assert!(g.resolve(&roots(&["app-a"])).is_ok());
     }
 
     // ---- rpm version ordering (downgrade detection) ----------------------

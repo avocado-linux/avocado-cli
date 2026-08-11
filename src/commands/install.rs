@@ -1,6 +1,7 @@
 //! Install command implementation that runs SDK, extension, and runtime installs.
 
 use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -15,6 +16,37 @@ use crate::utils::{
     target::validate_and_log_target,
     tui::{TaskId, TaskRenderer, TaskStatus},
 };
+
+/// DAG edges for the ext install tasks: each extension waits on the
+/// dependencies whose sysroots it seeds its rpmdb from.
+///
+/// Edges naming an extension that was not registered as a task are dropped —
+/// waiting on a task that never runs would hang the whole install rather than
+/// just skip de-duplication.
+fn ext_install_edges(
+    ext_task_ids: &[TaskId],
+    direct_deps: &HashMap<String, Vec<String>>,
+) -> Vec<(TaskId, Vec<TaskId>)> {
+    let registered: HashSet<&TaskId> = ext_task_ids.iter().collect();
+    ext_task_ids
+        .iter()
+        .map(|id| {
+            let TaskId::ExtInstall(name) = id else {
+                return (id.clone(), vec![]);
+            };
+            let deps = direct_deps
+                .get(name)
+                .map(|deps| {
+                    deps.iter()
+                        .map(|d| TaskId::ExtInstall(d.clone()))
+                        .filter(|t| registered.contains(t))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (id.clone(), deps)
+        })
+        .collect()
+}
 
 /// Represents an extension dependency
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -255,8 +287,58 @@ impl InstallCommand {
         let parsed = &composed.merged_value;
 
         // Determine which extensions and runtimes to install
-        let extensions_to_install = self.find_required_extensions(&composed, &_target)?;
+        let mut extensions_to_install = self.find_required_extensions(&composed, &_target)?;
         let target_runtimes = self.find_target_relevant_runtimes(config, parsed, &_target)?;
+
+        // Expand `depends_on`. A runtime lists only what its author cares
+        // about, so a shared platform base is named nowhere here — it would
+        // never be installed, and its dependents would have no populated
+        // sysroot to seed their rpmdb from. Pulling the closure in also gives
+        // the DAG below its edges: closure order is dependencies-first, so
+        // pushing in that order registers a base ahead of what needs it.
+        let ext_deps_edges: HashMap<String, Vec<String>> =
+            match crate::utils::ext_deps::DependencyGraph::from_composed(&composed, &_target) {
+                Ok(graph) => {
+                    let authored: Vec<String> = extensions_to_install
+                        .iter()
+                        .map(|e| {
+                            let ExtensionDependency::Local(name) = e;
+                            name.clone()
+                        })
+                        .collect();
+                    match graph.resolve(&authored) {
+                        Ok(closure) => {
+                            let already: HashSet<&String> = authored.iter().collect();
+                            for name in &closure.order {
+                                if !already.contains(name) {
+                                    extensions_to_install
+                                        .push(ExtensionDependency::Local(name.clone()));
+                                }
+                            }
+                            closure
+                                .order
+                                .iter()
+                                .filter_map(|name| {
+                                    let node = graph.get(name)?;
+                                    if node.depends_on.is_empty() {
+                                        return None;
+                                    }
+                                    Some((
+                                        name.clone(),
+                                        node.depends_on.iter().map(|d| d.name.clone()).collect(),
+                                    ))
+                                })
+                                .collect()
+                        }
+                        // A graph that will not resolve is reported with full
+                        // context by `runtime build`. Installing the authored
+                        // list flat is exactly what happened before
+                        // `depends_on` existed, so do not block the install.
+                        Err(_) => HashMap::new(),
+                    }
+                }
+                Err(_) => HashMap::new(),
+            };
 
         // Register ext/runtime tasks now that we know what was fetched.
         // (Sysroot tasks were already registered upfront.)
@@ -287,8 +369,8 @@ impl InstallCommand {
             max_parallel
         };
 
-        // Build DAG: ext installs have no inter-dependencies (parallel),
-        // runtime installs depend on all ext installs completing first.
+        // Build DAG: ext installs run in parallel except along `depends_on`
+        // edges, runtime installs depend on all ext installs completing first.
         if !extensions_to_install.is_empty() || !target_runtimes.is_empty() {
             let mut graph = TaskGraph::new();
 
@@ -300,8 +382,8 @@ impl InstallCommand {
                 })
                 .collect();
 
-            for id in &ext_task_ids {
-                graph.add_task(id.clone(), vec![]);
+            for (id, deps) in ext_install_edges(&ext_task_ids, &ext_deps_edges) {
+                graph.add_task(id, deps);
             }
 
             for rt in &target_runtimes {
@@ -372,7 +454,10 @@ impl InstallCommand {
                                 .with_runs_on(runs_on, nfs_port)
                                 .with_sdk_arch(sdk_arch)
                                 .with_composed_config(composed)
-                                .with_runtime(dual_write_runtime);
+                                .with_runtime(dual_write_runtime)
+                                // The DAG above scheduled every dependency as
+                                // its own task, ordered ahead of this one.
+                                .with_deps_scheduled(true);
                                 if let Some(ctx) = tui_ctx {
                                     cmd = cmd.with_tui_context(ctx);
                                 }
@@ -764,6 +849,25 @@ fn scope_label(scope: &PackageScope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ext_install_waits_on_the_base_it_seeds_from() {
+        let base = TaskId::ExtInstall("weston-base".to_string());
+        let app = TaskId::ExtInstall("kiosk-a".to_string());
+        let deps = HashMap::from([(
+            "kiosk-a".to_string(),
+            // The second name is deliberately not a registered task.
+            vec!["weston-base".to_string(), "never-scheduled".to_string()],
+        )]);
+
+        let edges: HashMap<TaskId, Vec<TaskId>> =
+            ext_install_edges(&[base.clone(), app.clone()], &deps)
+                .into_iter()
+                .collect();
+
+        assert_eq!(edges[&app], vec![base.clone()]);
+        assert!(edges[&base].is_empty());
+    }
 
     #[test]
     fn test_new() {
