@@ -979,7 +979,15 @@ if [ -n "$AVOCADO_SDK_REPO_URL" ]; then
 fi
 
 mkdir -p $AVOCADO_SDK_PREFIX/usr/lib/rpm
-cp -r /usr/lib/rpm/* $AVOCADO_SDK_PREFIX/usr/lib/rpm/
+# Seed the rpm config from the container image only when the sysroot has none.
+# nativesdk-rpm installs its own macros at this path, and they have to match the
+# rpm binaries in the sysroot rather than the ones in the image, which can be a
+# release behind. An image on rpm 4.19 overwriting a wrynose sysroot drops the
+# %mkbuilddir stage macros that rpm 4.20 requires, and rpmbuild then fails every
+# `avocado ext package` with "Couldn't exec %{__spec_builddir_cmd}".
+if [ ! -f $AVOCADO_SDK_PREFIX/usr/lib/rpm/macros ]; then
+    cp -r /usr/lib/rpm/* $AVOCADO_SDK_PREFIX/usr/lib/rpm/
+fi
 
 # Before calling DNF, $AVOCADO_SDK_PREFIX/usr/lib/rpm/macros needs to be updated to point:
 #   - /usr -> $AVOCADO_SDK_PREFIX/usr
