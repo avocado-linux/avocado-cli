@@ -47,6 +47,13 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
 
+    /// Minimum var disk size, e.g. `"200G"`. `vm start` grows the live
+    /// disk to at least this (never shrinks), and a var reset re-seeds
+    /// at it. `vm update` records the live disk's size here before a
+    /// reset, so a grown disk keeps its capacity across the re-seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub var_size: Option<String>,
+
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,
 }
@@ -326,6 +333,7 @@ mod tests {
             runtime: Some(RuntimeConfig {
                 cpus: Some(6),
                 memory_mib: Some(8192),
+                var_size: Some("200G".into()),
                 extra: Default::default(),
             }),
             ..Default::default()
