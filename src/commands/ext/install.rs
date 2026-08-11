@@ -10,10 +10,12 @@ use crate::utils::kernel_resolver::{
 };
 use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
-use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::output::{
+    print_debug, print_error, print_info, print_success, print_warning, OutputLevel,
+};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
-    compute_ext_install_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
+    compute_ext_install_input_hash_with_deps, generate_write_stamp_script, Stamp, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -27,6 +29,8 @@ pub struct ExtInstallCommand {
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
+    /// See [`Self::with_deps_scheduled`].
+    deps_scheduled: bool,
     runs_on: Option<String>,
     nfs_port: Option<u16>,
     sdk_arch: Option<String>,
@@ -62,6 +66,7 @@ impl ExtInstallCommand {
             container_args,
             dnf_args,
             no_stamps: false,
+            deps_scheduled: false,
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
@@ -115,6 +120,19 @@ impl ExtInstallCommand {
     /// Set the no_stamps flag
     pub fn with_no_stamps(mut self, no_stamps: bool) -> Self {
         self.no_stamps = no_stamps;
+        self
+    }
+
+    /// Declare that the caller has already scheduled every `depends_on`
+    /// target as its own install, ordered before this one.
+    ///
+    /// `avocado install` fans out one command per extension and runs them
+    /// concurrently. Each of them expanding its own closure would have two
+    /// dependents rebuild the same shared base at the same time — a `rm -rf`
+    /// of a sysroot another task is installing into. The scheduler owns the
+    /// closure there; this command only installs what it was handed.
+    pub fn with_deps_scheduled(mut self, scheduled: bool) -> Self {
+        self.deps_scheduled = scheduled;
         self
     }
 
@@ -255,6 +273,129 @@ impl ExtInstallCommand {
             return Ok(());
         }
 
+        let graph = crate::utils::ext_deps::DependencyGraph::from_composed(&composed, &target)?;
+
+        // Expand to the dependency closure, then order dependencies before
+        // dependents.
+        //
+        // This is the *install* order, deliberately the opposite of the
+        // runtime manifest's parent-first merge order: a dependency's sysroot
+        // has to exist and be fully populated before a dependent can seed its
+        // rpmdb from it. Installing alphabetically would seed from an empty or
+        // half-built dependency and silently defeat de-duplication.
+        let mut closure_resolved = true;
+        let extensions_to_install = {
+            let requested: Vec<String> = extensions_to_install
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
+            match graph.resolve(&requested) {
+                Ok(closure) => {
+                    let position = |name: &str| {
+                        closure
+                            .order
+                            .iter()
+                            .position(|n| n == name)
+                            // Anything outside the graph keeps its relative
+                            // place after the ordered members.
+                            .unwrap_or(usize::MAX)
+                    };
+                    let mut ordered = extensions_to_install;
+                    // `ext install kiosk-a` has to install weston-base too.
+                    // kiosk-a's rpmdb is seeded from its dependency's sysroot,
+                    // so a dependency the author never named still has to be
+                    // there — ordering alone would leave the seed source
+                    // absent and the install would fail creating the sysroot.
+                    //
+                    // Every closure member is a key in the composed
+                    // `extensions:` mapping by construction (that mapping is
+                    // what the graph was built from), which is exactly what
+                    // `Local` means here: read the block out of `parsed`. The
+                    // install path treats `Local` and `Remote` identically —
+                    // both read the merged config — so a remote dependency
+                    // needs no separate lookup.
+                    //
+                    // `closure.order` holds each name once, so the set of
+                    // names already present needs no updating as entries are
+                    // appended.
+                    let missing: Vec<String> = if self.deps_scheduled {
+                        vec![]
+                    } else {
+                        let present: HashSet<&String> = ordered.iter().map(|(n, _)| n).collect();
+                        closure
+                            .order
+                            .iter()
+                            .filter(|n| !present.contains(n))
+                            .cloned()
+                            .collect()
+                    };
+                    for name in missing {
+                        let location = ExtensionLocation::Local {
+                            name: name.clone(),
+                            config_path: self.config_path.clone(),
+                        };
+                        ordered.push((name, location));
+                    }
+                    ordered.sort_by_key(|(name, _)| position(name));
+                    if self.verbose {
+                        print_info(
+                            &format!(
+                                "Install order (dependencies first): {}",
+                                ordered
+                                    .iter()
+                                    .map(|(n, _)| n.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ")
+                            ),
+                            OutputLevel::Normal,
+                        );
+                    }
+                    ordered
+                }
+                // A graph that will not resolve is reported by the runtime
+                // build with full context. Installing extensions one by one
+                // still works, just without de-duplication, so do not block
+                // the whole command here.
+                Err(e) => {
+                    closure_resolved = false;
+                    if self.verbose {
+                        print_info(
+                            &format!("Dependency ordering unavailable ({e}); installing as listed"),
+                            OutputLevel::Normal,
+                        );
+                    }
+                    extensions_to_install
+                }
+            }
+        };
+
+        // Direct `depends_on` edges per extension, used to pick each one's
+        // rpmdb seed source. Derived *after* the expansion above so a
+        // dependency that was pulled in rather than named gets its own seed
+        // source too — a chain seeds base <- mid <- app, not just the leaf.
+        //
+        // Empty when the graph did not resolve. Seeding reads the dependency's
+        // sysroot, which only a resolved closure guarantees exists; without
+        // one, installing as listed and skipping de-duplication is the
+        // fallback the branch above already documents.
+        let direct_deps: HashMap<String, Vec<String>> = if closure_resolved {
+            extensions_to_install
+                .iter()
+                .filter_map(|(name, _)| {
+                    let node = graph.get(name)?;
+                    if node.depends_on.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        name.clone(),
+                        node.depends_on.iter().map(|d| d.name.clone()).collect(),
+                    ))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         let ext_names: Vec<&str> = extensions_to_install
             .iter()
             .map(|(n, _)| n.as_str())
@@ -309,6 +450,7 @@ impl ExtInstallCommand {
                 config,
                 parsed,
                 &extensions_to_install,
+                &direct_deps,
                 &container_helper,
                 container_image,
                 &target,
@@ -346,6 +488,7 @@ impl ExtInstallCommand {
         config: &Config,
         parsed: &serde_yaml::Value,
         extensions_to_install: &[(String, ExtensionLocation)],
+        direct_deps: &std::collections::HashMap<String, Vec<String>>,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
@@ -403,6 +546,7 @@ impl ExtInstallCommand {
                     &src_dir,
                     runs_on_context,
                     effective_tui_context,
+                    direct_deps.get(ext_name).map(Vec::as_slice).unwrap_or(&[]),
                 )
                 .await?
             {
@@ -416,7 +560,34 @@ impl ExtInstallCommand {
                     ctx.renderer
                         .append_output(&ctx.task_id, "Writing install stamp...".to_string());
                 }
-                let inputs = compute_ext_install_input_hash(parsed, ext_name)?;
+                // Fold in the state of whatever this extension was seeded
+                // from, so changing a dependency invalidates its dependents.
+                // Read after the dependency installed — topological order
+                // guarantees its lock entry is already current.
+                let dep_state: Vec<(String, String)> = direct_deps
+                    .get(ext_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|dep| {
+                        let versions = lock_file
+                            .get_extension_packages(target, dep)
+                            .map(|pkgs| {
+                                let mut v: Vec<String> =
+                                    pkgs.iter().map(|(k, val)| format!("{k}={val:?}")).collect();
+                                v.sort();
+                                v.join(",")
+                            })
+                            .unwrap_or_default();
+                        let source = lock_file
+                            .get_extension_source(target, dep)
+                            .and_then(|s| s.version.clone())
+                            .unwrap_or_default();
+                        (dep.clone(), format!("{source}|{versions}"))
+                    })
+                    .collect();
+                let inputs =
+                    compute_ext_install_input_hash_with_deps(parsed, ext_name, &dep_state)?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;
@@ -543,6 +714,7 @@ impl ExtInstallCommand {
         src_dir: &Path,
         runs_on_context: Option<&RunsOnContext>,
         effective_tui_context: &Option<TuiContext>,
+        direct_deps: &[String],
     ) -> Result<bool> {
         let sysroot = self.extension_sysroot(extension);
 
@@ -573,7 +745,20 @@ impl ExtInstallCommand {
             lock_file,
         );
 
-        if needs_clean_reinstall {
+        // The rpmdb seed is applied only when the sysroot is created, so a
+        // surviving sysroot keeps whatever it was seeded from originally.
+        //
+        // That silently defeats de-duplication: an extension first built
+        // before it had a dependency — or before its dependency changed —
+        // keeps a rootfs-seeded rpmdb, dnf sees the shared packages as absent,
+        // and installs a private copy again. The seed source is part of the
+        // sysroot's identity, so any reason to re-seed is a reason to recreate.
+        //
+        // Reaching here at all means the stamp was already judged stale (or
+        // stamps are off), so rebuilding a dependent is not extra work in the
+        // steady state.
+        let reseed_required = !direct_deps.is_empty();
+        if needs_clean_reinstall || self.force || reseed_required {
             // Clean the sysroot so it will be recreated fresh below
             let clean_command = format!(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}""#);
 
@@ -599,8 +784,48 @@ impl ExtInstallCommand {
 
         // Check if the sysroot exists (it may have just been cleaned above, or never created)
         let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
+
+        // Seed this extension's rpmdb — the mechanism that de-duplicates
+        // shared packages.
+        //
+        // An extension's image is the *net-new files* over whatever its rpmdb
+        // already claims is installed. Seeding from the rootfs alone means a
+        // dependency's packages look absent, so dnf installs a second private
+        // copy and both images ship it. Seeding from the dependency's sysroot
+        // instead makes those packages look present, and dnf omits them.
+        //
+        // A chain composes naturally: mid seeds from base (rootfs ∪ base),
+        // app-b then seeds from mid (rootfs ∪ base ∪ mid). Topological install
+        // order guarantees the dependency's sysroot is already populated.
+        let seed_source = match direct_deps {
+            [] => "$AVOCADO_PREFIX/rootfs".to_string(),
+            [only] => format!("$AVOCADO_EXT_SYSROOTS/{only}"),
+            [first, rest @ ..] => {
+                // True diamond. Seeding from one dependency still de-duplicates
+                // that branch; packages unique to the others are not yet
+                // subtracted, so they ship twice. Correct, just not optimal —
+                // say so rather than let it look fully deduplicated.
+                print_warning(
+                    &format!(
+                        "Extension '{extension}' depends on {} extensions; \
+                         de-duplicating against '{first}' only. Packages unique to {} \
+                         may be duplicated in this image.",
+                        direct_deps.len(),
+                        rest.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+                format!("$AVOCADO_EXT_SYSROOTS/{first}")
+            }
+        };
+        if self.verbose && !direct_deps.is_empty() {
+            print_info(
+                &format!("Seeding '{extension}' rpmdb from {seed_source}"),
+                OutputLevel::Normal,
+            );
+        }
         let setup_command = format!(
-            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf {seed_source}/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
         );
 
         let run_config = RunConfig {

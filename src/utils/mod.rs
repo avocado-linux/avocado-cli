@@ -3,6 +3,7 @@ pub mod config_edit;
 pub mod container;
 #[cfg(target_os = "macos")]
 pub mod disk_writer;
+pub mod ext_deps;
 pub mod ext_fetch;
 pub mod host_copy;
 pub mod image_signing;

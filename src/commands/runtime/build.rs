@@ -5,7 +5,7 @@ use crate::utils::config::get_post_install;
 use crate::utils::{
     config::{ComposedConfig, Config, ImageConfig},
     container::{RunConfig, SdkContainer, TuiContext},
-    output::{print_error, print_info, print_success, OutputLevel},
+    output::{print_error, print_info, print_success, print_warning, OutputLevel},
     permissions::{mapping_from_hashmap, render_users_groups_script},
     runs_on::RunsOnContext,
     stamps::{
@@ -182,6 +182,7 @@ impl RuntimeBuildCommand {
             .execute_build_internal(
                 config,
                 parsed,
+                &composed,
                 container_image,
                 &target_arch,
                 &merged_container_args,
@@ -217,6 +218,7 @@ impl RuntimeBuildCommand {
         &self,
         config: &crate::utils::config::Config,
         parsed: &serde_yaml::Value,
+        composed: &ComposedConfig,
         container_image: &str,
         target_arch: &str,
         merged_container_args: &Option<Vec<String>>,
@@ -492,6 +494,7 @@ impl RuntimeBuildCommand {
         let resolved_extensions = self
             .collect_runtime_extensions(
                 parsed,
+                composed,
                 config,
                 &self.runtime_name,
                 target_arch,
@@ -2654,10 +2657,20 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
     /// Returns a list of versioned extension names in the format "ext_name-version"
     /// (e.g., "my-ext-1.0.0"). This ensures AVOCADO_EXT_LIST and the build script
     /// use exact versions from the configuration, not wildcards.
+    ///
+    /// The runtime's `extensions:` list is **author intent**, not the final set:
+    /// each entry's `depends_on` closure is expanded here, so an author names
+    /// only the extensions they care about and the platform bases those depend
+    /// on come along automatically.
+    ///
+    /// Order is parent-first, dependencies flattened underneath — see
+    /// [`crate::utils::ext_deps::DependencyGraph::resolve_runtime_list`]. This
+    /// is merge-priority order, deliberately the opposite of install order.
     #[allow(clippy::too_many_arguments)]
     async fn collect_runtime_extensions(
         &self,
         parsed: &serde_yaml::Value,
+        composed: &ComposedConfig,
         config: &crate::utils::config::Config,
         runtime_name: &str,
         target_arch: &str,
@@ -2683,24 +2696,65 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             });
 
         if let Some(ext_seq) = ext_list {
-            for ext in ext_seq {
-                if let Some(spec) =
-                    crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
-                {
-                    let ext_name = spec.name.as_str();
-                    let version = self
-                        .resolve_extension_version(
-                            parsed,
-                            config,
-                            config_path,
-                            ext_name,
-                            container_image,
-                            target_arch,
-                            container_args.clone(),
-                        )
-                        .await?;
-                    extensions.push(format!("{ext_name}-{version}"));
+            // What the author actually wrote, in their order. Names are
+            // interpolated so they match the dependency graph's keys.
+            let authored: Vec<String> = ext_seq
+                .iter()
+                .filter_map(crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry)
+                .map(|spec| crate::utils::interpolation::interpolate_name(&spec.name, target_arch))
+                .collect();
+
+            // Expand `depends_on`. Built from the composed config so a remote
+            // extension that was never fetched is reported as such rather than
+            // silently resolving as dependency-free.
+            let graph =
+                crate::utils::ext_deps::DependencyGraph::from_composed(composed, target_arch)?;
+
+            // Validate the closure and surface advisory lints once, here,
+            // where the runtime being built can be named.
+            let closure = graph.resolve(&authored).with_context(|| {
+                format!("Failed to resolve extension dependencies for runtime '{runtime_name}'")
+            })?;
+            for warning in graph.lint(&closure) {
+                print_warning(&warning, OutputLevel::Normal);
+            }
+
+            // `closure` above already validated the graph, so order without
+            // re-walking it.
+            let resolved = graph.order_runtime_list(&authored);
+
+            if self.verbose {
+                let implied: Vec<&str> = resolved
+                    .iter()
+                    .filter(|e| !e.authored)
+                    .map(|e| e.name.as_str())
+                    .collect();
+                if !implied.is_empty() {
+                    print_info(
+                        &format!(
+                            "Runtime '{runtime_name}': pulled in {} dependency extension(s): {}",
+                            implied.len(),
+                            implied.join(", ")
+                        ),
+                        OutputLevel::Normal,
+                    );
                 }
+            }
+
+            for entry in resolved {
+                let ext_name = entry.name.as_str();
+                let version = self
+                    .resolve_extension_version(
+                        parsed,
+                        config,
+                        config_path,
+                        ext_name,
+                        container_image,
+                        target_arch,
+                        container_args.clone(),
+                    )
+                    .await?;
+                extensions.push(format!("{ext_name}-{version}"));
             }
         }
 

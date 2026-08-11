@@ -2798,6 +2798,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force,
+                locked,
                 extension,
                 target,
                 container_args,
@@ -2810,7 +2811,8 @@ async fn main() -> Result<()> {
                     target.or(cli.target.clone()),
                     container_args,
                 )
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_locked(locked);
                 fetch_cmd.execute().await?;
                 Ok(())
             }
@@ -4279,6 +4281,10 @@ enum ExtCommands {
         /// Force re-fetch even if already installed
         #[arg(short, long)]
         force: bool,
+        /// Fail instead of updating avocado.lock when a locked dependency
+        /// cannot satisfy a new requirement. Use this in CI.
+        #[arg(long)]
+        locked: bool,
         /// Extension name (deprecated, use positional argument)
         #[arg(short = 'e', long = "extension", hide = true)]
         extension: Option<String>,

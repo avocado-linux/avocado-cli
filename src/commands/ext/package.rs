@@ -232,6 +232,10 @@ impl ExtPackageCommand {
             );
         }
 
+        // Project `depends_on` / `class` into RPM metadata (see below).
+        let dependency_metadata =
+            self.build_dependency_metadata(&ext_config, &rpm_metadata, &target)?;
+
         // Create main RPM package in container
         // This packages the extension's src_dir (directory containing avocado.yaml)
         let output_path = self
@@ -242,6 +246,7 @@ impl ExtPackageCommand {
                 &ext_config_path,
                 &package_files,
                 &cfg_basename,
+                &dependency_metadata,
             )
             .await?;
 
@@ -491,6 +496,49 @@ impl ExtPackageCommand {
     }
 
     /// Generate summary from extension name
+    /// Project the extension's `depends_on` and `class` into RPM metadata.
+    ///
+    /// Mirrors the existing `supported_targets` → `avocado-target(...)`
+    /// projection: a field of `avocado.yaml` becomes repo metadata, readable
+    /// from `primary.xml` without downloading the package. That is what lets
+    /// the dependency graph be inspected before anything is materialized.
+    ///
+    /// The `Requires:` lines do real work — because the nested layout installs
+    /// every extension into one shared includes installroot, a single
+    /// `dnf install` depsolves and materializes the whole dependency closure
+    /// in one transaction rather than N discovery rounds.
+    ///
+    /// Dependencies are named by the virtual capability `avocado-ext(<name>)`,
+    /// never by the bare RPM name: `source.package` lets a consumer publish an
+    /// extension under a different package name, which would break a literal
+    /// `Requires: <ext-name>`.
+    fn build_dependency_metadata(
+        &self,
+        ext_config: &serde_yaml::Value,
+        metadata: &RpmMetadata,
+        target: &str,
+    ) -> Result<String> {
+        use crate::utils::ext_deps::{rpm_capability, ExtensionClass, ExtensionDependency};
+
+        let mut lines = vec![format!(
+            "Provides: {} = {}",
+            rpm_capability(&self.extension),
+            metadata.version
+        )];
+
+        let class = ExtensionClass::from_ext_config(&self.extension, ext_config)?;
+        lines.push(format!("Provides: avocado-ext-class({})", class.as_str()));
+
+        if let Some(seq) = ext_config.get("depends_on").and_then(|v| v.as_sequence()) {
+            for entry in seq {
+                let dep = ExtensionDependency::parse_entry(&self.extension, entry, target)?;
+                lines.extend(dep.to_rpm_requires()?);
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
     fn generate_summary_from_name(&self, name: &str) -> String {
         // Convert kebab-case to title case
         let words: Vec<&str> = name.split('-').collect();
@@ -525,6 +573,7 @@ impl ExtPackageCommand {
     /// * `target` - The target architecture
     /// * `ext_config_path` - Path to the extension's config file
     /// * `package_files` - List of files/directories to package (supports glob patterns like * and **)
+    #[allow(clippy::too_many_arguments)]
     async fn create_rpm_package_in_container(
         &self,
         metadata: &RpmMetadata,
@@ -533,6 +582,7 @@ impl ExtPackageCommand {
         ext_config_path: &str,
         package_files: &[String],
         cfg_basename: &str,
+        dependency_metadata: &str,
     ) -> Result<PathBuf> {
         let container_image = config
             .get_sdk_image()
@@ -730,6 +780,12 @@ Provides: avocado-ext-layout(nested)
 # query target compatibility without downloading the RPM, and so the feed server can route
 # it to the correct per-target -ext feed(s). "*" means all targets (cross-target).
 {target_provides}
+# Self-describe the inter-extension dependency edges, derived from avocado.yaml
+# `depends_on` / `class`. Dependents require the virtual `avocado-ext(<name>)`
+# capability rather than the RPM name, so a `source.package` rename can't break the
+# edge. Because nested packages share one includes installroot, these Requires let a
+# single `dnf install` materialize the whole closure in one transaction.
+{dependency_metadata}
 
 %description
 {description}
@@ -786,6 +842,7 @@ rm -rf "$TMPDIR"
             description = metadata.description,
             arch = metadata.arch,
             target_provides = target_provides,
+            dependency_metadata = dependency_metadata,
             rpm_filename = rpm_filename,
             container_src_dir = container_src_dir,
             package_files_str = package_files_str,
@@ -979,6 +1036,128 @@ struct RpmMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dep_metadata(ext_name: &str, ext_yaml: &str) -> String {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            ext_name.to_string(),
+            Some("qemux86-64".to_string()),
+            None,
+            false,
+            None,
+            None,
+        );
+        let ext_config: serde_yaml::Value = serde_yaml::from_str(ext_yaml).unwrap();
+        let metadata = RpmMetadata {
+            name: ext_name.to_string(),
+            version: "0.4.0".to_string(),
+            release: "r0".to_string(),
+            summary: String::new(),
+            description: String::new(),
+            license: String::new(),
+            arch: "x86_64".to_string(),
+            vendor: String::new(),
+            group: String::new(),
+            url: None,
+        };
+        cmd.build_dependency_metadata(&ext_config, &metadata, "qemux86-64")
+            .unwrap()
+    }
+
+    #[test]
+    fn test_dependency_metadata_provides_capability_and_class() {
+        let spec = dep_metadata("app-a", "types: [sysext]\n");
+        assert!(
+            spec.contains("Provides: avocado-ext(app-a) = 0.4.0"),
+            "{spec}"
+        );
+        // class defaults to application when unset
+        assert!(
+            spec.contains("Provides: avocado-ext-class(application)"),
+            "{spec}"
+        );
+        assert!(!spec.contains("Requires:"), "{spec}");
+    }
+
+    #[test]
+    fn test_dependency_metadata_marks_platform_class() {
+        let spec = dep_metadata("weston-base", "class: platform\n");
+        assert!(
+            spec.contains("Provides: avocado-ext-class(platform)"),
+            "{spec}"
+        );
+    }
+
+    #[test]
+    fn test_dependency_metadata_emits_requires_on_virtual_capability() {
+        // Requires must name avocado-ext(...), never the bare RPM name, so a
+        // `source.package` rename can't break the edge.
+        let spec = dep_metadata("app-a", "depends_on: [weston-base]\n");
+        assert!(
+            spec.contains("Requires: avocado-ext(weston-base)"),
+            "{spec}"
+        );
+        assert!(!spec.contains("Requires: weston-base"), "{spec}");
+    }
+
+    #[test]
+    fn test_dependency_metadata_expands_a_version_range() {
+        let spec = dep_metadata(
+            "app-a",
+            "depends_on:\n  - { name: weston-base, version: \"^1.2.0\" }\n",
+        );
+        assert!(
+            spec.contains("Requires: avocado-ext(weston-base) >= 1.2.0"),
+            "{spec}"
+        );
+        assert!(
+            spec.contains("Requires: avocado-ext(weston-base) < 2.0.0"),
+            "{spec}"
+        );
+    }
+
+    #[test]
+    fn test_dependency_metadata_interpolates_templated_dep_names() {
+        let spec = dep_metadata(
+            "app-a",
+            "depends_on: [\"avocado-bsp-{{ avocado.target }}\"]\n",
+        );
+        assert!(
+            spec.contains("Requires: avocado-ext(avocado-bsp-qemux86-64)"),
+            "{spec}"
+        );
+    }
+
+    #[test]
+    fn test_dependency_metadata_rejects_a_bad_version_requirement() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "app-a".to_string(),
+            Some("qemux86-64".to_string()),
+            None,
+            false,
+            None,
+            None,
+        );
+        let ext_config: serde_yaml::Value =
+            serde_yaml::from_str("depends_on:\n  - { name: weston-base, version: \"nonsense\" }\n")
+                .unwrap();
+        let metadata = RpmMetadata {
+            name: "app-a".to_string(),
+            version: "0.4.0".to_string(),
+            release: "r0".to_string(),
+            summary: String::new(),
+            description: String::new(),
+            license: String::new(),
+            arch: "x86_64".to_string(),
+            vendor: String::new(),
+            group: String::new(),
+            url: None,
+        };
+        assert!(cmd
+            .build_dependency_metadata(&ext_config, &metadata, "qemux86-64")
+            .is_err());
+    }
 
     #[test]
     fn test_generate_summary_from_name() {

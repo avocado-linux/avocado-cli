@@ -12,6 +12,133 @@ use crate::utils::config::ExtensionSource;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, OutputLevel};
 
+/// One package-source extension to materialize in a batched fetch.
+///
+/// `package_spec` is the fully-resolved NEVRA (or bare name for `version: '*'`)
+/// the caller wants installed. It is passed to dnf explicitly so the depsolve
+/// cannot substitute a different version than the lock file pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFetchEntry {
+    /// Extension name — also the directory it lands in under `includes/`.
+    pub ext_name: String,
+    /// RPM package name. Usually the extension name, but `source.package` can
+    /// rename it. Kept separate from `package_spec` because the layout query
+    /// matches on `%{name}` and a spec cannot be split back into name and
+    /// version unambiguously.
+    pub package_name: String,
+    /// Package spec handed to dnf (`<package_name>-<version>`, or just the name).
+    pub package_spec: String,
+    /// Optional `--repo=` restriction from `source.repo_name`.
+    pub repo_name: Option<String>,
+}
+
+/// Reject values that would be unsafe or ambiguous once interpolated into the
+/// fetch shell script.
+///
+/// The script builds `<ext>|<pkg>|<spec>` triples and splits them in shell, so
+/// a value containing whitespace, a quote, `|`, or a shell metacharacter would
+/// at best corrupt the split and at worst execute. Validating is better than
+/// escaping here: these are RPM package names and directory names under
+/// `includes/`, so none of those characters is ever legitimate — a value
+/// carrying one is a config error worth reporting, not something to quote and
+/// pass through.
+fn validate_shell_safe(field: &str, value: &str) -> Result<()> {
+    const FORBIDDEN: &[char] = &[
+        '|', '\'', '"', '`', '$', '\\', ';', '&', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?',
+        '!', '#', '~', '\n', '\r', '\t',
+    ];
+    if value.is_empty() {
+        anyhow::bail!("Extension {field} is empty.");
+    }
+    if let Some(bad) = value
+        .chars()
+        .find(|c| c.is_whitespace() || FORBIDDEN.contains(c))
+    {
+        anyhow::bail!(
+            "Extension {field} '{value}' contains the character {bad:?}, which is not \
+             valid in an RPM package name or an extension directory name."
+        );
+    }
+    Ok(())
+}
+
+impl PackageFetchEntry {
+    /// Check every value that reaches the fetch script.
+    ///
+    /// Called once per entry before the script is assembled, so a bad name is
+    /// reported by name rather than producing a confusing shell error inside
+    /// the container.
+    fn validate(&self) -> Result<()> {
+        validate_shell_safe("name", &self.ext_name)?;
+        validate_shell_safe("package name", &self.package_name)?;
+        validate_shell_safe("package spec", &self.package_spec)?;
+        if let Some(repo) = &self.repo_name {
+            validate_shell_safe("repo name", repo)?;
+        }
+        Ok(())
+    }
+
+    /// Build an entry from a `source: { type: package }` declaration.
+    ///
+    /// `package` overrides the RPM name when the extension is published under
+    /// a different one; otherwise the extension name is the package name.
+    /// `version: '*'` means "whatever the feed offers" and produces a bare
+    /// name, letting the depsolver choose.
+    pub fn from_package_source(
+        ext_name: &str,
+        package: Option<&str>,
+        version: &str,
+        repo_name: Option<&str>,
+    ) -> Self {
+        let package_name = package.unwrap_or(ext_name);
+        let package_spec = if version == "*" {
+            package_name.to_string()
+        } else {
+            format!("{package_name}-{version}")
+        };
+        Self {
+            ext_name: ext_name.to_string(),
+            package_name: package_name.to_string(),
+            package_spec,
+            repo_name: repo_name.map(str::to_string),
+        }
+    }
+}
+
+/// Delimiters around the post-install rpmdb report, so it can be picked out of
+/// dnf's own chatter on stdout.
+const INSTALLED_REPORT_BEGIN: &str = "---avocado-installed-extensions-begin---";
+const INSTALLED_REPORT_END: &str = "---avocado-installed-extensions-end---";
+
+/// Parse the `NAME VERSION-RELEASE` block emitted after a batched install.
+///
+/// Returns package name -> resolved version. Anything outside the delimiters
+/// is dnf output and ignored.
+fn parse_installed_report(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut inside = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == INSTALLED_REPORT_BEGIN {
+            inside = true;
+            continue;
+        }
+        if line == INSTALLED_REPORT_END {
+            break;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((name, version)) = line.split_once(char::is_whitespace) {
+            let (name, version) = (name.trim(), version.trim());
+            if !name.is_empty() && !version.is_empty() {
+                out.insert(name.to_string(), version.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Extension fetcher for downloading and installing remote extensions
 pub struct ExtensionFetcher {
     /// Path to the main configuration file
@@ -138,6 +265,223 @@ impl ExtensionFetcher {
         Ok(ext_install_path)
     }
 
+    /// Fetch several package-source extensions in a single DNF transaction.
+    ///
+    /// This is the path that makes inter-extension dependencies work. Because
+    /// nested packages all install into the one shared `includes` installroot,
+    /// a single `dnf install a b c` lets the **depsolver** pull in each
+    /// extension's `Requires: avocado-ext(<dep>)` closure — dependencies are
+    /// discovered, downloaded, and installed in one transaction rather than
+    /// through repeated fetch/recompose/discover rounds. It also collapses N
+    /// container spin-ups into one.
+    ///
+    /// Every requested extension is passed explicitly with its locked NEVRA, so
+    /// the depsolve cannot drift off the lock file and a consumer's declared
+    /// version always beats whatever range a dependent's `Requires:` allows.
+    ///
+    /// Layout is still detected per package, in-script: only packages providing
+    /// `avocado-ext-layout(nested)` may share the installroot. Legacy packages
+    /// (content at `/`) are installed one at a time into their own
+    /// per-extension installroot exactly as before — they cannot be batched
+    /// without colliding.
+    /// A `--repo=` restriction applies to the whole transaction, so entries are
+    /// grouped by `repo_name` and each group gets its own transaction. In the
+    /// overwhelmingly common case every entry has `repo_name: None` and this is
+    /// a single group.
+    pub async fn fetch_packages(
+        &self,
+        entries: &[PackageFetchEntry],
+        force: bool,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut resolved = std::collections::HashMap::new();
+        let mut repos: Vec<Option<String>> = Vec::new();
+        for e in entries {
+            if !repos.contains(&e.repo_name) {
+                repos.push(e.repo_name.clone());
+            }
+        }
+
+        for repo in repos {
+            let group: Vec<PackageFetchEntry> = entries
+                .iter()
+                .filter(|e| e.repo_name == repo)
+                .cloned()
+                .collect();
+            resolved.extend(
+                self.fetch_package_group(&group, repo.as_deref(), force)
+                    .await?,
+            );
+        }
+
+        Ok(resolved)
+    }
+
+    async fn fetch_package_group(
+        &self,
+        entries: &[PackageFetchEntry],
+        repo_name: Option<&str>,
+        force: bool,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if entries.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Everything below is interpolated into a shell script. Check it here,
+        // once, rather than trusting that config values are well-formed.
+        for entry in entries {
+            entry.validate()?;
+        }
+
+        if self.verbose {
+            print_info(
+                &format!(
+                    "Fetching {} package extension(s) in one transaction: {}",
+                    entries.len(),
+                    entries
+                        .iter()
+                        .map(|e| e.ext_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        // `<ext_name>|<package_name>|<package_spec>` triples. The package name
+        // is carried separately rather than parsed back out of the spec:
+        // `foo-1.2.0` cannot be split into name and version unambiguously in
+        // shell, and the layout query below matches on `%{name}`.
+        let triples = entries
+            .iter()
+            .map(|e| format!("\"{}|{}|{}\"", e.ext_name, e.package_name, e.package_spec))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let repo_arg = repo_name.map(|r| format!("--repo={r}")).unwrap_or_default();
+        let force_str = if force { "true" } else { "false" };
+
+        let script = format!(
+            r#"
+set -e
+
+DNF="RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX"
+
+# Layout detection for the WHOLE set in one query. Asking per package meant one
+# dnf metadata load each, which dominated the fetch: five extensions paid five
+# full repo loads just to learn where to put them. `--whatprovides` answers it
+# for every package at once, still from repo metadata with no payload download.
+NESTED_NAMES=$(RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+    $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {repo_arg} \
+    repoquery --whatprovides 'avocado-ext-layout(nested)' --qf '%{{name}}\n' 2>/dev/null | sort -u)
+
+NESTED_SPECS=""
+NESTED_NAMES_TO_REMOVE=""
+NESTED_DIRS=""
+
+for triple in {triples}; do
+    ext_name="${{triple%%|*}}"
+    rest="${{triple#*|}}"
+    pkg_name="${{rest%%|*}}"
+    spec="${{rest#*|}}"
+    ext_dir="$AVOCADO_PREFIX/includes/$ext_name"
+
+    if printf '%s\n' "$NESTED_NAMES" | grep -qxF "$pkg_name"; then
+        # Accumulate only — every dnf call for the nested set is batched below.
+        NESTED_SPECS="$NESTED_SPECS $spec"
+        NESTED_NAMES_TO_REMOVE="$NESTED_NAMES_TO_REMOVE $pkg_name"
+        NESTED_DIRS="$NESTED_DIRS $ext_dir"
+    else
+        # Legacy layout: content at /, so it needs its own installroot and
+        # cannot join the shared transaction.
+        echo "Extension '$ext_name': legacy layout -> per-extension installroot"
+        if [ "{force_str}" = "true" ]; then
+            rm -rf "$ext_dir"
+        fi
+        mkdir -p "$ext_dir"
+        RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+        RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {repo_arg} \
+            --installroot="$ext_dir" -y install "$spec"
+    fi
+done
+
+# --force: clear the whole nested set in ONE transaction. Removing per
+# extension meant a full dnf metadata load each, which is what dominated a
+# forced re-fetch — the install itself was already batched.
+if [ "{force_str}" = "true" ] && [ -n "$NESTED_NAMES_TO_REMOVE" ]; then
+    echo "Removing nested extensions for re-fetch:$NESTED_NAMES_TO_REMOVE"
+    RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS --installroot="$AVOCADO_PREFIX/includes" \
+        -y remove $NESTED_NAMES_TO_REMOVE 2>/dev/null || true
+    for d in $NESTED_DIRS; do rm -rf "$d"; done
+fi
+
+if [ -n "$NESTED_SPECS" ]; then
+    echo "Installing nested extensions into shared includes installroot:$NESTED_SPECS"
+    mkdir -p "$AVOCADO_PREFIX/includes"
+
+    # One transaction: dnf resolves each package's `Requires: avocado-ext(...)`
+    # and pulls in any dependency extensions not named explicitly here.
+    RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+    RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+    $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {repo_arg} \
+        --installroot="$AVOCADO_PREFIX/includes" -y install $NESTED_SPECS
+fi
+
+# Report what the installroot actually holds now. The requested spec is not
+# the answer: `version: "*"` requests nothing in particular, and the depsolver
+# may have pulled in extensions nobody named. Only the rpmdb knows the truth,
+# and the lock needs the truth to be reproducible.
+echo "{INSTALLED_REPORT_BEGIN}"
+rpm --root="$AVOCADO_PREFIX/includes" -qa \
+    --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}}\n' 2>/dev/null | sort
+echo "{INSTALLED_REPORT_END}"
+"#
+        );
+
+        let container_helper = SdkContainer::new().verbose(self.verbose);
+        let run_config = RunConfig {
+            container_image: self.container_image.clone(),
+            target: self.target.clone(),
+            command: script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: self.repo_url.clone(),
+            repo_release: self.repo_release.clone(),
+            container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        };
+
+        let out = container_helper
+            .run_in_container_capture(run_config)
+            .await?;
+        if !out.success {
+            return Err(anyhow::anyhow!(
+                "Failed to fetch package extension(s): {}{}",
+                entries
+                    .iter()
+                    .map(|e| e.ext_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                crate::utils::container::container_failure_detail(
+                    &out.stderr,
+                    crate::utils::container::STDERR_TAIL_LINES
+                )
+                .map(|d| format!("\n{d}"))
+                .unwrap_or_default()
+            ));
+        }
+
+        // The container's own progress output is suppressed by capture, so
+        // echo it when the user asked to see it.
+        if self.verbose && !out.stdout.is_empty() {
+            print_info(out.stdout.trim_end(), OutputLevel::Normal);
+        }
+
+        Ok(parse_installed_report(&out.stdout))
+    }
+
     /// Fetch an extension from the avocado package repository
     ///
     /// Installs the extension package into the SHARED `$AVOCADO_PREFIX/includes`
@@ -145,6 +489,7 @@ impl ExtensionFetcher {
     /// top-level `/<ext_name>/` dir, so the content lands at `includes/<ext_name>/` and a
     /// single rpmdb tracks every installed extension (proper tracking, clean upgrades,
     /// version management, no cross-extension file collisions).
+    #[allow(dead_code)]
     async fn fetch_from_repo(
         &self,
         ext_name: &str,
@@ -424,6 +769,165 @@ echo "Successfully fetched extension '{ext_name}' from git"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- post-install resolved-version report ---------------------------
+
+    #[test]
+    fn parses_the_delimited_report_and_ignores_dnf_chatter() {
+        let stdout = format!(
+            "Last metadata expiration check: 0:00:01 ago.\n\
+             Installing:\n\
+             \x20 avocado-ext-deptest-app-a  noarch  0.1.0-r0\n\
+             Complete!\n\
+             {INSTALLED_REPORT_BEGIN}\n\
+             avocado-ext-deptest-app-a 0.1.0-r0\n\
+             avocado-ext-deptest-base 1.2.0-r0\n\
+             avocado-ext-deptest-mid 0.3.0-r0\n\
+             {INSTALLED_REPORT_END}\n"
+        );
+        let got = parse_installed_report(&stdout);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got["avocado-ext-deptest-base"], "1.2.0-r0");
+        assert_eq!(got["avocado-ext-deptest-mid"], "0.3.0-r0");
+        // The "Installing:" table above must not be mistaken for the report.
+        assert!(!got.contains_key("Installing:"));
+    }
+
+    #[test]
+    fn report_absent_or_empty_yields_nothing_rather_than_garbage() {
+        assert!(parse_installed_report("").is_empty());
+        assert!(parse_installed_report("Complete!\nno markers here\n").is_empty());
+        assert!(parse_installed_report(&format!(
+            "{INSTALLED_REPORT_BEGIN}\n{INSTALLED_REPORT_END}\n"
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn report_tolerates_blank_and_malformed_lines() {
+        let stdout = format!(
+            "{INSTALLED_REPORT_BEGIN}\n\
+             \n\
+             no-version-here\n\
+             good-pkg 1.0.0-r0\n\
+             {INSTALLED_REPORT_END}\n"
+        );
+        let got = parse_installed_report(&stdout);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["good-pkg"], "1.0.0-r0");
+    }
+
+    #[test]
+    fn a_locked_version_produces_a_pinned_spec() {
+        // The round trip that makes a rebuild reproducible: whatever the rpmdb
+        // reported becomes the spec handed to the next depsolve.
+        let e = PackageFetchEntry::from_package_source(
+            "avocado-ext-deptest-base",
+            None,
+            "1.2.0-r0",
+            None,
+        );
+        assert_eq!(e.package_spec, "avocado-ext-deptest-base-1.2.0-r0");
+        assert_ne!(
+            e.package_spec, "avocado-ext-deptest-base",
+            "a pinned entry must not degrade to a bare name"
+        );
+    }
+
+    // ---- shell-safety validation ----------------------------------------
+
+    #[test]
+    fn ordinary_names_validate() {
+        let e = PackageFetchEntry::from_package_source(
+            "avocado-ext-deptest-base",
+            None,
+            "1.2.0-r0",
+            Some("my-repo"),
+        );
+        assert!(e.validate().is_ok());
+    }
+
+    #[test]
+    fn shell_metacharacters_are_rejected() {
+        for bad in [
+            "ext;rm -rf /",
+            "ext$(whoami)",
+            "ext`id`",
+            "ext name",
+            "ext|other",
+            "ext'quote",
+            "ext\"quote",
+            "ext\nnewline",
+        ] {
+            let e = PackageFetchEntry::from_package_source(bad, None, "1.0.0", None);
+            assert!(
+                e.validate().is_err(),
+                "should have rejected {bad:?} before it reached the shell"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pipe_delimiter_is_rejected_in_every_field() {
+        // The script splits `<ext>|<pkg>|<spec>`, so a pipe anywhere corrupts
+        // the split even without being dangerous.
+        let e = PackageFetchEntry::from_package_source("app", Some("pkg|x"), "1.0.0", None);
+        assert!(e.validate().is_err());
+        let e = PackageFetchEntry::from_package_source("app", None, "1.0.0", Some("repo|x"));
+        assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn empty_values_are_rejected() {
+        let e = PackageFetchEntry::from_package_source("", None, "1.0.0", None);
+        assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn test_package_entry_uses_extension_name_by_default() {
+        let e = PackageFetchEntry::from_package_source("weston-base", None, "1.2.0", None);
+        assert_eq!(e.ext_name, "weston-base");
+        assert_eq!(e.package_spec, "weston-base-1.2.0");
+        assert_eq!(e.repo_name, None);
+    }
+
+    #[test]
+    fn test_package_entry_keeps_name_separate_from_spec() {
+        // The layout query matches on %{name}; `app-a-0.1.0` cannot be split
+        // back into name and version in shell, so the name is carried.
+        let e = PackageFetchEntry::from_package_source("app-a", None, "0.1.0", None);
+        assert_eq!(e.package_name, "app-a");
+        assert_eq!(e.package_spec, "app-a-0.1.0");
+    }
+
+    #[test]
+    fn test_package_entry_honors_a_package_rename() {
+        // `source.package` publishes the extension under a different RPM name.
+        // The install spec must use it, while the extension name (and so the
+        // includes/<name>/ directory) stays as declared.
+        let e = PackageFetchEntry::from_package_source(
+            "weston-base",
+            Some("avocado-ext-weston-base"),
+            "1.2.0",
+            None,
+        );
+        assert_eq!(e.ext_name, "weston-base");
+        assert_eq!(e.package_name, "avocado-ext-weston-base");
+        assert_eq!(e.package_spec, "avocado-ext-weston-base-1.2.0");
+    }
+
+    #[test]
+    fn test_package_entry_wildcard_version_is_an_unpinned_spec() {
+        // `*` hands version choice to the depsolver rather than pinning.
+        let e = PackageFetchEntry::from_package_source("app-a", None, "*", None);
+        assert_eq!(e.package_spec, "app-a");
+    }
+
+    #[test]
+    fn test_package_entry_carries_repo_restriction() {
+        let e = PackageFetchEntry::from_package_source("app-a", None, "1.0.0", Some("my-repo"));
+        assert_eq!(e.repo_name.as_deref(), Some("my-repo"));
+    }
 
     #[test]
     fn test_extension_fetcher_creation() {
