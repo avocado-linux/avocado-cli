@@ -57,7 +57,8 @@ pub struct StartOptions {
     /// Target size of the persistent var.btrfs (e.g. "50G"). The file is
     /// truncated up to this size on every start (sparse — no disk use
     /// until written), then btrfs is resized to fill it inside the VM.
-    /// Shrinking is refused. `None` → default ([`DEFAULT_VAR_SIZE`]).
+    /// Shrinking is refused. `None` → the persisted `runtime.var_size`
+    /// in `~/.avocado/vm/config.yaml`, then [`DEFAULT_VAR_SIZE`].
     pub var_size: Option<String>,
     /// One-shot DNS override for this start only. Wins over the persisted
     /// `network.dns` in `~/.avocado/vm/config.yaml`; the persisted value
@@ -153,11 +154,20 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // attaches. `avocado vm rebuild --reset-data` wipes it back to the seed.
     seed_var_disk(&paths, &manifest, &artifact_dir)?;
 
-    // Grow the var.btrfs file (sparse) to the user-requested size, if
-    // larger than current. The matching `btrfs filesystem resize max` runs
-    // inside the VM after boot.
-    let var_target_bytes = parse_size(opts.var_size.as_deref().unwrap_or(DEFAULT_VAR_SIZE))
-        .context("invalid --var-size")?;
+    // Grow the var.btrfs file (sparse) to the requested size, if larger
+    // than current. Flag > persisted `runtime.var_size` > default. The
+    // matching `btrfs filesystem resize max` runs inside the VM after
+    // boot.
+    let persisted_var_size = super::config::VmConfig::load(&paths)
+        .ok()
+        .and_then(|c| c.runtime.and_then(|r| r.var_size));
+    let var_size_request = opts
+        .var_size
+        .as_deref()
+        .or(persisted_var_size.as_deref())
+        .unwrap_or(DEFAULT_VAR_SIZE);
+    let var_target_bytes = parse_size(var_size_request)
+        .with_context(|| format!("invalid var size {var_size_request:?}"))?;
     grow_var_file(&paths, var_target_bytes)?;
 
     let workspace = super::share::resolve_workspace(opts.workspace.as_deref())?;
@@ -602,7 +612,7 @@ fn shell_quote(s: &str) -> String {
 /// Parse a human-readable size string ("50G", "10M", "1024K", "12345" bytes).
 /// Suffixes are powers of 1024 (KiB/MiB/GiB), matching what `truncate(1)`
 /// and `btrfs filesystem resize` accept on Linux.
-fn parse_size(s: &str) -> Result<u64> {
+pub(crate) fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     if s.is_empty() {
         bail!("size must not be empty");
