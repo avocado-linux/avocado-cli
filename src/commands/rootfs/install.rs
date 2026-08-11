@@ -325,7 +325,11 @@ fn detect_sysroot_package_removals(
 /// Best-effort by design, matching the inline copies this replaced: an
 /// absent sysroot is the normal case on a first install and must not fail
 /// the run.
-async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) {
+/// Returns whether the wipe actually succeeded. The result used to be discarded
+/// outright; it is reported now because a failed wipe means the reinstall lands
+/// *alongside* the old contents (dnf install is additive), and writing a current
+/// stamp over that latches the mixed state forever.
+async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) -> bool {
     let clean_config = RunConfig {
         container_image: params.container_image.to_string(),
         target: params.target.to_string(),
@@ -341,18 +345,31 @@ async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) {
         ..Default::default()
     };
 
-    if let Some(context) = params.runs_on_context {
+    let outcome = if let Some(context) = params.runs_on_context {
         params
             .container_helper
             .run_in_container_with_context(&clean_config, context)
             .await
-            .ok();
     } else {
-        params
-            .container_helper
-            .run_in_container(clean_config)
-            .await
-            .ok();
+        params.container_helper.run_in_container(clean_config).await
+    };
+
+    match outcome {
+        Ok(true) => true,
+        Ok(false) => {
+            print_error(
+                &format!("Failed to clean the {sysroot_dir} sysroot before reinstalling."),
+                OutputLevel::Normal,
+            );
+            false
+        }
+        Err(e) => {
+            print_error(
+                &format!("Failed to clean the {sysroot_dir} sysroot before reinstalling: {e}"),
+                OutputLevel::Normal,
+            );
+            false
+        }
     }
 }
 
@@ -466,6 +483,67 @@ fn parse_probe_output(text: &str) -> Option<bool> {
     let idx = text.lines().position(|l| l.trim() == "AVOCADO_PROBE_OK")?;
     let names = text.lines().skip(idx + 1).collect::<Vec<_>>().join("\n");
     Some(!names.trim().is_empty())
+}
+
+/// Write this sysroot's install stamp.
+///
+/// Split out of [`install_sysroot`] so its failures can be reported without
+/// `?`-ing out of the caller: the install has already landed and its lock pins
+/// are recorded in memory by this point, and the caller only persists them when
+/// `install_sysroot` returns `Ok`.
+async fn write_install_stamp(
+    params: &SysrootInstallParams<'_>,
+    packages: &HashMap<String, serde_yaml::Value>,
+    label: &str,
+) -> Result<()> {
+    let Some(inputs) = compute_install_stamp_inputs(params, packages)? else {
+        return Ok(());
+    };
+
+    let stamp = match params.sysroot_type {
+        SysrootType::Rootfs => {
+            Stamp::rootfs_install(params.target, inputs, StampOutputs::default())
+        }
+        SysrootType::Initramfs => {
+            Stamp::initramfs_install(params.target, inputs, StampOutputs::default())
+        }
+        _ => unreachable!("sysroot type was validated at entry"),
+    };
+
+    let stamp_config = RunConfig {
+        container_image: params.container_image.to_string(),
+        target: params.target.to_string(),
+        command: generate_write_stamp_script(&stamp)?,
+        verbose: params.verbose,
+        source_environment: true,
+        interactive: false,
+        repo_url: params.repo_url.map(|s| s.to_string()),
+        repo_release: params.repo_release.map(|s| s.to_string()),
+        container_args: params.merged_container_args.clone(),
+        sdk_arch: params.sdk_arch.cloned(),
+        tui_context: params.tui_context.clone(),
+        ..Default::default()
+    };
+
+    if let Some(context) = params.runs_on_context {
+        params
+            .container_helper
+            .run_in_container_with_context(&stamp_config, context)
+            .await?;
+    } else {
+        params
+            .container_helper
+            .run_in_container(stamp_config)
+            .await?;
+    }
+
+    if params.verbose {
+        print_info(
+            &format!("Wrote install stamp for {label}."),
+            OutputLevel::Normal,
+        );
+    }
+    Ok(())
 }
 
 /// Install a sysroot (rootfs or initramfs) via DNF into the SDK container volume.
@@ -746,9 +824,14 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         );
     }
 
-    if needs_clean_reinstall {
-        clean_sysroot(params, sysroot_dir).await;
-    }
+    // A failed wipe is not fatal — the reinstall below still repairs the common
+    // case — but it must not be latched by a current stamp, since dnf installs
+    // additively and the old contents (an old kernel's modules, say) survive.
+    let clean_ok = if needs_clean_reinstall {
+        clean_sysroot(params, sysroot_dir).await
+    } else {
+        true
+    };
 
     let mut pkg_specs: Vec<String> = if packages.is_empty() {
         vec![build_package_spec_with_lock(
@@ -928,6 +1011,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         // date" and the user is wedged until they guess --no-stamps.
         let versions_recorded = !installed_versions.is_empty();
         let mut kernel_staging_ok = true;
+        let install_is_clean = clean_ok;
 
         if versions_recorded {
             params.lock_file.update_sysroot_versions(
@@ -1001,12 +1085,16 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         // derived: the install just re-pinned this sysroot's packages, and the
         // stamp has to record the lock state the *next* run will compare
         // against.
-        if !params.no_stamps && !(versions_recorded && kernel_staging_ok) {
+        let stamp_is_trustworthy = versions_recorded && kernel_staging_ok && install_is_clean;
+
+        if !params.no_stamps && !stamp_is_trustworthy {
             print_warning(
                 &format!(
                     "Not recording an install stamp for {label}: {}. \
                      The next run will reinstall rather than report it up to date.",
-                    if !versions_recorded {
+                    if !install_is_clean {
+                        "the sysroot could not be cleaned first, so stale contents may remain"
+                    } else if !versions_recorded {
                         "the installed package versions could not be read"
                     } else {
                         "kernel sysroot staging failed"
@@ -1016,51 +1104,21 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             );
         }
 
-        if !params.no_stamps && versions_recorded && kernel_staging_ok {
-            if let Some(inputs) = compute_install_stamp_inputs(params, &packages)? {
-                let stamp = match params.sysroot_type {
-                    SysrootType::Rootfs => {
-                        Stamp::rootfs_install(params.target, inputs, StampOutputs::default())
-                    }
-                    SysrootType::Initramfs => {
-                        Stamp::initramfs_install(params.target, inputs, StampOutputs::default())
-                    }
-                    _ => unreachable!("sysroot type was validated at entry"),
-                };
-
-                let stamp_config = RunConfig {
-                    container_image: params.container_image.to_string(),
-                    target: params.target.to_string(),
-                    command: generate_write_stamp_script(&stamp)?,
-                    verbose: params.verbose,
-                    source_environment: true,
-                    interactive: false,
-                    repo_url: params.repo_url.map(|s| s.to_string()),
-                    repo_release: params.repo_release.map(|s| s.to_string()),
-                    container_args: params.merged_container_args.clone(),
-                    sdk_arch: params.sdk_arch.cloned(),
-                    tui_context: params.tui_context.clone(),
-                    ..Default::default()
-                };
-
-                if let Some(context) = params.runs_on_context {
-                    params
-                        .container_helper
-                        .run_in_container_with_context(&stamp_config, context)
-                        .await?;
-                } else {
-                    params
-                        .container_helper
-                        .run_in_container(stamp_config)
-                        .await?;
-                }
-
-                if params.verbose {
-                    print_info(
-                        &format!("Wrote install stamp for {label}."),
-                        OutputLevel::Normal,
-                    );
-                }
+        // Deliberately not `?` anywhere below. The pins recorded above are only
+        // persisted by the caller when this function returns Ok, so propagating a
+        // stamp-write failure would discard the pins for an install that already
+        // landed — the next run would re-resolve the kernel against feed head with
+        // no prev_pinned_kver to compare against and install additively on top.
+        // A missing stamp is the benign outcome: the next run reinstalls.
+        if !params.no_stamps && stamp_is_trustworthy {
+            if let Err(e) = write_install_stamp(params, &packages, label).await {
+                print_warning(
+                    &format!(
+                        "Installed {label} sysroot but could not record its install stamp: {e}. \
+                         The next run will reinstall rather than report it up to date."
+                    ),
+                    OutputLevel::Normal,
+                );
             }
         }
     } else {

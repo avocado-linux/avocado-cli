@@ -1370,6 +1370,17 @@ fn compute_sysroot_install_input_hash(
         serde_yaml::Value::String("sdk.disable_weak_dependencies".to_string()),
         serde_yaml::Value::Bool(resolved.disable_weak_dependencies),
     );
+    // The SDK image is what actually runs the install — its dnf/rpm config and
+    // scriptlet machinery — so a project that repoints `sdk.image` must not keep
+    // a sysroot the old image produced. `compute_sdk_input_hash` already folds
+    // it; folding it here too keeps the two stamps from disagreeing about what
+    // counts as an input.
+    if let Some(image) = config.get("sdk").and_then(|s| s.get("image")) {
+        hash_data.insert(
+            serde_yaml::Value::String("sdk.image".to_string()),
+            image.clone(),
+        );
+    }
     // Order matters to the caller, not just membership: `--enablerepo=a
     // --enablerepo=b` and its reverse are the same transaction, but hashing the
     // sequence as given is the conservative choice — a reorder invalidates and
@@ -1677,7 +1688,22 @@ pub fn validate_stamps_batch(
     batch_output: &str,
     current_inputs: &[CurrentInput<'_>],
 ) -> StampValidationResult {
-    let stamp_data = parse_batch_stamps_output(batch_output);
+    validate_stamps_parsed(
+        requirements,
+        &parse_batch_stamps_output(batch_output),
+        current_inputs,
+    )
+}
+
+/// [`validate_stamps_batch`] for a caller that already parsed the batch output.
+///
+/// Split out so a holder of the parsed map doesn't have to keep the raw string
+/// alive purely to re-parse it into the map it already has.
+pub fn validate_stamps_parsed(
+    requirements: &[StampRequirement],
+    stamp_data: &std::collections::HashMap<String, Option<String>>,
+    current_inputs: &[CurrentInput<'_>],
+) -> StampValidationResult {
     let mut validation = StampValidationResult::new();
 
     for req in requirements {
@@ -3890,6 +3916,29 @@ rootfs:
             h_base, h_empty,
             "an empty dnf_args list must not invalidate"
         );
+    }
+
+    /// The SDK image runs the install, so repointing it has to invalidate — the
+    /// sibling `compute_sdk_input_hash` already treats it as an input.
+    #[test]
+    fn rootfs_stamp_tracks_sdk_image() {
+        let root = std::path::Path::new(".");
+        let packages = default_rootfs_packages();
+        let inputs = test_sysroot_inputs(&packages);
+
+        let a: serde_yaml::Value =
+            serde_yaml::from_str("sdk:\n  image: docker.io/avocadolinux/sdk:apollo-edge\n")
+                .unwrap();
+        let b: serde_yaml::Value =
+            serde_yaml::from_str("sdk:\n  image: docker.io/avocadolinux/sdk:dev\n").unwrap();
+
+        let ha = compute_rootfs_input_hash(&a, root, None, &inputs)
+            .unwrap()
+            .config_hash;
+        let hb = compute_rootfs_input_hash(&b, root, None, &inputs)
+            .unwrap()
+            .config_hash;
+        assert_ne!(ha, hb, "sdk.image must invalidate the sysroot stamp");
     }
 
     #[test]

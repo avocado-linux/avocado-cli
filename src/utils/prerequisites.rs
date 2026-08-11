@@ -11,16 +11,13 @@ use anyhow::{Context, Result};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
-    generate_batch_read_stamps_script, parse_batch_stamps_output, validate_stamps_batch,
+    generate_batch_read_stamps_script, parse_batch_stamps_output, validate_stamps_parsed,
     CurrentInput, Stamp, StampRequirement, StampValidationResult,
 };
 
 /// Stamps read from the SDK container in a single invocation, keyed by
 /// relative stamp path.
 pub struct StampBatch {
-    /// Raw batch output, kept so [`StampBatch::validate`] can defer to the
-    /// existing string-based validator.
-    raw: String,
     stamps: std::collections::HashMap<String, Option<String>>,
 }
 
@@ -37,13 +34,13 @@ impl StampBatch {
     }
 
     /// Validate `requirements` against freshly computed inputs. See
-    /// [`validate_stamps_batch`] for how requirements are matched to inputs.
+    /// [`validate_stamps_parsed`] for how requirements are matched to inputs.
     pub fn validate(
         &self,
         requirements: &[StampRequirement],
         current_inputs: &[CurrentInput<'_>],
     ) -> StampValidationResult {
-        validate_stamps_batch(requirements, &self.raw, current_inputs)
+        validate_stamps_parsed(requirements, &self.stamps, current_inputs)
     }
 }
 
@@ -84,7 +81,6 @@ pub async fn read_stamps_batch(
 
     Ok(StampBatch {
         stamps: parse_batch_stamps_output(&raw),
-        raw,
     })
 }
 
