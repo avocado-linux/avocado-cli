@@ -724,6 +724,15 @@ fi
 # tracks all installed extensions).
 cat > SPECS/package.spec << SPEC_EOF
 %define _buildhost reproducible
+# The payload is already-built target content, so rpm has to package it verbatim.
+# Two stock behaviours get in the way: the build-root policy scripts run the
+# container's host toolchain (strip and friends) over target binaries, and the
+# noarch guard rejects a payload carrying target ELF. These packages are noarch
+# by design - a target routes on the avocado-target provides below, not on the
+# package arch - so both checks are false positives here.
+# Comments must stay macro-free; rpm expands macros inside spec comments.
+%define __os_install_post %{{nil}}
+%define _binaries_in_noarch_packages_terminate_build 0
 AutoReqProv: no
 
 Name: {name}
