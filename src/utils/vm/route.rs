@@ -20,7 +20,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::utils::container::is_docker_desktop;
-use crate::utils::output::{print_info, print_warning, OutputLevel};
+use crate::utils::output::{print_info_stderr, print_warning_stderr};
 use crate::utils::vm::lifecycle::{self, StartOptions};
 use crate::utils::vm::manifest::Manifest;
 use crate::utils::vm::ssh::SshTarget;
@@ -93,17 +93,16 @@ pub async fn ensure_routed_for_process(
         let Some(vm_source) = vm_source_from_env() else {
             // Can't auto-start without artifacts. Print a clear hint and
             // proceed without routing — user can also opt out explicitly.
-            print_warning(
+            print_warning_stderr(
                 "avocado-vm not running and AVOCADO_VM_DIR is unset; falling back to local docker. \
                  Set AVOCADO_VM_DIR or run `avocado vm start --vm-source <dir>` to enable VM routing.",
-                OutputLevel::Normal,
             );
             return Ok(RoutingMode::OptedOut);
         };
-        print_info(
-            &format!("Starting avocado-vm from {}…", vm_source.display()),
-            OutputLevel::Normal,
-        );
+        print_info_stderr(&format!(
+            "Starting avocado-vm from {}…",
+            vm_source.display()
+        ));
         let status = lifecycle::start(StartOptions {
             vm_source,
             memory_mib: None,
@@ -132,13 +131,12 @@ pub async fn ensure_routed_for_process(
     if !socket.exists() {
         // Be loud — auto-routing without a working socket leaves the user
         // hitting "Cannot connect to the Docker daemon" mysteriously.
-        print_warning(
+        print_warning_stderr(
             &format!(
                 "docker socket forward {} is missing; the VM may not be fully up or the forwarder failed to start. \
                  Run `avocado vm stop && avocado vm start` to retry.",
                 socket.display()
             ),
-            OutputLevel::Normal,
         );
         return Ok(RoutingMode::OptedOut);
     }
@@ -181,15 +179,12 @@ fn warn_if_stale(paths: &VmPaths) {
             None => true,
         });
     if drift {
-        print_warning(
-            &format!(
-                "AVOCADO_VM_DIR ({}) has artifacts that differ from the running avocado-vm; \
+        print_warning_stderr(&format!(
+            "AVOCADO_VM_DIR ({}) has artifacts that differ from the running avocado-vm; \
                  run `avocado vm stop && avocado vm start --vm-source {}` to refresh.",
-                src.display(),
-                src.display(),
-            ),
-            OutputLevel::Normal,
-        );
+            src.display(),
+            src.display(),
+        ));
     }
 }
 

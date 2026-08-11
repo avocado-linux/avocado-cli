@@ -29,6 +29,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entire stdout blob, not its first line, so `.last()` still reaches it.
   `avocado-desktop` is not affected - its parser already reads the first line's
   second field.
+- **`avocado sbom`.** Emits an SPDX 3.0.1 JSON-LD document describing the
+  packages installed in a project — `software_Sbom` with
+  `software_sbomType: deployed`, one root per sysroot scope.
+
+  The SDK and target sysroot are excluded: they run on the build host and ship
+  nothing, unless `--include-sdk` is passed.
+
+  Each package carries its purl, license expression, supplier, homepage, build
+  time, and the sha256 of its rpm header, plus the producing recipe read from
+  `SOURCERPM`, so a device SBOM names the recipe behind a package without being
+  joined against the build's pkgdata. Yocto license strings are translated to
+  SPDX expressions (`&`/`|` to `AND`/`OR`).
+
+  A package's epoch is part of its identity, so it is queried and travels in
+  both the version (`1:3.5.6-r0.2`) and the purl's `epoch` qualifier: without
+  it `1:2.39-r0.2` and `2.39-r0.2` (different packages by rpm's own ordering)
+  would collapse into one element.
+
+  An extension's installroot is seeded with a copy of the rootfs RPM database,
+  and those packages are excluded from what the extension reports. The seed is
+  identified by RPM install *transaction*: every package of one `dnf install`
+  shares an `INSTALLTID`, the seed arrives as whole transactions, and a
+  transaction is the seed exactly when every package in it is one the rootfs
+  also carries by name. So an extension that installs a package the rootfs
+  also has keeps it (its transaction added something new), a rootfs that has
+  since upgraded a package does not turn the stale seeded copy — or the rest
+  of its transaction — into extension content, and `install --force`, which
+  reinstalls the whole rootfs in one new transaction, no longer detaches the
+  seed from anything recognisable. The remaining ambiguity is an extension
+  transaction holding only packages the rootfs already carries by name: it
+  reads as seed, so the extension loses its containment for them, though they
+  remain in the document under the rootfs. A seeded scope that reports at
+  least as many packages as the rootfs is called out on stderr, since that is
+  the shape this subtraction failing takes.
+
+  An extension is described under the runtime that carries it rather than
+  beside it: the runtime `contains` its extensions and is the only one of them
+  that is a root, so the composition declared in `avocado.yaml` survives into
+  the document. A legacy `ext:<name>` scope names no runtime, and an extension
+  whose runtime installed nothing of its own has no element to hang from —
+  both stay roots rather than being guessed at.
+
+  The document carries the feed it came from: the release, channel, and
+  immutable snapshot the lockfile pinned, with an `externalRef` locating that
+  snapshot's subtree. Without it the document is unjoinable — nothing would say
+  which feed produced these RPMs, so it could not be tied back to the build's
+  own SPDX documents or re-resolved later. Only the lockfile's pin is used;
+  the config's declared release and channel say what was asked for rather than
+  what was resolved, and a channel head moves. An absent or unreadable lockfile
+  costs that pointer and nothing else — the inventory itself comes from the RPM
+  databases.
+
+  Element ids are derived from the installed set, so the same set produces the
+  same document twice running rather than churning under a consumer diffing two
+  of them. `created` is the one field a clock would move, so `SOURCE_DATE_EPOCH`
+  pins it when set — with it the document is byte-stable and can be referenced
+  by content hash; unset or unparseable, it reports the current time, since a
+  typo silently dating every document to 1970 is worse than one that is honestly
+  not reproducible.
+
+  The command never transmits the document. It writes the file and, with `-o`,
+  points at <https://tools.spdx.org/app/validate/> for anyone who wants the
+  reference SPDX tools' verdict, along with the reason to think first: that
+  service stores every upload and serves it back without authentication for
+  about ten days, and an SBOM is a component inventory of a shipped product.
+  Whether a given document can be published is the operator's call, on a
+  document they can read first.
 
 ### Changed
 - **Extension images no longer ship package-manager state.** `var/lib/rpm`,
@@ -41,6 +108,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the live sysroot with no work copy, and later `ext dnf` / `ext
   install` calls still resolve against that database. Configured `var_files`
   patterns are unaffected.
+- **VM routing notices moved from stdout to stderr, and go quiet under
+  `--output json`.** The Docker-Desktop routing step runs before the command
+  dispatches, so its warnings - VM not running, `AVOCADO_VM_DIR` unset, docker
+  socket forward missing, stale manifest, plus the non-fatal hiccups from an
+  auto-start - used to land on the stdout of whatever command followed.
+  `avocado sbom > sbom.json` writes an SPDX document there, so a `[WARNING]`
+  ahead of it left a file no consumer could parse. These describe the
+  environment rather than the result, so they are now on stderr.
+
+  Under `--output json` they are dropped entirely, matching the upgrade banner:
+  the avocado-desktop CLI runner merges stdout and stderr in causal order and
+  parses the result, so stderr alone does not make a line safe. **The cost is
+  real**: `avocado vm update --output json` no longer reports a failed
+  hibernation-supervisor bind at all, and exits 0. Anything that needs those
+  diagnostics should run without `--output json`.
 - **A skipped remote version check no longer reports as a passed one.** When
   the remote's `--version` output cannot be parsed, `--runs-on` used to print
   `[SUCCESS] Remote avocado version: <whatever it read>`, which is a green line

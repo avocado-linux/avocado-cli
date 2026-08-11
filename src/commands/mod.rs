@@ -17,6 +17,7 @@ pub mod prune;
 pub mod rootfs;
 pub mod runtime;
 pub mod save;
+pub mod sbom;
 pub mod sdk;
 pub mod sign;
 pub mod signing_keys;

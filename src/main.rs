@@ -68,6 +68,7 @@ use commands::runtime::{
     RuntimeSignCommand,
 };
 use commands::save::SaveCommand;
+use commands::sbom::generate::SbomCommand;
 use commands::sdk::{
     SdkCleanCommand, SdkCompileCommand, SdkDepsCommand, SdkDnfCommand, SdkInstallCommand,
     SdkPackageCommand, SdkRunCommand,
@@ -145,6 +146,34 @@ enum Commands {
     Kernel {
         #[command(subcommand)]
         command: KernelCommands,
+    },
+    /// Emit an SPDX 3.0 SBOM of the packages installed in this project
+    Sbom {
+        /// Write the document here instead of to stdout
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output_path: Option<String>,
+        /// Path to avocado.yaml (defaults to ./avocado.yaml)
+        #[arg(short = 'C', long, default_value = "./avocado.yaml")]
+        config: String,
+        /// Target architecture
+        #[arg(short = 't', long)]
+        target: Option<String>,
+        /// Also describe the SDK and target sysroot. They run on the build host
+        /// and ship nothing to a device, so they are excluded by default: an
+        /// SBOM answering "what is on this device" must not list the cross
+        /// toolchain alongside what the device actually holds.
+        #[arg(long)]
+        include_sdk: bool,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// Additional arguments to pass to the container runtime
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Output format. The document itself is JSON-LD either way; this only
+        /// controls whether the summary lines accompany it.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
     },
     /// Initialize a new avocado project
     Init {
@@ -2014,6 +2043,9 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Initramfs { .. }
             | Commands::Kernel { .. }
             | Commands::Runtime { .. }
+            // Reads every sysroot's RPM database, which only exists inside the
+            // SDK container's state volume.
+            | Commands::Sbom { .. }
             | Commands::Hitl { .. }
             | Commands::Prune { .. }
             | Commands::Clean { .. }
@@ -2087,10 +2119,9 @@ async fn main() -> Result<()> {
             utils::vm::route::ensure_routed_for_process(cli.no_vm_auto_start, cli.runs_on.is_some())
                 .await
         {
-            utils::output::print_warning(
-                &format!("VM routing unavailable: {e:#}; falling back to local docker."),
-                utils::output::OutputLevel::Normal,
-            );
+            utils::output::print_warning_stderr(&format!(
+                "VM routing unavailable: {e:#}; falling back to local docker."
+            ));
         }
     }
 
@@ -3185,6 +3216,29 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Sbom {
+            output_path,
+            config,
+            target,
+            include_sdk,
+            verbose,
+            container_args,
+            output,
+        } => {
+            let cmd = SbomCommand::new(
+                config,
+                target.or(cli.target.clone()),
+                output_path,
+                include_sdk,
+                verbose,
+                container_args,
+                output,
+            )
+            .with_runs_on(cli.runs_on.clone())
+            .with_sdk_arch(cli.sdk_arch.clone());
+            cmd.execute().await?;
+            Ok(())
+        }
         Commands::Config { command } => match command {
             ConfigCommands::Show {
                 config,
@@ -4248,13 +4302,7 @@ async fn main() -> Result<()> {
             // the banner into a JSON parser, which then refused the
             // entire payload. Silent-when-machine-readable is the
             // safer contract.
-            let json_mode = std::env::args().any(|a| a == "--output")
-                && std::env::args()
-                    .skip_while(|a| a != "--output")
-                    .nth(1)
-                    .as_deref()
-                    == Some("json");
-            if !json_mode {
+            if !utils::output_format::json_requested_on_command_line() {
                 let upgrade_hint = match utils::install_method::current_install_method() {
                     utils::install_method::InstallMethod::Homebrew => {
                         "Run 'avocado upgrade' or 'brew upgrade avocado-cli' to update."
