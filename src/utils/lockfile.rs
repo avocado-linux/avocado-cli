@@ -1460,10 +1460,24 @@ impl LockFile {
                 .map(|ext| &mut ext.packages),
         };
 
+        let mut removed_any = false;
         if let Some(packages) = pkg_map {
             for pkg in packages_to_remove {
-                packages.remove(pkg);
+                removed_any |= packages.remove(pkg).is_some();
             }
+        }
+
+        // Mark the section authoritative, exactly as `clear_rootfs` does. Without
+        // this, `save()`'s merge re-inserts the dropped keys straight back off
+        // disk, so a removal never converges: the next run sees the resurrected
+        // package, detects the removal again, and wipes and reinstalls — forever,
+        // with the lockfile permanently listing a package that isn't installed.
+        //
+        // "Cleared" is the right flag even though only some keys were dropped:
+        // the caller goes on to reinstall and record the full installed set, so
+        // by save time the in-memory section *is* the complete intended state.
+        if removed_any {
+            target_locks.cleared_sections.insert(sysroot.lock_key());
         }
     }
 

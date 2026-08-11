@@ -1249,6 +1249,13 @@ pub struct SysrootStampInputs<'a> {
     pub repo_release: Option<&'a str>,
     /// `sdk.disable_weak_dependencies`: changes what dnf pulls in.
     pub disable_weak_dependencies: bool,
+    /// `--dnf-args`, which are interpolated straight into the install
+    /// transaction. Part of the hash because they change what the transaction
+    /// resolves (`--enablerepo=…`), so an up-to-date sysroot must not
+    /// short-circuit past a run that passes different ones. `--force` is
+    /// deliberately *not* here: it only selects `-y` and interactivity, not
+    /// content.
+    pub dnf_args: Option<&'a [String]>,
     /// Locked NVR pins for this sysroot, as recorded in `avocado.lock`.
     pub locked_packages: Option<&'a std::collections::HashMap<String, String>>,
 }
@@ -1363,6 +1370,20 @@ fn compute_sysroot_install_input_hash(
         serde_yaml::Value::String("sdk.disable_weak_dependencies".to_string()),
         serde_yaml::Value::Bool(resolved.disable_weak_dependencies),
     );
+    // Order matters to the caller, not just membership: `--enablerepo=a
+    // --enablerepo=b` and its reverse are the same transaction, but hashing the
+    // sequence as given is the conservative choice — a reorder invalidates and
+    // reinstalls, which is wrong-but-safe, where missing a change is not.
+    if let Some(args) = resolved.dnf_args.filter(|a| !a.is_empty()) {
+        hash_data.insert(
+            serde_yaml::Value::String("dnf_args".to_string()),
+            serde_yaml::Value::Sequence(
+                args.iter()
+                    .map(|a| serde_yaml::Value::String(a.clone()))
+                    .collect(),
+            ),
+        );
+    }
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::with_package_list(
@@ -1950,6 +1971,7 @@ mod tests {
             repo_url: None,
             repo_release: None,
             disable_weak_dependencies: false,
+            dnf_args: None,
             locked_packages: None,
         }
     }
@@ -3843,6 +3865,30 @@ rootfs:
         assert_ne!(
             h_base, h_weak,
             "disable_weak_dependencies must invalidate — it changes what dnf pulls"
+        );
+
+        // `--dnf-args` reach the transaction verbatim, so an up-to-date sysroot
+        // must not short-circuit past a run that passes different ones.
+        let args = ["--enablerepo=extra".to_string()];
+        let h_dnf = hash_of(&SysrootStampInputs {
+            dnf_args: Some(&args),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_ne!(
+            h_base, h_dnf,
+            "dnf_args must invalidate — they change what the transaction resolves"
+        );
+
+        // An empty list is the same transaction as none at all, so it must not
+        // invalidate; otherwise `--dnf-args ''` would force a pointless rebuild.
+        let empty: [String; 0] = [];
+        let h_empty = hash_of(&SysrootStampInputs {
+            dnf_args: Some(&empty),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_eq!(
+            h_base, h_empty,
+            "an empty dnf_args list must not invalidate"
         );
     }
 

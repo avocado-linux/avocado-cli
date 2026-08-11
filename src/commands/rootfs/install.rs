@@ -380,6 +380,7 @@ fn compute_install_stamp_inputs(
         repo_url: params.repo_url,
         repo_release: params.repo_release,
         disable_weak_dependencies: params.config.get_sdk_disable_weak_dependencies(),
+        dnf_args: params.dnf_args.as_deref(),
         locked_packages: params
             .lock_file
             .get_sysroot_versions(params.target, &params.sysroot_type),
@@ -1132,38 +1133,49 @@ impl RootfsInstallCommand {
             },
             runs_on_context.as_ref(),
         )
-        .await?;
-
-        let result = install_sysroot(&mut SysrootInstallParams {
-            sysroot_type: SysrootType::Rootfs,
-            config,
-            lock_file: &mut lock_file,
-            src_dir,
-            container_helper: &container_helper,
-            container_image,
-            target: &target,
-            target_board: self.target_board.as_deref(),
-            repo_url: repo_url.as_deref(),
-            repo_release: repo_release.as_deref(),
-            merged_container_args: merged_container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            force: self.force,
-            runs_on_context: runs_on_context.as_ref(),
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-            prefetched_stamp,
-            tui_context: None,
-        })
         .await;
+
+        // Not `?`: the teardown block below is the only thing that tears down the
+        // `runs_on` NFS server and remote mount, and an early return here would
+        // skip it — the next `--runs-on` run picks a fresh nfs_port and stacks
+        // another one on top. Carried into `result` and returned past teardown.
+        let result = match prefetched_stamp {
+            Err(e) => Err(e),
+            Ok(prefetched_stamp) => {
+                install_sysroot(&mut SysrootInstallParams {
+                    sysroot_type: SysrootType::Rootfs,
+                    config,
+                    lock_file: &mut lock_file,
+                    src_dir,
+                    container_helper: &container_helper,
+                    container_image,
+                    target: &target,
+                    target_board: self.target_board.as_deref(),
+                    repo_url: repo_url.as_deref(),
+                    repo_release: repo_release.as_deref(),
+                    merged_container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    verbose: self.verbose,
+                    force: self.force,
+                    runs_on_context: runs_on_context.as_ref(),
+                    sdk_arch: self.sdk_arch.as_ref(),
+                    no_stamps: self.no_stamps,
+                    parsed: Some(&composed.merged_value),
+                    prefetched_stamp,
+                    tui_context: None,
+                })
+                .await
+            }
+        };
 
         // Persist the lockfile the install updated. `install_sysroot` no
         // longer saves for itself — under `avocado sdk install` it runs on a
-        // clone that the caller merges and saves once.
-        if result.is_ok() {
-            lock_file.save(src_dir)?;
-        }
+        // clone that the caller merges and saves once. Folded into `result`
+        // rather than `?` so a save failure still reaches the teardown below.
+        let result = match result {
+            Ok(()) => lock_file.save(src_dir),
+            Err(e) => Err(e),
+        };
 
         // Always teardown runs_on context
         if let Some(ref mut context) = runs_on_context {
@@ -1312,6 +1324,32 @@ mod tests {
         assert!(
             detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock)
                 .is_empty()
+        );
+    }
+
+    /// The empty-lock case above passes for the wrong reason — it early-returns
+    /// before comparing anything, so it survives inverting the `difference`
+    /// operands. This one seeds the lock so the comparison actually runs, and
+    /// pins the direction: locked-minus-effective, never the reverse.
+    #[test]
+    fn removal_detection_compares_locked_against_effective_not_the_reverse() {
+        let lock = lock_with(&SysrootType::Rootfs, &["avocado-pkg-rootfs", "vim"]);
+
+        // `vim` dropped from config: locked but no longer effective => removed.
+        let effective = name_set(&["avocado-pkg-rootfs"]);
+        assert_eq!(
+            detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock),
+            vec!["vim".to_string()],
+        );
+
+        // The mirror image: a package that is effective but not yet locked is an
+        // *addition*, and must never be reported. Inverting the operands makes
+        // this arm return `curl` and fail.
+        let effective = name_set(&["avocado-pkg-rootfs", "vim", "curl"]);
+        assert!(
+            detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock)
+                .is_empty(),
+            "a newly added package must not read as a removal",
         );
     }
 

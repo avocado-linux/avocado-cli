@@ -145,37 +145,48 @@ impl InitramfsInstallCommand {
             },
             runs_on_context.as_ref(),
         )
-        .await?;
-
-        let result = install_sysroot(&mut SysrootInstallParams {
-            sysroot_type: SysrootType::Initramfs,
-            config,
-            lock_file: &mut lock_file,
-            src_dir,
-            container_helper: &container_helper,
-            container_image,
-            target: &target,
-            target_board: self.target_board.as_deref(),
-            repo_url: repo_url.as_deref(),
-            repo_release: repo_release.as_deref(),
-            merged_container_args: merged_container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            force: self.force,
-            runs_on_context: runs_on_context.as_ref(),
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-            prefetched_stamp,
-            tui_context: None,
-        })
         .await;
 
+        // Not `?`: the teardown block below is the only thing that tears down the
+        // `runs_on` NFS server and remote mount, and an early return here would
+        // skip it — the next `--runs-on` run picks a fresh nfs_port and stacks
+        // another one on top. Carried into `result` and returned past teardown.
+        let result = match prefetched_stamp {
+            Err(e) => Err(e),
+            Ok(prefetched_stamp) => {
+                install_sysroot(&mut SysrootInstallParams {
+                    sysroot_type: SysrootType::Initramfs,
+                    config,
+                    lock_file: &mut lock_file,
+                    src_dir,
+                    container_helper: &container_helper,
+                    container_image,
+                    target: &target,
+                    target_board: self.target_board.as_deref(),
+                    repo_url: repo_url.as_deref(),
+                    repo_release: repo_release.as_deref(),
+                    merged_container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    verbose: self.verbose,
+                    force: self.force,
+                    runs_on_context: runs_on_context.as_ref(),
+                    sdk_arch: self.sdk_arch.as_ref(),
+                    no_stamps: self.no_stamps,
+                    parsed: Some(&composed.merged_value),
+                    prefetched_stamp,
+                    tui_context: None,
+                })
+                .await
+            }
+        };
+
         // Persist the lockfile the install updated — `install_sysroot` leaves
-        // saving to its caller.
-        if result.is_ok() {
-            lock_file.save(src_dir)?;
-        }
+        // saving to its caller. Folded into `result` rather than `?` so a save
+        // failure still reaches the teardown below.
+        let result = match result {
+            Ok(()) => lock_file.save(src_dir),
+            Err(e) => Err(e),
+        };
 
         if let Some(ref mut context) = runs_on_context {
             if let Err(e) = context.teardown().await {

@@ -649,6 +649,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             if let Some(target_locks) = rootfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
                 entry.rootfs = target_locks.rootfs.clone();
+                // `cleared_sections` is `#[serde(skip)]`, so it lives only on the
+                // clone `install_sysroot` ran against. Carry it over or the flag
+                // dies here: `final_lock.save()` would merge the old kernel's
+                // keys back off disk, and a kernel repin would never stick.
+                entry
+                    .cleared_sections
+                    .extend(target_locks.cleared_sections.iter().cloned());
                 if let Some(kver) = target_locks
                     .kernel_versions
                     .get(&SysrootType::Rootfs.lock_key())
@@ -670,6 +677,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             if let Some(target_locks) = initramfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
                 entry.initramfs = target_locks.initramfs.clone();
+                // Same as the rootfs merge above — the in-memory-only flag has to
+                // cross the clone boundary or the save re-merges stale keys.
+                entry
+                    .cleared_sections
+                    .extend(target_locks.cleared_sections.iter().cloned());
                 if let Some(kver) = target_locks
                     .kernel_versions
                     .get(&SysrootType::Initramfs.lock_key())
