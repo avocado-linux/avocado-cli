@@ -46,9 +46,13 @@ Use this when you need a change that is not in the published feed - a BSP fix, a
 kernel option, anything you built yourself.
 
 ```bash
-# 1. build the images and the provisioning artifacts
-bakar bitbake avocado-core  meta-avocado/kas/machine/imx93-frdm.yml
-bakar bitbake avocado-stone meta-avocado/kas/machine/imx93-frdm.yml
+# 1. build the images and the provisioning artifacts.
+#    The :kas/feature/container-dev.yml append is required, not cosmetic - see
+#    "The feed has to carry docker and sshd" below.
+bakar bitbake avocado-core \
+  meta-avocado/kas/machine/imx93-frdm.yml:meta-avocado/kas/feature/container-dev.yml
+bakar bitbake avocado-stone \
+  meta-avocado/kas/machine/imx93-frdm.yml:meta-avocado/kas/feature/container-dev.yml
 
 # 2. assemble the fwup archive. Nothing in bitbake writes this - stone does.
 stone provision -i <build>/tmp/deploy/stone --partition-size var=536870912
@@ -57,7 +61,16 @@ stone provision -i <build>/tmp/deploy/stone --partition-size var=536870912
 scripts/avocado-flash -m avocado-imx93-frdm sd /dev/sdX
 ```
 
-Three things that will stop you:
+Four things that will stop you:
+
+**The feed has to carry `docker` and `sshd`.** Boards are minimal by default:
+image content is per-group and opt-in, so a plain
+`kas/machine/imx93-frdm.yml` build produces a feed with neither the container
+engine (`containers` group) nor an SSH server (`networking` group). Both
+extensions above then fail to resolve. `kas/feature/container-dev.yml`
+aggregates exactly those two groups, which is why every build command here
+appends it. The failure without it is unhelpful: the board boots, and `up` dies
+at the SSH bootstrap on a device you cannot log into to investigate.
 
 `stone provision` needs `--partition-size var=<bytes>` because the manifest
 marks `var` as `expand: true` with no size. Any value above the var image (~110
