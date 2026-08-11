@@ -171,34 +171,11 @@ impl ExtPackageCommand {
         // Get extension configuration from the composed/merged config
         // For remote extensions, this comes from the merged remote extension config (already read via container)
         // For local extensions, this uses get_merged_ext_config which reads from the file
-        let ext_config = match &extension_location {
-            ExtensionLocation::Remote { .. } => {
-                // Use the already-merged config from `parsed` which contains remote extension configs
-                // Then apply target-specific overrides manually
-                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
-                let ext_section = find_ext_in_mapping(parsed, &self.extension, &target);
-                if let Some(ext_val) = ext_section {
-                    let base_ext = ext_val.clone();
-                    // Check for target-specific override within this extension
-                    let target_override = ext_val.get(&target).cloned();
-                    if let Some(override_val) = target_override {
-                        // Merge target override into base, filtering out other target sections
-                        Some(config.merge_target_override(base_ext, override_val, &target))
-                    } else {
-                        Some(base_ext)
-                    }
-                } else {
-                    None
-                }
-            }
-            ExtensionLocation::Local { config_path, .. } => {
-                // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config(&self.extension, &target, config_path)?
-            }
-        }
-        .ok_or_else(|| {
-            anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-        })?;
+        let ext_config = self
+            .resolve_ext_config(config, parsed, &extension_location, &target)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+            })?;
 
         // Also get the raw (unmerged) extension config to find all target-specific overlays
         // For remote extensions, use the parsed config; for local, read from file
@@ -401,6 +378,41 @@ impl ExtPackageCommand {
         }
 
         default_files
+    }
+
+    /// Resolve the extension's effective config, applying its per-target
+    /// overrides. Everything downstream — notably [`Self::extract_rpm_metadata`],
+    /// which reads `version` / `release` / `summary` / `description` / `license`
+    /// straight off the result — depends on this being resolved, or a
+    /// `target-<name>:` override is silently dropped from the built RPM.
+    ///
+    /// Note this is deliberately separate from `raw_ext_config` at the call site:
+    /// that one stays unresolved on purpose, because `get_package_files` needs to
+    /// see *every* target's overlay, not just the active one's.
+    fn resolve_ext_config(
+        &self,
+        config: &Config,
+        parsed: &serde_yaml::Value,
+        extension_location: &ExtensionLocation,
+        target: &str,
+    ) -> Result<Option<serde_yaml::Value>> {
+        match extension_location {
+            ExtensionLocation::Remote { .. } => {
+                // Composed value from `parsed` (remote/path-sourced ext configs
+                // already merged in); resolve its `target-<name>:` overrides for
+                // the same result the Local path gets via get_merged_ext_config.
+                Ok(super::resolve_remote_ext_config(
+                    config,
+                    parsed,
+                    &self.extension,
+                    target,
+                ))
+            }
+            ExtensionLocation::Local { config_path, .. } => {
+                // For local extensions, read from the file with proper target merging
+                config.get_merged_ext_config(&self.extension, target, config_path)
+            }
+        }
     }
 
     /// Extract RPM metadata from extension configuration with defaults
@@ -979,6 +991,63 @@ struct RpmMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `target-<name>:` override on a remote/path-sourced extension must reach
+    /// [`ExtPackageCommand::extract_rpm_metadata`], so the RPM is built at the
+    /// per-target version rather than the base one.
+    ///
+    /// Regression: this arm used to look only for a legacy bare `<target>:` key
+    /// and return the composed value untouched when absent, so the modern
+    /// `target-<name>:` form was silently dropped from the packaged RPM (and the
+    /// key itself leaked through as literal config content).
+    #[test]
+    fn test_target_prefix_override_reaches_rpm_metadata() {
+        let cmd = ExtPackageCommand::new(
+            "avocado.yaml".to_string(),
+            "kos-layer-boardconf".to_string(),
+            Some("qemux86-64".to_string()),
+            None,
+            false,
+            None,
+            None,
+        );
+
+        let config =
+            Config::load_from_yaml_str("supported_targets: [qemux86-64, raspberrypi4]\n").unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  kos-layer-boardconf:
+    version: 2026.7.0
+    summary: base summary
+    target-qemux86-64:
+      version: 2026.7.1
+      summary: qemu summary
+    target-raspberrypi4:
+      version: 2026.7.2
+"#,
+        )
+        .unwrap();
+        let location = ExtensionLocation::Remote {
+            name: "kos-layer-boardconf".to_string(),
+            source: crate::utils::config::ExtensionSource::Path {
+                path: "extension-kabs/kos-layer-boardconf".to_string(),
+                include: None,
+            },
+        };
+
+        let resolved = cmd
+            .resolve_ext_config(&config, &parsed, &location, "qemux86-64")
+            .unwrap()
+            .expect("extension present in composed config");
+        let meta = cmd.extract_rpm_metadata(&resolved, "qemux86-64").unwrap();
+
+        assert_eq!(meta.version, "2026.7.1", "per-target version must win");
+        assert_eq!(meta.summary, "qemu summary");
+        // The sibling target's block must not leak in, nor the override keys.
+        assert!(resolved.get("target-qemux86-64").is_none());
+        assert!(resolved.get("target-raspberrypi4").is_none());
+    }
 
     #[test]
     fn test_generate_summary_from_name() {

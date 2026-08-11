@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::find_ext_in_mapping;
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
@@ -379,23 +378,11 @@ impl ExtBuildCommand {
         // For local extensions, this uses get_merged_ext_config which reads from the file
         let ext_config = match &extension_location {
             ExtensionLocation::Remote { .. } => {
-                // Use the already-merged config from `parsed` which contains remote extension configs
-                // Then apply target-specific overrides manually
-                // Use find_ext_in_mapping to handle template keys like "avocado-bsp-{{ avocado.target }}"
-                let ext_section = find_ext_in_mapping(parsed, &self.extension, &target);
-                if let Some(ext_val) = ext_section {
-                    let base_ext = ext_val.clone();
-                    // Check for target-specific override within this extension
-                    let target_override = ext_val.get(&target).cloned();
-                    if let Some(override_val) = target_override {
-                        // Merge target override into base, filtering out other target sections
-                        Some(config.merge_target_override(base_ext, override_val, &target))
-                    } else {
-                        Some(base_ext)
-                    }
-                } else {
-                    None
-                }
+                // Resolve the remote/path-sourced ext's config from the composed
+                // value, honoring its `target-<name>:` overrides (overlay + `--tag`)
+                // — the same result the Local path gets via get_merged_ext_config.
+                // Shared with `ext image`.
+                super::resolve_remote_ext_config(config, parsed, &self.extension, &target)
             }
             ExtensionLocation::Local { config_path, .. } => {
                 // For local extensions, read from the file with proper target merging

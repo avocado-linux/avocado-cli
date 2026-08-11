@@ -1201,11 +1201,15 @@ pub fn resolve_subvolumes(
         .collect();
     resolved.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // Validate: lib/avocado must not be disabled
+    // lib/avocado holds the manifest + images. Disabling it as a *subvolume*
+    // is allowed -- runtime build still creates the directory (see the manifest
+    // section), so you only forgo btrfs snapshot/rollback of that path.
     if !resolved.iter().any(|s| s.path == "lib/avocado") {
-        return Err(anyhow::anyhow!(
-            "subvolume 'lib/avocado' cannot be disabled; it is required for manifest and images"
-        ));
+        warnings.push(
+            "subvolume 'lib/avocado' is disabled; it will be a plain directory \
+             (no btrfs snapshot/rollback of manifest and images)"
+                .to_string(),
+        );
     }
 
     Ok((resolved, warnings))
@@ -2993,29 +2997,6 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
-    /// Merge a target-specific override into a base config value.
-    ///
-    /// Callers in ext lifecycle commands (build/clean/image/package) discover
-    /// the override section themselves (often via `find_ext_in_mapping`) and
-    /// pass it in alongside the base. The dispatcher path is preferred for
-    /// new code (handles `target-<name>:` and `kernel-<spec>:` uniformly), but
-    /// keeping this helper lets the explicit-override flow stay terse.
-    ///
-    /// We still funnel the base through `resolve_overrides_in_value` first to
-    /// strip any sibling `target-<other>:` / `kernel-<spec>:` / legacy bare-
-    /// target keys so they don't leak as content. `resolved_kver: None` keeps
-    /// kernel overrides stripped without applying them — the install paths
-    /// re-apply with `Some(kver)` after kernel resolution.
-    pub fn merge_target_override(
-        &self,
-        base: serde_yaml::Value,
-        target_override: serde_yaml::Value,
-        current_target: &str,
-    ) -> serde_yaml::Value {
-        let cleaned = self.resolve_overrides_in_value(base, current_target, None, "<override>");
-        self.merge_values(cleaned, target_override)
-    }
-
     /// Pull a top-level image section (`rootfs` / `initramfs` / `kernel`) out of
     /// a composed value and fold in its `target-<name>:` overrides for `target`.
     ///
@@ -3072,6 +3053,13 @@ impl Config {
     ///   2. Legacy bare-target match
     ///   3. `target-<name>:` match
     ///   4. `kernel-<spec>:` matches (in source order)
+    ///
+    /// Every matched block — `target-<name>:`, legacy bare-target, and
+    /// `kernel-<spec>:` alike — is resolved RECURSIVELY with the same target +
+    /// resolved kernel before being merged, so override keys nested inside it
+    /// compose in either direction (per-board × per-kernel). Without this a
+    /// nested override key would leak through as a literal key instead of being
+    /// applied/stripped, and the block it guards would be silently dropped.
     ///
     /// `section_path` is for diagnostic context only.
     pub fn resolve_overrides_in_value(
@@ -3158,12 +3146,21 @@ impl Config {
 
         let mut merged = serde_yaml::Value::Mapping(map);
         if let Some(v) = legacy_target_match {
+            // Recurse so override keys nested inside the target block (e.g.
+            // kernel-<spec>:) resolve against the same target + kernel instead
+            // of leaking through as literal keys.
+            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
             merged = self.merge_values(merged, v);
         }
         if let Some(v) = target_match {
+            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
             merged = self.merge_values(merged, v);
         }
         for v in kernel_matches {
+            // Same recursion as the target blocks above: a matched kernel block
+            // may nest its own override keys (target-<name>:, or a narrower
+            // kernel-<spec>:), which must resolve rather than leak.
+            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
             merged = self.merge_values(merged, v);
         }
         merged
@@ -8175,6 +8172,158 @@ extensions:
     }
 
     #[test]
+    fn test_nested_kernel_under_target_resolves() {
+        // A shared BSP-style extension: per-board packages live under
+        // target-<name>, with kernel-<spec> package blocks NESTED inside the
+        // target block. The resolver must recurse into the matched target
+        // block and apply the kernel block matching the resolved kernel.
+        let config =
+            Config::load_from_str("supported_targets: [\"raspberrypi4\", \"raspberrypi5\"]\n")
+                .unwrap();
+
+        let ext: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  common-pkg: '*'
+target-raspberrypi5:
+  packages:
+    board-pkg: '*'
+  kernel-6.6.*:
+    packages:
+      rpivid-hevc: '*'
+  kernel-6.12.*:
+    packages:
+      rpi-hevc-dec: '*'
+      drm-shmem-helper: '*'
+"#,
+        )
+        .unwrap();
+
+        // raspberrypi5 on a 6.12 kernel -> base + target + nested 6.12 block.
+        let r = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi5",
+            Some("6.12.25"),
+            "extensions.avocado-bsp",
+        );
+        let pkgs = r
+            .get("packages")
+            .and_then(|p| p.as_mapping())
+            .expect("packages");
+        assert!(pkgs.contains_key("common-pkg"));
+        assert!(pkgs.contains_key("board-pkg"));
+        assert!(pkgs.contains_key("rpi-hevc-dec"));
+        assert!(pkgs.contains_key("drm-shmem-helper"));
+        assert!(!pkgs.contains_key("rpivid-hevc"));
+        // No override keys leak through, at the section level or into packages.
+        assert!(r.get("target-raspberrypi5").is_none());
+        assert!(r.get("kernel-6.12.*").is_none());
+        assert!(!pkgs.contains_key("kernel-6.12.*"));
+        assert!(!pkgs.contains_key("kernel-6.6.*"));
+
+        // raspberrypi5 on a 6.6 kernel -> nested 6.6 block instead.
+        let r66 = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi5",
+            Some("6.6.90"),
+            "extensions.avocado-bsp",
+        );
+        let p66 = r66.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(p66.contains_key("rpivid-hevc"));
+        assert!(!p66.contains_key("rpi-hevc-dec"));
+
+        // Unknown kernel (build/image path, resolved_kver = None): nested
+        // kernel blocks are stripped, not applied and not leaked.
+        let rnone =
+            config.resolve_overrides_in_value(ext, "raspberrypi5", None, "extensions.avocado-bsp");
+        let pnone = rnone.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(pnone.contains_key("board-pkg"));
+        assert!(!pnone.contains_key("rpi-hevc-dec"));
+        assert!(!pnone.contains_key("rpivid-hevc"));
+        assert!(!pnone.contains_key("kernel-6.12.*"));
+    }
+
+    #[test]
+    fn test_nested_target_under_kernel_resolves() {
+        // The mirror of test_nested_kernel_under_target_resolves: a kernel-first
+        // layout, with per-board blocks NESTED inside the kernel block. Matched
+        // kernel blocks must recurse just like matched target blocks, otherwise
+        // the nested target- key leaks through as a literal package name and the
+        // board packages it guards are dropped.
+        let config =
+            Config::load_from_str("supported_targets: [\"raspberrypi4\", \"raspberrypi5\"]\n")
+                .unwrap();
+
+        let ext: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  common-pkg: '*'
+kernel-6.12.*:
+  packages:
+    kernel-pkg: '*'
+  target-raspberrypi5:
+    packages:
+      rpi5-only: '*'
+  target-raspberrypi4:
+    packages:
+      rpi4-only: '*'
+"#,
+        )
+        .unwrap();
+
+        // rpi5 on 6.12 -> base + kernel block + its nested rpi5 block.
+        let r = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi5",
+            Some("6.12.25"),
+            "extensions.avocado-bsp",
+        );
+        let pkgs = r
+            .get("packages")
+            .and_then(|p| p.as_mapping())
+            .expect("packages");
+        assert!(pkgs.contains_key("common-pkg"));
+        assert!(pkgs.contains_key("kernel-pkg"));
+        assert!(
+            pkgs.contains_key("rpi5-only"),
+            "target- block nested in a matched kernel- block was dropped"
+        );
+        assert!(!pkgs.contains_key("rpi4-only"));
+        // No override key leaks, at the section level or inside packages.
+        assert!(r.get("kernel-6.12.*").is_none());
+        assert!(
+            r.get("target-raspberrypi5").is_none(),
+            "target- key nested in a matched kernel- block leaked as content"
+        );
+        assert!(!pkgs.contains_key("target-raspberrypi5"));
+        assert!(!pkgs.contains_key("target-raspberrypi4"));
+
+        // Same kernel, other board -> the sibling nested block instead.
+        let r4 = config.resolve_overrides_in_value(
+            ext.clone(),
+            "raspberrypi4",
+            Some("6.12.25"),
+            "extensions.avocado-bsp",
+        );
+        let p4 = r4.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(p4.contains_key("rpi4-only"));
+        assert!(!p4.contains_key("rpi5-only"));
+
+        // Kernel doesn't match -> whole subtree discarded, nothing hoisted.
+        let rmiss = config.resolve_overrides_in_value(
+            ext,
+            "raspberrypi5",
+            Some("6.6.90"),
+            "extensions.avocado-bsp",
+        );
+        let pmiss = rmiss.get("packages").and_then(|p| p.as_mapping()).unwrap();
+        assert!(pmiss.contains_key("common-pkg"));
+        assert!(!pmiss.contains_key("kernel-pkg"));
+        assert!(!pmiss.contains_key("rpi5-only"));
+        assert!(rmiss.get("kernel-6.12.*").is_none());
+    }
+
+    #[test]
     fn test_edge_cases_and_error_conditions() {
         // Test configuration with only target-specific sections
         let target_only_config = r#"
@@ -10893,7 +11042,7 @@ var:
     }
 
     #[test]
-    fn test_resolve_subvolumes_lib_avocado_cannot_be_disabled() {
+    fn test_resolve_subvolumes_lib_avocado_can_be_disabled() {
         let parsed: serde_yaml::Value = serde_yaml::from_str("extensions: {}").unwrap();
         let runtime: serde_yaml::Value = serde_yaml::from_str(
             r#"
@@ -10906,9 +11055,11 @@ var:
         )
         .unwrap();
         let ext_list: Vec<&str> = vec![];
-        let result = resolve_subvolumes(&ext_list, &parsed, &runtime);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("lib/avocado"));
+        let (resolved, warnings) = resolve_subvolumes(&ext_list, &parsed, &runtime).unwrap();
+        // Disabling lib/avocado is allowed: the subvolume is dropped (flat /var) ...
+        assert!(!resolved.iter().any(|s| s.path == "lib/avocado"));
+        // ... and a warning is emitted instead of a hard error.
+        assert!(warnings.iter().any(|w| w.contains("lib/avocado")));
     }
 
     #[test]
