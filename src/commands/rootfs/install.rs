@@ -74,7 +74,7 @@ use crate::utils::{
     kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
     kernel_version::substitute_kernel_version,
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
-    output::{print_error, print_info, print_success, OutputLevel},
+    output::{print_error, print_info, print_success, print_warning, OutputLevel},
     prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
@@ -399,29 +399,31 @@ fn compute_install_stamp_inputs(
     Ok(Some(inputs))
 }
 
-/// Install a sysroot (rootfs or initramfs) via DNF into the SDK container volume.
+/// Probe the target repo for `package_name` via repoquery (metadata-only, no
+/// install).
 ///
-/// This is the shared implementation used by both `avocado rootfs install`,
-/// `avocado initramfs install`, and `avocado sdk install`.
-///
-/// Features:
-/// - Detects package removals by comparing config against lock file
-/// - Forces clean reinstall when packages are removed (DNF is additive-only)
-/// - Tracks all installed packages in the lock file
-/// - Writes install stamps for staleness detection
-// Probe the target repo for `package_name` via repoquery (metadata-only, no
-// install). Returns true if the package exists; `|| true` prevents a non-zero
-// exit when absent — an empty result is the signal.
+/// `Ok(Some(true))` / `Ok(Some(false))` mean the probe ran and answered.
+/// `Ok(None)` means the probe itself failed, which is *not* the same as
+/// "absent from the feed" and must not be collapsed into one.
 async fn package_exists_in_target_repo(
     params: &SysrootInstallParams<'_>,
     package_name: &str,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     // Append '*' to force glob mode: without it DNF parses the versioned name
     // (e.g. packagegroup-avocado-rootfs-modules-5.15.185-l4t-r36.5-1033.33)
     // as a NEVRA spec and splits on dashes to find NAME-VERSION-RELEASE,
     // causing a false-empty result even when the package is present.
+    // The `|| true` this replaces made a feed or metadata blip indistinguishable
+    // from "not in the feed" — and answering "absent" to a failed probe drops the
+    // module packagegroup, which then reads as a removal, wipes the sysroot, and
+    // reinstalls without it. Print a sentinel on the success branch so the caller
+    // can tell the two apart.
     let command = format!(
-        "$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --qf '%{{NAME}}' '{package_name}*' 2>/dev/null || true"
+        "if out=$($DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --qf '%{{NAME}}' '{package_name}*' 2>/dev/null); then \
+             printf 'AVOCADO_PROBE_OK\\n%s\\n' \"$out\"; \
+         else \
+             printf 'AVOCADO_PROBE_FAILED\\n'; \
+         fi"
     );
     let run_config = RunConfig {
         container_image: params.container_image.to_string(),
@@ -451,9 +453,31 @@ async fn package_exists_in_target_repo(
             .await
             .context("failed to probe target repo for package existence")?
     };
-    Ok(output.map(|s| !s.trim().is_empty()).unwrap_or(false))
+    Ok(output.as_deref().and_then(parse_probe_output))
 }
 
+/// Interpret [`package_exists_in_target_repo`]'s probe output.
+///
+/// `Some(true)`/`Some(false)` only when the `AVOCADO_PROBE_OK` sentinel is
+/// present, meaning repoquery exited zero and the lines after it are its
+/// answer. Anything else — `AVOCADO_PROBE_FAILED`, or output mangled by a
+/// shell banner — is `None`: unknown, not absent.
+fn parse_probe_output(text: &str) -> Option<bool> {
+    let idx = text.lines().position(|l| l.trim() == "AVOCADO_PROBE_OK")?;
+    let names = text.lines().skip(idx + 1).collect::<Vec<_>>().join("\n");
+    Some(!names.trim().is_empty())
+}
+
+/// Install a sysroot (rootfs or initramfs) via DNF into the SDK container volume.
+///
+/// This is the shared implementation used by `avocado rootfs install`,
+/// `avocado initramfs install`, and `avocado sdk install`.
+///
+/// Features:
+/// - Detects package removals by comparing config against lock file
+/// - Forces clean reinstall when packages are removed (DNF is additive-only)
+/// - Tracks all installed packages in the lock file
+/// - Writes install stamps for staleness detection
 pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()> {
     let (label, sysroot_dir, default_pkg) = match params.sysroot_type {
         SysrootType::Rootfs => ("rootfs", "rootfs", "avocado-pkg-rootfs"),
@@ -557,20 +581,38 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
                 }
                 _ => unreachable!(),
             };
-            if package_exists_in_target_repo(params, &name).await? {
-                print_info(
-                    &format!("Auto-including {name} for pinned kernel {kver}"),
-                    OutputLevel::Normal,
-                );
-                Some(name)
-            } else {
-                print_info(
-                    &format!(
-                        "Skipping {name}: not found in feed (feed predates per-kernel module packagegroups)"
-                    ),
-                    OutputLevel::Normal,
-                );
-                None
+            match package_exists_in_target_repo(params, &name).await? {
+                Some(true) => {
+                    print_info(
+                        &format!("Auto-including {name} for pinned kernel {kver}"),
+                        OutputLevel::Normal,
+                    );
+                    Some(name)
+                }
+                Some(false) => {
+                    print_info(
+                        &format!(
+                            "Skipping {name}: not found in feed (feed predates per-kernel module packagegroups)"
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    None
+                }
+                // Probe failed. Keeping the name is the safe answer: it stays in
+                // the effective set, so a package the lock already records does
+                // not read as a removal and trigger a wipe that reinstalls
+                // without it. If it genuinely is absent, dnf says so and fails
+                // loudly instead of silently shipping a module-less kernel.
+                None => {
+                    print_warning(
+                        &format!(
+                            "Could not probe the feed for {name} (repoquery failed). \
+                             Keeping it in the install set rather than assuming it is absent."
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    Some(name)
+                }
             }
         }
         (None, _) => {
@@ -878,7 +920,16 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             )
             .await?;
 
-        if !installed_versions.is_empty() {
+        // The stamp must not outlive the two things it implicitly claims: that the
+        // lock records what landed, and that the kernel sysroot was staged. Both
+        // can fail without failing the install -- `query_installed_packages`
+        // returns Ok(empty) on error, and staging only prints. Writing a current
+        // stamp anyway latches the broken state: every later run reports "up to
+        // date" and the user is wedged until they guess --no-stamps.
+        let versions_recorded = !installed_versions.is_empty();
+        let mut kernel_staging_ok = true;
+
+        if versions_recorded {
             params.lock_file.update_sysroot_versions(
                 params.target,
                 &params.sysroot_type,
@@ -939,6 +990,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                         ),
                         OutputLevel::Normal,
                     );
+                    kernel_staging_ok = false;
                 }
             }
         }
@@ -949,7 +1001,22 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         // derived: the install just re-pinned this sysroot's packages, and the
         // stamp has to record the lock state the *next* run will compare
         // against.
-        if !params.no_stamps {
+        if !params.no_stamps && !(versions_recorded && kernel_staging_ok) {
+            print_warning(
+                &format!(
+                    "Not recording an install stamp for {label}: {}. \
+                     The next run will reinstall rather than report it up to date.",
+                    if !versions_recorded {
+                        "the installed package versions could not be read"
+                    } else {
+                        "kernel sysroot staging failed"
+                    }
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        if !params.no_stamps && versions_recorded && kernel_staging_ok {
             if let Some(inputs) = compute_install_stamp_inputs(params, &packages)? {
                 let stamp = match params.sysroot_type {
                     SysrootType::Rootfs => {
@@ -1193,7 +1260,7 @@ impl RootfsInstallCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_overlay_script, detect_sysroot_package_removals};
+    use super::{build_overlay_script, detect_sysroot_package_removals, parse_probe_output};
     use crate::utils::lockfile::{LockFile, SysrootType};
     use std::collections::{HashMap, HashSet};
 
@@ -1350,6 +1417,33 @@ mod tests {
             detect_sysroot_package_removals(&effective, &SysrootType::Rootfs, TARGET, &lock)
                 .is_empty(),
             "a newly added package must not read as a removal",
+        );
+    }
+
+    /// A failed probe must never read as "absent from the feed": answering
+    /// absent drops the module packagegroup, which then reads as a removal,
+    /// wipes the sysroot, and reinstalls a kernel with no modules.
+    #[test]
+    fn probe_output_distinguishes_failure_from_absence() {
+        assert_eq!(
+            parse_probe_output("AVOCADO_PROBE_OK\npackagegroup-avocado-rootfs-modules-6.6.1\n"),
+            Some(true),
+        );
+        // Ran, found nothing — genuinely absent.
+        assert_eq!(parse_probe_output("AVOCADO_PROBE_OK\n\n"), Some(false));
+        assert_eq!(parse_probe_output("AVOCADO_PROBE_OK\n"), Some(false));
+        // repoquery failed — unknown, and must not collapse to `Some(false)`.
+        assert_eq!(parse_probe_output("AVOCADO_PROBE_FAILED\n"), None);
+        assert_eq!(parse_probe_output(""), None);
+        // A login banner ahead of the sentinel must not defeat it, and one
+        // ahead of a failure must not invent an answer.
+        assert_eq!(
+            parse_probe_output("Welcome to the builder!\nAVOCADO_PROBE_OK\nsome-pkg\n"),
+            Some(true),
+        );
+        assert_eq!(
+            parse_probe_output("Welcome to the builder!\nAVOCADO_PROBE_FAILED\n"),
+            None,
         );
     }
 
