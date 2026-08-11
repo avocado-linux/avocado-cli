@@ -6,11 +6,31 @@
 //!
 //! - `replace` — always re-downloaded when the sha differs (kernel,
 //!   initramfs, rootfs).
-//! - `seed_only` — downloaded only on first install. On subsequent
-//!   updates we skip it entirely so the user's `var` (Docker volumes,
-//!   project caches in `/data`, the persistent `var.btrfs`) survives
-//!   across image bumps. Refresh via `avocado vm reset-var` if you
-//!   actually want a clean slate.
+//! - `seed_only` — the `var` image. Fetched on first install and, on a
+//!   version bump, re-fetched and re-seeded. See below.
+//!
+//! ## Why a version bump resets `var` (ENG-2226)
+//!
+//! `seed_only` was written to preserve user state across image bumps,
+//! on the assumption — stated in avocado-vm's `release/README.md` —
+//! that the in-VM agent would migrate the existing btrfs at boot. That
+//! migration does not exist yet, and `var` holds more than user state:
+//! the VM's own system extensions live in `/var/lib/avocado/images` and
+//! are merged onto `/usr` and `/etc` at boot. Carrying `var` across a
+//! bump therefore boots a new kernel and rootfs against the *old*
+//! userspace.
+//!
+//! Nothing catches that. Each extension's `extension-release` is
+//! synthesized at merge time carrying `ID=_any`, which is
+//! systemd-sysext's explicit "matches any OS" wildcard — so the
+//! mismatched extensions merge silently and the VM looks healthy.
+//!
+//! Until the guest can migrate in place, a version bump takes the new
+//! seed and discards the live disk. That costs the user their Docker
+//! volumes, SDK images and `/data` work, so they must re-run `avocado
+//! install` and `avocado build` — a tradeoff deliberately accepted over
+//! shipping a VM whose halves don't match. An unchanged `var` sha means
+//! no reset.
 //!
 //! Behaviour with a running VM: query lifecycle, stop it cleanly,
 //! perform the swap, restart with the same `start` options. The
@@ -33,7 +53,7 @@ use crate::utils::vm::channel::ChannelPointer;
 use crate::utils::vm::manifest::{Manifest, UpdatePolicy};
 use crate::utils::vm::staging::StagingDir;
 use crate::utils::vm::state::VmPaths;
-use crate::utils::vm_update_check::{check_for_vm_update, DEFAULT_BASE};
+use crate::utils::vm_update_check::{check_for_vm_update, VmUpdateStatus, DEFAULT_BASE};
 
 /// CLI surface — keep this in sync with the clap variant in main.rs.
 pub struct UpdateCommand {
@@ -73,14 +93,21 @@ impl UpdateCommand {
             .and_then(|m| m.version.as_deref())
             .map(|s| s.to_string());
 
-        // Channel poll (24h cached). Returns Some only when newer
-        // *and* CLI is compatible with min_cli_version.
-        let avail = check_for_vm_update(&channel_name, installed_version.as_deref()).await;
-
-        // Print the "what's available" summary so --check is useful
-        // even when nothing's new.
-        let Some(avail) = avail else {
-            return print_up_to_date(installed_version.as_deref(), &channel_name, self.output);
+        // Channel poll (24h cached).
+        let avail = match check_for_vm_update(&channel_name, installed_version.as_deref()).await {
+            VmUpdateStatus::Available(avail) => avail,
+            // A newer release exists that this CLI must not install.
+            // Fail rather than print-and-succeed: the desktop's
+            // `check_vm` maps a non-zero `--check` exit to an Error
+            // status carrying our stderr, so the actionable "run
+            // `avocado upgrade` first" reaches the Updates pane without
+            // needing a desktop-side change to understand a new field.
+            VmUpdateStatus::CliTooOld { message } => bail!(message),
+            // Print the "what's available" summary so --check is useful
+            // even when nothing's new.
+            VmUpdateStatus::NoUpdate => {
+                return print_up_to_date(installed_version.as_deref(), &channel_name, self.output)
+            }
         };
 
         if self.check_only {
@@ -113,11 +140,6 @@ impl UpdateCommand {
             )
         })?;
 
-        // Confirm with the user (unless --yes).
-        if !self.assume_yes {
-            confirm(&avail.pointer, installed_version.as_deref())?;
-        }
-
         // HTTP client — `connect_timeout` is bounded so a stalled DNS /
         // TCP handshake fails fast, but the overall request timeout is
         // unset because artifact downloads can run several minutes on
@@ -129,21 +151,24 @@ impl UpdateCommand {
             .connect_timeout(Duration::from_secs(30))
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .build()?;
-        let new_manifest: Manifest = serde_json::from_str(
-            &http
-                .get(&platform_entry.manifest_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?,
-        )
-        .context("parsing remote manifest")?;
+        // Fetched once and kept: we parse this text to plan the download
+        // and later write the same bytes out as the installed manifest.
+        // Two separate GETs could disagree if the release were
+        // re-published mid-run, leaving a manifest that doesn't describe
+        // the artifacts we actually committed.
+        let manifest_raw = http
+            .get(&platform_entry.manifest_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let new_manifest: Manifest =
+            serde_json::from_str(&manifest_raw).context("parsing remote manifest")?;
 
-        // Decide what to download. `seed_only` artifacts are pulled
-        // only when the installed dir has no copy of them (first run);
-        // on a real update they're skipped entirely. `replace`
-        // artifacts are pulled whenever the sha differs.
+        // Decide what to download. `replace` artifacts are pulled
+        // whenever the sha differs; the `seed_only` var image is pulled
+        // on first install and on any sha change (see the module docs).
         let install_dir = paths.install_dir();
         std::fs::create_dir_all(&install_dir)
             .with_context(|| format!("creating install dir {}", install_dir.display()))?;
@@ -151,6 +176,21 @@ impl UpdateCommand {
         if downloads.is_empty() {
             println!("avocado vm update: nothing to download (all artifacts already current).");
             return Ok(());
+        }
+
+        // Whether this run replaces the live var disk. Only on an update
+        // of an existing install: with no installed manifest there is no
+        // user state to destroy, and `seed_var_disk` on the next start
+        // handles a missing disk anyway. Gating on the planned download
+        // means an unchanged var sha leaves the disk alone.
+        let reseed_var = installed.is_some() && downloads.iter().any(|d| d.seed_only);
+
+        // Confirm with the user (unless --yes). Deliberately after
+        // planning: whether this destroys the VM's state is the material
+        // fact about the operation, and we can't know it before reading
+        // the remote manifest.
+        if !self.assume_yes {
+            confirm(&avail.pointer, installed_version.as_deref(), reseed_var)?;
         }
 
         // Was the VM running before we tear it down?
@@ -230,19 +270,40 @@ impl UpdateCommand {
                 format!("committing {} into {}", item.file, install_dir.display())
             })?;
         }
+        // Replace the live var disk once the new seed is committed and
+        // the VM is down. Deleting rather than copying is deliberate:
+        // `lifecycle::start` already re-seeds a missing var.btrfs from
+        // the artifact dir and then re-applies the configured size, so
+        // the boot path stays the single owner of both, and an update
+        // that dies here leaves no half-copied disk to mistake for
+        // state — the next start just seeds it.
+        if reseed_var {
+            let var = paths.var_disk();
+            if var.exists() {
+                std::fs::remove_file(&var)
+                    .with_context(|| format!("removing stale var disk {}", var.display()))?;
+            }
+            if json_mode {
+                // The desktop needs this to know the VM's SDK and Docker
+                // state is gone, so it can drop its host-side install
+                // fingerprints and tell the user to re-run install/build.
+                crate::utils::output_format::emit_json_object(&json!({
+                    "event": "var_reset",
+                    "reason": "vm_image_updated",
+                }));
+            } else {
+                println!(
+                    "avocado vm update: reset /var to the new seed — \
+                     re-run `avocado install` and `avocado build`."
+                );
+            }
+        }
+
         // Write the new manifest last — it's the marker that says
         // "this install is complete at this version."
         let manifest_path = install_dir.join("manifest.json");
         let manifest_bytes =
-            serde_json::to_vec_pretty(&serde_json::from_str::<serde_json::Value>(
-                &http
-                    .get(&platform_entry.manifest_url)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .text()
-                    .await?,
-            )?)?;
+            serde_json::to_vec_pretty(&serde_json::from_str::<serde_json::Value>(&manifest_raw)?)?;
         std::fs::write(&manifest_path, &manifest_bytes)
             .with_context(|| format!("writing {}", manifest_path.display()))?;
 
@@ -286,10 +347,13 @@ struct PlannedDownload {
     file: String,
     sha256: String,
     size: Option<u64>,
+    /// This artifact is the `seed_only` var image. Committing it means
+    /// the live var disk has to be re-seeded from it — see the module
+    /// docs on ENG-2226.
+    seed_only: bool,
 }
 
-/// Decide what to download from the new manifest. Skips `seed_only`
-/// artifacts when an installed copy exists.
+/// Decide what to download from the new manifest.
 fn plan_downloads(
     new: &Manifest,
     installed: Option<&Manifest>,
@@ -297,31 +361,32 @@ fn plan_downloads(
 ) -> Vec<PlannedDownload> {
     let mut out = Vec::new();
     for (role, art) in &new.artifacts {
-        match art.update_policy {
-            UpdatePolicy::SeedOnly => {
-                // Pull only on first install (no existing file in
-                // install_dir for this role's filename).
-                if !install_dir.join(&art.file).exists() {
-                    out.push(PlannedDownload {
-                        file: art.file.clone(),
-                        sha256: art.sha256.clone(),
-                        size: art.size,
-                    });
-                }
-            }
-            UpdatePolicy::Replace => {
-                // Pull if installed sha differs (or no installed manifest yet).
-                let installed_sha = installed
-                    .and_then(|m| m.artifact(role))
-                    .map(|a| a.sha256.as_str());
-                if installed_sha != Some(art.sha256.as_str()) {
-                    out.push(PlannedDownload {
-                        file: art.file.clone(),
-                        sha256: art.sha256.clone(),
-                        size: art.size,
-                    });
-                }
-            }
+        // Sha comparison against the installed manifest, for both
+        // policies. `None` (no installed manifest — first install)
+        // never matches, so everything is fetched.
+        let installed_sha = installed
+            .and_then(|m| m.artifact(role))
+            .map(|a| a.sha256.as_str());
+        let sha_differs = installed_sha != Some(art.sha256.as_str());
+        let wanted = match art.update_policy {
+            // On a first install, the file's presence is the only signal
+            // we have — there's no installed manifest to compare against,
+            // and a var image already in place is one we just fetched.
+            // On an update the sha decides, so an unchanged var image
+            // costs neither a ~450 MB download nor the user's state.
+            UpdatePolicy::SeedOnly => match installed {
+                Some(_) => sha_differs,
+                None => !install_dir.join(&art.file).exists(),
+            },
+            UpdatePolicy::Replace => sha_differs,
+        };
+        if wanted {
+            out.push(PlannedDownload {
+                file: art.file.clone(),
+                sha256: art.sha256.clone(),
+                size: art.size,
+                seed_only: art.update_policy == UpdatePolicy::SeedOnly,
+            });
         }
     }
     out
@@ -345,9 +410,36 @@ async fn is_vm_running() -> bool {
         .unwrap_or(false)
 }
 
-fn confirm(p: &ChannelPointer, installed: Option<&str>) -> Result<()> {
+fn confirm(p: &ChannelPointer, installed: Option<&str>, reseed_var: bool) -> Result<()> {
     let from = installed.unwrap_or("(not installed)");
     println!("avocado vm update: {} -> {}", from, p.version);
+    if reseed_var {
+        // Spelled out, and gated behind typing a word rather than `y`,
+        // because this is not the non-destructive update the command name
+        // implies. Matches `avocado vm reset`'s prompt for the same reason.
+        println!();
+        println!("This release ships a new /var image, which carries the VM's own");
+        println!("system extensions — so /var is replaced, not migrated. You will lose:");
+        println!();
+        println!("  - installed SDKs and their container images");
+        println!("  - Docker volumes and build caches");
+        println!("  - anything resident in /data inside the VM");
+        println!();
+        println!("Your projects on the host are untouched, but you will need to re-run");
+        println!("`avocado install` and `avocado build` for each of them afterwards.");
+        println!();
+        print!("Type 'update' to confirm: ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading confirmation")?;
+        if line.trim() != "update" {
+            bail!("aborted by user");
+        }
+        return Ok(());
+    }
     print!("Proceed? [y/N] ");
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -491,4 +583,97 @@ async fn download_artifact(
         }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest with one `replace` artifact (rootfs) and the
+    /// `seed_only` var image, at caller-chosen shas.
+    fn manifest_json(rootfs_sha: &str, var_sha: &str) -> String {
+        format!(
+            r#"{{
+              "format": "avocado-direct",
+              "format_version": 1,
+              "version": "0.4.0",
+              "platform": "avocado-qemuarm64",
+              "architecture": "arm64",
+              "artifacts": {{
+                "rootfs": {{ "file": "rootfs.erofs-lz4", "sha256": "{rootfs_sha}",
+                             "type": "erofs-lz4", "update_policy": "replace" }},
+                "var":    {{ "file": "var.btrfs", "sha256": "{var_sha}",
+                             "type": "btrfs", "update_policy": "seed_only" }}
+              }},
+              "cmdline_default": ""
+            }}"#
+        )
+    }
+
+    fn manifest(rootfs_sha: &str, var_sha: &str) -> Manifest {
+        serde_json::from_str(&manifest_json(rootfs_sha, var_sha)).expect("fixture parses")
+    }
+
+    fn planned(downloads: &[PlannedDownload], file: &str) -> bool {
+        downloads.iter().any(|d| d.file == file)
+    }
+
+    #[test]
+    fn first_install_fetches_every_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan_downloads(&manifest("aa", "bb"), None, dir.path());
+        assert!(planned(&plan, "rootfs.erofs-lz4"));
+        assert!(planned(&plan, "var.btrfs"));
+    }
+
+    #[test]
+    fn first_install_skips_a_var_image_already_on_disk() {
+        // Resuming a first install that already pulled the ~450 MB var
+        // image: no installed manifest to compare shas against, so
+        // presence is the only signal.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("var.btrfs"), b"seed").unwrap();
+        let plan = plan_downloads(&manifest("aa", "bb"), None, dir.path());
+        assert!(planned(&plan, "rootfs.erofs-lz4"));
+        assert!(!planned(&plan, "var.btrfs"));
+    }
+
+    #[test]
+    fn update_with_a_new_var_image_plans_it_as_seed_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // The var image is on disk from the previous install — under the
+        // old rule that alone was enough to skip it, which is exactly how
+        // a stale /var survived a version bump (ENG-2226).
+        std::fs::write(dir.path().join("var.btrfs"), b"old seed").unwrap();
+        let installed = manifest("aa", "bb");
+        let plan = plan_downloads(&manifest("aa2", "bb2"), Some(&installed), dir.path());
+        assert!(planned(&plan, "var.btrfs"));
+        assert!(
+            plan.iter().any(|d| d.file == "var.btrfs" && d.seed_only),
+            "the var image must be flagged seed_only so the caller re-seeds the live disk",
+        );
+    }
+
+    #[test]
+    fn update_leaves_an_unchanged_var_image_alone() {
+        // A release that only bumps the boot artifacts must not cost the
+        // user their /var — nothing in it is stale.
+        let dir = tempfile::tempdir().unwrap();
+        let installed = manifest("aa", "bb");
+        let plan = plan_downloads(&manifest("aa2", "bb"), Some(&installed), dir.path());
+        assert!(planned(&plan, "rootfs.erofs-lz4"));
+        assert!(!planned(&plan, "var.btrfs"));
+        assert!(
+            !plan.iter().any(|d| d.seed_only),
+            "no seed_only download means the caller must not touch var.btrfs",
+        );
+    }
+
+    #[test]
+    fn update_with_nothing_changed_plans_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = manifest("aa", "bb");
+        let plan = plan_downloads(&manifest("aa", "bb"), Some(&installed), dir.path());
+        assert!(plan.is_empty());
+    }
 }
