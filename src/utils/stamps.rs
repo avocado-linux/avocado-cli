@@ -1731,7 +1731,7 @@ pub fn validate_stamps_parsed(
 #[allow(unused)]
 pub fn generate_package_hash_script(installroot: &str) -> String {
     format!(
-        r#"rpm --root={installroot} -qa --queryformat '%{{NAME}}-%{{VERSION}}-%{{RELEASE}}\n' 2>/dev/null | sort | sha256sum | cut -d' ' -f1"#
+        r#"rpm --root={installroot} -qa --queryformat '%{{NAME}}-%{{VERSION}}-%{{RELEASE}}\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -d' ' -f1"#
     )
 }
 
