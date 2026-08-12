@@ -301,7 +301,7 @@ impl SdkPackageCommand {
 
         // Build the RPM script
         let (rpm_build_script, rpm_filenames) =
-            self.generate_rpm_build_script(metadata, pkg_config, target);
+            self.generate_rpm_build_script(metadata, pkg_config, target)?;
 
         if self.verbose {
             print_info(
@@ -365,10 +365,15 @@ impl SdkPackageCommand {
         metadata: &RpmMetadata,
         pkg_config: &PackageConfig,
         _target: &str,
-    ) -> (String, Vec<String>) {
+    ) -> Result<(String, Vec<String>)> {
         let section = &self.section;
         let name = &metadata.name;
-        let version = &metadata.version;
+        // Every use of the version below is an RPM filename or the spec's
+        // `Version:` field, so it's the RPM form throughout — `extract_rpm_metadata`
+        // validates semver but `rpmspec` rejects a `-`, which aborted this command
+        // on any pre-release before.
+        let version = &crate::utils::version::to_rpm_version(&metadata.version)
+            .with_context(|| format!("Section '{}' cannot be packaged", self.section))?;
         let release = &metadata.release;
         let arch = &metadata.arch;
         let summary = &metadata.summary;
@@ -512,7 +517,7 @@ rm -rf "$TMPDIR"
 "#,
         );
 
-        (script, rpm_filenames)
+        Ok((script, rpm_filenames))
     }
 
     /// Generate spec sub-package sections for split packages.

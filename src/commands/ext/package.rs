@@ -525,6 +525,188 @@ impl ExtPackageCommand {
         format!("System extension package for {name}")
     }
 
+    /// Generate the `rpmbuild` shell script for this extension.
+    ///
+    /// Split out of [`Self::create_rpm_package_in_container`] so the two places
+    /// the RPM-form version lands — the spec's `Version:` line and the NVR
+    /// filename — are assertable without running a container. Mirrors
+    /// `sdk::package`'s `generate_rpm_build_script`.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_rpm_build_script(
+        &self,
+        metadata: &RpmMetadata,
+        rpm_version: &str,
+        rpm_filename: &str,
+        target_provides: &str,
+        container_src_dir: &str,
+        package_files_str: &str,
+        version_bake_section: &str,
+    ) -> String {
+        format!(
+            r#"
+set -e
+
+# Extension source directory
+EXT_SRC_DIR="{container_src_dir}"
+
+# Package files patterns (may contain globs like * and **)
+PACKAGE_FILES="{package_files_str}"
+
+# Ensure output directory exists
+mkdir -p $AVOCADO_PREFIX/output/extensions
+
+# Check if extension source directory exists
+if [ ! -d "$EXT_SRC_DIR" ]; then
+echo "Extension source directory not found: $EXT_SRC_DIR"
+exit 1
+fi
+
+# Check for avocado config file
+if [ ! -f "$EXT_SRC_DIR/avocado.yaml" ] && [ ! -f "$EXT_SRC_DIR/avocado.yml" ]; then
+echo "No avocado.yaml/yml found in $EXT_SRC_DIR"
+exit 1
+fi
+
+# Create temporary directory for RPM build
+TMPDIR=$(mktemp -d)
+STAGING_DIR="$TMPDIR/staging"
+mkdir -p "$STAGING_DIR"
+cd "$TMPDIR"
+
+# Create directory structure for rpmbuild
+mkdir -p BUILD RPMS SOURCES SPECS SRPMS
+
+# Enable globstar for ** pattern support
+shopt -s globstar nullglob
+
+# Copy files matching patterns to staging directory
+cd "$EXT_SRC_DIR"
+FILE_COUNT=0
+for pattern in $PACKAGE_FILES; do
+# Expand the glob pattern
+for file in $pattern; do
+    if [ -e "$file" ]; then
+        # Create parent directory in staging and copy
+        parent_dir=$(dirname "$file")
+        if [ "$parent_dir" != "." ]; then
+            mkdir -p "$STAGING_DIR/$parent_dir"
+        fi
+        cp -r "$file" "$STAGING_DIR/$file"
+        if [ -f "$file" ]; then
+            FILE_COUNT=$((FILE_COUNT + 1))
+        elif [ -d "$file" ]; then
+            dir_files=$(find "$file" -type f | wc -l)
+            FILE_COUNT=$((FILE_COUNT + dir_files))
+        fi
+    fi
+done
+done
+cd "$TMPDIR"
+{version_bake_section}
+echo "Creating RPM with $FILE_COUNT files from source directory..."
+
+if [ "$FILE_COUNT" -eq 0 ]; then
+echo "No files matched the package_files patterns: $PACKAGE_FILES"
+exit 1
+fi
+
+# Create spec file
+# The extension's src_dir maps to a top-level /<ext_name>/ directory in the package, so
+# that installing into a SHARED includes installroot lands its content at
+# includes/<ext_name>/ without colliding with other extensions' files (and one rpmdb
+# tracks all installed extensions).
+cat > SPECS/package.spec << SPEC_EOF
+%define _buildhost reproducible
+# The payload is already-built target content, so rpm has to package it verbatim.
+# Two stock behaviours get in the way: the build-root policy scripts run the
+# container's host toolchain (strip and friends) over target binaries, and the
+# noarch guard rejects a payload carrying target ELF. These packages are noarch
+# by design - a target routes on the avocado-target provides below, not on the
+# package arch - so both checks are false positives here.
+# Comments must stay macro-free; rpm expands macros inside spec comments.
+%define __os_install_post %{{nil}}
+%define _binaries_in_noarch_packages_terminate_build 0
+AutoReqProv: no
+
+Name: {name}
+Version: {version}
+Release: {release}
+Summary: {summary}
+License: {license}
+Vendor: {vendor}
+Group: {group}{url_line}
+# Self-describe the on-disk layout so the CLI knows how to install this package: content
+# is nested under /<ext_name>/, so it installs into the SHARED includes installroot.
+# Legacy packages (content at /) lack this provide and use the per-ext installroot.
+Provides: avocado-ext-layout(nested)
+# Self-describe which targets this extension supports, derived from avocado.yaml
+# supported_targets. Surfaced in the feed's repo metadata (primary.xml) so the CLI can
+# query target compatibility without downloading the RPM, and so the feed server can route
+# it to the correct per-target -ext feed(s). "*" means all targets (cross-target).
+{target_provides}
+
+%description
+{description}
+
+%files
+/{name}
+
+%prep
+# No prep needed
+
+%build
+# No build needed
+
+%install
+# Nest the staged files under /<ext_name>/ so a shared includes installroot yields
+# includes/<ext_name>/... (collision-free, one rpmdb per includes root).
+mkdir -p %{{buildroot}}/{name}
+cp -r "$STAGING_DIR"/* %{{buildroot}}/{name}/
+
+%clean
+# Skip clean section - not needed for our use case
+
+%changelog
+SPEC_EOF
+
+# Build the RPM with custom architecture target
+rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --target {arch} -bb SPECS/package.spec
+
+# Move RPM to output directory
+mv RPMS/{arch}/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} || {{
+mv RPMS/*/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} 2>/dev/null || {{
+    echo "Failed to find built RPM"
+    exit 1
+}}
+}}
+
+echo "RPM created successfully: $AVOCADO_PREFIX/output/extensions/{rpm_filename}"
+
+# Cleanup
+rm -rf "$TMPDIR"
+"#,
+            name = metadata.name,
+            version = rpm_version,
+            release = metadata.release,
+            summary = metadata.summary,
+            license = metadata.license,
+            vendor = metadata.vendor,
+            group = metadata.group,
+            url_line = if let Some(url) = &metadata.url {
+                format!("\nURL: {url}")
+            } else {
+                String::new()
+            },
+            description = metadata.description,
+            arch = metadata.arch,
+            target_provides = target_provides,
+            rpm_filename = rpm_filename,
+            container_src_dir = container_src_dir,
+            package_files_str = package_files_str,
+            version_bake_section = version_bake_section,
+        )
+    }
+
     /// Create the RPM package containing the extension's src_dir
     ///
     /// The package root (/) maps to the extension's src_dir contents.
@@ -572,10 +754,18 @@ impl ExtPackageCommand {
             format!("/opt/src/{ext_src_dir}")
         };
 
-        // Create the RPM filename
+        // RPM forbids `-` in Version (it is the Version/Release separator), so map
+        // the semver version to its RPM form (`1.0.0-rc.1` -> `1.0.0~rc.1`). Used
+        // for the spec `Version:` and the built RPM's name; the semver form is kept
+        // for the avocado.yaml baked into the payload (consumers validate semver).
+        let rpm_version = crate::utils::version::to_rpm_version(&metadata.version)
+            .with_context(|| format!("Extension '{}' cannot be packaged", self.extension))?;
+
+        // Create the RPM filename (matches the built RPM's NVR, so it uses the
+        // RPM-form version, not the semver form).
         let rpm_filename = format!(
             "{}-{}-{}.{}.rpm",
-            metadata.name, metadata.version, metadata.release, metadata.arch
+            metadata.name, rpm_version, metadata.release, metadata.arch
         );
 
         // Convert package_files to a space-separated string for the shell script
@@ -649,168 +839,14 @@ fi
 
         // Create RPM using rpmbuild in container
         // Package root (/) maps to the extension's src_dir contents
-        let rpm_build_script = format!(
-            r#"
-set -e
-
-# Extension source directory
-EXT_SRC_DIR="{container_src_dir}"
-
-# Package files patterns (may contain globs like * and **)
-PACKAGE_FILES="{package_files_str}"
-
-# Ensure output directory exists
-mkdir -p $AVOCADO_PREFIX/output/extensions
-
-# Check if extension source directory exists
-if [ ! -d "$EXT_SRC_DIR" ]; then
-    echo "Extension source directory not found: $EXT_SRC_DIR"
-    exit 1
-fi
-
-# Check for avocado config file
-if [ ! -f "$EXT_SRC_DIR/avocado.yaml" ] && [ ! -f "$EXT_SRC_DIR/avocado.yml" ]; then
-    echo "No avocado.yaml/yml found in $EXT_SRC_DIR"
-    exit 1
-fi
-
-# Create temporary directory for RPM build
-TMPDIR=$(mktemp -d)
-STAGING_DIR="$TMPDIR/staging"
-mkdir -p "$STAGING_DIR"
-cd "$TMPDIR"
-
-# Create directory structure for rpmbuild
-mkdir -p BUILD RPMS SOURCES SPECS SRPMS
-
-# Enable globstar for ** pattern support
-shopt -s globstar nullglob
-
-# Copy files matching patterns to staging directory
-cd "$EXT_SRC_DIR"
-FILE_COUNT=0
-for pattern in $PACKAGE_FILES; do
-    # Expand the glob pattern
-    for file in $pattern; do
-        if [ -e "$file" ]; then
-            # Create parent directory in staging and copy
-            parent_dir=$(dirname "$file")
-            if [ "$parent_dir" != "." ]; then
-                mkdir -p "$STAGING_DIR/$parent_dir"
-            fi
-            cp -r "$file" "$STAGING_DIR/$file"
-            if [ -f "$file" ]; then
-                FILE_COUNT=$((FILE_COUNT + 1))
-            elif [ -d "$file" ]; then
-                dir_files=$(find "$file" -type f | wc -l)
-                FILE_COUNT=$((FILE_COUNT + dir_files))
-            fi
-        fi
-    done
-done
-cd "$TMPDIR"
-{version_bake_section}
-echo "Creating RPM with $FILE_COUNT files from source directory..."
-
-if [ "$FILE_COUNT" -eq 0 ]; then
-    echo "No files matched the package_files patterns: $PACKAGE_FILES"
-    exit 1
-fi
-
-# Create spec file
-# The extension's src_dir maps to a top-level /<ext_name>/ directory in the package, so
-# that installing into a SHARED includes installroot lands its content at
-# includes/<ext_name>/ without colliding with other extensions' files (and one rpmdb
-# tracks all installed extensions).
-cat > SPECS/package.spec << SPEC_EOF
-%define _buildhost reproducible
-# The payload is already-built target content, so rpm has to package it verbatim.
-# Two stock behaviours get in the way: the build-root policy scripts run the
-# container's host toolchain (strip and friends) over target binaries, and the
-# noarch guard rejects a payload carrying target ELF. These packages are noarch
-# by design - a target routes on the avocado-target provides below, not on the
-# package arch - so both checks are false positives here.
-# Comments must stay macro-free; rpm expands macros inside spec comments.
-%define __os_install_post %{{nil}}
-%define _binaries_in_noarch_packages_terminate_build 0
-AutoReqProv: no
-
-Name: {name}
-Version: {version}
-Release: {release}
-Summary: {summary}
-License: {license}
-Vendor: {vendor}
-Group: {group}{url_line}
-# Self-describe the on-disk layout so the CLI knows how to install this package: content
-# is nested under /<ext_name>/, so it installs into the SHARED includes installroot.
-# Legacy packages (content at /) lack this provide and use the per-ext installroot.
-Provides: avocado-ext-layout(nested)
-# Self-describe which targets this extension supports, derived from avocado.yaml
-# supported_targets. Surfaced in the feed's repo metadata (primary.xml) so the CLI can
-# query target compatibility without downloading the RPM, and so the feed server can route
-# it to the correct per-target -ext feed(s). "*" means all targets (cross-target).
-{target_provides}
-
-%description
-{description}
-
-%files
-/{name}
-
-%prep
-# No prep needed
-
-%build
-# No build needed
-
-%install
-# Nest the staged files under /<ext_name>/ so a shared includes installroot yields
-# includes/<ext_name>/... (collision-free, one rpmdb per includes root).
-mkdir -p %{{buildroot}}/{name}
-cp -r "$STAGING_DIR"/* %{{buildroot}}/{name}/
-
-%clean
-# Skip clean section - not needed for our use case
-
-%changelog
-SPEC_EOF
-
-# Build the RPM with custom architecture target
-rpmbuild --define "_topdir $TMPDIR" --define "_arch {arch}" --target {arch} -bb SPECS/package.spec
-
-# Move RPM to output directory
-mv RPMS/{arch}/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} || {{
-    mv RPMS/*/*.rpm $AVOCADO_PREFIX/output/extensions/{rpm_filename} 2>/dev/null || {{
-        echo "Failed to find built RPM"
-        exit 1
-    }}
-}}
-
-echo "RPM created successfully: $AVOCADO_PREFIX/output/extensions/{rpm_filename}"
-
-# Cleanup
-rm -rf "$TMPDIR"
-"#,
-            name = metadata.name,
-            version = metadata.version,
-            release = metadata.release,
-            summary = metadata.summary,
-            license = metadata.license,
-            vendor = metadata.vendor,
-            group = metadata.group,
-            url_line = if let Some(url) = &metadata.url {
-                format!("\nURL: {url}")
-            } else {
-                String::new()
-            },
-            description = metadata.description,
-            arch = metadata.arch,
-            target_provides = target_provides,
-            rpm_filename = rpm_filename,
-            container_src_dir = container_src_dir,
-            package_files_str = package_files_str,
-            version_bake_section = version_bake_section,
+        let rpm_build_script = self.generate_rpm_build_script(
+            metadata,
+            &rpm_version,
+            &rpm_filename,
+            &target_provides,
+            &container_src_dir,
+            &package_files_str,
+            &version_bake_section,
         );
 
         // Run the RPM build in the container
@@ -1000,6 +1036,101 @@ struct RpmMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cmd() -> ExtPackageCommand {
+        ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            Some("x86_64-unknown-linux-gnu".to_string()),
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn metadata_with_version(version: &str) -> RpmMetadata {
+        RpmMetadata {
+            name: "my-ext".to_string(),
+            version: version.to_string(),
+            release: "r0".to_string(),
+            summary: "s".to_string(),
+            description: "d".to_string(),
+            license: "MIT".to_string(),
+            arch: "noarch".to_string(),
+            vendor: "v".to_string(),
+            group: "g".to_string(),
+            url: None,
+        }
+    }
+
+    /// The spec `Version:` line and the NVR filename must both carry the RPM
+    /// form. `rpmbuild` aborts with `Illegal char '-'` on the semver form, so a
+    /// refactor that interpolated `metadata.version` into either would break
+    /// packaging for every pre-release — and, before this test, do it with a
+    /// fully green suite.
+    #[test]
+    fn test_generate_rpm_build_script_uses_rpm_form_version() {
+        let cmd = test_cmd();
+        let metadata = metadata_with_version("1.0.0-rc.1");
+        let rpm_version = crate::utils::version::to_rpm_version(&metadata.version).unwrap();
+        let rpm_filename = format!(
+            "{}-{}-{}.{}.rpm",
+            metadata.name, rpm_version, metadata.release, metadata.arch
+        );
+
+        let script = cmd.generate_rpm_build_script(
+            &metadata,
+            &rpm_version,
+            &rpm_filename,
+            "Provides: avocado-target(*)",
+            "/opt/src",
+            "avocado.yaml",
+            "",
+        );
+
+        // The spec field rpmbuild parses.
+        assert!(
+            script.contains("Version: 1.0.0~rc.1"),
+            "spec Version: must be the RPM form"
+        );
+        assert!(
+            !script.contains("Version: 1.0.0-rc.1"),
+            "spec Version: must not carry the semver hyphen"
+        );
+        // The built artifact's name.
+        assert!(
+            script.contains("my-ext-1.0.0~rc.1-r0.noarch.rpm"),
+            "RPM filename must be the RPM form"
+        );
+        assert!(
+            !script.contains("my-ext-1.0.0-rc.1-r0.noarch.rpm"),
+            "RPM filename must not carry the semver hyphen"
+        );
+    }
+
+    /// A plain release version is passed through untouched, so the common path
+    /// is unaffected by the mapping.
+    #[test]
+    fn test_generate_rpm_build_script_release_version_unchanged() {
+        let cmd = test_cmd();
+        let metadata = metadata_with_version("1.2.3");
+        let rpm_version = crate::utils::version::to_rpm_version(&metadata.version).unwrap();
+
+        let script = cmd.generate_rpm_build_script(
+            &metadata,
+            &rpm_version,
+            "my-ext-1.2.3-r0.noarch.rpm",
+            "Provides: avocado-target(*)",
+            "/opt/src",
+            "avocado.yaml",
+            "",
+        );
+
+        assert!(script.contains("Version: 1.2.3"));
+        assert!(script.contains("my-ext-1.2.3-r0.noarch.rpm"));
+        assert!(!script.contains('~'), "no `~` for a release version");
+    }
 
     /// A `target-<name>:` override on a remote/path-sourced extension must reach
     /// [`ExtPackageCommand::extract_rpm_metadata`], so the RPM is built at the

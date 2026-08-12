@@ -14,6 +14,19 @@ The `version` field in an extension's `avocado.yaml` IS the version. Always. For
 
 Keep semver — unified versioning across all output artifacts. Distro extensions use `YYYY.S.PATCH` convention (e.g., `2024.0.0`).
 
+#### One deliberate exception: the RPM `Version:` field
+
+RPM's grammar forbids `-`, so a semver pre-release cannot be an RPM `Version:` verbatim — `rpmbuild` rejects `1.0.0-rc.1` with `Illegal char '-'`. Pre-release versions are therefore stored in the RPM as `1.0.0~rc.1` (and build metadata as `^`), which is the form that also gives RPM the right ordering: `1.0.0~rc.1` sorts before `1.0.0`, matching semver precedence.
+
+This is the one place a version is *not* the config's string, so it is confined as tightly as possible:
+
+- Only the spec's `Version:` field and the NVR filename use the RPM form. `utils::version::to_rpm_version` is the single place it is produced.
+- Everything else stays semver — config, the `avocado.yaml` baked into the package payload, the version the platform records for a published extension.
+- The mapping is injective, so `from_rpm_version` inverts it exactly. Any version read back *out* of rpm (an rpmdb query, a parsed NVR) must go through it, or it will not match the config it came from.
+- A `-` *inside* a pre-release identifier (`1.0.0-rc-1`) is rejected rather than mapped: `~` is a precedence operator to RPM, so mapping it would invert ordering and dnf would refuse the upgrade. Use `.` to separate identifiers.
+
+So config remains the source of truth; the RPM form is a representation of it at one boundary, not a second version.
+
 ### Rename `distro.version` → `distro.release`
 
 `distro.version` was overloaded — it was used as a repo path component, a package version spec, an extension version source, and passed as runtime env vars. It should only be the **release family identifier** (feed year).

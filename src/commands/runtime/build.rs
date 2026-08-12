@@ -2788,7 +2788,13 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             .await
         {
             Ok(Some(actual_version)) => {
-                let trimmed_version = actual_version.trim();
+                // `%{VERSION}` is the RPM form, so invert it back to semver. Every
+                // consumer of this value composes it with a name that was built
+                // from the *config* version — `ext/image.rs` names the `.raw` that
+                // way — so returning `1.0.0~rc.1` would have the caller demand an
+                // artifact named after a version nothing produces.
+                let trimmed_version =
+                    crate::utils::version::from_rpm_version(actual_version.trim());
                 if self.verbose {
                     print_info(
                         &format!(
@@ -2797,7 +2803,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
                         OutputLevel::Normal,
                     );
                 }
-                Ok(trimmed_version.to_string())
+                Ok(trimmed_version)
             }
             Ok(None) => Err(anyhow::anyhow!(
                 "Failed to query version for extension '{ext_name}' from RPM database. \
