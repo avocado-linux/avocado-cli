@@ -2459,6 +2459,19 @@ if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
     done
 fi
 STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
+# Also search the SDK's stone dir. A BSP's stone-<arch>.json references boot
+# artifacts it does not build here - u-boot.bin, bootfiles/ - and the runtime
+# input dir only ever holds what this build produced (rootfs, kernel, initramfs,
+# var), so a manifest naming any of them fails resolution with "not found in any
+# input directory".
+#
+# This is the consumer half of a two-part change and is inert without the
+# other: today meta-avocado's avocado-sdk-target installs only the stone JSON
+# into this directory, so nothing new resolves from it yet. It is the right
+# half to land regardless - stone resolves first-match-wins across -i dirs, so
+# an empty extra input changes no current behaviour - but the finalize failure
+# it targets stays until the BSP recipe stages those artifacts here.
+STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $AVOCADO_SDK_PREFIX/stone"
 
 STONE_OVERLAY_FLAG=""
 {device_tree_overlay_section}
