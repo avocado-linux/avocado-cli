@@ -848,6 +848,7 @@ impl ConnectUploadCommand {
                 Ok(parts) => parts,
                 Err(e) => {
                     let _ = tokio::process::Command::new(&container_tool)
+                        // stdio-flags-ok: docker stop timeout in seconds, not a tty
                         .args(["stop", "-t", "2", &container_name_ref])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())

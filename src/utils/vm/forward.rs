@@ -61,6 +61,7 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
         "BatchMode=yes",
         "-o",
         "LogLevel=ERROR",
+        // stdio-flags-ok: ssh identity file, not stdin
         "-i",
         paths.ssh_key().to_str().context("ssh key path utf-8")?,
         "-p",

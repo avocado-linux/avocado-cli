@@ -533,6 +533,7 @@ fn spawn_ssh_tunnel(args: &RunArgs) -> Result<u32> {
         "BatchMode=yes",
         "-o",
         "LogLevel=ERROR",
+        // stdio-flags-ok: ssh identity file, not stdin
         "-i",
         args.ssh_key.to_str().context("ssh key path utf-8")?,
         "-p",

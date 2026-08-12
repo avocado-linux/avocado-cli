@@ -291,11 +291,26 @@ impl DiskWriter {
     }
 
     fn prompt_disk_selection(&self, count: usize) -> Result<usize> {
+        // Without a terminal this loop never terminates: `read_line` returns
+        // Ok(0) at EOF leaving `input` empty, the parse fails, and it spins
+        // printing "Invalid selection" forever. Fail with something actionable
+        // instead of hanging.
+        if !crate::utils::interactivity::can_prompt_user() {
+            anyhow::bail!(
+                "Multiple removable devices were found, but there is no terminal \
+                 to ask which one to use.\n\
+                 Pass the device explicitly instead of selecting it interactively."
+            );
+        }
         loop {
             print!("Select device [1-{}]: ", count);
             std::io::stdout().flush()?;
             let mut input = String::new();
-            std::io::stdin().lock().read_line(&mut input)?;
+            // EOF also breaks the loop, so a closed stdin cannot spin even if
+            // the guard above is ever bypassed.
+            if std::io::stdin().lock().read_line(&mut input)? == 0 {
+                anyhow::bail!("stdin closed while waiting for a device selection");
+            }
             if let Ok(n) = input.trim().parse::<usize>() {
                 if n >= 1 && n <= count {
                     return Ok(n - 1);
@@ -309,6 +324,12 @@ impl DiskWriter {
     }
 
     fn confirm(&self, prompt: &str) -> Result<bool> {
+        // No terminal means no consent. This gates a destructive raw-device
+        // write, so an unanswerable prompt must read as "no", never as a
+        // default yes.
+        if !crate::utils::interactivity::can_prompt_user() {
+            return Ok(false);
+        }
         print!("{}", prompt);
         std::io::stdout().flush()?;
         let mut input = String::new();

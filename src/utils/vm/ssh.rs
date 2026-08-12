@@ -45,6 +45,7 @@ impl SshTarget {
         vec![
             "-p".into(),
             self.port.to_string(),
+            // stdio-flags-ok: ssh identity file, not stdin
             "-i".into(),
             self.key.to_string_lossy().into_owned(),
             "-o".into(),

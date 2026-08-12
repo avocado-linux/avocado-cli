@@ -1175,8 +1175,18 @@ impl SdkContainer {
             extra_args.extend(args.clone());
         }
 
-        if config.interactive {
-            extra_args.push("-it".to_string());
+        // Same intent-vs-capability rule as the local path, including the
+        // per-run TUI context. Using `for_intent` here would consult only the
+        // global renderer, so a caller that set `tui_context` without
+        // registering one would get `-i`/`-t` on the remote path while its
+        // output is being captured — the exact local/remote divergence this
+        // module exists to remove.
+        let mut caps = crate::utils::interactivity::StdioCapabilities::detect();
+        caps.tui_active |= config.tui_context.is_some();
+        for flag in
+            crate::utils::interactivity::ContainerStdio::decide(config.interactive, &caps).flags()
+        {
+            extra_args.push((*flag).to_string());
         }
 
         let extra_args_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
@@ -1247,17 +1257,20 @@ impl SdkContainer {
         // TTY) and skip -i too — dnf prompts would deadlock against
         // an empty stdin. Treat JSON mode as the same constraint set
         // as TUI mode.
-        let global_tui_active = crate::utils::tui::get_active_renderer().is_some();
-        let json_active = crate::utils::output_format::is_json_output_active();
-        if config.interactive && !json_active {
-            // Explicit interactive mode (e.g. avocado shell): full -it
-            container_cmd.push("-i".to_string());
-            container_cmd.push("-t".to_string());
-        } else if config.tui_context.is_none() && !global_tui_active && !json_active {
-            // Non-TUI mode: keep stdin open for prompts, no PTY
-            container_cmd.push("-i".to_string());
+        // Intent (`config.interactive`) is combined with what the environment
+        // can actually provide by `ContainerStdio` — crucially including
+        // whether stdin is a terminal, which decides whether `-t` is even
+        // legal. See utils::interactivity for the full matrix and why this
+        // must not be decided here.
+        let mut caps = crate::utils::interactivity::StdioCapabilities::detect();
+        // A per-run TUI context counts as TUI-active even when no global
+        // renderer is registered.
+        caps.tui_active |= config.tui_context.is_some();
+
+        let stdio = crate::utils::interactivity::ContainerStdio::decide(config.interactive, &caps);
+        for flag in stdio.flags() {
+            container_cmd.push((*flag).to_string());
         }
-        // TUI mode / JSON mode: no -i, no -t (output is piped)
 
         // Add FUSE device and capability for bindfs support
         container_cmd.push("--device".to_string());
@@ -2012,6 +2025,7 @@ impl SdkContainer {
                         // Stop the container gracefully
                         if let Some(name) = container_name {
                             let stop_result = AsyncCommand::new(&self.container_tool)
+                                // stdio-flags-ok: docker stop timeout in seconds, not a tty
                                 .args(["stop", "-t", "2", name])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
@@ -2136,6 +2150,7 @@ impl SdkContainer {
                 // Stop the container gracefully
                 if let Some(name) = container_name {
                     let _ = AsyncCommand::new(&self.container_tool)
+                        // stdio-flags-ok: docker stop timeout in seconds, not a tty
                         .args(["stop", "-t", "2", name])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
@@ -3097,6 +3112,115 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wiring tests for container stdio.
+    ///
+    /// `utils::interactivity` tests the *decision*; these test that the
+    /// decision is actually applied to the argv. That distinction matters:
+    /// the original bug was not a wrong decision, it was that the assembled
+    /// command never consulted stdin at all. Deleting the `stdio.flags()`
+    /// loop leaves every interactivity unit test green — only these fail.
+    mod stdio_wiring {
+        use super::*;
+        use crate::utils::volume::VolumeState;
+        use std::io::IsTerminal;
+
+        fn container() -> SdkContainer {
+            SdkContainer::new()
+        }
+
+        fn volume_state() -> VolumeState {
+            VolumeState::new(PathBuf::from("/tmp/avocado-test"), "docker".to_string())
+        }
+
+        fn argv(interactive: bool) -> Vec<String> {
+            let config = RunConfig {
+                container_image: "example/sdk:test".to_string(),
+                target: "qemux86-64".to_string(),
+                command: "true".to_string(),
+                interactive,
+                ..Default::default()
+            };
+            container()
+                .build_container_command(
+                    &config,
+                    &["true".to_string()],
+                    &HashMap::new(),
+                    &volume_state(),
+                )
+                .expect("command assembly should not fail")
+        }
+
+        /// Whether `-t` appears as a standalone argument (not as part of
+        /// `--platform` values or a path).
+        fn has_tty_flag(cmd: &[String]) -> bool {
+            // stdio-flags-ok: asserting on the assembled argv, not building it
+            cmd.iter().any(|a| a == "-t")
+        }
+
+        fn has_stdin_flag(cmd: &[String]) -> bool {
+            // stdio-flags-ok: asserting on the assembled argv, not building it
+            cmd.iter().any(|a| a == "-i")
+        }
+
+        #[test]
+        fn assembled_command_matches_the_stdio_decision() {
+            // Environment-independent: whatever the harness's stdin is, the
+            // argv must agree with what `interactivity` decided. This is the
+            // link that was missing, and it holds whether the suite runs from
+            // a terminal or from CI.
+            for interactive in [true, false] {
+                let expected = crate::utils::interactivity::ContainerStdio::decide(
+                    interactive,
+                    &crate::utils::interactivity::StdioCapabilities::detect(),
+                );
+                let cmd = argv(interactive);
+                assert_eq!(
+                    has_tty_flag(&cmd),
+                    expected.allocates_tty(),
+                    "interactive={interactive}: tty flag in argv disagrees with {expected:?}"
+                );
+                assert_eq!(
+                    has_stdin_flag(&cmd),
+                    expected.keeps_stdin(),
+                    "interactive={interactive}: stdin flag in argv disagrees with {expected:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn never_requests_a_pty_without_a_terminal() {
+            // The original regression, asserted directly against the argv.
+            // Under CI (and any piped run) stdin is not a terminal, so an
+            // interactive command must still assemble without `-t` — Docker
+            // rejects that combination outright.
+            if std::io::stdin().is_terminal() {
+                // Running from a terminal; the precondition doesn't hold here.
+                // `assembled_command_matches_the_stdio_decision` still covers
+                // the linkage, and CI exercises this branch for real.
+                return;
+            }
+            let cmd = argv(true);
+            assert!(
+                !has_tty_flag(&cmd),
+                "asked for -t with no terminal on stdin; docker refuses this: {cmd:?}"
+            );
+            assert!(
+                has_stdin_flag(&cmd),
+                "stdin should stay open so piped answers still work: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn a_tty_flag_never_appears_without_stdin() {
+            for interactive in [true, false] {
+                let cmd = argv(interactive);
+                if has_tty_flag(&cmd) {
+                    assert!(has_stdin_flag(&cmd), "-t without -i in {cmd:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn failure_detail_none_for_blank_stderr() {
