@@ -2398,6 +2398,17 @@ echo "Copying required extension images to runtime-specific directory..."
 # uniformly across rootfs / initramfs / kernel.
 KERNEL_IMAGE_GLOB=$(ls "$AVOCADO_PREFIX"/kernel/*/Image 2>/dev/null | head -1)
 if [ -n "$KERNEL_IMAGE_GLOB" ]; then
+    # `Image` is a symlink to the real <KERNEL_IMAGETYPE>-<kver> file. `ls`
+    # happily prints a dangling one, but the manifest generator gates on
+    # os.path.isfile(), which follows the link — so a broken link would set
+    # this var, produce no `kernel` block in manifest.json, and say nothing.
+    # Fail here instead, where the cause is still visible.
+    if [ ! -f "$KERNEL_IMAGE_GLOB" ]; then
+        echo "ERROR: kernel image '$KERNEL_IMAGE_GLOB' is a broken symlink" >&2
+        echo "       -> $(readlink "$KERNEL_IMAGE_GLOB" 2>/dev/null)" >&2
+        echo "       Re-run 'avocado rootfs install' to restage the kernel sysroot." >&2
+        exit 1
+    fi
     export AVOCADO_KERNEL_IMAGE="$KERNEL_IMAGE_GLOB"
 fi
 

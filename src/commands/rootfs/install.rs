@@ -69,7 +69,7 @@ fi
 }
 
 use crate::utils::{
-    config::{ComposedConfig, Config},
+    config::{get_kernel_binary, get_kernel_package, ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
     kernel_version::substitute_kernel_version,
@@ -158,6 +158,112 @@ pub async fn read_sysroot_install_stamp(
     Ok(batch.stamp_for(&requirement))
 }
 
+/// The parts of a `kernel:` section that make the kernel *explicitly managed*.
+///
+/// Kernel-sysroot staging used to be gated solely on `has_default_pkg` — i.e.
+/// on the rootfs still installing the default `avocado-pkg-rootfs` meta. That
+/// conflates two unrelated intents: "I curate my own package list" and "don't
+/// manage my kernel". A config slimming the rootfs down to its own
+/// packagegroup silently lost kernel staging, and with it the `kernel` block
+/// in the runtime manifest — no error, discovered on the device.
+///
+/// Naming either key opts back in regardless of the package list.
+#[derive(Default, Debug, PartialEq)]
+struct KernelDeclaration {
+    /// `kernel.binary` — which staged variant `Image` should point at.
+    binary: Option<String>,
+    /// `kernel.package` — the package providing the kernel image.
+    package: Option<String>,
+}
+
+impl KernelDeclaration {
+    /// True when the config says anything concrete about the kernel.
+    fn is_explicit(&self) -> bool {
+        self.binary.is_some() || self.package.is_some()
+    }
+}
+
+/// Resolve the `kernel:` section for `target` and extract the managed-kernel
+/// keys. Goes through `resolve_image_section` so `target-<name>:` overrides
+/// apply, matching how `kernel image` and `runtime build` read the section.
+fn resolve_kernel_declaration(
+    config: &Config,
+    parsed: Option<&serde_yaml::Value>,
+    target: &str,
+) -> KernelDeclaration {
+    let node = parsed.and_then(|p| config.resolve_image_section(p, "kernel", target));
+    KernelDeclaration {
+        binary: get_kernel_binary(node.as_ref()),
+        package: get_kernel_package(node.as_ref()),
+    }
+}
+
+/// Compression suffixes the kernel build appends to `KERNEL_IMAGETYPE`.
+/// Mirrors arch/*/boot/Makefile's `Image.{bz2,gz,lz4,lzma,lzo,zst,xz}` rules
+/// plus x86's `bzImage`-adjacent `vmlinux.gz`.
+const COMPRESSED_IMAGETYPE_SUFFIXES: &[&str] =
+    &[".gz", ".bz2", ".lz4", ".lzma", ".lzo", ".zst", ".xz"];
+
+/// Build the shell fragment that points `$KERNEL_DIR/Image` at one of the
+/// staged `<KERNEL_IMAGETYPE>-<kver>` files.
+///
+/// Two modes:
+///
+/// * `kernel.binary` set — link exactly that variant, or fail listing what was
+///   actually staged. No fallback on purpose: quietly linking a different
+///   kernel than the one asked for is how a config that says `Image.gz` ends
+///   up shipping a 30 MB uncompressed kernel in every downstream kab.
+/// * unset — historical behaviour: first uncompressed variant in sort order,
+///   else the first variant at all.
+///
+/// The uncompressed test strips `-<kver>` before checking the suffix. A
+/// previous version tested `"$abs_path" == *.gz`, which never matched: Yocto
+/// installs `${{imageType}}-${{KERNEL_VERSION}}`, so the compressed variant is
+/// `Image.gz-6.12.25-v8` and ends in the kver, not in `.gz`. The intended
+/// "prefer uncompressed" result still happened by accident, because `sort`
+/// puts `Image-` (0x2D) ahead of `Image.gz-` (0x2E).
+fn build_kernel_binary_block(kver: &str, kernel_binary: Option<&str>) -> String {
+    match kernel_binary {
+        Some(binary) => format!(
+            r#"WANT="{binary}-{kver}"
+if [ ! -e "$KERNEL_DIR/$WANT" ]; then
+    echo "[ERROR] kernel.binary is '{binary}', but '$WANT' was not staged for kernel {kver}." >&2
+    echo "        Available kernel binaries for {kver}:" >&2
+    for abs_path in "${{boot_files[@]}}"; do
+        b=$(basename "$abs_path")
+        echo "          ${{b%-{kver}}}" >&2
+    done
+    echo "        Set kernel.binary to one of the above, or unset it to take the default." >&2
+    exit 1
+fi
+ln -sfn "$WANT" "$KERNEL_DIR/Image"
+echo "Kernel binary: {binary} (kernel.binary)""#
+        ),
+        None => {
+            // `case` patterns are shell globs; build them from the shared list
+            // so adding a compression format touches one place.
+            let patterns = COMPRESSED_IMAGETYPE_SUFFIXES
+                .iter()
+                .map(|s| format!("*{s}"))
+                .collect::<Vec<_>>()
+                .join("|");
+            format!(
+                r#"for abs_path in "${{boot_files[@]}}"; do
+    b=$(basename "$abs_path")
+    imagetype="${{b%-{kver}}}"
+    case "$imagetype" in {patterns}) continue ;; esac
+    ln -sfn "$b" "$KERNEL_DIR/Image"
+    break
+done
+if [ ! -e "$KERNEL_DIR/Image" ]; then
+    ln -sfn "$(basename "${{boot_files[0]}}")" "$KERNEL_DIR/Image"
+fi
+echo "Kernel binary: $(basename "$(readlink "$KERNEL_DIR/Image")" | sed 's/-{kver}$//') (default)""#
+            )
+        }
+    }
+}
+
 /// Stage the kernel `Image` from the rootfs sysroot into the per-target
 /// content-addressed kernel sysroot at `$AVOCADO_PREFIX/kernel/<kver>/`.
 ///
@@ -168,6 +274,9 @@ pub async fn read_sysroot_install_stamp(
 /// to its sysroot; this staging step mirrors the resulting `Image` to the
 /// kernel sysroot so multiple runtimes pinning the same kver share one copy
 /// and provision has a kver-stable path to construct `boot.img` from.
+///
+/// `kernel_binary` is the resolved `kernel.binary` config value; see
+/// [`build_kernel_binary_block`] for how it picks among the staged variants.
 ///
 /// Records the staged `kernel-image-<kver>` package version in
 /// `lock.kernels[<kver>]` so subsequent installs see the kernel sysroot as
@@ -181,6 +290,7 @@ async fn stage_kernel_sysroot_from_rootfs(
     kver: &str,
     rootfs_image_pkg_name: &str,
     rootfs_image_pkg_version: &str,
+    kernel_binary: Option<&str>,
     lock_file: &mut LockFile,
     repo_url: Option<&str>,
     repo_release: Option<&str>,
@@ -190,11 +300,12 @@ async fn stage_kernel_sysroot_from_rootfs(
     verbose: bool,
     tui_context: Option<crate::utils::container::TuiContext>,
 ) -> Result<()> {
-    // The rootfs auto-append landed `Image-<kver>` (and `Image-<kver>.gz`
+    // The rootfs auto-append landed `Image-<kver>` (and `Image.gz-<kver>`
     // for kernels that ship a compressed variant) under
     // `$AVOCADO_PREFIX/rootfs/boot/`. Mirror them into the kernel sysroot
     // directory keyed by version. Use cp -a so any future `Image*` siblings
     // (DTBs, multi-arch builds) get staged uniformly.
+    let binary_block = build_kernel_binary_block(kver, kernel_binary);
     let stage_command = format!(
         r#"
 set -e
@@ -226,17 +337,16 @@ fi
 for abs_path in "${{boot_files[@]}}"; do
     cp -a "$abs_path" "$KERNEL_DIR/"
 done
-# Stable 'Image' symlink — prefer uncompressed over .gz so consumers can use
-# it directly without decompression. -sfn replaces a stale symlink in place
-# on rerun without erroring on "File exists".
-for abs_path in "${{boot_files[@]}}"; do
-    [[ "$abs_path" == *.gz ]] && continue
-    ln -sfn "$(basename "$abs_path")" "$KERNEL_DIR/Image"
-    break
-done
-if [ ! -e "$KERNEL_DIR/Image" ]; then
-    ln -sfn "$(basename "${{boot_files[0]}}")" "$KERNEL_DIR/Image"
-fi
+# Stable 'Image' symlink. Everything downstream — `kernel image`, `runtime
+# build`, provision — resolves $AVOCADO_PREFIX/kernel/<kver>/Image and never
+# looks at the variant names, so this link is the single point where the
+# choice of kernel binary is made. -sfn replaces a stale link in place on
+# rerun without erroring on "File exists".
+#
+# Note the names here are Yocto's `<KERNEL_IMAGETYPE>-<kver>`, e.g.
+# "Image.gz-6.12.25-v8" — the compression marker is in the middle, not a
+# trailing extension, so variant tests must strip -<kver> first.
+{binary_block}
 "#
     );
 
@@ -653,6 +763,9 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // dnf's NVR tie-break. Users opt out implicitly by defining their own
     // rootfs.packages: / initramfs.packages: without the default meta-package.
     let has_default_pkg = packages.is_empty() || packages.contains_key(default_pkg);
+    // Deliberately NOT widened to the explicit-kernel opt-in below: the module
+    // packagegroup is bulky, and a config that trimmed the rootfs to its own
+    // package list would not expect naming `kernel.binary` to pull it back in.
     let auto_module_pkg: Option<String> = match (resolved_kver.as_deref(), has_default_pkg) {
         (Some(kver), true) => {
             let name = match params.sysroot_type {
@@ -724,21 +837,49 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // and kernel-image-image.gz-${kver}); dnf pulls both. Initramfs doesn't
     // need this — boot.img embeds the initramfs cpio, the kernel comes from
     // the rootfs sysroot.
+    //
+    // Gated on the default meta OR an explicit `kernel:` declaration, so a
+    // curated package list no longer silently disables kernel staging. When
+    // `kernel.package` names the package, honour it (after
+    // `{{ avocado.kernel.version }}` substitution) instead of synthesising the
+    // canonical meta — the key otherwise has no effect on this path at all.
+    let kernel_decl = resolve_kernel_declaration(params.config, params.parsed, params.target);
+    let manage_kernel_image = has_default_pkg || kernel_decl.is_explicit();
     let auto_kernel_image_pkg: Option<String> = match (
         resolved_kver.as_deref(),
-        has_default_pkg,
+        manage_kernel_image,
         &params.sysroot_type,
     ) {
         (Some(kver), true, SysrootType::Rootfs) => {
-            let name = format!("kernel-image-{kver}");
+            let (name, why) = match kernel_decl.package.as_deref() {
+                Some(pkg) => (resolve_name(pkg), "kernel.package"),
+                None if has_default_pkg => (format!("kernel-image-{kver}"), "default rootfs meta"),
+                None => (format!("kernel-image-{kver}"), "kernel.binary"),
+            };
             print_info(
-                &format!("Auto-including {name} for pinned kernel {kver}"),
+                &format!("Auto-including {name} for pinned kernel {kver} ({why})"),
                 OutputLevel::Normal,
             );
             Some(name)
         }
         _ => None,
     };
+
+    // An explicit declaration that cannot be acted on must say so. Without
+    // this the chain fails silently all the way to the device: no staged
+    // sysroot -> no `$AVOCADO_PREFIX/kernel/*/Image` -> `add_image_entry`
+    // returns None -> manifest.json ships with no `kernel` block.
+    if kernel_decl.is_explicit()
+        && matches!(params.sysroot_type, SysrootType::Rootfs)
+        && auto_kernel_image_pkg.is_none()
+    {
+        print_error(
+            "kernel.binary/kernel.package is set but no kernel version could be resolved; \
+             the kernel sysroot will not be staged and the runtime manifest will have no \
+             `kernel` entry.",
+            OutputLevel::Normal,
+        );
+    }
 
     // The set of names a completed install of this sysroot is expected to
     // have recorded in the lockfile: config-declared packages plus whatever
@@ -1052,6 +1193,14 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                     .cloned()
                     .unwrap_or_else(|| "*".to_string());
 
+                // `kernel.binary` decides which staged variant the `Image`
+                // symlink points at. Applied here rather than in `kernel
+                // image` because this is where the symlink is created, so
+                // `runtime build` — which reads the same symlink — picks the
+                // choice up for free. Resolved once further up, alongside the
+                // opt-in that got us into this block.
+                let kernel_binary = kernel_decl.binary.clone();
+
                 if let Err(e) = stage_kernel_sysroot_from_rootfs(
                     params.container_helper,
                     params.container_image,
@@ -1059,6 +1208,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                     kver,
                     kernel_image_pkg,
                     &pkg_version,
+                    kernel_binary.as_deref(),
                     params.lock_file,
                     params.repo_url,
                     params.repo_release,
@@ -1070,6 +1220,24 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 )
                 .await
                 {
+                    // Staging is best-effort *by default* — provision can fall
+                    // back to reading the Image out of the rootfs sysroot. But
+                    // when `kernel.binary` names a variant, a failure means the
+                    // requested kernel does not exist, and continuing is worse
+                    // than stopping: the `Image` symlink is left absent or
+                    // pointing at the previous build's kernel, `runtime build`
+                    // resolves it with `ls .../kernel/*/Image`, and
+                    // `add_image_entry` drops the entry via `os.path.isfile`.
+                    // The result is a manifest silently missing its `kernel`
+                    // block, discovered on the device rather than in the build.
+                    if let Some(requested) = kernel_binary.as_deref() {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "kernel.binary is '{requested}', so kernel sysroot staging \
+                                 for '{kver}' cannot be skipped"
+                            )
+                        });
+                    }
                     print_error(
                         &format!(
                             "Kernel sysroot staging failed: {e}. \
@@ -1321,9 +1489,228 @@ impl RootfsInstallCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_overlay_script, detect_sysroot_package_removals, parse_probe_output};
+    use super::{
+        build_kernel_binary_block, build_overlay_script, detect_sysroot_package_removals,
+        parse_probe_output,
+    };
     use crate::utils::lockfile::{LockFile, SysrootType};
     use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    const KBIN_KVER: &str = "6.12.25-v8";
+
+    /// Run a generated binary_block against a throwaway kernel dir populated
+    /// with `variants` (bare KERNEL_IMAGETYPE names, `-<kver>` appended here).
+    ///
+    /// These tests execute the fragment rather than grepping it. The bug this
+    /// code replaces — a `*.gz` suffix test that Yocto filenames never match —
+    /// was invisible to string assertions but obvious the moment the shell
+    /// actually runs.
+    fn run_block(tag: &str, variants: &[&str], kernel_binary: Option<&str>) -> (bool, String) {
+        let dir = std::env::temp_dir().join(format!("avocado-kbin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut boot_files: Vec<PathBuf> = variants
+            .iter()
+            .map(|v| dir.join(format!("{v}-{KBIN_KVER}")))
+            .collect();
+        // `find | LC_ALL=C sort` feeds boot_files in the real script; match that
+        // so default-mode ordering is exercised the same way.
+        boot_files.sort();
+        for f in &boot_files {
+            std::fs::write(f, b"kernel").unwrap();
+        }
+
+        let quoted: Vec<String> = boot_files
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .collect();
+        let script = format!(
+            "KERNEL_DIR='{}'\nboot_files=({})\n{}\n",
+            dir.display(),
+            quoted.join(" "),
+            build_kernel_binary_block(KBIN_KVER, kernel_binary)
+        );
+
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let link = std::fs::read_link(dir.join("Image"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        (out.status.success(), format!("{link}\n{combined}"))
+    }
+
+    /// Build a Config + composed value from yaml, the way install_sysroot
+    /// sees them, and resolve the kernel declaration for `target`.
+    fn decl_for(yaml: &str, target: &str) -> super::KernelDeclaration {
+        let cfg = crate::utils::config::Config::load_from_yaml_str(yaml).unwrap();
+        let composed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        super::resolve_kernel_declaration(&cfg, Some(&composed), target)
+    }
+
+    #[test]
+    fn kernel_declaration_is_explicit_only_when_a_key_is_named() {
+        // The regression this opt-in exists for: a rootfs that drops the
+        // default meta-package used to lose kernel staging outright, taking
+        // the manifest's `kernel` block with it and saying nothing.
+        let bare = "kernel:\n  image:\n    type: kab\n    args: '-b'\n";
+        assert_eq!(
+            decl_for(bare, "raspberrypi4"),
+            super::KernelDeclaration::default()
+        );
+        assert!(
+            !decl_for(bare, "raspberrypi4").is_explicit(),
+            "an image-only kernel section must not count as explicit -- that \
+             would flip staging on for every existing config"
+        );
+
+        let with_binary = "kernel:\n  binary: Image.gz\n  image:\n    type: kab\n";
+        assert!(decl_for(with_binary, "raspberrypi4").is_explicit());
+
+        let with_package = "kernel:\n  package: kernel-image\n";
+        let d = decl_for(with_package, "raspberrypi4");
+        assert!(d.is_explicit());
+        assert_eq!(d.package.as_deref(), Some("kernel-image"));
+    }
+
+    #[test]
+    fn kernel_declaration_follows_target_overrides() {
+        // Matches the shape in the product's kernel kab: base section plus a
+        // target-scoped binary. Targets without an override must stay
+        // non-explicit so their staging behaviour is untouched.
+        let yaml =
+            "kernel:\n  image:\n    type: kab\n  target-raspberrypi4:\n    binary: Image.gz\n";
+        let rpi = decl_for(yaml, "raspberrypi4");
+        assert_eq!(rpi.binary.as_deref(), Some("Image.gz"));
+        assert!(rpi.is_explicit());
+
+        let x86 = decl_for(yaml, "qemux86-64");
+        assert!(
+            !x86.is_explicit(),
+            "target without an override must not opt in; got {x86:?}"
+        );
+    }
+
+    #[test]
+    fn blank_kernel_keys_do_not_opt_in() {
+        // A blank value is a config accident, not a declaration. Treating it
+        // as explicit would opt into staging and then fail matching "".
+        let yaml = "kernel:\n  binary: '  '\n  package: ''\n";
+        assert!(!decl_for(yaml, "raspberrypi4").is_explicit());
+    }
+
+    #[test]
+    fn generated_binary_blocks_are_valid_bash() {
+        // The fragments are built with format!, where every literal shell
+        // brace has to be doubled. `${b%-<kver>}` is the easy one to get
+        // wrong, and a broken expansion would only surface at install time.
+        for kernel_binary in [None, Some("Image.gz")] {
+            let script = format!(
+                "KERNEL_DIR=/tmp/x\nboot_files=()\n{}\n",
+                build_kernel_binary_block(KBIN_KVER, kernel_binary)
+            );
+            let out = Command::new("bash")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "binary_block for {kernel_binary:?} is not valid bash:\n{}\n--- script ---\n{script}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn default_mode_prefers_uncompressed() {
+        let (ok, got) = run_block("default", &["Image", "Image.gz"], None);
+        assert!(ok, "default mode should succeed; got:\n{got}");
+        assert!(
+            got.starts_with(&format!("Image-{KBIN_KVER}\n")),
+            "default mode must link the uncompressed variant; got:\n{got}"
+        );
+    }
+
+    #[test]
+    fn default_mode_falls_back_to_compressed_when_alone() {
+        // Only a compressed variant staged: the `case` skips it, so the
+        // fallback link is what saves us. Without it there'd be no `Image`
+        // at all and `kernel image` would fail with "no staged kernel".
+        let (ok, got) = run_block("onlygz", &["Image.gz"], None);
+        assert!(ok, "default mode should succeed; got:\n{got}");
+        assert!(
+            got.starts_with(&format!("Image.gz-{KBIN_KVER}\n")),
+            "sole compressed variant must still be linked; got:\n{got}"
+        );
+    }
+
+    #[test]
+    fn explicit_binary_selects_compressed_over_sort_order() {
+        // The regression this key exists for: both variants staged, and
+        // "Image-" sorts ahead of "Image.gz-", so anything order-driven
+        // yields the uncompressed kernel.
+        let (ok, got) = run_block("explicit", &["Image", "Image.gz"], Some("Image.gz"));
+        assert!(ok, "explicit selection should succeed; got:\n{got}");
+        assert!(
+            got.starts_with(&format!("Image.gz-{KBIN_KVER}\n")),
+            "kernel.binary must win over sort order; got:\n{got}"
+        );
+        assert!(got.contains("kernel.binary"), "should say why; got:\n{got}");
+    }
+
+    #[test]
+    fn explicit_binary_selects_uncompressed_too() {
+        let (ok, got) = run_block("explicit-raw", &["Image", "Image.gz"], Some("Image"));
+        assert!(ok, "explicit selection should succeed; got:\n{got}");
+        assert!(
+            got.starts_with(&format!("Image-{KBIN_KVER}\n")),
+            "got:\n{got}"
+        );
+    }
+
+    #[test]
+    fn explicit_binary_fails_loudly_when_missing() {
+        // Never silently fall back: a config asking for Image.gz that
+        // quietly links Image ships the wrong kernel in every kab built
+        // downstream, which is exactly how this bug went unnoticed.
+        let (ok, got) = run_block("missing", &["Image"], Some("Image.gz"));
+        assert!(!ok, "missing variant must fail the install; got:\n{got}");
+        assert!(
+            got.contains("kernel.binary is 'Image.gz'"),
+            "error must name the requested variant; got:\n{got}"
+        );
+        assert!(
+            got.contains("Available kernel binaries"),
+            "error must list what was staged; got:\n{got}"
+        );
+        assert!(
+            got.contains("          Image\n"),
+            "listing must show bare imagetypes with -<kver> stripped; got:\n{got}"
+        );
+    }
+
+    #[test]
+    fn explicit_binary_handles_non_arm_names() {
+        let (ok, got) = run_block("bzimage", &["bzImage"], Some("bzImage"));
+        assert!(ok, "bzImage should select fine; got:\n{got}");
+        assert!(
+            got.starts_with(&format!("bzImage-{KBIN_KVER}\n")),
+            "got:\n{got}"
+        );
+    }
 
     const KVER: &str = "6.8.12-l4t-r39.2.0-1021.21";
     const TARGET: &str = "jetson-agx-thor";
