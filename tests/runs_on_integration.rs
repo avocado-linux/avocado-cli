@@ -154,52 +154,52 @@ mod version_compatibility_tests {
 
     #[test]
     fn test_equal_versions() {
-        assert!(is_version_compatible("0.20.0", "0.20.0"));
-        assert!(is_version_compatible("1.0.0", "1.0.0"));
-        assert!(is_version_compatible("2.5.10", "2.5.10"));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.0"), Some(true));
+        assert_eq!(is_version_compatible("1.0.0", "1.0.0"), Some(true));
+        assert_eq!(is_version_compatible("2.5.10", "2.5.10"), Some(true));
     }
 
     #[test]
     fn test_remote_newer_patch() {
-        assert!(is_version_compatible("0.20.0", "0.20.1"));
-        assert!(is_version_compatible("0.20.0", "0.20.99"));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.1"), Some(true));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.99"), Some(true));
     }
 
     #[test]
     fn test_remote_newer_minor() {
-        assert!(is_version_compatible("0.20.0", "0.21.0"));
-        assert!(is_version_compatible("0.20.5", "0.25.0"));
+        assert_eq!(is_version_compatible("0.20.0", "0.21.0"), Some(true));
+        assert_eq!(is_version_compatible("0.20.5", "0.25.0"), Some(true));
     }
 
     #[test]
     fn test_remote_newer_major() {
-        assert!(is_version_compatible("0.20.0", "1.0.0"));
-        assert!(is_version_compatible("1.5.3", "2.0.0"));
+        assert_eq!(is_version_compatible("0.20.0", "1.0.0"), Some(true));
+        assert_eq!(is_version_compatible("1.5.3", "2.0.0"), Some(true));
     }
 
     #[test]
     fn test_remote_older_patch() {
-        assert!(!is_version_compatible("0.20.1", "0.20.0"));
-        assert!(!is_version_compatible("0.20.5", "0.20.4"));
+        assert_eq!(is_version_compatible("0.20.1", "0.20.0"), Some(false));
+        assert_eq!(is_version_compatible("0.20.5", "0.20.4"), Some(false));
     }
 
     #[test]
     fn test_remote_older_minor() {
-        assert!(!is_version_compatible("0.21.0", "0.20.0"));
-        assert!(!is_version_compatible("0.25.0", "0.20.5"));
+        assert_eq!(is_version_compatible("0.21.0", "0.20.0"), Some(false));
+        assert_eq!(is_version_compatible("0.25.0", "0.20.5"), Some(false));
     }
 
     #[test]
     fn test_remote_older_major() {
-        assert!(!is_version_compatible("1.0.0", "0.20.0"));
-        assert!(!is_version_compatible("2.0.0", "1.5.3"));
+        assert_eq!(is_version_compatible("1.0.0", "0.20.0"), Some(false));
+        assert_eq!(is_version_compatible("2.0.0", "1.5.3"), Some(false));
     }
 
     #[test]
     fn test_prerelease_versions() {
         // Pre-release suffix should be stripped for comparison
-        assert!(is_version_compatible("0.20.0-beta", "0.20.0"));
-        assert!(is_version_compatible("0.20.0", "0.20.1-rc1"));
+        assert_eq!(is_version_compatible("0.20.0-beta", "0.20.0"), Some(true));
+        assert_eq!(is_version_compatible("0.20.0", "0.20.1-rc1"), Some(true));
     }
 }
 

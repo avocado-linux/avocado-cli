@@ -61,6 +61,86 @@ pub fn print_warning(message: &str, _level: OutputLevel) {
     }
 }
 
+/// Print a warning that an active renderer cannot swallow.
+///
+/// [`print_warning`] early-returns on [`tui_is_active`], which is also true for
+/// `--json`, so on the interactive renderer path and every JSON invocation it
+/// prints nothing at all. That is fine for progress chatter the task lines
+/// already convey, but not for a notice that a safety check was skipped: those
+/// are exactly the paths where the user would otherwise see an unqualified
+/// green run.
+///
+/// Routes through the renderer's `print_above` when one is active so the notice
+/// lands above the task list instead of being overwritten by it. With no
+/// renderer but JSON output active, goes to stderr - stdout carries the NDJSON
+/// stream and prose would corrupt it.
+pub fn print_warning_above(message: &str) {
+    // stdout carries the NDJSON stream, so the human line goes to stderr under
+    // --json (see print_notice_above). Without an event too, a consumer reading
+    // only the stream sees nothing at all and renders an unqualified green run -
+    // which is the failure this whole notice exists to prevent, just moved.
+    if crate::utils::output_format::is_json_output_active() {
+        crate::utils::output_format::emit_json_event(
+            &serde_json::json!({"event": "warning", "message": message}),
+        );
+    }
+    print_notice_above(&format!("\x1b[93m[WARNING]\x1b[0m {message}"), |line| {
+        println!("{line}")
+    });
+}
+
+/// Emit `formatted` where neither an active renderer nor the NDJSON stream can
+/// swallow it.
+///
+/// The three-way routing had been open-coded three times (here,
+/// [`crate::utils::container::print_failure_notice`], and
+/// `commands/runtime/build.rs`), each copy re-deriving the same policy. This is
+/// the one implementation; [`warning_sink`] stays separate as the pure,
+/// testable statement of that policy.
+///
+/// `plain` is the emit for the neither-active case and is a parameter because
+/// severity genuinely differs there: a warning belongs on stdout, an error on
+/// stderr. Everything above that case is identical, which is the part worth
+/// sharing.
+///
+/// The renderer `Option` is bound once and matched alongside the sink rather
+/// than looked up a second time behind an `expect`. `get_active_renderer`
+/// returning `None` on the second call is reachable - `clear_active_renderer`
+/// is `pub` and is the first statement of `TaskRenderer::shutdown` - so the
+/// old shape could abort the process while printing an informational notice.
+/// Pairing the two makes that branch fall through to stderr instead of
+/// depending on the interleaving being impossible.
+pub fn print_notice_above(formatted: &str, plain: impl FnOnce(&str)) {
+    let renderer = crate::utils::tui::get_active_renderer();
+    let json_active = crate::utils::output_format::is_json_output_active();
+    match (warning_sink(renderer.is_some(), json_active), renderer) {
+        (WarningSink::Renderer, Some(active)) => active.print_above(formatted),
+        (WarningSink::Renderer, None) | (WarningSink::Stderr, _) => eprintln!("{formatted}"),
+        (WarningSink::Stdout, _) => plain(formatted),
+    }
+}
+
+/// Where a [`print_warning_above`] notice goes.
+///
+/// Split out from the emit so the routing policy is testable: the property that
+/// matters is that there is no fourth, suppressed variant, which is precisely
+/// what `print_warning` has and what made the skipped-check notice invisible on
+/// the default paths.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WarningSink {
+    Renderer,
+    Stderr,
+    Stdout,
+}
+
+pub fn warning_sink(renderer_active: bool, json_active: bool) -> WarningSink {
+    match (renderer_active, json_active) {
+        (true, _) => WarningSink::Renderer,
+        (false, true) => WarningSink::Stderr,
+        (false, false) => WarningSink::Stdout,
+    }
+}
+
 /// Print a message without any color formatting.
 /// Suppressed when TUI is active.
 #[allow(dead_code)]
@@ -131,5 +211,39 @@ mod tests {
         print_debug("Test debug", OutputLevel::Normal);
         flush_stdout();
         flush_stderr();
+    }
+
+    #[test]
+    fn warning_above_is_never_suppressed() {
+        // `tui_is_active()` is true for BOTH an active renderer and `--json`,
+        // and those are the two states `print_warning` drops the message in -
+        // which is every interactive run and every JSON run. Each of the four
+        // combinations has to reach a real sink.
+        //
+        // Asserting the exact sink per combination, not merely that the result
+        // is one of the three variants: a three-variant enum makes that weaker
+        // form unfalsifiable, so it stayed green under a `warning_sink` forced
+        // to return a single arm.
+        assert_eq!(warning_sink(true, true), WarningSink::Renderer);
+        assert_eq!(warning_sink(true, false), WarningSink::Renderer);
+        assert_eq!(warning_sink(false, true), WarningSink::Stderr);
+        assert_eq!(warning_sink(false, false), WarningSink::Stdout);
+    }
+
+    #[test]
+    fn warning_above_goes_through_the_renderer_when_one_is_active() {
+        // A plain println would be painted over by the task list on the next
+        // frame, so an active renderer has to take precedence over the JSON
+        // check rather than the other way round.
+        assert_eq!(warning_sink(true, false), WarningSink::Renderer);
+        assert_eq!(warning_sink(true, true), WarningSink::Renderer);
+    }
+
+    #[test]
+    fn warning_above_keeps_json_stdout_clean() {
+        // stdout carries the NDJSON stream; prose on it would break consumers
+        // parsing line by line.
+        assert_eq!(warning_sink(false, true), WarningSink::Stderr);
+        assert_eq!(warning_sink(false, false), WarningSink::Stdout);
     }
 }

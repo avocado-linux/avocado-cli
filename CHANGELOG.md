@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `avocado-desktop` is not affected - its parser already reads the first line's
   second field.
 
+### Changed
+- **A skipped remote version check no longer reports as a passed one.** When
+  the remote's `--version` output cannot be parsed, `--runs-on` used to print
+  `[SUCCESS] Remote avocado version: <whatever it read>`, which is a green line
+  for a comparison that never happened. It now prints a `[WARNING]` saying the
+  check was skipped, on a path an active renderer or `--json` cannot swallow,
+  and emits a `{"event":"warning"}` line on the NDJSON stream so a consumer
+  reading only that stream does not render an unqualified green run.
+  `--runs-on localhost` reports neither: it is the same machine, so the check
+  is skipped with nothing to say rather than asserting a version it never read.
+
+### Breaking
+- **`is_version_compatible` returns `Option<bool>` instead of `bool`.** Only
+  affects consumers of the `avocado_cli` lib target. `None` means the remote
+  version could not be read at all, which the old `bool` could not express -
+  it collapsed "definitely older" and "unreadable" into the same `false`, and
+  that collapse is what let an unparseable version fall through as a pass.
+
 ### Fixed
 - **`--connect-sign` guidance.** The deploy help text and the Level 2 setup
   messages now reference `avocado connect trust promote-root --key <KEY>` with

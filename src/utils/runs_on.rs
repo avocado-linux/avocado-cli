@@ -13,9 +13,10 @@ use crate::utils::nfs_server::{
     find_available_port, get_docker_volume_mountpoint, is_port_available, NfsExport, NfsServer,
     NfsServerConfig, DEFAULT_NFS_PORT_RANGE,
 };
-use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::output::{print_info, print_success, print_warning_above, OutputLevel};
 use crate::utils::remote::{
-    get_local_ip_for_remote, RemoteHost, RemoteVolumeManager, SshClient, SshControlMaster,
+    get_local_ip_for_remote, version_check_notice, RemoteHost, RemoteVolumeManager, SshClient,
+    SshControlMaster, VersionNotice,
 };
 
 #[cfg(unix)]
@@ -119,11 +120,16 @@ impl RunsOnContext {
 
         // Check remote CLI version compatibility
         print_info("Checking remote avocado version...", OutputLevel::Normal);
-        let remote_version = ssh.check_cli_version().await?;
-        print_success(
-            &format!("Remote avocado version: {remote_version}"),
-            OutputLevel::Normal,
-        );
+        // The Verified/Skipped -> notice mapping lives in `version_check_notice`
+        // so it is covered by tests; this arm is a total dispatch over its
+        // result. `print_warning_above` rather than `print_warning` because the
+        // latter is suppressed whenever a renderer or `--json` is active, which
+        // is the default for most of these commands.
+        match version_check_notice(&ssh.check_cli_version().await?) {
+            VersionNotice::Success(message) => print_success(&message, OutputLevel::Normal),
+            VersionNotice::Warning(warning) => print_warning_above(&warning),
+            VersionNotice::Silent => {}
+        }
 
         // Determine which port to use
         let port = match nfs_port {
