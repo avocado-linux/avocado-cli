@@ -815,16 +815,12 @@ impl RuntimeBuildCommand {
             .await
         {
             let msg = format!("Skipping TUF delegation staging: {e:#}");
-            if let Some(renderer) = crate::utils::tui::get_active_renderer() {
-                renderer.print_above(&msg);
-            } else if crate::utils::output_format::is_json_output_active() {
-                // Verbose JSON builds create no renderer, and print_info is
-                // suppressed in JSON mode — write to stderr directly so the
-                // notice survives without touching the NDJSON stdout stream.
-                eprintln!("{msg}");
-            } else {
-                print_info(&msg, OutputLevel::Normal);
-            }
+            // Verbose JSON builds create no renderer, and print_info is
+            // suppressed in JSON mode, so this routes through the shared notice
+            // sink to reach stderr without touching the NDJSON stdout stream.
+            crate::utils::output::print_notice_above(&msg, |line| {
+                print_info(line, OutputLevel::Normal)
+            });
         }
 
         Ok(())

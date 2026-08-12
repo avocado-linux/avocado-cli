@@ -92,7 +92,7 @@ pub fn print_warning_above(message: &str) {
 /// Emit `formatted` where neither an active renderer nor the NDJSON stream can
 /// swallow it.
 ///
-/// The three-way routing had been open-coded four times (here,
+/// The three-way routing had been open-coded three times (here,
 /// [`crate::utils::container::print_failure_notice`], and
 /// `commands/runtime/build.rs`), each copy re-deriving the same policy. This is
 /// the one implementation; [`warning_sink`] stays separate as the pure,
