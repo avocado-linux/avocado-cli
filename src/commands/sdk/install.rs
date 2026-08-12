@@ -12,11 +12,12 @@ use crate::utils::{
     kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
     output::{print_error, print_info, print_success, OutputLevel},
+    prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
         compute_compile_deps_input_hash, compute_sdk_input_hash,
         generate_write_sdk_stamp_script_dynamic_arch, generate_write_stamp_script, get_local_arch,
-        Stamp, StampOutputs,
+        Stamp, StampOutputs, StampRequirement,
     },
     target::validate_and_log_target,
     tui::{TaskId, TaskStatus, TuiGuard},
@@ -414,6 +415,39 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             None
         };
 
+        // Read both sysroots' install stamps in a single container
+        // invocation, before the parallel phase starts. `install_sysroot`
+        // compares each against its freshly computed inputs and skips the
+        // whole install when they match — so an unchanged project does no
+        // container work for rootfs/initramfs at all. Batching matters
+        // because stamps live in the `/opt/_avocado` named volume, not a host
+        // bind mount, so each read otherwise costs its own container run.
+        let (rootfs_stamp, initramfs_stamp) = if self.no_stamps {
+            (None, None)
+        } else {
+            let rootfs_req = StampRequirement::rootfs_install();
+            let initramfs_req = StampRequirement::initramfs_install();
+            let batch = read_stamps_batch(
+                &[rootfs_req.clone(), initramfs_req.clone()],
+                container_helper,
+                RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.to_string(),
+                    repo_url: repo_url.map(|s| s.to_string()),
+                    repo_release: repo_release.map(|s| s.to_string()),
+                    container_args: merged_container_args.cloned(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    ..Default::default()
+                },
+                runs_on_context,
+            )
+            .await?;
+            (
+                batch.stamp_for(&rootfs_req),
+                batch.stamp_for(&initramfs_req),
+            )
+        };
+
         // Register parallel tasks on TUI and signal status transitions.
         if let Some(r) = crate::utils::tui::get_active_renderer() {
             r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
@@ -481,6 +515,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            prefetched_stamp: rootfs_stamp,
             tui_context: rootfs_tui,
         };
         let mut initramfs_params = SysrootInstallParams {
@@ -502,6 +537,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
             parsed: Some(&composed.merged_value),
+            prefetched_stamp: initramfs_stamp,
             tui_context: initramfs_tui,
         };
 
@@ -613,6 +649,13 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             if let Some(target_locks) = rootfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
                 entry.rootfs = target_locks.rootfs.clone();
+                // `cleared_sections` is `#[serde(skip)]`, so it lives only on the
+                // clone `install_sysroot` ran against. Carry it over or the flag
+                // dies here: `final_lock.save()` would merge the old kernel's
+                // keys back off disk, and a kernel repin would never stick.
+                entry
+                    .cleared_sections
+                    .extend(target_locks.cleared_sections.iter().cloned());
                 if let Some(kver) = target_locks
                     .kernel_versions
                     .get(&SysrootType::Rootfs.lock_key())
@@ -634,6 +677,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             if let Some(target_locks) = initramfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
                 entry.initramfs = target_locks.initramfs.clone();
+                // Same as the rootfs merge above — the in-memory-only flag has to
+                // cross the clone boundary or the save re-merges stale keys.
+                entry
+                    .cleared_sections
+                    .extend(target_locks.cleared_sections.iter().cloned());
                 if let Some(kver) = target_locks
                     .kernel_versions
                     .get(&SysrootType::Initramfs.lock_key())

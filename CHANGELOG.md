@@ -49,6 +49,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that collapse is what let an unparseable version fall through as a pass.
 
 ### Fixed
+- **Rootfs and initramfs no longer reinstall on every run.** `avocado sdk
+  install` wiped and rebuilt both sysroots from scratch on every invocation,
+  even with nothing changed. Removal detection compared the lockfile against
+  *config-declared* packages only, so the per-kernel packages the install
+  auto-appends (`packagegroup-avocado-{rootfs,initramfs}-modules-<kver>` and
+  `kernel-image-<kver>`) read as "removed" from the second run onward and
+  forced a clean reinstall. It now compares against the effective set —
+  config packages plus those auto-appends.
+  As a second-order effect of that false positive, the same path dropped those
+  packages' version pins from the in-memory lockfile, so dnf resolved the
+  kernel image and module packagegroup to newest-available instead of the
+  locked NVR. `avocado.lock` looked pinned on disk but the pin never applied;
+  it now binds.
+- **Unchanged sysroots are skipped outright.** The rootfs and initramfs install
+  stamps were written but never read, so each run still paid a kernel
+  repoquery, a dnf transaction, and a lockfile rewrite. Both stamps are now
+  read (batched into one container invocation) and a current stamp short-
+  circuits the install. The stamp hash covers the effective package set,
+  `sdk.repo_url`, `sdk.repo_release`, `sdk.disable_weak_dependencies`, and a
+  digest of the sysroot's lockfile pins, so a snapshot bump, a feed switch, or
+  an `avocado unlock` all invalidate it. `avocado {rootfs,initramfs} clean` now
+  removes the install stamp along with the sysroot, and `--no-stamps` still
+  forces a full reinstall.
 - **`--connect-sign` guidance.** The deploy help text and the Level 2 setup
   messages now reference `avocado connect trust promote-root --key <KEY>` with
   its required `--key` option, matching the CLI reference documentation.

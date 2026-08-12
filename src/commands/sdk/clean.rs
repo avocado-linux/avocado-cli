@@ -7,7 +7,8 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_error, print_info, print_success, OutputLevel},
-    stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
+    prerequisites::read_stamps_batch,
+    stamps::StampRequirement,
     target::resolve_target_required,
 };
 
@@ -111,28 +112,23 @@ impl SdkCleanCommand {
         if !self.sections.is_empty() {
             // Validate SDK is installed before running clean scripts
             let requirements = vec![StampRequirement::sdk_install()];
-            let batch_script = generate_batch_read_stamps_script(&requirements);
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.clone(),
-                command: batch_script,
-                verbose: false,
-                source_environment: true,
-                interactive: false,
-                repo_url: repo_url.clone(),
-                repo_release: repo_release.clone(),
-                container_args: merged_container_args.clone(),
-                dnf_args: self.dnf_args.clone(),
-                sdk_arch: self.sdk_arch.clone(),
-                ..Default::default()
-            };
-
-            let output = container_helper
-                .run_in_container_with_output(run_config)
-                .await?;
-
-            let validation =
-                validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
+            let validation = read_stamps_batch(
+                &requirements,
+                &container_helper,
+                RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.clone(),
+                    repo_url: repo_url.clone(),
+                    repo_release: repo_release.clone(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .validate(&requirements, &[]);
 
             if !validation.is_satisfied() {
                 validation
@@ -159,8 +155,14 @@ impl SdkCleanCommand {
             );
         }
 
-        let remove_command =
-            "rm -rf $AVOCADO_SDK_PREFIX $AVOCADO_PREFIX/rootfs $AVOCADO_PREFIX/initramfs";
+        // The install stamps go with the sysroots, same as `rootfs clean` /
+        // `initramfs clean` (see `rootfs::clean::clean_sysroot_command`). Leaving
+        // them behind makes `sdk clean && sdk install` a silent no-op: both
+        // stamps still match, both installs report "up to date", and the build
+        // that follows consumes two empty sysroots.
+        let remove_command = "rm -rf $AVOCADO_SDK_PREFIX \
+             $AVOCADO_PREFIX/rootfs $AVOCADO_PREFIX/initramfs \
+             $AVOCADO_PREFIX/.stamps/rootfs $AVOCADO_PREFIX/.stamps/initramfs";
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.clone(),

@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::SdkContainer,
+    container::{RunConfig, SdkContainer},
     lockfile::{LockFile, SysrootType},
     output::{print_error, OutputLevel},
     runs_on::RunsOnContext,
     target::validate_and_log_target,
 };
 
-use crate::commands::rootfs::install::{install_sysroot, SysrootInstallParams};
+use crate::commands::rootfs::install::{
+    install_sysroot, read_sysroot_install_stamp, SysrootInstallParams,
+};
 
 /// Implementation of the 'initramfs install' command.
 pub struct InitramfsInstallCommand {
@@ -128,28 +130,63 @@ impl InitramfsInstallCommand {
             .unwrap_or(std::path::Path::new("."));
         let mut lock_file = LockFile::load(src_dir)?;
 
-        let result = install_sysroot(&mut SysrootInstallParams {
-            sysroot_type: SysrootType::Initramfs,
-            config,
-            lock_file: &mut lock_file,
-            src_dir,
-            container_helper: &container_helper,
-            container_image,
-            target: &target,
-            target_board: self.target_board.as_deref(),
-            repo_url: repo_url.as_deref(),
-            repo_release: repo_release.as_deref(),
-            merged_container_args: merged_container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            force: self.force,
-            runs_on_context: runs_on_context.as_ref(),
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-            tui_context: None,
-        })
+        let prefetched_stamp = read_sysroot_install_stamp(
+            &SysrootType::Initramfs,
+            self.no_stamps,
+            &container_helper,
+            RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            },
+            runs_on_context.as_ref(),
+        )
         .await;
+
+        // Not `?`: the teardown block below is the only thing that tears down the
+        // `runs_on` NFS server and remote mount, and an early return here would
+        // skip it — the next `--runs-on` run picks a fresh nfs_port and stacks
+        // another one on top. Carried into `result` and returned past teardown.
+        let result = match prefetched_stamp {
+            Err(e) => Err(e),
+            Ok(prefetched_stamp) => {
+                install_sysroot(&mut SysrootInstallParams {
+                    sysroot_type: SysrootType::Initramfs,
+                    config,
+                    lock_file: &mut lock_file,
+                    src_dir,
+                    container_helper: &container_helper,
+                    container_image,
+                    target: &target,
+                    target_board: self.target_board.as_deref(),
+                    repo_url: repo_url.as_deref(),
+                    repo_release: repo_release.as_deref(),
+                    merged_container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    verbose: self.verbose,
+                    force: self.force,
+                    runs_on_context: runs_on_context.as_ref(),
+                    sdk_arch: self.sdk_arch.as_ref(),
+                    no_stamps: self.no_stamps,
+                    parsed: Some(&composed.merged_value),
+                    prefetched_stamp,
+                    tui_context: None,
+                })
+                .await
+            }
+        };
+
+        // Persist the lockfile the install updated — `install_sysroot` leaves
+        // saving to its caller. Folded into `result` rather than `?` so a save
+        // failure still reaches the teardown below.
+        let result = match result {
+            Ok(()) => lock_file.save(src_dir),
+            Err(e) => Err(e),
+        };
 
         if let Some(ref mut context) = runs_on_context {
             if let Err(e) = context.teardown().await {

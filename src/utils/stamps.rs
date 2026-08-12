@@ -106,8 +106,9 @@ impl StampInputs {
         }
     }
 
-    /// Create stamp inputs with both hashes (for future output-based staleness detection)
-    #[allow(unused)]
+    /// Create stamp inputs with both hashes. Used by the sysroot install
+    /// steps, which fold the lockfile pins in force at install time into
+    /// `package_list_hash` so a re-pin invalidates independently of config.
     pub fn with_package_list(config_hash: String, package_list_hash: String) -> Self {
         Self {
             config_hash,
@@ -1230,113 +1231,212 @@ fn ext_build_hash_data(
     Ok(hash_data)
 }
 
+/// The inputs to a sysroot install stamp that cannot be read out of the
+/// merged YAML: the *effective* package set (config default already
+/// applied), the SDK feed identity the install resolves against, and the
+/// lockfile pins currently in force.
+///
+/// These are what make the hash trustworthy enough to *skip* an install on.
+/// Hashing the raw `rootfs.packages` node alone cannot tell an absent
+/// section from one that spells out the default meta-package, and says
+/// nothing about a snapshot bump or a hand-edited `avocado.lock`.
+pub struct SysrootStampInputs<'a> {
+    /// Effective package map — `Config::get_{rootfs,initramfs}_packages`.
+    pub packages: &'a std::collections::HashMap<String, serde_yaml::Value>,
+    /// `sdk.repo_url`: a feed switch must invalidate.
+    pub repo_url: Option<&'a str>,
+    /// `sdk.repo_release`: the resolved snapshot, which `avocado update` moves.
+    pub repo_release: Option<&'a str>,
+    /// `sdk.disable_weak_dependencies`: changes what dnf pulls in.
+    pub disable_weak_dependencies: bool,
+    /// `--dnf-args`, which are interpolated straight into the install
+    /// transaction. Part of the hash because they change what the transaction
+    /// resolves (`--enablerepo=…`), so an up-to-date sysroot must not
+    /// short-circuit past a run that passes different ones. `--force` is
+    /// deliberately *not* here: it only selects `-y` and interactivity, not
+    /// content.
+    pub dnf_args: Option<&'a [String]>,
+    /// Locked NVR pins for this sysroot, as recorded in `avocado.lock`.
+    pub locked_packages: Option<&'a std::collections::HashMap<String, String>>,
+}
+
+/// Digest of a sysroot's lockfile pins as `name=version` lines ordered by
+/// name.
+///
+/// Deliberately always returns a hash rather than `None` for an empty pin
+/// set: [`Stamp::is_current`] only compares `package_list_hash` when *both*
+/// sides carry one, so returning `None` after `avocado unlock` cleared the
+/// section would let a stamp written against real pins compare equal by
+/// omission. An empty set hashing to its own distinct value makes that read
+/// as stale.
+fn package_list_hash(locked: Option<&std::collections::HashMap<String, String>>) -> String {
+    let mut lines: Vec<String> = locked
+        .map(|pins| {
+            pins.iter()
+                .map(|(name, version)| format!("{name}={version}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    lines.sort();
+    compute_hash(&lines.join("\n"))
+}
+
+/// Render the effective package map as a deterministically ordered YAML
+/// mapping. `HashMap` iteration order varies per process and
+/// [`compute_config_hash`] serializes in insertion order, so the keys have
+/// to be sorted here or the hash is unstable between runs.
+fn packages_for_hash(
+    packages: &std::collections::HashMap<String, serde_yaml::Value>,
+) -> serde_yaml::Value {
+    let mut names: Vec<&String> = packages.keys().collect();
+    names.sort();
+    let mut out = serde_yaml::Mapping::new();
+    for name in names {
+        out.insert(
+            serde_yaml::Value::String(name.clone()),
+            packages[name].clone(),
+        );
+    }
+    serde_yaml::Value::Mapping(out)
+}
+
+/// Shared input-hash core for the rootfs and initramfs installs, which take
+/// identical inputs under different config sections. `section` is the
+/// top-level key (`"rootfs"` / `"initramfs"`).
+fn compute_sysroot_install_input_hash(
+    section: &str,
+    config: &serde_yaml::Value,
+    project_root: &Path,
+    cli_target_board: Option<&str>,
+    resolved: &SysrootStampInputs<'_>,
+) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+
+    // The effective set, not the raw `<section>.packages` node — an absent
+    // section and one that names the default meta-package install the same
+    // thing and must hash the same.
+    hash_data.insert(
+        serde_yaml::Value::String(format!("{section}.packages")),
+        packages_for_hash(resolved.packages),
+    );
+
+    if let Some(sysroot) = config.get(section) {
+        if let Some(overlay) = sysroot.get("overlay") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("{section}.overlay")),
+                overlay.clone(),
+            );
+            fold_overlay_content_hash(
+                &mut hash_data,
+                &format!("{section}.overlay_content"),
+                overlay,
+                config,
+                project_root,
+                None,
+                None,
+                cli_target_board,
+            )?;
+        }
+        if let Some(post_install) = sysroot.get("post_install").and_then(|v| v.as_str()) {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("{section}.post_install")),
+                script_hash_value(project_root, post_install),
+            );
+        }
+    }
+
+    if let Some(kernel) = config.get("kernel") {
+        hash_data.insert(
+            serde_yaml::Value::String("kernel".to_string()),
+            narrow_kernel_for_hash(kernel),
+        );
+    }
+
+    // Feed identity and resolver flags. A snapshot bump, a feed switch, or a
+    // weak-deps flip all change what lands in the sysroot even when every
+    // config section above is byte-identical.
+    for (key, value) in [
+        ("sdk.repo_url", resolved.repo_url),
+        ("sdk.repo_release", resolved.repo_release),
+    ] {
+        if let Some(v) = value {
+            hash_data.insert(
+                serde_yaml::Value::String(key.to_string()),
+                serde_yaml::Value::String(v.to_string()),
+            );
+        }
+    }
+    hash_data.insert(
+        serde_yaml::Value::String("sdk.disable_weak_dependencies".to_string()),
+        serde_yaml::Value::Bool(resolved.disable_weak_dependencies),
+    );
+    // The SDK image is what actually runs the install — its dnf/rpm config and
+    // scriptlet machinery — so a project that repoints `sdk.image` must not keep
+    // a sysroot the old image produced. `compute_sdk_input_hash` already folds
+    // it; folding it here too keeps the two stamps from disagreeing about what
+    // counts as an input.
+    if let Some(image) = config.get("sdk").and_then(|s| s.get("image")) {
+        hash_data.insert(
+            serde_yaml::Value::String("sdk.image".to_string()),
+            image.clone(),
+        );
+    }
+    // Order matters to the caller, not just membership: `--enablerepo=a
+    // --enablerepo=b` and its reverse are the same transaction, but hashing the
+    // sequence as given is the conservative choice — a reorder invalidates and
+    // reinstalls, which is wrong-but-safe, where missing a change is not.
+    if let Some(args) = resolved.dnf_args.filter(|a| !a.is_empty()) {
+        hash_data.insert(
+            serde_yaml::Value::String("dnf_args".to_string()),
+            serde_yaml::Value::Sequence(
+                args.iter()
+                    .map(|a| serde_yaml::Value::String(a.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::with_package_list(
+        config_hash,
+        package_list_hash(resolved.locked_packages),
+    ))
+}
+
 /// Compute input hash for **rootfs install**.
 ///
-/// Includes `rootfs.packages`, `rootfs.overlay`, and the narrowed kernel
-/// selection (`package`/`version`/`compile`/`install` only — adding an
-/// unrelated `kernel.metadata` field does NOT invalidate). Also includes
-/// the `post_install` hook path and its file contents so an in-place
-/// script edit invalidates without `--no-stamps`.
+/// Includes the effective `rootfs.packages` set, `rootfs.overlay`, and the
+/// narrowed kernel selection (`package`/`version`/`compile`/`install` only —
+/// adding an unrelated `kernel.metadata` field does NOT invalidate). Also
+/// includes the `post_install` hook path and its file contents so an
+/// in-place script edit invalidates without `--no-stamps`, the SDK feed
+/// identity, and a digest of the sysroot's lockfile pins.
 pub fn compute_rootfs_input_hash(
     config: &serde_yaml::Value,
     project_root: &Path,
     cli_target_board: Option<&str>,
+    resolved: &SysrootStampInputs<'_>,
 ) -> Result<StampInputs> {
-    let mut hash_data = serde_yaml::Mapping::new();
-
-    if let Some(rootfs) = config.get("rootfs") {
-        if let Some(packages) = rootfs.get("packages") {
-            hash_data.insert(
-                serde_yaml::Value::String("rootfs.packages".to_string()),
-                packages.clone(),
-            );
-        }
-        if let Some(overlay) = rootfs.get("overlay") {
-            hash_data.insert(
-                serde_yaml::Value::String("rootfs.overlay".to_string()),
-                overlay.clone(),
-            );
-            fold_overlay_content_hash(
-                &mut hash_data,
-                "rootfs.overlay_content",
-                overlay,
-                config,
-                project_root,
-                None,
-                None,
-                cli_target_board,
-            )?;
-        }
-        if let Some(post_install) = rootfs.get("post_install").and_then(|v| v.as_str()) {
-            hash_data.insert(
-                serde_yaml::Value::String("rootfs.post_install".to_string()),
-                script_hash_value(project_root, post_install),
-            );
-        }
-    }
-
-    if let Some(kernel) = config.get("kernel") {
-        hash_data.insert(
-            serde_yaml::Value::String("kernel".to_string()),
-            narrow_kernel_for_hash(kernel),
-        );
-    }
-
-    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
-    Ok(StampInputs::new(config_hash))
+    compute_sysroot_install_input_hash("rootfs", config, project_root, cli_target_board, resolved)
 }
 
 /// Compute input hash for **initramfs install**.
 ///
-/// Same shape as [`compute_rootfs_input_hash`] — narrowed kernel block,
-/// `post_install` content hashed alongside its path.
+/// Same inputs as [`compute_rootfs_input_hash`], read from the `initramfs`
+/// config section.
 pub fn compute_initramfs_input_hash(
     config: &serde_yaml::Value,
     project_root: &Path,
     cli_target_board: Option<&str>,
+    resolved: &SysrootStampInputs<'_>,
 ) -> Result<StampInputs> {
-    let mut hash_data = serde_yaml::Mapping::new();
-
-    if let Some(initramfs) = config.get("initramfs") {
-        if let Some(packages) = initramfs.get("packages") {
-            hash_data.insert(
-                serde_yaml::Value::String("initramfs.packages".to_string()),
-                packages.clone(),
-            );
-        }
-        if let Some(overlay) = initramfs.get("overlay") {
-            hash_data.insert(
-                serde_yaml::Value::String("initramfs.overlay".to_string()),
-                overlay.clone(),
-            );
-            fold_overlay_content_hash(
-                &mut hash_data,
-                "initramfs.overlay_content",
-                overlay,
-                config,
-                project_root,
-                None,
-                None,
-                cli_target_board,
-            )?;
-        }
-        if let Some(post_install) = initramfs.get("post_install").and_then(|v| v.as_str()) {
-            hash_data.insert(
-                serde_yaml::Value::String("initramfs.post_install".to_string()),
-                script_hash_value(project_root, post_install),
-            );
-        }
-    }
-
-    if let Some(kernel) = config.get("kernel") {
-        hash_data.insert(
-            serde_yaml::Value::String("kernel".to_string()),
-            narrow_kernel_for_hash(kernel),
-        );
-    }
-
-    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
-    Ok(StampInputs::new(config_hash))
+    compute_sysroot_install_input_hash(
+        "initramfs",
+        config,
+        project_root,
+        cli_target_board,
+        resolved,
+    )
 }
 
 /// Compute input hash for **runtime install**.
@@ -1588,7 +1688,22 @@ pub fn validate_stamps_batch(
     batch_output: &str,
     current_inputs: &[CurrentInput<'_>],
 ) -> StampValidationResult {
-    let stamp_data = parse_batch_stamps_output(batch_output);
+    validate_stamps_parsed(
+        requirements,
+        &parse_batch_stamps_output(batch_output),
+        current_inputs,
+    )
+}
+
+/// [`validate_stamps_batch`] for a caller that already parsed the batch output.
+///
+/// Split out so a holder of the parsed map doesn't have to keep the raw string
+/// alive purely to re-parse it into the map it already has.
+pub fn validate_stamps_parsed(
+    requirements: &[StampRequirement],
+    stamp_data: &std::collections::HashMap<String, Option<String>>,
+    current_inputs: &[CurrentInput<'_>],
+) -> StampValidationResult {
     let mut validation = StampValidationResult::new();
 
     for req in requirements {
@@ -1861,6 +1976,41 @@ pub fn check_stamp_requirement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The effective rootfs package set for a default project — what
+    /// `Config::get_rootfs_packages` returns when `rootfs.packages` is absent.
+    fn default_rootfs_packages() -> std::collections::HashMap<String, serde_yaml::Value> {
+        std::collections::HashMap::from([(
+            "avocado-pkg-rootfs".to_string(),
+            serde_yaml::Value::String("*".to_string()),
+        )])
+    }
+
+    /// Resolved inputs for hash tests: the default package set, no feed
+    /// identity, no lock pins. Tests exercising a specific resolved input
+    /// build their own [`SysrootStampInputs`].
+    fn test_sysroot_inputs(
+        packages: &std::collections::HashMap<String, serde_yaml::Value>,
+    ) -> SysrootStampInputs<'_> {
+        SysrootStampInputs {
+            packages,
+            repo_url: None,
+            repo_release: None,
+            disable_weak_dependencies: false,
+            dnf_args: None,
+            locked_packages: None,
+        }
+    }
+
+    /// `compute_rootfs_input_hash`'s config hash for a default package set —
+    /// the shape most of the hash tests below want, since they vary a config
+    /// section and assert on the resulting hash.
+    fn rootfs_config_hash(config: &serde_yaml::Value, project_root: &Path) -> String {
+        let packages = default_rootfs_packages();
+        compute_rootfs_input_hash(config, project_root, None, &test_sysroot_inputs(&packages))
+            .unwrap()
+            .config_hash
+    }
 
     #[test]
     fn test_stamp_creation() {
@@ -3600,12 +3750,8 @@ kernel:
 "#,
         )
         .unwrap();
-        let h_base = compute_rootfs_input_hash(&base, std::path::Path::new("."), None)
-            .unwrap()
-            .config_hash;
-        let h_extra = compute_rootfs_input_hash(&with_metadata, std::path::Path::new("."), None)
-            .unwrap()
-            .config_hash;
+        let h_base = rootfs_config_hash(&base, std::path::Path::new("."));
+        let h_extra = rootfs_config_hash(&with_metadata, std::path::Path::new("."));
         assert_eq!(
             h_base, h_extra,
             "adding unrelated keys under `kernel:` must not invalidate the rootfs install stamp"
@@ -3634,12 +3780,8 @@ kernel:
 "#,
         )
         .unwrap();
-        let h_v1 = compute_rootfs_input_hash(&v1, std::path::Path::new("."), None)
-            .unwrap()
-            .config_hash;
-        let h_v2 = compute_rootfs_input_hash(&v2, std::path::Path::new("."), None)
-            .unwrap()
-            .config_hash;
+        let h_v1 = rootfs_config_hash(&v1, std::path::Path::new("."));
+        let h_v2 = rootfs_config_hash(&v2, std::path::Path::new("."));
         assert_ne!(h_v1, h_v2);
     }
 
@@ -3658,16 +3800,257 @@ rootfs:
 "#,
         )
         .unwrap();
-        let h1 = compute_rootfs_input_hash(&config, tmp.path(), None)
-            .unwrap()
-            .config_hash;
+        let h1 = rootfs_config_hash(&config, tmp.path());
 
         std::fs::write(&script, b"#!/bin/sh\necho v2\n").unwrap();
-        let h2 = compute_rootfs_input_hash(&config, tmp.path(), None)
+        let h2 = rootfs_config_hash(&config, tmp.path());
+
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn rootfs_hash_stable_across_absent_and_explicit_default_packages() {
+        // The install-skip decision rests on this: a project with no `rootfs:`
+        // section and one that spells out the default meta-package install
+        // exactly the same thing, so they must hash the same. Hashing the raw
+        // config node instead of the effective set makes these differ and
+        // forces a reinstall on any project that writes the default out.
+        let absent: serde_yaml::Value = serde_yaml::from_str("sdk:\n  image: foo\n").unwrap();
+        let explicit: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+sdk:
+  image: foo
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rootfs_config_hash(&absent, std::path::Path::new(".")),
+            rootfs_config_hash(&explicit, std::path::Path::new(".")),
+        );
+    }
+
+    #[test]
+    fn rootfs_hash_changes_on_added_package() {
+        let config: serde_yaml::Value = serde_yaml::from_str("sdk:\n  image: foo\n").unwrap();
+        let root = std::path::Path::new(".");
+
+        let base = default_rootfs_packages();
+        let mut with_vim = base.clone();
+        with_vim.insert(
+            "vim".to_string(),
+            serde_yaml::Value::String("*".to_string()),
+        );
+
+        let h_base = compute_rootfs_input_hash(&config, root, None, &test_sysroot_inputs(&base))
+            .unwrap()
+            .config_hash;
+        let h_vim = compute_rootfs_input_hash(&config, root, None, &test_sysroot_inputs(&with_vim))
             .unwrap()
             .config_hash;
 
-        assert_ne!(h1, h2);
+        assert_ne!(h_base, h_vim);
+    }
+
+    #[test]
+    fn rootfs_hash_changes_on_feed_identity_and_weak_deps() {
+        let config: serde_yaml::Value = serde_yaml::from_str("sdk:\n  image: foo\n").unwrap();
+        let root = std::path::Path::new(".");
+        let packages = default_rootfs_packages();
+
+        let hash_of = |resolved: &SysrootStampInputs<'_>| {
+            compute_rootfs_input_hash(&config, root, None, resolved)
+                .unwrap()
+                .config_hash
+        };
+
+        let base = test_sysroot_inputs(&packages);
+        let h_base = hash_of(&base);
+
+        // A snapshot bump moves repo_release — this is the hook that makes
+        // `avocado update` land instead of being skipped as up to date.
+        let h_release = hash_of(&SysrootStampInputs {
+            repo_release: Some("2026.9.20260727"),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_ne!(h_base, h_release, "repo_release must invalidate");
+
+        let h_url = hash_of(&SysrootStampInputs {
+            repo_url: Some("https://repo.avocadolinux.org/2026/next"),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_ne!(h_base, h_url, "repo_url must invalidate");
+
+        let h_weak = hash_of(&SysrootStampInputs {
+            disable_weak_dependencies: true,
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_ne!(
+            h_base, h_weak,
+            "disable_weak_dependencies must invalidate — it changes what dnf pulls"
+        );
+
+        // `--dnf-args` reach the transaction verbatim, so an up-to-date sysroot
+        // must not short-circuit past a run that passes different ones.
+        let args = ["--enablerepo=extra".to_string()];
+        let h_dnf = hash_of(&SysrootStampInputs {
+            dnf_args: Some(&args),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_ne!(
+            h_base, h_dnf,
+            "dnf_args must invalidate — they change what the transaction resolves"
+        );
+
+        // An empty list is the same transaction as none at all, so it must not
+        // invalidate; otherwise `--dnf-args ''` would force a pointless rebuild.
+        let empty: [String; 0] = [];
+        let h_empty = hash_of(&SysrootStampInputs {
+            dnf_args: Some(&empty),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_eq!(
+            h_base, h_empty,
+            "an empty dnf_args list must not invalidate"
+        );
+    }
+
+    /// The SDK image runs the install, so repointing it has to invalidate — the
+    /// sibling `compute_sdk_input_hash` already treats it as an input.
+    #[test]
+    fn rootfs_stamp_tracks_sdk_image() {
+        let root = std::path::Path::new(".");
+        let packages = default_rootfs_packages();
+        let inputs = test_sysroot_inputs(&packages);
+
+        let a: serde_yaml::Value =
+            serde_yaml::from_str("sdk:\n  image: docker.io/avocadolinux/sdk:apollo-edge\n")
+                .unwrap();
+        let b: serde_yaml::Value =
+            serde_yaml::from_str("sdk:\n  image: docker.io/avocadolinux/sdk:dev\n").unwrap();
+
+        let ha = compute_rootfs_input_hash(&a, root, None, &inputs)
+            .unwrap()
+            .config_hash;
+        let hb = compute_rootfs_input_hash(&b, root, None, &inputs)
+            .unwrap()
+            .config_hash;
+        assert_ne!(ha, hb, "sdk.image must invalidate the sysroot stamp");
+    }
+
+    #[test]
+    fn rootfs_package_list_hash_tracks_lock_pins() {
+        let config: serde_yaml::Value = serde_yaml::from_str("sdk:\n  image: foo\n").unwrap();
+        let root = std::path::Path::new(".");
+        let packages = default_rootfs_packages();
+
+        let pinned: std::collections::HashMap<String, String> =
+            std::collections::HashMap::from([(
+                "avocado-pkg-rootfs".to_string(),
+                "2026.9-r0.0".to_string(),
+            )]);
+        let repinned: std::collections::HashMap<String, String> = std::collections::HashMap::from(
+            [("avocado-pkg-rootfs".to_string(), "2026.10-r0.0".to_string())],
+        );
+
+        let inputs_for = |locked: Option<&std::collections::HashMap<String, String>>| {
+            compute_rootfs_input_hash(
+                &config,
+                root,
+                None,
+                &SysrootStampInputs {
+                    locked_packages: locked,
+                    ..test_sysroot_inputs(&packages)
+                },
+            )
+            .unwrap()
+        };
+
+        let a = inputs_for(Some(&pinned));
+        let b = inputs_for(Some(&repinned));
+        let cleared = inputs_for(None);
+
+        // The config side is untouched by a re-pin; only the package list moves.
+        assert_eq!(a.config_hash, b.config_hash);
+        assert_ne!(a.package_list_hash, b.package_list_hash);
+
+        // `avocado unlock` clears the section. That has to read as stale, which
+        // is why an empty pin set hashes to a value rather than to None —
+        // `is_current` only compares two Some sides.
+        assert!(cleared.package_list_hash.is_some());
+        assert_ne!(a.package_list_hash, cleared.package_list_hash);
+
+        let stamp = Stamp::rootfs_install("qemux86-64", a.clone(), StampOutputs::default());
+        assert!(stamp.is_current(&a));
+        assert!(!stamp.is_current(&b), "a re-pin must invalidate the stamp");
+        assert!(
+            !stamp.is_current(&cleared),
+            "avocado unlock must invalidate the stamp"
+        );
+    }
+
+    #[test]
+    fn rootfs_package_list_hash_is_order_independent() {
+        // Lock pins come out of a HashMap, so iteration order varies between
+        // runs. The digest must not.
+        let a = std::collections::HashMap::from([
+            ("alpha".to_string(), "1".to_string()),
+            ("beta".to_string(), "2".to_string()),
+            ("gamma".to_string(), "3".to_string()),
+        ]);
+        let b = std::collections::HashMap::from([
+            ("gamma".to_string(), "3".to_string()),
+            ("alpha".to_string(), "1".to_string()),
+            ("beta".to_string(), "2".to_string()),
+        ]);
+
+        assert_eq!(package_list_hash(Some(&a)), package_list_hash(Some(&b)));
+    }
+
+    #[test]
+    fn initramfs_hash_is_independent_of_rootfs_section() {
+        // The two sysroots install independently; a rootfs-only edit must not
+        // invalidate the initramfs stamp (and so reinstall it for nothing).
+        let base: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+initramfs:
+  packages:
+    avocado-pkg-initramfs: "*"
+"#,
+        )
+        .unwrap();
+        let with_rootfs: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+initramfs:
+  packages:
+    avocado-pkg-initramfs: "*"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+    vim: "*"
+"#,
+        )
+        .unwrap();
+
+        let packages = std::collections::HashMap::from([(
+            "avocado-pkg-initramfs".to_string(),
+            serde_yaml::Value::String("*".to_string()),
+        )]);
+        let root = std::path::Path::new(".");
+
+        let h_base =
+            compute_initramfs_input_hash(&base, root, None, &test_sysroot_inputs(&packages))
+                .unwrap()
+                .config_hash;
+        let h_with =
+            compute_initramfs_input_hash(&with_rootfs, root, None, &test_sysroot_inputs(&packages))
+                .unwrap()
+                .config_hash;
+
+        assert_eq!(h_base, h_with);
     }
 
     #[test]
@@ -3694,13 +4077,9 @@ rootfs:
         .unwrap();
 
         std::env::set_var("STAMP_OVL_TOKEN", "aaa");
-        let h1 = compute_rootfs_input_hash(&config, tmp.path(), None)
-            .unwrap()
-            .config_hash;
+        let h1 = rootfs_config_hash(&config, tmp.path());
         std::env::set_var("STAMP_OVL_TOKEN", "bbb");
-        let h2 = compute_rootfs_input_hash(&config, tmp.path(), None)
-            .unwrap()
-            .config_hash;
+        let h2 = rootfs_config_hash(&config, tmp.path());
 
         // Changing a value referenced by a preprocessed overlay file must
         // invalidate the rootfs install hash so the image rebuilds.
@@ -3826,13 +4205,9 @@ rootfs:
         )
         .unwrap();
 
-        let h1 = compute_rootfs_input_hash(&config, tmp.path(), None)
-            .unwrap()
-            .config_hash;
+        let h1 = rootfs_config_hash(&config, tmp.path());
         std::fs::write(tmp.path().join("overlay/etc/f.txt"), "v2-different").unwrap();
-        let h2 = compute_rootfs_input_hash(&config, tmp.path(), None)
-            .unwrap()
-            .config_hash;
+        let h2 = rootfs_config_hash(&config, tmp.path());
         assert_eq!(h1, h2);
     }
 

@@ -5,9 +5,8 @@ use std::sync::Arc;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
-use crate::utils::stamps::{
-    generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement,
-};
+use crate::utils::prerequisites::read_stamps_batch;
+use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
 
 pub struct ExtCleanCommand {
@@ -207,28 +206,24 @@ impl ExtCleanCommand {
 
         // Validate SDK is installed before running clean scripts
         let requirements = vec![StampRequirement::sdk_install()];
-        let batch_script = generate_batch_read_stamps_script(&requirements);
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: batch_script,
-            verbose: false,
-            source_environment: true,
-            interactive: false,
-            repo_url: repo_url.clone(),
-            repo_release: repo_release.clone(),
-            container_args: merged_container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            sdk_arch: self.sdk_arch.clone(),
-            env_vars: self.runtime_env_vars(),
-            ..Default::default()
-        };
-
-        let output = container_helper
-            .run_in_container_with_output(run_config)
-            .await?;
-
-        let validation = validate_stamps_batch(&requirements, output.as_deref().unwrap_or(""), &[]);
+        let validation = read_stamps_batch(
+            &requirements,
+            &container_helper,
+            RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                repo_url: repo_url.clone(),
+                repo_release: repo_release.clone(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                env_vars: self.runtime_env_vars(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await?
+        .validate(&requirements, &[]);
 
         if !validation.is_satisfied() {
             validation

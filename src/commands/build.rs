@@ -175,10 +175,7 @@ impl BuildCommand {
         // task list.  This gives the user a clear "run avocado install" message
         // instead of failing mid-build inside a TUI.
         if !self.no_stamps {
-            use crate::utils::stamps::{
-                generate_batch_read_stamps_script, resolve_required_stamps, validate_stamps_batch,
-                StampCommand, StampComponent,
-            };
+            use crate::utils::stamps::{resolve_required_stamps, StampCommand, StampComponent};
 
             let container_image = config.get_sdk_image().ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'")
@@ -192,27 +189,24 @@ impl BuildCommand {
             let required =
                 resolve_required_stamps(StampCommand::Install, StampComponent::Runtime, None, &[]);
 
-            let batch_script = generate_batch_read_stamps_script(&required);
-            let run_config = crate::utils::container::RunConfig {
-                container_image: container_image.clone(),
-                target: target.clone(),
-                command: batch_script,
-                verbose: false,
-                source_environment: true,
-                interactive: false,
-                repo_url: config.get_sdk_repo_url(),
-                repo_release: config.get_sdk_repo_release(),
-                container_args: self.container_args.clone(),
-                sdk_arch: self.sdk_arch.clone(),
-                runs_on: self.runs_on.clone(),
-                nfs_port: self.nfs_port,
-                ..Default::default()
-            };
-
-            let output = container_helper
-                .run_in_container_with_output(run_config)
-                .await?;
-            let validation = validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &[]);
+            let validation = crate::utils::prerequisites::read_stamps_batch(
+                &required,
+                &container_helper,
+                crate::utils::container::RunConfig {
+                    container_image: container_image.clone(),
+                    target: target.clone(),
+                    repo_url: config.get_sdk_repo_url(),
+                    repo_release: config.get_sdk_repo_release(),
+                    container_args: self.container_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    runs_on: self.runs_on.clone(),
+                    nfs_port: self.nfs_port,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .validate(&required, &[]);
 
             if !validation.is_satisfied() {
                 let error =
