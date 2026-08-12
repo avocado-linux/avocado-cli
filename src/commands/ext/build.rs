@@ -1272,18 +1272,32 @@ fi
 # Enable service file for {}
 sysroot="$AVOCADO_EXT_SYSROOTS/{}"
 service="{}"
-unit_file="$sysroot/usr/lib/systemd/system/$service"
 
-if [ -f "$unit_file" ]; then
-    echo "Enabling service: $service in sysroot $sysroot"
+# Search the same unit directories systemd does, in its precedence order, rather
+# than /usr/lib alone. A unit shipped under /etc is a legitimate placement that
+# systemd resolves and prefers, but looking only in /usr/lib skipped it: the
+# extension merged, presented the unit, and left it disabled with nothing at
+# runtime to say why.
+unit_file=""
+unit_target=""
+for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do
+    if [ -f "$sysroot$unit_dir/$service" ]; then
+        unit_file="$sysroot$unit_dir/$service"
+        unit_target="$unit_dir/$service"
+        break
+    fi
+done
+
+if [ -n "$unit_file" ]; then
+    echo "Enabling service: $service (found at $unit_target) in sysroot $sysroot"
 
     # Parse WantedBy= from [Install] section and create .wants symlinks
     wanted_by=$(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$unit_file" | tr ',' ' ')
     for target in $wanted_by; do
         target_dir="$sysroot/etc/systemd/system/$target.wants"
         mkdir -p "$target_dir"
-        ln -sf "/usr/lib/systemd/system/$service" "$target_dir/$service"
-        echo "Created symlink: $target_dir/$service -> /usr/lib/systemd/system/$service"
+        ln -sf "$unit_target" "$target_dir/$service"
+        echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
     # Parse RequiredBy= from [Install] section and create .requires symlinks
@@ -1291,17 +1305,20 @@ if [ -f "$unit_file" ]; then
     for target in $required_by; do
         target_dir="$sysroot/etc/systemd/system/$target.requires"
         mkdir -p "$target_dir"
-        ln -sf "/usr/lib/systemd/system/$service" "$target_dir/$service"
-        echo "Created symlink: $target_dir/$service -> /usr/lib/systemd/system/$service"
+        ln -sf "$unit_target" "$target_dir/$service"
+        echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
+    # An [Install] section with neither key enables nothing, so the declaration
+    # is unmet just as surely as a missing unit - fail rather than warn.
     if [ -z "$wanted_by" ] && [ -z "$required_by" ]; then
-        echo "Warning: No WantedBy= or RequiredBy= found in [Install] section of $service"
-    else
-        echo "Successfully enabled $service"
+        echo "Error: enable_services lists $service, but its [Install] section has no WantedBy= or RequiredBy=, so there is no target to enable it into. Add one, or drop it from enable_services."
+        exit 1
     fi
+    echo "Successfully enabled $service"
 else
-    echo "Warning: Service file $service not found in extension sysroot"
+    echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/."
+    exit 1
 fi"#,
                     service, self.extension, service
                 ));
@@ -1931,7 +1948,10 @@ mod tests {
         assert!(script.contains("# Enable service file for peridiod.service"));
         assert!(script.contains("sysroot=\"$AVOCADO_EXT_SYSROOTS/test-ext\""));
         assert!(script.contains("service=\"peridiod.service\""));
-        assert!(script.contains("unit_file=\"$sysroot/usr/lib/systemd/system/$service\""));
+        // The unit is searched for in systemd's own directories, in its
+        // precedence order - not /usr/lib alone.
+        assert!(script.contains("for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do"));
+        assert!(script.contains("if [ -f \"$sysroot$unit_dir/$service\" ]; then"));
         // Check for WantedBy= parsing
         assert!(script.contains("wanted_by=$(sed -n"));
         assert!(script.contains("/^WantedBy=/"));
@@ -1940,18 +1960,75 @@ mod tests {
         assert!(script.contains("required_by=$(sed -n"));
         assert!(script.contains("/^RequiredBy=/"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.requires"));
-        // Check for symlink creation
-        assert!(
-            script.contains("ln -sf \"/usr/lib/systemd/system/$service\" \"$target_dir/$service\"")
-        );
+        // The symlink points at wherever the unit was actually found, so a unit
+        // under /etc is not linked to a /usr/lib path that holds nothing.
+        assert!(script.contains("ln -sf \"$unit_target\" \"$target_dir/$service\""));
         assert!(script.contains("# Enable service file for test.service"));
         assert!(script.contains("service=\"test.service\""));
-        assert!(script
-            .contains("echo \"Warning: Service file $service not found in extension sysroot\""));
+
+        // A declaration that cannot be honored fails the build. Warning-and-succeed
+        // shipped an extension that merged, presented the unit, and left it
+        // disabled forever, with the only evidence a line in the build log.
+        assert!(
+            script.contains("no such unit exists in the extension sysroot"),
+            "an unresolvable enable_services entry must be an error, not a warning"
+        );
+        assert!(
+            !script.contains("Warning: Service file"),
+            "the old warn-and-continue path must be gone"
+        );
 
         // Check that AVOCADO_ENABLE_SERVICES is written to release file
         assert!(script.contains("echo \"AVOCADO_ENABLE_SERVICES=\\\"peridiod.service test.service\\\"\" >> \"$release_file\""));
         assert!(script.contains("[INFO] Added AVOCADO_ENABLE_SERVICES=\\\"peridiod.service test.service\\\" to release file"));
+    }
+
+    /// Both ways an `enable_services` entry can go unhonored must stop the build.
+    ///
+    /// The extension that motivated this shipped its unit under
+    /// `overlay/etc/systemd/system/`, which the old `/usr/lib`-only lookup
+    /// skipped. The build warned and succeeded, the extension merged and
+    /// presented the unit, and `systemctl is-enabled` answered `disabled` on
+    /// every boot with no journal entry to explain it.
+    #[test]
+    fn unhonorable_enable_services_entries_fail_the_build() {
+        let cmd = ExtBuildCommand {
+            extension: "test-ext".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            verbose: false,
+            target: None,
+            container_args: None,
+            dnf_args: None,
+            no_stamps: false,
+            ..Default::default()
+        };
+
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &["container-hello.service".to_string()],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            "/opt/src",
+        );
+
+        // Unit absent from both search directories.
+        assert!(script.contains("no such unit exists in the extension sysroot"));
+        // An [Install] section carrying neither key enables nothing either.
+        assert!(script.contains("has no WantedBy= or RequiredBy="));
+
+        // Each failure path exits non-zero rather than falling through. Two
+        // guards, so two exits, and the build script must not continue past
+        // either - the whole point is that a silent pass is what shipped the bug.
+        assert_eq!(
+            script.matches("exit 1").count(),
+            2,
+            "both the missing-unit and no-install-target guards must exit non-zero"
+        );
     }
 
     #[test]

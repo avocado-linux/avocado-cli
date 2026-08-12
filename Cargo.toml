@@ -31,10 +31,15 @@ tokio = { version = "1.0", features = [
     "rt-multi-thread",
     "process",
     "io-util",
+    "fs",
     "signal",
     "time",
     "sync",
 ] }
+# `io` only, for ReaderStream: the registry streams stored blobs off disk instead
+# of sizing an allocation by the blob. Already in the tree transitively (axum,
+# tokio-tungstenite), so this adds an explicit edge rather than a new dependency.
+tokio-util = { version = "0.7", features = ["io"] }
 thiserror = "2.0"
 directories = "6.0"
 reqwest = { version = "0.13", default-features = false, features = [
@@ -70,7 +75,25 @@ tough = { version = "0.22", default-features = false }
 semver = "1"
 crossterm = "0.29"
 num_cpus = "1.16"
+# Container Dev Mode embedded registry server surface. Pure-Rust HTTP/TLS/WS
+# stack pinned to the aws-lc-rs rustls provider already linked via reqwest, so
+# no new C toolchain requirement is introduced. rcgen and tokio-tungstenite
+# both default to aws_lc_rs; do not enable a `ring` feature here or a second
+# crypto provider would be linked.
+axum = "0.8"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rcgen = { version = "0.13", default-features = false, features = [
+    "crypto",
+    "pem",
+    "aws_lc_rs",
+] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
+# `oneshot` drives the write router directly, so a body stream that ERRORS can be
+# injected deterministically - a truncated real HTTP body just makes the server
+# wait for bytes that never arrive.
+tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 serial_test = "3.0"
