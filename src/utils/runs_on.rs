@@ -693,7 +693,7 @@ impl RunsOnContext {
 }
 
 /// Shell escape a string for safe use in a shell command
-fn shell_escape(s: &str) -> String {
+pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
