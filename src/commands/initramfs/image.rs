@@ -358,6 +358,8 @@ export AVOCADO_OS_VERSION_ID
         if wrap_kab {
             env_vars.insert("KAB_KEYSET_FILE".to_string(), "/tmp/kab.keyset".to_string());
         }
+        // Reproducibility stamp for the initramfs mtime-normalization pass.
+        crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
 
         let container_args_with_keyset = if let Some(ref host_path) = kab_keyset_host_path {
             let mut args = merged_container_args.clone().unwrap_or_default();
