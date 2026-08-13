@@ -43,6 +43,11 @@ jobs:
       matrix:
         include:
           - { target: qemux86-64, distro-release: "2024", distro-channel: next }
+          # Keep a cross-arch leg. A same-arch target cannot catch a host/target
+          # toolchain mix-up in avocado-cli-compile.sh: on qemux86-64 the target
+          # gcc runs natively, so picking the wrong one still builds. On aarch64
+          # the wrong pick goes through qemu-user and fails every C probe.
+          - { target: raspberrypi4, distro-release: "2024", distro-channel: next }
     uses: avocado-linux/actions/.github/workflows/extension-test.yml@v1
     with:
       target:         ${{ matrix.target }}
