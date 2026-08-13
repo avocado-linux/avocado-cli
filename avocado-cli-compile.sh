@@ -32,6 +32,17 @@ for var in $(env | grep -o 'CARGO_TARGET_[A-Z0-9_]*_RUSTFLAGS'); do
     unset "$var"
 done
 
+# Require the SDK vars before touching the tree or deriving any path. Letting
+# them expand empty would collapse CROSS_BINDIR to "/usr/bin", where the -x check
+# below finds the *host* gcc and quietly produces a native binary packaged as a
+# target extension; an empty SDKTARGETSYSROOT would bake a bogus --sysroot into
+# .cargo/config.toml. This script runs with `set -e` but not `set -u`, so nothing
+# else catches it. Guarding here also means neither abort leaves a half-written
+# .cargo/config.toml behind.
+: "${OECORE_NATIVE_SYSROOT:?not set -- SDK environment-setup was not sourced}"
+: "${SDKTARGETSYSROOT:?not set -- SDK environment-setup was not sourced}"
+: "${CROSS_COMPILE:?not set -- SDK environment-setup was not sourced}"
+
 # Remove only the generated cross-compile config, preserving any committed
 # .cargo files used for development.
 rm -f .cargo/config.toml
@@ -56,17 +67,18 @@ EOF
 # target like qemux86-64, where the target gcc happens to run natively.
 #
 # Arch-agnostic: the triple comes from $CROSS_COMPILE, no hardcoded value.
-#
-# Require both vars rather than letting them expand empty: that would collapse
-# CROSS_BINDIR to "/usr/bin" and the -x check below would find the *host* gcc,
-# quietly producing a native binary packaged as a target extension. This script
-# runs with `set -e` but not `set -u`, so nothing else catches it.
-: "${OECORE_NATIVE_SYSROOT:?not set -- SDK environment-setup was not sourced}"
-: "${CROSS_COMPILE:?not set -- SDK environment-setup was not sourced}"
-
 CROSS_BINDIR="$OECORE_NATIVE_SYSROOT/usr/bin/${CROSS_COMPILE%-}"
-if [ ! -x "$CROSS_BINDIR/${CROSS_COMPILE}gcc" ]; then
-    echo "Error: cross compiler not found at $CROSS_BINDIR/${CROSS_COMPILE}gcc" >&2
+
+# Check the binary `cc` will actually run: it takes the FIRST token of $CC (the
+# rest are target flags) and falls back to guessing "<triple>-gcc" when $CC is
+# unset. Hardcoding gcc here would also abort a working clang SDK.
+CC_BIN="${CC:-${CROSS_COMPILE}gcc}"
+CC_BIN="${CC_BIN%% *}"
+if [ ! -x "$CROSS_BINDIR/$CC_BIN" ]; then
+    echo "Error: cross compiler '$CC_BIN' not found in $CROSS_BINDIR" >&2
+    echo "The SDK is missing the C cross-canadian toolchain. An SDK installed" >&2
+    echo "before it was added to avocado.yaml will not have it -- reinstall with:" >&2
+    echo "    avocado sdk install --force" >&2
     exit 1
 fi
 export PATH="$CROSS_BINDIR:$PATH"
