@@ -868,6 +868,29 @@ impl ExtImageCommand {
             })
             .collect::<Vec<_>>();
 
+        // Package-manager bookkeeping, always excluded, ahead of the var_files
+        // patterns. dnf leaves this in every extension installroot, and `ext
+        // install` / `ext dnf` additionally seed var/lib/rpm from the rootfs so
+        // dependencies resolve against what the rootfs already provides. On a
+        // qemux86-64 build that is 13.4M of a 22M sysroot for
+        // avocado-ext-tunnels, against an 8.2M /usr payload.
+        //
+        // Nothing on target can read it: systemd-sysext/confext merge /usr,
+        // /opt and /etc, never /var. And it is what stops the images being
+        // reproducible across a reinstall — the rpmdb stamps INSTALLTIME and
+        // INSTALLTID per package, var/lib/dnf/history.sqlite records the
+        // transaction, and var/cache/dnf holds generated repodata and solvfiles.
+        //
+        // Excluded at image time rather than deleted, because `ext image` runs
+        // mkfs directly against the live sysroot (no work copy, unlike the
+        // rootfs and initramfs paths) and later `ext dnf` / `ext install` calls
+        // still resolve against that rpmdb.
+        let excludes: Vec<String> = ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .chain(var_excludes)
+            .collect();
+
         let mkfs_command = match filesystem {
             "erofs" | "erofs-lz4" | "erofs-zst" => {
                 let compress_flag = match filesystem {
@@ -875,7 +898,7 @@ impl ExtImageCommand {
                     "erofs-zst" => "\n  -z zstd \\",
                     _ => "",
                 };
-                let exclude_flags = var_excludes
+                let exclude_flags = excludes
                     .iter()
                     .map(|p| format!("  --exclude-path={p} \\"))
                     .collect::<Vec<_>>()
@@ -897,7 +920,7 @@ mkfs.erofs \
                 )
             }
             _ => {
-                let exclude_flags = var_excludes
+                let exclude_flags = excludes
                     .iter()
                     .map(|p| format!("  -e \"{p}\""))
                     .collect::<Vec<_>>()
@@ -1129,6 +1152,101 @@ mod tests {
         );
     }
 
+    /// Package-manager state must never reach an extension image.
+    ///
+    /// Regression: verified present in shipped images — `rpmdb.sqlite` and the
+    /// SQLite file magic both grep out of `config-dev-0.1.0.raw` and
+    /// `avocado-ext-tunnels-2024.1.0.raw`. It was 13.4M of a 22M sysroot against
+    /// an 8.2M /usr payload, unreadable on target (sysext/confext merge /usr,
+    /// /opt and /etc, never /var), and unreproducible across a reinstall because
+    /// the rpmdb stamps INSTALLTIME/INSTALLTID per package.
+    ///
+    /// Excluded rather than deleted: `ext image` runs mkfs against the live
+    /// sysroot, which later `ext dnf` / `ext install` calls resolve against.
+    #[test]
+    fn test_pkg_state_excluded_from_erofs_image() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
+
+        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+            assert!(
+                script.contains(&format!("--exclude-path={path}")),
+                "{path} must be excluded from the erofs image"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pkg_state_excluded_from_squashfs_image() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+
+        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+            assert!(
+                script.contains(&format!("-e \"{path}\"")),
+                "{path} must be excluded from the squashfs image"
+            );
+        }
+    }
+
+    /// The always-excluded paths are additive — a project's own `var_files`
+    /// patterns must still be excluded alongside them, not replaced by them.
+    #[test]
+    fn test_var_files_excludes_survive_alongside_pkg_state() {
+        let cmd = make_cmd("my-ext");
+        let var_files = vec!["var/lib/myapp/**".to_string()];
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &var_files, "raw", None);
+
+        assert!(
+            script.contains("--exclude-path=var/lib/myapp"),
+            "configured var_files patterns must still be excluded"
+        );
+        assert!(
+            script.contains("--exclude-path=var/lib/rpm"),
+            "package-manager excludes must not displace var_files excludes"
+        );
+    }
+
+    /// The rest of the erofs reproducibility contract, which nothing pinned.
+    /// Each of these silently reintroduces per-build variance if dropped: the
+    /// UUID would be randomized, and ownership would come from whoever ran the
+    /// build instead of being normalized to root.
+    #[test]
+    fn test_erofs_image_reproducibility_flags_are_pinned() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
+
+        assert!(
+            script.contains("-U 00000000-0000-0000-0000-000000000000"),
+            "erofs UUID must be pinned, or every build gets a fresh one"
+        );
+        assert!(
+            script.contains("--all-root"),
+            "ownership must be normalized to root, not the build user"
+        );
+        assert!(
+            script.contains("-T \"$SOURCE_DATE_EPOCH\""),
+            "timestamps must come from SOURCE_DATE_EPOCH"
+        );
+    }
+
+    /// squashfs has no `-T`; `-reproducible` is what makes its output stable.
+    #[test]
+    fn test_squashfs_image_is_built_reproducibly() {
+        let cmd = make_cmd("my-ext");
+        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+
+        assert!(
+            script.contains("-reproducible"),
+            "mksquashfs must be invoked with -reproducible"
+        );
+        assert!(
+            script.contains("-no-xattrs"),
+            "xattrs must be dropped, they carry build-host state"
+        );
+    }
+
     #[test]
     fn test_create_build_script_source_date_epoch_default() {
         let cmd = make_cmd("my-ext");
@@ -1220,13 +1338,18 @@ mod tests {
     }
 
     #[test]
-    fn test_create_build_script_no_var_files_no_excludes() {
+    fn test_no_var_files_leaves_only_the_pkg_state_excludes() {
+        // Was `test_create_build_script_no_var_files_no_excludes`, which asserted
+        // that no var_files meant no excludes at all. The package-manager paths
+        // are now always excluded, so the surviving guarantee is the narrower
+        // one: nothing beyond them is excluded when no var_files are configured.
         let cmd = make_cmd("my-ext");
         let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
 
-        assert!(
-            !script.contains("-e \"var/"),
-            "script should not contain exclude flags when no var_files"
+        assert_eq!(
+            script.matches("-e \"").count(),
+            3,
+            "only the three package-manager paths should be excluded"
         );
     }
 }
