@@ -48,11 +48,22 @@ pub struct RuntimeConfig {
     pub memory_mib: Option<u32>,
 
     /// Minimum var disk size, e.g. `"200G"`. `vm start` grows the live
-    /// disk to at least this (never shrinks), and a var reset re-seeds
-    /// at it. `vm update` records the live disk's size here before a
-    /// reset, so a grown disk keeps its capacity across the re-seed.
+    /// disk to at least this (never shrinks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub var_size: Option<String>,
+
+    /// sha256 of a var seed the live disk has not yet synced its Avocado
+    /// state from. Set by `vm update` when the seed changes; `vm start`
+    /// attaches that seed read-only so the guest can lift the new
+    /// runtime out of it, and clears the key once the guest confirms.
+    ///
+    /// Left set on any failure, which is what makes the sync retry on
+    /// the next start rather than needing a repair path. It must also
+    /// never point at the seed the live disk was *copied* from: the copy
+    /// is byte-identical, so attaching it would put two devices with one
+    /// btrfs fsid in front of the kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_var_seed_sha: Option<String>,
 
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,
@@ -334,6 +345,7 @@ mod tests {
                 cpus: Some(6),
                 memory_mib: Some(8192),
                 var_size: Some("200G".into()),
+                pending_var_seed_sha: Some("abc123".into()),
                 extra: Default::default(),
             }),
             ..Default::default()
