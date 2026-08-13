@@ -44,13 +44,24 @@ rustflags = ["--sysroot=$SDKTARGETSYSROOT/usr", "-C", "link-arg=--sysroot=$SDKTA
 EOF
 
 # The SDK exports $CC as the cross-compiler command (bare name + target flags +
-# --sysroot), but in the `ext build` environment that compiler binary lives in
-# the SDK target-sysroot bindir, which is not on PATH. Without this, the `cc`
-# crate (pulled in by the remaining C dep aws-lc-sys) can't resolve the compiler
-# from $CC and falls back to guessing "<triple>-gcc", failing with ToolNotFound.
-# Put the SDK compiler bindir on PATH so the build uses exactly the $CC the SDK
-# configured. Arch-agnostic: derived from $SDKTARGETSYSROOT, no hardcoded triple.
-export PATH="$SDKTARGETSYSROOT/usr/bin:$PATH"
+# --sysroot), so the `cc` crate (pulled in by the C dep aws-lc-sys) needs that
+# binary on PATH or it fails with ToolNotFound.
+#
+# It lives in the cross-canadian bindir under the SDK *native* sysroot -- NOT in
+# $SDKTARGETSYSROOT/usr/bin, which holds the target-*native* toolchain. Putting
+# the target sysroot bindir on PATH resolves "<triple>-gcc" to a target ELF;
+# binfmt_misc then hands it to qemu-user, which dies on the unresolvable target
+# loader ("qemu-aarch64: Could not open '/usr/lib/ld-linux-aarch64.so.1'") and
+# fails every compiler probe with exit 255. That is invisible on a same-arch
+# target like qemux86-64, where the target gcc happens to run natively.
+#
+# Arch-agnostic: the triple comes from $CROSS_COMPILE, no hardcoded value.
+CROSS_BINDIR="$OECORE_NATIVE_SYSROOT/usr/bin/${CROSS_COMPILE%-}"
+if [ ! -x "$CROSS_BINDIR/${CROSS_COMPILE}gcc" ]; then
+    echo "Error: cross compiler not found at $CROSS_BINDIR/${CROSS_COMPILE}gcc" >&2
+    exit 1
+fi
+export PATH="$CROSS_BINDIR:$PATH"
 
 # --locked: published builds run from staged package_files; fail loudly on a
 # missing/stale Cargo.lock instead of silently re-resolving dependencies.
