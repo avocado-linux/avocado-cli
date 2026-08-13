@@ -515,11 +515,15 @@ pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, Stri
 
 /// Inject `SOURCE_DATE_EPOCH` into a container's env map when the project sets it.
 ///
-/// The image build scripts already read `${SOURCE_DATE_EPOCH:-0}` — `mkfs.erofs -T`
-/// for the rootfs, the mtime-normalization pass for the initramfs — but nothing
-/// ever set the variable, so the `source_date_epoch` config key was honored for
-/// extension images (which export it inside their own script) and silently
-/// ignored for every other image type.
+/// Consumed today by the rootfs script, which passes `-T "${SOURCE_DATE_EPOCH:-0}"`
+/// to `mkfs.erofs`. Nothing ever set the variable, so the `source_date_epoch`
+/// config key was honored for extension images — which export it inside their own
+/// script rather than reading the env — and silently ignored everywhere else.
+///
+/// Also exported on the initramfs path, where it is currently inert: that script
+/// has no reader yet, because the mtime-normalization step that consumes it is
+/// landing separately. The epoch belongs in the env for every image-building run
+/// either way, so it is set uniformly rather than per-consumer.
 ///
 /// Deliberately left unset when the key is absent rather than defaulting to 0
 /// here: the scripts carry their own `:-0` fallback, and `SOURCE_DATE_EPOCH` is
@@ -3136,7 +3140,7 @@ mod tests {
     use super::*;
 
     /// Regression: `source_date_epoch` was plumbed into extension images only.
-    /// The rootfs and initramfs scripts read `${SOURCE_DATE_EPOCH:-0}` but
+    /// The rootfs script reads `${SOURCE_DATE_EPOCH:-0}` for `mkfs.erofs -T` but
     /// nothing set the variable, so a project that configured it got a
     /// reproducibility stamp on its `.raw` extensions and a silently ignored
     /// key everywhere else.
