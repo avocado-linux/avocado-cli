@@ -40,6 +40,11 @@ extensions:
         nativesdk-rust: '*'
         nativesdk-git: '*'
         packagegroup-rust-cross-canadian-avocado-{{ avocado.target }}: '*'
+        # The rust- packagegroup brings rust-cross-canadian + nativesdk-gcc (a
+        # HOST compiler); it does NOT bring a C cross-compiler. aws-lc-sys needs
+        # one, so pull the C cross-canadian toolchain explicitly -- this is what
+        # provides $OECORE_NATIVE_SYSROOT/usr/bin/<triple>/<triple>-gcc.
+        packagegroup-cross-canadian-avocado-{{ avocado.target }}: '*'
 
 sdk:
   image: docker.io/avocadolinux/sdk:{{ env.AVOCADO_DISTRO_RELEASE }}
