@@ -56,6 +56,14 @@ EOF
 # target like qemux86-64, where the target gcc happens to run natively.
 #
 # Arch-agnostic: the triple comes from $CROSS_COMPILE, no hardcoded value.
+#
+# Require both vars rather than letting them expand empty: that would collapse
+# CROSS_BINDIR to "/usr/bin" and the -x check below would find the *host* gcc,
+# quietly producing a native binary packaged as a target extension. This script
+# runs with `set -e` but not `set -u`, so nothing else catches it.
+: "${OECORE_NATIVE_SYSROOT:?not set -- SDK environment-setup was not sourced}"
+: "${CROSS_COMPILE:?not set -- SDK environment-setup was not sourced}"
+
 CROSS_BINDIR="$OECORE_NATIVE_SYSROOT/usr/bin/${CROSS_COMPILE%-}"
 if [ ! -x "$CROSS_BINDIR/${CROSS_COMPILE}gcc" ]; then
     echo "Error: cross compiler not found at $CROSS_BINDIR/${CROSS_COMPILE}gcc" >&2
