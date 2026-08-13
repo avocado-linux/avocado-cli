@@ -9,28 +9,33 @@
 //! - `seed_only` — the `var` image. Fetched on first install and, on a
 //!   version bump, re-fetched and re-seeded. See below.
 //!
-//! ## Why a version bump resets `var`
+//! ## Why a version bump needs more than the boot artifacts
 //!
-//! `seed_only` was written to preserve user state across image bumps,
-//! on the assumption that the in-VM agent would migrate the existing
-//! btrfs at boot. That
-//! migration does not exist yet, and `var` holds more than user state:
-//! the VM's own system extensions live in `/var/lib/avocado/images` and
-//! are merged onto `/usr` and `/etc` at boot. Carrying `var` across a
-//! bump therefore boots a new kernel and rootfs against the *old*
-//! userspace.
+//! `var` holds more than user state: the VM's own system extensions
+//! live in `/var/lib/avocado` and are merged onto `/usr` and `/etc` at
+//! boot. Replacing only kernel/initramfs/rootfs therefore boots a new
+//! kernel against the *old* userspace, and nothing catches it — each
+//! extension's `extension-release` carries `ID=_any`, systemd-sysext's
+//! "matches any OS" wildcard, so mismatched extensions merge silently.
 //!
-//! Nothing catches that. Each extension's `extension-release` is
-//! synthesized at merge time carrying `ID=_any`, which is
-//! systemd-sysext's explicit "matches any OS" wildcard — so the
-//! mismatched extensions merge silently and the VM looks healthy.
+//! It cannot be fixed by carrying the new seed's `var` wholesale
+//! either: the same filesystem holds the user's Docker volumes and
+//! installed SDKs (`$AVOCADO_PREFIX` is a Docker named volume inside
+//! the VM), which are expensive to rebuild and entirely theirs.
 //!
-//! Until the guest can migrate in place, a version bump takes the new
-//! seed and discards the live disk. That costs the user their Docker
-//! volumes, SDK images and `/data` work, so they must re-run `avocado
-//! install` and `avocado build` — a tradeoff deliberately accepted over
-//! shipping a VM whose halves don't match. An unchanged `var` sha means
-//! no reset.
+//! So the two lifetimes are separated at the granularity that already
+//! distinguishes them. The avocado-owned half — `runtimes/`, `images/`
+//! and the `active` pointer — is content-addressed and versioned, so
+//! the guest can install the new runtime *alongside* the old one out of
+//! the new seed and switch `active` only once it is fully staged.
+//! `vm update` records the seed sha here; `vm start` attaches that seed
+//! read-only; the guest does the work in early boot, before extensions
+//! merge. Nothing the user owns is touched, and every failure leaves
+//! the VM on its previous runtime rather than on none.
+//!
+//! The btrfs work has to happen guest-side regardless: this VM exists
+//! because the host is macOS or Windows, neither of which can mount a
+//! btrfs image.
 //!
 //! Behaviour with a running VM: query lifecycle, stop it cleanly,
 //! perform the swap, restart with the same `start` options. The
@@ -60,10 +65,6 @@ pub struct UpdateCommand {
     pub channel: Option<String>,
     pub check_only: bool,
     pub assume_yes: bool,
-    /// Authorizes the var reset when combined with `--yes`. Interactive
-    /// runs consent at the typed prompt instead, so this is only
-    /// consulted when `assume_yes` is set.
-    pub reset_var: bool,
     pub output: OutputFormat,
 }
 
@@ -197,39 +198,20 @@ impl UpdateCommand {
             return Ok(());
         }
 
-        let reseed_var =
-            should_reseed_var(installed.as_ref(), &new_manifest, paths.var_disk().exists());
+        let sync_var_seed =
+            should_sync_var_seed(installed.as_ref(), &new_manifest, paths.var_disk().exists());
 
-        // `--yes` alone consents to a non-destructive update only; the
-        // var reset needs `--reset-var` (interactive runs consent at
-        // the typed prompt instead).
-        if reseed_var && self.assume_yes && !self.reset_var {
-            bail!(
-                "this update ships a new /var image and resets the VM's internal \
-                 state (installed SDKs, Docker volumes, /data). Re-run with \
-                 `--yes --reset-var` to authorize, or without `--yes` to be \
-                 prompted."
-            );
-        }
-
-        // Confirm with the user (unless --yes). Deliberately after
-        // planning: whether this destroys the VM's state is the material
-        // fact about the operation, and we can't know it before reading
-        // the remote manifest.
+        // Confirm with the user (unless --yes). This no longer needs a
+        // destructive-consent path: the update replaces boot artifacts
+        // and schedules a state sync, and keeps the VM's Docker volumes,
+        // installed SDKs and /data either way.
         if !self.assume_yes {
             // The prompt writes prose into the NDJSON stream and blocks
             // on stdin; machine mode never prompts.
             if self.output.is_json() {
-                bail!(
-                    "refusing to prompt in --output json mode; re-run with --yes{}",
-                    if reseed_var {
-                        " --reset-var (this update resets the VM's /var)"
-                    } else {
-                        ""
-                    }
-                );
+                bail!("refusing to prompt in --output json mode; re-run with --yes");
             }
-            confirm(&avail.pointer, installed_version.as_deref(), reseed_var)?;
+            confirm(&avail.pointer, installed_version.as_deref(), sync_var_seed)?;
         }
 
         // Was the VM running before we tear it down?
@@ -316,37 +298,43 @@ impl UpdateCommand {
         // the boot path stays the single owner of both, and an update
         // that dies here leaves no half-copied disk to mistake for
         // state — the next start just seeds it.
-        if reseed_var {
-            let var = paths.var_disk();
-            if var.exists() {
-                // The live disk's length is the only record of how far
-                // the user grew /var (growing never wrote config).
-                // Persist it before the delete so the re-seeded disk
-                // comes back at the same capacity.
-                let live_len = std::fs::metadata(&var)
-                    .with_context(|| format!("stat {}", var.display()))?
-                    .len();
-                let mut cfg = crate::utils::vm::config::VmConfig::load(&paths)
-                    .context("loading config.yaml to record the var size")?;
-                if record_var_size_floor(&mut cfg, live_len)? {
-                    cfg.save(&paths)
-                        .context("recording runtime.var_size in config.yaml")?;
-                }
-                std::fs::remove_file(&var)
-                    .with_context(|| format!("removing stale var disk {}", var.display()))?;
-            }
+        if sync_var_seed {
+            // Record the seed the guest owes a state sync from, rather
+            // than acting on the live disk here. `vm start` attaches
+            // that seed read-only and the guest lifts the new runtime
+            // out of it in early boot, before extensions merge — the
+            // only place the work can happen, since the host is macOS
+            // or Windows and has no btrfs.
+            //
+            // Nothing is destroyed: the new runtime is installed
+            // alongside the old and `active` only moves once it is
+            // fully staged, so every failure leaves the VM on its
+            // previous runtime rather than on none.
+            let new_sha = new_manifest
+                .artifact("var")
+                .map(|a| a.sha256.clone())
+                .expect("should_sync_var_seed only fires on a var artifact");
+            let mut cfg = crate::utils::vm::config::VmConfig::load(&paths)
+                .context("loading config.yaml to record the pending var seed")?;
+            cfg.runtime
+                .get_or_insert_with(Default::default)
+                .pending_var_seed_sha = Some(new_sha);
+            cfg.save(&paths)
+                .context("recording runtime.pending_var_seed_sha in config.yaml")?;
+
             if json_mode {
-                // Host applications need this to know the VM's SDK and
-                // Docker state is gone, so they can drop cached install
-                // state and tell the user to re-run install/build.
+                // Distinct from the old `var_reset`: nothing is lost, so
+                // host applications keep their cached install state.
+                // Extensions change on the next boot, not on this call.
                 crate::utils::output_format::emit_json_object(&json!({
-                    "event": "var_reset",
+                    "event": "var_seed_sync_pending",
                     "reason": "vm_image_updated",
                 }));
             } else {
                 println!(
-                    "avocado vm update: reset /var to the new seed; \
-                     re-run `avocado install` and `avocado build`."
+                    "avocado vm update: the VM will pick up the new Avocado \
+                     extensions on its next start; installed SDKs, Docker \
+                     volumes and /data are kept."
                 );
             }
         }
@@ -444,17 +432,23 @@ fn plan_downloads(
     out
 }
 
-/// Whether this run replaces the live var disk:
+/// Whether the guest owes a state sync from the new seed:
 ///
-/// - an installed manifest exists (a first install has no state to
-///   destroy),
-/// - the live disk exists (a never-started VM has nothing to reset,
-///   and the prompt + `var_reset` event must not fire for one), and
+/// - an installed manifest exists (a first install has nothing to carry
+///   forward),
+/// - the live disk exists — a never-started VM gets the new seed copied
+///   wholesale by `seed_var_disk`, so it is already current. This case
+///   also *must* stay false: the copy is byte-identical to the seed, so
+///   attaching that seed alongside it would put two devices with one
+///   btrfs fsid in front of the kernel.
 /// - a `seed_only` artifact's sha changed. Keyed on the manifests, not
 ///   the planned downloads: `plan_downloads` also re-fetches a seed
-///   that merely went missing (same sha), which must not reset the
-///   live disk.
-fn should_reseed_var(installed: Option<&Manifest>, new: &Manifest, var_disk_exists: bool) -> bool {
+///   that merely went missing (same sha), which needs no sync.
+fn should_sync_var_seed(
+    installed: Option<&Manifest>,
+    new: &Manifest,
+    var_disk_exists: bool,
+) -> bool {
     let Some(installed) = installed else {
         return false;
     };
@@ -465,32 +459,6 @@ fn should_reseed_var(installed: Option<&Manifest>, new: &Manifest, var_disk_exis
         art.update_policy == UpdatePolicy::SeedOnly
             && installed.artifact(role).map(|a| a.sha256.as_str()) != Some(art.sha256.as_str())
     })
-}
-
-/// Raise `runtime.var_size` to cover a live disk of `live_len` bytes,
-/// rounded up to whole GiB. Returns whether the config changed. The
-/// effective size never shrinks (`grow_var_file` refuses to), so the
-/// live disk is always >= any previously configured target; recording
-/// its length preserves the largest size the user ever grew to.
-fn record_var_size_floor(
-    cfg: &mut crate::utils::vm::config::VmConfig,
-    live_len: u64,
-) -> Result<bool> {
-    use crate::utils::vm::lifecycle::{parse_size, DEFAULT_VAR_SIZE};
-
-    let configured = cfg
-        .runtime
-        .as_ref()
-        .and_then(|r| r.var_size.as_deref())
-        .unwrap_or(DEFAULT_VAR_SIZE);
-    let configured_bytes = parse_size(configured)
-        .with_context(|| format!("invalid runtime.var_size {configured:?} in config.yaml"))?;
-    if live_len <= configured_bytes {
-        return Ok(false);
-    }
-    let gib = live_len.div_ceil(1 << 30);
-    cfg.runtime.get_or_insert_with(Default::default).var_size = Some(format!("{gib}G"));
-    Ok(true)
 }
 
 /// Best guess at the host's platform string. Matches what the avocado-vm
@@ -511,36 +479,18 @@ async fn is_vm_running() -> bool {
         .unwrap_or(false)
 }
 
-fn confirm(p: &ChannelPointer, installed: Option<&str>, reseed_var: bool) -> Result<()> {
+fn confirm(p: &ChannelPointer, installed: Option<&str>, sync_var_seed: bool) -> Result<()> {
     let from = installed.unwrap_or("(not installed)");
     println!("avocado vm update: {} -> {}", from, p.version);
-    if reseed_var {
-        // Spelled out, and gated behind typing a word rather than `y`,
-        // because this is not the non-destructive update the command name
-        // implies. Matches `avocado vm reset`'s prompt for the same reason.
+    if sync_var_seed {
+        // Informational, not a consent gate: the sync installs the new
+        // runtime alongside the old and only then switches, so nothing
+        // the user owns is at risk. Worth saying anyway, because the
+        // extensions change on the next boot rather than on this call.
         println!();
-        println!("This release ships a new /var image, which carries the VM's own");
-        println!("system extensions, so /var is replaced rather than migrated. The");
-        println!("update resets the VM's internal state:");
+        println!("This release ships new system extensions. They are applied on the");
+        println!("VM's next start; installed SDKs, Docker volumes and /data are kept.");
         println!();
-        println!("  - installed SDKs and their container images");
-        println!("  - Docker volumes and build caches");
-        println!("  - anything resident in /data inside the VM");
-        println!();
-        println!("Your projects on the host are untouched, but each will need");
-        println!("`avocado install` and `avocado build` run again afterwards.");
-        println!();
-        print!("Type 'update' to confirm: ");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .context("reading confirmation")?;
-        if line.trim() != "update" {
-            bail!("aborted by user");
-        }
-        return Ok(());
     }
     print!("Proceed? [y/N] ");
     use std::io::Write;
@@ -787,24 +737,34 @@ mod tests {
         assert!(plan.is_empty());
     }
 
-    // ── should_reseed_var — the one decision that destroys user state ──
+    // ── should_sync_var_seed — when the guest owes a state sync ──
 
     #[test]
-    fn reseed_requires_a_var_sha_change() {
+    fn sync_requires_a_var_sha_change() {
         let old = manifest("aa", "bb");
-        assert!(should_reseed_var(Some(&old), &manifest("aa2", "bb2"), true));
+        assert!(should_sync_var_seed(
+            Some(&old),
+            &manifest("aa2", "bb2"),
+            true
+        ));
         // Boot-artifact-only release: var untouched.
-        assert!(!should_reseed_var(Some(&old), &manifest("aa2", "bb"), true));
+        assert!(!should_sync_var_seed(
+            Some(&old),
+            &manifest("aa2", "bb"),
+            true
+        ));
     }
 
     #[test]
-    fn reseed_never_fires_on_first_install_or_without_a_live_disk() {
+    fn sync_never_fires_on_first_install_or_without_a_live_disk() {
         let old = manifest("aa", "bb");
-        // No installed manifest → no user state to destroy.
-        assert!(!should_reseed_var(None, &manifest("aa", "bb"), true));
-        // VM never started → nothing to reset; claiming otherwise makes
-        // host applications drop cached install state for no reason.
-        assert!(!should_reseed_var(
+        // No installed manifest → nothing to carry forward.
+        assert!(!should_sync_var_seed(None, &manifest("aa", "bb"), true));
+        // VM never started → `seed_var_disk` copies the new seed
+        // wholesale, so it is already current. Syncing anyway would
+        // attach a seed byte-identical to the live disk, colliding on
+        // btrfs fsid.
+        assert!(!should_sync_var_seed(
             Some(&old),
             &manifest("aa2", "bb2"),
             false
@@ -812,60 +772,16 @@ mod tests {
     }
 
     #[test]
-    fn repairing_a_missing_seed_does_not_reseed_the_live_disk() {
+    fn repairing_a_missing_seed_does_not_schedule_a_sync() {
         // `plan_downloads` re-fetches a merely-missing seed at the same
-        // sha; that repair must never be read as "the release changed
-        // var" and cost the user their live disk.
+        // sha. That repair must not be read as "the release changed
+        // var" — the seed it would attach is the one the live disk was
+        // copied from, i.e. the fsid-collision case.
         let old = manifest("aa", "bb");
-        assert!(!should_reseed_var(Some(&old), &manifest("aa", "bb"), true));
-    }
-
-    // ── record_var_size_floor — capacity survives the re-seed ──
-
-    use crate::utils::vm::config::VmConfig;
-
-    const GIB: u64 = 1 << 30;
-
-    fn var_size_of(cfg: &VmConfig) -> Option<&str> {
-        cfg.runtime.as_ref().and_then(|r| r.var_size.as_deref())
-    }
-
-    #[test]
-    fn a_grown_disk_records_its_size() {
-        let mut cfg = VmConfig::default();
-        assert!(record_var_size_floor(&mut cfg, 200 * GIB).unwrap());
-        assert_eq!(var_size_of(&cfg), Some("200G"));
-        // Partial GiB rounds up — recording less than the live disk
-        // would shrink it on re-seed.
-        let mut cfg = VmConfig::default();
-        assert!(record_var_size_floor(&mut cfg, 200 * GIB + 1).unwrap());
-        assert_eq!(var_size_of(&cfg), Some("201G"));
-    }
-
-    #[test]
-    fn a_default_sized_disk_records_nothing() {
-        // 50G file with no config: nothing to preserve, and the config
-        // file must not grow a runtime section as a side effect.
-        let mut cfg = VmConfig::default();
-        assert!(!record_var_size_floor(&mut cfg, 50 * GIB).unwrap());
-        assert!(cfg.runtime.is_none());
-    }
-
-    #[test]
-    fn an_explicit_config_already_covering_the_disk_is_untouched() {
-        let mut cfg = VmConfig::default();
-        cfg.runtime.get_or_insert_with(Default::default).var_size = Some("300G".into());
-        assert!(!record_var_size_floor(&mut cfg, 200 * GIB).unwrap());
-        assert_eq!(var_size_of(&cfg), Some("300G"));
-    }
-
-    #[test]
-    fn a_disk_grown_past_its_config_raises_the_config() {
-        // Growing (e.g. the desktop's disk-grow) never wrote config, so
-        // the file can legitimately exceed it; the file is the truth.
-        let mut cfg = VmConfig::default();
-        cfg.runtime.get_or_insert_with(Default::default).var_size = Some("100G".into());
-        assert!(record_var_size_floor(&mut cfg, 200 * GIB).unwrap());
-        assert_eq!(var_size_of(&cfg), Some("200G"));
+        assert!(!should_sync_var_seed(
+            Some(&old),
+            &manifest("aa", "bb"),
+            true
+        ));
     }
 }
