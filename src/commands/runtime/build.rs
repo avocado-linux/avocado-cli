@@ -534,6 +534,11 @@ impl RuntimeBuildCommand {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
 
+        // Reproducibility stamp. This run executes the rootfs, initramfs and
+        // extension image sections in one container, so one insert covers all
+        // three.
+        crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
+
         if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
             target_arch,

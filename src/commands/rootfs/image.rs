@@ -398,6 +398,8 @@ export AVOCADO_OS_VERSION_ID
         if wrap_kab {
             env_vars.insert("KAB_KEYSET_FILE".to_string(), "/tmp/kab.keyset".to_string());
         }
+        // Reproducibility stamp for `mkfs.erofs -T` in the build script above.
+        crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
 
         // Bind-mount the keyset into the container as a single -v arg
         // appended to whatever the user / config already has.
@@ -516,6 +518,25 @@ export AVOCADO_OS_VERSION_ID
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rootfs_script_reads_source_date_epoch_from_the_env() {
+        // The other half of `inject_source_date_epoch`. Injection and
+        // consumption have to agree on the variable name, and a mismatch in
+        // either half fails silently — the script just falls back to 0 and the
+        // configured stamp is quietly ignored, which is the bug this pairing
+        // exists to fix. Pin the name on this side too.
+        let script = generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            "",
+        );
+        assert!(
+            script.contains(r#"-T "${SOURCE_DATE_EPOCH:-0}""#),
+            "mkfs.erofs must take its timestamp from $SOURCE_DATE_EPOCH"
+        );
+    }
 
     #[test]
     fn test_rootfs_script_guards_against_half_populated_sysroot() {
