@@ -1291,8 +1291,32 @@ done
 if [ -n "$unit_file" ]; then
     echo "Enabling service: $service (found at $unit_target) in sysroot $sysroot"
 
-    # Parse WantedBy= from [Install] section and create .wants symlinks
-    wanted_by=$(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$unit_file" | tr ',' ' ')
+    # [Install] can come from a drop-in as well as the unit body, and
+    # `systemctl enable` honours a WantedBy= declared there. Reading only
+    # the unit made the standard way to enable a vendor unit that ships
+    # without an [Install] — a drop-in supplying one — invisible here, so
+    # the build failed with the fix already sitting in the overlay.
+    install_sources="$unit_file"
+    for dropin_dir in /etc/systemd/system /usr/lib/systemd/system; do
+        for dropin in "$sysroot$dropin_dir/$service.d/"*.conf; do
+            [ -f "$dropin" ] && install_sources="$install_sources $dropin"
+        done
+    done
+
+    # One sed per file: a single invocation over several files shares one
+    # input stream, so the /^\[Install\]/,/^\[/ range would run past the
+    # end of one file and match keys in the next.
+    wanted_by=""
+    required_by=""
+    for install_src in $install_sources; do
+        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$install_src" | tr ',' ' ')"
+        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$install_src" | tr ',' ' ')"
+    done
+    # Unquoted: collapses the separators left by accumulation so the
+    # emptiness checks below see "" rather than a run of spaces.
+    wanted_by=$(echo $wanted_by)
+    required_by=$(echo $required_by)
+
     for target in $wanted_by; do
         target_dir="$sysroot/etc/systemd/system/$target.wants"
         mkdir -p "$target_dir"
@@ -1300,8 +1324,6 @@ if [ -n "$unit_file" ]; then
         echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
-    # Parse RequiredBy= from [Install] section and create .requires symlinks
-    required_by=$(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$unit_file" | tr ',' ' ')
     for target in $required_by; do
         target_dir="$sysroot/etc/systemd/system/$target.requires"
         mkdir -p "$target_dir"
@@ -1917,6 +1939,78 @@ mod tests {
         assert!(script.contains("AVOCADO_EXT_SYSROOTS/multi-scope-ext/etc/extension-release.d"));
     }
 
+    // A drop-in supplying [Install] must actually enable the unit.
+    // String assertions can't catch a shell bug in generated code, so
+    // this runs the emitted fragment against a real sysroot.
+    #[test]
+    fn install_section_from_a_dropin_enables_the_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sysroot = tmp.path().join("sysroot");
+        let unit_dir = sysroot.join("usr/lib/systemd/system");
+        let dropin_dir = unit_dir.join("qga.service.d");
+        std::fs::create_dir_all(&dropin_dir).unwrap();
+
+        // Vendor unit with no [Install] — the case that used to fail.
+        std::fs::write(
+            unit_dir.join("qga.service"),
+            "[Unit]\nDescription=q\n[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dropin_dir.join("install.conf"),
+            "[Install]\nWantedBy=multi-user.target\n",
+        )
+        .unwrap();
+
+        let fragment = fragment_for("qga.service");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&fragment)
+            .env("AVOCADO_EXT_SYSROOTS", tmp.path())
+            .output()
+            .expect("run fragment");
+
+        assert!(
+            out.status.success(),
+            "fragment failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            sysroot
+                .join("etc/systemd/system/multi-user.target.wants/qga.service")
+                .is_symlink(),
+            "no .wants symlink created: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// Slice the generated enable-services shell for one unit out of the
+    /// full build script. The extension name doubles as the sysroot dir.
+    fn fragment_for(service: &str) -> String {
+        let cmd = ExtBuildCommand {
+            extension: "sysroot".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let script = cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &[service.to_string()],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            "/opt/src",
+        );
+        let start = script
+            .find("# Enable service file for")
+            .expect("no enable block");
+        let end = script[start..].find("\nfi").expect("no block end") + start + 3;
+        script[start..end].to_string()
+    }
+
     #[test]
     fn test_create_confext_build_script_with_services() {
         let cmd = ExtBuildCommand {
@@ -1953,12 +2047,12 @@ mod tests {
         assert!(script.contains("for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do"));
         assert!(script.contains("if [ -f \"$sysroot$unit_dir/$service\" ]; then"));
         // Check for WantedBy= parsing
-        assert!(script.contains("wanted_by=$(sed -n"));
         assert!(script.contains("/^WantedBy=/"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.wants"));
         // Check for RequiredBy= parsing
-        assert!(script.contains("required_by=$(sed -n"));
         assert!(script.contains("/^RequiredBy=/"));
+        // [Install] is collected from drop-ins too, matching systemd.
+        assert!(script.contains("$service.d/\"*.conf"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.requires"));
         // The symlink points at wherever the unit was actually found, so a unit
         // under /etc is not linked to a /usr/lib path that holds nothing.
