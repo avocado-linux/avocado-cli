@@ -5749,7 +5749,12 @@ pub fn find_active_compile_sections(
         }
     }
 
-    // Also include compile sections referenced by runtimes via kernel.compile
+    // Also include compile sections referenced by runtimes, both via
+    // `kernel.compile` and via `packages.<pkg>.compile`. Missing the latter
+    // meant a runtime package's compile section was never counted as active, so
+    // no target sysroot was provisioned and the section's own `packages:` were
+    // silently dropped -- the build then failed much later on absent target
+    // headers/libraries with nothing pointing back at the cause.
     if let Some(runtimes) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
         for (_runtime_name, runtime_val) in runtimes {
             if let Some(section_name) = runtime_val
@@ -5759,6 +5764,16 @@ pub fn find_active_compile_sections(
             {
                 if seen.insert(section_name.to_string()) {
                     active_sections.push(section_name.to_string());
+                }
+            }
+
+            if let Some(packages) = runtime_val.get("packages").and_then(|p| p.as_mapping()) {
+                for (_pkg_name, pkg_val) in packages {
+                    if let Some(section_name) = pkg_val.get("compile").and_then(|c| c.as_str()) {
+                        if seen.insert(section_name.to_string()) {
+                            active_sections.push(section_name.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -6251,6 +6266,54 @@ sdk:
         let active = find_active_compile_sections(&parsed, &no_extensions);
 
         assert_eq!(active, vec!["kernel"]);
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_via_runtime_package() {
+        // A compile section reached through `runtimes.<n>.packages.<pkg>.compile`
+        // is just as active as one reached through `kernel.compile`. Missing it
+        // meant no target sysroot was provisioned and `packages:` below were
+        // silently ignored.
+        let config_content = r#"
+runtimes:
+  dev:
+    packages:
+      avocado-runtime: '*'
+      uboot:
+        compile: uboot
+        install: uboot-install.sh
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot:
+      compile: uboot-compile.sh
+      packages:
+        libgcc-s-dev: '*'
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let no_extensions = std::collections::HashSet::new();
+
+        let active = find_active_compile_sections(&parsed, &no_extensions);
+
+        assert_eq!(active, vec!["uboot"]);
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_ignores_plain_version_packages() {
+        // `avocado-runtime: '*'` is a scalar, not a mapping -- must not panic or
+        // be mistaken for a compile reference.
+        let config_content = r#"
+runtimes:
+  dev:
+    packages:
+      avocado-runtime: '*'
+      other: '1.2.3'
+"#;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let no_extensions = std::collections::HashSet::new();
+
+        assert!(find_active_compile_sections(&parsed, &no_extensions).is_empty());
     }
 
     #[test]
