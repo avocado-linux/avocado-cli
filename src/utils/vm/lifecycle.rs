@@ -223,6 +223,13 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // and Avocado.app's settings UI both see the same value.
     let (cpus, memory_mib) = resolve_and_persist_runtime(&paths, opts.cpus, opts.memory_mib)?;
 
+    // A seed the guest still has to sync its Avocado state out of, if
+    // `vm update` left one pending. Resolved before launch so the drive
+    // is present from the first instruction — the guest does the sync
+    // in early boot, before extensions merge.
+    let pending_seed = resolve_pending_var_seed(&paths, &manifest, &artifact_dir);
+    let pending_seed_sha = pending_seed.as_ref().map(|(sha, _)| sha.clone());
+
     let cfg = QemuConfig {
         memory_mib,
         cpus,
@@ -230,6 +237,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         cmdline_extra: opts.cmdline_extra,
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
+        var_seed: pending_seed.map(|(sha256, path)| super::qemu::VarSeed { sha256, path }),
     };
 
     // The CLI is authoritative for the qemu lifecycle on every platform.
@@ -306,6 +314,15 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
                 var_target_bytes
             ),
         );
+    }
+
+    // Clear the pending-sync marker only once the guest confirms it
+    // applied this exact seed. Every other outcome — sync failed, unit
+    // absent from an older rootfs, SSH unreachable — leaves the marker
+    // set, so the next `vm start` re-attaches and retries. That retry is
+    // the entire recovery story; there is no repair path to get wrong.
+    if let Some(sha) = pending_seed_sha.as_deref() {
+        clear_pending_var_seed_if_applied(&paths, &target, sha).await;
     }
 
     // Apply persisted network config (+ any one-shot --dns override). The
@@ -679,6 +696,79 @@ fn seed_var_disk(paths: &VmPaths, manifest: &Manifest, artifact_dir: &Path) -> R
     Ok(())
 }
 
+/// Path inside the guest where the sync unit records the seed it applied.
+/// Deliberately outside `/var/lib/avocado`, so replacing that tree can't
+/// take the record with it.
+const GUEST_SEED_STAMP: &str = "/var/.avocado-seed-applied";
+
+/// Resolve a var seed the guest still owes a state sync for, as
+/// `(sha, path)`.
+///
+/// Returns `None` — leaving the live disk untouched — unless all of:
+///
+/// - `runtime.pending_var_seed_sha` is set (only `vm update` sets it, and
+///   only when the seed actually changed),
+/// - it still matches the installed manifest's seed sha. A mismatch means
+///   the config outlived the install it referred to; attaching that seed
+///   would sync state from a release the VM isn't running.
+/// - the live var disk exists. A first boot copies the new seed wholesale
+///   via `seed_var_disk`, so it is already current — and attaching the
+///   source of that copy would present two devices with one btrfs fsid.
+/// - the seed file is actually on disk.
+fn resolve_pending_var_seed(
+    paths: &VmPaths,
+    manifest: &Manifest,
+    artifact_dir: &Path,
+) -> Option<(String, PathBuf)> {
+    let pending = super::config::VmConfig::load(paths)
+        .ok()?
+        .runtime?
+        .pending_var_seed_sha?;
+
+    if !paths.var_disk().exists() {
+        return None;
+    }
+    let art = manifest.artifact("var")?;
+    if !art.sha256.eq_ignore_ascii_case(&pending) {
+        return None;
+    }
+    let path = artifact_dir.join(&art.file);
+    path.exists().then_some((pending, path))
+}
+
+/// Drop `runtime.pending_var_seed_sha` once the guest reports it applied
+/// this seed. Silent and best-effort in every failure direction: an
+/// unreported sync just retries on the next start, which is cheap
+/// (content-addressed images make a redundant sync close to a no-op) and
+/// strictly safer than clearing a marker for work that didn't happen.
+async fn clear_pending_var_seed_if_applied(
+    paths: &VmPaths,
+    target: &super::ssh::SshTarget,
+    expected_sha: &str,
+) {
+    let Ok((applied, _)) = target
+        .exec(&format!("cat {GUEST_SEED_STAMP} 2>/dev/null || true"))
+        .await
+    else {
+        return;
+    };
+    if !applied.trim().eq_ignore_ascii_case(expected_sha) {
+        crate::utils::output::print_warning(
+            "the VM did not apply the new Avocado state this boot; \
+             it will retry on the next `avocado vm start`.",
+            crate::utils::output::OutputLevel::Normal,
+        );
+        return;
+    }
+    let Ok(mut cfg) = super::config::VmConfig::load(paths) else {
+        return;
+    };
+    if let Some(rt) = cfg.runtime.as_mut() {
+        rt.pending_var_seed_sha = None;
+    }
+    let _ = cfg.save(paths);
+}
+
 fn send_signal(pid: u32, sig: libc::c_int) {
     #[cfg(unix)]
     unsafe {
@@ -1010,5 +1100,120 @@ async fn spawn_supervisor(
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest_with_var(var_file: &str, var_sha: &str) -> Manifest {
+        serde_json::from_value(json!({
+            "format": "avocado-direct",
+            "format_version": 1,
+            "platform": "avocado-qemuarm64",
+            "architecture": "arm64",
+            "artifacts": {
+                "kernel": { "file": "Image", "sha256": "00", "type": "kernel" },
+                "var": {
+                    "file": var_file,
+                    "sha256": var_sha,
+                    "type": "btrfs",
+                    "update_policy": "seed_only"
+                }
+            },
+            "cmdline_default": "console=ttyAMA0"
+        }))
+        .unwrap()
+    }
+
+    /// Builds a VM state dir + artifact dir. `pending` seeds
+    /// `runtime.pending_var_seed_sha`; `live_disk` controls whether the
+    /// VM has ever started.
+    fn fixture(
+        pending: Option<&str>,
+        live_disk: bool,
+        seed_on_disk: bool,
+    ) -> (tempfile::TempDir, VmPaths, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path().join("state"));
+        paths.ensure().unwrap();
+
+        if live_disk {
+            std::fs::write(paths.var_disk(), b"live").unwrap();
+        }
+        if let Some(sha) = pending {
+            let mut cfg = super::super::config::VmConfig::default();
+            cfg.runtime
+                .get_or_insert_with(Default::default)
+                .pending_var_seed_sha = Some(sha.to_string());
+            cfg.save(&paths).unwrap();
+        }
+
+        let artifact_dir = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        if seed_on_disk {
+            std::fs::write(artifact_dir.join("var-new.btrfs"), b"seed").unwrap();
+        }
+        (tmp, paths, artifact_dir)
+    }
+
+    #[test]
+    fn pending_seed_resolves_when_everything_lines_up() {
+        let (_t, paths, art) = fixture(Some("newsha"), true, true);
+        let got =
+            resolve_pending_var_seed(&paths, &manifest_with_var("var-new.btrfs", "newsha"), &art);
+        assert_eq!(got, Some(("newsha".to_string(), art.join("var-new.btrfs"))));
+    }
+
+    #[test]
+    fn no_marker_means_no_seed_drive() {
+        let (_t, paths, art) = fixture(None, true, true);
+        assert!(resolve_pending_var_seed(
+            &paths,
+            &manifest_with_var("var-new.btrfs", "newsha"),
+            &art
+        )
+        .is_none());
+    }
+
+    /// The fsid-collision guard. Without a live disk, `seed_var_disk`
+    /// byte-copies this very seed into place; attaching the source
+    /// alongside the copy shows the kernel two devices with one btrfs
+    /// fsid, which it reads as a single multi-device filesystem.
+    #[test]
+    fn a_never_started_vm_never_attaches_the_seed_it_was_copied_from() {
+        let (_t, paths, art) = fixture(Some("newsha"), false, true);
+        assert!(resolve_pending_var_seed(
+            &paths,
+            &manifest_with_var("var-new.btrfs", "newsha"),
+            &art
+        )
+        .is_none());
+    }
+
+    /// A marker left over from an install that has since been replaced
+    /// would sync state from a release the VM isn't running.
+    #[test]
+    fn a_marker_that_outlived_its_install_is_ignored() {
+        let (_t, paths, art) = fixture(Some("oldsha"), true, true);
+        assert!(resolve_pending_var_seed(
+            &paths,
+            &manifest_with_var("var-new.btrfs", "newsha"),
+            &art
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_missing_seed_file_is_not_attached() {
+        let (_t, paths, art) = fixture(Some("newsha"), true, false);
+        assert!(resolve_pending_var_seed(
+            &paths,
+            &manifest_with_var("var-new.btrfs", "newsha"),
+            &art
+        )
+        .is_none());
     }
 }
