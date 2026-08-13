@@ -13,6 +13,11 @@ use super::fdt;
 use super::manifest::Manifest;
 use super::state::VmPaths;
 
+/// virtio-blk serial for the read-only var seed. The guest resolves the
+/// device as `/dev/disk/by-id/virtio-<this>`; changing it breaks the
+/// guest-side sync unit, which hardcodes the same string.
+pub const VAR_SEED_SERIAL: &str = "avocado-varseed";
+
 /// Knobs the CLI passes to QEMU at launch.
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
@@ -28,6 +33,28 @@ pub struct QemuConfig {
     pub artifact_dir: PathBuf,
     /// Host path exposed to the guest as a 9p `workspace` share.
     pub workspace: PathBuf,
+    /// A var seed to attach read-only so the guest can sync its Avocado
+    /// state out of it. `None` on every boot that isn't the first one
+    /// after a seed change.
+    ///
+    /// Must never be the seed the live var disk was copied from — that
+    /// copy is byte-identical, so both would present the same btrfs
+    /// fsid and the kernel would treat them as one multi-device
+    /// filesystem. `vm update` only sets this when the sha differs,
+    /// which is exactly the case where the seeds were built separately.
+    pub var_seed: Option<VarSeed>,
+}
+
+/// A pending seed and the sha identifying it.
+///
+/// The sha rides the kernel cmdline because the guest has no other way
+/// to learn it — it names the seed on the *host*, and the guest must
+/// echo it back for `vm start` to know this exact sync landed rather
+/// than some earlier one.
+#[derive(Debug, Clone)]
+pub struct VarSeed {
+    pub sha256: String,
+    pub path: PathBuf,
 }
 
 /// Resolve the right qemu-system binary for the manifest's architecture.
@@ -120,6 +147,14 @@ pub fn build_qemu_args(
         cmdline.push_str(" systemd.tpm2_wait=false");
     }
 
+    // Name the pending seed to the guest. The sync unit echoes this back
+    // into a stamp file, which is how `vm start` distinguishes "this
+    // sync landed" from "a stamp is lying around from an earlier one"
+    // before it clears the pending marker.
+    if let Some(seed) = &cfg.var_seed {
+        cmdline.push_str(&format!(" avocado.seed_sha={}", seed.sha256));
+    }
+
     let mut args: Vec<String> = Vec::new();
 
     args.push("-machine".into());
@@ -168,6 +203,25 @@ pub fn build_qemu_args(
     if data.exists() {
         args.push("-drive".into());
         args.push(format!("file={},if=virtio,format=qcow2", data.display()));
+    }
+
+    // Var seed for a pending state sync, read-only. Attached last and
+    // addressed by serial rather than `/dev/vdN`: both drives above are
+    // conditional, so enumeration order isn't stable across boots or
+    // arches, and the guest resolves this one through
+    // /dev/disk/by-id/virtio-… instead. `if=none` plus an explicit
+    // -device is required because modern QEMU dropped `serial=` from
+    // -drive.
+    if let Some(seed) = &cfg.var_seed {
+        args.push("-drive".into());
+        args.push(format!(
+            "file={},if=none,id=varseed,format=raw,readonly=on",
+            seed.path.display()
+        ));
+        args.push("-device".into());
+        args.push(format!(
+            "virtio-blk-pci,drive=varseed,serial={VAR_SEED_SERIAL}"
+        ));
     }
 
     // Usermode networking; one port-forward to guest sshd
@@ -502,6 +556,7 @@ mod tests {
             cmdline_extra: Some("init=/sbin/init".into()),
             artifact_dir: tmp.path().to_path_buf(),
             workspace: tmp.path().to_path_buf(),
+            var_seed: None,
         };
         let args = build_qemu_args(&m, &paths, &cfg).unwrap();
         let rendered = args.join(" ");
@@ -516,6 +571,71 @@ mod tests {
         assert!(rendered.contains("org.qemu.guest_agent.0"));
         assert!(rendered.contains("readonly=on"));
         assert!(rendered.contains("mount_tag=workspace"));
+    }
+
+    fn cfg_for(tmp: &Path, var_seed: Option<VarSeed>) -> QemuConfig {
+        QemuConfig {
+            memory_mib: 2048,
+            cpus: 2,
+            ssh_port: 51234,
+            cmdline_extra: None,
+            artifact_dir: tmp.to_path_buf(),
+            workspace: tmp.to_path_buf(),
+            var_seed,
+        }
+    }
+
+    /// The overwhelmingly common boot. A seed drive here would be an
+    /// fsid collision with the live var disk it was copied from.
+    #[test]
+    fn no_seed_drive_without_a_pending_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = build_qemu_args(
+            &fake_manifest("arm64"),
+            &VmPaths::at(tmp.path()),
+            &cfg_for(tmp.path(), None),
+        )
+        .unwrap();
+        let rendered = args.join(" ");
+        assert!(!rendered.contains("varseed"), "unexpected seed: {rendered}");
+        assert!(!rendered.contains(VAR_SEED_SERIAL));
+        assert!(!rendered.contains("avocado.seed_sha"));
+    }
+
+    #[test]
+    fn seed_drive_is_read_only_and_addressed_by_serial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = tmp.path().join("var-new.btrfs");
+        std::fs::write(&seed, b"seed").unwrap();
+
+        let args = build_qemu_args(
+            &fake_manifest("arm64"),
+            &VmPaths::at(tmp.path()),
+            &cfg_for(
+                tmp.path(),
+                Some(VarSeed {
+                    sha256: "deadbeef".into(),
+                    path: seed.clone(),
+                }),
+            ),
+        )
+        .unwrap();
+        let rendered = args.join(" ");
+
+        // The guest can only learn which seed it is applying from here.
+        assert!(rendered.contains("avocado.seed_sha=deadbeef"));
+
+        assert!(rendered.contains(&format!(
+            "file={},if=none,id=varseed,format=raw,readonly=on",
+            seed.display()
+        )));
+        assert!(rendered.contains(&format!(
+            "virtio-blk-pci,drive=varseed,serial={VAR_SEED_SERIAL}"
+        )));
+        // The guest finds it by serial, so it must not be wedged in
+        // ahead of the drives whose /dev/vdN the guest fstab pins.
+        let seed_at = rendered.find("id=varseed").unwrap();
+        assert!(rendered.find("format=qcow2").is_none_or(|d| d < seed_at));
     }
 
     #[test]

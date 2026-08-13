@@ -3291,14 +3291,12 @@ async fn main() -> Result<()> {
                 channel,
                 check,
                 yes,
-                reset_var,
                 output,
             } => {
                 commands::vm::update::UpdateCommand {
                     channel,
                     check_only: check,
                     assume_yes: yes,
-                    reset_var,
                     output,
                 }
                 .execute()
@@ -4813,8 +4811,8 @@ enum VmCommands {
     },
     /// Check for and apply VM image updates from the release channel.
     /// Stops + restarts the VM if it was running. A release that ships
-    /// a new `var` image resets the VM's internal state (see
-    /// --reset-var); otherwise `var` is preserved.
+    /// a new `var` image schedules a state sync applied on the next
+    /// start; the VM's Docker volumes, SDKs and /data are preserved.
     Update {
         /// Channel name (default: `~/.avocado/config.yaml [vm].channel`,
         /// or `stable` if unset).
@@ -4823,16 +4821,9 @@ enum VmCommands {
         /// Print availability + exit without downloading.
         #[arg(long)]
         check: bool,
-        /// Skip the interactive confirmation prompt. When the release
-        /// ships a new /var image, --reset-var is also required.
+        /// Skip the interactive confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
-        /// With --yes: authorize resetting the VM's internal state
-        /// (installed SDKs, Docker volumes, /data) when the release
-        /// ships a new /var image. Interactive runs confirm at the
-        /// prompt instead.
-        #[arg(long)]
-        reset_var: bool,
         /// Output format (human prose or single JSON object).
         #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
         output: crate::utils::output_format::OutputFormat,
