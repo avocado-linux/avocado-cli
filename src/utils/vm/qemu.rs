@@ -13,11 +13,6 @@ use super::fdt;
 use super::manifest::Manifest;
 use super::state::VmPaths;
 
-/// virtio-blk serial for the read-only var seed. The guest resolves the
-/// device as `/dev/disk/by-id/virtio-<this>`; changing it breaks the
-/// guest-side sync unit, which hardcodes the same string.
-pub const VAR_SEED_SERIAL: &str = "avocado-varseed";
-
 /// Knobs the CLI passes to QEMU at launch.
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
@@ -45,15 +40,24 @@ pub struct QemuConfig {
     pub var_seed: Option<VarSeed>,
 }
 
-/// A pending seed and the sha identifying it.
+/// A pending seed, plus the two identifiers the guest needs for it.
 ///
-/// The sha rides the kernel cmdline because the guest has no other way
-/// to learn it — it names the seed on the *host*, and the guest must
-/// echo it back for `vm start` to know this exact sync landed rather
-/// than some earlier one.
+/// `sha256` rides the kernel cmdline because the guest has no other way
+/// to learn it — it names the seed on the *host*, and the guest echoes
+/// it back so `vm start` knows this exact sync landed rather than an
+/// earlier one.
+///
+/// `fsid` is the seed's btrfs filesystem UUID, so the guest can find the
+/// disk by `/dev/disk/by-uuid/` instead of guessing a `/dev/vdN`. It is
+/// deliberately *not* a virtio serial: giving the seed an explicit
+/// `-device` moved it ahead of the `if=virtio` drives in PCI order, so
+/// the seed became `/dev/vda` and the rootfs and var disks shifted out
+/// from under `root=/dev/vda` and the guest's fstab. Keeping every drive
+/// on `if=virtio` makes attaching one purely additive.
 #[derive(Debug, Clone)]
 pub struct VarSeed {
     pub sha256: String,
+    pub fsid: String,
     pub path: PathBuf,
 }
 
@@ -152,7 +156,10 @@ pub fn build_qemu_args(
     // sync landed" from "a stamp is lying around from an earlier one"
     // before it clears the pending marker.
     if let Some(seed) = &cfg.var_seed {
-        cmdline.push_str(&format!(" avocado.seed_sha={}", seed.sha256));
+        cmdline.push_str(&format!(
+            " avocado.seed_sha={} avocado.seed_fsid={}",
+            seed.sha256, seed.fsid
+        ));
     }
 
     let mut args: Vec<String> = Vec::new();
@@ -205,22 +212,21 @@ pub fn build_qemu_args(
         args.push(format!("file={},if=virtio,format=qcow2", data.display()));
     }
 
-    // Var seed for a pending state sync, read-only. Attached last and
-    // addressed by serial rather than `/dev/vdN`: both drives above are
-    // conditional, so enumeration order isn't stable across boots or
-    // arches, and the guest resolves this one through
-    // /dev/disk/by-id/virtio-… instead. `if=none` plus an explicit
-    // -device is required because modern QEMU dropped `serial=` from
-    // -drive.
+    // Var seed for a pending state sync, read-only, appended last.
+    //
+    // Must stay `if=virtio` like the drives above. An explicit
+    // `-device virtio-blk-pci` takes a lower PCI slot than the devices
+    // qemu creates for `if=virtio`, so the seed became /dev/vda and
+    // pushed the rootfs and var disks along — breaking both
+    // `root=/dev/vda` on the cmdline and `/dev/vdb /var` in the guest
+    // fstab, which drops the VM into emergency mode. Appending an
+    // `if=virtio` drive is purely additive; the guest finds this one by
+    // filesystem UUID rather than by position.
     if let Some(seed) = &cfg.var_seed {
         args.push("-drive".into());
         args.push(format!(
-            "file={},if=none,id=varseed,format=raw,readonly=on",
+            "file={},if=virtio,format=raw,readonly=on",
             seed.path.display()
-        ));
-        args.push("-device".into());
-        args.push(format!(
-            "virtio-blk-pci,drive=varseed,serial={VAR_SEED_SERIAL}"
         ));
     }
 
@@ -597,9 +603,13 @@ mod tests {
         )
         .unwrap();
         let rendered = args.join(" ");
-        assert!(!rendered.contains("varseed"), "unexpected seed: {rendered}");
-        assert!(!rendered.contains(VAR_SEED_SERIAL));
         assert!(!rendered.contains("avocado.seed_sha"));
+        assert!(!rendered.contains("avocado.seed_fsid"));
+        // Only the rootfs in this fixture (var/data are conditional on
+        // the files existing). The pair with the seed test below is the
+        // point: attaching a seed adds exactly one drive and never
+        // renumbers the ones the cmdline and guest fstab pin.
+        assert_eq!(rendered.matches("if=virtio,format=raw").count(), 1);
     }
 
     #[test]
@@ -615,6 +625,7 @@ mod tests {
                 tmp.path(),
                 Some(VarSeed {
                     sha256: "deadbeef".into(),
+                    fsid: "fed386a1-f288-4748-8c91-f614242e0410".into(),
                     path: seed.clone(),
                 }),
             ),
@@ -622,20 +633,25 @@ mod tests {
         .unwrap();
         let rendered = args.join(" ");
 
-        // The guest can only learn which seed it is applying from here.
+        // The guest can only learn these from here.
         assert!(rendered.contains("avocado.seed_sha=deadbeef"));
+        assert!(rendered.contains("avocado.seed_fsid=fed386a1-f288-4748-8c91-f614242e0410"));
 
         assert!(rendered.contains(&format!(
-            "file={},if=none,id=varseed,format=raw,readonly=on",
+            "file={},if=virtio,format=raw,readonly=on",
             seed.display()
         )));
-        assert!(rendered.contains(&format!(
-            "virtio-blk-pci,drive=varseed,serial={VAR_SEED_SERIAL}"
-        )));
-        // The guest finds it by serial, so it must not be wedged in
-        // ahead of the drives whose /dev/vdN the guest fstab pins.
-        let seed_at = rendered.find("id=varseed").unwrap();
-        assert!(rendered.find("format=qcow2").is_none_or(|d| d < seed_at));
+        // No explicit -device: one takes a lower PCI slot than the
+        // if=virtio drives, which made the seed /dev/vda and shifted the
+        // rootfs out from under `root=/dev/vda`.
+        assert!(!rendered.contains("virtio-blk-pci,drive="));
+        // The seed must come after the rootfs, so attaching it cannot
+        // renumber the disks the cmdline and fstab pin by position.
+        let rootfs_at = rendered.find("rootfs").expect("rootfs drive");
+        let seed_at = rendered.find(&seed.display().to_string()).unwrap();
+        assert!(rootfs_at < seed_at, "seed must not precede the rootfs");
+        // One more drive than the no-seed case, and no more.
+        assert_eq!(rendered.matches("if=virtio,format=raw").count(), 2);
     }
 
     #[test]

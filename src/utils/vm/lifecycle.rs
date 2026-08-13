@@ -237,7 +237,11 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         cmdline_extra: opts.cmdline_extra,
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
-        var_seed: pending_seed.map(|(sha256, path)| super::qemu::VarSeed { sha256, path }),
+        var_seed: pending_seed.and_then(|(sha256, path)| {
+            // No fsid, no way for the guest to find the disk — so skip
+            // attaching rather than hand it one it cannot identify.
+            btrfs_fsid(&path).map(|fsid| super::qemu::VarSeed { sha256, fsid, path })
+        }),
     };
 
     // The CLI is authoritative for the qemu lifecycle on every platform.
@@ -700,6 +704,31 @@ fn seed_var_disk(paths: &VmPaths, manifest: &Manifest, artifact_dir: &Path) -> R
     std::fs::copy(&src, &dest)
         .with_context(|| format!("seed var.btrfs: {} → {}", src.display(), dest.display()))?;
     Ok(())
+}
+
+/// Read a btrfs filesystem UUID straight out of an image.
+///
+/// The superblock sits at a fixed 64 KiB offset with the fsid 32 bytes
+/// into it, so this is a 16-byte read. Done by hand rather than shelling
+/// out to `blkid` because the hosts that run this VM are macOS and
+/// Windows, where there is no blkid and no btrfs at all.
+fn btrfs_fsid(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SUPERBLOCK_FSID_OFFSET: u64 = 0x1_0020;
+
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(SUPERBLOCK_FSID_OFFSET)).ok()?;
+    let mut b = [0u8; 16];
+    f.read_exact(&mut b).ok()?;
+    let hex = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        hex(&b[0..4]),
+        hex(&b[4..6]),
+        hex(&b[6..8]),
+        hex(&b[8..10]),
+        hex(&b[10..16])
+    ))
 }
 
 /// Path inside the guest where the sync unit records the seed it applied.
