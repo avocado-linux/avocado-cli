@@ -172,6 +172,25 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     sed -i '/^AVOCADO_OS_BUILD_ID=/d' "$ROOTFS_SYSROOT/usr/lib/os-release"
     echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_SYSROOT/usr/lib/os-release"
 
+    # Purge package-manager bookkeeping from the work copy before imaging.
+    #
+    # dnf installs into the sysroot leave ~13MB of state behind (measured on a
+    # qemux86-64 rootfs: 2.0M rpmdb, 6.4M var/cache/dnf). Nothing on target
+    # consumes it — there is no runtime package manager — and it is what keeps
+    # the image from being reproducible: the rpmdb records INSTALLTIME and
+    # INSTALLTID per package, var/lib/dnf/history.sqlite records the
+    # transaction, and var/cache/dnf holds generated repodata plus solvfiles.
+    # While those are in the tree, two installs of the same package set never
+    # produce identical image bytes.
+    #
+    # Runs after post_install so state left by a hook's own dnf call is caught
+    # too. Safe for identity and for extension priming: the build ID above
+    # queries $ROOTFS_SYSROOT, and the installroot seeding in `ext install` /
+    # `runtime install` copies from $AVOCADO_PREFIX/rootfs — all the pristine
+    # sysroot, never this work copy.
+    echo "Purging package-manager state from rootfs image"
+    rm -rf "$ROOTFS_WORK/var/lib/rpm" "$ROOTFS_WORK/var/lib/dnf" "$ROOTFS_WORK/var/cache/dnf"
+
     # Build rootfs image using configured filesystem format
     ROOTFS_FS="{rootfs_filesystem}"
     ROOTFS_OUTPUT="$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.$ROOTFS_FS"
@@ -543,6 +562,42 @@ mod tests {
             script.contains("avocado prune"),
             "script must also point at `avocado prune`, since clean alone does not \
              clear abandoned volumes that can shadow a build"
+        );
+    }
+
+    #[test]
+    fn test_rootfs_purges_package_manager_state_before_imaging() {
+        // Regression: ~13MB of dnf/rpm bookkeeping was being imaged into the
+        // rootfs. Nothing on target consumes it, and it blocked reproducible
+        // images — the rpmdb stamps INSTALLTIME/INSTALLTID per package and
+        // var/cache/dnf holds generated repodata, so the same package set
+        // produced different image bytes on every install.
+        let script = generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            "",
+        );
+
+        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+            assert!(
+                script.contains(&format!("\"$ROOTFS_WORK/{path}\"")),
+                "{path} must be purged from the work copy before imaging"
+            );
+        }
+
+        // The purge only helps if it runs before the image is built.
+        let purge_at = script
+            .find("Purging package-manager state")
+            .expect("purge step present");
+        let mkfs_at = script.find("mkfs.erofs").expect("mkfs step present");
+        assert!(purge_at < mkfs_at, "purge must precede mkfs");
+
+        // The shared sysroot keeps its rpmdb: the build ID reads it, and so
+        // does the installroot seeding in `ext install` / `runtime install`.
+        assert!(
+            !script.contains("$ROOTFS_SYSROOT/var/lib/rpm"),
+            "the shared sysroot's rpmdb must not be removed"
         );
     }
 
