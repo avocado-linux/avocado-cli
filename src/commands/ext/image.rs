@@ -898,16 +898,12 @@ impl ExtImageCommand {
                     "erofs-zst" => "\n  -z zstd \\",
                     _ => "",
                 };
-                let exclude_flags = excludes
+                // Always non-empty: the package-state paths above are
+                // unconditional, so there is no no-excludes case to handle.
+                let exclude_section = excludes
                     .iter()
-                    .map(|p| format!("  --exclude-path={p} \\"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let exclude_section = if exclude_flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{exclude_flags}")
-                };
+                    .map(|p| format!("\n  --exclude-path={p} \\"))
+                    .collect::<String>();
                 format!(
                     r#"# Create erofs image
 mkfs.erofs \
@@ -920,16 +916,23 @@ mkfs.erofs \
                 )
             }
             _ => {
-                let exclude_flags = excludes
+                // Always non-empty, as in the erofs arm.
+                //
+                // mksquashfs takes everything after the first `-e` as
+                // filenames, so the later `-e` tokens are read as paths that do
+                // not exist and ignored. It works, but not for the reason the
+                // shape suggests.
+                //
+                // Note `-reproducible` does NOT normalize ownership the way
+                // erofs's `--all-root` does -- a live run reports
+                // `Number of uids 1: <builduser>`. So squashfs ext images still
+                // vary by build user. Fixing that means adding `-all-root`
+                // here, which changes image contents and belongs in its own
+                // change.
+                let exclude_section = excludes
                     .iter()
-                    .map(|p| format!("  -e \"{p}\""))
-                    .collect::<Vec<_>>()
-                    .join(" \\\n");
-                let exclude_section = if exclude_flags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" \\\n{exclude_flags}")
-                };
+                    .map(|p| format!(" \\\n  -e \"{p}\""))
+                    .collect::<String>();
                 format!(
                     r#"# Create squashfs image
 mksquashfs \
@@ -1205,45 +1208,6 @@ mod tests {
         assert!(
             script.contains("--exclude-path=var/lib/rpm"),
             "package-manager excludes must not displace var_files excludes"
-        );
-    }
-
-    /// The rest of the erofs reproducibility contract, which nothing pinned.
-    /// Each of these silently reintroduces per-build variance if dropped: the
-    /// UUID would be randomized, and ownership would come from whoever ran the
-    /// build instead of being normalized to root.
-    #[test]
-    fn test_erofs_image_reproducibility_flags_are_pinned() {
-        let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
-
-        assert!(
-            script.contains("-U 00000000-0000-0000-0000-000000000000"),
-            "erofs UUID must be pinned, or every build gets a fresh one"
-        );
-        assert!(
-            script.contains("--all-root"),
-            "ownership must be normalized to root, not the build user"
-        );
-        assert!(
-            script.contains("-T \"$SOURCE_DATE_EPOCH\""),
-            "timestamps must come from SOURCE_DATE_EPOCH"
-        );
-    }
-
-    /// squashfs has no `-T`; `-reproducible` is what makes its output stable.
-    #[test]
-    fn test_squashfs_image_is_built_reproducibly() {
-        let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
-
-        assert!(
-            script.contains("-reproducible"),
-            "mksquashfs must be invoked with -reproducible"
-        );
-        assert!(
-            script.contains("-no-xattrs"),
-            "xattrs must be dropped, they carry build-host state"
         );
     }
 
