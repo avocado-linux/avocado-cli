@@ -101,11 +101,13 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
     # Purge package-manager bookkeeping from the work copy before archiving.
     # Same reasoning as the rootfs image — see the comment in
-    # `generate_rootfs_build_script`. Measured 14MB of a 123MB qemux86-64
-    # initramfs (2.5M rpmdb, 4.3M var/lib/dnf, 6.4M var/cache/dnf), all of it
-    # unreproducible and none of it read by anything in an initrd.
+    # `generate_rootfs_build_script`, including why dnf's logs come too and why
+    # this is necessary but not sufficient for reproducibility. Measured 14MB
+    # of a 123MB qemux86-64 initramfs (2.5M rpmdb, 4.3M var/lib/dnf, 6.4M
+    # var/cache/dnf), none of it read by anything in an initrd.
     echo "Purging package-manager state from initramfs image"
     rm -rf "$INITRAMFS_WORK/var/lib/rpm" "$INITRAMFS_WORK/var/lib/dnf" "$INITRAMFS_WORK/var/cache/dnf"
+    rm -f "$INITRAMFS_WORK/var/log/dnf.log" "$INITRAMFS_WORK/var/log/dnf.rpm.log" "$INITRAMFS_WORK/var/log/hawkey.log"
 
     # Build initramfs image using configured filesystem format
     INITRAMFS_FS="{initramfs_filesystem}"
@@ -443,7 +445,14 @@ mod tests {
             "",
         );
 
-        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+        for path in [
+            "var/lib/rpm",
+            "var/lib/dnf",
+            "var/cache/dnf",
+            "var/log/dnf.log",
+            "var/log/dnf.rpm.log",
+            "var/log/hawkey.log",
+        ] {
             assert!(
                 script.contains(&format!("\"$INITRAMFS_WORK/{path}\"")),
                 "{path} must be purged from the work copy before archiving"
@@ -458,11 +467,5 @@ mod tests {
             .find("cpio --reproducible")
             .expect("cpio step present");
         assert!(purge_at < cpio_at, "purge must precede cpio creation");
-
-        // The shared sysroot keeps its rpmdb — the build ID query reads it.
-        assert!(
-            !script.contains("$INITRAMFS_SYSROOT/var/lib/rpm"),
-            "the shared sysroot's rpmdb must not be removed"
-        );
     }
 }

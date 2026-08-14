@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second field.
 
 ### Changed
+- **Rootfs and initramfs images no longer ship package-manager state.** The
+  rpmdb, `var/lib/dnf`, `var/cache/dnf` and dnf's own logs (`dnf.log`,
+  `dnf.rpm.log`, `hawkey.log`) are removed from the staged copy before the
+  image is built — measured at ~13MB of a qemux86-64 rootfs and 14MB of a
+  123MB initramfs. Nothing on target reads any of it; these systems have no
+  runtime package manager. Only the staged copy is touched, so the shared
+  sysroot keeps its database and `ext install` / `runtime install` still seed
+  their installroots from it.
+
+  Anything inspecting a built image for installed packages — `rpm -qa` against
+  a loop-mounted rootfs, say — needs to query the sysroot or the lockfile
+  instead. This is a necessary step toward reproducible images but not a
+  sufficient one on its own; archive mtime normalization is separate.
 - **A skipped remote version check no longer reports as a passed one.** When
   the remote's `--version` output cannot be parsed, `--runs-on` used to print
   `[SUCCESS] Remote avocado version: <whatever it read>`, which is a green line
