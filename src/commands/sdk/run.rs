@@ -11,6 +11,7 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    shell::shell_escape,
     target::validate_and_log_target,
 };
 
@@ -20,7 +21,7 @@ use crate::utils::{
 /// element must be quoted or the container shell re-splits it.
 fn join_argv(argv: &[String]) -> String {
     argv.iter()
-        .map(|a| crate::utils::runs_on::shell_escape(a))
+        .map(|a| shell_escape(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -272,7 +273,7 @@ impl SdkRunCommand {
         // Require either a command or --interactive flag
         if !self.interactive && self.command.is_none() {
             return Err(anyhow::anyhow!(
-                "You must either provide a --command (-c) or use --interactive (-i)."
+                "You must either provide a command to run or use --interactive (-i)."
             ));
         }
 
@@ -529,7 +530,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("You must either provide a --command"));
+            .contains("You must either provide a command to run"));
     }
 
     #[test]
