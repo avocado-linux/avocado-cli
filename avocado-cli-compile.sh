@@ -69,11 +69,13 @@ EOF
 # Arch-agnostic: the triple comes from $CROSS_COMPILE, no hardcoded value.
 CROSS_BINDIR="$OECORE_NATIVE_SYSROOT/usr/bin/${CROSS_COMPILE%-}"
 
-# Check the binary `cc` will actually run: it takes the FIRST token of $CC (the
-# rest are target flags) and falls back to guessing "<triple>-gcc" when $CC is
-# unset. Hardcoding gcc here would also abort a working clang SDK.
-CC_BIN="${CC:-${CROSS_COMPILE}gcc}"
-CC_BIN="${CC_BIN%% *}"
+# Name the compiler from $CROSS_COMPILE rather than parsing $CC. oe-core writes
+# both from ${TARGET_PREFIX} in toolchain-scripts.bbclass, so $CC's first token
+# is byte-identical to this in every SDK we ship against, and meta-clang only
+# appends CLANGCC without overriding CC. Deriving it from $CC bought nothing and
+# mis-read three real inputs: an empty first token (making -x test the bindir
+# itself, so the guard passed), a ccache/distcc wrapper, and an absolute path.
+CC_BIN="${CROSS_COMPILE}gcc"
 if [ ! -x "$CROSS_BINDIR/$CC_BIN" ]; then
     echo "Error: cross compiler '$CC_BIN' not found in $CROSS_BINDIR" >&2
     echo "The SDK is missing the C cross-canadian toolchain. An SDK installed" >&2
