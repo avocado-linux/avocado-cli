@@ -18,6 +18,7 @@ use crate::utils::remote::{
     get_local_ip_for_remote, version_check_notice, RemoteHost, RemoteVolumeManager, SshClient,
     SshControlMaster, VersionNotice,
 };
+use crate::utils::shell::shell_escape;
 
 #[cfg(unix)]
 use crate::utils::remote::SshTunnel;
@@ -689,38 +690,5 @@ impl RunsOnContext {
         println!();
 
         Ok(())
-    }
-}
-
-/// Shell escape a string for safe use in a shell command
-pub(crate) fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_shell_escape_simple() {
-        assert_eq!(shell_escape("hello"), "'hello'");
-    }
-
-    #[test]
-    fn test_shell_escape_with_spaces() {
-        assert_eq!(shell_escape("hello world"), "'hello world'");
-    }
-
-    #[test]
-    fn test_shell_escape_with_quotes() {
-        assert_eq!(shell_escape("it's"), "'it'\\''s'");
-    }
-
-    #[test]
-    fn test_shell_escape_complex() {
-        assert_eq!(
-            shell_escape("echo 'hello' && rm -rf /"),
-            "'echo '\\''hello'\\'' && rm -rf /'"
-        );
     }
 }
