@@ -99,6 +99,16 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
         echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
     fi
 
+    # Purge package-manager bookkeeping from the work copy before archiving.
+    # Same reasoning as the rootfs image — see the comment in
+    # `generate_rootfs_build_script`, including why dnf's logs come too and why
+    # this is necessary but not sufficient for reproducibility. Measured 14MB
+    # of a 123MB qemux86-64 initramfs (2.5M rpmdb, 4.3M var/lib/dnf, 6.4M
+    # var/cache/dnf), none of it read by anything in an initrd.
+    echo "Purging package-manager state from initramfs image"
+    rm -rf "$INITRAMFS_WORK/var/lib/rpm" "$INITRAMFS_WORK/var/lib/dnf" "$INITRAMFS_WORK/var/cache/dnf"
+    rm -f "$INITRAMFS_WORK/var/log/dnf.log" "$INITRAMFS_WORK/var/log/dnf.rpm.log" "$INITRAMFS_WORK/var/log/hawkey.log"
+
     # Build initramfs image using configured filesystem format
     INITRAMFS_FS="{initramfs_filesystem}"
     INITRAMFS_OUTPUT="$OUTPUT_DIR/avocado-image-initramfs-$TARGET_ARCH.$INITRAMFS_FS"
@@ -414,5 +424,48 @@ export AVOCADO_OS_VERSION_ID
 
         print_success("Built initramfs image.", OutputLevel::Normal);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the staged initramfs carried 14MB of dnf/rpm state (2.5M
+    /// rpmdb, 4.3M var/lib/dnf, 6.4M var/cache/dnf) into the cpio. Nothing in
+    /// an initrd reads it, and it made the archive unreproducible — the rpmdb
+    /// records INSTALLTIME/INSTALLTID per package and var/cache/dnf holds
+    /// generated repodata, so the same package set produced different bytes.
+    #[test]
+    fn test_initramfs_purges_package_manager_state_before_archiving() {
+        let script = generate_initramfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "cpio.zst",
+            None,
+            "",
+        );
+
+        for path in [
+            "var/lib/rpm",
+            "var/lib/dnf",
+            "var/cache/dnf",
+            "var/log/dnf.log",
+            "var/log/dnf.rpm.log",
+            "var/log/hawkey.log",
+        ] {
+            assert!(
+                script.contains(&format!("\"$INITRAMFS_WORK/{path}\"")),
+                "{path} must be purged from the work copy before archiving"
+            );
+        }
+
+        // The purge only helps if it runs before the archive is created.
+        let purge_at = script
+            .find("Purging package-manager state")
+            .expect("purge step present");
+        let cpio_at = script
+            .find("cpio --reproducible")
+            .expect("cpio step present");
+        assert!(purge_at < cpio_at, "purge must precede cpio creation");
     }
 }
