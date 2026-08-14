@@ -49,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that collapse is what let an unparseable version fall through as a pass.
 
 ### Fixed
+- **`source_date_epoch` is honored outside extension images.** The key was
+  read only by `ext image`, which exports it inside its own script. The rootfs
+  build script has always passed `-T "${SOURCE_DATE_EPOCH:-0}"` to
+  `mkfs.erofs`, but nothing ever set the variable, so a project that
+  configured an epoch got a reproducibility stamp on its `.raw` extensions and
+  a silently ignored key everywhere else — including in `post_build` hooks,
+  which run in their own container. Rootfs, initramfs and `post_build` runs
+  now all carry it.
+
+  Note the key still behaves two ways by design: absent config leaves the
+  variable unset for rootfs/initramfs/`post_build`, because
+  `SOURCE_DATE_EPOCH` changes the behavior of tools well beyond ours (gzip,
+  tar, python bytecode) and hooks should not inherit that unasked. `ext image`
+  continues to export `0`.
 - **Rootfs and initramfs no longer reinstall on every run.** `avocado sdk
   install` wiped and rebuilt both sysroots from scratch on every invocation,
   even with nothing changed. Removal detection compared the lockfile against
