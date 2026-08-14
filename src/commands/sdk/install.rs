@@ -343,8 +343,14 @@ impl SdkInstallCommand {
         // Discover whether target-dev sysroot is needed (compile sections from
         // fetched external extensions). Prepare the command BEFORE launching
         // the parallel sysroot installs so all four can run concurrently.
-        let active_compile_sections =
-            find_active_compile_sections(&composed.merged_value, active_extensions);
+        let active_compile_sections = find_active_compile_sections(
+            config,
+            &composed.merged_value,
+            active_extensions,
+            target,
+            &composed.config_path,
+            None,
+        )?;
         // An extension declaring device-tree overlays needs the delivery
         // hook in the target-sysroot, so provision the target-sysroot even when
         // there is no compile section (a no-#include overlay needs no kernel-devsrc).

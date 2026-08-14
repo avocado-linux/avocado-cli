@@ -176,6 +176,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SOURCE_DATE_EPOCH` changes the behavior of tools well beyond ours (gzip,
   tar, python bytecode) and hooks should not inherit that unasked. `ext image`
   continues to export `0`.
+- **A runtime package's `compile:` section now counts as active.** Only
+  `kernel.compile` and extension packages were scanned, so a section reached
+  through `runtimes.<name>.packages.<pkg>.compile` was treated as unused: no
+  target-dev sysroot was provisioned and the section's own `packages:` were
+  dropped without a word. The build then failed much later on missing target
+  headers or libraries, with nothing pointing back at the cause.
+
+  That scan is also scoped to the current target now, the way the sibling
+  extension scan already was. It previously read every runtime in the file
+  regardless of `runtimes.<name>.target` or `--runtime`, which in a
+  multi-target config provisioned target-dev for runtimes the user had not
+  asked to build.
 - **Rootfs and initramfs no longer reinstall on every run.** `avocado sdk
   install` wiped and rebuilt both sysroots from scratch on every invocation,
   even with nothing changed. Removal detection compared the lockfile against
