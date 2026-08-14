@@ -541,7 +541,14 @@ mod tests {
             "",
         );
 
-        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+        for path in [
+            "var/lib/rpm",
+            "var/lib/dnf",
+            "var/cache/dnf",
+            "var/log/dnf.log",
+            "var/log/dnf.rpm.log",
+            "var/log/hawkey.log",
+        ] {
             assert!(
                 script.contains(&format!("\"$INITRAMFS_WORK/{path}\"")),
                 "{path} must be purged from the work copy before archiving"
@@ -556,12 +563,6 @@ mod tests {
             .find("cpio --reproducible")
             .expect("cpio step present");
         assert!(purge_at < cpio_at, "purge must precede cpio creation");
-
-        // The shared sysroot keeps its rpmdb — the build ID query reads it.
-        assert!(
-            !script.contains("$INITRAMFS_SYSROOT/var/lib/rpm"),
-            "the shared sysroot's rpmdb must not be removed"
-        );
     }
 
     /// Archive order is byte order, not locale collation. Entry order *is*

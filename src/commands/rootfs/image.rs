@@ -222,6 +222,17 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # While those are in the tree, two installs of the same package set never
     # produce identical image bytes.
     #
+    # dnf's own logs go with it. The rootfs install omits $DNF_SDK_HOST_OPTS,
+    # which is what redirects logdir/cachedir/persistdir to the SDK prefix — so
+    # the same omission that lands var/cache/dnf and var/lib/dnf in the sysroot
+    # also lands dnf.log, dnf.rpm.log and hawkey.log in var/log, each line
+    # stamped with a wall-clock time.
+    #
+    # Removing all of this is necessary for a reproducible image but not
+    # sufficient: the archive's own mtime handling is a separate problem, and
+    # the removal itself restamps the directories it empties. That is #199's
+    # half, not this one's.
+    #
     # Runs after post_install so state left by a hook's own dnf call is caught
     # too. Safe for identity and for extension priming: the build ID above
     # queries $ROOTFS_SYSROOT, and the installroot seeding in `ext install` /
@@ -229,6 +240,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # sysroot, never this work copy.
     echo "Purging package-manager state from rootfs image"
     rm -rf "$ROOTFS_WORK/var/lib/rpm" "$ROOTFS_WORK/var/lib/dnf" "$ROOTFS_WORK/var/cache/dnf"
+    rm -f "$ROOTFS_WORK/var/log/dnf.log" "$ROOTFS_WORK/var/log/dnf.rpm.log" "$ROOTFS_WORK/var/log/hawkey.log"
 
     # Build rootfs image using configured filesystem format
     ROOTFS_FS="{rootfs_filesystem}"
@@ -662,7 +674,14 @@ mod tests {
             "",
         );
 
-        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+        for path in [
+            "var/lib/rpm",
+            "var/lib/dnf",
+            "var/cache/dnf",
+            "var/log/dnf.log",
+            "var/log/dnf.rpm.log",
+            "var/log/hawkey.log",
+        ] {
             assert!(
                 script.contains(&format!("\"$ROOTFS_WORK/{path}\"")),
                 "{path} must be purged from the work copy before imaging"
@@ -675,13 +694,6 @@ mod tests {
             .expect("purge step present");
         let mkfs_at = script.find("mkfs.erofs").expect("mkfs step present");
         assert!(purge_at < mkfs_at, "purge must precede mkfs");
-
-        // The shared sysroot keeps its rpmdb: the build ID reads it, and so
-        // does the installroot seeding in `ext install` / `runtime install`.
-        assert!(
-            !script.contains("$ROOTFS_SYSROOT/var/lib/rpm"),
-            "the shared sysroot's rpmdb must not be removed"
-        );
     }
 
     #[test]

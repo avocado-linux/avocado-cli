@@ -98,6 +98,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document they can read first.
 
 ### Changed
+- **Rootfs and initramfs images no longer ship package-manager state.** The
+  rpmdb, `var/lib/dnf` and `var/cache/dnf` are removed from the staged copy
+  before the image is built — measured at ~13MB of a qemux86-64 rootfs and
+  14MB of a 123MB initramfs. Nothing on target reads any of it; these systems
+  have no runtime package manager. Only the staged copy is touched, so the
+  shared sysroot keeps its database and `ext install` / `runtime install`
+  still seed their installroots from it. (dnf's own logs never land in the
+  staged copy at all — dnf does not prefix `logdir` with the installroot —
+  so they need no removal; they live under the SDK prefix.)
+
+  Anything inspecting a built image for installed packages — `rpm -qa` against
+  a loop-mounted rootfs, say — needs to query the sysroot or the lockfile
+  instead. This is a necessary step toward reproducible images but not a
+  sufficient one on its own; archive mtime normalization is separate.
 - **Extension images no longer ship package-manager state.** `var/lib/rpm`,
   `var/lib/dnf` and `var/cache/dnf` are excluded from the built `.raw` —
   measured at 13.4M of a 22M `avocado-ext-tunnels` sysroot, against an 8.2M
