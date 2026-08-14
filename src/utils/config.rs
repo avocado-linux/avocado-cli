@@ -5726,17 +5726,22 @@ pub fn find_active_extensions(
 }
 
 /// Find the set of sdk.compile section names that are referenced by active extensions
-/// or by any runtime's `kernel.compile` field.
+/// or by the runtimes relevant to `target`.
 ///
 /// This examines:
 /// - The `packages` section of each active extension for `compile:` references
-/// - The `kernel.compile` field of every runtime
+/// - The `kernel.compile` and `packages.<pkg>.compile` fields of each runtime
+///   that `target` (and `requested_runtime`, when given) selects
 ///
 /// returning only the compile section names that are actually needed.
 pub fn find_active_compile_sections(
+    config: &Config,
     parsed: &serde_yaml::Value,
     active_extensions: &std::collections::HashSet<String>,
-) -> Vec<String> {
+    target: &str,
+    config_path: &str,
+    requested_runtime: Option<&str>,
+) -> Result<Vec<String>> {
     let mut active_sections = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -5755,8 +5760,20 @@ pub fn find_active_compile_sections(
     // no target sysroot was provisioned and the section's own `packages:` were
     // silently dropped -- the build then failed much later on absent target
     // headers/libraries with nothing pointing back at the cause.
+    //
+    // Scoped to the runtimes this target selects, the same way
+    // `find_active_extensions` scopes its own scan. Reading every runtime here
+    // provisions target-dev for runtimes belonging to some other target, which
+    // is wasted work at best and the wrong toolchain at worst.
+    let target_runtimes =
+        find_target_relevant_runtimes(config, parsed, target, config_path, requested_runtime)?;
+
     if let Some(runtimes) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
-        for (_runtime_name, runtime_val) in runtimes {
+        for runtime_name in &target_runtimes {
+            let Some(runtime_val) = runtimes.get(runtime_name.as_str()) else {
+                continue;
+            };
+
             if let Some(section_name) = runtime_val
                 .get("kernel")
                 .and_then(|k| k.get("compile"))
@@ -5780,7 +5797,7 @@ pub fn find_active_compile_sections(
     }
 
     active_sections.sort();
-    active_sections
+    Ok(active_sections)
 }
 
 #[cfg(test)]
@@ -6242,6 +6259,23 @@ extensions:
         assert!(result.is_err());
     }
 
+    /// Load `config_content` as a real Config and resolve its active compile
+    /// sections for `target`, the way `sdk install` does.
+    fn active_compile_sections_for(
+        config_content: &str,
+        active_extensions: &std::collections::HashSet<String>,
+        target: &str,
+    ) -> Vec<String> {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = Config::load(temp_file.path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        find_active_compile_sections(&config, &parsed, active_extensions, target, &path, None)
+            .unwrap()
+    }
+
     #[test]
     fn test_find_active_compile_sections_via_runtime_kernel() {
         let config_content = r#"
@@ -6260,10 +6294,9 @@ sdk:
         glibc-dev: '*'
         libelf1: '*'
 "#;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let no_extensions = std::collections::HashSet::new();
 
-        let active = find_active_compile_sections(&parsed, &no_extensions);
+        let active = active_compile_sections_for(config_content, &no_extensions, "qemux86-64");
 
         assert_eq!(active, vec!["kernel"]);
     }
@@ -6291,10 +6324,9 @@ sdk:
       packages:
         libgcc-s-dev: '*'
 "#;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let no_extensions = std::collections::HashSet::new();
 
-        let active = find_active_compile_sections(&parsed, &no_extensions);
+        let active = active_compile_sections_for(config_content, &no_extensions, "qemux86-64");
 
         assert_eq!(active, vec!["uboot"]);
     }
@@ -6310,10 +6342,11 @@ runtimes:
       avocado-runtime: '*'
       other: '1.2.3'
 "#;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let no_extensions = std::collections::HashSet::new();
 
-        assert!(find_active_compile_sections(&parsed, &no_extensions).is_empty());
+        assert!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64").is_empty()
+        );
     }
 
     #[test]
@@ -6337,14 +6370,52 @@ sdk:
     kernel:
       compile: kernel-compile.sh
 "#;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let mut active_exts = std::collections::HashSet::new();
         active_exts.insert("my-ext".to_string());
 
-        let active = find_active_compile_sections(&parsed, &active_exts);
+        let active = active_compile_sections_for(config_content, &active_exts, "qemux86-64");
 
         assert_eq!(active.len(), 1);
         assert_eq!(active[0], "kernel");
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_scopes_to_the_target() {
+        // Each runtime declares its own target. Scanning for one target must
+        // not drag in the other's compile section: that provisions a target-dev
+        // sysroot for a runtime the user did not ask to build, with the wrong
+        // toolchain for the one they did.
+        let config_content = r#"
+runtimes:
+  board-a:
+    target: qemux86-64
+    packages:
+      uboot:
+        compile: uboot-x86
+  board-b:
+    target: raspberrypi4
+    packages:
+      uboot:
+        compile: uboot-rpi4
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot-x86:
+      compile: uboot-compile.sh
+    uboot-rpi4:
+      compile: uboot-compile.sh
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64"),
+            vec!["uboot-x86"]
+        );
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "raspberrypi4"),
+            vec!["uboot-rpi4"]
+        );
     }
 
     #[test]
