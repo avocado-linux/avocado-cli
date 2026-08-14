@@ -566,12 +566,7 @@ mod tests {
         // either half fails silently — the script just falls back to 0 and the
         // configured stamp is quietly ignored, which is the bug this pairing
         // exists to fix. Pin the name on this side too.
-        let script = generate_rootfs_build_script(
-            "00000000-0000-0000-0000-000000000000",
-            "erofs-lz4",
-            None,
-            "",
-        );
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "");
         // Counted, not just `contains`. Both mkfs branches (erofs-zst and
         // erofs-lz4) are emitted unconditionally, so a `contains` check passes
         // even if one branch loses the flag — asserting the count is what

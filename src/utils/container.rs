@@ -515,21 +515,15 @@ pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, Stri
 
 /// Inject `SOURCE_DATE_EPOCH` into a container's env map when the project sets it.
 ///
-/// Consumed today by the rootfs script, which passes `-T "${SOURCE_DATE_EPOCH:-0}"`
-/// to `mkfs.erofs`. Nothing ever set the variable, so the `source_date_epoch`
-/// config key was honored for extension images — which export it inside their own
-/// script rather than reading the env — and silently ignored everywhere else.
+/// Read today by the rootfs script's `mkfs.erofs -T "${SOURCE_DATE_EPOCH:-0}"`.
+/// The initramfs path exports it too, inert until its mtime-normalization step
+/// lands separately.
 ///
-/// Also exported on the initramfs path, where it is currently inert: that script
-/// has no reader yet, because the mtime-normalization step that consumes it is
-/// landing separately. The epoch belongs in the env for every image-building run
-/// either way, so it is set uniformly rather than per-consumer.
-///
-/// Deliberately left unset when the key is absent rather than defaulting to 0
-/// here: the scripts carry their own `:-0` fallback, and `SOURCE_DATE_EPOCH` is
-/// honored by plenty of tools besides ours (gzip, tar, python bytecode), so
-/// exporting it unconditionally would change build behavior inside post_install
-/// hooks for projects that never opted in.
+/// Left unset when the key is absent rather than defaulted to 0, because
+/// `SOURCE_DATE_EPOCH` is honored by plenty of tools besides ours (gzip, tar,
+/// python bytecode) and would change post_install behavior for projects that
+/// never opted in. `ext image` differs — it exports `unwrap_or(0)` inside its
+/// own script, so the key behaves one way there and another way here.
 pub fn inject_source_date_epoch(
     env_vars: &mut std::collections::HashMap<String, String>,
     source_date_epoch: Option<u64>,
