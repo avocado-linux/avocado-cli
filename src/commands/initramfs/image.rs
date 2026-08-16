@@ -86,8 +86,14 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
 {post_install_block}
 
-    # Compute deterministic build ID for initramfs
-    INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | sort)
+    # Compute deterministic build ID for initramfs.
+    #
+    # LC_ALL=C for the same reason as the cpio pipeline below: this hash becomes
+    # $INITRAMFS_BUILD_ID, which is appended to initrd-release and
+    # os-release-initrd *inside* the archive. Collation drift would reorder the
+    # NEVRA list, change the hash, and so change the archive contents for an
+    # otherwise unchanged package set.
+    INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | LC_ALL=C sort)
     INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
     INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH'))")
 
@@ -99,22 +105,54 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
         echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
     fi
 
-    # Build initramfs image using configured filesystem format
+    # Normalize mtimes across the staged tree so the cpio is reproducible.
+    #
+    # `cpio --reproducible` is only --ignore-devno --ignore-dirnlink
+    # --renumber-inodes; it passes mtime straight through from the
+    # filesystem. Most file mtimes come from RPM payloads and are already
+    # stable, but everything *created* during install is stamped with
+    # wall-clock time: every directory, the `usr/lib/opkg/alternatives/*`
+    # links, depmod's `modules.*` output, systemd preset `*.wants/*` links,
+    # plus the usrmerge symlinks and the release files this script appends
+    # to above. A runtime build and a standalone build install at different
+    # times, so those mtimes differ and the same package set produces a
+    # different cpio — which kos_boot then reports as initramfs drift.
+    #
+    # -h stamps symlinks themselves instead of dereferencing to their
+    # targets. touch on an existing entry doesn't perturb its parent
+    # directory's mtime, so a single unordered pass is sufficient.
+    echo "Normalizing initramfs mtimes to SOURCE_DATE_EPOCH=${{SOURCE_DATE_EPOCH:-0}}"
+    find "$INITRAMFS_WORK" -print0 \
+        | xargs -0r touch -h -d "@${{SOURCE_DATE_EPOCH:-0}}"
+
+    # Build initramfs image using configured filesystem format.
+    #
+    # Reproducibility notes for the pipeline below:
+    #   * `LC_ALL=C sort` — entry order is archive order (and, with
+    #     --renumber-inodes, decides the inode numbers), so collation must not
+    #     drift. Today's SDK ships only the C/POSIX locales, which makes this a
+    #     no-op, but it stops the archive from changing if the image ever gains
+    #     real locales or the CLI starts forwarding the host's LC_* vars.
+    #   * `gzip -n` — belt-and-braces. gzip already writes MTIME=0 and no FNAME
+    #     when it reads stdin (there is no input file to take them from), so
+    #     this only matters if the pipeline is ever refactored to compress a
+    #     file in place.
+    #   * zstd/lz4 embed no timestamp, and both run single-threaded here.
     INITRAMFS_FS="{initramfs_filesystem}"
     INITRAMFS_OUTPUT="$OUTPUT_DIR/avocado-image-initramfs-$TARGET_ARCH.$INITRAMFS_FS"
     echo "Building initramfs image: $INITRAMFS_FS"
     case "$INITRAMFS_FS" in
         cpio)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet > "$INITRAMFS_OUTPUT")
+            (cd "$INITRAMFS_WORK" && find . | LC_ALL=C sort | cpio --reproducible -o -H newc --quiet > "$INITRAMFS_OUTPUT")
             ;;
         cpio.zst)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | zstd -3 -f -o "$INITRAMFS_OUTPUT")
+            (cd "$INITRAMFS_WORK" && find . | LC_ALL=C sort | cpio --reproducible -o -H newc --quiet | zstd -3 -f -o "$INITRAMFS_OUTPUT")
             ;;
         cpio.lz4)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | lz4 -l -f - "$INITRAMFS_OUTPUT")
+            (cd "$INITRAMFS_WORK" && find . | LC_ALL=C sort | cpio --reproducible -o -H newc --quiet | lz4 -l -f - "$INITRAMFS_OUTPUT")
             ;;
         cpio.gz)
-            (cd "$INITRAMFS_WORK" && find . | sort | cpio --reproducible -o -H newc --quiet | gzip -9 > "$INITRAMFS_OUTPUT")
+            (cd "$INITRAMFS_WORK" && find . | LC_ALL=C sort | cpio --reproducible -o -H newc --quiet | gzip -9 -n > "$INITRAMFS_OUTPUT")
             ;;
         *)
             echo "ERROR: unsupported initramfs filesystem format: $INITRAMFS_FS"
@@ -414,5 +452,110 @@ export AVOCADO_OS_VERSION_ID
 
         print_success("Built initramfs image.", OutputLevel::Normal);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The staged tree's mtimes must be normalized before the cpio is created.
+    ///
+    /// Regression: `cpio --reproducible` only covers devno / dirnlink / inode
+    /// renumbering — it passes mtime through from the filesystem. Entries created
+    /// during install (directories, `opkg/alternatives` links, depmod output,
+    /// systemd preset links, the usrmerge symlinks) carry wall-clock mtimes, so a
+    /// runtime build and a standalone build of the same package set produced
+    /// byte-different cpios and kos_boot reported initramfs drift.
+    #[test]
+    fn test_initramfs_mtimes_normalized_before_cpio() {
+        let script = generate_initramfs_build_script(
+            "7488fa35-6390-425b-bbbf-b156cfe1eed2",
+            "cpio.zst",
+            None,
+            "",
+        );
+
+        // Normalization is emitted, pinned to SOURCE_DATE_EPOCH (default 0 so it
+        // is stable when the caller doesn't set one).
+        assert!(script.contains(r#"touch -h -d "@${SOURCE_DATE_EPOCH:-0}""#));
+        // -h so symlinks are stamped rather than their targets.
+        assert!(script.contains("touch -h"));
+
+        // It must run BEFORE the archive is created, or it normalizes nothing.
+        let touch_at = script.find("touch -h").expect("normalization step present");
+        let cpio_at = script
+            .find("find . | LC_ALL=C sort | cpio --reproducible")
+            .expect("cpio step present");
+        assert!(
+            touch_at < cpio_at,
+            "mtime normalization must precede cpio creation"
+        );
+
+        // And after the release-file injection, so those appends are covered too.
+        let inject_at = script
+            .find("AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID")
+            .expect("build-id injection present");
+        assert!(
+            inject_at < touch_at,
+            "normalization must follow the release-file appends"
+        );
+    }
+
+    /// Archive order is byte order, not locale collation. Entry order *is*
+    /// archive order, and with `--renumber-inodes` it also decides the inode
+    /// numbers, so a collation change would rewrite the whole archive.
+    #[test]
+    fn test_cpio_entry_order_is_locale_independent() {
+        for fs in ["cpio", "cpio.zst", "cpio.lz4", "cpio.gz"] {
+            let script = generate_initramfs_build_script("ns", fs, None, "");
+            assert!(
+                script.contains("find . | LC_ALL=C sort | cpio --reproducible"),
+                "{fs}: sort must be pinned to the C locale"
+            );
+            assert!(
+                !script.contains("find . | sort |"),
+                "{fs}: unpinned sort left in the pipeline"
+            );
+        }
+    }
+
+    /// The build-ID hash is derived from a sorted NEVRA list, and the resulting
+    /// $INITRAMFS_BUILD_ID is appended to release files *inside* the archive —
+    /// so that sort needs the same C-locale pin as the cpio pipeline. Pinning
+    /// only the cpio sort would leave the archive contents locale-sensitive.
+    #[test]
+    fn test_build_id_nevra_sort_is_locale_independent() {
+        let script = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        assert!(
+            script.contains(r#"--root "$INITRAMFS_SYSROOT" | LC_ALL=C sort)"#),
+            "the NEVRA sort feeding INITRAMFS_BUILD_ID must be pinned to LC_ALL=C"
+        );
+        // No unpinned `| sort` anywhere in the generated script.
+        assert!(
+            !script.contains("| sort)") && !script.contains("| sort |"),
+            "an unpinned sort remains in the generated initramfs script"
+        );
+    }
+
+    /// gzip already omits MTIME/FNAME when reading stdin, but `-n` keeps that
+    /// true if the pipeline is ever changed to compress a file in place.
+    #[test]
+    fn test_gzip_omits_timestamp() {
+        let script = generate_initramfs_build_script("ns", "cpio.gz", None, "");
+        assert!(script.contains("gzip -9 -n"));
+    }
+
+    /// Every compressed variant goes through the same normalized tree.
+    #[test]
+    fn test_all_cpio_formats_get_normalized_tree() {
+        for fs in ["cpio", "cpio.zst", "cpio.lz4", "cpio.gz"] {
+            let script = generate_initramfs_build_script("ns", fs, None, "");
+            let touch_at = script.find("touch -h").expect("normalization present");
+            let cpio_at = script
+                .find("find . | LC_ALL=C sort | cpio --reproducible")
+                .expect("cpio present");
+            assert!(touch_at < cpio_at, "{fs}: normalization must precede cpio");
+        }
     }
 }

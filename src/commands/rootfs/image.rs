@@ -157,7 +157,10 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 {post_install_block}
 
     # Compute deterministic AVOCADO_OS_BUILD_ID from installed packages
-    PKG_NEVRA=$(rpm --dbpath /var/lib/rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | sort)
+    # LC_ALL=C so NEVRA ordering — and therefore this hash and the
+    # AVOCADO_OS_BUILD_ID injected into os-release inside the image — can't
+    # shift with the container's collation.
+    PKG_NEVRA=$(rpm --dbpath /var/lib/rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | LC_ALL=C sort)
     PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
     OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH'))")
 

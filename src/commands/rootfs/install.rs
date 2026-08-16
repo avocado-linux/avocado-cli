@@ -210,11 +210,14 @@ fi
 # *-{kver}.gz that isn't a known non-bootable kernel-base artifact qualifies.
 # (The RPM sysroot db is not queryable here — packages installed via dnf
 # --installroot are not tracked in the sysroot's own rpmdb.)
+# LC_ALL=C: this order is not cosmetic — the 'Image' symlink block below walks
+# boot_files and takes the FIRST uncompressed variant (falling back to [0]), so
+# collation decides which kernel binary 'Image' ends up pointing at.
 mapfile -t boot_files < <(
     find "$ROOTFS_ROOT/boot" -maxdepth 1 -type f \
         \( -name "*-{kver}" -o -name "*-{kver}.gz" \) \
         ! -name "System.map-*" ! -name "config-*" \
-    | sort
+    | LC_ALL=C sort
 )
 if [ "${{#boot_files[@]}}" -eq 0 ]; then
     echo "[ERROR] No bootable kernel image found for {kver} in rootfs /boot" >&2

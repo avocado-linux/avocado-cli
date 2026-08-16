@@ -254,7 +254,7 @@ set -eo pipefail
 {
     $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery --whatprovides 'avocado-kernel-*' --provides 2>/dev/null || true
     $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF repoquery 'kernel-*' --qf '%{NAME}\n' 2>/dev/null || true
-} | sort -u
+} | LC_ALL=C sort -u
 "#
     .to_string();
 
