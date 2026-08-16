@@ -20,6 +20,10 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+# Only used to read a version out of a Cargo.toml-style file for
+# `extensions.<n>.version: { file, key }`. Reading is all we do, so the
+# serializer (`display`) stays off; `serde` is what provides `toml::Value`.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 anyhow = "1.0"
 bytes = "1"
 clap = { version = "4.0", features = ["derive"] }

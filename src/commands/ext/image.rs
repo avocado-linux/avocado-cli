@@ -552,12 +552,11 @@ impl ExtImageCommand {
         let ext_version = config_version.to_string();
 
         // Validate semver format
-        crate::utils::version::validate_semver(&ext_version).with_context(|| {
-            format!(
-                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
-                self.extension, ext_version
-            )
-        })?;
+        crate::utils::version::validate_ext_version(
+            &self.extension,
+            &ext_version,
+            composed.get_extension_source_config(&self.extension),
+        )?;
 
         // Create a single image for the extension
         // The runtime will decide whether to use it as sysext, confext, or both

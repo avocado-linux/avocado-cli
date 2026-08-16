@@ -623,12 +623,11 @@ impl ExtBuildCommand {
         let ext_version = config_version.to_string();
 
         // Validate semver format
-        crate::utils::version::validate_semver(&ext_version).with_context(|| {
-            format!(
-                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
-                self.extension, ext_version
-            )
-        })?;
+        crate::utils::version::validate_ext_version(
+            &self.extension,
+            &ext_version,
+            composed.get_extension_source_config(&self.extension),
+        )?;
 
         // Determine the extension source path for overlay resolution
         // For remote extensions, files are in $AVOCADO_PREFIX/includes/<ext-name>/

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use super::find_ext_in_mapping;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::SdkContainer;
+use crate::utils::ext_version_source::VersionSource;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 // Note: Stamp imports removed - we no longer validate build stamps for packaging
 // since we now package src_dir instead of built sysroot
@@ -143,9 +144,9 @@ impl ExtPackageCommand {
             }
         };
 
-        // On-disk config filename (avocado.yaml or avocado.yml). Used both for the
-        // default packaged config and for the version bake so a `.yml` ext stages
-        // and bakes under its real name rather than a hardcoded `avocado.yaml`.
+        // On-disk config filename (avocado.yaml or avocado.yml), so a `.yml`
+        // extension stages under its real name rather than a hardcoded
+        // `avocado.yaml`.
         let cfg_basename = std::path::Path::new(&ext_config_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -187,13 +188,22 @@ impl ExtPackageCommand {
         };
 
         // Extract RPM metadata with defaults
-        let rpm_metadata = self.extract_rpm_metadata(&ext_config, &target)?;
+        let rpm_metadata = self.extract_rpm_metadata(&ext_config, &target, &ext_config_path)?;
 
         // Determine which files to package
         // Pass both merged config (for package_files), raw config (for all target overlays),
-        // and full parsed config (for sdk.compile scripts)
-        let package_files =
-            self.get_package_files(&ext_config, raw_ext_config.as_ref(), parsed, &cfg_basename);
+        // and full parsed config (for sdk.compile scripts). The version source (if the
+        // extension declared `version: { file, key }`) is read from the composed config
+        // rather than the raw text, so it is found the same way for a local extension and
+        // for one that was fetched from a remote source.
+        let version_source = composed.ext_version_sources.get(&self.extension);
+        let package_files = self.get_package_files(
+            &ext_config,
+            raw_ext_config.as_ref(),
+            parsed,
+            &cfg_basename,
+            version_source,
+        );
 
         if self.verbose {
             print_info(
@@ -211,6 +221,63 @@ impl ExtPackageCommand {
 
         // Create main RPM package in container
         // This packages the extension's src_dir (directory containing avocado.yaml)
+        // Resolve package-time-only fields in the avocado.yaml that ships in the
+        // package payload. Today that is just `version`, and only for the legacy
+        // `version: '{{ env.AVOCADO_EXT_VERSION }}'` form: that template resolves
+        // only while the env var is set (package time), so if it survived into the
+        // published package a downstream build — which has no such env in scope —
+        // would interpolate it to '' and fail semver validation. We bake the
+        // resolved value and leave every other template (e.g. `{{ avocado.target }}`)
+        // for the consumer to resolve at their build time.
+        //
+        // An extension using a `version: { file, key }` provider is SKIPPED: the
+        // provider reads from the extension's own tree, which ships in the payload,
+        // so the published config resolves itself. Baking it would also corrupt the
+        // file — the line-scoped rewriter would replace the `version:` line and
+        // strand its `file:`/`key:` children.
+        let version_bake_section = if version_source.is_some() {
+            String::new()
+        } else {
+            match fs::read_to_string(&ext_config_path) {
+                Ok(text) => {
+                    let baked = crate::utils::config_edit::bake_extension_version(
+                        &text,
+                        &self.extension,
+                        &target,
+                        &rpm_metadata.version,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Failed to bake resolved version '{}' into the packaged \
+                             config for extension '{}'",
+                            rpm_metadata.version, self.extension
+                        )
+                    })?;
+                    let b64 = BASE64_STANDARD.encode(baked.as_bytes());
+                    // The resolved version is baked into the base64 payload only;
+                    // it is never interpolated into the shell, so a version string
+                    // carrying pre-release/build metadata can't reach the command line.
+                    format!(
+                        r#"
+# Bake the resolved extension version into the packaged config so the published
+# avocado.yaml carries a concrete semver instead of an env-only template that
+# would interpolate to '' during a downstream runtime build.
+if [ -f "$STAGING_DIR/{basename}" ]; then
+    printf '%s' '{b64}' | base64 -d > "$STAGING_DIR/{basename}"
+    echo "Baked resolved extension version into {basename}"
+fi
+"#,
+                        basename = cfg_basename,
+                        b64 = b64,
+                    )
+                }
+                // Remote/unreadable source (e.g. packaging a fetched remote ext
+                // whose config lives in the container volume): leave the payload
+                // untouched rather than fail the package.
+                Err(_) => String::new(),
+            }
+        };
+
         let output_path = self
             .create_rpm_package_in_container(
                 &rpm_metadata,
@@ -218,7 +285,7 @@ impl ExtPackageCommand {
                 &target,
                 &ext_config_path,
                 &package_files,
-                &cfg_basename,
+                &version_bake_section,
             )
             .await?;
 
@@ -284,25 +351,36 @@ impl ExtPackageCommand {
     /// - Compile scripts from sdk.compile sections
     /// - Install scripts from extension package dependencies
     ///
+    /// Whatever the outcome, a `version: { file, key }` provider's file is always
+    /// included: the published `avocado.yaml` keeps the provider rather than a
+    /// baked literal, so a payload missing that file would be unresolvable for
+    /// every consumer. See `version_source`.
+    ///
     /// # Arguments
     /// * `ext_config` - The merged extension config (for package_files check)
     /// * `raw_ext_config` - The raw unmerged extension config (to find all target-specific overlays)
     /// * `full_parsed_config` - The full parsed config (to find sdk.compile scripts)
+    /// * `version_source` - The version provider this extension resolved through, if any
     fn get_package_files(
         &self,
         ext_config: &serde_yaml::Value,
         raw_ext_config: Option<&serde_yaml::Value>,
         full_parsed_config: &serde_yaml::Value,
         cfg_basename: &str,
+        version_source: Option<&VersionSource>,
     ) -> Vec<String> {
         // Check if package_files is explicitly defined
         if let Some(package_files) = ext_config.get("package_files") {
             if let Some(files_array) = package_files.as_sequence() {
-                let files: Vec<String> = files_array
+                let mut files: Vec<String> = files_array
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
                 if !files.is_empty() {
+                    // An explicit list replaces the defaults entirely, so the
+                    // version file has to be added back here too — forgetting it
+                    // would only surface once someone consumed the package.
+                    Self::add_version_source_file(&mut files, version_source);
                     return files;
                 }
             }
@@ -310,7 +388,7 @@ impl ExtPackageCommand {
 
         // Default behavior: the config file + overlays + compile scripts + install
         // scripts. Use the actual on-disk config name so an `avocado.yml` ext is
-        // staged (and later baked) under its real name.
+        // staged under its real name.
         let mut default_files = vec![cfg_basename.to_string()];
         let mut seen_files = std::collections::HashSet::new();
 
@@ -377,6 +455,8 @@ impl ExtPackageCommand {
             }
         }
 
+        Self::add_version_source_file(&mut default_files, version_source);
+
         default_files
     }
 
@@ -415,11 +495,24 @@ impl ExtPackageCommand {
         }
     }
 
+    /// Append a `version: { file, key }` provider's file to a package file list.
+    ///
+    /// Idempotent — an author who already listed the file doesn't get it twice.
+    fn add_version_source_file(files: &mut Vec<String>, version_source: Option<&VersionSource>) {
+        let Some(source) = version_source else { return };
+        if !files.iter().any(|f| f == &source.file) {
+            files.push(source.file.clone());
+        }
+    }
+
     /// Extract RPM metadata from extension configuration with defaults
+    ///
+    /// `source_path` is only used to say where an invalid `version` came from.
     fn extract_rpm_metadata(
         &self,
         ext_config: &serde_yaml::Value,
         _target: &str, // Not used - extensions default to noarch
+        source_path: &str,
     ) -> Result<RpmMetadata> {
         // Version is required
         let version = ext_config
@@ -434,12 +527,7 @@ impl ExtPackageCommand {
             .to_string();
 
         // Validate semver format
-        crate::utils::version::validate_semver(&version).with_context(|| {
-            format!(
-                "Extension '{}' has invalid version '{}'. Version must be in semantic versioning format (e.g., '1.0.0', '2.1.3')",
-                self.extension, version
-            )
-        })?;
+        crate::utils::version::validate_ext_version(&self.extension, &version, source_path)?;
 
         // Generate defaults
         let name = self.extension.clone();
@@ -726,7 +814,7 @@ rm -rf "$TMPDIR"
         target: &str,
         ext_config_path: &str,
         package_files: &[String],
-        cfg_basename: &str,
+        version_bake_section: &str,
     ) -> Result<PathBuf> {
         let container_image = config
             .get_sdk_image()
@@ -785,58 +873,6 @@ rm -rf "$TMPDIR"
             _ => "Provides: avocado-target(*)".to_string(),
         };
 
-        // Resolve package-time-only fields in the avocado.yaml that ships in the
-        // package payload. Today that is just `version`: the in-source program
-        // extensions declare `version: '{{ env.AVOCADO_EXT_VERSION }}'` so the
-        // packaged version tracks Cargo.toml, but that template only resolves
-        // while AVOCADO_EXT_VERSION is set (package time). If it survives into the
-        // published package, a downstream runtime build — which has no such env in
-        // scope — interpolates it to '' and fails semver validation. We bake just
-        // the resolved value (`metadata.version`, already interpolated + validated)
-        // and leave every other template (e.g. `{{ avocado.target }}`,
-        // `{{ env.AVOCADO_DISTRO_RELEASE }}`) for the consumer to resolve at their
-        // build time. Additional required fields can be folded in here later.
-        let version_bake_section = {
-            match fs::read_to_string(ext_config_path) {
-                Ok(text) => {
-                    let baked = crate::utils::config_edit::bake_extension_version(
-                        &text,
-                        &self.extension,
-                        target,
-                        &metadata.version,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Failed to bake resolved version '{}' into the packaged \
-                                     config for extension '{}'",
-                            metadata.version, self.extension
-                        )
-                    })?;
-                    let b64 = BASE64_STANDARD.encode(baked.as_bytes());
-                    // The resolved version is baked into the base64 payload only;
-                    // it is never interpolated into the shell, so a version string
-                    // carrying pre-release/build metadata can't reach the command line.
-                    format!(
-                        r#"
-# Bake the resolved extension version into the packaged config so the published
-# avocado.yaml carries a concrete semver instead of an env-only template that
-# would interpolate to '' during a downstream runtime build.
-if [ -f "$STAGING_DIR/{basename}" ]; then
-    printf '%s' '{b64}' | base64 -d > "$STAGING_DIR/{basename}"
-    echo "Baked resolved extension version into {basename}"
-fi
-"#,
-                        basename = cfg_basename,
-                        b64 = b64,
-                    )
-                }
-                // Remote/unreadable source (e.g. packaging a fetched remote ext
-                // whose config lives in the container volume): leave the payload
-                // untouched rather than fail the package.
-                Err(_) => String::new(),
-            }
-        };
-
         // Create RPM using rpmbuild in container
         // Package root (/) maps to the extension's src_dir contents
         let rpm_build_script = self.generate_rpm_build_script(
@@ -846,7 +882,7 @@ fi
             &target_provides,
             &container_src_dir,
             &package_files_str,
-            &version_bake_section,
+            version_bake_section,
         );
 
         // Run the RPM build in the container
@@ -1180,7 +1216,9 @@ extensions:
             .resolve_ext_config(&config, &parsed, &location, "qemux86-64")
             .unwrap()
             .expect("extension present in composed config");
-        let meta = cmd.extract_rpm_metadata(&resolved, "qemux86-64").unwrap();
+        let meta = cmd
+            .extract_rpm_metadata(&resolved, "qemux86-64", "avocado.yaml")
+            .unwrap();
 
         assert_eq!(meta.version, "2026.7.1", "per-target version must win");
         assert_eq!(meta.summary, "qemu summary");
@@ -1260,7 +1298,7 @@ extensions:
         );
 
         let metadata = cmd
-            .extract_rpm_metadata(&ext_config, "x86_64-unknown-linux-gnu")
+            .extract_rpm_metadata(&ext_config, "x86_64-unknown-linux-gnu", "avocado.yaml")
             .unwrap();
 
         assert_eq!(metadata.name, "test-extension");
@@ -1327,7 +1365,7 @@ extensions:
         );
 
         let metadata = cmd
-            .extract_rpm_metadata(&ext_config, "aarch64-unknown-linux-gnu")
+            .extract_rpm_metadata(&ext_config, "aarch64-unknown-linux-gnu", "avocado.yaml")
             .unwrap();
 
         assert_eq!(metadata.name, "web-server");
@@ -1356,7 +1394,8 @@ extensions:
 
         let ext_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
 
-        let result = cmd.extract_rpm_metadata(&ext_config, "x86_64-unknown-linux-gnu");
+        let result =
+            cmd.extract_rpm_metadata(&ext_config, "x86_64-unknown-linux-gnu", "avocado.yaml");
 
         assert!(result.is_err());
         assert!(result
@@ -1395,7 +1434,9 @@ extensions:
         ];
 
         for target in targets {
-            let metadata = cmd.extract_rpm_metadata(&ext_config, target).unwrap();
+            let metadata = cmd
+                .extract_rpm_metadata(&ext_config, target, "avocado.yaml")
+                .unwrap();
             assert_eq!(
                 metadata.arch, "noarch",
                 "Extension should default to noarch for target: {target}"
@@ -1460,7 +1501,8 @@ extensions:
 
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml");
+        let files =
+            cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml", None);
         assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 
@@ -1496,6 +1538,7 @@ extensions:
             Some(&ext_config),
             &empty_full_config,
             "avocado.yaml",
+            None,
         );
         assert_eq!(
             files,
@@ -1545,6 +1588,7 @@ extensions:
             Some(&ext_config),
             &empty_full_config,
             "avocado.yaml",
+            None,
         );
         assert_eq!(
             files,
@@ -1596,6 +1640,7 @@ extensions:
             Some(&ext_config),
             &empty_full_config,
             "avocado.yaml",
+            None,
         );
         assert_eq!(
             files,
@@ -1606,6 +1651,135 @@ extensions:
                 "README.md".to_string(),
             ]
         );
+    }
+
+    /// Helpers for the version-source payload tests below.
+    fn ext_with_version(version: &str) -> serde_yaml::Value {
+        let mut ext = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        ext.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("version".to_string()),
+            serde_yaml::Value::String(version.to_string()),
+        );
+        ext
+    }
+
+    fn cargo_version_source() -> VersionSource {
+        VersionSource {
+            file: "Cargo.toml".to_string(),
+            key: Some("package.version".to_string()),
+            format: None,
+        }
+    }
+
+    fn package_cmd() -> ExtPackageCommand {
+        ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "test-ext".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
+    /// The published avocado.yaml keeps the `version: { file, key }` provider
+    /// rather than a baked literal, so the file it names has to ship or the
+    /// package is unresolvable for every consumer.
+    #[test]
+    fn test_get_package_files_default_includes_version_source_file() {
+        let cmd = package_cmd();
+        let ext_config = ext_with_version("1.0.0");
+        let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        let files = cmd.get_package_files(
+            &ext_config,
+            None,
+            &empty_full_config,
+            "avocado.yaml",
+            Some(&cargo_version_source()),
+        );
+
+        assert_eq!(
+            files,
+            vec!["avocado.yaml".to_string(), "Cargo.toml".to_string()]
+        );
+    }
+
+    /// An explicit `package_files` replaces the defaults wholesale, so the
+    /// version file has to be added back on that branch too. Forgetting it
+    /// would only surface when someone consumed the published package.
+    #[test]
+    fn test_get_package_files_explicit_list_includes_version_source_file() {
+        let cmd = package_cmd();
+        let mut ext_config = ext_with_version("1.0.0");
+        ext_config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("package_files".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("avocado.yaml".to_string()),
+                serde_yaml::Value::String("src".to_string()),
+            ]),
+        );
+        let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        let files = cmd.get_package_files(
+            &ext_config,
+            Some(&ext_config),
+            &empty_full_config,
+            "avocado.yaml",
+            Some(&cargo_version_source()),
+        );
+
+        assert_eq!(
+            files,
+            vec![
+                "avocado.yaml".to_string(),
+                "src".to_string(),
+                "Cargo.toml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_get_package_files_does_not_duplicate_listed_version_source_file() {
+        let cmd = package_cmd();
+        let mut ext_config = ext_with_version("1.0.0");
+        ext_config.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("package_files".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("avocado.yaml".to_string()),
+                serde_yaml::Value::String("Cargo.toml".to_string()),
+                serde_yaml::Value::String("src".to_string()),
+            ]),
+        );
+        let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        let files = cmd.get_package_files(
+            &ext_config,
+            Some(&ext_config),
+            &empty_full_config,
+            "avocado.yaml",
+            Some(&cargo_version_source()),
+        );
+
+        assert_eq!(
+            files.iter().filter(|f| *f == "Cargo.toml").count(),
+            1,
+            "version source file listed twice: {files:?}"
+        );
+    }
+
+    /// A literal `version:` has no provider, so nothing extra is added.
+    #[test]
+    fn test_get_package_files_without_version_source_is_unchanged() {
+        let cmd = package_cmd();
+        let ext_config = ext_with_version("1.0.0");
+        let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+
+        let files =
+            cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml", None);
+
+        assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 
     #[test]
@@ -1634,7 +1808,8 @@ extensions:
 
         // Pass empty full config since we're not testing compile script extraction
         let empty_full_config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let files = cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml");
+        let files =
+            cmd.get_package_files(&ext_config, None, &empty_full_config, "avocado.yaml", None);
         assert_eq!(files, vec!["avocado.yaml".to_string()]);
     }
 
@@ -1703,6 +1878,7 @@ extensions:
             Some(&raw_config),
             &empty_full_config,
             "avocado.yaml",
+            None,
         );
 
         // Should include avocado.yaml and both target-specific overlays

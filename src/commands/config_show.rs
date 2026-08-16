@@ -218,10 +218,16 @@ fn build_detail(merged: &serde_yaml::Value) -> serde_json::Value {
                 .get(ext_name)
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
+            // Always the resolved literal: `load_composed` has already turned a
+            // `version: { file, key }` provider into a string. Release CI reads
+            // this instead of hand-parsing avocado.yaml, which cannot see through
+            // a provider.
+            let version = ext_value.get("version").and_then(|v| v.as_str());
 
             extensions_out.push(json!({
                 "name": ext_name,
                 "node_path": format!("/extensions/{ext_name}"),
+                "version": version,
                 "types": types,
                 "packages": packages,
                 "enable_services": enable_services,
