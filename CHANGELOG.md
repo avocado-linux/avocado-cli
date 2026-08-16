@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second field.
 
 ### Changed
+- **Extension images no longer ship package-manager state.** `var/lib/rpm`,
+  `var/lib/dnf` and `var/cache/dnf` are excluded from the built `.raw` —
+  measured at 13.4M of a 22M `avocado-ext-tunnels` sysroot, against an 8.2M
+  `/usr` payload. Nothing on target can read it: sysext and confext merge
+  `/usr`, `/opt` and `/etc`, never `/var`.
+
+  Excluded at image time rather than deleted, because `ext image` runs mkfs
+  against the live sysroot with no work copy, and later `ext dnf` / `ext
+  install` calls still resolve against that database. Configured `var_files`
+  patterns are unaffected.
 - **A skipped remote version check no longer reports as a passed one.** When
   the remote's `--version` output cannot be parsed, `--runs-on` used to print
   `[SUCCESS] Remote avocado version: <whatever it read>`, which is a green line
