@@ -276,7 +276,7 @@ pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
     let manifest_json = build_manifest_json(overlays)?;
     let mut s = String::new();
 
-    s.push_str("# --- device-tree overlays (ENG-2134) ---\n");
+    s.push_str("# --- device-tree overlays ---\n");
     s.push_str(
         "DTBO_STAGING=\"$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/device-tree-overlays\"\n",
     );
@@ -324,7 +324,22 @@ pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
 
     // D2 (2c): pass the hook-emitted fragment to stone via --overlay, and add
     // the staging dir to the -i include path so `in: <name>.dtbo` resolves.
-    s.push_str("STONE_INCLUDE_FLAGS=\"$STONE_INCLUDE_FLAGS -i $DTBO_STAGING\"\n");
+    //
+    // PREPENDED, not appended. stone resolves an image name against its -i dirs
+    // and takes the first match (create.rs find_file_in_dirs), and the merged
+    // DTB is published under the BSP's own base filename because the signer
+    // regenerates kernel_<base>.dtb from it. Appending put the one directory
+    // holding the merged tree behind all three others - the project's own
+    // stone_include_paths, the runtime input dir, and the SDK stone dir - so a
+    // file with that basename in any of them won the lookup and the board
+    // flashed an unmerged tree: a clean boot with no overlay applied and
+    // nothing reported. stone_include_paths is project-supplied, so that
+    // collision is reachable from ordinary user config.
+    //
+    // Prepending makes the merged tree win by construction rather than by the
+    // absence of a collision, which is the only version of this that a guard
+    // cannot silently miss.
+    s.push_str("STONE_INCLUDE_FLAGS=\"-i $DTBO_STAGING $STONE_INCLUDE_FLAGS\"\n");
     s.push_str("if [ -f \"$DTO_FRAGMENT\" ]; then\n");
     s.push_str("    STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\"\n");
     s.push_str("fi\n");

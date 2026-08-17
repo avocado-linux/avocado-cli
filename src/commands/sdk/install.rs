@@ -345,7 +345,7 @@ impl SdkInstallCommand {
         // the parallel sysroot installs so all four can run concurrently.
         let active_compile_sections =
             find_active_compile_sections(&composed.merged_value, active_extensions);
-        // ENG-2134: an extension declaring device-tree overlays needs the delivery
+        // An extension declaring device-tree overlays needs the delivery
         // hook in the target-sysroot, so provision the target-sysroot even when
         // there is no compile section (a no-#include overlay needs no kernel-devsrc).
         let provision_dto =
@@ -400,7 +400,7 @@ impl SdkInstallCommand {
                 target_sysroot_config_version,
             );
 
-            // ENG-2134: the per-BSP delivery hook lands in the target-sysroot so the
+            // The per-BSP delivery hook lands in the target-sysroot so the
             // runtime build can invoke it. A BSP that ships no hook package fails the
             // install here, earlier and clearer than the build-time backstop.
             let dto_hook_pkg = if provision_dto {
@@ -1796,7 +1796,7 @@ fi
             sdk_package_names.extend(self.extract_package_names(ext_deps));
         }
 
-        // ENG-2134: provision the SDK overlay build wrapper when any active
+        // Provision the SDK overlay build wrapper when any active
         // extension declares device-tree overlays. Its RDEPENDS pulls
         // nativesdk-dtc, and stone is a baseline SDK package, so neither is
         // provisioned separately.

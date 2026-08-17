@@ -1810,7 +1810,7 @@ extensions:
     fn test_ensure_connect_extensions_compact_indent_runtime_list() {
         // Compact-style sequence: items at the same indent as the `extensions:` key.
         // This is what the shell-heartbeat reference scaffold emits as of avocado 0.40.0.
-        // Regression for ENG-1868: previously the inserter hard-coded 6-space indent,
+        // Regression: previously the inserter hard-coded 6-space indent,
         // producing unparseable mixed-indent YAML.
         let config = r#"runtimes:
   dev:
