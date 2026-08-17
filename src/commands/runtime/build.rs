@@ -1239,7 +1239,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                 )
             })?;
 
-        // Device-tree overlays declared by this runtime's extensions (ENG-2134).
+        // Device-tree overlays declared by this runtime's extensions.
         // Empty section - and no build-time work - unless at least one is declared.
         let device_tree_overlay_section = {
             let overlays =
@@ -3127,7 +3127,7 @@ runtimes:
         assert!(script.contains("stone bundle"));
         assert!(script.contains("mkfs.btrfs"));
         // No overlays declared: the device-tree overlay section is inert.
-        assert!(!script.contains("device-tree overlays (ENG-2134)"));
+        assert!(!script.contains("device-tree overlays"));
         assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
     }
 
@@ -3221,7 +3221,7 @@ extensions:
         // The overlay section is emitted, builds the declared overlay via the
         // SDK wrapper, and wires the delivery hook + stone --overlay before the
         // bundle call.
-        assert!(script.contains("device-tree overlays (ENG-2134)"));
+        assert!(script.contains("device-tree overlays"));
         assert!(script.contains(
             "avocado-dtc-overlay --name \"my-spi\" --src \"/opt/src/overlays/my-spi.dtso\""
         ));
@@ -3229,6 +3229,23 @@ extensions:
         assert!(script.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""));
         // And the bundle call consumes the flag.
         assert!(script.contains("$STONE_OVERLAY_FLAG \\"));
+
+        // The staging dir must be PREPENDED to the include flags. stone takes
+        // the first -i dir that holds a matching name, and the merged DTB is
+        // published under the BSP's own base filename, so appending lets any
+        // earlier dir - including the project's own stone_include_paths - win
+        // the lookup and ship an unmerged tree. That failure boots cleanly with
+        // no overlay applied and reports nothing, so nothing downstream catches
+        // it; the ordering is the only thing that prevents it.
+        assert!(
+            script.contains("STONE_INCLUDE_FLAGS=\"-i $DTBO_STAGING $STONE_INCLUDE_FLAGS\""),
+            "staging dir must be prepended, not appended, or a same-named DTB \
+             in an earlier -i dir silently wins over the merged one"
+        );
+        assert!(
+            !script.contains("STONE_INCLUDE_FLAGS=\"$STONE_INCLUDE_FLAGS -i $DTBO_STAGING\""),
+            "the appended form reintroduces the silent unmerged-DTB failure"
+        );
     }
 
     #[test]
