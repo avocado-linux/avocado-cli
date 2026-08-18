@@ -61,15 +61,21 @@ echo \"Applied systemd presets\"; fi",
 /// `work_var` names the image work-dir shell variable (e.g. `ROOTFS_WORK`,
 /// `INITRAMFS_WORK`). `LC_ALL=C sort` makes the hash independent of the
 /// order the permissions section appended entries in (the `users:`/`groups:`
-/// maps have no guaranteed iteration order); missing files (e.g. no
-/// base-passwd) contribute nothing rather than aborting.
+/// maps have no guaranteed iteration order); missing files (e.g. a minimal
+/// initramfs with no `/etc/shadow`) contribute nothing rather than aborting.
+///
+/// The `cat` is wrapped in a `{ …; } || true` brace group so a missing file
+/// doesn't fail the pipeline: the standalone `avocado rootfs image` /
+/// `avocado initramfs image` scripts run under `set -euo pipefail`, where an
+/// unguarded `cat` failure would take down the `$(…)` assignment — and with
+/// its only diagnostic sent to `/dev/null`, kill the build with no output.
 pub fn render_auth_files_hash(work_var: &str, out_var: &str) -> String {
     format!(
-        r#"    {out_var}=$(cat \
+        r#"    {out_var}=$({{ cat \
         "${work_var}/etc/passwd" \
         "${work_var}/etc/shadow" \
         "${work_var}/etc/group" \
-        "${work_var}/etc/gshadow" 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{{print $1}}')"#
+        "${work_var}/etc/gshadow" 2>/dev/null || true; }} | LC_ALL=C sort | sha256sum | awk '{{print $1}}')"#
     )
 }
 
@@ -609,17 +615,26 @@ mod tests {
         // locale so the digest is independent of append order.
         assert_eq!(
             render_auth_files_hash("ROOTFS_WORK", "AUTH_HASH"),
-            r#"    AUTH_HASH=$(cat \
+            r#"    AUTH_HASH=$({ cat \
         "$ROOTFS_WORK/etc/passwd" \
         "$ROOTFS_WORK/etc/shadow" \
         "$ROOTFS_WORK/etc/group" \
-        "$ROOTFS_WORK/etc/gshadow" 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{print $1}')"#
+        "$ROOTFS_WORK/etc/gshadow" 2>/dev/null || true; } | LC_ALL=C sort | sha256sum | awk '{print $1}')"#
         );
         // Work dir and output var are both substituted, so the initramfs build
         // reuses it verbatim with its own names.
         let initramfs = render_auth_files_hash("INITRAMFS_WORK", "INITRAMFS_AUTH_HASH");
-        assert!(initramfs.contains("INITRAMFS_AUTH_HASH=$(cat"));
+        assert!(initramfs.contains("INITRAMFS_AUTH_HASH=$({ cat"));
         assert!(initramfs.contains("\"$INITRAMFS_WORK/etc/passwd\""));
+    }
+
+    #[test]
+    fn test_render_auth_files_hash_survives_pipefail() {
+        // Standalone `avocado rootfs image` / `avocado initramfs image` run the
+        // fragment under `set -euo pipefail`. A missing file (e.g. a minimal
+        // initramfs with no /etc/shadow) must not fail the pipeline and abort
+        // the build — the `{ …; } || true` brace group absorbs cat's status.
+        assert!(render_auth_files_hash("ROOTFS_WORK", "AUTH_HASH").contains("|| true; }"));
     }
 
     #[test]
