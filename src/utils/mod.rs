@@ -5,6 +5,8 @@ pub mod container_dev;
 #[cfg(target_os = "macos")]
 pub mod disk_writer;
 pub mod ext_fetch;
+pub mod ext_source_reader;
+pub mod ext_version_source;
 pub mod host_copy;
 pub mod image_signing;
 pub mod install_method;

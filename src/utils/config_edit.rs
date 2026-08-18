@@ -1342,6 +1342,28 @@ pub fn bake_extension_version(
 mod tests {
     use super::*;
 
+    /// The provider form and the bake are mutually exclusive by design, but if
+    /// they ever did meet, the line-scoped rewriter would replace the `version:`
+    /// line and strand its `file:`/`key:` children as orphaned mapping entries.
+    /// `ext package` guards against this by skipping the bake entirely when the
+    /// extension resolved through a provider; this test documents why.
+    #[test]
+    fn test_bake_extension_version_would_corrupt_a_provider_block() {
+        let src = "extensions:\n  \
+  my-ext:\n    \
+    version:\n      \
+      file: Cargo.toml\n      \
+      key: package.version\n    \
+    release: r0\n";
+        let out = bake_extension_version(src, "my-ext", "qemux86-64", "1.2.3").unwrap();
+        // The scalar lands, but `file:`/`key:` are left behind — hence the guard.
+        assert!(out.contains("version: '1.2.3'"));
+        assert!(
+            out.contains("file: Cargo.toml"),
+            "expected the orphaned provider keys this guard exists to avoid:\n{out}"
+        );
+    }
+
     #[test]
     fn test_bake_extension_version_replaces_only_version_keeps_other_templates() {
         let src = "supported_targets: '*'\n\

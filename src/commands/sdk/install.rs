@@ -1312,7 +1312,9 @@ load_presets() {
     fi
     for dir in "${preset_dirs[@]}"; do
         [ -d "$dir" ] || continue
-        for f in $(ls "$dir"/*.preset 2>/dev/null | sort); do
+        # LC_ALL=C to match systemd's own C-collation ordering: preset rules are
+        # first-match-wins, so this order decides which units end up enabled.
+        for f in $(ls "$dir"/*.preset 2>/dev/null | LC_ALL=C sort); do
             while IFS= read -r line || [[ -n "$line" ]]; do
                 line="${line%%#*}"
                 line="${line#"${line%%[![:space:]]*}"}"
