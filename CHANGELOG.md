@@ -42,6 +42,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is skipped with nothing to say rather than asserting a version it never read.
 
 ### Breaking
+- **`sdk run` passes its argv through literally; the container shell no longer
+  re-splits or expands it.** Anything passing a `$VAR`, a glob, or a `&&` chain
+  as a single argument and counting on the container shell to interpret it now
+  gets that string through as one command word: `avocado sdk run -- 'ls /foo &&
+  ls /bar'` no longer runs two commands, and `avocado sdk run -- echo '$HOME'`
+  prints a literal `$HOME`. Ask for a shell explicitly instead — `avocado sdk
+  run -- bash -lc 'ls /foo && ls /bar'` — which is the form the flags already
+  implied and which only works correctly after this change.
+
+  This one breaks silently at runtime: there is no error and no warning, so a
+  pinned-version bump in CI will not fail the build, it will just run a
+  different command. Audit any job that shells through `sdk run` before
+  upgrading.
+
+  **What it fixes.** The arguments after `--` were spliced into the container's
+  script with a bare `join(" ")`, so the shell inside re-parsed them. `avocado
+  sdk run -- bash -lc 'U=/opt/x; ls $U'` arrived as `bash -lc U=/opt/x; ls $U`,
+  which the shell read as two commands and whose `$U` the *outer* shell expanded
+  to nothing — printing plausible output for a different directory rather than
+  failing. Each element is quoted now, so argv is argv, matching `docker run`
+  and `kubectl exec`.
 - **`is_version_compatible` returns `Option<bool>` instead of `bool`.** Only
   affects consumers of the `avocado_cli` lib target. `None` means the remote
   version could not be read at all, which the old `bool` could not express -
@@ -49,23 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that collapse is what let an unparseable version fall through as a pass.
 
 ### Fixed
-- **`sdk run` no longer lets the container shell re-split its argv.** The
-  arguments after `--` were spliced into the container's script with a bare
-  `join(" ")`, so the shell inside re-parsed them. `avocado sdk run -- bash
-  -lc 'U=/opt/x; ls $U'` arrived as `bash -lc U=/opt/x; ls $U`, which the shell
-  read as two commands and whose `$U` the *outer* shell expanded to nothing —
-  printing plausible output for a different directory rather than failing.
-  Each element is quoted now, so argv is argv, matching `docker run` and
-  `kubectl exec`.
-
-  **This removes an expansion that some invocations relied on.** Anything
-  passing a `$VAR`, a glob, or a `&&` chain as a single argument and counting
-  on the container shell to interpret it now gets that string through
-  literally: `avocado sdk run -- 'ls /foo && ls /bar'` becomes one command
-  word, and `avocado sdk run -- echo '$HOME'` prints `$HOME`. Ask for a shell
-  explicitly instead — `avocado sdk run -- bash -lc 'ls /foo && ls /bar'` —
-  which is the form the flags already implied and which only works correctly
-  after this change.
 - **Rootfs and initramfs no longer reinstall on every run.** `avocado sdk
   install` wiped and rebuilt both sysroots from scratch on every invocation,
   even with nothing changed. Removal detection compared the lockfile against
