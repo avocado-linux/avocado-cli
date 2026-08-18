@@ -58,9 +58,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   That scan is also scoped to the current target now, the way the sibling
   extension scan already was. It previously read every runtime in the file
-  regardless of `runtimes.<name>.target` or `--runtime`, which in a
-  multi-target config provisioned target-dev for runtimes the user had not
-  asked to build.
+  regardless of `runtimes.<name>.target`, which in a multi-target config
+  provisioned target-dev for runtimes the user had not asked to build. The scan
+  reads the merged runtime config, so a `compile:` reference declared inside a
+  `target-<t>:` override block counts too — selecting runtimes from resolved
+  config while scanning unresolved config meant no target-dev sysroot was
+  installed for such a section, yet `runtime build` still ran its compile
+  script.
+- **A runtime that names its `target:` only inside a `target-<t>:` block is no
+  longer treated as targeting everything.** Override resolution strips the
+  non-matching blocks before target selection reads the runtime, so such a
+  runtime arrived with no `target:` key at all and matched the
+  "no target declared, applies to every target" branch. `avocado sdk install
+  --target qemux86-64` would install a raspberrypi4-only runtime's compile
+  packages into the x86-64 target sysroot. A `target-<t>:` block for the target
+  being built still keeps a runtime in scope even when it declares no `target:`
+  of its own. This also scopes the extension and runtime steps of `avocado
+  install`, which shared the selection logic through a duplicate that has been
+  collapsed onto the fixed one.
 - **Rootfs and initramfs no longer reinstall on every run.** `avocado sdk
   install` wiped and rebuilt both sysroots from scratch on every invocation,
   even with nothing changed. Removal detection compared the lockfile against
