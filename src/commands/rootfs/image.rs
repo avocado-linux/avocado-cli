@@ -49,6 +49,36 @@ echo \"Applied systemd presets\"; fi",
     "echo \"Generated ld.so.cache\"",
 ];
 
+/// Render the shell snippet that hashes an image's identity/auth files
+/// (`/etc/{passwd,shadow,group,gshadow}`) into `out_var`.
+///
+/// Folded into the build id alongside the package NEVRA hash so a
+/// `permissions:`-only change — which rewrites these files but never the
+/// rpmdb — still moves the build id and therefore OTAs (ENG-2437). Shared
+/// by the rootfs and initramfs build scripts so both derive their build id
+/// the same way.
+///
+/// `work_var` names the image work-dir shell variable (e.g. `ROOTFS_WORK`,
+/// `INITRAMFS_WORK`). `LC_ALL=C sort` makes the hash independent of the
+/// order the permissions section appended entries in (the `users:`/`groups:`
+/// maps have no guaranteed iteration order); missing files (e.g. a minimal
+/// initramfs with no `/etc/shadow`) contribute nothing rather than aborting.
+///
+/// The `cat` is wrapped in a `{ …; } || true` brace group so a missing file
+/// doesn't fail the pipeline: the standalone `avocado rootfs image` /
+/// `avocado initramfs image` scripts run under `set -euo pipefail`, where an
+/// unguarded `cat` failure would take down the `$(…)` assignment — and with
+/// its only diagnostic sent to `/dev/null`, kill the build with no output.
+pub fn render_auth_files_hash(work_var: &str, out_var: &str) -> String {
+    format!(
+        r#"    {out_var}=$({{ cat \
+        "${work_var}/etc/passwd" \
+        "${work_var}/etc/shadow" \
+        "${work_var}/etc/group" \
+        "${work_var}/etc/gshadow" 2>/dev/null || true; }} | LC_ALL=C sort | sha256sum | awk '{{print $1}}')"#
+    )
+}
+
 /// Render a list of user-supplied shell commands as an indented block,
 /// preceded by a one-line "Running … hooks" echo for log clarity. Empty
 /// input returns an empty string so the surrounding script stays clean.
@@ -162,7 +192,13 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # shift with the container's collation.
     PKG_NEVRA=$(rpm --dbpath /var/lib/rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | LC_ALL=C sort)
     PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
-    OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH'))")
+
+    # Fold the assembled auth files into the build id so a `permissions:`-only
+    # change — which the NEVRA set above is blind to — still moves the id and
+    # OTAs (ENG-2437). See render_auth_files_hash.
+{auth_hash_block}
+
+    OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH:$AUTH_HASH'))")
 
     # Inject identity into os-release (work copy for the image, sysroot for stone)
     # Strip any prior injected fields from the work copy before appending
@@ -218,6 +254,7 @@ fi"#,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        auth_hash_block = render_auth_files_hash("ROOTFS_WORK", "AUTH_HASH"),
     )
 }
 
@@ -568,6 +605,75 @@ mod tests {
         assert!(
             guard_pos < perms_pos,
             "the /etc/passwd guard must run before the permissions/user-creation section"
+        );
+    }
+
+    #[test]
+    fn test_render_auth_files_hash_snippet() {
+        // The snippet hashes the four auth files under the given work dir into
+        // the given var, tolerates missing files, and pins the sort to the C
+        // locale so the digest is independent of append order.
+        assert_eq!(
+            render_auth_files_hash("ROOTFS_WORK", "AUTH_HASH"),
+            r#"    AUTH_HASH=$({ cat \
+        "$ROOTFS_WORK/etc/passwd" \
+        "$ROOTFS_WORK/etc/shadow" \
+        "$ROOTFS_WORK/etc/group" \
+        "$ROOTFS_WORK/etc/gshadow" 2>/dev/null || true; } | LC_ALL=C sort | sha256sum | awk '{print $1}')"#
+        );
+        // Work dir and output var are both substituted, so the initramfs build
+        // reuses it verbatim with its own names.
+        let initramfs = render_auth_files_hash("INITRAMFS_WORK", "INITRAMFS_AUTH_HASH");
+        assert!(initramfs.contains("INITRAMFS_AUTH_HASH=$({ cat"));
+        assert!(initramfs.contains("\"$INITRAMFS_WORK/etc/passwd\""));
+    }
+
+    #[test]
+    fn test_render_auth_files_hash_survives_pipefail() {
+        // Standalone `avocado rootfs image` / `avocado initramfs image` run the
+        // fragment under `set -euo pipefail`. A missing file (e.g. a minimal
+        // initramfs with no /etc/shadow) must not fail the pipeline and abort
+        // the build — the `{ …; } || true` brace group absorbs cat's status.
+        assert!(render_auth_files_hash("ROOTFS_WORK", "AUTH_HASH").contains("|| true; }"));
+    }
+
+    #[test]
+    fn test_build_id_folds_auth_files() {
+        // Regression for ENG-2437: a permissions-only change must move
+        // AVOCADO_OS_BUILD_ID, so the build id has to hash the assembled
+        // auth files — not just the package NEVRA set — and feed both into
+        // the uuid5 derivation.
+        let script = generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            "# permissions placeholder\n",
+        );
+
+        assert!(
+            script.contains("AUTH_HASH="),
+            "build id must incorporate a hash of the auth files"
+        );
+        for f in ["passwd", "shadow", "group", "gshadow"] {
+            assert!(
+                script.contains(&format!("$ROOTFS_WORK/etc/{f}")),
+                "auth hash must cover /etc/{f}"
+            );
+        }
+        assert!(
+            script.contains("'$PKG_HASH:$AUTH_HASH'"),
+            "uuid5 input must combine the package hash and the auth hash"
+        );
+
+        // The auth hash must be computed after the permissions section has
+        // written the files, otherwise it can't observe the change.
+        let perms_pos = script
+            .find("# permissions placeholder")
+            .expect("permissions section present");
+        let auth_pos = script.find("AUTH_HASH=").expect("auth hash present");
+        assert!(
+            perms_pos < auth_pos,
+            "auth hash must be computed after the permissions section runs"
         );
     }
 }

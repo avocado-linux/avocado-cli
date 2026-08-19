@@ -16,7 +16,9 @@ use crate::utils::{
     target::resolve_target_required,
 };
 
-use crate::commands::rootfs::image::{render_hook_block, resolve_install_hooks, NAMESPACE_UUID};
+use crate::commands::rootfs::image::{
+    render_auth_files_hash, render_hook_block, resolve_install_hooks, NAMESPACE_UUID,
+};
 
 /// Default post-install commands for the initramfs build. Same shape as
 /// `DEFAULT_ROOTFS_POST_INSTALL` but for `$INITRAMFS_WORK`, plus the
@@ -95,7 +97,13 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     # otherwise unchanged package set.
     INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | LC_ALL=C sort)
     INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
-    INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH'))")
+
+    # Fold the assembled auth files into the build id so a `permissions:`-only
+    # change — which the NEVRA set above is blind to — still moves the id and
+    # OTAs (ENG-2437). See render_auth_files_hash.
+{auth_hash_block}
+
+    INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH:$INITRAMFS_AUTH_HASH'))")
 
     # Inject identity into initrd-release and os-release-initrd
     if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
@@ -172,6 +180,7 @@ fi"#,
         initramfs_filesystem = initramfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        auth_hash_block = render_auth_files_hash("INITRAMFS_WORK", "INITRAMFS_AUTH_HASH"),
     )
 }
 
@@ -544,6 +553,40 @@ mod tests {
     fn test_gzip_omits_timestamp() {
         let script = generate_initramfs_build_script("ns", "cpio.gz", None, "");
         assert!(script.contains("gzip -9 -n"));
+    }
+
+    /// ENG-2437: a `permissions:`-only change must move the initramfs build
+    /// id too, so the id has to fold the auth-file hash into its uuid5 input —
+    /// the same way the rootfs build id does.
+    #[test]
+    fn test_build_id_folds_auth_files() {
+        let marker = "# permissions placeholder";
+        let script = generate_initramfs_build_script("ns", "cpio.zst", None, marker);
+
+        assert!(
+            script.contains("INITRAMFS_AUTH_HASH="),
+            "build id must incorporate a hash of the auth files"
+        );
+        for f in ["passwd", "shadow", "group", "gshadow"] {
+            assert!(
+                script.contains(&format!("$INITRAMFS_WORK/etc/{f}")),
+                "auth hash must cover /etc/{f}"
+            );
+        }
+        assert!(
+            script.contains("'$INITRAMFS_PKG_HASH:$INITRAMFS_AUTH_HASH'"),
+            "uuid5 input must combine the package hash and the auth hash"
+        );
+
+        // The auth hash must be computed after the permissions section runs.
+        let perms_pos = script.find(marker).expect("permissions section present");
+        let auth_pos = script
+            .find("INITRAMFS_AUTH_HASH=")
+            .expect("auth hash present");
+        assert!(
+            perms_pos < auth_pos,
+            "auth hash must be computed after the permissions section runs"
+        );
     }
 
     /// Every compressed variant goes through the same normalized tree.
