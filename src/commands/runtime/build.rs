@@ -6,7 +6,7 @@ use crate::utils::{
     config::{ComposedConfig, Config, ImageConfig},
     container::{RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
-    permissions::{mapping_from_hashmap, render_users_groups_script},
+    permissions::{mapping_from_map, render_users_groups_script},
     runs_on::RunsOnContext,
     stamps::{
         compute_runtime_build_input_hash, compute_runtime_install_input_hash,
@@ -2300,8 +2300,8 @@ echo "Docker image priming complete.""#,
             let Some(perms) = image.and_then(|img| config.resolve_image_permissions(img)) else {
                 return String::new();
             };
-            let users = mapping_from_hashmap(perms.users.as_ref());
-            let groups = mapping_from_hashmap(perms.groups.as_ref());
+            let users = mapping_from_map(perms.users.as_ref());
+            let groups = mapping_from_map(perms.groups.as_ref());
             render_users_groups_script(users.as_ref(), groups.as_ref(), etc_dir, None)
         };
 
