@@ -490,64 +490,26 @@ impl InstallCommand {
         Ok(extensions)
     }
 
-    /// Find runtimes that are relevant for the specified target
+    /// Find runtimes that are relevant for the specified target.
+    ///
+    /// Delegates to the shared helper rather than keeping a second copy of the
+    /// selection logic: this one had drifted into an independently maintained
+    /// duplicate, and the target-override handling the shared version grew would
+    /// otherwise apply to the SDK step of an install but not to its extension
+    /// and runtime steps.
     fn find_target_relevant_runtimes(
         &self,
         config: &Config,
         parsed: &serde_yaml::Value,
         target: &str,
     ) -> Result<Vec<String>> {
-        let mut relevant_runtimes = Vec::new();
-
-        if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
-            for runtime_name_val in runtime_section.keys() {
-                if let Some(runtime_name) = runtime_name_val.as_str() {
-                    // If a specific runtime is requested, only check that one
-                    if let Some(ref requested_runtime) = self.runtime {
-                        if runtime_name != requested_runtime {
-                            continue;
-                        }
-                    }
-
-                    // Check if this runtime is relevant for the target
-                    let merged_runtime = config.get_merged_runtime_config(
-                        runtime_name,
-                        target,
-                        &self.config_path,
-                    )?;
-                    if let Some(merged_value) = merged_runtime {
-                        if let Some(runtime_target) =
-                            merged_value.get("target").and_then(|t| t.as_str())
-                        {
-                            // Runtime has explicit target - only include if it matches
-                            if runtime_target == target {
-                                relevant_runtimes.push(runtime_name.to_string());
-                            }
-                        } else {
-                            // Runtime has no target specified - include for all targets
-                            relevant_runtimes.push(runtime_name.to_string());
-                        }
-                    } else {
-                        // If there's no merged config, check the base runtime config
-                        if let Some(runtime_config) = runtime_section.get(runtime_name_val) {
-                            if let Some(runtime_target) =
-                                runtime_config.get("target").and_then(|t| t.as_str())
-                            {
-                                // Runtime has explicit target - only include if it matches
-                                if runtime_target == target {
-                                    relevant_runtimes.push(runtime_name.to_string());
-                                }
-                            } else {
-                                // Runtime has no target specified - include for all targets
-                                relevant_runtimes.push(runtime_name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(relevant_runtimes)
+        crate::utils::config::find_target_relevant_runtimes(
+            config,
+            parsed,
+            target,
+            &self.config_path,
+            self.runtime.as_deref(),
+        )
     }
 }
 

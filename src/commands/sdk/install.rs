@@ -343,8 +343,14 @@ impl SdkInstallCommand {
         // Discover whether target-dev sysroot is needed (compile sections from
         // fetched external extensions). Prepare the command BEFORE launching
         // the parallel sysroot installs so all four can run concurrently.
-        let active_compile_sections =
-            find_active_compile_sections(&composed.merged_value, active_extensions);
+        let active_compile_sections = find_active_compile_sections(
+            config,
+            &composed.merged_value,
+            active_extensions,
+            target,
+            &composed.config_path,
+            None,
+        )?;
         let need_target_dev = config.has_compile_sections() && !active_compile_sections.is_empty();
 
         // Prepare target-dev install command if needed (CPU-only prep, no container calls)

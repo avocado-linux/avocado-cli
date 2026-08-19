@@ -5402,11 +5402,74 @@ pub fn load_config<P: AsRef<Path>>(config_path: P) -> Result<Config> {
     Config::load(config_path)
 }
 
+/// Does this runtime declare its `target:` *only* inside `target-<t>:` override
+/// blocks, none of which is the current target?
+///
+/// `resolve_overrides_in_value` strips every non-matching `target-<t>:` block
+/// before a merged runtime is handed back, so a runtime shaped like
+///
+/// ```yaml
+/// runtimes:
+///   rpi:
+///     target-raspberrypi4:
+///       target: raspberrypi4
+/// ```
+///
+/// arrives with no `target` key at all when the current target is something
+/// else. Read naively that looks target-agnostic, which lands it in the
+/// include-for-all-targets branch and defeats the scoping: `sdk install
+/// --target qemux86-64` would install this runtime's u-boot compile packages
+/// into the x86-64 target sysroot.
+///
+/// Deliberately conservative - it reports true only when the config gives no
+/// sign whatsoever that the runtime applies to `target`. A `target-<target>:`
+/// block that exists but declares no `target:` of its own keeps the runtime
+/// target-agnostic and included, since the author plainly wrote something for
+/// this target.
+///
+/// The deprecated bare-target-name form (`raspberrypi4:` rather than
+/// `target-raspberrypi4:`) is not covered here; using it already warns.
+fn declares_target_only_for_other_targets(
+    raw_runtime: Option<&serde_yaml::Value>,
+    target: &str,
+) -> bool {
+    let Some(mapping) = raw_runtime.and_then(|v| v.as_mapping()) else {
+        return false;
+    };
+
+    // An unconditional `target:` needs nothing from us: the caller read it out
+    // of the merged value and already decided.
+    if mapping.get("target").is_some() {
+        return false;
+    }
+
+    let mut names_another_target = false;
+    for (key, sub_value) in mapping {
+        let Some(block_target) = key.as_str().and_then(|k| k.strip_prefix("target-")) else {
+            continue;
+        };
+        if block_target == target {
+            return false;
+        }
+        if sub_value.get("target").and_then(|t| t.as_str()).is_some() {
+            names_another_target = true;
+        }
+    }
+
+    names_another_target
+}
+
 /// Find runtimes that are relevant for the specified target.
 ///
 /// A runtime is relevant if:
 /// - It has a `target:` field matching the given target, OR
-/// - It has no `target:` field (matches all targets)
+/// - It has no `target:` field anywhere (matches all targets)
+///
+/// A runtime whose only `target:` sits inside a `target-<t>:` override block is
+/// relevant just to the targets it names there - see
+/// [`declares_target_only_for_other_targets`], which exists because override
+/// resolution has already stripped those blocks by the time the merged runtime
+/// is read here.
 ///
 /// If `requested_runtime` is Some, only that runtime is considered.
 pub fn find_target_relevant_runtimes(
@@ -5438,7 +5501,10 @@ pub fn find_target_relevant_runtimes(
                         if runtime_target == target {
                             relevant_runtimes.push(runtime_name.to_string());
                         }
-                    } else {
+                    } else if !declares_target_only_for_other_targets(
+                        runtime_section.get(runtime_name_val),
+                        target,
+                    ) {
                         // No target specified - include for all targets
                         relevant_runtimes.push(runtime_name.to_string());
                     }
@@ -5521,17 +5587,22 @@ pub fn find_active_extensions(
 }
 
 /// Find the set of sdk.compile section names that are referenced by active extensions
-/// or by any runtime's `kernel.compile` field.
+/// or by the runtimes relevant to `target`.
 ///
 /// This examines:
 /// - The `packages` section of each active extension for `compile:` references
-/// - The `kernel.compile` field of every runtime
+/// - The `kernel.compile` and `packages.<pkg>.compile` fields of each runtime
+///   that `target` (and `requested_runtime`, when given) selects
 ///
 /// returning only the compile section names that are actually needed.
 pub fn find_active_compile_sections(
+    config: &Config,
     parsed: &serde_yaml::Value,
     active_extensions: &std::collections::HashSet<String>,
-) -> Vec<String> {
+    target: &str,
+    config_path: &str,
+    requested_runtime: Option<&str>,
+) -> Result<Vec<String>> {
     let mut active_sections = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -5544,9 +5615,41 @@ pub fn find_active_compile_sections(
         }
     }
 
-    // Also include compile sections referenced by runtimes via kernel.compile
+    // Also include compile sections referenced by runtimes, both via
+    // `kernel.compile` and via `packages.<pkg>.compile`. Missing the latter
+    // meant a runtime package's compile section was never counted as active, so
+    // no target sysroot was provisioned and the section's own `packages:` were
+    // silently dropped -- the build then failed much later on absent target
+    // headers/libraries with nothing pointing back at the cause.
+    //
+    // Scoped to the runtimes this target selects, the same way
+    // `find_active_extensions` scopes its own scan. Reading every runtime here
+    // provisions target-dev for runtimes belonging to some other target, which
+    // is wasted work at best and the wrong toolchain at worst.
+    let target_runtimes =
+        find_target_relevant_runtimes(config, parsed, target, config_path, requested_runtime)?;
+
     if let Some(runtimes) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
-        for (_runtime_name, runtime_val) in runtimes {
+        for runtime_name in &target_runtimes {
+            let Some(raw_runtime) = runtimes.get(runtime_name.as_str()) else {
+                continue;
+            };
+
+            // Read the *merged* body, not the raw one. The names above were
+            // selected through `get_merged_runtime_config`, so reading the
+            // un-resolved mapping here would select on resolved config and then
+            // scan unresolved config: a compile ref declared inside a
+            // `target-<t>:` block is invisible to the raw read, while runtime
+            // build -- which reads the merged value -- still executes it. That
+            // pairing is worse than either half alone. `need_target_dev` stays
+            // false so no target-dev sysroot is installed, yet the compile-deps
+            // stamp is still written and later accepted on existence alone, so
+            // the compile script runs against a sysroot holding none of the
+            // packages it declared.
+            let merged_runtime =
+                config.get_merged_runtime_config(runtime_name, target, config_path)?;
+            let runtime_val = merged_runtime.as_ref().unwrap_or(raw_runtime);
+
             if let Some(section_name) = runtime_val
                 .get("kernel")
                 .and_then(|k| k.get("compile"))
@@ -5556,11 +5659,21 @@ pub fn find_active_compile_sections(
                     active_sections.push(section_name.to_string());
                 }
             }
+
+            if let Some(packages) = runtime_val.get("packages").and_then(|p| p.as_mapping()) {
+                for (_pkg_name, pkg_val) in packages {
+                    if let Some(section_name) = pkg_val.get("compile").and_then(|c| c.as_str()) {
+                        if seen.insert(section_name.to_string()) {
+                            active_sections.push(section_name.to_string());
+                        }
+                    }
+                }
+            }
         }
     }
 
     active_sections.sort();
-    active_sections
+    Ok(active_sections)
 }
 
 #[cfg(test)]
@@ -6022,6 +6135,23 @@ extensions:
         assert!(result.is_err());
     }
 
+    /// Load `config_content` as a real Config and resolve its active compile
+    /// sections for `target`, the way `sdk install` does.
+    fn active_compile_sections_for(
+        config_content: &str,
+        active_extensions: &std::collections::HashSet<String>,
+        target: &str,
+    ) -> Vec<String> {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = Config::load(temp_file.path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        find_active_compile_sections(&config, &parsed, active_extensions, target, &path, None)
+            .unwrap()
+    }
+
     #[test]
     fn test_find_active_compile_sections_via_runtime_kernel() {
         let config_content = r#"
@@ -6040,12 +6170,59 @@ sdk:
         glibc-dev: '*'
         libelf1: '*'
 "#;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let no_extensions = std::collections::HashSet::new();
 
-        let active = find_active_compile_sections(&parsed, &no_extensions);
+        let active = active_compile_sections_for(config_content, &no_extensions, "qemux86-64");
 
         assert_eq!(active, vec!["kernel"]);
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_via_runtime_package() {
+        // A compile section reached through `runtimes.<n>.packages.<pkg>.compile`
+        // is just as active as one reached through `kernel.compile`. Missing it
+        // meant no target sysroot was provisioned and `packages:` below were
+        // silently ignored.
+        let config_content = r#"
+runtimes:
+  dev:
+    packages:
+      avocado-runtime: '*'
+      uboot:
+        compile: uboot
+        install: uboot-install.sh
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot:
+      compile: uboot-compile.sh
+      packages:
+        libgcc-s-dev: '*'
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        let active = active_compile_sections_for(config_content, &no_extensions, "qemux86-64");
+
+        assert_eq!(active, vec!["uboot"]);
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_ignores_plain_version_packages() {
+        // `avocado-runtime: '*'` is a scalar, not a mapping -- must not panic or
+        // be mistaken for a compile reference.
+        let config_content = r#"
+runtimes:
+  dev:
+    packages:
+      avocado-runtime: '*'
+      other: '1.2.3'
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        assert!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64").is_empty()
+        );
     }
 
     #[test]
@@ -6069,14 +6246,147 @@ sdk:
     kernel:
       compile: kernel-compile.sh
 "#;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         let mut active_exts = std::collections::HashSet::new();
         active_exts.insert("my-ext".to_string());
 
-        let active = find_active_compile_sections(&parsed, &active_exts);
+        let active = active_compile_sections_for(config_content, &active_exts, "qemux86-64");
 
         assert_eq!(active.len(), 1);
         assert_eq!(active[0], "kernel");
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_scopes_to_the_target() {
+        // Each runtime declares its own target. Scanning for one target must
+        // not drag in the other's compile section: that provisions a target-dev
+        // sysroot for a runtime the user did not ask to build, with the wrong
+        // toolchain for the one they did.
+        let config_content = r#"
+runtimes:
+  board-a:
+    target: qemux86-64
+    packages:
+      uboot:
+        compile: uboot-x86
+  board-b:
+    target: raspberrypi4
+    packages:
+      uboot:
+        compile: uboot-rpi4
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot-x86:
+      compile: uboot-compile.sh
+    uboot-rpi4:
+      compile: uboot-compile.sh
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64"),
+            vec!["uboot-x86"]
+        );
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "raspberrypi4"),
+            vec!["uboot-rpi4"]
+        );
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_reads_target_override_blocks() {
+        // The compile ref lives inside `target-<t>:`. Selection already resolves
+        // overrides, so scanning the raw mapping here saw nothing while runtime
+        // build -- reading the merged value -- still ran the compile script,
+        // against a target-dev sysroot that was never installed.
+        let config_content = r#"
+runtimes:
+  dev:
+    target-qemux86-64:
+      packages:
+        uboot:
+          compile: uboot-x86
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot-x86:
+      compile: uboot-compile.sh
+      packages:
+        libgcc-s-dev: '*'
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64"),
+            vec!["uboot-x86"]
+        );
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_honors_target_declared_under_override() {
+        // The runtime names its target only inside `target-raspberrypi4:`.
+        // Override resolution strips that block for every other target, leaving
+        // a runtime that looks target-agnostic -- which would drag the rpi4
+        // u-boot compile packages into an x86-64 target sysroot.
+        let config_content = r#"
+runtimes:
+  rpi:
+    target-raspberrypi4:
+      target: raspberrypi4
+    packages:
+      uboot:
+        compile: uboot-rpi4
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot-rpi4:
+      compile: uboot-compile.sh
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "raspberrypi4"),
+            vec!["uboot-rpi4"]
+        );
+        assert!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64").is_empty()
+        );
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_keeps_runtime_with_a_block_for_this_target() {
+        // Mixed shape: `target:` is declared under one target's block, and the
+        // current target has a block of its own that declares none. The narrowing
+        // above must not fire here -- the author wrote something for this target,
+        // so the runtime stays target-agnostic and included. Pins the
+        // conservative half of `declares_target_only_for_other_targets`.
+        let config_content = r#"
+runtimes:
+  multi:
+    target-raspberrypi4:
+      target: raspberrypi4
+    target-qemux86-64:
+      packages:
+        extra: '*'
+    packages:
+      uboot:
+        compile: uboot-shared
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot-shared:
+      compile: uboot-compile.sh
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        assert_eq!(
+            active_compile_sections_for(config_content, &no_extensions, "qemux86-64"),
+            vec!["uboot-shared"]
+        );
     }
 
     #[test]
