@@ -345,7 +345,17 @@ impl SdkInstallCommand {
         // the parallel sysroot installs so all four can run concurrently.
         let active_compile_sections =
             find_active_compile_sections(&composed.merged_value, active_extensions);
-        let need_target_dev = config.has_compile_sections() && !active_compile_sections.is_empty();
+        // An extension declaring device-tree overlays needs the delivery
+        // hook in the target-sysroot, so provision the target-sysroot even when
+        // there is no compile section (a no-#include overlay needs no kernel-devsrc).
+        let provision_dto =
+            !crate::utils::device_tree_overlay::active_extensions_declaring_overlays(
+                &composed.merged_value,
+                active_extensions,
+            )
+            .is_empty();
+        let need_target_dev =
+            (config.has_compile_sections() && !active_compile_sections.is_empty()) || provision_dto;
 
         // Prepare target-dev install command if needed (CPU-only prep, no container calls)
         let target_dev_command = if need_target_dev {
@@ -390,6 +400,21 @@ impl SdkInstallCommand {
                 target_sysroot_config_version,
             );
 
+            // The per-BSP delivery hook lands in the target-sysroot so the
+            // runtime build can invoke it. A BSP that ships no hook package fails the
+            // install here, earlier and clearer than the build-time backstop.
+            let dto_hook_pkg = if provision_dto {
+                build_package_spec_with_lock(
+                    lock_file,
+                    target,
+                    &SysrootType::TargetSysroot,
+                    crate::utils::device_tree_overlay::DELIVERY_HOOK_PACKAGE,
+                    "*",
+                )
+            } else {
+                String::new()
+            };
+
             let command = format!(
                 r#"
 unset RPM_CONFIGDIR
@@ -397,13 +422,14 @@ RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
     --disablerepo=${{AVOCADO_TARGET}}-target-ext \
     {} {} {} --installroot ${{AVOCADO_PREFIX}}/sdk/target-sysroot \
-    install {} {}
+    install {} {} {}
 "#,
                 dnf_args_str,
                 exclude_str,
                 yes,
                 target_sysroot_pkg,
-                all_compile_packages.join(" ")
+                all_compile_packages.join(" "),
+                dto_hook_pkg
             );
 
             Some((
@@ -473,6 +499,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             config,
             &bootstrap.sdk_dependencies,
             &bootstrap.extension_sdk_dependencies,
+            provision_dto,
             &mut sdk_pkg_lock,
             &bootstrap.all_sdk_package_names,
             &bootstrap.sdk_sysroot,
@@ -1731,6 +1758,7 @@ fi
         config: &Config,
         sdk_dependencies: &Option<HashMap<String, serde_yaml::Value>>,
         extension_sdk_dependencies: &HashMap<String, HashMap<String, serde_yaml::Value>>,
+        provision_dto: bool,
         lock_file: &mut LockFile,
         bootstrap_package_names: &[String],
         sdk_sysroot: &SysrootType,
@@ -1768,6 +1796,22 @@ fi
                 self.build_package_list_with_lock(ext_deps, lock_file, target, sdk_sysroot);
             sdk_packages.extend(ext_packages);
             sdk_package_names.extend(self.extract_package_names(ext_deps));
+        }
+
+        // Provision the SDK overlay build wrapper when any active
+        // extension declares device-tree overlays. Its RDEPENDS pulls
+        // nativesdk-dtc, and stone is a baseline SDK package, so neither is
+        // provisioned separately.
+        if provision_dto {
+            sdk_packages.push(build_package_spec_with_lock(
+                lock_file,
+                target,
+                sdk_sysroot,
+                crate::utils::device_tree_overlay::SDK_OVERLAY_PACKAGE,
+                "*",
+            ));
+            sdk_package_names
+                .push(crate::utils::device_tree_overlay::SDK_OVERLAY_PACKAGE.to_string());
         }
 
         // Track all SDK package names for version query (bootstrap pkgs + new deps)

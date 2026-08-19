@@ -1232,6 +1232,14 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                 )
             })?;
 
+        // Device-tree overlays declared by this runtime's extensions.
+        // Empty section - and no build-time work - unless at least one is declared.
+        let device_tree_overlay_section = {
+            let overlays =
+                crate::utils::device_tree_overlay::collect_for_runtime(&merged_runtime, parsed)?;
+            crate::utils::device_tree_overlay::render_build_section(&overlays)?
+        };
+
         // Extract extension names from the `extensions` array
         let mut required_extensions = HashSet::new();
         let _extension_type_overrides: HashMap<String, Vec<String>> = HashMap::new();
@@ -2444,7 +2452,22 @@ if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
     done
 fi
 STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
+# Also search the SDK's stone dir. A BSP's stone-<arch>.json references boot
+# artifacts it does not build here - u-boot.bin, bootfiles/ - and the runtime
+# input dir only ever holds what this build produced (rootfs, kernel, initramfs,
+# var), so a manifest naming any of them fails resolution with "not found in any
+# input directory".
+#
+# This is the consumer half of a two-part change and is inert without the
+# other: today meta-avocado's avocado-sdk-target installs only the stone JSON
+# into this directory, so nothing new resolves from it yet. It is the right
+# half to land regardless - stone resolves first-match-wins across -i dirs, so
+# an empty extra input changes no current behaviour - but the finalize failure
+# it targets stays until the BSP recipe stages those artifacts here.
+STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $AVOCADO_SDK_PREFIX/stone"
 
+STONE_OVERLAY_FLAG=""
+{device_tree_overlay_section}
 echo -e "\033[94m[INFO]\033[0m Running stone bundle."
 echo -e "  Manifest:  $STONE_MANIFEST"
 echo -e "  Output:    $STONE_AOS_OUTPUT"
@@ -2461,6 +2484,7 @@ stone bundle \
     $STONE_INITRD_FLAG \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
+    $STONE_OVERLAY_FLAG \
     --partition-size "var=$FINAL_SIZE" \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
@@ -2562,6 +2586,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             manifest_section = manifest_section,
             update_authority_section = update_authority_section,
             docker_section = docker_section,
+            device_tree_overlay_section = device_tree_overlay_section,
         );
 
         Ok(script)
@@ -3084,6 +3109,9 @@ runtimes:
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
         assert!(script.contains("stone bundle"));
         assert!(script.contains("mkfs.btrfs"));
+        // No overlays declared: the device-tree overlay section is inert.
+        assert!(!script.contains("device-tree overlays"));
+        assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
     }
 
     #[test]
@@ -3129,6 +3157,78 @@ extensions:
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
         assert!(script.contains("$RUNTIME_EXT_DIR/test-ext-1.0.0.raw"));
         assert!(!script.contains("$VAR_DIR/lib/avocado/extensions/"));
+    }
+
+    #[test]
+    fn test_create_build_script_with_device_tree_overlays() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - test-ext
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+    device_tree_overlays:
+      - name: my-spi
+        src: overlays/my-spi.dtso
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .unwrap();
+
+        // The overlay section is emitted, builds the declared overlay via the
+        // SDK wrapper, and wires the delivery hook + stone --overlay before the
+        // bundle call.
+        assert!(script.contains("device-tree overlays"));
+        assert!(script.contains(
+            "avocado-dtc-overlay --name \"my-spi\" --src \"/opt/src/overlays/my-spi.dtso\""
+        ));
+        assert!(script.contains("device-tree-overlay-deliver"));
+        assert!(script.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""));
+        // And the bundle call consumes the flag.
+        assert!(script.contains("$STONE_OVERLAY_FLAG \\"));
+
+        // The staging dir must be PREPENDED to the include flags. stone takes
+        // the first -i dir that holds a matching name, and the merged DTB is
+        // published under the BSP's own base filename, so appending lets any
+        // earlier dir - including the project's own stone_include_paths - win
+        // the lookup and ship an unmerged tree. That failure boots cleanly with
+        // no overlay applied and reports nothing, so nothing downstream catches
+        // it; the ordering is the only thing that prevents it.
+        assert!(
+            script.contains("STONE_INCLUDE_FLAGS=\"-i $DTBO_STAGING $STONE_INCLUDE_FLAGS\""),
+            "staging dir must be prepended, not appended, or a same-named DTB \
+             in an earlier -i dir silently wins over the merged one"
+        );
+        assert!(
+            !script.contains("STONE_INCLUDE_FLAGS=\"$STONE_INCLUDE_FLAGS -i $DTBO_STAGING\""),
+            "the appended form reintroduces the silent unmerged-DTB failure"
+        );
     }
 
     #[test]
