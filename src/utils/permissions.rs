@@ -372,13 +372,16 @@ echo "Set proper permissions on authentication files""#
     script_lines.join("")
 }
 
-/// Convert an `Option<&HashMap<String, serde_yaml::Value>>` (the shape
+/// Convert an `Option<&BTreeMap<String, serde_yaml::Value>>` (the shape
 /// stored in [`crate::utils::config::PermissionsConfig`]) into an owned
-/// `serde_yaml::Mapping` ref appropriate for [`render_users_groups_script`].
+/// `serde_yaml::Mapping` appropriate for [`render_users_groups_script`].
+///
+/// `BTreeMap` iterates in key order, so the resulting `Mapping` — and the
+/// users/groups the script then provisions — are deterministic across builds.
 ///
 /// Returns `None` if the input is `None` or empty.
-pub fn mapping_from_hashmap(
-    src: Option<&std::collections::HashMap<String, serde_yaml::Value>>,
+pub fn mapping_from_map(
+    src: Option<&std::collections::BTreeMap<String, serde_yaml::Value>>,
 ) -> Option<Mapping> {
     let map = src?;
     if map.is_empty() {
@@ -472,5 +475,31 @@ mod tests {
         let script = render_users_groups_script(None, Some(&groups), "/etc", None);
         assert!(script.contains("Creating group 'docker'"));
         assert!(script.contains("chown root:root \"/etc/passwd\""));
+    }
+
+    #[test]
+    fn mapping_from_map_provisions_in_sorted_order() {
+        // ENG-2441: users/groups come from a BTreeMap, so mapping_from_map must
+        // preserve key-sorted order — the generated passwd appends and the
+        // auto-assigned UIDs follow it, and a stable order is what stops the
+        // build id (and any UID a user omits) from churning every build.
+        let mut users = std::collections::BTreeMap::new();
+        users.insert("zeta".to_string(), user(""));
+        users.insert("alpha".to_string(), user(""));
+        users.insert("mike".to_string(), user(""));
+
+        let mapping = mapping_from_map(Some(&users)).expect("non-empty map yields Some");
+        let keys: Vec<&str> = mapping.iter().filter_map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["alpha", "mike", "zeta"]);
+
+        let script = render_users_groups_script(Some(&mapping), None, "/etc", None);
+        let a = script.find("Creating user 'alpha'").unwrap();
+        let m = script.find("Creating user 'mike'").unwrap();
+        let z = script.find("Creating user 'zeta'").unwrap();
+        assert!(a < m && m < z, "users must be provisioned in sorted order");
+
+        // Empty / absent maps still fold to nothing.
+        assert!(mapping_from_map(None).is_none());
+        assert!(mapping_from_map(Some(&std::collections::BTreeMap::new())).is_none());
     }
 }

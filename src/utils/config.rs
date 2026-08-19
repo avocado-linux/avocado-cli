@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -835,10 +835,16 @@ pub struct ImageConfig {
 /// (rootfs or initramfs). Values are kept as raw YAML so the existing
 /// dynamic field parser in [`crate::utils::permissions`] can consume them
 /// without re-typing every shadow attribute.
+///
+/// `BTreeMap` (not `HashMap`) so users/groups are provisioned in a stable,
+/// key-sorted order: `render_users_groups_script` appends to /etc/passwd and
+/// /etc/group in iteration order and auto-assigns UID/GID in that order, so a
+/// random per-process `HashMap` order would otherwise reshuffle the generated
+/// script — and the auto-assigned UIDs — on every build.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PermissionsConfig {
-    pub users: Option<HashMap<String, serde_yaml::Value>>,
-    pub groups: Option<HashMap<String, serde_yaml::Value>>,
+    pub users: Option<BTreeMap<String, serde_yaml::Value>>,
+    pub groups: Option<BTreeMap<String, serde_yaml::Value>>,
 }
 
 /// Provision profile configuration

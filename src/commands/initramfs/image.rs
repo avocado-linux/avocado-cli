@@ -11,13 +11,13 @@ use crate::utils::{
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
     output::{print_error, print_info, print_success, OutputLevel},
-    permissions::{mapping_from_hashmap, render_users_groups_script},
+    permissions::{mapping_from_map, render_users_groups_script},
     runs_on::RunsOnContext,
     target::resolve_target_required,
 };
 
 use crate::commands::rootfs::image::{
-    render_auth_files_hash, render_hook_block, resolve_install_hooks, NAMESPACE_UUID,
+    render_build_id_block, render_hook_block, resolve_install_hooks, BuildIdSpec, NAMESPACE_UUID,
 };
 
 /// Default post-install commands for the initramfs build. Same shape as
@@ -88,31 +88,15 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
 {post_install_block}
 
-    # Compute deterministic build ID for initramfs.
-    #
-    # LC_ALL=C for the same reason as the cpio pipeline below: this hash becomes
-    # $INITRAMFS_BUILD_ID, which is appended to initrd-release and
-    # os-release-initrd *inside* the archive. Collation drift would reorder the
-    # NEVRA list, change the hash, and so change the archive contents for an
-    # otherwise unchanged package set.
-    INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | LC_ALL=C sort)
-    INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
-
-    # Fold the assembled auth files into the build id so a `permissions:`-only
-    # change — which the NEVRA set above is blind to — still moves the id and
-    # OTAs (ENG-2437). See render_auth_files_hash.
-{auth_hash_block}
-
-    INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH:$INITRAMFS_AUTH_HASH'))")
-
-    # Inject identity into initrd-release and os-release-initrd
-    if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
-        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/initrd-release"
-    fi
-    if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
-        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
-    fi
-
+    # Compute the deterministic build id from the assembled work tree (see
+    # render_build_id_block). Taken before the identity injection below so the
+    # hash can't depend on the id it is about to write. LC_ALL=C throughout for
+    # the same reason as the cpio pipeline: collation must not reorder the hash
+    # inputs (the id lands in initrd-release / os-release-initrd inside the
+    # archive, so a shift would change the archive for an unchanged tree).
+    # Runs BEFORE the build-id derivation so the tree hash covers exactly
+    # what ships: dnf/rpm state is both nondeterministic and absent from the
+    # image, so it must be gone (or pruned) before the id is taken.
     # Purge package-manager bookkeeping from the work copy before archiving.
     # Same reasoning as the rootfs image — see the comment in
     # `generate_rootfs_build_script`, including why dnf's logs are NOT on the
@@ -125,6 +109,16 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     # directories it empties, and the mtime pass is what makes that not matter.
     echo "Purging package-manager state from initramfs image"
     rm -rf "$INITRAMFS_WORK/var/lib/rpm" "$INITRAMFS_WORK/var/lib/dnf" "$INITRAMFS_WORK/var/cache/dnf"
+
+{build_id_block}
+
+    # Inject identity into initrd-release and os-release-initrd
+    if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
+        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/initrd-release"
+    fi
+    if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
+        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
+    fi
 
     # Normalize mtimes across the staged tree so the cpio is reproducible.
     #
@@ -189,11 +183,17 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 else
     echo "No initramfs sysroot found — skipping initramfs image build."
 fi"#,
-        namespace_uuid = namespace_uuid,
         initramfs_filesystem = initramfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
-        auth_hash_block = render_auth_files_hash("INITRAMFS_WORK", "INITRAMFS_AUTH_HASH"),
+        build_id_block = render_build_id_block(&BuildIdSpec {
+            namespace_uuid,
+            work_var: "INITRAMFS_WORK",
+            sysroot_var: "INITRAMFS_SYSROOT",
+            rpm_args: "",
+            id_var: "INITRAMFS_BUILD_ID",
+            identity_files: &["usr/lib/initrd-release", "usr/lib/os-release-initrd"],
+        }),
     )
 }
 
@@ -290,8 +290,8 @@ impl InitramfsImageCommand {
             .initramfs_default()
             .and_then(|img| config.resolve_image_permissions(img))
             .map(|p| {
-                let users = mapping_from_hashmap(p.users.as_ref());
-                let groups = mapping_from_hashmap(p.groups.as_ref());
+                let users = mapping_from_map(p.users.as_ref());
+                let groups = mapping_from_map(p.groups.as_ref());
                 render_users_groups_script(
                     users.as_ref(),
                     groups.as_ref(),
@@ -559,6 +559,14 @@ mod tests {
             .expect("cpio step present");
         assert!(purge_at < cpio_at, "purge must precede cpio creation");
 
+        // And before the build-id derivation, so the tree hash covers exactly
+        // what ships rather than dnf/rpm state that is about to be deleted.
+        let tree_at = script.find("TREE_HASH=").expect("tree hash present");
+        assert!(
+            purge_at < tree_at,
+            "purge must precede the build-id tree hash"
+        );
+
         // dnf never writes its logs into an installroot (logdir is not
         // prefixed by prepend_installroot), so a log purge here would be a
         // no-op that reads as coverage. Pin its absence.
@@ -604,6 +612,27 @@ mod tests {
         );
     }
 
+    /// Initramfs derives its id through the same render_build_id_block as rootfs
+    /// (NEVRA package hash + work-tree content hash, rpmdb pruned), so the two
+    /// images can't diverge on the correctness-critical id logic (ENG-2441).
+    #[test]
+    fn test_build_id_uses_shared_tree_hash() {
+        let s = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        assert!(s.contains("TREE_HASH="), "work-tree content hash present");
+        assert!(s.contains("-path ./var/lib/rpm"), "rpmdb pruned");
+        assert!(
+            s.contains("INITRAMFS_BUILD_ID=$(python3"),
+            "id assigned to the initramfs var"
+        );
+        assert!(
+            s.contains("'$PKG_HASH:$TREE_HASH'"),
+            "package + tree hash folded"
+        );
+        // Both initramfs identity files are canonicalized before hashing.
+        assert!(s.contains(r#"[ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]"#));
+        assert!(s.contains(r#"[ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]"#));
+    }
+
     /// gzip already omits MTIME/FNAME when reading stdin, but `-n` keeps that
     /// true if the pipeline is ever changed to compress a file in place.
     #[test]
@@ -613,36 +642,27 @@ mod tests {
     }
 
     /// ENG-2437: a `permissions:`-only change must move the initramfs build
-    /// id too, so the id has to fold the auth-file hash into its uuid5 input —
-    /// the same way the rootfs build id does.
+    /// id. Under the tree-hash derivation (ENG-2441) the auth files are
+    /// ordinary tree content, so the guarantee holds iff the tree hash is
+    /// computed after the permissions section runs and `/etc` is never on the
+    /// prune list.
     #[test]
-    fn test_build_id_folds_auth_files() {
+    fn test_build_id_sees_permissions_changes() {
         let marker = "# permissions placeholder";
         let script = generate_initramfs_build_script("ns", "cpio.zst", None, marker);
 
-        assert!(
-            script.contains("INITRAMFS_AUTH_HASH="),
-            "build id must incorporate a hash of the auth files"
-        );
-        for f in ["passwd", "shadow", "group", "gshadow"] {
-            assert!(
-                script.contains(&format!("$INITRAMFS_WORK/etc/{f}")),
-                "auth hash must cover /etc/{f}"
-            );
-        }
-        assert!(
-            script.contains("'$INITRAMFS_PKG_HASH:$INITRAMFS_AUTH_HASH'"),
-            "uuid5 input must combine the package hash and the auth hash"
-        );
-
-        // The auth hash must be computed after the permissions section runs.
         let perms_pos = script.find(marker).expect("permissions section present");
-        let auth_pos = script
-            .find("INITRAMFS_AUTH_HASH=")
-            .expect("auth hash present");
+        let tree_pos = script
+            .find("INITRAMFS_TREE_HASH=")
+            .or_else(|| script.find("TREE_HASH="))
+            .expect("tree hash present");
         assert!(
-            perms_pos < auth_pos,
-            "auth hash must be computed after the permissions section runs"
+            perms_pos < tree_pos,
+            "tree hash must be computed after the permissions section runs"
+        );
+        assert!(
+            !script.contains("-path ./etc"),
+            "/etc must never be pruned from the tree hash — it is what carries permissions changes into the id"
         );
     }
 
