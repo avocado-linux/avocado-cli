@@ -11,7 +11,7 @@ use crate::utils::{
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
     output::{print_error, print_info, print_success, OutputLevel},
-    permissions::{mapping_from_hashmap, render_users_groups_script},
+    permissions::{mapping_from_map, render_users_groups_script},
     runs_on::RunsOnContext,
     target::resolve_target_required,
 };
@@ -92,6 +92,105 @@ fi"
     }
 }
 
+/// Work-relative paths pruned from the build-id tree hash: their bytes are
+/// nondeterministic across builds and are either not part of the image identity
+/// or already covered elsewhere.
+/// - `var/lib/rpm`: the rpmdb sqlite embeds install timestamps — which is
+///   exactly why package identity is hashed from the NEVRA set (`PKG_HASH`),
+///   not these bytes.
+/// - `var/cache`, `var/log`: dnf caches and logs, build-varying.
+const BUILD_ID_TREE_PRUNES: &[&str] = &["./var/lib/rpm", "./var/cache", "./var/log"];
+
+/// The differences between the rootfs and initramfs build-id derivations, fed to
+/// [`render_build_id_block`].
+pub struct BuildIdSpec<'a> {
+    /// Namespace UUID for the uuid5 derivation.
+    pub namespace_uuid: &'a str,
+    /// Shell variable naming the assembled work dir (e.g. `ROOTFS_WORK`).
+    pub work_var: &'a str,
+    /// Shell variable naming the sysroot holding the rpmdb (e.g. `ROOTFS_SYSROOT`).
+    pub sysroot_var: &'a str,
+    /// Extra `rpm` args to locate the db — rootfs passes `--dbpath /var/lib/rpm`,
+    /// initramfs the empty string (default path).
+    pub rpm_args: &'a str,
+    /// Shell variable to assign the derived id (e.g. `OS_BUILD_ID`).
+    pub id_var: &'a str,
+    /// Work-relative identity files to canonicalize before hashing (strip any
+    /// AVOCADO_* fields a prior build injected), e.g. `usr/lib/os-release`.
+    pub identity_files: &'a [&'a str],
+}
+
+/// Render the shell that derives a deterministic build id into `spec.id_var`.
+///
+/// The id is `uuid5(namespace, "$PKG_HASH:$TREE_HASH")`:
+/// - `PKG_HASH` is the sorted NEVRA set — a stable package identity that does
+///   not depend on the nondeterministic rpmdb *bytes* (so a version-only bump
+///   with an identical file payload still moves the id).
+/// - `TREE_HASH` is a content hash of the assembled work tree, so *any*
+///   rootfs-affecting change — `permissions:`, `post_install`, `overlay:`,
+///   anything future — moves the id and therefore OTAs. It hashes exactly what
+///   the image carries: sorted path, type, mode, symlink target, and file
+///   content. It excludes what the image build normalizes away (`mkfs.erofs -T`
+///   mtimes, `--all-root` ownership) and what is fs-dependent (directory
+///   sizes), so it can't churn on noise the image doesn't hold.
+///   [`BUILD_ID_TREE_PRUNES`] are excluded.
+///
+/// Must be invoked AFTER the permissions and post_install steps and BEFORE the
+/// os-release identity lines are appended: the derivation strips `AVOCADO_*`
+/// from the identity files first, so the hash can't depend on a prior build's
+/// id (self-reference) or the possibly-unpinned runtime version.
+pub fn render_build_id_block(spec: &BuildIdSpec) -> String {
+    let BuildIdSpec {
+        namespace_uuid,
+        work_var,
+        sysroot_var,
+        rpm_args,
+        id_var,
+        identity_files,
+    } = *spec;
+
+    // Strip any AVOCADO_* fields a prior build injected into the identity files
+    // (the work copy inherits them from the sysroot) so the tree hash is stable.
+    let strip = identity_files
+        .iter()
+        .map(|f| {
+            format!(
+                "    if [ -f \"${work_var}/{f}\" ]; then\n        \
+                 sed -i '/^AVOCADO_OS_BUILD_ID=/d;/^AVOCADO_RUNTIME_NAME=/d;/^AVOCADO_RUNTIME_VERSION=/d' \"${work_var}/{f}\"\n    fi"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prune = BUILD_ID_TREE_PRUNES
+        .iter()
+        .map(|p| format!("-path {p}"))
+        .collect::<Vec<_>>()
+        .join(" -o ");
+
+    format!(
+        r#"    # Canonicalize the identity files before hashing (see render_build_id_block).
+{strip}
+
+    # Deterministic package identity from the NEVRA set — independent of the
+    # rpmdb *bytes*, which embed install timestamps (hence var/lib/rpm is pruned
+    # from the tree hash below). LC_ALL=C so collation can't reorder it.
+    PKG_NEVRA=$(rpm {rpm_args} -qa --queryformat '%{{NEVRA}}\n' --root "${sysroot_var}" | LC_ALL=C sort)
+    PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
+
+    # Content hash of the assembled work tree: the id must move iff the image
+    # bytes move. Hash only what the image carries — sorted path, type, mode,
+    # symlink target, file content — excluding what the image build normalizes
+    # out (mtime, ownership) or what is fs-dependent (directory sizes). %m is the
+    # octal mode, %l the symlink target (empty for non-links).
+    BUILD_ID_META=$(cd "${work_var}" && find . \( {prune} \) -prune -o -printf '%y %m %P\t%l\n' | LC_ALL=C sort)
+    BUILD_ID_CONTENT=$(cd "${work_var}" && find . \( {prune} \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+    TREE_HASH=$(printf '%s\n%s\n' "$BUILD_ID_META" "$BUILD_ID_CONTENT" | sha256sum | awk '{{print $1}}')
+
+    {id_var}=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH:$TREE_HASH'))")"#
+    )
+}
+
 /// Generate the shell script fragment that builds a rootfs image from the shared sysroot.
 ///
 /// The generated script expects these shell variables to be set:
@@ -156,17 +255,11 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 
 {post_install_block}
 
-    # Compute deterministic AVOCADO_OS_BUILD_ID from installed packages
-    # LC_ALL=C so NEVRA ordering — and therefore this hash and the
-    # AVOCADO_OS_BUILD_ID injected into os-release inside the image — can't
-    # shift with the container's collation.
-    PKG_NEVRA=$(rpm --dbpath /var/lib/rpm -qa --queryformat '%{{NEVRA}}\n' --root "$ROOTFS_SYSROOT" | LC_ALL=C sort)
-    PKG_HASH=$(echo "$PKG_NEVRA" | sha256sum | awk '{{print $1}}')
-    OS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$PKG_HASH'))")
+{build_id_block}
 
-    # Inject identity into os-release (work copy for the image, sysroot for stone)
-    # Strip any prior injected fields from the work copy before appending
-    sed -i '/^AVOCADO_OS_BUILD_ID=/d;/^AVOCADO_RUNTIME_NAME=/d;/^AVOCADO_RUNTIME_VERSION=/d' "$ROOTFS_WORK/usr/lib/os-release"
+    # Inject identity into os-release (work copy for the image, sysroot for stone).
+    # The work copy was canonicalized (AVOCADO_* stripped) during id derivation,
+    # so these appends land in a clean file.
     echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_NAME=$RUNTIME_NAME" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_VERSION=$RUNTIME_VERSION" >> "$ROOTFS_WORK/usr/lib/os-release"
@@ -214,10 +307,17 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 else
     echo "No rootfs sysroot found — skipping rootfs image build."
 fi"#,
-        namespace_uuid = namespace_uuid,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        build_id_block = render_build_id_block(&BuildIdSpec {
+            namespace_uuid,
+            work_var: "ROOTFS_WORK",
+            sysroot_var: "ROOTFS_SYSROOT",
+            rpm_args: "--dbpath /var/lib/rpm",
+            id_var: "OS_BUILD_ID",
+            identity_files: &["usr/lib/os-release"],
+        }),
     )
 }
 
@@ -314,8 +414,8 @@ impl RootfsImageCommand {
             .rootfs_default()
             .and_then(|img| config.resolve_image_permissions(img))
             .map(|p| {
-                let users = mapping_from_hashmap(p.users.as_ref());
-                let groups = mapping_from_hashmap(p.groups.as_ref());
+                let users = mapping_from_map(p.users.as_ref());
+                let groups = mapping_from_map(p.groups.as_ref());
                 render_users_groups_script(
                     users.as_ref(),
                     groups.as_ref(),
@@ -569,5 +669,93 @@ mod tests {
             guard_pos < perms_pos,
             "the /etc/passwd guard must run before the permissions/user-creation section"
         );
+    }
+
+    fn rootfs_script() -> String {
+        generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            "",
+        )
+    }
+
+    #[test]
+    fn test_build_id_is_pkg_hash_plus_tree_hash() {
+        // ENG-2441: the id folds a content hash of the assembled work tree in
+        // beside the NEVRA package hash, so any rootfs-affecting change moves it.
+        let s = rootfs_script();
+        assert!(s.contains("PKG_HASH="), "package identity retained");
+        assert!(s.contains("TREE_HASH="), "work-tree content hash present");
+        assert!(
+            s.contains("uuid.uuid5(uuid.UUID('00000000-0000-0000-0000-000000000000'), '$PKG_HASH:$TREE_HASH')"),
+            "id must derive from both the package hash and the tree hash"
+        );
+    }
+
+    #[test]
+    fn test_tree_hash_prunes_nondeterministic_paths_and_excludes_metadata() {
+        // The rpmdb (install timestamps) and dnf caches/logs would churn the id
+        // every build, and mtime/ownership are normalized out of the image — so
+        // none may feed the hash. It hashes type, mode (%m), path (%P) and
+        // symlink target (%l) only.
+        let s = rootfs_script();
+        for pruned in [
+            "-path ./var/lib/rpm",
+            "-path ./var/cache",
+            "-path ./var/log",
+        ] {
+            assert!(s.contains(pruned), "tree hash must prune {pruned}");
+        }
+        assert!(
+            s.contains(r"-printf '%y %m %P\t%l\n'"),
+            "hash covers type/mode/path/link"
+        );
+        // No mtime (%T*), user (%u/%U) or group (%g/%G) directives leak in.
+        for meta in ["%T", "%u", "%U", "%g", "%G"] {
+            assert!(!s.contains(meta), "tree hash must not depend on {meta}");
+        }
+    }
+
+    #[test]
+    fn test_build_id_computed_before_identity_is_injected() {
+        // Taking the hash after the os-release identity append would make the id
+        // depend on itself (and on the possibly-unpinned runtime version), so the
+        // derivation — including the strip that canonicalizes os-release — must
+        // finish before anything is appended.
+        let s = rootfs_script();
+        let strip = s
+            .find("sed -i '/^AVOCADO_OS_BUILD_ID=/d")
+            .expect("identity strip present");
+        let tree = s.find("TREE_HASH=").expect("tree hash present");
+        let derive = s
+            .find("OS_BUILD_ID=$(python3")
+            .expect("id derivation present");
+        let append = s
+            .find(r#"echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >>"#)
+            .expect("identity append present");
+        assert!(
+            strip < tree && tree < derive && derive < append,
+            "order must be: strip identity -> tree hash -> derive id -> append identity"
+        );
+    }
+
+    #[test]
+    fn test_render_build_id_block_shape() {
+        // Direct contract check on the shared helper both images use.
+        let block = render_build_id_block(&BuildIdSpec {
+            namespace_uuid: "11111111-1111-1111-1111-111111111111",
+            work_var: "WK",
+            sysroot_var: "SR",
+            rpm_args: "--dbpath /var/lib/rpm",
+            id_var: "MY_ID",
+            identity_files: &["usr/lib/os-release"],
+        });
+        assert!(block.contains(r#"[ -f "$WK/usr/lib/os-release" ]"#));
+        assert!(block.contains(r#"--root "$SR""#));
+        assert!(block.contains(r#"rpm --dbpath /var/lib/rpm -qa"#));
+        assert!(block.contains(r#"cd "$WK" && find ."#));
+        assert!(block.contains("MY_ID=$(python3"));
+        assert!(block.contains("'$PKG_HASH:$TREE_HASH'"));
     }
 }

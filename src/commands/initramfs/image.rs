@@ -11,12 +11,14 @@ use crate::utils::{
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
     output::{print_error, print_info, print_success, OutputLevel},
-    permissions::{mapping_from_hashmap, render_users_groups_script},
+    permissions::{mapping_from_map, render_users_groups_script},
     runs_on::RunsOnContext,
     target::resolve_target_required,
 };
 
-use crate::commands::rootfs::image::{render_hook_block, resolve_install_hooks, NAMESPACE_UUID};
+use crate::commands::rootfs::image::{
+    render_build_id_block, render_hook_block, resolve_install_hooks, BuildIdSpec, NAMESPACE_UUID,
+};
 
 /// Default post-install commands for the initramfs build. Same shape as
 /// `DEFAULT_ROOTFS_POST_INSTALL` but for `$INITRAMFS_WORK`, plus the
@@ -86,16 +88,13 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
 {post_install_block}
 
-    # Compute deterministic build ID for initramfs.
-    #
-    # LC_ALL=C for the same reason as the cpio pipeline below: this hash becomes
-    # $INITRAMFS_BUILD_ID, which is appended to initrd-release and
-    # os-release-initrd *inside* the archive. Collation drift would reorder the
-    # NEVRA list, change the hash, and so change the archive contents for an
-    # otherwise unchanged package set.
-    INITRAMFS_PKG_NEVRA=$(rpm -qa --queryformat '%{{NEVRA}}\n' --root "$INITRAMFS_SYSROOT" | LC_ALL=C sort)
-    INITRAMFS_PKG_HASH=$(echo "$INITRAMFS_PKG_NEVRA" | sha256sum | awk '{{print $1}}')
-    INITRAMFS_BUILD_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('{namespace_uuid}'), '$INITRAMFS_PKG_HASH'))")
+    # Compute the deterministic build id from the assembled work tree (see
+    # render_build_id_block). Taken before the identity injection below so the
+    # hash can't depend on the id it is about to write. LC_ALL=C throughout for
+    # the same reason as the cpio pipeline: collation must not reorder the hash
+    # inputs (the id lands in initrd-release / os-release-initrd inside the
+    # archive, so a shift would change the archive for an unchanged tree).
+{build_id_block}
 
     # Inject identity into initrd-release and os-release-initrd
     if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
@@ -168,10 +167,17 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 else
     echo "No initramfs sysroot found — skipping initramfs image build."
 fi"#,
-        namespace_uuid = namespace_uuid,
         initramfs_filesystem = initramfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        build_id_block = render_build_id_block(&BuildIdSpec {
+            namespace_uuid,
+            work_var: "INITRAMFS_WORK",
+            sysroot_var: "INITRAMFS_SYSROOT",
+            rpm_args: "",
+            id_var: "INITRAMFS_BUILD_ID",
+            identity_files: &["usr/lib/initrd-release", "usr/lib/os-release-initrd"],
+        }),
     )
 }
 
@@ -268,8 +274,8 @@ impl InitramfsImageCommand {
             .initramfs_default()
             .and_then(|img| config.resolve_image_permissions(img))
             .map(|p| {
-                let users = mapping_from_hashmap(p.users.as_ref());
-                let groups = mapping_from_hashmap(p.groups.as_ref());
+                let users = mapping_from_map(p.users.as_ref());
+                let groups = mapping_from_map(p.groups.as_ref());
                 render_users_groups_script(
                     users.as_ref(),
                     groups.as_ref(),
@@ -536,6 +542,27 @@ mod tests {
             !script.contains("| sort)") && !script.contains("| sort |"),
             "an unpinned sort remains in the generated initramfs script"
         );
+    }
+
+    /// Initramfs derives its id through the same render_build_id_block as rootfs
+    /// (NEVRA package hash + work-tree content hash, rpmdb pruned), so the two
+    /// images can't diverge on the correctness-critical id logic (ENG-2441).
+    #[test]
+    fn test_build_id_uses_shared_tree_hash() {
+        let s = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        assert!(s.contains("TREE_HASH="), "work-tree content hash present");
+        assert!(s.contains("-path ./var/lib/rpm"), "rpmdb pruned");
+        assert!(
+            s.contains("INITRAMFS_BUILD_ID=$(python3"),
+            "id assigned to the initramfs var"
+        );
+        assert!(
+            s.contains("'$PKG_HASH:$TREE_HASH'"),
+            "package + tree hash folded"
+        );
+        // Both initramfs identity files are canonicalized before hashing.
+        assert!(s.contains(r#"[ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]"#));
+        assert!(s.contains(r#"[ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]"#));
     }
 
     /// gzip already omits MTIME/FNAME when reading stdin, but `-n` keeps that
