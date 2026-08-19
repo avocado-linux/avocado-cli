@@ -32,6 +32,17 @@ for var in $(env | grep -o 'CARGO_TARGET_[A-Z0-9_]*_RUSTFLAGS'); do
     unset "$var"
 done
 
+# Require the SDK vars before touching the tree or deriving any path. Letting
+# them expand empty would collapse CROSS_BINDIR to "/usr/bin", where the -x check
+# below finds the *host* gcc and quietly produces a native binary packaged as a
+# target extension; an empty SDKTARGETSYSROOT would bake a bogus --sysroot into
+# .cargo/config.toml. This script runs with `set -e` but not `set -u`, so nothing
+# else catches it. Guarding here also means neither abort leaves a half-written
+# .cargo/config.toml behind.
+: "${OECORE_NATIVE_SYSROOT:?not set -- SDK environment-setup was not sourced}"
+: "${SDKTARGETSYSROOT:?not set -- SDK environment-setup was not sourced}"
+: "${CROSS_COMPILE:?not set -- SDK environment-setup was not sourced}"
+
 # Remove only the generated cross-compile config, preserving any committed
 # .cargo files used for development.
 rm -f .cargo/config.toml
@@ -44,13 +55,35 @@ rustflags = ["--sysroot=$SDKTARGETSYSROOT/usr", "-C", "link-arg=--sysroot=$SDKTA
 EOF
 
 # The SDK exports $CC as the cross-compiler command (bare name + target flags +
-# --sysroot), but in the `ext build` environment that compiler binary lives in
-# the SDK target-sysroot bindir, which is not on PATH. Without this, the `cc`
-# crate (pulled in by the remaining C dep aws-lc-sys) can't resolve the compiler
-# from $CC and falls back to guessing "<triple>-gcc", failing with ToolNotFound.
-# Put the SDK compiler bindir on PATH so the build uses exactly the $CC the SDK
-# configured. Arch-agnostic: derived from $SDKTARGETSYSROOT, no hardcoded triple.
-export PATH="$SDKTARGETSYSROOT/usr/bin:$PATH"
+# --sysroot), so the `cc` crate (pulled in by the C dep aws-lc-sys) needs that
+# binary on PATH or it fails with ToolNotFound.
+#
+# It lives in the cross-canadian bindir under the SDK *native* sysroot -- NOT in
+# $SDKTARGETSYSROOT/usr/bin, which holds the target-*native* toolchain. Putting
+# the target sysroot bindir on PATH resolves "<triple>-gcc" to a target ELF;
+# binfmt_misc then hands it to qemu-user, which dies on the unresolvable target
+# loader ("qemu-aarch64: Could not open '/usr/lib/ld-linux-aarch64.so.1'") and
+# fails every compiler probe with exit 255. That is invisible on a same-arch
+# target like qemux86-64, where the target gcc happens to run natively.
+#
+# Arch-agnostic: the triple comes from $CROSS_COMPILE, no hardcoded value.
+CROSS_BINDIR="$OECORE_NATIVE_SYSROOT/usr/bin/${CROSS_COMPILE%-}"
+
+# Name the compiler from $CROSS_COMPILE rather than parsing $CC. oe-core writes
+# both from ${TARGET_PREFIX} in toolchain-scripts.bbclass, so $CC's first token
+# is byte-identical to this in every SDK we ship against, and meta-clang only
+# appends CLANGCC without overriding CC. Deriving it from $CC bought nothing and
+# mis-read three real inputs: an empty first token (making -x test the bindir
+# itself, so the guard passed), a ccache/distcc wrapper, and an absolute path.
+CC_BIN="${CROSS_COMPILE}gcc"
+if [ ! -x "$CROSS_BINDIR/$CC_BIN" ]; then
+    echo "Error: cross compiler '$CC_BIN' not found in $CROSS_BINDIR" >&2
+    echo "The SDK is missing the C cross-canadian toolchain. An SDK installed" >&2
+    echo "before it was added to avocado.yaml will not have it -- reinstall with:" >&2
+    echo "    avocado sdk install --force" >&2
+    exit 1
+fi
+export PATH="$CROSS_BINDIR:$PATH"
 
 # --locked: published builds run from staged package_files; fail loudly on a
 # missing/stale Cargo.lock instead of silently re-resolving dependencies.
