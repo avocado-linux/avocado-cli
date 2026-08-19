@@ -11,8 +11,20 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     output::{print_info, print_success, OutputLevel},
+    shell::shell_escape,
     target::validate_and_log_target,
 };
+
+/// Join a user-supplied argv into one shell-safe command string.
+///
+/// The result is spliced into a shell script inside the container, so each
+/// element must be quoted or the container shell re-splits it.
+fn join_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| shell_escape(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Implementation of the 'sdk run' command.
 pub struct SdkRunCommand {
@@ -261,7 +273,7 @@ impl SdkRunCommand {
         // Require either a command or --interactive flag
         if !self.interactive && self.command.is_none() {
             return Err(anyhow::anyhow!(
-                "You must either provide a --command (-c) or use --interactive (-i)."
+                "You must either provide a command to run or use --interactive (-i)."
             ));
         }
 
@@ -310,9 +322,16 @@ impl SdkRunCommand {
             println!("Container name: {name}");
         }
 
-        // Build the command to execute
+        // Build the command to execute.
+        //
+        // The argv vector is spliced into a shell script inside the container, so
+        // each element has to be quoted or the container shell re-splits it. A bare
+        // join(" ") turns `-- bash -lc 'X=1; echo $X'` into
+        // `bash -lc X=1; echo $X`, which the shell reads as two commands and
+        // expands `$X` in the *outer* shell (to nothing). That silently produces
+        // wrong output instead of an error, which is worse than failing.
         let command = if let Some(ref cmd) = self.command {
-            let user_command = cmd.join(" ");
+            let user_command = join_argv(cmd);
             if self.env {
                 format!(". avocado-env && {user_command}")
             } else {
@@ -442,6 +461,24 @@ mod tests {
         assert_eq!(cmd.command, Some(vec!["ls".to_string(), "-la".to_string()]));
     }
 
+    #[test]
+    fn test_join_argv_preserves_argv_boundaries() {
+        // A bare join(" ") would emit `bash -lc X=1; echo $X`, which the
+        // container shell splits into two commands and expands `$X` itself.
+        let argv = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "X=1; echo $X".to_string(),
+        ];
+        assert_eq!(join_argv(&argv), "'bash' '-lc' 'X=1; echo $X'");
+    }
+
+    #[test]
+    fn test_join_argv_escapes_embedded_single_quotes() {
+        let argv = vec!["echo".to_string(), "it's".to_string()];
+        assert_eq!(join_argv(&argv), "'echo' 'it'\\''s'");
+    }
+
     #[tokio::test]
     async fn test_invalid_arguments() {
         let cmd = SdkRunCommand::new(
@@ -493,7 +530,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("You must either provide a --command"));
+            .contains("You must either provide a command to run"));
     }
 
     #[test]
