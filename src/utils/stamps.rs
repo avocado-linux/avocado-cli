@@ -893,13 +893,14 @@ fn script_hash_value(project_root: &Path, rel_path: &str) -> serde_yaml::Value {
     serde_yaml::Value::Mapping(m)
 }
 
-/// Fold a digest of an overlay's post-preprocessing tree into `hash_data` under
-/// `key`, but only when the overlay opts into preprocessing
-/// (`overlay: { ..., preprocess: ... }`). For verbatim overlays this is a no-op,
-/// preserving today's hashing (which keys only on the overlay config value, not
-/// file contents). When enabled, a changed template value (e.g. a new claim
-/// token) or an edited overlay file changes the digest and forces a rebuild.
-/// Only the SHA-256 is stored — never the resolved plaintext.
+/// Fold a digest of an overlay's tree into `hash_data` under `key`, so that an
+/// edit to any overlay file forces a rebuild. The overlay is applied to the
+/// sysroot by a plain `cp` (not RPM), so without this its file contents are
+/// invisible to the install stamp and a change silently never reaches the image
+/// (ENG-2440). A verbatim overlay hashes raw bytes; one that opts into
+/// preprocessing (`overlay: { ..., preprocess: ... }`) hashes the post-`{{ }}`
+/// content, so a changed template value (e.g. a new claim token) invalidates
+/// too. Only the SHA-256 is stored — never the resolved plaintext.
 // The (target, runtime, cli_target_board) trio mirrors the interpolation
 // context the materialize step builds; bundling them into a context struct is
 // the right cleanup once a fourth CLI override lands.
@@ -914,15 +915,11 @@ fn fold_overlay_content_hash(
     runtime: Option<&str>,
     cli_target_board: Option<&str>,
 ) -> Result<()> {
-    use crate::utils::overlay_preprocess::PreprocessSpec;
+    use crate::utils::overlay_preprocess::{parse_overlay_config, PreprocessSpec};
     let spec = PreprocessSpec::from_overlay_value(overlay);
-    if !spec.is_enabled() {
-        return Ok(());
-    }
-    let dir = overlay
-        .get("dir")
-        .and_then(|d| d.as_str())
-        .unwrap_or("overlay");
+    // `dir` via the shared parser so a bare-string overlay (`overlay: mydir`)
+    // hashes the right tree, not the "overlay" default.
+    let (dir, _opaque) = parse_overlay_config(overlay);
     // Build the same interpolation context the build's materialize step uses, so
     // the digest reflects the exact rendered overlay content. `target` keeps
     // `{{ avocado.target }}` accurate and `cli_target_board` keeps
@@ -942,7 +939,7 @@ fn fold_overlay_content_hash(
     // let a broken overlay silently skip rebuild invalidation.
     if let Some(digest) = crate::utils::overlay_preprocess::overlay_content_digest(
         project_root,
-        dir,
+        &dir,
         &spec,
         config,
         &context,
@@ -4301,9 +4298,11 @@ extensions:
     }
 
     #[test]
-    fn rootfs_verbatim_overlay_ignores_file_contents() {
-        // Without `preprocess`, the hash keys only on the overlay config value,
-        // not file contents (today's behavior) — no content digest is folded in.
+    fn rootfs_verbatim_overlay_hashes_file_contents() {
+        // A verbatim overlay is applied by `cp`, not RPM, so its contents must be
+        // folded into the install stamp — editing an overlay file has to make the
+        // stamp stale, otherwise the change silently never reaches the image
+        // (ENG-2440).
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("overlay/etc")).unwrap();
         std::fs::write(tmp.path().join("overlay/etc/f.txt"), "v1").unwrap();
@@ -4322,7 +4321,38 @@ rootfs:
         let h1 = rootfs_config_hash(&config, tmp.path());
         std::fs::write(tmp.path().join("overlay/etc/f.txt"), "v2-different").unwrap();
         let h2 = rootfs_config_hash(&config, tmp.path());
-        assert_eq!(h1, h2);
+        assert_ne!(
+            h1, h2,
+            "editing a verbatim overlay file must invalidate the stamp"
+        );
+    }
+
+    #[test]
+    fn rootfs_bare_string_overlay_hashes_file_contents() {
+        // The bare-string form (`overlay: dirname`) must hash the named dir, not
+        // the "overlay" default — a regression guard for the shared
+        // parse_overlay_config path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("custom/etc")).unwrap();
+        std::fs::write(tmp.path().join("custom/etc/f.txt"), "v1").unwrap();
+
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rootfs:
+  packages:
+    avocado-pkg-rootfs: "*"
+  overlay: custom
+"#,
+        )
+        .unwrap();
+
+        let h1 = rootfs_config_hash(&config, tmp.path());
+        std::fs::write(tmp.path().join("custom/etc/f.txt"), "v2-different").unwrap();
+        let h2 = rootfs_config_hash(&config, tmp.path());
+        assert_ne!(
+            h1, h2,
+            "editing a bare-string overlay's file must invalidate the stamp"
+        );
     }
 
     #[test]
