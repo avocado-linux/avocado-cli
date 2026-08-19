@@ -6,6 +6,7 @@ pub mod fetch;
 pub mod hitl;
 pub mod init;
 pub mod runtime;
+pub mod sbom;
 pub mod sdk;
 
 use crate::common;

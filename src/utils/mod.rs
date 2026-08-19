@@ -35,6 +35,7 @@ pub mod signing_keys;
 pub mod signing_service;
 pub mod snapshot;
 pub mod stamps;
+pub mod sysroot_scan;
 pub mod target;
 pub mod tui;
 pub mod update_check;

@@ -290,12 +290,11 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // — no-op if /var is already at the device's max size. Non-fatal so a
     // btrfs hiccup doesn't tear down the VM.
     if let Err(e) = target.exec("btrfs filesystem resize max /var").await {
-        crate::utils::output::print_warning(
+        crate::utils::output::print_warning_stderr(
             &format!(
                 "btrfs resize on /var failed: {e:#}. /var size = {} bytes on host but the FS inside may not reflect that yet.",
                 var_target_bytes
             ),
-            crate::utils::output::OutputLevel::Normal,
         );
     }
 
@@ -304,9 +303,8 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // via scoped resolvers, which QEMU's slirp DNS proxy (10.0.2.3) can't
     // see. Pointing the guest at public resolvers via SLIRP's NAT works.
     if let Err(e) = apply_network_config(&target, opts.dns_override.as_deref()).await {
-        crate::utils::output::print_warning(
+        crate::utils::output::print_warning_stderr(
             &format!("applying network config in guest failed: {e:#}. Falling back to slirp's default DNS (10.0.2.3)."),
-            crate::utils::output::OutputLevel::Normal,
         );
     }
 
@@ -320,12 +318,11 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // useful for debugging.
     if idle_after_secs == 0 {
         if let Err(e) = super::forward::start(&paths, ssh_port).await {
-            crate::utils::output::print_warning(
+            crate::utils::output::print_warning_stderr(
                 &format!(
                     "docker socket forward failed: {e:#}. Local DOCKER_HOST routing won't work until you start it. \
                      (`avocado vm stop && avocado vm start` retries.)"
                 ),
-                crate::utils::output::OutputLevel::Normal,
             );
         }
     }
@@ -575,10 +572,7 @@ async fn apply_network_config(
         .await
         .with_context(|| format!("resolvectl domain eth0 {domains}"))?;
 
-    crate::utils::output::print_info(
-        &format!("applied guest DNS: {}", dns_list.join(", ")),
-        crate::utils::output::OutputLevel::Normal,
-    );
+    crate::utils::output::print_info_stderr(&format!("applied guest DNS: {}", dns_list.join(", ")));
     Ok(())
 }
 
@@ -997,12 +991,11 @@ async fn spawn_supervisor(
             // the supervisor managed to do. Worst case the user-facing
             // port refuses connections and the user sees a normal SSH
             // connection error.
-            crate::utils::output::print_warning(
+            crate::utils::output::print_warning_stderr(
                 &format!(
                     "hibernation supervisor (pid {spawn_pid}) didn't bind 127.0.0.1:{user_port} within 5s; \
                      proxy may be down. SSH may not work until you restart with `vm stop && vm start`."
                 ),
-                crate::utils::output::OutputLevel::Normal,
             );
             return Ok(());
         }

@@ -141,6 +141,92 @@ pub fn warning_sink(renderer_active: bool, json_active: bool) -> WarningSink {
     }
 }
 
+/// Print a diagnostic about the environment the command runs in, on stderr.
+///
+/// [`print_warning`] and [`print_info`] are `println!`, which is right for
+/// progress commentary that shares stdout with nothing else. It is wrong for a
+/// notice emitted before the command even dispatches, because the command that
+/// follows may own stdout: `avocado sbom > sbom.json` writes an SPDX document
+/// there, and a `[WARNING]` line ahead of it leaves a file no consumer can
+/// parse. These notices describe the environment rather than the result, so
+/// stderr is where they belong whichever command comes next.
+///
+/// Prose on stderr on a human-output run; nothing at all under `--output json`.
+///
+/// Stderr alone does not make a line safe. The avocado-desktop CLI runner merges
+/// stdout and stderr in causal order and parses the result, which is why the
+/// upgrade banner in `main` is suppressed under `--output json`. Same trade
+/// here, and the same cost: under JSON these notices are lost outright, which
+/// for the non-fatal failures in `lifecycle` means a caller can read a clean
+/// success over a VM whose SSH proxy never came up.
+///
+/// An earlier version emitted an NDJSON `{"event":"warning"}` record under JSON
+/// instead of going quiet, on the theory that a record joins a stream
+/// harmlessly. For most callers it did: the pre-dispatch notices fire for every
+/// `needs_vm_routing` command that declares `--output`, and `build`, `install`
+/// and `provision` all answer in NDJSON, where one more record is well-formed.
+/// `vm update` is the case that lost most by the removal — the `lifecycle`
+/// auto-start hiccups are the diagnostics it exists to report, and its
+/// `download_*` events are a stream too. It is the weakest of those
+/// beneficiaries today: the apply path in `commands/vm/update.rs` still has
+/// ungated `println!` prose between those events, so the stream a record would
+/// have joined is not clean under `--output json` yet regardless.
+///
+/// `sbom` is the one caller the record was wrong for, and the earlier note here
+/// overstated how: the record originates in `ensure_routed_for_process`, which
+/// runs before dispatch, so it could not land in the *middle* of the document.
+/// (`SbomCommand::execute` does reach this module — `print_summary` calls
+/// `print_info` and `print_success` — but only on the `output_path.is_some()`
+/// arm, where the document went to a file rather than to stdout.) It would have
+/// been **prepended** — one `{"event":"warning"}` from
+/// `ensure_routed_for_process` ahead of the single SPDX object — two objects
+/// where the contract says one.
+/// Latent rather than observed, and Docker-Desktop-only: every route.rs emitter
+/// sits behind `RoutingMode::Apply`.
+///
+/// So this is not "silence is right for every caller". It is one rule that
+/// cannot corrupt a one-object contract, bought by dropping a record the stream
+/// commands could have carried. Keeping both needs each command to declare
+/// stream-versus-object; nothing carries that yet.
+///
+/// The predicate is
+/// [`crate::utils::output_format::json_requested_on_command_line`] and not the
+/// `is_json_output_active` flag, because five of the ten callers sit in
+/// `ensure_routed_for_process`, which runs before the dispatch match and so
+/// before any guard exists.
+///
+/// Returns the line it emitted, or `None` when it stayed quiet. `eprintln!` is
+/// not observable from a test, so the return value is how a test sees which
+/// predicate fed the decision.
+fn print_stderr_notice(formatted: &str) -> Option<&str> {
+    let line = stderr_notice_line(
+        formatted,
+        crate::utils::output_format::json_requested_on_command_line(),
+    )?;
+    print_notice_above(line, |l| eprintln!("{l}"));
+    Some(line)
+}
+
+/// The line [`print_stderr_notice`] emits, or `None` when it stays quiet.
+///
+/// Split from the emit for the same reason as [`warning_sink`]: the policy is
+/// the part worth pinning. Taking `json_requested` as an argument is what lets a
+/// test drive the quiet side at all — the real predicate reads `argv`, which an
+/// in-process test cannot change.
+fn stderr_notice_line(formatted: &str, json_requested: bool) -> Option<&str> {
+    (!json_requested).then_some(formatted)
+}
+
+/// The warning severity of [`print_stderr_notice`], which documents the routing.
+pub fn print_warning_stderr(message: &str) {
+    let _ = print_stderr_notice(&format!("\x1b[93m[WARNING]\x1b[0m {message}"));
+}
+
+/// The informational counterpart of [`print_warning_stderr`], same reasoning.
+pub fn print_info_stderr(message: &str) {
+    let _ = print_stderr_notice(&format!("\x1b[94m[INFO]\x1b[0m {message}"));
+}
+
 /// Print a message without any color formatting.
 /// Suppressed when TUI is active.
 #[allow(dead_code)]
@@ -237,6 +323,36 @@ mod tests {
         // check rather than the other way round.
         assert_eq!(warning_sink(true, false), WarningSink::Renderer);
         assert_eq!(warning_sink(true, true), WarningSink::Renderer);
+    }
+
+    #[test]
+    fn an_environment_notice_goes_quiet_only_under_json() {
+        // Both directions matter and they fail differently. Emitting under
+        // JSON puts ANSI prose in a parsed stream; suppressing without it
+        // loses the routing warning on every ordinary run, which is the whole
+        // reason these printers exist.
+        assert_eq!(stderr_notice_line("[WARNING] x", true), None);
+        assert_eq!(
+            stderr_notice_line("[WARNING] x", false),
+            Some("[WARNING] x")
+        );
+    }
+
+    #[test]
+    fn an_environment_notice_reads_argv_not_the_process_flag() {
+        // Which predicate feeds the policy, pinned rather than asserted in a doc
+        // comment. Five of the ten callers run inside
+        // `ensure_routed_for_process`, before the dispatch match and so before
+        // any `JsonOutputGuard` exists — `is_json_output_active()` is false
+        // there on a `--output json` run, which is the bug that put prose in a
+        // parsed stream in the first place.
+        //
+        // Holding a guard is what makes the two predicates disagree: the flag is
+        // now true while this test binary's `argv` carries no `--output json`.
+        // Only the argv predicate lets the notice through, so swapping the
+        // callsite to the flag turns this `Some` into `None`.
+        let _json = crate::utils::output_format::JsonOutputGuard::enable();
+        assert_eq!(print_stderr_notice("[WARNING] x"), Some("[WARNING] x"));
     }
 
     #[test]
