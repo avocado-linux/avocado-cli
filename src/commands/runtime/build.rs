@@ -534,6 +534,12 @@ impl RuntimeBuildCommand {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
 
+        // Reproducibility stamp. This run executes the rootfs and initramfs
+        // image sections, so one insert covers both. Extension images are NOT
+        // built here -- this run only copies their pre-built artifacts, and
+        // `ext image` exports the epoch inside its own script.
+        crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
+
         if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
             target_arch,
@@ -734,6 +740,7 @@ impl RuntimeBuildCommand {
                 merged_container_args,
                 container_helper,
                 runs_on_context,
+                config.source_date_epoch,
             )
             .await?;
         }
@@ -2829,6 +2836,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
     /// - `AVOCADO_RUNTIME_BUILD_DIR`: `/opt/_avocado/<target>/runtimes/<runtime>` —
     ///   the runtime build dir the script can inspect or post-process.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_post_build(
         &self,
         script_path: &str,
@@ -2839,6 +2847,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
         merged_container_args: &Option<Vec<String>>,
         container_helper: &SdkContainer,
         runs_on_context: Option<&RunsOnContext>,
+        source_date_epoch: Option<u64>,
     ) -> Result<()> {
         print_info(
             &format!(
@@ -2872,7 +2881,15 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             dnf_args: self.dnf_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
             tui_context: self.tui_context.clone(),
-            env_vars: self.runtime_env_vars(),
+            env_vars: {
+                // post_build runs in its own container, so it needs its own
+                // injection -- the build run's env does not reach it. A hook
+                // that produces an artifact gets the same stamp the image
+                // steps do, rather than silently building against wall clock.
+                let mut env = self.runtime_env_vars().unwrap_or_default();
+                crate::utils::container::inject_source_date_epoch(&mut env, source_date_epoch);
+                Some(env)
+            },
             ..Default::default()
         };
 

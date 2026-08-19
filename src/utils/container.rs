@@ -513,6 +513,26 @@ pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, Stri
     }
 }
 
+/// Inject `SOURCE_DATE_EPOCH` into a container's env map when the project sets it.
+///
+/// Read today by the rootfs script's `mkfs.erofs -T "${SOURCE_DATE_EPOCH:-0}"`.
+/// The initramfs path exports it too, inert until its mtime-normalization step
+/// lands separately.
+///
+/// Left unset when the key is absent rather than defaulted to 0, because
+/// `SOURCE_DATE_EPOCH` is honored by plenty of tools besides ours (gzip, tar,
+/// python bytecode) and would change post_install behavior for projects that
+/// never opted in. `ext image` differs — it exports `unwrap_or(0)` inside its
+/// own script, so the key behaves one way there and another way here.
+pub fn inject_source_date_epoch(
+    env_vars: &mut std::collections::HashMap<String, String>,
+    source_date_epoch: Option<u64>,
+) {
+    if let Some(epoch) = source_date_epoch {
+        env_vars.insert("SOURCE_DATE_EPOCH".to_string(), epoch.to_string());
+    }
+}
+
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -3112,6 +3132,47 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `source_date_epoch` was plumbed into extension images only.
+    /// The rootfs script reads `${SOURCE_DATE_EPOCH:-0}` for `mkfs.erofs -T` but
+    /// nothing set the variable, so a project that configured it got a
+    /// reproducibility stamp on its `.raw` extensions and a silently ignored
+    /// key everywhere else.
+    mod source_date_epoch {
+        use super::*;
+
+        #[test]
+        fn configured_value_reaches_the_container_env() {
+            let mut env_vars = std::collections::HashMap::new();
+            inject_source_date_epoch(&mut env_vars, Some(1700000000));
+            assert_eq!(
+                env_vars.get("SOURCE_DATE_EPOCH").map(String::as_str),
+                Some("1700000000")
+            );
+        }
+
+        #[test]
+        fn zero_is_a_real_value_not_an_absent_one() {
+            // `Some(0)` is an explicit opt-in to the epoch, distinct from unset.
+            let mut env_vars = std::collections::HashMap::new();
+            inject_source_date_epoch(&mut env_vars, Some(0));
+            assert_eq!(
+                env_vars.get("SOURCE_DATE_EPOCH").map(String::as_str),
+                Some("0")
+            );
+        }
+
+        #[test]
+        fn unset_config_leaves_the_var_absent() {
+            // Not defaulted to 0 on purpose: the build scripts carry their own
+            // `:-0` fallback, and SOURCE_DATE_EPOCH is honored by unrelated
+            // tools that may run in post_install hooks. Projects that never
+            // opted in must see the same container env as before.
+            let mut env_vars = std::collections::HashMap::new();
+            inject_source_date_epoch(&mut env_vars, None);
+            assert!(!env_vars.contains_key("SOURCE_DATE_EPOCH"));
+        }
+    }
 
     /// Wiring tests for container stdio.
     ///

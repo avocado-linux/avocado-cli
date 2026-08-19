@@ -401,6 +401,8 @@ export AVOCADO_OS_VERSION_ID
         if wrap_kab {
             env_vars.insert("KAB_KEYSET_FILE".to_string(), "/tmp/kab.keyset".to_string());
         }
+        // Reproducibility stamp for `mkfs.erofs -T` in the build script above.
+        crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
 
         // Bind-mount the keyset into the container as a single -v arg
         // appended to whatever the user / config already has.
@@ -519,6 +521,47 @@ export AVOCADO_OS_VERSION_ID
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rootfs_script_reads_source_date_epoch_from_the_env() {
+        // The other half of `inject_source_date_epoch`. Injection and
+        // consumption have to agree on the variable name, and a mismatch in
+        // either half fails silently — the script just falls back to 0 and the
+        // configured stamp is quietly ignored, which is the bug this pairing
+        // exists to fix. Pin the name on this side too.
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "");
+        // Counted, not just `contains`. Both mkfs branches (erofs-zst and
+        // erofs-lz4) are emitted unconditionally, so a `contains` check passes
+        // even if one branch loses the flag — asserting the count is what
+        // actually catches that.
+        assert_eq!(
+            script.matches(r#"-T "${SOURCE_DATE_EPOCH:-0}""#).count(),
+            2,
+            "both mkfs.erofs branches must take their timestamp from $SOURCE_DATE_EPOCH"
+        );
+    }
+
+    /// The rest of the rootfs reproducibility contract. Nothing pinned these,
+    /// and each silently reintroduces per-build variance if dropped: the image
+    /// UUID would be randomized, and ownership would come from whoever ran the
+    /// build rather than being normalized to root.
+    #[test]
+    fn test_rootfs_image_reproducibility_flags_are_pinned() {
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "");
+
+        assert_eq!(
+            script
+                .matches("-U 00000000-0000-0000-0000-000000000000")
+                .count(),
+            2,
+            "both mkfs.erofs branches must pin the image UUID"
+        );
+        assert_eq!(
+            script.matches("--all-root").count(),
+            2,
+            "both mkfs.erofs branches must normalize ownership to root"
+        );
+    }
 
     #[test]
     fn test_rootfs_script_guards_against_half_populated_sysroot() {
