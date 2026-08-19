@@ -5,28 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Parse the `overlay:` config value into `(dir, opaque)`.
-/// Accepts either a plain string (`"path/to/dir"`) or a mapping
-/// (`{ dir: "path/to/dir", mode: "opaque" | "merge" }`).
-fn parse_overlay_config(value: &serde_yaml::Value) -> (String, bool) {
-    if let Some(dir_str) = value.as_str() {
-        (dir_str.to_string(), false)
-    } else if let Some(table) = value.as_mapping() {
-        let dir = table
-            .get("dir")
-            .and_then(|d| d.as_str())
-            .unwrap_or("overlay")
-            .to_string();
-        let opaque = table
-            .get("mode")
-            .and_then(|m| m.as_str())
-            .map(|m| m == "opaque")
-            .unwrap_or(false);
-        (dir, opaque)
-    } else {
-        ("overlay".to_string(), false)
-    }
-}
+use crate::utils::overlay_preprocess::parse_overlay_config;
 
 /// Build the shell snippet that applies an overlay directory into a sysroot.
 /// `overlay_dir` is the path relative to `/opt/src` (the project root inside the container).

@@ -24,6 +24,29 @@ use crate::utils::interpolation::{preprocess_text, AvocadoContext};
 /// scratch after the lock file moved to the top-level `avocado.lock`.
 const STAGING_SUBDIR: &str = ".avocado/overlay-staging";
 
+/// Parse the `overlay:` config value into `(dir, opaque)`.
+/// Accepts either a plain string (`"path/to/dir"`) or a mapping
+/// (`{ dir: "path/to/dir", mode: "opaque" | "merge" }`).
+pub fn parse_overlay_config(value: &Value) -> (String, bool) {
+    if let Some(dir_str) = value.as_str() {
+        (dir_str.to_string(), false)
+    } else if let Some(table) = value.as_mapping() {
+        let dir = table
+            .get("dir")
+            .and_then(|d| d.as_str())
+            .unwrap_or("overlay")
+            .to_string();
+        let opaque = table
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "opaque")
+            .unwrap_or(false);
+        (dir, opaque)
+    } else {
+        ("overlay".to_string(), false)
+    }
+}
+
 /// Which overlay files to run the `{{ }}` preprocessor over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreprocessSpec {
@@ -146,11 +169,41 @@ fn sorted_entries(overlay_src: &Path) -> Vec<walkdir::DirEntry> {
     entries
 }
 
+/// Overlay-relative path as raw bytes, `None` for the overlay root itself.
+/// Lossless and infallible on a non-UTF-8 name, unlike [`rel_str`] — so the
+/// verbatim digest (below) can hash a byte-for-byte-copied overlay without
+/// demanding UTF-8 filenames. Only the preprocessing paths (glob matching +
+/// staging), which are genuinely string-based, need [`rel_str`].
+fn rel_bytes(overlay_src: &Path, path: &Path) -> Option<Vec<u8>> {
+    let rel = path.strip_prefix(overlay_src).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(os_bytes(rel.as_os_str()))
+}
+
+/// Raw bytes of an `OsStr`, losslessly on unix (where a filename is arbitrary
+/// bytes). On other platforms fall back to the lossy UTF-8 form with `\`
+/// separators normalized to `/`; a Windows filename is effectively always valid
+/// UTF-16, so this is lossless in practice there too.
+#[cfg(unix)]
+fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    s.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    s.to_string_lossy().replace('\\', "/").into_bytes()
+}
+
 /// Overlay-relative, forward-slash path. `Ok(None)` for the overlay root
-/// itself. Errors on a non-UTF-8 path: staging and the digest are string-based,
-/// so `to_string_lossy` would mangle a non-UTF-8 name to U+FFFD (and two such
-/// names could collide / hash equal), unlike the byte-preserving verbatim `cp -a`
-/// path. Reject explicitly rather than silently corrupt.
+/// itself. Errors on a non-UTF-8 path because the *preprocessing* paths that
+/// use it — glob matching and on-disk staging — are string-based, and
+/// `to_string_lossy` would mangle a non-UTF-8 name to U+FFFD (two such names
+/// could then collide). The verbatim digest hashes [`rel_bytes`] instead, so a
+/// non-UTF-8 filename only trips this when the overlay opts into preprocessing —
+/// where the suggested fix (scope/disable `preprocess`) genuinely applies.
 fn rel_str(overlay_src: &Path, path: &Path) -> Result<Option<String>> {
     let rel = match path.strip_prefix(overlay_src) {
         Ok(r) => r,
@@ -169,12 +222,14 @@ fn rel_str(overlay_src: &Path, path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Compute a deterministic digest of the overlay tree *after* preprocessing,
-/// without materializing it to disk. Returns `None` when preprocessing is
-/// disabled or the overlay dir does not exist (so stamps are unchanged for the
-/// verbatim path). Folded into the rootfs/initramfs/ext build input hashes so a
-/// changed template value (e.g. a new claim token) or an edited overlay file
-/// forces a rebuild. Only the SHA-256 is retained — never the plaintext.
+/// Compute a deterministic digest of the overlay tree, without materializing it
+/// to disk. Preprocessing is applied per `spec`: a verbatim overlay
+/// ([`PreprocessSpec::None`]) hashes raw file bytes, an enabled one hashes the
+/// post-`{{ }}` content (so a changed template value — e.g. a new claim token —
+/// also moves the digest). Returns `None` only when the overlay dir does not
+/// exist. Folded into the rootfs/initramfs/ext build input hashes so any edit
+/// to an overlay file forces a rebuild (ENG-2440); only the SHA-256 is retained
+/// — never the plaintext.
 pub fn overlay_content_digest(
     project_root: &Path,
     overlay_rel_dir: &str,
@@ -182,9 +237,6 @@ pub fn overlay_content_digest(
     root: &Value,
     context: &AvocadoContext,
 ) -> Result<Option<String>> {
-    if !spec.is_enabled() {
-        return Ok(None);
-    }
     let overlay_src = project_root.join(overlay_rel_dir);
     if !overlay_src.is_dir() {
         return Ok(None);
@@ -193,7 +245,7 @@ pub fn overlay_content_digest(
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for entry in sorted_entries(&overlay_src) {
-        let Some(rel) = rel_str(&overlay_src, entry.path())? else {
+        let Some(rel) = rel_bytes(&overlay_src, entry.path()) else {
             continue;
         };
         let ft = entry.file_type();
@@ -201,14 +253,20 @@ pub fn overlay_content_digest(
             // Fold directory modes so a permission drift (e.g. 0700 .ssh widened
             // to 0755) invalidates the stamp — materialize preserves dir modes.
             let mode = file_mode(entry.path());
-            hasher.update(format!("D\0{rel}\0{mode:o}\0").as_bytes());
+            hasher.update(b"D\0");
+            hasher.update(&rel);
+            hasher.update(format!("\0{mode:o}\0").as_bytes());
         } else if ft.is_symlink() {
             // Fail the same way `materialize` does on an unreadable link, so the
             // stamp check and the build can't disagree.
             let target = std::fs::read_link(entry.path()).with_context(|| {
                 format!("Failed to read overlay symlink: {}", entry.path().display())
             })?;
-            hasher.update(format!("L\0{rel}\0{}\0", target.to_string_lossy()).as_bytes());
+            hasher.update(b"L\0");
+            hasher.update(&rel);
+            hasher.update(b"\0");
+            hasher.update(os_bytes(target.as_os_str()));
+            hasher.update(b"\0");
         } else if ft.is_file() {
             // Propagate read/preprocess errors rather than silently dropping the
             // digest, which would let a broken overlay skip rebuild invalidation.
@@ -216,9 +274,20 @@ pub fn overlay_content_digest(
                 format!("Failed to read overlay file: {}", entry.path().display())
             })?;
             let mode = file_mode(entry.path());
-            let bytes = process_file_bytes(&rel, raw, spec, root, context)?;
+            // Only preprocessing inspects the path (to glob-match) and rewrites
+            // content, and it needs a UTF-8 path to do so. A verbatim overlay
+            // copies bytes untouched, so don't demand UTF-8 of its filenames.
+            let bytes = if spec.is_enabled() {
+                let rel_utf8 = rel_str(&overlay_src, entry.path())?
+                    .expect("a non-root file always has a relative path");
+                process_file_bytes(&rel_utf8, raw, spec, root, context)?
+            } else {
+                raw
+            };
             let file_hash = Sha256::digest(&bytes);
-            hasher.update(format!("F\0{rel}\0{mode:o}\0").as_bytes());
+            hasher.update(b"F\0");
+            hasher.update(&rel);
+            hasher.update(format!("\0{mode:o}\0").as_bytes());
             hasher.update(file_hash);
         }
     }
@@ -524,16 +593,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(h1, h2, "digest must change when a templated value changes");
+    }
 
-        // Disabled spec yields no digest (verbatim path unchanged).
+    #[test]
+    fn verbatim_digest_tracks_raw_bytes() {
+        // A verbatim overlay (no `preprocess`) still gets a content digest, over
+        // raw bytes — editing a file must move it (ENG-2440). `{{ }}` markers are
+        // left untouched since nothing selects the file for preprocessing.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("overlay/etc")).unwrap();
+        std::fs::write(root.join("overlay/etc/f.txt"), "v1 {{ env.NOPE }}").unwrap();
+
+        let h1 =
+            overlay_content_digest(root, "overlay", &PreprocessSpec::None, &Value::Null, &ctx())
+                .unwrap()
+                .expect("verbatim overlay must produce a digest");
+        std::fs::write(root.join("overlay/etc/f.txt"), "v2-different").unwrap();
+        let h2 =
+            overlay_content_digest(root, "overlay", &PreprocessSpec::None, &Value::Null, &ctx())
+                .unwrap()
+                .unwrap();
+        assert_ne!(
+            h1, h2,
+            "editing a verbatim overlay file must change the digest"
+        );
+
+        // A missing overlay dir is the one case that yields no digest.
         assert!(overlay_content_digest(
             root,
-            "overlay",
+            "absent",
             &PreprocessSpec::None,
             &Value::Null,
             &ctx()
         )
         .unwrap()
         .is_none());
+    }
+
+    // A non-UTF-8 filename can't be created on a UTF-8-enforcing filesystem
+    // (e.g. macOS APFS returns EILSEQ), so exercise the path handling directly
+    // and in memory rather than through a temp file.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_hashes_losslessly_but_preprocessing_rejects_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = b"bad\xffname";
+        let name = std::ffi::OsStr::from_bytes(raw);
+
+        // The verbatim digest keys on raw bytes, so a `cp -a`-copyable non-UTF-8
+        // filename hashes losslessly instead of failing the build (ENG-2440
+        // review) — `to_string_lossy` would collapse 0xff to U+FFFD.
+        assert_eq!(os_bytes(name), raw);
+        let root = Path::new("/proj/overlay");
+        assert_eq!(rel_bytes(root, &root.join(name)).as_deref(), Some(&raw[..]));
+
+        // Preprocessing is genuinely string-based, so it still rejects the name
+        // with a clear error — the one place the "scope/disable preprocess"
+        // guidance applies.
+        let err = rel_str(root, &root.join(name)).unwrap_err();
+        assert!(err.to_string().contains("non-UTF-8"));
     }
 }
