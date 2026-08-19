@@ -24,6 +24,29 @@ use crate::utils::interpolation::{preprocess_text, AvocadoContext};
 /// scratch after the lock file moved to the top-level `avocado.lock`.
 const STAGING_SUBDIR: &str = ".avocado/overlay-staging";
 
+/// Parse the `overlay:` config value into `(dir, opaque)`.
+/// Accepts either a plain string (`"path/to/dir"`) or a mapping
+/// (`{ dir: "path/to/dir", mode: "opaque" | "merge" }`).
+pub fn parse_overlay_config(value: &Value) -> (String, bool) {
+    if let Some(dir_str) = value.as_str() {
+        (dir_str.to_string(), false)
+    } else if let Some(table) = value.as_mapping() {
+        let dir = table
+            .get("dir")
+            .and_then(|d| d.as_str())
+            .unwrap_or("overlay")
+            .to_string();
+        let opaque = table
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "opaque")
+            .unwrap_or(false);
+        (dir, opaque)
+    } else {
+        ("overlay".to_string(), false)
+    }
+}
+
 /// Which overlay files to run the `{{ }}` preprocessor over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreprocessSpec {
@@ -169,12 +192,14 @@ fn rel_str(overlay_src: &Path, path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Compute a deterministic digest of the overlay tree *after* preprocessing,
-/// without materializing it to disk. Returns `None` when preprocessing is
-/// disabled or the overlay dir does not exist (so stamps are unchanged for the
-/// verbatim path). Folded into the rootfs/initramfs/ext build input hashes so a
-/// changed template value (e.g. a new claim token) or an edited overlay file
-/// forces a rebuild. Only the SHA-256 is retained — never the plaintext.
+/// Compute a deterministic digest of the overlay tree, without materializing it
+/// to disk. Preprocessing is applied per `spec`: a verbatim overlay
+/// ([`PreprocessSpec::None`]) hashes raw file bytes, an enabled one hashes the
+/// post-`{{ }}` content (so a changed template value — e.g. a new claim token —
+/// also moves the digest). Returns `None` only when the overlay dir does not
+/// exist. Folded into the rootfs/initramfs/ext build input hashes so any edit
+/// to an overlay file forces a rebuild (ENG-2440); only the SHA-256 is retained
+/// — never the plaintext.
 pub fn overlay_content_digest(
     project_root: &Path,
     overlay_rel_dir: &str,
@@ -182,9 +207,6 @@ pub fn overlay_content_digest(
     root: &Value,
     context: &AvocadoContext,
 ) -> Result<Option<String>> {
-    if !spec.is_enabled() {
-        return Ok(None);
-    }
     let overlay_src = project_root.join(overlay_rel_dir);
     if !overlay_src.is_dir() {
         return Ok(None);
@@ -524,11 +546,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(h1, h2, "digest must change when a templated value changes");
+    }
 
-        // Disabled spec yields no digest (verbatim path unchanged).
+    #[test]
+    fn verbatim_digest_tracks_raw_bytes() {
+        // A verbatim overlay (no `preprocess`) still gets a content digest, over
+        // raw bytes — editing a file must move it (ENG-2440). `{{ }}` markers are
+        // left untouched since nothing selects the file for preprocessing.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("overlay/etc")).unwrap();
+        std::fs::write(root.join("overlay/etc/f.txt"), "v1 {{ env.NOPE }}").unwrap();
+
+        let h1 =
+            overlay_content_digest(root, "overlay", &PreprocessSpec::None, &Value::Null, &ctx())
+                .unwrap()
+                .expect("verbatim overlay must produce a digest");
+        std::fs::write(root.join("overlay/etc/f.txt"), "v2-different").unwrap();
+        let h2 =
+            overlay_content_digest(root, "overlay", &PreprocessSpec::None, &Value::Null, &ctx())
+                .unwrap()
+                .unwrap();
+        assert_ne!(
+            h1, h2,
+            "editing a verbatim overlay file must change the digest"
+        );
+
+        // A missing overlay dir is the one case that yields no digest.
         assert!(overlay_content_digest(
             root,
-            "overlay",
+            "absent",
             &PreprocessSpec::None,
             &Value::Null,
             &ctx()
