@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_drive_is_read_only_and_addressed_by_serial() {
+    fn seed_drive_is_read_only_and_identified_by_fsid() {
         let tmp = tempfile::tempdir().unwrap();
         let seed = tmp.path().join("var-new.btrfs");
         std::fs::write(&seed, b"seed").unwrap();

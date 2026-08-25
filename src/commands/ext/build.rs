@@ -1295,21 +1295,25 @@ if [ -n "$unit_file" ]; then
     # the unit made the standard way to enable a vendor unit that ships
     # without an [Install] — a drop-in supplying one — invisible here, so
     # the build failed with the fix already sitting in the overlay.
-    install_sources="$unit_file"
-    for dropin_dir in /etc/systemd/system /usr/lib/systemd/system; do
-        for dropin in "$sysroot$dropin_dir/$service.d/"*.conf; do
-            [ -f "$dropin" ] && install_sources="$install_sources $dropin"
-        done
-    done
-
+    #
+    # Each file is parsed as it is encountered, through a quoted "$1" —
+    # accumulating paths into one string and re-splitting it would break on
+    # any path with a space in it.
+    #
     # One sed per file: a single invocation over several files shares one
     # input stream, so the /^\[Install\]/,/^\[/ range would run past the
     # end of one file and match keys in the next.
+    _avocado_collect_install() {{
+        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$1" | tr ',' ' ')"
+        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$1" | tr ',' ' ')"
+    }}
     wanted_by=""
     required_by=""
-    for install_src in $install_sources; do
-        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$install_src" | tr ',' ' ')"
-        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$install_src" | tr ',' ' ')"
+    _avocado_collect_install "$unit_file"
+    for dropin_dir in /etc/systemd/system /usr/lib/systemd/system; do
+        for dropin in "$sysroot$dropin_dir/$service.d/"*.conf; do
+            [ -f "$dropin" ] && _avocado_collect_install "$dropin"
+        done
     done
     # Unquoted: collapses the separators left by accumulation so the
     # emptiness checks below see "" rather than a run of spaces.
