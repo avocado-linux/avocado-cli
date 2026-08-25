@@ -9,9 +9,9 @@ use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::stamps::{
-    compute_ext_build_input_hash, compute_ext_image_input_hash, compute_ext_install_input_hash,
-    generate_batch_read_stamps_script, generate_write_stamp_script, resolve_required_stamps,
-    validate_stamps_batch, CurrentInput, Stamp, StampCommand, StampComponent, StampOutputs,
+    compute_ext_build_input_hash, compute_ext_image_input_hash, generate_batch_read_stamps_script,
+    generate_write_stamp_script, resolve_required_stamps, validate_stamps_batch, CurrentInput,
+    Stamp, StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -299,7 +299,24 @@ impl ExtImageCommand {
             // three so validate_stamps_batch can match each requirement
             // against the matching step's hash.
             let project_root = config.project_root(&self.config_path);
-            let install_inputs = compute_ext_install_input_hash(parsed, &self.extension).ok();
+            // Deps-aware, matching what `ext install` actually stamped: the plain
+            // hash never agrees with a stamp that folded in seeded_from state,
+            // so every depends_on extension validated as stale forever.
+            let lock_src_dir = config
+                .get_resolved_src_dir(&self.config_path)
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&self.config_path)
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                });
+            let install_inputs = crate::utils::stamps::compute_ext_install_input_hash_current(
+                &composed,
+                &self.extension,
+                &target,
+                &lock_src_dir,
+            )
+            .ok();
             let build_inputs = compute_ext_build_input_hash(
                 parsed,
                 &self.extension,
