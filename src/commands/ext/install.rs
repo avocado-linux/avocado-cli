@@ -283,7 +283,6 @@ impl ExtInstallCommand {
         // has to exist and be fully populated before a dependent can seed its
         // rpmdb from it. Installing alphabetically would seed from an empty or
         // half-built dependency and silently defeat de-duplication.
-        let mut closure_resolved = true;
         let extensions_to_install = {
             let requested: Vec<String> = extensions_to_install
                 .iter()
@@ -352,19 +351,19 @@ impl ExtInstallCommand {
                     }
                     ordered
                 }
-                // A graph that will not resolve is reported by the runtime
-                // build with full context. Installing extensions one by one
-                // still works, just without de-duplication, so do not block
-                // the whole command here.
+                // A closure that will not resolve is an error HERE, not a
+                // degradation: falling back to a flat install let
+                // `ext install app` "succeed" without installing or seeding
+                // from its declared base — the opposite of refusing unknown
+                // dependency subtrees. `resolve` only walks the requested
+                // roots, so unrelated broken or unfetched extensions cannot
+                // block an install that never touches them.
                 Err(e) => {
-                    closure_resolved = false;
-                    if self.verbose {
-                        print_info(
-                            &format!("Dependency ordering unavailable ({e}); installing as listed"),
-                            OutputLevel::Normal,
-                        );
-                    }
-                    extensions_to_install
+                    return Err(anyhow::anyhow!(
+                        "Cannot install with an unresolved dependency closure: {e}\n\
+                         Fix the depends_on declaration (or fetch the missing \
+                         extension) and re-run."
+                    ));
                 }
             }
         };
@@ -374,27 +373,21 @@ impl ExtInstallCommand {
         // dependency that was pulled in rather than named gets its own seed
         // source too — a chain seeds base <- mid <- app, not just the leaf.
         //
-        // Empty when the graph did not resolve. Seeding reads the dependency's
-        // sysroot, which only a resolved closure guarantees exists; without
-        // one, installing as listed and skipping de-duplication is the
-        // fallback the branch above already documents.
-        let direct_deps: HashMap<String, Vec<String>> = if closure_resolved {
-            extensions_to_install
-                .iter()
-                .filter_map(|(name, _)| {
-                    let node = graph.get(name)?;
-                    if node.depends_on.is_empty() {
-                        return None;
-                    }
-                    Some((
-                        name.clone(),
-                        node.depends_on.iter().map(|d| d.name.clone()).collect(),
-                    ))
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        // The closure resolved above (an unresolved one is an error now), so
+        // every dependency's sysroot is guaranteed to exist for seeding.
+        let direct_deps: HashMap<String, Vec<String>> = extensions_to_install
+            .iter()
+            .filter_map(|(name, _)| {
+                let node = graph.get(name)?;
+                if node.depends_on.is_empty() {
+                    return None;
+                }
+                Some((
+                    name.clone(),
+                    node.depends_on.iter().map(|d| d.name.clone()).collect(),
+                ))
+            })
+            .collect();
 
         let ext_names: Vec<&str> = extensions_to_install
             .iter()
