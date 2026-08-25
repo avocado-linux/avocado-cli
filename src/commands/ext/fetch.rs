@@ -266,11 +266,21 @@ impl ExtFetchCommand {
                     include,
                 } = source
                 {
-                    let effective_version = lock_file
+                    // Lock versions are already RPM-form NEVRAs and pass
+                    // through untouched. A CONFIG-declared version is semver:
+                    // a pre-release like `1.0.0-rc.1` is packaged as
+                    // `1.0.0~rc.1`, so without conversion the generated spec
+                    // matches nothing on the very first fetch — replay only
+                    // worked because the rpmdb already reports the `~` form.
+                    let effective_version = match lock_file
                         .get_extension_source(&target, ext_name)
                         .and_then(|s| s.version.as_deref())
-                        .unwrap_or(version.as_str())
-                        .to_string();
+                    {
+                        Some(locked) => locked.to_string(),
+                        None if version == "*" => version.clone(),
+                        None => crate::utils::version::to_rpm_version(version)
+                            .unwrap_or_else(|_| version.clone()),
+                    };
                     ExtensionSource::Package {
                         version: effective_version,
                         package: package.clone(),
@@ -501,18 +511,50 @@ impl ExtFetchCommand {
                     .iter()
                     .map(|e| (e.package_name.as_str(), e))
                     .collect();
+                // Every avocado-ext capability some installed package still
+                // requires — the solver-visible LIVE edges. An implied entry
+                // outside this set is a leftover from a removed edge and must
+                // age out of the lock rather than replay forever.
+                let required_caps: HashSet<&str> = resolved
+                    .values()
+                    .flat_map(|p| p.requires_exts.iter().map(String::as_str))
+                    .collect();
                 for (pkg_name, installed) in &resolved {
                     let entry = requested.get(pkg_name.as_str());
                     // Extension identity, in precedence order: the declared
                     // entry's name; else the package's own avocado-ext(<name>)
                     // provide — the identity that survives a `source.package`
                     // rename, so a depsolver-pulled renamed dependency locks
-                    // under the name the graph and stamp code address it by;
-                    // else (a legacy package with no provide) the RPM name.
-                    let ext_name = entry
-                        .map(|e| e.ext_name.clone())
-                        .or_else(|| installed.ext_name.clone())
-                        .unwrap_or_else(|| pkg_name.clone());
+                    // under the name the graph and stamp code address it by.
+                    //
+                    // An UNREQUESTED package with no avocado-ext provide is an
+                    // ordinary RPM dependency, not an extension — locking it
+                    // would fabricate an implied extension that later fetches
+                    // replay into includes/<pkg>. Only explicitly requested
+                    // legacy packages may lack the provide.
+                    let ext_name = match (entry, installed.ext_name.as_ref()) {
+                        (Some(e), _) => e.ext_name.clone(),
+                        (None, Some(provide)) => provide.clone(),
+                        (None, None) => continue,
+                    };
+                    // Implied means "not author-declared", NOT "not in this
+                    // transaction": a replayed pin sits in the batch (and so
+                    // in `requested`), and recording it implied:false would
+                    // make the lock forget the extension belongs to the
+                    // solver-derived closure — the next clean checkout would
+                    // stop replaying its pin.
+                    let implied = !declared.contains(&ext_name);
+                    // A leftover implied extension nothing requires any more
+                    // (its depends_on edge was removed) is pruned from the
+                    // lock instead of re-recorded. The installed payload still
+                    // sits in the installroot until a --force re-fetch clears
+                    // it, but the lock stops asserting it, so it no longer
+                    // replays into future solves.
+                    if implied && !required_caps.contains(ext_name.as_str()) {
+                        lock_file.clear_extension_source(&target, &ext_name);
+                        lock_file_dirty = true;
+                        continue;
+                    }
                     lock_file.set_extension_source(
                         &target,
                         &ext_name,
@@ -520,7 +562,7 @@ impl ExtFetchCommand {
                             source_type: "package".to_string(),
                             package: Some(pkg_name.clone()),
                             version: Some(installed.version.clone()),
-                            implied: entry.is_none(),
+                            implied,
                         },
                     );
                     lock_file_dirty = true;

@@ -2163,6 +2163,14 @@ impl Config {
                 .and_then(|m| Self::find_matching_ext_key(m, &ext_name).and_then(|k| m.get(&k)))
             {
                 for dep_name in crate::utils::ext_deps::dependency_names(this_ext) {
+                    // Interpolate before checking or queuing: this loop runs on
+                    // configs parsed BEFORE the final interpolation pass, so a
+                    // dependency declared as `avocado-bsp-{{ avocado.target }}`
+                    // arrives verbatim — and a queued template name would send
+                    // ExtSourceReader hunting for a literal `{{ … }}` directory
+                    // while the concrete installed BSP sat unresolved.
+                    let dep_name =
+                        crate::utils::interpolation::interpolate_name(&dep_name, &resolved_target);
                     if queued.contains(&dep_name) {
                         continue;
                     }

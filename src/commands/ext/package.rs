@@ -635,7 +635,24 @@ fi
         let class = ExtensionClass::from_ext_config(&self.extension, ext_config)?;
         lines.push(format!("Provides: avocado-ext-class({})", class.as_str()));
 
-        if let Some(seq) = ext_config.get("depends_on").and_then(|v| v.as_sequence()) {
+        if let Some(dep_val) = ext_config.get("depends_on") {
+            // A present-but-malformed depends_on must fail HERE, not merely at
+            // graph time: packaging `depends_on: weston-base` (a bare scalar
+            // where a list is required) would otherwise succeed with no
+            // Requires emitted, and DNF could never materialize the closure
+            // the author declared.
+            let Some(seq) = dep_val.as_sequence() else {
+                anyhow::bail!(
+                    "Extension '{}': `depends_on` must be a list (e.g. \
+                     `depends_on: [weston-base]`), got a {}.",
+                    self.extension,
+                    match dep_val {
+                        serde_yaml::Value::String(_) => "string",
+                        serde_yaml::Value::Mapping(_) => "mapping",
+                        _ => "non-list value",
+                    }
+                );
+            };
             for entry in seq {
                 let dep = ExtensionDependency::parse_entry(&self.extension, entry, target)?;
                 lines.extend(dep.to_rpm_requires()?);

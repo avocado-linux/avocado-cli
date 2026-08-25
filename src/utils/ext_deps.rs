@@ -903,38 +903,98 @@ impl DependencyGraph {
                 name: name.clone(),
                 authored: true,
             });
-            self.push_implied(name, &authored_set, &mut emitted, &mut out);
         }
 
-        out
-    }
+        // Discover the implied closure breadth-first from the authored list
+        // (in author order), so the tiebreak below is stable and readable.
+        let mut discovered: Vec<String> = Vec::new();
+        let mut queue: std::collections::VecDeque<&str> =
+            authored.iter().map(String::as_str).collect();
+        while let Some(name) = queue.pop_front() {
+            let Some(node) = self.nodes.get(name) else {
+                continue;
+            };
+            for dep in &node.depends_on {
+                // The author placed this one themselves — theirs is truth, and
+                // it stays at the position they chose.
+                if authored_set.contains(dep.name.as_str()) {
+                    continue;
+                }
+                if emitted.insert(dep.name.clone()) {
+                    discovered.push(dep.name.clone());
+                    queue.push_back(
+                        self.nodes
+                            .get(&dep.name)
+                            .map(|n| n.name.as_str())
+                            .unwrap_or(dep.name.as_str()),
+                    );
+                }
+            }
+        }
 
-    fn push_implied(
-        &self,
-        name: &str,
-        authored_set: &HashSet<&str>,
-        emitted: &mut HashSet<String>,
-        out: &mut Vec<RuntimeEntry>,
-    ) {
-        let Some(node) = self.nodes.get(name) else {
-            return;
-        };
-        for dep in &node.depends_on {
-            // The author placed this one themselves — theirs is truth, and it
-            // is emitted at their position rather than here.
-            if authored_set.contains(dep.name.as_str()) {
-                continue;
+        // Interleave the implied set, dependents-first GLOBALLY. Fixing each
+        // dependency at its first use violated the merge-priority invariant
+        // whenever a dependency was shared: authored [app-a, app-b] with
+        // app-a -> base, app-b -> mid, mid -> base emitted
+        // [app-a, base, app-b, mid] — base ahead of the mid that depends on
+        // it, so the shared base could shadow its own dependent.
+        //
+        // An implied entry still lands as early as the invariant allows —
+        // right after the parent that completes its dependent set — so the
+        // "deps fall under their parent" shape is preserved everywhere the
+        // old code was correct, and deferred only where it was wrong. An
+        // authored dependency is exempt by design (the author's position is
+        // truth), which is what keeps `- base: {{ enabled: false }}` placeable
+        // anywhere. `resolve` has proven the closure acyclic, so every
+        // implied node is eventually emittable.
+        let closure: Vec<&str> = authored
+            .iter()
+            .map(String::as_str)
+            .chain(discovered.iter().map(String::as_str))
+            .collect();
+        let mut placed: HashSet<&str> = HashSet::new();
+        let mut remaining: Vec<String> = discovered.clone();
+        let mut result: Vec<RuntimeEntry> = Vec::new();
+        for entry in out {
+            placed.insert(
+                closure
+                    .iter()
+                    .find(|n| **n == entry.name)
+                    .copied()
+                    .unwrap_or(""),
+            );
+            result.push(entry);
+            // Emit every implied node whose dependents are all placed; repeat
+            // until a full sweep places nothing (an emission can unblock the
+            // next, e.g. mid unblocks base).
+            while let Some(pos) = remaining.iter().position(|candidate| {
+                !closure.iter().any(|x| {
+                    !placed.contains(x)
+                        && *x != candidate.as_str()
+                        && self
+                            .nodes
+                            .get(*x)
+                            .map(|n| n.depends_on.iter().any(|d| &d.name == candidate))
+                            .unwrap_or(false)
+                })
+            }) {
+                let name = remaining.remove(pos);
+                placed.insert(closure.iter().find(|n| **n == name).copied().unwrap_or(""));
+                result.push(RuntimeEntry {
+                    name,
+                    authored: false,
+                });
             }
-            if !emitted.insert(dep.name.clone()) {
-                continue;
-            }
-            out.push(RuntimeEntry {
-                name: dep.name.clone(),
+        }
+        // Acyclic closure guarantees emptiness; drain defensively regardless.
+        for name in remaining {
+            result.push(RuntimeEntry {
+                name,
                 authored: false,
             });
-            // Safe to recurse: `resolve` already proved the graph acyclic.
-            self.push_implied(&dep.name, authored_set, emitted, out);
         }
+
+        result
     }
 
     /// Advisory checks over a resolved closure. Warnings, never failures —
@@ -1617,11 +1677,14 @@ mod tests {
     fn author_places_only_parents_and_deps_fall_under_them() {
         let g = fixture_graph();
         let out = g.resolve_runtime_list(&roots(&["app-a", "app-b"])).unwrap();
-        // Each parent immediately followed by what it pulls in.
-        assert_eq!(names(&out), vec!["app-a", "base", "app-b", "mid"]);
+        // The shared `base` is deferred until after `mid` — every dependent
+        // must precede its dependencies (merge priority is index-based), and
+        // mid depends on base. Emitting base at its first use under app-a put
+        // it ahead of mid and let the shared base shadow its own dependent.
+        assert_eq!(names(&out), vec!["app-a", "app-b", "mid", "base"]);
         assert_eq!(
             out.iter().map(|e| e.authored).collect::<Vec<_>>(),
-            vec![true, false, true, false]
+            vec![true, true, false, false]
         );
     }
 
@@ -1636,13 +1699,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_dependency_appears_once_at_its_first_use() {
+    fn shared_dependency_appears_once_after_every_dependent() {
         let g = fixture_graph();
         let out = g.resolve_runtime_list(&roots(&["app-a", "app-b"])).unwrap();
         assert_eq!(names(&out).iter().filter(|n| **n == "base").count(), 1);
-        // Placed under app-a, the first parent to need it — not repeated
-        // under mid.
-        assert_eq!(names(&out)[1], "base");
+        // Emitted once, and only after EVERY closure member that depends on
+        // it (app-a and mid) — not at its first use, which ranked it above
+        // the mid that depends on it.
+        let pos = |n: &str| names(&out).iter().position(|x| *x == n).unwrap();
+        assert!(pos("app-a") < pos("base"));
+        assert!(pos("mid") < pos("base"));
     }
 
     #[test]
