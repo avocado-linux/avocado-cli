@@ -290,12 +290,27 @@ impl ExtFetchCommand {
                     ..
                 } = &effective_source
                 {
-                    package_batch.push(PackageFetchEntry::from_package_source(
-                        ext_name,
-                        package.as_deref(),
-                        version,
-                        repo_name.as_deref(),
-                    ));
+                    // Declared depends_on names ride along so fetch_packages
+                    // can order repo-restricted groups provider-first.
+                    let declared_deps: Vec<String> = composed
+                        .merged_value
+                        .get("extensions")
+                        .and_then(|e| e.as_mapping())
+                        .and_then(|m| m.get(serde_yaml::Value::String(ext_name.clone())))
+                        .map(crate::utils::ext_deps::dependency_names)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|d| crate::utils::interpolation::interpolate_name(&d, &target))
+                        .collect();
+                    package_batch.push(
+                        PackageFetchEntry::from_package_source(
+                            ext_name,
+                            package.as_deref(),
+                            version,
+                            repo_name.as_deref(),
+                        )
+                        .with_depends_on(declared_deps),
+                    );
                     // Lock entries are written *after* the transaction, from
                     // the installroot's rpmdb — see below. Recording the
                     // requested version here would pin `"*"` as `"*"`.
@@ -432,8 +447,10 @@ impl ExtFetchCommand {
                 let mut downgrades: Vec<String> = Vec::new();
                 for (name, pin) in lock_file.implied_extension_sources(&target) {
                     let pkg = pin.package.clone().unwrap_or_else(|| name.clone());
-                    let (Some(was), Some(now)) = (pin.version.as_deref(), resolved.get(&pkg))
-                    else {
+                    let (Some(was), Some(now)) = (
+                        pin.version.as_deref(),
+                        resolved.get(&pkg).map(|p| p.version.as_str()),
+                    ) else {
                         continue;
                     };
                     if was == now {
@@ -484,13 +501,17 @@ impl ExtFetchCommand {
                     .iter()
                     .map(|e| (e.package_name.as_str(), e))
                     .collect();
-                for (pkg_name, version) in &resolved {
+                for (pkg_name, installed) in &resolved {
                     let entry = requested.get(pkg_name.as_str());
-                    // An installed package nobody asked for is a dependency the
-                    // depsolver added. Its extension name is its package name —
-                    // only a declared entry can carry a `source.package` rename.
+                    // Extension identity, in precedence order: the declared
+                    // entry's name; else the package's own avocado-ext(<name>)
+                    // provide — the identity that survives a `source.package`
+                    // rename, so a depsolver-pulled renamed dependency locks
+                    // under the name the graph and stamp code address it by;
+                    // else (a legacy package with no provide) the RPM name.
                     let ext_name = entry
                         .map(|e| e.ext_name.clone())
+                        .or_else(|| installed.ext_name.clone())
                         .unwrap_or_else(|| pkg_name.clone());
                     lock_file.set_extension_source(
                         &target,
@@ -498,7 +519,7 @@ impl ExtFetchCommand {
                         ExtensionSourceLock {
                             source_type: "package".to_string(),
                             package: Some(pkg_name.clone()),
-                            version: Some(version.clone()),
+                            version: Some(installed.version.clone()),
                             implied: entry.is_none(),
                         },
                     );

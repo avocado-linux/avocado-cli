@@ -1281,8 +1281,12 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         }
 
         // Recursively discover all extension dependencies (including nested external extensions)
-        let all_required_extensions =
-            self.find_all_extension_dependencies(config, &required_extensions, target_arch)?;
+        let all_required_extensions = self.find_all_extension_dependencies(
+            config,
+            parsed,
+            &required_extensions,
+            target_arch,
+        )?;
 
         // Build a map from extension name to versioned name from resolved_extensions
         // Format of resolved_extensions items: "ext_name-version" (e.g., "my-ext-1.0.0")
@@ -2606,6 +2610,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
     fn find_all_extension_dependencies(
         &self,
         config: &crate::utils::config::Config,
+        parsed: &serde_yaml::Value,
         direct_extensions: &HashSet<String>,
         target_arch: &str,
     ) -> Result<HashSet<String>> {
@@ -2616,6 +2621,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
         for ext_name in direct_extensions {
             self.collect_extension_dependencies(
                 config,
+                parsed,
                 ext_name,
                 &mut all_extensions,
                 &mut visited,
@@ -2630,10 +2636,11 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
     fn collect_extension_dependencies(
         &self,
         _config: &crate::utils::config::Config,
+        parsed: &serde_yaml::Value,
         ext_name: &str,
         all_extensions: &mut HashSet<String>,
         visited: &mut HashSet<String>,
-        _target_arch: &str,
+        target_arch: &str,
     ) -> Result<()> {
         // Avoid infinite loops
         if visited.contains(ext_name) {
@@ -2644,18 +2651,16 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
         // Add this extension to the result set
         all_extensions.insert(ext_name.to_string());
 
-        // Load the main config to check for local extensions
-        let content = std::fs::read_to_string(&self.config_path)?;
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
-
-        // Check if this is a local extension defined in the ext section
-        // Extension source configuration (repo, git, path) is now in the ext section
+        // Read from the COMPOSED config, not a re-parse of the file on disk:
+        // a remote extension's declaration (and therefore its edges) only
+        // exists after composition merges it in, so the raw file made every
+        // remote extension's dependencies invisible here.
         if let Some(ext_config) = parsed
             .get("extensions")
             .and_then(|e| e.as_mapping())
             .and_then(|table| table.get(ext_name))
         {
-            // This is a local extension - check if it has an extensions array for nested deps
+            // Legacy nested `extensions:` sequence.
             if let Some(nested_extensions) =
                 ext_config.get("extensions").and_then(|e| e.as_sequence())
             {
@@ -2667,13 +2672,32 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
                     {
                         self.collect_extension_dependencies(
                             _config,
+                            parsed,
                             &spec.name,
                             all_extensions,
                             visited,
-                            _target_arch,
+                            target_arch,
                         )?;
                     }
                 }
+            }
+
+            // `depends_on` edges. The resolver includes these in the install
+            // closure (they land in AVOCADO_EXT_PAIRS), so the copy selection
+            // has to follow them too or an implied base is declared to the
+            // manifest but its image never copied into the runtime directory —
+            // manifest generation then warns and silently omits it.
+            for dep_name in crate::utils::ext_deps::dependency_names(ext_config) {
+                let interpolated =
+                    crate::utils::interpolation::interpolate_name(&dep_name, target_arch);
+                self.collect_extension_dependencies(
+                    _config,
+                    parsed,
+                    &interpolated,
+                    all_extensions,
+                    visited,
+                    target_arch,
+                )?;
             }
         }
 
