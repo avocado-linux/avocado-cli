@@ -70,10 +70,24 @@ fn validate_shell_safe_spec(field: &str, value: &str) -> Result<()> {
 fn validate_shell_safe_chars(field: &str, value: &str, allow_tilde: bool) -> Result<()> {
     const FORBIDDEN: &[char] = &[
         '|', '\'', '"', '`', '$', '\\', ';', '&', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?',
-        '!', '#', '~', '\n', '\r', '\t',
+        '!', '#', '~', '/', '\n', '\r', '\t',
     ];
     if value.is_empty() {
         anyhow::bail!("Extension {field} is empty.");
+    }
+    // `/` is in FORBIDDEN (an ext name reaches `includes/<name>`, and a path
+    // separator would escape it), so `..` can only appear as the whole value —
+    // where it walks OUT of includes/, which `--force` then rm -rf's.
+    if value == "." || value == ".." {
+        anyhow::bail!("Extension {field} '{value}' is a path component, not a name.");
+    }
+    // A leading `-` reads as an option once expanded into the dnf/rpm command
+    // line inside the generated script.
+    if value.starts_with('-') {
+        anyhow::bail!(
+            "Extension {field} '{value}' starts with '-', which would be read \
+             as a command-line option."
+        );
     }
     if let Some(bad) = value
         .chars()

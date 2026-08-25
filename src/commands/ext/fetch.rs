@@ -239,10 +239,20 @@ impl ExtFetchCommand {
             // closure — inter-extension dependencies are materialized by dnf, not
             // by repeated fetch/recompose/discover rounds.
             let mut package_batch: Vec<PackageFetchEntry> = Vec::new();
+            // Every AUTHOR-DECLARED package-source extension this round saw —
+            // including ones skipped because they are already installed. The
+            // implied/prune classification below must key on authorship, not
+            // batch membership: on a second fetch the installed authored app
+            // is absent from the batch, and classifying it from the batch
+            // marked it implied and let the prune clear its source lock.
+            let mut authored_package_exts: HashSet<String> = HashSet::new();
 
             for (ext_name, source) in &round_targets {
                 if !attempted.insert(ext_name.clone()) {
                     continue;
+                }
+                if matches!(source, ExtensionSource::Package { .. }) {
+                    authored_package_exts.insert(ext_name.clone());
                 }
                 // Check if already installed
                 if !force_this_round
@@ -367,8 +377,9 @@ impl ExtFetchCommand {
             //
             // Declared extensions are skipped: they are already in the batch
             // carrying the author's own constraint, which outranks the lock.
-            let declared: HashSet<String> =
-                package_batch.iter().map(|e| e.ext_name.clone()).collect();
+            // Authorship set, not batch membership: an authored extension
+            // skipped as already-installed is still authored.
+            let declared: HashSet<String> = authored_package_exts.clone();
             // Everything up to here is author-declared; pins are appended
             // after, so the two groups can be separated again if the pinned
             // solve has to be retried without them.
