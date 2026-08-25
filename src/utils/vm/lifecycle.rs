@@ -227,8 +227,30 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // `vm update` left one pending. Resolved before launch so the drive
     // is present from the first instruction — the guest does the sync
     // in early boot, before extensions merge.
-    let pending_seed = resolve_pending_var_seed(&paths, &manifest, &artifact_dir);
-    let pending_seed_sha = pending_seed.as_ref().map(|(sha, _)| sha.clone());
+    // The sha for the applied-check below is derived from the seed that was
+    // actually ATTACHED, not from the pending marker. A seed whose fsid cannot
+    // be read never reaches the guest, so asking the guest whether it applied
+    // that sha is a question with only one answer — deriving the sha before the
+    // fsid filter did exactly that, silently re-asking on every start.
+    let var_seed =
+        resolve_pending_var_seed(&paths, &manifest, &artifact_dir).and_then(|(sha256, path)| {
+            match btrfs_fsid(&path) {
+                Some(fsid) => Some(super::qemu::VarSeed { sha256, fsid, path }),
+                None => {
+                    // No fsid, no way for the guest to find the disk — so skip
+                    // attaching rather than hand it one it cannot identify. Loudly:
+                    // the pending marker stays set, and without this line the only
+                    // symptom would be an update that never lands.
+                    crate::utils::output::print_warning_stderr(&format!(
+                        "var seed {} has no readable btrfs UUID (truncated or corrupt?); \
+                     not attaching it. Re-run `avocado vm update` to re-fetch the seed.",
+                        path.display()
+                    ));
+                    None
+                }
+            }
+        });
+    let pending_seed_sha = var_seed.as_ref().map(|vs| vs.sha256.clone());
 
     let cfg = QemuConfig {
         memory_mib,
@@ -237,11 +259,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         cmdline_extra: opts.cmdline_extra,
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
-        var_seed: pending_seed.and_then(|(sha256, path)| {
-            // No fsid, no way for the guest to find the disk — so skip
-            // attaching rather than hand it one it cannot identify.
-            btrfs_fsid(&path).map(|fsid| super::qemu::VarSeed { sha256, fsid, path })
-        }),
+        var_seed,
     };
 
     // The CLI is authoritative for the qemu lifecycle on every platform.

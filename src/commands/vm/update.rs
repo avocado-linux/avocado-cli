@@ -291,13 +291,9 @@ impl UpdateCommand {
                 format!("committing {} into {}", item.file, install_dir.display())
             })?;
         }
-        // Replace the live var disk once the new seed is committed and
-        // the VM is down. Deleting rather than copying is deliberate:
-        // `lifecycle::start` already re-seeds a missing var.btrfs from
-        // the artifact dir and then re-applies the configured size, so
-        // the boot path stays the single owner of both, and an update
-        // that dies here leaves no half-copied disk to mistake for
-        // state — the next start just seeds it.
+        // The live var disk is never touched here — it holds the user's
+        // Docker volumes and installed SDKs, which is the whole reason
+        // this is a sync and not a reset.
         if sync_var_seed {
             // Record the seed the guest owes a state sync from, rather
             // than acting on the live disk here. `vm start` attaches
