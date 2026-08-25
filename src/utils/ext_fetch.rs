@@ -119,6 +119,11 @@ impl PackageFetchEntry {
         let package_spec = if version == "*" {
             package_name.to_string()
         } else {
+            // `version` must arrive in RPM form. A lock-replayed value is
+            // (VERSION-RELEASE from the rpmdb); a config-declared semver is
+            // converted by the caller BEFORE it reaches here — converting
+            // in this constructor would also mangle lock NEVRAs, whose
+            // `-r0` release suffix parses as a semver pre-release.
             format!("{package_name}-{version}")
         };
         Self {
@@ -154,6 +159,12 @@ const INSTALLED_REPORT_END: &str = "---avocado-installed-extensions-end---";
 pub struct InstalledPackage {
     pub version: String,
     pub ext_name: Option<String>,
+    /// Extension names this package Requires via `avocado-ext(<name>)` —
+    /// the solver-visible edges. Used to tell a live implied dependency
+    /// (something installed still requires it) from a leftover whose edge
+    /// was removed, which must age out of the lock rather than replay
+    /// forever.
+    pub requires_exts: Vec<String>,
 }
 
 /// Parse the `NAME VERSION-RELEASE [provides…]` block emitted after a batched
@@ -180,14 +191,27 @@ fn parse_installed_report(stdout: &str) -> std::collections::HashMap<String, Ins
         let (Some(name), Some(version)) = (parts.next(), parts.next()) else {
             continue;
         };
-        let ext_name = parts
-            .find_map(|p| p.strip_prefix("avocado-ext(")?.strip_suffix(')'))
-            .map(str::to_string);
+        let mut ext_name = None;
+        let mut requires_exts = Vec::new();
+        for tok in parts {
+            if let Some(cap) = tok
+                .strip_prefix("p:avocado-ext(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                ext_name.get_or_insert_with(|| cap.to_string());
+            } else if let Some(cap) = tok
+                .strip_prefix("r:avocado-ext(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                requires_exts.push(cap.to_string());
+            }
+        }
         out.insert(
             name.to_string(),
             InstalledPackage {
                 version: version.to_string(),
                 ext_name,
+                requires_exts,
             },
         );
     }
@@ -473,9 +497,14 @@ DNF="RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK
 # dnf metadata load each, which dominated the fetch: five extensions paid five
 # full repo loads just to learn where to put them. `--whatprovides` answers it
 # for every package at once, still from repo metadata with no payload download.
-NESTED_NAMES=$(RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+# `name nvr` pairs, so the per-triple check below can match the SELECTED
+# package rather than any version of the name: a locked legacy version and a
+# newer nested-layout version can share a name, and keying on the name alone
+# would route the locked legacy payload into the shared root, landing its
+# content at / instead of includes/<ext>.
+NESTED_PROBE=$(RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
     $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {repo_arg} \
-    repoquery --whatprovides 'avocado-ext-layout(nested)' --qf '%{{name}}\n' 2>/dev/null | sort -u)
+    repoquery --whatprovides 'avocado-ext-layout(nested)' --qf '%{{name}} %{{name}}-%{{version}}-%{{release}}\n' 2>/dev/null | sort -u)
 
 NESTED_SPECS=""
 NESTED_NAMES_TO_REMOVE=""
@@ -489,7 +518,13 @@ for triple in {triples}; do
     spec="${{rest#*|}}"
     ext_dir="$AVOCADO_PREFIX/includes/$ext_name"
 
-    if printf '%s\n' "$NESTED_NAMES" | grep -qxF "$pkg_name"; then
+    # A wildcard spec matches on name: any nested-providing version routes it
+    # to the shared root — dnf selects the newest, and layout migrations run
+    # legacy->nested, so the newest is the nested one. A pinned spec must
+    # match its own NVR: exact for a full name-version-release, prefix for
+    # name-version.
+    if printf '%s\n' "$NESTED_PROBE" | awk -v p="$pkg_name" -v s="$spec" \
+        '($1 == p && s == p) || $2 == s || index($2, s "-") == 1 {{ found = 1 }} END {{ exit !found }}'; then
         # Accumulate only — every dnf call for the nested set is batched below.
         NESTED_SPECS="$NESTED_SPECS $spec"
         NESTED_NAMES_TO_REMOVE="$NESTED_NAMES_TO_REMOVE $pkg_name"
@@ -546,12 +581,12 @@ fi
 # root cannot see them, and an unreported package never gets its lock pinned.
 echo "{INSTALLED_REPORT_BEGIN}"
 rpm --root="$AVOCADO_PREFIX/includes" -qa \
-    --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}} [%{{PROVIDENAME}} ]\n' 2>/dev/null | sort
+    --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}} [p:%{{PROVIDENAME}} ][r:%{{REQUIRENAME}} ]\n' 2>/dev/null | sort
 for pair in $LEGACY_REPORT; do
     legacy_root="${{pair%%|*}}"
     legacy_pkg="${{pair#*|}}"
     rpm --root="$legacy_root" -q "$legacy_pkg" \
-        --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}} [%{{PROVIDENAME}} ]\n' 2>/dev/null || true
+        --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}} [p:%{{PROVIDENAME}} ][r:%{{REQUIRENAME}} ]\n' 2>/dev/null || true
 done
 echo "{INSTALLED_REPORT_END}"
 "#
@@ -945,8 +980,8 @@ mod tests {
              \x20 avocado-ext-deptest-app-a  noarch  0.1.0-r0\n\
              Complete!\n\
              {INSTALLED_REPORT_BEGIN}\n\
-             avocado-ext-deptest-app-a 0.1.0-r0 avocado-ext(deptest-app-a) avocado-ext-layout(nested)\n\
-             avocado-ext-deptest-base 1.2.0-r0 avocado-ext(deptest-base)\n\
+             avocado-ext-deptest-app-a 0.1.0-r0 p:avocado-ext(deptest-app-a) p:avocado-ext-layout(nested) r:avocado-ext(deptest-base)\n\
+             avocado-ext-deptest-base 1.2.0-r0 p:avocado-ext(deptest-base)\n\
              avocado-ext-deptest-mid 0.3.0-r0\n\
              {INSTALLED_REPORT_END}\n"
         );
@@ -959,6 +994,13 @@ mod tests {
             got["avocado-ext-deptest-base"].ext_name.as_deref(),
             Some("deptest-base")
         );
+        // The requires side surfaces the solver-visible edges, so the lock
+        // can tell a live implied dependency from a removed-edge leftover.
+        assert_eq!(
+            got["avocado-ext-deptest-app-a"].requires_exts,
+            vec!["deptest-base".to_string()]
+        );
+        assert!(got["avocado-ext-deptest-base"].requires_exts.is_empty());
         // A package with no avocado-ext provide (legacy) reports none.
         assert_eq!(got["avocado-ext-deptest-mid"].version, "0.3.0-r0");
         assert_eq!(got["avocado-ext-deptest-mid"].ext_name, None);
