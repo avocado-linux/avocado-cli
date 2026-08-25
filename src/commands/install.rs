@@ -330,14 +330,27 @@ impl InstallCommand {
                                 })
                                 .collect()
                         }
-                        // A graph that will not resolve is reported with full
-                        // context by `runtime build`. Installing the authored
-                        // list flat is exactly what happened before
-                        // `depends_on` existed, so do not block the install.
-                        Err(_) => HashMap::new(),
+                        // An unresolved closure is an error here, not a
+                        // degradation: installing only the authored list with
+                        // no DAG edges reports success without realizing the
+                        // declared closure, leaving invalid partial state that
+                        // only surfaces (if ever) at `runtime build`. `resolve`
+                        // walks only the requested roots, so unrelated broken
+                        // extensions cannot block an install that never
+                        // touches them.
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Cannot install with an unresolved dependency \
+                                 closure: {e}\nFix the depends_on declaration \
+                                 (or fetch the missing extension) and re-run."
+                            ));
+                        }
                     }
                 }
-                Err(_) => HashMap::new(),
+                // A graph that fails to BUILD means a malformed depends_on
+                // declaration somewhere in the composed config — the
+                // diagnostic names the offending extension; surface it.
+                Err(e) => return Err(e),
             };
 
         // Register ext/runtime tasks now that we know what was fetched.
