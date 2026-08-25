@@ -800,10 +800,12 @@ async fn clear_pending_var_seed_if_applied(
         return;
     };
     if !applied.trim().eq_ignore_ascii_case(expected_sha) {
-        crate::utils::output::print_warning(
+        // stderr, not stdout: this runs on the vm start path, before the
+        // command that may own stdout — the no_stdout_on_the_vm_path guard
+        // test enforces it.
+        crate::utils::output::print_warning_stderr(
             "the VM did not apply the new Avocado state this boot; \
              it will retry on the next `avocado vm start`.",
-            crate::utils::output::OutputLevel::Normal,
         );
         return;
     }
