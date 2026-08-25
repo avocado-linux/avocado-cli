@@ -1155,10 +1155,48 @@ pub fn compute_ext_install_input_hash_with_deps(
 pub fn ext_dep_fingerprint(
     lock_file: &crate::utils::lockfile::LockFile,
     target: &str,
+    graph: &crate::utils::ext_deps::DependencyGraph,
     dep: &str,
 ) -> String {
+    let mut memo: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    ext_dep_fingerprint_inner(lock_file, target, graph, dep, &mut visiting, &mut memo)
+}
+
+/// TRANSITIVE on purpose. A dependency's own `source version | package map`
+/// does not move when something UNDERNEATH it changes: for `app -> mid ->
+/// base`, a base package change rebuilds mid's sysroot (the rpmdb app was
+/// seeded from) while mid's own lock rows stay put — so a fingerprint of
+/// mid's own state alone left app's stamp valid over a changed seed. Each
+/// fingerprint therefore folds in the fingerprints of the dependency's own
+/// dependencies, sorted, so a change anywhere in the chain reaches every
+/// downstream dependent.
+///
+/// Package versions are read through the any-scope accessor: a
+/// runtime-scoped install records them only under
+/// `runtimes.<r>.extensions.<ext>`, and reading just the global map saw an
+/// empty set for those.
+///
+/// The digest is hashed rather than concatenated so deep chains don't grow
+/// the stamp input unboundedly. `resolve` proves the graph acyclic; the
+/// `visiting` guard is defensive.
+fn ext_dep_fingerprint_inner(
+    lock_file: &crate::utils::lockfile::LockFile,
+    target: &str,
+    graph: &crate::utils::ext_deps::DependencyGraph,
+    dep: &str,
+    visiting: &mut std::collections::HashSet<String>,
+    memo: &mut std::collections::HashMap<String, String>,
+) -> String {
+    if let Some(hit) = memo.get(dep) {
+        return hit.clone();
+    }
+    if !visiting.insert(dep.to_string()) {
+        return "<cycle>".to_string();
+    }
+
     let versions = lock_file
-        .get_extension_packages(target, dep)
+        .get_extension_packages_any_scope(target, dep)
         .map(|pkgs| {
             let mut v: Vec<String> = pkgs.iter().map(|(k, val)| format!("{k}={val:?}")).collect();
             v.sort();
@@ -1169,7 +1207,29 @@ pub fn ext_dep_fingerprint(
         .get_extension_source(target, dep)
         .and_then(|s| s.version.clone())
         .unwrap_or_default();
-    format!("{source}|{versions}")
+
+    let mut state = format!("{source}|{versions}");
+    if let Some(node) = graph.get(dep) {
+        let mut dep_names: Vec<&str> = node.depends_on.iter().map(|d| d.name.as_str()).collect();
+        dep_names.sort();
+        for name in dep_names {
+            let sub = ext_dep_fingerprint_inner(lock_file, target, graph, name, visiting, memo);
+            state.push_str(&format!("|{name}={sub}"));
+        }
+    }
+
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(state.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    visiting.remove(dep);
+    memo.insert(dep.to_string(), digest.clone());
+    digest
 }
 
 /// Compute the ext-install input hash the way `ext install` STAMPS it, for a
@@ -1208,12 +1268,20 @@ pub fn compute_ext_install_input_hash_current(
     let dep_state: Vec<(String, String)> = if dep_names.is_empty() {
         Vec::new()
     } else {
-        match crate::utils::lockfile::LockFile::load(lock_src_dir) {
-            Ok(lock_file) => dep_names
+        match (
+            crate::utils::lockfile::LockFile::load(lock_src_dir),
+            crate::utils::ext_deps::DependencyGraph::from_composed(composed, target),
+        ) {
+            (Ok(lock_file), Ok(graph)) => dep_names
                 .iter()
-                .map(|dep| (dep.clone(), ext_dep_fingerprint(&lock_file, target, dep)))
+                .map(|dep| {
+                    (
+                        dep.clone(),
+                        ext_dep_fingerprint(&lock_file, target, &graph, dep),
+                    )
+                })
                 .collect(),
-            Err(_) => Vec::new(),
+            _ => Vec::new(),
         }
     };
 
@@ -3760,6 +3828,44 @@ extensions:
             plain, with_deps,
             "a validator using the plain hash can never accept a deps-aware stamp"
         );
+    }
+
+    /// `app -> mid -> base`: a change in base's lock state must move MID's
+    /// fingerprint even though mid's own lock rows are untouched — the seed
+    /// rpmdb app was built from changed. A non-transitive fingerprint left
+    /// app's stamp valid over that change.
+    #[test]
+    fn dependency_fingerprint_propagates_through_chains() {
+        let ext_yaml: serde_yaml::Value =
+            serde_yaml::from_str("extensions:\n  base: {}\n  mid: {depends_on: [base]}\n").unwrap();
+        let graph = crate::utils::ext_deps::DependencyGraph::from_extensions_section(
+            ext_yaml.get("extensions").unwrap(),
+            "qemux86-64",
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+
+        let src = |v: &str| crate::utils::lockfile::ExtensionSourceLock {
+            source_type: "package".to_string(),
+            package: None,
+            version: Some(v.to_string()),
+            implied: true,
+        };
+        let mut lock = crate::utils::lockfile::LockFile::default();
+        lock.set_extension_source("t", "mid", src("1.0.0"));
+        lock.set_extension_source("t", "base", src("1.0.0"));
+
+        let before = ext_dep_fingerprint(&lock, "t", &graph, "mid");
+        lock.set_extension_source("t", "base", src("2.0.0"));
+        let after = ext_dep_fingerprint(&lock, "t", &graph, "mid");
+        assert_ne!(
+            before, after,
+            "a change beneath a dependency must move the dependency's fingerprint"
+        );
+
+        // And it reaches arbitrary depth: base's change moves base's own
+        // fingerprint too, trivially, but the mid case above is the one a
+        // per-node fingerprint got wrong.
     }
 
     /// With a broken graph or an unloadable lock, the reader degrades to an
