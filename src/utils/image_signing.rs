@@ -181,10 +181,7 @@ pub fn sign_file(
     // Create signature file content
     let sig_content = create_signature_content(
         &hash,
-        signature
-            .as_ref()
-            .try_into()
-            .expect("signature should be 64 bytes"),
+        signature.as_ref(),
         checksum_algorithm,
         key_name,
         keyid,
@@ -211,7 +208,7 @@ pub fn sign_file(
 /// Create signature file content in JSON format
 fn create_signature_content(
     hash: &[u8],
-    signature: [u8; 64],
+    signature: &[u8],
     checksum_algorithm: &ChecksumAlgorithm,
     key_name: &str,
     keyid: &str,
@@ -220,7 +217,7 @@ fn create_signature_content(
         "version": "1",
         "checksum_algorithm": checksum_algorithm.name(),
         "checksum": hex_encode(hash),
-        "signature": hex_encode(&signature),
+        "signature": hex_encode(signature),
         "key_name": key_name,
         "keyid": keyid,
     });
@@ -368,13 +365,7 @@ pub fn sign_hash_manifest(
         // Create signature file content
         let sig_content = create_signature_content(
             &hash_bytes,
-            signature_bytes.try_into().unwrap_or_else(|v: Vec<u8>| {
-                // Pad or truncate to 64 bytes for compatibility
-                let mut arr = [0u8; 64];
-                let len = v.len().min(64);
-                arr[..len].copy_from_slice(&v[..len]);
-                arr
-            }),
+            &signature_bytes,
             &manifest.checksum_algorithm.parse()?,
             key_name,
             keyid,
@@ -518,10 +509,7 @@ mod tests {
         // Create signature content
         let sig_content = create_signature_content(
             &hash,
-            signature
-                .as_ref()
-                .try_into()
-                .expect("signature should be 64 bytes"),
+            signature.as_ref(),
             &ChecksumAlgorithm::Sha256,
             "test-key",
             "test-keyid",
@@ -573,10 +561,7 @@ mod tests {
         // Create signature content
         let sig_content = create_signature_content(
             &hash,
-            signature
-                .as_ref()
-                .try_into()
-                .expect("signature should be 64 bytes"),
+            signature.as_ref(),
             &ChecksumAlgorithm::Blake3,
             "test-key-blake3",
             "test-keyid-blake3",
@@ -623,10 +608,7 @@ mod tests {
         // Create signature content
         let sig_content = create_signature_content(
             &test_hash,
-            signature
-                .as_ref()
-                .try_into()
-                .expect("signature should be 64 bytes"),
+            signature.as_ref(),
             &ChecksumAlgorithm::Sha256,
             "my-key",
             "my-keyid-123",
@@ -748,6 +730,67 @@ mod tests {
         // Verify it's deterministic
         let hash2 = compute_file_hash_from_bytes(test_data, &ChecksumAlgorithm::Blake3).unwrap();
         assert_eq!(hash, hash2, "Hash should be deterministic");
+    }
+
+    /// A signature longer than 64 bytes must survive verbatim.
+    ///
+    /// RSA-2048 signatures are 256 bytes. `create_signature_content` used to
+    /// take a `[u8; 64]`, so `sign_hash_manifest` truncated anything longer —
+    /// silently emitting a `.sig` that could never verify.
+    #[test]
+    fn test_signature_longer_than_64_bytes_is_not_truncated() {
+        let hash =
+            compute_file_hash_from_bytes(b"rsa payload", &ChecksumAlgorithm::Sha256).unwrap();
+        // Distinct per byte so a truncation at any offset is visible.
+        let signature: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
+
+        let sig_content = create_signature_content(
+            &hash,
+            &signature,
+            &ChecksumAlgorithm::Sha256,
+            "rsa-key",
+            "rsa-keyid",
+        )
+        .unwrap();
+
+        let sig_json: serde_json::Value = serde_json::from_str(&sig_content).unwrap();
+        let round_tripped = hex_decode(sig_json["signature"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            round_tripped, signature,
+            "a 256-byte signature must round-trip byte for byte"
+        );
+    }
+
+    /// A signature shorter than 64 bytes must not be zero-padded.
+    ///
+    /// DER-encoded ECDSA-P256 signatures are variable length, typically 70-72
+    /// bytes but shorter when a leading integer byte is dropped. The old
+    /// `[u8; 64]` parameter zero-padded anything shorter, changing the value.
+    #[test]
+    fn test_signature_shorter_than_64_bytes_is_not_padded() {
+        let hash =
+            compute_file_hash_from_bytes(b"ecdsa payload", &ChecksumAlgorithm::Sha256).unwrap();
+        let signature: Vec<u8> = (0..48u8).map(|i| i.wrapping_add(1)).collect();
+
+        let sig_content = create_signature_content(
+            &hash,
+            &signature,
+            &ChecksumAlgorithm::Sha256,
+            "ecdsa-key",
+            "ecdsa-keyid",
+        )
+        .unwrap();
+
+        let sig_json: serde_json::Value = serde_json::from_str(&sig_content).unwrap();
+        let round_tripped = hex_decode(sig_json["signature"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            round_tripped.len(),
+            48,
+            "a 48-byte signature must not be padded out to 64"
+        );
+        assert_eq!(round_tripped, signature);
     }
 
     // Helper function to compute hash from bytes (for testing)
