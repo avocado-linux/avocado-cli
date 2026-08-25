@@ -1571,11 +1571,34 @@ impl LockFile {
     ///
     /// Used to fingerprint a dependency so its dependents invalidate when its
     /// contents change.
-    pub fn get_extension_packages(&self, target: &str, ext_name: &str) -> Option<&PackageVersions> {
-        self.targets
-            .get(target)
-            .and_then(|tl| tl.extensions.get(ext_name))
-            .map(|ext| &ext.packages)
+    /// Read an extension's locked package versions, falling back to the
+    /// runtime-scoped namespaces (`runtimes.<r>.extensions.<ext>`) when the
+    /// global map has no entry. A runtime-scoped install records versions
+    /// ONLY there (see [`SysrootType::RuntimeExtension`]), so a reader that
+    /// only checks the global map sees an empty package set for such an
+    /// extension. Runtimes are scanned in sorted-name order so the answer is
+    /// deterministic when several carry the extension.
+    pub fn get_extension_packages_any_scope(
+        &self,
+        target: &str,
+        ext_name: &str,
+    ) -> Option<&PackageVersions> {
+        let tl = self.targets.get(target)?;
+        if let Some(ext) = tl.extensions.get(ext_name) {
+            if !ext.packages.is_empty() {
+                return Some(&ext.packages);
+            }
+        }
+        let mut runtime_names: Vec<&String> = tl.runtimes.keys().collect();
+        runtime_names.sort();
+        for rt in runtime_names {
+            if let Some(ext) = tl.runtimes.get(rt).and_then(|r| r.extensions.get(ext_name)) {
+                if !ext.packages.is_empty() {
+                    return Some(&ext.packages);
+                }
+            }
+        }
+        tl.extensions.get(ext_name).map(|e| &e.packages)
     }
 
     pub fn get_extension_source(

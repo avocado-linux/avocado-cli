@@ -451,6 +451,7 @@ impl ExtInstallCommand {
                 parsed,
                 &extensions_to_install,
                 &direct_deps,
+                &graph,
                 &container_helper,
                 container_image,
                 &target,
@@ -489,6 +490,7 @@ impl ExtInstallCommand {
         parsed: &serde_yaml::Value,
         extensions_to_install: &[(String, ExtensionLocation)],
         direct_deps: &std::collections::HashMap<String, Vec<String>>,
+        graph: &crate::utils::ext_deps::DependencyGraph,
         container_helper: &SdkContainer,
         container_image: &str,
         target: &str,
@@ -575,7 +577,9 @@ impl ExtInstallCommand {
                     .map(|dep| {
                         (
                             dep.clone(),
-                            crate::utils::stamps::ext_dep_fingerprint(&lock_file, target, dep),
+                            crate::utils::stamps::ext_dep_fingerprint(
+                                &lock_file, target, graph, dep,
+                            ),
                         )
                     })
                     .collect();

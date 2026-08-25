@@ -567,9 +567,15 @@ done
 # forced re-fetch — the install itself was already batched.
 if [ "{force_str}" = "true" ] && [ -n "$NESTED_NAMES_TO_REMOVE" ]; then
     echo "Removing nested extensions for re-fetch:$NESTED_NAMES_TO_REMOVE"
+    # rpm -e --nodeps, NOT dnf remove: dnf's dependency-aware removal drags
+    # every installed package that Requires a removed provider out with it, so
+    # `--force` on a subset (say, just a shared base) silently erased its
+    # dependent apps — and only the subset was reinstalled below. --nodeps is
+    # safe here precisely because the same packages are reinstalled in this
+    # script run: the window where dependents' Requires dangle never survives
+    # the transaction, and nothing executes from this rpmdb meanwhile.
     RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
-        $DNF_SDK_HOST $DNF_SDK_HOST_OPTS --installroot="$AVOCADO_PREFIX/includes" \
-        -y remove $NESTED_NAMES_TO_REMOVE 2>/dev/null || true
+        rpm --root="$AVOCADO_PREFIX/includes" -e --nodeps $NESTED_NAMES_TO_REMOVE 2>/dev/null || true
     for d in $NESTED_DIRS; do rm -rf "$d"; done
 fi
 
