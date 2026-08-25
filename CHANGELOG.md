@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.2] - 2026-08-28
+
 ### Added
 - **`runtimes.<name>.var.encrypt: true` — encrypted `/var`.** Opts a runtime
   into a LUKS2 `/var` sealed to the target's hardware key store (OP-TEE fTPM
@@ -29,6 +31,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fit-image.its` template, with this runtime's initramfs (previously a FIT
   machine booted the feed's initramfs), the rootfs root hash when set, and a
   signature from `AVOCADO_FIT_KEY_DIR` (`FIT.key`/`FIT.crt`) when given.
+- **Inter-extension dependencies via `depends_on`.** An extension can declare
+  the extensions it builds on (`depends_on: [weston-base]`, optionally with a
+  semver range); the CLI expands the closure everywhere it matters — fetch
+  resolves and installs dependencies in one DNF transaction via virtual
+  `avocado-ext(<name>)` capabilities, install seeds each dependent's rpmdb
+  from its dependency (shared packages de-duplicated), the runtime list
+  orders dependents ahead of their dependencies for merge priority, and
+  install stamps carry a transitive fingerprint of the whole chain so a
+  change anywhere underneath invalidates every dependent. Solver-derived
+  dependencies are pinned in `avocado.lock` and replayed on clean checkouts;
+  `ext fetch --locked` turns lock drift into an error for CI. An unresolved
+  closure (missing dependency, cycle, version conflict) now fails `install`
+  outright instead of silently installing a flat, unseeded list.
+- **Device-tree overlays compile and deliver during builds.** An extension
+  declaring `device_tree_overlays` gets the SDK tooling provisioned at
+  `sdk install`, its `.dtbo`s compiled and delivered into the OS bundle at
+  `avocado build` through per-BSP delivery hooks (verified on-device on
+  Jetson Orin Nano and raspberrypi5).
+- **Container Dev Mode.** Host CLI with an embedded registry and a VM push
+  path for iterating on container workloads against the dev VM.
+- **`--target-board` flag** for board interpolation across build commands.
 - **Build commit in `avocado --version`.** The version line now reports the
   commit the binary was built from and its date, following rustc's shape:
   `avocado 1.0.0-rc.1 (abc1234 2026-03-05)`. A bug report now identifies the
@@ -119,6 +142,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document they can read first.
 
 ### Changed
+- **`avocado vm update` migrates state instead of destroying it.** A version
+  bump no longer resets the var disk: the host records the pending seed and
+  attaches it read-only on the next start (found by btrfs UUID), and the
+  guest adopts the release's runtime out of it before extensions merge —
+  Docker volumes, image layers and installed SDKs survive the update.
+- **`AVOCADO_OS_BUILD_ID` derives from the assembled work tree.** The id was
+  an input list (package NEVRAs, then auth files) that missed overlay and
+  `post_install` content; it is now `uuid5(ns, PKG_HASH:TREE_HASH)` where the
+  tree hash covers exactly what `mkfs.erofs` preserves, taken before the
+  identity append, on one shared rootfs/initramfs derivation. Any
+  image-affecting change now OTAs. Every existing image re-ids once on the
+  first rebuild after this release.
+- **`permissions:` users and groups provision in stable sorted order.** They
+  were HashMap-ordered, so auto-assigned UIDs/GIDs could differ between
+  builds; the first build after this release may assign a different UID than
+  the previous build did for users that omit `uid:`.
+- **cpio archives are reproducible.** Entry order, inode numbering, and
+  mtimes are normalized (`SOURCE_DATE_EPOCH`), matching the erofs side.
 - **Rootfs and initramfs images no longer ship package-manager state.** The
   rpmdb, `var/lib/dnf` and `var/cache/dnf` are removed from the staged copy
   before the image is built — measured at ~13MB of a qemux86-64 rootfs and
@@ -197,6 +238,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that collapse is what let an unparseable version fall through as a pass.
 
 ### Fixed
+- **`avocado build` refuses a stale rootfs or initramfs install stamp.** An
+  `overlay/` edit followed by `avocado build` alone used to build from the
+  previous overlay content with exit 0 and an unchanged `AVOCADO_OS_BUILD_ID`,
+  so the update pipeline never offered it. The build now validates the install
+  stamps against the current inputs, the same check `install` already made.
+- **The build id covers everything the image ships.** The tree hash no longer
+  prunes `var/cache` and `var/log` wholesale (only `var/cache/dnf` is actually
+  purged from the image), and the initramfs hash includes file ownership, which
+  `cpio` preserves. A change under either previously reached the image without
+  moving `AVOCADO_OS_BUILD_ID`, so devices running different bytes were never
+  offered the update. Images re-id once.
+- **`ext fetch --locked` fails on an extension the lock has no entry for**, and
+  never writes the lock. It previously gated only edited pins and moved
+  implied dependencies, letting a newly declared extension resolve against
+  feed head and be recorded silently.
+- **Signature files carry the whole signature.** `create_signature_content`
+  assumed 64 bytes; an RSA signature was truncated to 64 bytes in `.sig` files
+  by `sign_hash_manifest` and made `sign_file` panic. The length is now the
+  algorithm's.
+- **Editing an `overlay/` file now invalidates the install stamp.** The stamp
+  hashed only the overlay's config value (dir name), so `avocado build` after
+  an overlay edit shipped the previous file with no warning; the content
+  digest now always folds in (verbatim and preprocessed overlays alike, and
+  bare-string `overlay: mydir` declarations hash the right tree).
+- **`ext build` resolves `$CC` from the cross-canadian bindir.** The
+  target-sysroot gcc it found before is a target ELF that only fails on a
+  cross-arch host, which same-arch CI never caught; the SDK env vars are now
+  required up front and CI gained a qemuarm64 leg.
+- **Extension packaging emits RPM-safe versions for pre-releases** and works
+  against an rpm 4.20 SDK sysroot; `target-<name>:` overrides are honored on
+  every ext path, recursively; extension versions resolve from the
+  extension's own source tree.
+- **Registry-name signing keys resolve in provision, sign, and `sdk run`;**
+  deploy surfaces container script stderr instead of a generic failure;
+  `connect auth` honors `--org` before the zero-orgs shortcut; PTY allocation
+  derives from the environment; abandoned build volumes are reaped.
 - **`source_date_epoch` is honored outside extension images.** The key was
   read only by `ext image`, which exports it inside its own script. The rootfs
   build script has always passed `-T "${SOURCE_DATE_EPOCH:-0}"` to
