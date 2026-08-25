@@ -421,6 +421,14 @@ async fn post_route(
 }
 
 /// Drain `body` into `upload`, mapping a transport error to an OCI response.
+///
+/// `Err` is a full axum `Response` on purpose: every error here is an OCI
+/// error payload the caller returns verbatim, which is the axum idiom.
+/// clippy 1.98's `result_large_err` (>=128 bytes) would rather see it boxed,
+/// but this fn is called once per upload request, not in a loop - the
+/// indirection would cost call-site `?` ergonomics to save bytes that do
+/// not matter here.
+#[allow(clippy::result_large_err)]
 async fn stream_into(body: Body, upload: &mut BlobUpload) -> Result<(), Response> {
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
