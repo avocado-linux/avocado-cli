@@ -222,11 +222,12 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # While those are in the tree, two installs of the same package set never
     # produce identical image bytes.
     #
-    # dnf's own logs go with it. The rootfs install omits $DNF_SDK_HOST_OPTS,
-    # which is what redirects logdir/cachedir/persistdir to the SDK prefix — so
-    # the same omission that lands var/cache/dnf and var/lib/dnf in the sysroot
-    # also lands dnf.log, dnf.rpm.log and hawkey.log in var/log, each line
-    # stamped with a wall-clock time.
+    # dnf's logs are deliberately NOT on this list. dnf only prepends the
+    # installroot to cachedir and persistdir (dnf/cli/cli.py, the
+    # prepend_installroot loop); logdir is never installroot-relative, so the
+    # logs land in the SDK prefix and there has never been one in the staged
+    # tree to remove — verified across real build volumes, where var/log
+    # resolves to an empty volatile/log in every image.
     #
     # Removing all of this is necessary for a reproducible image but not
     # sufficient: the archive's own mtime handling is a separate problem, and
@@ -240,7 +241,6 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # sysroot, never this work copy.
     echo "Purging package-manager state from rootfs image"
     rm -rf "$ROOTFS_WORK/var/lib/rpm" "$ROOTFS_WORK/var/lib/dnf" "$ROOTFS_WORK/var/cache/dnf"
-    rm -f "$ROOTFS_WORK/var/log/dnf.log" "$ROOTFS_WORK/var/log/dnf.rpm.log" "$ROOTFS_WORK/var/log/hawkey.log"
 
     # Build rootfs image using configured filesystem format
     ROOTFS_FS="{rootfs_filesystem}"
@@ -674,14 +674,7 @@ mod tests {
             "",
         );
 
-        for path in [
-            "var/lib/rpm",
-            "var/lib/dnf",
-            "var/cache/dnf",
-            "var/log/dnf.log",
-            "var/log/dnf.rpm.log",
-            "var/log/hawkey.log",
-        ] {
+        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
             assert!(
                 script.contains(&format!("\"$ROOTFS_WORK/{path}\"")),
                 "{path} must be purged from the work copy before imaging"
@@ -694,6 +687,14 @@ mod tests {
             .expect("purge step present");
         let mkfs_at = script.find("mkfs.erofs").expect("mkfs step present");
         assert!(purge_at < mkfs_at, "purge must precede mkfs");
+
+        // dnf never writes its logs into an installroot (logdir is not
+        // prefixed by prepend_installroot), so a log purge here would be a
+        // no-op that reads as coverage. Pin its absence.
+        assert!(
+            !script.contains("var/log/dnf.log"),
+            "the script must not claim to purge dnf logs that are never staged"
+        );
     }
 
     #[test]
