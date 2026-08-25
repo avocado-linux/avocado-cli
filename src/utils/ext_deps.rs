@@ -263,11 +263,32 @@ pub fn rpm_version_constraints(req: &VersionReq) -> Vec<(&'static str, String)> 
             format!("{}.{}.{}~{}", c.major, minor, patch, c.pre)
         };
 
+        // For a PARTIAL comparator, semver's own semantics are range-based:
+        // `=1.2` accepts every 1.2.x, `>1.2` starts after the whole 1.2.x
+        // range, `<=1.2` includes all of it. Zero-filling those to 1.2.0
+        // silently narrowed (`=`) or shifted (`>`/`<=`) the accepted set, so
+        // DNF could reject versions the declaration allows or accept ones it
+        // excludes. `>=` and `<` zero-fill correctly by construction. A
+        // partial comparator cannot carry a pre-release (semver requires the
+        // full triple before `-pre`), so `upper` never needs the `~` form.
+        let partial = c.minor.is_none() || c.patch.is_none();
+        let upper = if c.minor.is_none() {
+            at(c.major + 1, 0, 0)
+        } else {
+            at(c.major, minor + 1, 0)
+        };
+
         match c.op {
+            Op::Exact if partial => {
+                out.push((">=", lower));
+                out.push(("<", upper));
+            }
             Op::Exact => out.push(("=", lower)),
+            Op::Greater if partial => out.push((">=", upper)),
             Op::Greater => out.push((">", lower)),
             Op::GreaterEq => out.push((">=", lower)),
             Op::Less => out.push(("<", lower)),
+            Op::LessEq if partial => out.push(("<", upper)),
             Op::LessEq => out.push(("<=", lower)),
             // ^1.2.3 → >=1.2.3, <2.0.0 | ^0.2.3 → >=0.2.3, <0.3.0
             // ^0.0.3 → >=0.0.3, <0.0.4 — leading zeros narrow the range.
@@ -1449,6 +1470,51 @@ mod tests {
         assert_eq!(
             requires(Some("<2.0.0")),
             vec!["Requires: avocado-ext(weston-base) < 2.0.0"]
+        );
+    }
+
+    #[test]
+    fn partial_comparators_expand_to_semver_ranges() {
+        // semver's own semantics for a PARTIAL comparator are range-based:
+        // `=1.2` accepts every 1.2.x. Zero-filling to `= 1.2.0` silently
+        // narrowed it to one version; DNF then rejected valid dependencies.
+        assert_eq!(
+            requires(Some("=1.2")),
+            vec![
+                "Requires: avocado-ext(weston-base) >= 1.2.0",
+                "Requires: avocado-ext(weston-base) < 1.3.0",
+            ]
+        );
+        assert_eq!(
+            requires(Some("=1")),
+            vec![
+                "Requires: avocado-ext(weston-base) >= 1.0.0",
+                "Requires: avocado-ext(weston-base) < 2.0.0",
+            ]
+        );
+        // `>1.2` starts after the whole 1.2.x range, not at 1.2.0.
+        assert_eq!(
+            requires(Some(">1.2")),
+            vec!["Requires: avocado-ext(weston-base) >= 1.3.0"]
+        );
+        // `<=1.2` includes all of 1.2.x.
+        assert_eq!(
+            requires(Some("<=1.2")),
+            vec!["Requires: avocado-ext(weston-base) < 1.3.0"]
+        );
+        // Full comparators keep exact semantics.
+        assert_eq!(
+            requires(Some("=1.2.3")),
+            vec!["Requires: avocado-ext(weston-base) = 1.2.3"]
+        );
+        // `>=`/`<` zero-fill correctly by construction and stay unchanged.
+        assert_eq!(
+            requires(Some(">=1.2")),
+            vec!["Requires: avocado-ext(weston-base) >= 1.2.0"]
+        );
+        assert_eq!(
+            requires(Some("<1.2")),
+            vec!["Requires: avocado-ext(weston-base) < 1.2.0"]
         );
     }
 

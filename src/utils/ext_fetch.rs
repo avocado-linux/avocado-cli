@@ -30,6 +30,13 @@ pub struct PackageFetchEntry {
     pub package_spec: String,
     /// Optional `--repo=` restriction from `source.repo_name`.
     pub repo_name: Option<String>,
+    /// This extension's DECLARED `depends_on` names (interpolated). Used only
+    /// to order repo-restricted transaction groups so a provider declared in
+    /// another repo installs first — a `--repo=` restriction hides every other
+    /// repo from the depsolver, but an already-installed provide still
+    /// satisfies a later restricted transaction. Empty for lock-pinned
+    /// replays (their dependencies are pinned entries themselves).
+    pub depends_on: Vec<String>,
 }
 
 /// Reject values that would be unsafe or ambiguous once interpolated into the
@@ -43,6 +50,24 @@ pub struct PackageFetchEntry {
 /// carrying one is a config error worth reporting, not something to quote and
 /// pass through.
 fn validate_shell_safe(field: &str, value: &str) -> Result<()> {
+    validate_shell_safe_chars(field, value, false)
+}
+
+/// Like [`validate_shell_safe`], but permits `~`.
+///
+/// `~` is part of the canonical RPM version for a pre-release —
+/// `to_rpm_version` turns `1.0.0-rc.1` into `1.0.0~rc.1`, and the rpmdb
+/// reports that form back into the lock — so a resolved pre-release spec like
+/// `app-1.0.0~rc.1-r0` must replay on the next fetch. It is shell-inert here:
+/// the spec sits inside the generated quoted triple, is never re-evaluated
+/// after parameter expansion, and tilde-expansion only ever applies at an
+/// unquoted word start. Names and repo ids keep rejecting it — an RPM *name*
+/// never legitimately carries one.
+fn validate_shell_safe_spec(field: &str, value: &str) -> Result<()> {
+    validate_shell_safe_chars(field, value, true)
+}
+
+fn validate_shell_safe_chars(field: &str, value: &str, allow_tilde: bool) -> Result<()> {
     const FORBIDDEN: &[char] = &[
         '|', '\'', '"', '`', '$', '\\', ';', '&', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?',
         '!', '#', '~', '\n', '\r', '\t',
@@ -52,7 +77,7 @@ fn validate_shell_safe(field: &str, value: &str) -> Result<()> {
     }
     if let Some(bad) = value
         .chars()
-        .find(|c| c.is_whitespace() || FORBIDDEN.contains(c))
+        .find(|c| (c.is_whitespace() || FORBIDDEN.contains(c)) && !(allow_tilde && *c == '~'))
     {
         anyhow::bail!(
             "Extension {field} '{value}' contains the character {bad:?}, which is not \
@@ -71,7 +96,7 @@ impl PackageFetchEntry {
     fn validate(&self) -> Result<()> {
         validate_shell_safe("name", &self.ext_name)?;
         validate_shell_safe("package name", &self.package_name)?;
-        validate_shell_safe("package spec", &self.package_spec)?;
+        validate_shell_safe_spec("package spec", &self.package_spec)?;
         if let Some(repo) = &self.repo_name {
             validate_shell_safe("repo name", repo)?;
         }
@@ -97,11 +122,18 @@ impl PackageFetchEntry {
             format!("{package_name}-{version}")
         };
         Self {
+            depends_on: Vec::new(),
             ext_name: ext_name.to_string(),
             package_name: package_name.to_string(),
             package_spec,
             repo_name: repo_name.map(str::to_string),
         }
+    }
+
+    /// Attach the declared dependency names (see the field docs).
+    pub fn with_depends_on(mut self, deps: Vec<String>) -> Self {
+        self.depends_on = deps;
+        self
     }
 }
 
@@ -110,11 +142,26 @@ impl PackageFetchEntry {
 const INSTALLED_REPORT_BEGIN: &str = "---avocado-installed-extensions-begin---";
 const INSTALLED_REPORT_END: &str = "---avocado-installed-extensions-end---";
 
-/// Parse the `NAME VERSION-RELEASE` block emitted after a batched install.
+/// One package from the installed report: its resolved version and, when it
+/// carries one, the extension name from its `avocado-ext(<name>)` provide.
 ///
-/// Returns package name -> resolved version. Anything outside the delimiters
-/// is dnf output and ignored.
-fn parse_installed_report(stdout: &str) -> std::collections::HashMap<String, String> {
+/// The provide is the authoritative extension identity. A publisher can
+/// rename the RPM via `source.package` — that rename is the whole reason the
+/// virtual capability exists — so recording the RPM name as the extension
+/// name would make the lock entry unaddressable by the graph/stamp code and
+/// replay it into the wrong `includes/<name>` directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPackage {
+    pub version: String,
+    pub ext_name: Option<String>,
+}
+
+/// Parse the `NAME VERSION-RELEASE [provides…]` block emitted after a batched
+/// install.
+///
+/// Returns package name -> resolved version + extension identity. Anything
+/// outside the delimiters is dnf output and ignored.
+fn parse_installed_report(stdout: &str) -> std::collections::HashMap<String, InstalledPackage> {
     let mut out = std::collections::HashMap::new();
     let mut inside = false;
     for line in stdout.lines() {
@@ -129,14 +176,69 @@ fn parse_installed_report(stdout: &str) -> std::collections::HashMap<String, Str
         if !inside {
             continue;
         }
-        if let Some((name, version)) = line.split_once(char::is_whitespace) {
-            let (name, version) = (name.trim(), version.trim());
-            if !name.is_empty() && !version.is_empty() {
-                out.insert(name.to_string(), version.to_string());
-            }
-        }
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(version)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let ext_name = parts
+            .find_map(|p| p.strip_prefix("avocado-ext(")?.strip_suffix(')'))
+            .map(str::to_string);
+        out.insert(
+            name.to_string(),
+            InstalledPackage {
+                version: version.to_string(),
+                ext_name,
+            },
+        );
     }
     out
+}
+
+/// Order repo-restricted transaction groups so declared cross-repo providers
+/// install first.
+///
+/// `--repo=` restricts the WHOLE transaction, so if an app in repo A requires
+/// a base declared in repo B and A's group ran first, the depsolver could not
+/// see B's provider and the transaction failed — but only in one declaration
+/// order, which is the worst kind of bug. An already-installed provide
+/// satisfies a later restricted transaction, so running B first is
+/// sufficient. First-seen order is the tiebreak; on a cycle the remaining
+/// groups keep their original order (a cross-repo dependency cycle cannot be
+/// satisfied under restrictions in any order, and dnf's own
+/// unsatisfied-Requires error names the missing capability).
+///
+/// Only DECLARED `depends_on` edges are visible here. An *implied* cross-repo
+/// dependency under a repo restriction remains unresolvable by ordering —
+/// nothing names it before the depsolver runs.
+fn order_repo_groups(
+    entries: &[PackageFetchEntry],
+    repos: Vec<Option<String>>,
+) -> Vec<Option<String>> {
+    let repo_of: std::collections::HashMap<&str, &Option<String>> = entries
+        .iter()
+        .map(|e| (e.ext_name.as_str(), &e.repo_name))
+        .collect();
+    let needs = |a: &Option<String>, b: &Option<String>| -> bool {
+        entries
+            .iter()
+            .filter(|e| &e.repo_name == a)
+            .flat_map(|e| e.depends_on.iter())
+            .any(|dep| repo_of.get(dep.as_str()).map(|r| *r == b).unwrap_or(false))
+    };
+    let mut ordered: Vec<Option<String>> = Vec::new();
+    let mut remaining = repos;
+    while !remaining.is_empty() {
+        let pick = remaining
+            .iter()
+            .position(|candidate| {
+                !remaining
+                    .iter()
+                    .any(|other| other != candidate && needs(candidate, other))
+            })
+            .unwrap_or(0); // cycle: keep original order
+        ordered.push(remaining.remove(pick));
+    }
+    ordered
 }
 
 /// Extension fetcher for downloading and installing remote extensions
@@ -292,7 +394,7 @@ impl ExtensionFetcher {
         &self,
         entries: &[PackageFetchEntry],
         force: bool,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, InstalledPackage>> {
         let mut resolved = std::collections::HashMap::new();
         let mut repos: Vec<Option<String>> = Vec::new();
         for e in entries {
@@ -301,7 +403,9 @@ impl ExtensionFetcher {
             }
         }
 
-        for repo in repos {
+        let ordered = order_repo_groups(entries, repos);
+
+        for repo in ordered {
             let group: Vec<PackageFetchEntry> = entries
                 .iter()
                 .filter(|e| e.repo_name == repo)
@@ -321,7 +425,7 @@ impl ExtensionFetcher {
         entries: &[PackageFetchEntry],
         repo_name: Option<&str>,
         force: bool,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<std::collections::HashMap<String, InstalledPackage>> {
         if entries.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -376,6 +480,7 @@ NESTED_NAMES=$(RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm RPM_ETCCONFIGDIR=$A
 NESTED_SPECS=""
 NESTED_NAMES_TO_REMOVE=""
 NESTED_DIRS=""
+LEGACY_REPORT=""
 
 for triple in {triples}; do
     ext_name="${{triple%%|*}}"
@@ -391,7 +496,11 @@ for triple in {triples}; do
         NESTED_DIRS="$NESTED_DIRS $ext_dir"
     else
         # Legacy layout: content at /, so it needs its own installroot and
-        # cannot join the shared transaction.
+        # cannot join the shared transaction. Its installroot is recorded so
+        # the report below can query it — the shared-includes query cannot see
+        # it, and skipping it left the legacy entry's lock source unwritten
+        # (`version: "*"` stayed unpinned forever).
+        LEGACY_REPORT="$LEGACY_REPORT $ext_dir|$pkg_name"
         echo "Extension '$ext_name': legacy layout -> per-extension installroot"
         if [ "{force_str}" = "true" ]; then
             rm -rf "$ext_dir"
@@ -431,9 +540,19 @@ fi
 # the answer: `version: "*"` requests nothing in particular, and the depsolver
 # may have pulled in extensions nobody named. Only the rpmdb knows the truth,
 # and the lock needs the truth to be reproducible.
+# The provides ride along so the host can read each package's
+# `avocado-ext(<name>)` capability — the extension identity that survives a
+# `source.package` rename. Legacy installroots are queried too: the shared
+# root cannot see them, and an unreported package never gets its lock pinned.
 echo "{INSTALLED_REPORT_BEGIN}"
 rpm --root="$AVOCADO_PREFIX/includes" -qa \
-    --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}}\n' 2>/dev/null | sort
+    --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}} [%{{PROVIDENAME}} ]\n' 2>/dev/null | sort
+for pair in $LEGACY_REPORT; do
+    legacy_root="${{pair%%|*}}"
+    legacy_pkg="${{pair#*|}}"
+    rpm --root="$legacy_root" -q "$legacy_pkg" \
+        --queryformat '%{{NAME}} %{{VERSION}}-%{{RELEASE}} [%{{PROVIDENAME}} ]\n' 2>/dev/null || true
+done
 echo "{INSTALLED_REPORT_END}"
 "#
         );
@@ -782,6 +901,42 @@ mod tests {
 
     // ---- post-install resolved-version report ---------------------------
 
+    /// The declaration-order trap: app (repo A) depends on base (repo B).
+    /// With A's restricted group first, dnf under --repo=A cannot see B's
+    /// provider. Ordering must put the provider group first regardless of
+    /// declaration order.
+    #[test]
+    fn repo_groups_order_providers_before_dependents() {
+        let app = PackageFetchEntry::from_package_source("app", None, "1.0.0", Some("repo-a"))
+            .with_depends_on(vec!["base".to_string()]);
+        let base = PackageFetchEntry::from_package_source("base", None, "2.0.0", Some("repo-b"));
+        let entries = vec![app, base];
+        let repos = vec![Some("repo-a".to_string()), Some("repo-b".to_string())];
+        assert_eq!(
+            order_repo_groups(&entries, repos),
+            vec![Some("repo-b".to_string()), Some("repo-a".to_string())],
+            "the provider's group must run first"
+        );
+    }
+
+    /// A dependency cycle across restricted repos cannot be satisfied in any
+    /// order; the ordering must terminate and keep the original order rather
+    /// than spin or panic.
+    #[test]
+    fn repo_group_cycles_keep_declaration_order() {
+        let a = PackageFetchEntry::from_package_source("a", None, "1.0.0", Some("ra"))
+            .with_depends_on(vec!["b".to_string()]);
+        let b = PackageFetchEntry::from_package_source("b", None, "1.0.0", Some("rb"))
+            .with_depends_on(vec!["a".to_string()]);
+        let entries = vec![a, b];
+        let repos = vec![Some("ra".to_string()), Some("rb".to_string())];
+        assert_eq!(
+            order_repo_groups(&entries, repos.clone()),
+            repos,
+            "a cycle falls back to declaration order"
+        );
+    }
+
     #[test]
     fn parses_the_delimited_report_and_ignores_dnf_chatter() {
         let stdout = format!(
@@ -790,15 +945,23 @@ mod tests {
              \x20 avocado-ext-deptest-app-a  noarch  0.1.0-r0\n\
              Complete!\n\
              {INSTALLED_REPORT_BEGIN}\n\
-             avocado-ext-deptest-app-a 0.1.0-r0\n\
-             avocado-ext-deptest-base 1.2.0-r0\n\
+             avocado-ext-deptest-app-a 0.1.0-r0 avocado-ext(deptest-app-a) avocado-ext-layout(nested)\n\
+             avocado-ext-deptest-base 1.2.0-r0 avocado-ext(deptest-base)\n\
              avocado-ext-deptest-mid 0.3.0-r0\n\
              {INSTALLED_REPORT_END}\n"
         );
         let got = parse_installed_report(&stdout);
         assert_eq!(got.len(), 3);
-        assert_eq!(got["avocado-ext-deptest-base"], "1.2.0-r0");
-        assert_eq!(got["avocado-ext-deptest-mid"], "0.3.0-r0");
+        // The avocado-ext(...) provide is the extension identity — it is what
+        // survives a `source.package` rename, so the parser must surface it.
+        assert_eq!(got["avocado-ext-deptest-base"].version, "1.2.0-r0");
+        assert_eq!(
+            got["avocado-ext-deptest-base"].ext_name.as_deref(),
+            Some("deptest-base")
+        );
+        // A package with no avocado-ext provide (legacy) reports none.
+        assert_eq!(got["avocado-ext-deptest-mid"].version, "0.3.0-r0");
+        assert_eq!(got["avocado-ext-deptest-mid"].ext_name, None);
         // The "Installing:" table above must not be mistaken for the report.
         assert!(!got.contains_key("Installing:"));
     }
@@ -824,7 +987,7 @@ mod tests {
         );
         let got = parse_installed_report(&stdout);
         assert_eq!(got.len(), 1);
-        assert_eq!(got["good-pkg"], "1.0.0-r0");
+        assert_eq!(got["good-pkg"].version, "1.0.0-r0");
     }
 
     #[test]

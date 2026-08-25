@@ -1122,6 +1122,21 @@ pub fn compute_ext_install_input_hash_with_deps(
                 source.clone(),
             );
         }
+        // The DECLARED dependency edges, independent of `dep_state`. dep_state
+        // carries the dependencies' resolved content, but it is reconstructed
+        // from the graph and the lock — and when either is unavailable the
+        // reader degrades to an empty dep_state. Without this field, that
+        // degraded hash equals a pre-`depends_on` stamp exactly (the plain
+        // hash never saw the edges), so a freshly added dependency could
+        // validate against a sysroot never seeded from it. Folding the config
+        // value in makes the degradation genuinely one-directional: any edit
+        // to `depends_on` moves the hash whether or not the lock loads.
+        if let Some(depends_on) = ext.get("depends_on") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.depends_on")),
+                depends_on.clone(),
+            );
+        }
     }
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
@@ -1166,10 +1181,15 @@ pub fn ext_dep_fingerprint(
 /// with no dependencies degrades to the plain hash, byte-identical to what a
 /// dependency-free install stamped.
 ///
-/// Degraded inputs fall back to the plain hash on purpose: a graph that no
-/// longer builds, or a lock that will not load, can only make the comparison
-/// come out STALE — over-invalidation costs a rebuild, which is the correct
-/// failure direction for a validator.
+/// Degraded inputs fall back to an empty `dep_state` on purpose — and that is
+/// only safe because the hash also folds in the declared `depends_on` config
+/// value directly. Without that field, an empty-dep_state fallback would be
+/// byte-identical to a pre-`depends_on` stamp, so a freshly declared
+/// dependency plus a broken graph or unloadable lock would VALIDATE a sysroot
+/// never seeded from it. With it, any `depends_on` edit moves the hash
+/// unconditionally, so the degradation can only read STALE —
+/// over-invalidation costs a rebuild, which is the correct failure direction
+/// for a validator.
 pub fn compute_ext_install_input_hash_current(
     composed: &crate::utils::config::ComposedConfig,
     ext_name: &str,
@@ -3739,6 +3759,23 @@ extensions:
         assert_ne!(
             plain, with_deps,
             "a validator using the plain hash can never accept a deps-aware stamp"
+        );
+    }
+
+    /// With a broken graph or an unloadable lock, the reader degrades to an
+    /// empty dep_state — and before `depends_on` was folded into the hash
+    /// directly, that degraded hash was byte-identical to a pre-`depends_on`
+    /// stamp, so a freshly declared dependency could VALIDATE a sysroot never
+    /// seeded from it. Declaring an edge must move the hash even with no
+    /// dep_state at all.
+    #[test]
+    fn declaring_a_dependency_moves_the_hash_even_without_dep_state() {
+        let without = ext_with_extras("");
+        let with = ext_with_extras("    depends_on: [weston-base]");
+        assert_ne!(
+            ext_install_hash(&without),
+            ext_install_hash(&with),
+            "a depends_on edit must be visible to the plain (empty dep_state) hash"
         );
     }
 

@@ -620,10 +620,16 @@ fi
     ) -> Result<String> {
         use crate::utils::ext_deps::{rpm_capability, ExtensionClass, ExtensionDependency};
 
+        // RPM form, not semver: the spec's Version: is converted with
+        // to_rpm_version (1.0.0-rc.1 -> 1.0.0~rc.1) and the Requires bounds
+        // to_rpm_requires emits are in RPM form too. Advertising the provide
+        // in semver form made an exact pre-release Requires unsatisfiable.
+        let provide_version = crate::utils::version::to_rpm_version(&metadata.version)
+            .unwrap_or_else(|_| metadata.version.clone());
         let mut lines = vec![format!(
             "Provides: {} = {}",
             rpm_capability(&self.extension),
-            metadata.version
+            provide_version
         )];
 
         let class = ExtensionClass::from_ext_config(&self.extension, ext_config)?;
@@ -1313,6 +1319,43 @@ extensions:
         };
         cmd.build_dependency_metadata(&ext_config, &metadata, "qemux86-64")
             .unwrap()
+    }
+
+    /// The versioned provide must be in RPM form, matching the spec's
+    /// `Version:` and the RPM-form bounds `to_rpm_requires` emits. In semver
+    /// form (`1.0.0-rc.1`) an exact pre-release Requires could never match.
+    #[test]
+    fn test_dependency_metadata_provide_uses_rpm_version_form() {
+        let cmd = ExtPackageCommand::new(
+            "test.yaml".to_string(),
+            "app-a".to_string(),
+            Some("qemux86-64".to_string()),
+            None,
+            false,
+            None,
+            None,
+        );
+        let ext_config: serde_yaml::Value = serde_yaml::from_str("types: [sysext]\n").unwrap();
+        let metadata = RpmMetadata {
+            name: "app-a".to_string(),
+            version: "1.0.0-rc.1".to_string(),
+            release: "r0".to_string(),
+            summary: String::new(),
+            description: String::new(),
+            license: String::new(),
+            arch: "x86_64".to_string(),
+            vendor: String::new(),
+            group: String::new(),
+            url: None,
+        };
+        let spec = cmd
+            .build_dependency_metadata(&ext_config, &metadata, "qemux86-64")
+            .unwrap();
+        assert!(
+            spec.contains("Provides: avocado-ext(app-a) = 1.0.0~rc.1"),
+            "{spec}"
+        );
+        assert!(!spec.contains("= 1.0.0-rc.1"), "{spec}");
     }
 
     #[test]
