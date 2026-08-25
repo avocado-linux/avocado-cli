@@ -564,26 +564,19 @@ impl ExtInstallCommand {
                 // from, so changing a dependency invalidates its dependents.
                 // Read after the dependency installed — topological order
                 // guarantees its lock entry is already current.
+                // Fingerprinted through the same helper build/image validation
+                // uses — the writer and readers drifting apart is the hash
+                // mismatch that broke every depends_on extension at build.
                 let dep_state: Vec<(String, String)> = direct_deps
                     .get(ext_name)
                     .map(Vec::as_slice)
                     .unwrap_or(&[])
                     .iter()
                     .map(|dep| {
-                        let versions = lock_file
-                            .get_extension_packages(target, dep)
-                            .map(|pkgs| {
-                                let mut v: Vec<String> =
-                                    pkgs.iter().map(|(k, val)| format!("{k}={val:?}")).collect();
-                                v.sort();
-                                v.join(",")
-                            })
-                            .unwrap_or_default();
-                        let source = lock_file
-                            .get_extension_source(target, dep)
-                            .and_then(|s| s.version.clone())
-                            .unwrap_or_default();
-                        (dep.clone(), format!("{source}|{versions}"))
+                        (
+                            dep.clone(),
+                            crate::utils::stamps::ext_dep_fingerprint(&lock_file, target, dep),
+                        )
                     })
                     .collect();
                 let inputs =

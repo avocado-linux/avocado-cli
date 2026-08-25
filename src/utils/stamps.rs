@@ -1044,7 +1044,9 @@ pub fn compute_compile_deps_input_hash(
     Ok(StampInputs::new(config_hash))
 }
 
-/// Compute input hash for **extension install**.
+/// Compute input hash for **extension install**, folding in the state of the
+/// extensions this one was seeded from (`dep_state` empty for an extension
+/// with no dependencies).
 ///
 /// Includes only inputs that affect the package-install step:
 /// - `ext.<name>.packages` (what gets installed)
@@ -1054,15 +1056,6 @@ pub fn compute_compile_deps_input_hash(
 /// Deliberately excludes `image`, `var_files`, `subvolumes`, `post_build`,
 /// `filesystem`, `permissions`, `overlay`, `version`, and all merge/service
 /// fields — those affect build/image output, not what gets installed.
-pub fn compute_ext_install_input_hash(
-    config: &serde_yaml::Value,
-    ext_name: &str,
-) -> Result<StampInputs> {
-    compute_ext_install_input_hash_with_deps(config, ext_name, &[])
-}
-
-/// Like [`compute_ext_install_input_hash`], but folds in the state of the
-/// extensions this one was seeded from.
 ///
 /// An extension de-duplicated against a dependency only ships the files that
 /// dependency does *not* provide, so its image is a function of the
@@ -1133,6 +1126,78 @@ pub fn compute_ext_install_input_hash_with_deps(
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
+}
+
+/// Fingerprint one dependency for `seeded_from` hashing: the dependency's
+/// resolved source version plus its resolved package versions, from the lock.
+///
+/// Shared by the stamp WRITER (`ext install`) and the stamp READERS
+/// (`ext build` / `ext image` via
+/// [`compute_ext_install_input_hash_current`]): the two sides drifting is
+/// exactly the bug this function exists to prevent — install stamped a
+/// deps-aware hash while build/image validated a plain one, so every
+/// `depends_on` extension read as stale forever and died at build.
+pub fn ext_dep_fingerprint(
+    lock_file: &crate::utils::lockfile::LockFile,
+    target: &str,
+    dep: &str,
+) -> String {
+    let versions = lock_file
+        .get_extension_packages(target, dep)
+        .map(|pkgs| {
+            let mut v: Vec<String> = pkgs.iter().map(|(k, val)| format!("{k}={val:?}")).collect();
+            v.sort();
+            v.join(",")
+        })
+        .unwrap_or_default();
+    let source = lock_file
+        .get_extension_source(target, dep)
+        .and_then(|s| s.version.clone())
+        .unwrap_or_default();
+    format!("{source}|{versions}")
+}
+
+/// Compute the ext-install input hash the way `ext install` STAMPS it, for a
+/// reader validating that stamp.
+///
+/// Resolves the extension's direct `depends_on` edges from the composed
+/// config's dependency graph and fingerprints each from the lock, then folds
+/// them in via [`compute_ext_install_input_hash_with_deps`]. An extension
+/// with no dependencies degrades to the plain hash, byte-identical to what a
+/// dependency-free install stamped.
+///
+/// Degraded inputs fall back to the plain hash on purpose: a graph that no
+/// longer builds, or a lock that will not load, can only make the comparison
+/// come out STALE — over-invalidation costs a rebuild, which is the correct
+/// failure direction for a validator.
+pub fn compute_ext_install_input_hash_current(
+    composed: &crate::utils::config::ComposedConfig,
+    ext_name: &str,
+    target: &str,
+    lock_src_dir: &Path,
+) -> Result<StampInputs> {
+    let dep_names: Vec<String> =
+        match crate::utils::ext_deps::DependencyGraph::from_composed(composed, target) {
+            Ok(graph) => graph
+                .get(ext_name)
+                .map(|node| node.depends_on.iter().map(|d| d.name.clone()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+
+    let dep_state: Vec<(String, String)> = if dep_names.is_empty() {
+        Vec::new()
+    } else {
+        match crate::utils::lockfile::LockFile::load(lock_src_dir) {
+            Ok(lock_file) => dep_names
+                .iter()
+                .map(|dep| (dep.clone(), ext_dep_fingerprint(&lock_file, target, dep)))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    compute_ext_install_input_hash_with_deps(&composed.merged_value, ext_name, &dep_state)
 }
 
 /// Compute input hash for **extension build**.
@@ -3644,7 +3709,7 @@ extensions:
     }
 
     fn ext_install_hash(value: &serde_yaml::Value) -> String {
-        compute_ext_install_input_hash(value, "my-ext")
+        compute_ext_install_input_hash_with_deps(value, "my-ext", &[])
             .unwrap()
             .config_hash
     }
@@ -3657,6 +3722,24 @@ extensions:
 
     fn dep(name: &str, fingerprint: &str) -> (String, String) {
         (name.to_string(), fingerprint.to_string())
+    }
+
+    /// The writer/reader drift bug: `ext install` stamped a deps-aware hash
+    /// while `ext build`/`ext image` validated with the plain (empty-deps)
+    /// hash, and the two NEVER agree when dep_state is non-empty — so every
+    /// `depends_on` extension read as stale forever and died at build. The
+    /// validators now go through `compute_ext_install_input_hash_current`,
+    /// which reconstructs dep_state the same way the writer builds it; this
+    /// pins the arithmetic fact that made the plain reader unfixable.
+    #[test]
+    fn a_deps_aware_stamp_never_matches_the_plain_hash() {
+        let cfg = ext_with_extras("");
+        let plain = ext_install_hash(&cfg);
+        let with_deps = ext_install_hash_with_deps(&cfg, &[dep("base", "1.2.0|openssh=9.6p1")]);
+        assert_ne!(
+            plain, with_deps,
+            "a validator using the plain hash can never accept a deps-aware stamp"
+        );
     }
 
     #[test]
