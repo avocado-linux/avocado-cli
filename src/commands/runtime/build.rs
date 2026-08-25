@@ -2421,7 +2421,23 @@ echo "Docker image priming complete.""#,
         );
 
         let initramfs_post_install = get_post_install(initramfs_section.as_ref());
-        let initramfs_permissions_section = render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
+        let mut initramfs_permissions_section =
+            render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
+        // Encrypted /var is a per-runtime opt-in, but the initramfs sysroot is
+        // shared across runtimes (cryptsetup-var is in all of them once one
+        // opts in). This marker, written into THIS runtime's work copy, is
+        // what the initrd (avocado-tegra-init & co.) keys on. Deliberately
+        // not /etc/avocado-security-capabilities: that file states what the
+        // image was built to support and is owned by the feed.
+        if crate::utils::config::get_runtime_var_encrypt(&merged_runtime) {
+            initramfs_permissions_section.push_str(
+                r#"
+    # Encrypted /var opt-in (avocado.yaml runtimes.<name>.var.encrypt).
+    mkdir -p "$INITRAMFS_WORK/etc/avocado"
+    echo "luks2" > "$INITRAMFS_WORK/etc/avocado/var-encrypt"
+"#,
+            );
+        }
         let initramfs_build_section = generate_initramfs_build_script(
             NAMESPACE_UUID,
             &config.get_initramfs_filesystem(),
@@ -3791,6 +3807,44 @@ runtimes:
         // No overlays declared: the device-tree overlay section is inert.
         assert!(!script.contains("device-tree overlays"));
         assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
+        // No var.encrypt: the plaintext path writes no marker.
+        assert!(!script.contains("/etc/avocado/var-encrypt"));
+    }
+
+    #[test]
+    fn test_create_build_script_var_encrypt_writes_initramfs_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    var:
+      encrypt: true
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &[])
+            .unwrap();
+
+        assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
+        // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
+        assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
     }
 
     #[test]

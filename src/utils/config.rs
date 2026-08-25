@@ -948,6 +948,15 @@ pub struct VarConfig {
     pub compression: Option<String>,
     /// Subvolumes keyed by path relative to var root (e.g. "lib/mydata").
     pub subvolumes: Option<HashMap<String, SubvolumeEntry>>,
+    /// Encrypt the var partition on the device (LUKS2, key sealed to the
+    /// target's hardware key store - e.g. the OP-TEE fTPM on Jetson). How the
+    /// key is sealed is a machine fact owned by the target's BSP, so this is a
+    /// plain opt-in. Unset/false leaves today's plaintext behaviour untouched.
+    /// When set, the initramfs carries `cryptsetup-var` and an
+    /// `/etc/avocado/var-encrypt` marker; on first boot the flashed var image
+    /// is encrypted in place, so seeded content (subvolumes, var_files,
+    /// primed images) survives.
+    pub encrypt: Option<bool>,
 }
 
 /// A subvolume entry supporting shorthand and full forms.
@@ -1325,6 +1334,16 @@ pub fn get_runtime_var_files(runtime_config: &serde_yaml::Value) -> Vec<VarFileM
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether the (target-merged) runtime config opts its var partition into
+/// encryption (`runtimes.<name>.var.encrypt: true`).
+pub fn get_runtime_var_encrypt(runtime_config: &serde_yaml::Value) -> bool {
+    runtime_config
+        .get("var")
+        .and_then(|v| v.get("encrypt"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Helper module for deserializing signing keys list
@@ -3888,33 +3907,68 @@ impl Config {
     /// Get rootfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-rootfs": "*" }` when the section is absent.
     pub fn get_rootfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
-        if let Some(rootfs) = self.rootfs_default() {
-            if let Some(ref packages) = rootfs.packages {
-                return packages.clone();
+        let mut packages = match self.rootfs_default().and_then(|r| r.packages.clone()) {
+            Some(packages) => packages,
+            None => {
+                let mut default = HashMap::new();
+                default.insert(
+                    "avocado-pkg-rootfs".to_string(),
+                    serde_yaml::Value::String("*".to_string()),
+                );
+                default
             }
+        };
+        if self.any_runtime_var_encrypt() {
+            // Re-creates /dev/mapper/var after switch-root (udev rule).
+            packages
+                .entry("cryptsetup-var-udev".to_string())
+                .or_insert_with(|| serde_yaml::Value::String("*".to_string()));
         }
-        let mut default = HashMap::new();
-        default.insert(
-            "avocado-pkg-rootfs".to_string(),
-            serde_yaml::Value::String("*".to_string()),
-        );
-        default
+        packages
+    }
+
+    /// True when any runtime in this project sets `var.encrypt: true`.
+    ///
+    /// The rootfs/initramfs sysroots are target-scoped and shared by every
+    /// runtime, so the package set has to be the union: one opted-in runtime
+    /// puts `cryptsetup-var` into the initramfs of its siblings too, where it
+    /// stays dormant (the per-runtime marker written at build time is what
+    /// activates it). Reads the typed `runtimes.<r>.var` block, so an
+    /// `encrypt:` placed only inside a `target-<x>:` override is not seen
+    /// here - put it on the runtime's `var:` block.
+    pub fn any_runtime_var_encrypt(&self) -> bool {
+        self.runtimes
+            .as_ref()
+            .map(|runtimes| {
+                runtimes
+                    .values()
+                    .any(|r| r.var.as_ref().and_then(|v| v.encrypt).unwrap_or(false))
+            })
+            .unwrap_or(false)
     }
 
     /// Get initramfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-initramfs": "*" }` when the section is absent.
     pub fn get_initramfs_packages(&self) -> HashMap<String, serde_yaml::Value> {
-        if let Some(initramfs) = self.initramfs_default() {
-            if let Some(ref packages) = initramfs.packages {
-                return packages.clone();
+        let mut packages = match self.initramfs_default().and_then(|i| i.packages.clone()) {
+            Some(packages) => packages,
+            None => {
+                let mut default = HashMap::new();
+                default.insert(
+                    "avocado-pkg-initramfs".to_string(),
+                    serde_yaml::Value::String("*".to_string()),
+                );
+                default
             }
+        };
+        if self.any_runtime_var_encrypt() {
+            // First-boot encrypt + unlock of /var. Its RDEPENDS bring the
+            // target's key-store tooling (e.g. tpm2-tools on Jetson).
+            packages
+                .entry("cryptsetup-var".to_string())
+                .or_insert_with(|| serde_yaml::Value::String("*".to_string()));
         }
-        let mut default = HashMap::new();
-        default.insert(
-            "avocado-pkg-initramfs".to_string(),
-            serde_yaml::Value::String("*".to_string()),
-        );
-        default
+        packages
     }
 
     /// Get rootfs filesystem format from top-level config.
@@ -11693,6 +11747,61 @@ subvolumes:
         let avocado = subvolumes.get("lib/avocado").unwrap().to_config();
         assert_eq!(avocado.compression, Some("zstd:3".to_string()));
         assert_eq!(avocado.quota, Some("500M".to_string()));
+    }
+
+    #[test]
+    fn test_var_encrypt_defaults_off_and_adds_nothing() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+runtimes:
+  dev:
+    target: jetson-orin-nx
+"#,
+        )
+        .unwrap();
+        assert!(!config.any_runtime_var_encrypt());
+        assert!(!config
+            .get_initramfs_packages()
+            .contains_key("cryptsetup-var"));
+        assert!(!config
+            .get_rootfs_packages()
+            .contains_key("cryptsetup-var-udev"));
+        let merged: serde_yaml::Value = serde_yaml::from_str("var: {compression: zstd}").unwrap();
+        assert!(!get_runtime_var_encrypt(&merged));
+    }
+
+    #[test]
+    fn test_var_encrypt_opt_in_adds_cryptsetup_var_packages() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+initramfs:
+  default:
+    packages:
+      avocado-pkg-initramfs: "*"
+runtimes:
+  plain:
+    target: jetson-orin-nx
+  secure:
+    target: jetson-orin-nx
+    var:
+      encrypt: true
+"#,
+        )
+        .unwrap();
+        assert!(config.any_runtime_var_encrypt());
+        let initramfs = config.get_initramfs_packages();
+        // User-declared packages are kept, cryptsetup-var is added alongside.
+        assert!(initramfs.contains_key("avocado-pkg-initramfs"));
+        assert_eq!(
+            initramfs.get("cryptsetup-var"),
+            Some(&serde_yaml::Value::String("*".to_string()))
+        );
+        assert_eq!(
+            config.get_rootfs_packages().get("cryptsetup-var-udev"),
+            Some(&serde_yaml::Value::String("*".to_string()))
+        );
+        let merged: serde_yaml::Value = serde_yaml::from_str("var: {encrypt: true}").unwrap();
+        assert!(get_runtime_var_encrypt(&merged));
     }
 
     // --- kernel.version tests ---

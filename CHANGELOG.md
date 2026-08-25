@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`runtimes.<name>.var.encrypt: true` — encrypted `/var`.** Opts a runtime
+  into a LUKS2 `/var` sealed to the target's hardware key store (OP-TEE fTPM
+  on Jetson). The cli adds `cryptsetup-var` to the initramfs and
+  `cryptsetup-var-udev` to the rootfs package sets and writes an
+  `/etc/avocado/var-encrypt` marker into that runtime's initramfs; first boot
+  encrypts the flashed var image in place, so seeded content survives. Unset
+  is byte-identical to before. See `docs/features/encrypted-var.md`.
 - **Build commit in `avocado --version`.** The version line now reports the
   commit the binary was built from and its date, following rustc's shape:
   `avocado 1.0.0-rc.1 (abc1234 2026-03-05)`. A bug report now identifies the
