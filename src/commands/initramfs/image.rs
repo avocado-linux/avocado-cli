@@ -115,9 +115,11 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
     # Purge package-manager bookkeeping from the work copy before archiving.
     # Same reasoning as the rootfs image — see the comment in
-    # `generate_rootfs_build_script`. Measured 14MB of a 123MB qemux86-64
-    # initramfs (2.5M rpmdb, 4.3M var/lib/dnf, 6.4M var/cache/dnf), all of it
-    # unreproducible and none of it read by anything in an initrd.
+    # `generate_rootfs_build_script`, including why dnf's logs are NOT on the
+    # list (dnf never writes them into an installroot) and why this is
+    # necessary but not sufficient for reproducibility. Measured 14MB of a
+    # 123MB qemux86-64 initramfs (2.5M rpmdb, 4.3M var/lib/dnf, 6.4M
+    # var/cache/dnf), none of it read by anything in an initrd.
     #
     # Before the mtime normalization below on purpose: the purge restamps the
     # directories it empties, and the mtime pass is what makes that not matter.
@@ -541,14 +543,7 @@ mod tests {
             "",
         );
 
-        for path in [
-            "var/lib/rpm",
-            "var/lib/dnf",
-            "var/cache/dnf",
-            "var/log/dnf.log",
-            "var/log/dnf.rpm.log",
-            "var/log/hawkey.log",
-        ] {
+        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
             assert!(
                 script.contains(&format!("\"$INITRAMFS_WORK/{path}\"")),
                 "{path} must be purged from the work copy before archiving"
@@ -563,6 +558,14 @@ mod tests {
             .find("cpio --reproducible")
             .expect("cpio step present");
         assert!(purge_at < cpio_at, "purge must precede cpio creation");
+
+        // dnf never writes its logs into an installroot (logdir is not
+        // prefixed by prepend_installroot), so a log purge here would be a
+        // no-op that reads as coverage. Pin its absence.
+        assert!(
+            !script.contains("var/log/dnf.log"),
+            "the script must not claim to purge dnf logs that are never staged"
+        );
     }
 
     /// Archive order is byte order, not locale collation. Entry order *is*
