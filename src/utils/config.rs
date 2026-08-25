@@ -1785,8 +1785,19 @@ impl Config {
                 .get("extensions")
                 .and_then(|e| e.as_mapping())
             {
-                for (nested_ext_key, _) in nested_ext_section {
+                for (nested_ext_key, nested_ext_value) in nested_ext_section {
                     if let Some(nested_ext_name) = nested_ext_key.as_str() {
+                        // A sibling that carries its own `source:` is a stub
+                        // pointing at ANOTHER remote — this file does not
+                        // define it. Recording it here would mark it as
+                        // fetched (`extension_sources` under a non-main path
+                        // is the graph's fetched-proof), so its dependency
+                        // subtree would silently resolve as empty even though
+                        // its real config was never read. Its entry is written
+                        // when its own config is discovered and merged.
+                        if nested_ext_value.get("source").is_some() {
+                            continue;
+                        }
                         extension_sources
                             .insert(nested_ext_name.to_string(), resolved_path_str.clone());
                         ext_readers.insert(
@@ -2216,8 +2227,19 @@ impl Config {
             if let Some(nested_ext_section) =
                 ext_config.get("extensions").and_then(|e| e.as_mapping())
             {
-                for (nested_ext_key, _) in nested_ext_section {
+                for (nested_ext_key, nested_ext_value) in nested_ext_section {
                     if let Some(nested_ext_name) = nested_ext_key.as_str() {
+                        // A sibling that carries its own `source:` is a stub
+                        // pointing at ANOTHER remote — this file does not
+                        // define it. Recording it here would mark it as
+                        // fetched (`extension_sources` under a non-main path
+                        // is the graph's fetched-proof), so its dependency
+                        // subtree would silently resolve as empty even though
+                        // its real config was never read. Its entry is written
+                        // when its own config is discovered and merged.
+                        if nested_ext_value.get("source").is_some() {
+                            continue;
+                        }
                         extension_sources
                             .insert(nested_ext_name.to_string(), ext_config_path_str.clone());
                         // A nested extension ships inside the same tree, so it
