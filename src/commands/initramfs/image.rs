@@ -201,6 +201,10 @@ fi"#,
             rpm_args: "",
             id_var: "INITRAMFS_BUILD_ID",
             identity_files: &["usr/lib/initrd-release", "usr/lib/os-release-initrd"],
+            // Unlike erofs, cpio has no --all-root: every newc header carries
+            // uid/gid and nothing in this script chowns the tree, so ownership
+            // reaches the image and must reach the id with it.
+            hash_ownership: true,
         }),
     )
 }
@@ -656,6 +660,50 @@ mod tests {
         // Both initramfs identity files are canonicalized before hashing.
         assert!(s.contains(r#"[ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]"#));
         assert!(s.contains(r#"[ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]"#));
+    }
+
+    /// The initramfs hash covers uid/gid; the rootfs hash must not. The two
+    /// derivations share `render_build_id_block` on purpose, so the exclusion
+    /// was shared too — and it was only ever right for one of them. Measured:
+    /// two trees differing only in one file's owner produce identical erofs
+    /// bytes (`--all-root` flattens it) but different cpio bytes, because
+    /// `cpio --reproducible` is just `--ignore-devno --ignore-dirnlink
+    /// --renumber-inodes` and every newc header still carries uid/gid. So the
+    /// initramfs shipped a changed image under an unchanged id, and the OTA
+    /// pipeline — which compares ids — never offered it.
+    ///
+    /// Pinned as a pairing rather than two independent asserts: what makes
+    /// either side correct is that it matches its own image format. Flipping
+    /// one without the other silently reintroduces the bug in one direction or
+    /// spurious every-build OTAs in the other.
+    #[test]
+    fn test_ownership_is_hashed_iff_the_image_records_it() {
+        let initramfs = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        let rootfs = crate::commands::rootfs::image::generate_rootfs_build_script(
+            "ns",
+            "erofs-lz4",
+            None,
+            "",
+        );
+
+        assert!(
+            initramfs.contains(r"-printf '%y %m %U %G %P\t%l\n'"),
+            "cpio stores uid/gid, so the initramfs tree hash must cover it"
+        );
+        assert!(
+            !initramfs.contains("--all-root") && !initramfs.contains("--owner"),
+            "nothing normalizes initramfs ownership — if that changes, stop hashing it"
+        );
+
+        assert!(
+            rootfs.contains(r"-printf '%y %m %P\t%l\n'"),
+            "mkfs.erofs --all-root flattens ownership, so the rootfs must not hash it"
+        );
+        assert_eq!(
+            rootfs.matches("--all-root").count(),
+            2,
+            "the rootfs exclusion is only correct while both mkfs.erofs branches normalize"
+        );
     }
 
     /// gzip already omits MTIME/FNAME when reading stdin, but `-n` keeps that

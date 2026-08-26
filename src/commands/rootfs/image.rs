@@ -156,6 +156,12 @@ pub struct BuildIdSpec<'a> {
     /// Work-relative identity files to canonicalize before hashing (strip any
     /// AVOCADO_* fields a prior build injected), e.g. `usr/lib/os-release`.
     pub identity_files: &'a [&'a str],
+    /// Whether the tree hash covers uid/gid. Set iff the image format for this
+    /// spec records ownership: `mkfs.erofs --all-root` flattens it to root, so
+    /// the rootfs must not hash it (the id would move while the image did not);
+    /// `cpio -H newc` stores uid/gid in every header and `--reproducible` does
+    /// not touch them, so the initramfs must.
+    pub hash_ownership: bool,
 }
 
 /// Render the shell that derives a deterministic build id into `spec.id_var`.
@@ -168,10 +174,16 @@ pub struct BuildIdSpec<'a> {
 ///   rootfs-affecting change — `permissions:`, `post_install`, `overlay:`,
 ///   anything future — moves the id and therefore OTAs. It hashes exactly what
 ///   the image carries: sorted path, type, mode, symlink target, and file
-///   content. It excludes what the image build normalizes away (`mkfs.erofs -T`
-///   mtimes, `--all-root` ownership) and what is fs-dependent (directory
+///   content, plus uid/gid when `spec.hash_ownership` is set. It excludes what
+///   the image build normalizes away and what is fs-dependent (directory
 ///   sizes), so it can't churn on noise the image doesn't hold.
 ///   [`BUILD_STATE_PATHS`] are excluded.
+///
+///   What gets normalized away is per-consumer, so the two specs differ. Each
+///   image flattens mtimes by its own means — `mkfs.erofs -T` on the rootfs,
+///   the `touch -h -d` pass on the initramfs — but only erofs flattens
+///   ownership (`--all-root`). cpio records uid/gid, so the initramfs hashes it
+///   and the rootfs does not.
 ///
 /// Must be invoked AFTER the permissions and post_install steps and BEFORE the
 /// os-release identity lines are appended: the derivation strips `AVOCADO_*`
@@ -185,6 +197,7 @@ pub fn render_build_id_block(spec: &BuildIdSpec) -> String {
         rpm_args,
         id_var,
         identity_files,
+        hash_ownership,
     } = *spec;
 
     // Strip any AVOCADO_* fields a prior build injected into the identity files
@@ -206,6 +219,10 @@ pub fn render_build_id_block(spec: &BuildIdSpec) -> String {
         .collect::<Vec<_>>()
         .join(" -o ");
 
+    // Numeric ids, not %u/%g: the archive header stores numbers, and the name
+    // lookup would resolve against whatever passwd the SDK happens to ship.
+    let owner = if hash_ownership { "%U %G " } else { "" };
+
     format!(
         r#"    # Canonicalize the identity files before hashing (see render_build_id_block).
 {strip}
@@ -218,10 +235,11 @@ pub fn render_build_id_block(spec: &BuildIdSpec) -> String {
 
     # Content hash of the assembled work tree: the id must move iff the image
     # bytes move. Hash only what the image carries — sorted path, type, mode,
-    # symlink target, file content — excluding what the image build normalizes
-    # out (mtime, ownership) or what is fs-dependent (directory sizes). %m is the
-    # octal mode, %l the symlink target (empty for non-links).
-    BUILD_ID_META=$(cd "${work_var}" && find . \( {prune} \) -prune -o -printf '%y %m %P\t%l\n' | LC_ALL=C sort)
+    # symlink target, file content, and uid/gid where the image format keeps it
+    # — excluding what the image build normalizes out (mtime, and ownership on
+    # the erofs side) or what is fs-dependent (directory sizes). %m is the octal
+    # mode, %l the symlink target (empty for non-links).
+    BUILD_ID_META=$(cd "${work_var}" && find . \( {prune} \) -prune -o -printf '%y %m {owner}%P\t%l\n' | LC_ALL=C sort)
     BUILD_ID_CONTENT=$(cd "${work_var}" && find . \( {prune} \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
     TREE_HASH=$(printf '%s\n%s\n' "$BUILD_ID_META" "$BUILD_ID_CONTENT" | sha256sum | awk '{{print $1}}')
 
@@ -399,6 +417,9 @@ fi"#,
             rpm_args: "--dbpath /var/lib/rpm",
             id_var: "OS_BUILD_ID",
             identity_files: &["usr/lib/os-release"],
+            // mkfs.erofs --all-root flattens ownership to root, so hashing it
+            // would move the id for an image whose bytes are unchanged.
+            hash_ownership: false,
         }),
     )
 }
@@ -866,9 +887,9 @@ mod tests {
     #[test]
     fn test_tree_hash_prunes_nondeterministic_paths_and_excludes_metadata() {
         // The rpmdb (install timestamps), dnf caches and ldconfig's aux-cache
-        // would churn the id every build, and mtime/ownership are normalized
-        // out of the image — so none may feed the hash. It hashes type, mode
-        // (%m), path (%P) and symlink target (%l) only.
+        // would churn the id every build, so none may feed the hash. What is
+        // left is what erofs carries: type, mode (%m), path (%P) and symlink
+        // target (%l).
         let s = rootfs_script();
         for path in BUILD_STATE_PATHS {
             assert!(
@@ -880,9 +901,20 @@ mod tests {
             s.contains(r"-printf '%y %m %P\t%l\n'"),
             "hash covers type/mode/path/link"
         );
-        // No mtime (%T*), user (%u/%U) or group (%g/%G) directives leak in.
+        // Mtime is out because `mkfs.erofs -T` overwrites it, ownership because
+        // `--all-root` flattens it: hashing either would move the id for an
+        // image whose bytes are identical. This is a *rootfs* argument, not a
+        // general one — see test_ownership_is_hashed_iff_the_image_records_it.
+        //
+        // Scoped to the directive list, not the whole script: prose that names
+        // a directive would otherwise read as a use of it.
+        assert_eq!(s.matches("-printf '").count(), 1, "one directive list");
+        let directive = s.split("-printf '").nth(1).unwrap();
         for meta in ["%T", "%u", "%U", "%g", "%G"] {
-            assert!(!s.contains(meta), "tree hash must not depend on {meta}");
+            assert!(
+                !directive.split('\'').next().unwrap().contains(meta),
+                "tree hash must not depend on {meta}"
+            );
         }
     }
 
@@ -976,6 +1008,7 @@ mod tests {
             rpm_args: "--dbpath /var/lib/rpm",
             id_var: "MY_ID",
             identity_files: &["usr/lib/os-release"],
+            hash_ownership: false,
         });
         assert!(block.contains(r#"[ -f "$WK/usr/lib/os-release" ]"#));
         assert!(block.contains(r#"--root "$SR""#));
@@ -983,5 +1016,32 @@ mod tests {
         assert!(block.contains(r#"cd "$WK" && find ."#));
         assert!(block.contains("MY_ID=$(python3"));
         assert!(block.contains("'$PKG_HASH:$TREE_HASH'"));
+    }
+
+    /// `hash_ownership` is the only thing that may vary the directive list, and
+    /// it must vary it by exactly `%U %G` — numeric, because that is what a cpio
+    /// header stores; `%u`/`%g` would resolve names against the SDK's passwd.
+    #[test]
+    fn test_hash_ownership_toggles_exactly_the_uid_gid_directives() {
+        let render = |hash_ownership| {
+            render_build_id_block(&BuildIdSpec {
+                namespace_uuid: "11111111-1111-1111-1111-111111111111",
+                work_var: "WK",
+                sysroot_var: "SR",
+                rpm_args: "",
+                id_var: "MY_ID",
+                identity_files: &[],
+                hash_ownership,
+            })
+        };
+        let off = render(false);
+        let on = render(true);
+        assert!(off.contains(r"-printf '%y %m %P\t%l\n'"));
+        assert!(on.contains(r"-printf '%y %m %U %G %P\t%l\n'"));
+        assert_eq!(
+            off,
+            on.replace("%y %m %U %G %P", "%y %m %P"),
+            "the flag may change the printf directives and nothing else"
+        );
     }
 }
