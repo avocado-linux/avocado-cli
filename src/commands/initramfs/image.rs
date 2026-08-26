@@ -17,7 +17,8 @@ use crate::utils::{
 };
 
 use crate::commands::rootfs::image::{
-    render_build_id_block, render_hook_block, resolve_install_hooks, BuildIdSpec, NAMESPACE_UUID,
+    render_build_id_block, render_build_state_purge, render_hook_block, resolve_install_hooks,
+    BuildIdSpec, NAMESPACE_UUID,
 };
 
 /// Default post-install commands for the initramfs build. Same shape as
@@ -94,21 +95,27 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     # the same reason as the cpio pipeline: collation must not reorder the hash
     # inputs (the id lands in initrd-release / os-release-initrd inside the
     # archive, so a shift would change the archive for an unchanged tree).
-    # Runs BEFORE the build-id derivation so the tree hash covers exactly
-    # what ships: dnf/rpm state is both nondeterministic and absent from the
-    # image, so it must be gone (or pruned) before the id is taken.
-    # Purge package-manager bookkeeping from the work copy before archiving.
+    # Purge build-time state from the work copy before archiving, from the same
+    # BUILD_STATE_PATHS list the build-id tree hash prunes.
+    #
+    # Runs BEFORE the build-id derivation so the tree hash covers exactly what
+    # ships: this state is both nondeterministic and absent from the image, so
+    # it must be gone before the id is taken.
+    #
     # Same reasoning as the rootfs image — see the comment in
-    # `generate_rootfs_build_script`, including why dnf's logs are NOT on the
-    # list (dnf never writes them into an installroot) and why this is
-    # necessary but not sufficient for reproducibility. Measured 14MB of a
-    # 123MB qemux86-64 initramfs (2.5M rpmdb, 4.3M var/lib/dnf, 6.4M
-    # var/cache/dnf), none of it read by anything in an initrd.
+    # `generate_rootfs_build_script`, including why var/log is on neither list
+    # and why this is necessary but not sufficient for reproducibility.
+    # Measured 14MB of a 123MB qemux86-64 initramfs (2.5M rpmdb, 4.3M
+    # var/lib/dnf, 6.4M var/cache/dnf), none of it read by anything in an
+    # initrd. The default initramfs post_install runs no ldconfig, so
+    # var/cache/ldconfig is normally absent here — it is still purged so a
+    # custom post_install that does run ldconfig cannot ship an unhashed
+    # aux-cache.
     #
     # Before the mtime normalization below on purpose: the purge restamps the
     # directories it empties, and the mtime pass is what makes that not matter.
     echo "Purging package-manager state from initramfs image"
-    rm -rf "$INITRAMFS_WORK/var/lib/rpm" "$INITRAMFS_WORK/var/lib/dnf" "$INITRAMFS_WORK/var/cache/dnf"
+    rm -rf {purge_paths}
 
 {build_id_block}
 
@@ -186,6 +193,7 @@ fi"#,
         initramfs_filesystem = initramfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        purge_paths = render_build_state_purge("INITRAMFS_WORK"),
         build_id_block = render_build_id_block(&BuildIdSpec {
             namespace_uuid,
             work_var: "INITRAMFS_WORK",
@@ -543,12 +551,29 @@ mod tests {
             "",
         );
 
-        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
-            assert!(
-                script.contains(&format!("\"$INITRAMFS_WORK/{path}\"")),
-                "{path} must be purged from the work copy before archiving"
-            );
-        }
+        // The initramfs shares the rootfs list, so purge and prune cannot
+        // drift apart here either. Both sides are pinned as whole rendered
+        // expressions — a per-path `contains` is only a subset check, so it
+        // would pass on a list that gained an extra entry.
+        let paths = crate::commands::rootfs::image::BUILD_STATE_PATHS;
+        let prunes = paths
+            .iter()
+            .map(|p| format!("-path ./{p}"))
+            .collect::<Vec<_>>()
+            .join(" -o ");
+        assert!(
+            script.contains(&format!("find . \\( {prunes} \\) -prune")),
+            "the tree hash must prune exactly BUILD_STATE_PATHS"
+        );
+        let purge = paths
+            .iter()
+            .map(|p| format!("\"$INITRAMFS_WORK/{p}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            script.contains(&format!("rm -rf {purge}\n")),
+            "the purge must remove exactly BUILD_STATE_PATHS"
+        );
 
         // The purge only helps if it runs before the archive is created.
         let purge_at = script
@@ -614,7 +639,7 @@ mod tests {
 
     /// Initramfs derives its id through the same render_build_id_block as rootfs
     /// (NEVRA package hash + work-tree content hash, rpmdb pruned), so the two
-    /// images can't diverge on the correctness-critical id logic (ENG-2441).
+    /// images can't diverge on the correctness-critical id logic.
     #[test]
     fn test_build_id_uses_shared_tree_hash() {
         let s = generate_initramfs_build_script("ns", "cpio.zst", None, "");
@@ -641,9 +666,9 @@ mod tests {
         assert!(script.contains("gzip -9 -n"));
     }
 
-    /// ENG-2437: a `permissions:`-only change must move the initramfs build
-    /// id. Under the tree-hash derivation (ENG-2441) the auth files are
-    /// ordinary tree content, so the guarantee holds iff the tree hash is
+    /// A `permissions:`-only change must move the initramfs build id. Under
+    /// the tree-hash derivation the auth files are ordinary tree content, so
+    /// the guarantee holds iff the tree hash is
     /// computed after the permissions section runs and `/etc` is never on the
     /// prune list.
     #[test]
