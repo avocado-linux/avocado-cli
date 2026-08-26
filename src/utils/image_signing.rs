@@ -1,7 +1,9 @@
 //! Image signing utilities for runtime builds.
 //!
-//! Provides functionality for signing image files using ed25519 keys
-//! with configurable hash algorithms (sha256 or blake3).
+//! Provides functionality for signing image files with file-backed ed25519
+//! keys or PKCS#11 devices (ECDSA-P256, RSA-2048), with configurable hash
+//! algorithms (sha256 or blake3). The `.sig` sidecar carries the signature at
+//! whatever length the algorithm produces.
 //!
 //! Supports multi-pass signing workflow:
 //! 1. Container computes hashes and outputs manifest
@@ -764,9 +766,10 @@ mod tests {
 
     /// A signature shorter than 64 bytes must not be zero-padded.
     ///
-    /// DER-encoded ECDSA-P256 signatures are variable length, typically 70-72
-    /// bytes but shorter when a leading integer byte is dropped. The old
-    /// `[u8; 64]` parameter zero-padded anything shorter, changing the value.
+    /// No algorithm the CLI currently produces yields one (CKM_ECDSA returns a
+    /// fixed-width `r || s`, 64 bytes for P-256), so this is a property test:
+    /// it pins that the length is never coerced. The old `[u8; 64]` parameter
+    /// zero-padded anything shorter, changing the value.
     #[test]
     fn test_signature_shorter_than_64_bytes_is_not_padded() {
         let hash =
