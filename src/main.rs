@@ -4370,8 +4370,10 @@ enum ExtCommands {
         /// Force re-fetch even if already installed
         #[arg(short, long)]
         force: bool,
-        /// Fail instead of updating avocado.lock when a locked dependency
-        /// cannot satisfy a new requirement. Use this in CI.
+        /// Fail instead of updating avocado.lock: a declared extension with
+        /// no lock entry, a pinned version that moved, or a pin that cannot
+        /// satisfy the current requirements. Never writes the lock. Use this
+        /// in CI.
         #[arg(long)]
         locked: bool,
         /// Extension name (deprecated, use positional argument)
