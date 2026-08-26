@@ -67,9 +67,28 @@ pub fn generate_initramfs_build_script(
     initramfs_filesystem: &str,
     post_install: Option<&str>,
     permissions_section: &str,
+    var_encrypt: bool,
 ) -> String {
     let post = resolve_install_hooks(post_install, DEFAULT_INITRAMFS_POST_INSTALL);
     let post_install_block = render_hook_block("post_install", &post);
+    // Encrypted /var is a per-runtime opt-in, but the initramfs sysroot is
+    // shared across runtimes (cryptsetup-var is in all of them once one opts
+    // in). This marker, written into THIS runtime's work copy, is what the
+    // initrd (avocado-tegra-init & co.) keys on. Deliberately not
+    // /etc/avocado-security-capabilities: that file states what the image was
+    // built to support and is owned by the feed.
+    //
+    // Emitted AFTER post_install so a hook that rebuilds $INITRAMFS_WORK/etc
+    // cannot drop it, and BEFORE the build id so the opt-in moves the id.
+    let var_encrypt_block = if var_encrypt {
+        r#"
+    # Encrypted /var opt-in (avocado.yaml runtimes.<name>.var.encrypt).
+    mkdir -p "$INITRAMFS_WORK/etc/avocado"
+    echo "luks2" > "$INITRAMFS_WORK/etc/avocado/var-encrypt"
+"#
+    } else {
+        ""
+    };
     format!(
         r#"
 # Build initramfs image from shared sysroot.
@@ -88,7 +107,7 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 {permissions_section}
 
 {post_install_block}
-
+{var_encrypt_block}
     # Compute the deterministic build id from the assembled work tree (see
     # render_build_id_block). Taken before the identity injection below so the
     # hash can't depend on the id it is about to write. LC_ALL=C throughout for
@@ -193,6 +212,7 @@ fi"#,
         initramfs_filesystem = initramfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        var_encrypt_block = var_encrypt_block,
         purge_paths = render_build_state_purge("INITRAMFS_WORK"),
         build_id_block = render_build_id_block(&BuildIdSpec {
             namespace_uuid,
@@ -317,6 +337,8 @@ impl InitramfsImageCommand {
             &initramfs_filesystem,
             post_install.as_deref(),
             &permissions_section,
+            // Standalone image builds have no runtime to opt in.
+            false,
         );
 
         // Same kab-wrap pipeline as rootfs/image.rs — see comments
@@ -513,6 +535,7 @@ mod tests {
             "cpio.zst",
             None,
             "",
+            false,
         );
 
         // Normalization is emitted, pinned to SOURCE_DATE_EPOCH (default 0 so it
@@ -553,6 +576,7 @@ mod tests {
             "cpio.zst",
             None,
             "",
+            false,
         );
 
         // The initramfs shares the rootfs list, so purge and prune cannot
@@ -611,7 +635,7 @@ mod tests {
     #[test]
     fn test_cpio_entry_order_is_locale_independent() {
         for fs in ["cpio", "cpio.zst", "cpio.lz4", "cpio.gz"] {
-            let script = generate_initramfs_build_script("ns", fs, None, "");
+            let script = generate_initramfs_build_script("ns", fs, None, "", false);
             assert!(
                 script.contains("find . | LC_ALL=C sort | cpio --reproducible"),
                 "{fs}: sort must be pinned to the C locale"
@@ -629,7 +653,7 @@ mod tests {
     /// only the cpio sort would leave the archive contents locale-sensitive.
     #[test]
     fn test_build_id_nevra_sort_is_locale_independent() {
-        let script = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        let script = generate_initramfs_build_script("ns", "cpio.zst", None, "", false);
         assert!(
             script.contains(r#"--root "$INITRAMFS_SYSROOT" | LC_ALL=C sort)"#),
             "the NEVRA sort feeding INITRAMFS_BUILD_ID must be pinned to LC_ALL=C"
@@ -646,7 +670,7 @@ mod tests {
     /// images can't diverge on the correctness-critical id logic.
     #[test]
     fn test_build_id_uses_shared_tree_hash() {
-        let s = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        let s = generate_initramfs_build_script("ns", "cpio.zst", None, "", false);
         assert!(s.contains("TREE_HASH="), "work-tree content hash present");
         assert!(s.contains("-path ./var/lib/rpm"), "rpmdb pruned");
         assert!(
@@ -710,7 +734,7 @@ mod tests {
     /// true if the pipeline is ever changed to compress a file in place.
     #[test]
     fn test_gzip_omits_timestamp() {
-        let script = generate_initramfs_build_script("ns", "cpio.gz", None, "");
+        let script = generate_initramfs_build_script("ns", "cpio.gz", None, "", false);
         assert!(script.contains("gzip -9 -n"));
     }
 
@@ -719,10 +743,34 @@ mod tests {
     /// the guarantee holds iff the tree hash is
     /// computed after the permissions section runs and `/etc` is never on the
     /// prune list.
+    /// The var-encrypt marker is the initrd's switch, so it must be the last
+    /// word: after a user post_install (which may rebuild /etc) and before the
+    /// build id (so opting in moves the id).
+    #[test]
+    fn test_var_encrypt_marker_follows_post_install_and_precedes_build_id() {
+        let hook = "rm -rf \"$INITRAMFS_WORK/etc\" # hook placeholder";
+        let script = generate_initramfs_build_script("ns", "cpio.zst", Some(hook), "", true);
+        let marker = "echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\"";
+        let hook_at = script.find(hook).expect("post_install present");
+        let marker_at = script.find(marker).expect("marker present");
+        let tree_at = script.find("TREE_HASH=").expect("tree hash present");
+        assert!(
+            hook_at < marker_at,
+            "marker must be written after post_install"
+        );
+        assert!(
+            marker_at < tree_at,
+            "marker must be hashed into the build id"
+        );
+
+        let off = generate_initramfs_build_script("ns", "cpio.zst", Some(hook), "", false);
+        assert!(!off.contains("var-encrypt"), "unset writes no marker");
+    }
+
     #[test]
     fn test_build_id_sees_permissions_changes() {
         let marker = "# permissions placeholder";
-        let script = generate_initramfs_build_script("ns", "cpio.zst", None, marker);
+        let script = generate_initramfs_build_script("ns", "cpio.zst", None, marker, false);
 
         let perms_pos = script.find(marker).expect("permissions section present");
         let tree_pos = script
@@ -743,7 +791,7 @@ mod tests {
     #[test]
     fn test_all_cpio_formats_get_normalized_tree() {
         for fs in ["cpio", "cpio.zst", "cpio.lz4", "cpio.gz"] {
-            let script = generate_initramfs_build_script("ns", fs, None, "");
+            let script = generate_initramfs_build_script("ns", fs, None, "", false);
             let touch_at = script.find("touch -h").expect("normalization present");
             let cpio_at = script
                 .find("find . | LC_ALL=C sort | cpio --reproducible")

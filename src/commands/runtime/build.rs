@@ -264,7 +264,7 @@ impl RuntimeBuildCommand {
             (StampComponent::Rootfs, SysrootType::Rootfs),
             (StampComponent::Initramfs, SysrootType::Initramfs),
         ] {
-            let Some(packages) = sysroot_packages(config, &sysroot_type) else {
+            let Some(packages) = sysroot_packages(config, &sysroot_type, target_arch) else {
                 continue;
             };
             if let Some(computed) = compute_sysroot_install_inputs(
@@ -2421,28 +2421,17 @@ echo "Docker image priming complete.""#,
         );
 
         let initramfs_post_install = get_post_install(initramfs_section.as_ref());
-        let mut initramfs_permissions_section =
-            render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
-        // Encrypted /var is a per-runtime opt-in, but the initramfs sysroot is
-        // shared across runtimes (cryptsetup-var is in all of them once one
-        // opts in). This marker, written into THIS runtime's work copy, is
-        // what the initrd (avocado-tegra-init & co.) keys on. Deliberately
-        // not /etc/avocado-security-capabilities: that file states what the
-        // image was built to support and is owned by the feed.
-        if crate::utils::config::get_runtime_var_encrypt(&merged_runtime) {
-            initramfs_permissions_section.push_str(
-                r#"
-    # Encrypted /var opt-in (avocado.yaml runtimes.<name>.var.encrypt).
-    mkdir -p "$INITRAMFS_WORK/etc/avocado"
-    echo "luks2" > "$INITRAMFS_WORK/etc/avocado/var-encrypt"
-"#,
-            );
-        }
+        let initramfs_permissions_section = render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
         let initramfs_build_section = generate_initramfs_build_script(
             NAMESPACE_UUID,
             &config.get_initramfs_filesystem(),
             initramfs_post_install.as_deref(),
             &initramfs_permissions_section,
+            // Typed field, same source as the package union in
+            // Config::any_runtime_var_encrypt — never the merged YAML, so a
+            // target-override-only `encrypt` cannot write a marker the
+            // sysroot has no cryptsetup-var to honour.
+            config.runtime_var_encrypt(&self.runtime_name),
         );
 
         let script = format!(
@@ -3414,8 +3403,8 @@ runtimes:
             "20260531T120000Z-qemux86-64",
         );
         assert_ne!(live, pinned, "the test is vacuous unless these differ");
-        let packages =
-            sysroot_packages(&composed.config, &SysrootType::Rootfs).expect("rootfs packages");
+        let packages = sysroot_packages(&composed.config, &SysrootType::Rootfs, "qemux86-64")
+            .expect("rootfs packages");
         let want = compute_sysroot_install_inputs(
             &SysrootStampContext {
                 sysroot_type: &SysrootType::Rootfs,
@@ -3612,8 +3601,8 @@ runtimes:
         );
         lock.save(&src_dir).unwrap();
         let stamp_json = |sysroot_type: SysrootType| {
-            let packages =
-                sysroot_packages(&composed.config, &sysroot_type).expect("sysroot packages");
+            let packages = sysroot_packages(&composed.config, &sysroot_type, "qemux86-64")
+                .expect("sysroot packages");
             let inputs = compute_sysroot_install_inputs(
                 &SysrootStampContext {
                     sysroot_type: &sysroot_type,
@@ -3845,6 +3834,43 @@ runtimes:
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
+    }
+
+    /// `encrypt:` only under a `target-<x>:` override must not write the
+    /// marker: package selection cannot see it, so a marker would boot an
+    /// initrd with no cryptsetup-var to honour it.
+    #[test]
+    fn test_create_build_script_var_encrypt_override_only_writes_no_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    target-x86_64:
+      var:
+        encrypt: true
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &[])
+            .unwrap();
+        assert!(!script.contains("/etc/avocado/var-encrypt"));
     }
 
     #[test]

@@ -18,9 +18,10 @@ runtimes:
   to the rootfs package set (`Config::get_initramfs_packages` /
   `get_rootfs_packages`). The target's BSP makes `cryptsetup-var` pull in
   whatever its key store needs (Jetson: `tpm2-tools`), so the cli stays
-  target-agnostic. The initramfs/rootfs sysroots are shared per target, so
-  sibling runtimes in the same project receive the package too — dormant
-  without the marker below.
+  target-agnostic. The initramfs/rootfs sysroots are installed once per
+  target, so sibling runtimes **on the same target** receive the package too —
+  dormant without the marker below. Runtimes on other targets are unaffected:
+  a Jetson opt-in never asks a qemu feed for `cryptsetup-var`.
 - Writes `/etc/avocado/var-encrypt` into **this runtime's** initramfs work
   copy during `runtime build`. That marker is what the initrd keys on.
   `/etc/avocado-security-capabilities` is deliberately left alone: it states
@@ -49,6 +50,7 @@ agx-thor) does as of meta-avocado wrynose.
 
 ## Limitations
 
-- `encrypt:` is read from the runtime's own `var:` block for package
-  selection; placing it only under a `target-<x>:` override is not seen there.
+- `encrypt:` is read from the runtime's own `var:` block, for both package
+  selection and the marker; placing it only under a `target-<x>:` override is
+  a no-op.
 - Device must be re-provisioned to go back to plaintext.
