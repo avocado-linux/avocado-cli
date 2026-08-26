@@ -708,6 +708,7 @@ mod tests {
             "erofs-lz4",
             None,
             "",
+            false,
         );
 
         assert!(

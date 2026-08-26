@@ -721,6 +721,30 @@ impl RuntimeBuildCommand {
             }
         };
 
+        // FIT signing key for the boot image assembled below (FIT machines
+        // only). AVOCADO_FIT_KEY_DIR names a host directory holding
+        // FIT.key/FIT.crt - the key-name-hint the feed's FIT template uses -
+        // and is bind-mounted read-only at /tmp/fit-keys. Optional: without
+        // it the FIT is assembled unsigned, which only boots on a U-Boot with
+        // no embedded key. Env rather than config until signing_keys can
+        // materialize PEM for external tools.
+        let fit_keydir_host_path: Option<String> = match std::env::var("AVOCADO_FIT_KEY_DIR") {
+            Ok(dir) => {
+                if !std::path::Path::new(&dir).join("FIT.key").is_file() {
+                    return Err(anyhow::anyhow!(
+                        "AVOCADO_FIT_KEY_DIR points to '{}' but it has no FIT.key.",
+                        dir
+                    ));
+                }
+                env_vars.insert(
+                    "AVOCADO_FIT_KEY_DIR".to_string(),
+                    "/tmp/fit-keys".to_string(),
+                );
+                Some(dir)
+            }
+            Err(_) => None,
+        };
+
         // The in-container sign_amf shell helper checks
         // $AVOCADO_AMF_KOS. Only kos runtimes set it; everyone else
         // treats sign_amf as a no-op.
@@ -769,6 +793,11 @@ impl RuntimeBuildCommand {
             if let Some(ref keyset_path) = kab_keyset_host_path {
                 args.push("-v".to_string());
                 args.push(format!("{keyset_path}:/tmp/kab.keyset:ro"));
+                modified = true;
+            }
+            if let Some(ref keydir) = fit_keydir_host_path {
+                args.push("-v".to_string());
+                args.push(format!("{keydir}:/tmp/fit-keys:ro"));
                 modified = true;
             }
             if modified {
@@ -1878,6 +1907,10 @@ rootfs_entry = add_image_entry(
     version_id,
     os.environ.get("AVOCADO_ROOTFS_IMAGE_TYPE", "raw"),
 )
+# rootfs.image.verity: record the root hash the signed FIT carries, so the
+# manifest states what the device is expected to have verified at boot.
+if rootfs_entry and os.environ.get("AVOCADO_ROOTFS_ROOTHASH"):
+    rootfs_entry["root_hash"] = os.environ["AVOCADO_ROOTFS_ROOTHASH"]
 initramfs_entry = add_image_entry(
     os.environ.get("AVOCADO_INITRAMFS_IMAGE", ""),
     version_id,
@@ -2435,12 +2468,18 @@ echo "Docker image priming complete.""#,
         // how the image tag override is applied above.
         let rootfs_post_install = get_post_install(rootfs_section.as_ref());
         let rootfs_permissions_section = render_perms(resolved_rootfs, "$ROOTFS_WORK/etc");
+        let rootfs_verity = rootfs_section
+            .as_ref()
+            .map(crate::utils::config::get_ext_image_verity)
+            .unwrap_or(false);
         let rootfs_build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
             &config.get_rootfs_filesystem(),
             rootfs_post_install.as_deref(),
             &rootfs_permissions_section,
+            rootfs_verity,
         );
+        let fit_section = generate_fit_assembly_script();
 
         let initramfs_post_install = get_post_install(initramfs_section.as_ref());
         let initramfs_permissions_section = render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
@@ -2517,6 +2556,7 @@ echo "Copying required extension images to runtime-specific directory..."
 # Build rootfs and initramfs images from package sysroots
 {rootfs_build_section}
 {initramfs_build_section}
+{fit_section}
 
 # Resolve kernel image staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
 # Done in shell so the optional KAB wrap below can rewrite the env var
@@ -2720,6 +2760,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             runtime_version = runtime_version,
             copy_section = copy_section,
             rootfs_build_section = rootfs_build_section,
+            fit_section = fit_section,
             initramfs_build_section = initramfs_build_section,
             rootfs_kab_wrap = rootfs_kab_wrap,
             initramfs_kab_wrap = initramfs_kab_wrap,
@@ -3228,8 +3269,73 @@ async fn run_container_command_capture(
     }
 }
 
+/// Assemble the boot FIT for machines that boot one (the feed ships the
+/// `fit-image.its` it built its own `fitImage` from, plus `linux.bin` and the
+/// dtbs it references, into the runtime dir). Re-using that template with the
+/// PROJECT's initramfs is what makes `initramfs:` config reach a FIT machine
+/// at all - the feed's fitImage carries the feed's initramfs. When the rootfs
+/// is verity-protected the root hash is added to every configuration node as
+/// `avocado,roothash`, which the U-Boot env reads back after the FIT has been
+/// verified and folds into the kernel cmdline - so the hash is covered by the
+/// FIT signature. Signed with the project's key when AVOCADO_FIT_KEY_DIR is
+/// set; otherwise the signature nodes are dropped and the FIT is unsigned.
+/// No-op on machines without a FIT template.
+pub fn generate_fit_assembly_script() -> String {
+    r#"
+# Boot FIT: rebuild the feed's fitImage with this runtime's initramfs (and
+# the rootfs root hash when verity is on), signed with the project key if one
+# is configured. Skipped on machines whose boot partition takes loose files.
+FIT_ITS="$OUTPUT_DIR/fit-image.its"
+if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
+    echo "Assembling boot FIT from $FIT_ITS..."
+    FIT_WORK_ITS="$OUTPUT_DIR/fit-image.project.its"
+    # The template's ramdisk node points at the distro build's initramfs by an
+    # absolute path that does not exist here; point it at ours.
+    sed -E "s#(type = \"ramdisk\";)#\1#; s#/incbin/\(\"[^\"]*initramfs[^\"]*\"\)#/incbin/(\"$AVOCADO_INITRAMFS_IMAGE\")#" "$FIT_ITS" > "$FIT_WORK_ITS"
+    if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
+        # One property per configuration node, right after its opening line.
+        sed -i -E "s#^([[:space:]]*conf-[^[:space:]]+ \{)\$#\1\n\t\t\tavocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\";#" "$FIT_WORK_ITS"
+    fi
+    FIT_SIGN_ARGS=""
+    if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
+        FIT_SIGN_ARGS="-k $AVOCADO_FIT_KEY_DIR -r"
+    else
+        # No key: strip the signature nodes so mkimage does not look for one.
+        sed -i -E '/^[[:space:]]*signature-[0-9]+ \{/,/^[[:space:]]*\};/d' "$FIT_WORK_ITS"
+    fi
+    rm -f "$OUTPUT_DIR/fitImage"
+    (cd "$OUTPUT_DIR" && mkimage -f "$FIT_WORK_ITS" $FIT_SIGN_ARGS "$OUTPUT_DIR/fitImage" > /dev/null)
+    mkimage -l "$OUTPUT_DIR/fitImage" | grep -E 'Default Configuration|Sign algo' | head -2 | sed 's/^/  /'
+    echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
+fi
+"#
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fit_assembly_script_is_gated_and_handles_signing_both_ways() {
+        let s = super::generate_fit_assembly_script();
+        assert!(
+            s.contains("if [ -f \"$FIT_ITS\" ]"),
+            "must be a no-op without a FIT template"
+        );
+        assert!(
+            s.contains("AVOCADO_INITRAMFS_IMAGE"),
+            "project initramfs must replace the template's"
+        );
+        assert!(
+            s.contains("avocado,roothash"),
+            "rootfs root hash must be embedded in the FIT"
+        );
+        assert!(s.contains("-k $AVOCADO_FIT_KEY_DIR -r"), "signing path");
+        assert!(
+            s.contains("signature-[0-9]+"),
+            "unsigned path must strip signature nodes"
+        );
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;
