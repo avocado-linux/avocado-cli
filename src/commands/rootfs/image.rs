@@ -92,20 +92,52 @@ fi"
     }
 }
 
-/// Work-relative paths pruned from the build-id tree hash: their bytes are
-/// nondeterministic across builds and are either not part of the image identity
-/// or already covered elsewhere.
-/// - `var/lib/rpm`: the rpmdb sqlite embeds install timestamps — which is
-///   exactly why package identity is hashed from the NEVRA set (`PKG_HASH`),
+/// Build-time state: removed from the work copy before imaging *and* pruned
+/// from the build-id tree hash. One list drives both — [`render_build_state_purge`]
+/// emits the `rm -rf`, [`render_build_id_block`] the `find -prune`. They were
+/// maintained separately and drifted: the prunes covered all of `./var/cache`
+/// and `./var/log` while the purge removed only `var/cache/dnf`, so anything a
+/// project shipped under those paths (an `overlay:` seed, a `post_install`
+/// cache) reached the image without reaching the hash — the bytes moved, the
+/// id did not, and no OTA was ever offered.
+///
+/// A path belongs here iff its bytes are build-varying for an unchanged
+/// project *and* nothing on target reads it:
+/// - `var/lib/rpm`: the rpmdb sqlite embeds INSTALLTIME/INSTALLTID per package
+///   — exactly why package identity is hashed from the NEVRA set (`PKG_HASH`),
 ///   not these bytes.
-/// - `var/cache`, `var/log`: dnf caches and logs, build-varying.
-// ./var/lib/dnf holds history.sqlite, whose bytes move on every install
-// transaction — with id = f(tree) that is an OTA on every build, the exact
-// risk-direction flip ENG-2441 warns about. It is also purged from the work
-// copy before imaging, but the prune stays so the id is safe even if the
-// purge ever moves or narrows.
-const BUILD_ID_TREE_PRUNES: &[&str] =
-    &["./var/lib/rpm", "./var/lib/dnf", "./var/cache", "./var/log"];
+/// - `var/lib/dnf`: `history.sqlite` moves on every install transaction. With
+///   id = f(tree) that would be an OTA on every build — the opposite failure
+///   mode, and the worse one.
+/// - `var/cache/dnf`: generated repodata and solvfiles.
+/// - `var/cache/ldconfig`: `aux-cache` stores per-library `dev`/`ino`/`ctime`
+///   (glibc `aux_cache_file_entry`), and the work copy is `cp -a`'d fresh each
+///   build, so its inodes — and its bytes — differ every time. The loader reads
+///   `/etc/ld.so.cache`, which is content-derived; that stays in the image and
+///   in the hash.
+///
+/// `var/log` is deliberately absent. By default it is a symlink to
+/// `volatile/log`, so there is nothing to purge and the symlink entry hashes
+/// deterministically; a `post_install` that replaces it with a real directory
+/// ships whatever it writes there, and that content hashes too — which is the
+/// point. dnf never writes logs into an installroot either: only cachedir and
+/// persistdir get `prepend_installroot` (dnf/cli/cli.py).
+pub const BUILD_STATE_PATHS: &[&str] = &[
+    "var/lib/rpm",
+    "var/lib/dnf",
+    "var/cache/dnf",
+    "var/cache/ldconfig",
+];
+
+/// The space-separated, quoted `rm -rf` argument list that strips
+/// [`BUILD_STATE_PATHS`] from the work copy named by `work_var`.
+pub fn render_build_state_purge(work_var: &str) -> String {
+    BUILD_STATE_PATHS
+        .iter()
+        .map(|p| format!("\"${work_var}/{p}\""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// The differences between the rootfs and initramfs build-id derivations, fed to
 /// [`render_build_id_block`].
@@ -139,7 +171,7 @@ pub struct BuildIdSpec<'a> {
 ///   content. It excludes what the image build normalizes away (`mkfs.erofs -T`
 ///   mtimes, `--all-root` ownership) and what is fs-dependent (directory
 ///   sizes), so it can't churn on noise the image doesn't hold.
-///   [`BUILD_ID_TREE_PRUNES`] are excluded.
+///   [`BUILD_STATE_PATHS`] are excluded.
 ///
 /// Must be invoked AFTER the permissions and post_install steps and BEFORE the
 /// os-release identity lines are appended: the derivation strips `AVOCADO_*`
@@ -168,9 +200,9 @@ pub fn render_build_id_block(spec: &BuildIdSpec) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let prune = BUILD_ID_TREE_PRUNES
+    let prune = BUILD_STATE_PATHS
         .iter()
-        .map(|p| format!("-path {p}"))
+        .map(|p| format!("-path ./{p}"))
         .collect::<Vec<_>>()
         .join(" -o ");
 
@@ -261,10 +293,13 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 
 {post_install_block}
 
-    # Runs BEFORE the build-id derivation so the tree hash covers exactly
-    # what ships: dnf/rpm state is both nondeterministic and absent from the
-    # image, so it must be gone (or pruned) before the id is taken.
-    # Purge package-manager bookkeeping from the work copy before imaging.
+    # Purge build-time state from the work copy before imaging. The paths come
+    # from BUILD_STATE_PATHS — the same list the build-id tree hash prunes — so
+    # the two can never disagree about what ships.
+    #
+    # Runs BEFORE the build-id derivation so the tree hash covers exactly what
+    # ships: this state is both nondeterministic and absent from the image, so
+    # it must be gone before the id is taken.
     #
     # dnf installs into the sysroot leave ~13MB of state behind (measured on a
     # qemux86-64 rootfs: 2.0M rpmdb, 6.4M var/cache/dnf). Nothing on target
@@ -275,12 +310,18 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # While those are in the tree, two installs of the same package set never
     # produce identical image bytes.
     #
-    # dnf's logs are deliberately NOT on this list. dnf only prepends the
-    # installroot to cachedir and persistdir (dnf/cli/cli.py, the
-    # prepend_installroot loop); logdir is never installroot-relative, so the
-    # logs land in the SDK prefix and there has never been one in the staged
-    # tree to remove — verified across real build volumes, where var/log
-    # resolves to an empty volatile/log in every image.
+    # ldconfig's aux-cache is on the list for the same reason: post_install
+    # runs ldconfig, which caches per-library dev/ino/ctime under
+    # var/cache/ldconfig, and the work copy is cp -a'd fresh every build so
+    # those inodes never repeat. /etc/ld.so.cache is the file the loader reads;
+    # it is content-derived, so it stays in the image and in the hash.
+    #
+    # var/log is deliberately on neither list. By default it is a symlink to
+    # volatile/log, so there is nothing to remove and the symlink entry hashes
+    # deterministically; a post_install that turns it into a real directory
+    # ships what it writes there, and that content hashes too. dnf never writes
+    # logs into an installroot anyway: only cachedir and persistdir get
+    # prepend_installroot (dnf/cli/cli.py), so its logs land in the SDK prefix.
     #
     # Removing all of this is necessary for a reproducible image but not
     # sufficient: the archive's own mtime handling is a separate problem, and
@@ -293,7 +334,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # `runtime install` copies from $AVOCADO_PREFIX/rootfs — all the pristine
     # sysroot, never this work copy.
     echo "Purging package-manager state from rootfs image"
-    rm -rf "$ROOTFS_WORK/var/lib/rpm" "$ROOTFS_WORK/var/lib/dnf" "$ROOTFS_WORK/var/cache/dnf"
+    rm -rf {purge_paths}
 
 {build_id_block}
 
@@ -350,6 +391,7 @@ fi"#,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
+        purge_paths = render_build_state_purge("ROOTFS_WORK"),
         build_id_block = render_build_id_block(&BuildIdSpec {
             namespace_uuid,
             work_var: "ROOTFS_WORK",
@@ -746,7 +788,7 @@ mod tests {
             "",
         );
 
-        for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
+        for path in BUILD_STATE_PATHS {
             assert!(
                 script.contains(&format!("\"$ROOTFS_WORK/{path}\"")),
                 "{path} must be purged from the work copy before imaging"
@@ -810,8 +852,8 @@ mod tests {
 
     #[test]
     fn test_build_id_is_pkg_hash_plus_tree_hash() {
-        // ENG-2441: the id folds a content hash of the assembled work tree in
-        // beside the NEVRA package hash, so any rootfs-affecting change moves it.
+        // The id folds a content hash of the assembled work tree in beside the
+        // NEVRA package hash, so any rootfs-affecting change moves it.
         let s = rootfs_script();
         assert!(s.contains("PKG_HASH="), "package identity retained");
         assert!(s.contains("TREE_HASH="), "work-tree content hash present");
@@ -823,17 +865,16 @@ mod tests {
 
     #[test]
     fn test_tree_hash_prunes_nondeterministic_paths_and_excludes_metadata() {
-        // The rpmdb (install timestamps) and dnf caches/logs would churn the id
-        // every build, and mtime/ownership are normalized out of the image — so
-        // none may feed the hash. It hashes type, mode (%m), path (%P) and
-        // symlink target (%l) only.
+        // The rpmdb (install timestamps), dnf caches and ldconfig's aux-cache
+        // would churn the id every build, and mtime/ownership are normalized
+        // out of the image — so none may feed the hash. It hashes type, mode
+        // (%m), path (%P) and symlink target (%l) only.
         let s = rootfs_script();
-        for pruned in [
-            "-path ./var/lib/rpm",
-            "-path ./var/cache",
-            "-path ./var/log",
-        ] {
-            assert!(s.contains(pruned), "tree hash must prune {pruned}");
+        for path in BUILD_STATE_PATHS {
+            assert!(
+                s.contains(&format!("-path ./{path}")),
+                "tree hash must prune {path}"
+            );
         }
         assert!(
             s.contains(r"-printf '%y %m %P\t%l\n'"),
@@ -843,6 +884,63 @@ mod tests {
         for meta in ["%T", "%u", "%U", "%g", "%G"] {
             assert!(!s.contains(meta), "tree hash must not depend on {meta}");
         }
+    }
+
+    /// The purge and the tree-hash prunes must name exactly the same paths. Maintained as two hand-written lists they drifted — `./var/cache`
+    /// and `./var/log` were pruned wholesale while only `var/cache/dnf` was
+    /// purged — so anything a project shipped under those paths reached the
+    /// image without reaching the hash. The bytes moved, the id did not, and
+    /// the OTA pipeline (which compares ids) never offered the update.
+    #[test]
+    fn test_purge_and_tree_hash_prunes_name_the_same_paths() {
+        let s = rootfs_script();
+
+        // Pinned as whole expressions, so a future hand-edit that hardcodes
+        // either call site instead of using BUILD_STATE_PATHS fails here.
+        let prunes = BUILD_STATE_PATHS
+            .iter()
+            .map(|p| format!("-path ./{p}"))
+            .collect::<Vec<_>>()
+            .join(" -o ");
+        assert!(
+            s.contains(&format!("find . \\( {prunes} \\) -prune")),
+            "the tree hash must prune exactly BUILD_STATE_PATHS"
+        );
+
+        let purge = BUILD_STATE_PATHS
+            .iter()
+            .map(|p| format!("\"$ROOTFS_WORK/{p}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The trailing newline is load-bearing: unanchored, a purge that
+        // appended an extra path still matched this prefix, and a superset
+        // purge deletes shipped content instead of hiding it from the hash.
+        assert!(
+            s.contains(&format!("rm -rf {purge}\n")),
+            "the purge must remove exactly BUILD_STATE_PATHS"
+        );
+    }
+
+    /// The other half of that invariant: only build-time state may be pruned. A
+    /// wholesale `var/cache` or `var/log` prune hides project-shipped content
+    /// (an `overlay:` seed file, a `post_install`-populated cache) from the id.
+    #[test]
+    fn test_tree_hash_does_not_prune_shipped_var_content() {
+        assert!(
+            !BUILD_STATE_PATHS.contains(&"var/cache"),
+            "pruning all of var/cache hides shipped content from the build id"
+        );
+        assert!(
+            !BUILD_STATE_PATHS.contains(&"var/log"),
+            "pruning all of var/log hides shipped content from the build id"
+        );
+        // var/log defaults to a symlink to volatile/log, so there is nothing
+        // under it to purge; when a hook makes it a real directory its content
+        // ships and must hash.
+        assert!(
+            !BUILD_STATE_PATHS.iter().any(|p| p.starts_with("var/log")),
+            "purging var/log would delete hook-written logs that ship in the image"
+        );
     }
 
     #[test]
