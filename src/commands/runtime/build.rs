@@ -728,6 +728,9 @@ impl RuntimeBuildCommand {
         // it the FIT is assembled unsigned, which only boots on a U-Boot with
         // no embedded key. Env rather than config until signing_keys can
         // materialize PEM for external tools.
+        if std::env::var("AVOCADO_FIT_UNSIGNED").as_deref() == Ok("1") {
+            env_vars.insert("AVOCADO_FIT_UNSIGNED".to_string(), "1".to_string());
+        }
         let fit_keydir_host_path: Option<String> = match std::env::var("AVOCADO_FIT_KEY_DIR") {
             Ok(dir) => {
                 if !std::path::Path::new(&dir).join("FIT.key").is_file() {
@@ -3307,31 +3310,50 @@ async fn run_container_command_capture(
 /// No-op on machines without a FIT template.
 pub fn generate_fit_assembly_script() -> String {
     r#"
-# Boot FIT: rebuild the feed's fitImage with this runtime's initramfs (and
-# the rootfs root hash when verity is on), signed with the project key if one
-# is configured. Skipped on machines whose boot partition takes loose files.
+# Boot FIT: rebuild the feed's fitImage with this runtime's initramfs (and the
+# rootfs root hash when verity is on). Only on machines whose feed ships the
+# fit-image.its template, and only when the result can be signed
+# (AVOCADO_FIT_KEY_DIR) or an unsigned FIT is explicitly asked for
+# (AVOCADO_FIT_UNSIGNED=1): a distro built with verified-boot embeds its key in
+# U-Boot, and an unsigned FIT would not boot there. Without either, the feed's
+# FIT is left alone - which also means this runtime's initramfs is not in it.
 FIT_ITS="$OUTPUT_DIR/fit-image.its"
 if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
-    echo "Assembling boot FIT from $FIT_ITS..."
-    FIT_WORK_ITS="$OUTPUT_DIR/fit-image.project.its"
-    # The template's ramdisk node points at the distro build's initramfs by an
-    # absolute path that does not exist here; point it at ours.
-    sed -E "s#(type = \"ramdisk\";)#\1#; s#/incbin/\(\"[^\"]*initramfs[^\"]*\"\)#/incbin/(\"$AVOCADO_INITRAMFS_IMAGE\")#" "$FIT_ITS" > "$FIT_WORK_ITS"
-    if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
-        # One property per configuration node, right after its opening line.
-        sed -i -E "s#^([[:space:]]*conf-[^[:space:]]+ \{)\$#\1\n\t\t\tavocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\";#" "$FIT_WORK_ITS"
-    fi
-    FIT_SIGN_ARGS=""
-    if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
-        FIT_SIGN_ARGS="-k $AVOCADO_FIT_KEY_DIR -r"
+    if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
+        if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
+            echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set AVOCADO_FIT_KEY_DIR to a directory holding FIT.key/FIT.crt, or AVOCADO_FIT_UNSIGNED=1 if this machine's U-Boot enforces no key." >&2
+            exit 1
+        fi
+        echo "WARNING: boot FIT not rebuilt (no AVOCADO_FIT_KEY_DIR, AVOCADO_FIT_UNSIGNED not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
     else
-        # No key: strip the signature nodes so mkimage does not look for one.
-        sed -i -E '/^[[:space:]]*signature-[0-9]+ \{/,/^[[:space:]]*\};/d' "$FIT_WORK_ITS"
+        echo "Assembling boot FIT from $FIT_ITS..."
+        FIT_WORK_ITS="$OUTPUT_DIR/fit-image.project.its"
+        # The template's ramdisk node points at the distro build's initramfs by an
+        # absolute path that does not exist here; point it at ours, and make
+        # sure the rewrite actually matched.
+        sed -E "s#/incbin/\(\"[^\"]*initramfs[^\"]*\"\)#/incbin/(\"$AVOCADO_INITRAMFS_IMAGE\")#" "$FIT_ITS" > "$FIT_WORK_ITS"
+        grep -qF "/incbin/(\"$AVOCADO_INITRAMFS_IMAGE\")" "$FIT_WORK_ITS" \
+            || { echo "ERROR: could not find the initramfs node to replace in $FIT_ITS" >&2; exit 1; }
+        if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
+            # One property per configuration node, right after its opening line.
+            sed -i -E "s#^([[:space:]]*conf-[^[:space:]]+ \{)\$#\1\n\t\t\tavocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\";#" "$FIT_WORK_ITS"
+            grep -qF "avocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\"" "$FIT_WORK_ITS" \
+                || { echo "ERROR: no conf-* configuration node in $FIT_ITS to carry the rootfs root hash" >&2; exit 1; }
+        fi
+        FIT_SIGN_ARGS=""
+        if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
+            FIT_SIGN_ARGS="-k $AVOCADO_FIT_KEY_DIR -r"
+        else
+            # Explicitly unsigned: strip the signature nodes so mkimage does not look for a key.
+            sed -i -E '/^[[:space:]]*signature-[0-9]+ \{/,/^[[:space:]]*\};/d' "$FIT_WORK_ITS"
+        fi
+        rm -f "$OUTPUT_DIR/fitImage"
+        (cd "$OUTPUT_DIR" && mkimage -f "$FIT_WORK_ITS" $FIT_SIGN_ARGS "$OUTPUT_DIR/fitImage" > /dev/null) \
+            || { echo "ERROR: mkimage failed to assemble the boot FIT" >&2; exit 1; }
+        [ -s "$OUTPUT_DIR/fitImage" ] || { echo "ERROR: boot FIT was not produced" >&2; exit 1; }
+        mkimage -l "$OUTPUT_DIR/fitImage" | grep -E 'Default Configuration|Sign algo' | head -2 | sed 's/^/  /'
+        echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
     fi
-    rm -f "$OUTPUT_DIR/fitImage"
-    (cd "$OUTPUT_DIR" && mkimage -f "$FIT_WORK_ITS" $FIT_SIGN_ARGS "$OUTPUT_DIR/fitImage" > /dev/null)
-    mkimage -l "$OUTPUT_DIR/fitImage" | grep -E 'Default Configuration|Sign algo' | head -2 | sed 's/^/  /'
-    echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
 fi
 "#
     .to_string()

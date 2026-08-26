@@ -302,8 +302,14 @@ pub fn generate_rootfs_build_script(
     veritysetup format \
         --salt=0000000000000000000000000000000000000000000000000000000000000000 \
         --uuid=00000000-0000-0000-0000-000000000000 \
-        --root-hash-file="$ROOTFS_ROOTHASH_FILE" "$ROOTFS_OUTPUT" "$ROOTFS_VERITY" > /dev/null
-    export AVOCADO_ROOTFS_ROOTHASH="$(cat "$ROOTFS_ROOTHASH_FILE")"
+        --root-hash-file="$ROOTFS_ROOTHASH_FILE" "$ROOTFS_OUTPUT" "$ROOTFS_VERITY" > /dev/null \
+        || { echo "ERROR: veritysetup format failed on $ROOTFS_OUTPUT" >&2; exit 1; }
+    # This block runs without set -e in the runtime build: an empty root hash
+    # here would mean no root_hash in the manifest, no avocado,roothash in the
+    # FIT, and a device booting unverified with verity: true in config.
+    AVOCADO_ROOTFS_ROOTHASH="$(cat "$ROOTFS_ROOTHASH_FILE" 2>/dev/null)"
+    [ -n "$AVOCADO_ROOTFS_ROOTHASH" ] || { echo "ERROR: veritysetup produced no root hash for $ROOTFS_OUTPUT" >&2; exit 1; }
+    export AVOCADO_ROOTFS_ROOTHASH
     export AVOCADO_ROOTFS_VERITY="$ROOTFS_VERITY"
     echo "rootfs dm-verity root hash: $AVOCADO_ROOTFS_ROOTHASH"
 "#
@@ -779,6 +785,16 @@ mod tests {
         );
         let without = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", false);
         assert!(!without.contains("veritysetup"));
+        for script in [&with, &without] {
+            let ok = std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(true);
+            assert!(ok, "generated rootfs script must be valid shell");
+        }
     }
 
     #[test]
