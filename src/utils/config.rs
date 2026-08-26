@@ -3897,9 +3897,14 @@ impl Config {
     /// Get rootfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-rootfs": "*" }` when the section is absent.
     ///
-    /// `target` is the sysroot's target: the set unions in `cryptsetup-var-udev`
-    /// only when a runtime *for that target* opts into `var.encrypt`.
-    pub fn get_rootfs_packages(&self, target: &str) -> HashMap<String, serde_yaml::Value> {
+    /// `target` is the sysroot's target and `parsed` the composed YAML: the set
+    /// unions in `cryptsetup-var-udev` only when a runtime *for that target*
+    /// opts into `var.encrypt` — see [`Self::var_encrypt_runtimes`].
+    pub fn get_rootfs_packages(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        target: &str,
+    ) -> HashMap<String, serde_yaml::Value> {
         let mut packages = match self.rootfs_default().and_then(|r| r.packages.clone()) {
             Some(packages) => packages,
             None => {
@@ -3911,7 +3916,7 @@ impl Config {
                 default
             }
         };
-        if self.any_runtime_var_encrypt(target) {
+        if !self.var_encrypt_runtimes(parsed, target).is_empty() {
             // Re-creates /dev/mapper/var after switch-root (udev rule).
             packages
                 .entry("cryptsetup-var-udev".to_string())
@@ -3920,48 +3925,62 @@ impl Config {
         packages
     }
 
-    /// Whether runtime `name` opts into `var.encrypt: true`.
+    /// Runtimes built for `target` that opt into `var.encrypt: true`.
     ///
-    /// Reads the typed `runtimes.<name>.var` block — the same source
-    /// [`Self::any_runtime_var_encrypt`] unions over — so the initramfs marker
-    /// and the package set can never disagree. An `encrypt:` placed only under
-    /// a `target-<x>:` override is a no-op for both.
-    pub fn runtime_var_encrypt(&self, name: &str) -> bool {
-        self.runtimes
-            .as_ref()
-            .and_then(|r| r.get(name))
-            .and_then(|r| r.var.as_ref())
-            .and_then(|v| v.encrypt)
-            .unwrap_or(false)
-    }
-
-    /// True when any runtime built for `target` sets `var.encrypt: true`.
+    /// The one source for both halves of the feature — the sysroot package
+    /// union ([`Self::get_rootfs_packages`] / [`Self::get_initramfs_packages`])
+    /// and the initramfs marker `runtime build` writes — so they can never
+    /// disagree on the flag or on the target.
     ///
-    /// The rootfs/initramfs sysroots are installed once per target and shared
-    /// by every runtime on it, so the package set has to be the union over
-    /// those runtimes: one opted-in runtime puts `cryptsetup-var` into the
-    /// initramfs of its same-target siblings too, where it stays dormant (the
-    /// per-runtime marker written at build time is what activates it). A
-    /// runtime for another target does not count — only some feeds publish
-    /// the packages, so a Jetson opt-in must not break a qemu sysroot install.
-    /// A runtime with no `target:` follows `default_target`, so it matches any.
-    pub fn any_runtime_var_encrypt(&self, target: &str) -> bool {
-        self.runtimes
-            .as_ref()
-            .map(|runtimes| {
-                runtimes
-                    .values()
-                    .filter(|r| r.target.is_none() || r.target.as_deref() == Some(target))
-                    .any(|r| r.var.as_ref().and_then(|v| v.encrypt).unwrap_or(false))
+    /// Target: sysroots are installed once per target and shared by every
+    /// runtime on it, so a runtime counts iff its declared `target:` is this
+    /// one (or absent, meaning `default_target`). Only some feeds publish
+    /// `cryptsetup-var`, so a Jetson opt-in must not reach a qemu sysroot.
+    ///
+    /// Flag: read from `parsed` (the composed YAML) with `target-<x>:`
+    /// overrides resolved, exactly as `var.compression` / `var.subvolumes` /
+    /// `var_files` are read at build time. Without `parsed` it falls back to
+    /// the typed `runtimes.<r>.var.encrypt`, where overrides are invisible.
+    pub fn var_encrypt_runtimes(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        target: &str,
+    ) -> Vec<String> {
+        let Some(runtimes) = self.runtimes.as_ref() else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = runtimes
+            .iter()
+            .filter(|(_, r)| r.target.is_none() || r.target.as_deref() == Some(target))
+            .filter(|(name, r)| {
+                let node = parsed
+                    .and_then(|p| p.get("runtimes")?.get(name.as_str()))
+                    .cloned();
+                match node {
+                    Some(node) => self
+                        .resolve_overrides_in_value(node, target, None, &format!("runtimes.{name}"))
+                        .get("var")
+                        .and_then(|v| v.get("encrypt"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    None => r.var.as_ref().and_then(|v| v.encrypt).unwrap_or(false),
+                }
             })
-            .unwrap_or(false)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Get initramfs packages from top-level config.
     /// Defaults to `{ "avocado-pkg-initramfs": "*" }` when the section is absent.
     ///
-    /// `target` scopes the `cryptsetup-var` union — see [`Self::get_rootfs_packages`].
-    pub fn get_initramfs_packages(&self, target: &str) -> HashMap<String, serde_yaml::Value> {
+    /// `parsed`/`target` scope the `cryptsetup-var` union — see [`Self::get_rootfs_packages`].
+    pub fn get_initramfs_packages(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        target: &str,
+    ) -> HashMap<String, serde_yaml::Value> {
         let mut packages = match self.initramfs_default().and_then(|i| i.packages.clone()) {
             Some(packages) => packages,
             None => {
@@ -3973,7 +3992,7 @@ impl Config {
                 default
             }
         };
-        if self.any_runtime_var_encrypt(target) {
+        if !self.var_encrypt_runtimes(parsed, target).is_empty() {
             // First-boot encrypt + unlock of /var. Its RDEPENDS bring the
             // target's key-store tooling (e.g. tpm2-tools on Jetson).
             packages
@@ -11771,13 +11790,14 @@ runtimes:
 "#,
         )
         .unwrap();
-        assert!(!config.any_runtime_var_encrypt("jetson-orin-nx"));
-        assert!(!config.runtime_var_encrypt("dev"));
+        assert!(config
+            .var_encrypt_runtimes(None, "jetson-orin-nx")
+            .is_empty());
         assert!(!config
-            .get_initramfs_packages("jetson-orin-nx")
+            .get_initramfs_packages(None, "jetson-orin-nx")
             .contains_key("cryptsetup-var"));
         assert!(!config
-            .get_rootfs_packages("jetson-orin-nx")
+            .get_rootfs_packages(None, "jetson-orin-nx")
             .contains_key("cryptsetup-var-udev"));
     }
 
@@ -11799,10 +11819,11 @@ runtimes:
 "#,
         )
         .unwrap();
-        assert!(config.any_runtime_var_encrypt("jetson-orin-nx"));
-        assert!(config.runtime_var_encrypt("secure"));
-        assert!(!config.runtime_var_encrypt("plain"));
-        let initramfs = config.get_initramfs_packages("jetson-orin-nx");
+        assert_eq!(
+            config.var_encrypt_runtimes(None, "jetson-orin-nx"),
+            vec!["secure".to_string()]
+        );
+        let initramfs = config.get_initramfs_packages(None, "jetson-orin-nx");
         // User-declared packages are kept, cryptsetup-var is added alongside.
         assert!(initramfs.contains_key("avocado-pkg-initramfs"));
         assert_eq!(
@@ -11811,7 +11832,7 @@ runtimes:
         );
         assert_eq!(
             config
-                .get_rootfs_packages("jetson-orin-nx")
+                .get_rootfs_packages(None, "jetson-orin-nx")
                 .get("cryptsetup-var-udev"),
             Some(&serde_yaml::Value::String("*".to_string()))
         );
@@ -11835,16 +11856,19 @@ runtimes:
 "#,
         )
         .unwrap();
-        assert!(config.any_runtime_var_encrypt("jetson-orin-nx"));
-        assert!(!config.any_runtime_var_encrypt("qemux86-64"));
+        assert_eq!(
+            config.var_encrypt_runtimes(None, "jetson-orin-nx"),
+            vec!["prod".to_string()]
+        );
+        assert!(config.var_encrypt_runtimes(None, "qemux86-64").is_empty());
         assert!(!config
-            .get_initramfs_packages("qemux86-64")
+            .get_initramfs_packages(None, "qemux86-64")
             .contains_key("cryptsetup-var"));
         assert!(!config
-            .get_rootfs_packages("qemux86-64")
+            .get_rootfs_packages(None, "qemux86-64")
             .contains_key("cryptsetup-var-udev"));
         assert!(config
-            .get_initramfs_packages("jetson-orin-nx")
+            .get_initramfs_packages(None, "jetson-orin-nx")
             .contains_key("cryptsetup-var"));
 
         // A runtime without `target:` builds for default_target, so it counts
@@ -11859,26 +11883,66 @@ runtimes:
 "#,
         )
         .unwrap();
-        assert!(untargeted.any_runtime_var_encrypt("qemux86-64"));
+        assert_eq!(
+            untargeted.var_encrypt_runtimes(None, "qemux86-64"),
+            vec!["prod".to_string()]
+        );
     }
 
-    /// The marker and the package union read the same typed field, so an
-    /// `encrypt:` only under a `target-<x>:` override is a no-op for both.
+    /// `encrypt:` under a `target-<x>:` override is honored like every other
+    /// `var:` key (compression, subvolumes, var_files all read the merged
+    /// runtime), and both halves — package union and marker — see it, because
+    /// both read `var_encrypt_runtimes` from the composed YAML.
     #[test]
-    fn test_var_encrypt_under_target_override_is_a_uniform_no_op() {
-        let config: Config = serde_yaml::from_str(
-            r#"
+    fn test_var_encrypt_under_target_override_is_honored_by_both_halves() {
+        let yaml = r#"
 runtimes:
   prod:
     target: jetson-orin-nx
+    var:
+      compression: zstd
     target-jetson-orin-nx:
       var:
         encrypt: true
-"#,
-        )
-        .unwrap();
-        assert!(!config.runtime_var_encrypt("prod"));
-        assert!(!config.any_runtime_var_encrypt("jetson-orin-nx"));
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.var_encrypt_runtimes(Some(&parsed), "jetson-orin-nx"),
+            vec!["prod".to_string()]
+        );
+        assert!(config
+            .get_initramfs_packages(Some(&parsed), "jetson-orin-nx")
+            .contains_key("cryptsetup-var"));
+        assert!(config
+            .get_rootfs_packages(Some(&parsed), "jetson-orin-nx")
+            .contains_key("cryptsetup-var-udev"));
+
+        // An override for another target does not leak in, and the typed
+        // fallback (no composed YAML) cannot see overrides at all.
+        assert!(config
+            .var_encrypt_runtimes(Some(&parsed), "qemux86-64")
+            .is_empty());
+        assert!(config
+            .var_encrypt_runtimes(None, "jetson-orin-nx")
+            .is_empty());
+
+        // The override can also switch it off.
+        let off = r#"
+runtimes:
+  prod:
+    target: jetson-orin-nx
+    var:
+      encrypt: true
+    target-jetson-orin-nx:
+      var:
+        encrypt: false
+"#;
+        let config: Config = serde_yaml::from_str(off).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(off).unwrap();
+        assert!(config
+            .var_encrypt_runtimes(Some(&parsed), "jetson-orin-nx")
+            .is_empty());
     }
 
     // --- kernel.version tests ---
@@ -12862,7 +12926,9 @@ rootfs:
         std::fs::write(fragment_dir.join("avocado.yaml"), fragment_yaml).unwrap();
 
         let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
-        let pkgs = composed.config.get_rootfs_packages("raspberrypi4");
+        let pkgs = composed
+            .config
+            .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4");
         assert!(
             pkgs.contains_key("avocado-pkg-rootfs"),
             "fragment's rootfs.packages must merge in"
@@ -12926,7 +12992,7 @@ rootfs:
         assert!(
             composed
                 .config
-                .get_rootfs_packages("raspberrypi4")
+                .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4")
                 .contains_key("avocado-pkg-rootfs"),
             "rootfs source.path must resolve relative to src_dir (repo root), not the config dir"
         );
@@ -13080,7 +13146,7 @@ kernel:
         assert!(
             composed
                 .config
-                .get_initramfs_packages("raspberrypi4")
+                .get_initramfs_packages(Some(&composed.merged_value), "raspberrypi4")
                 .contains_key("avocado-pkg-initramfs"),
             "initramfs fragment must merge"
         );

@@ -50,7 +50,10 @@ agx-thor) does as of meta-avocado wrynose.
 
 ## Limitations
 
-- `encrypt:` is read from the runtime's own `var:` block, for both package
-  selection and the marker; placing it only under a `target-<x>:` override is
-  a no-op.
+- `runtimes.<name>.target` does not choose the build target (`--target` >
+  `AVOCADO_TARGET` > `default_target` does). A runtime that opts in for its
+  declared `target:` must be built for that target; `runtime build` for any
+  other target fails rather than shipping an initramfs whose marker has no
+  `cryptsetup-var` behind it. `encrypt:` under a `target-<x>:` override is
+  honored like every other `var:` key.
 - Device must be re-provisioned to go back to plaintext.

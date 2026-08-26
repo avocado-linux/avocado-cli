@@ -362,10 +362,11 @@ pub fn sysroot_packages(
     config: &Config,
     sysroot_type: &SysrootType,
     target: &str,
+    parsed: Option<&serde_yaml::Value>,
 ) -> Option<HashMap<String, serde_yaml::Value>> {
     match sysroot_type {
-        SysrootType::Rootfs => Some(config.get_rootfs_packages(target)),
-        SysrootType::Initramfs => Some(config.get_initramfs_packages(target)),
+        SysrootType::Rootfs => Some(config.get_rootfs_packages(parsed, target)),
+        SysrootType::Initramfs => Some(config.get_initramfs_packages(parsed, target)),
         _ => None,
     }
 }
@@ -601,8 +602,12 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
 
     // Get packages from config (the effective set — absent config yields the
     // default meta-package).
-    let Some(packages) = sysroot_packages(params.config, &params.sysroot_type, params.target)
-    else {
+    let Some(packages) = sysroot_packages(
+        params.config,
+        &params.sysroot_type,
+        params.target,
+        params.parsed,
+    ) else {
         unreachable!("sysroot_type was narrowed to rootfs/initramfs above")
     };
 
