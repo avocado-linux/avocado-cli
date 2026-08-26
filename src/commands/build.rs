@@ -411,6 +411,7 @@ impl BuildCommand {
             .with_no_stamps(self.no_stamps)
             .with_runs_on(self.runs_on.clone(), self.nfs_port)
             .with_sdk_arch(self.sdk_arch.clone())
+            .with_target_board(self.target_board.clone())
             .with_composed_config(Arc::clone(&composed));
 
             if let Some(ctx) = tui_ctx {

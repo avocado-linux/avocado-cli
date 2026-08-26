@@ -314,6 +314,29 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
     Ok(())
 }
 
+/// The releasever [`resolve_and_apply`] would export for `target`, read from
+/// the recorded pin — no network, no lock write. For callers that must
+/// reproduce an install's inputs without performing one.
+///
+/// `None` in exactly the branches where [`resolve_and_apply`] leaves
+/// `AVOCADO_RELEASEVER` alone, so the caller falls back to the plain
+/// configured value as the install did.
+pub fn pinned_releasever(config: &Config, lock: &LockFile, target: &str) -> Option<String> {
+    if releasever_is_overridden(config) {
+        return None;
+    }
+    let (release, channel) = (config.get_distro_release()?, config.get_distro_channel()?);
+    let snap = lock.get_repo_snapshot(target)?;
+    match pin_status(Some(snap), &release, &channel) {
+        PinStatus::Matches => Some(effective_releasever(
+            &snap.release,
+            &snap.channel,
+            &snap.snapshot,
+        )),
+        PinStatus::None | PinStatus::Mismatch => None,
+    }
+}
+
 /// Convenience entry for commands that hold a `config_path` string: resolves
 /// `src_dir` the same way the install/clean commands do, then delegates to
 /// [`resolve_and_apply`]. One line per command call site.

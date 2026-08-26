@@ -716,6 +716,14 @@ impl StampValidationError {
         fixes
     }
 
+    /// The record [`Self::print_and_exit`] emits under `--output json`, where
+    /// the prose path is suppressed wholesale (`tui_is_active` is true) and a
+    /// consumer would otherwise see a bare exit(1) with no reason. `build` and
+    /// `install` always run through JSON under the desktop app.
+    fn json_error_event(&self) -> serde_json::Value {
+        serde_json::json!({ "event": "error", "message": self.to_string() })
+    }
+
     /// Print the error with formatted [ERROR]/[INFO] tags matching CLI output style,
     /// then exit with a non-zero status code.
     pub fn print_and_exit(&self) -> ! {
@@ -727,6 +735,10 @@ impl StampValidationError {
         // terminal is left in a broken state.
         if let Some(renderer) = crate::utils::tui::get_active_renderer() {
             renderer.shutdown();
+        }
+
+        if crate::utils::output_format::is_json_output_active() {
+            crate::utils::output_format::emit_json_event(&self.json_error_event());
         }
 
         print_error(
@@ -3201,6 +3213,46 @@ runtime/my-runtime/build.stamp:::null"#,
         assert!(msg.contains("avocado sdk install"));
         assert!(msg.contains("avocado ext install app"));
         assert!(msg.contains("avocado ext build app"));
+    }
+
+    #[test]
+    fn test_json_error_event_carries_reason_and_remedy() {
+        let mut result = StampValidationResult::new();
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        let event = result
+            .into_error("Cannot build runtime 'dev'")
+            .json_error_event();
+
+        // The desktop maps `event: "error"` to a top-level run_error and
+        // renders `message`; anything else is silently ignored by its parser.
+        assert_eq!(event["event"], "error");
+        let msg = event["message"].as_str().expect("message is a string");
+        assert!(msg.contains("rootfs install"), "{msg}");
+        assert!(msg.contains("avocado rootfs install"), "{msg}");
+    }
+
+    /// `print_and_exit` ships this string verbatim as the `{"event":"error"}`
+    /// message under `--output json`, where the prose path is suppressed — so
+    /// the remedy has to survive into it or the desktop shows a bare failure.
+    #[test]
+    fn test_stale_sysroot_error_carries_its_install_command() {
+        let mut result = StampValidationResult::new();
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        result.add_stale(
+            StampRequirement::initramfs_install(),
+            "config hash mismatch".to_string(),
+        );
+
+        let msg = result.into_error("Cannot build runtime 'dev'").to_string();
+        assert!(msg.contains("Stale steps"));
+        assert!(msg.contains("avocado rootfs install"), "{msg}");
+        assert!(msg.contains("avocado initramfs install"), "{msg}");
     }
 
     #[test]

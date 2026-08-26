@@ -1701,6 +1701,9 @@ enum RuntimeCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Target board override for `{{ avocado.target.board }}`
+        #[arg(long)]
+        target_board: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -2641,6 +2644,7 @@ async fn main() -> Result<()> {
                 verbose,
                 force: _,
                 target,
+                target_board,
                 container_args,
                 dnf_args,
             } => {
@@ -2657,7 +2661,8 @@ async fn main() -> Result<()> {
                 )
                 .with_no_stamps(cli.no_stamps)
                 .with_runs_on(cli.runs_on.clone(), cli.nfs_port)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_target_board(park_target_board(target_board));
                 build_cmd.execute().await?;
                 Ok(())
             }
