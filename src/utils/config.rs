@@ -1278,6 +1278,18 @@ pub fn get_ext_image_type(ext_config: &serde_yaml::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Whether the extension image is dm-verity protected (image.verity: true).
+/// Orthogonal to image.type: the hash tree is computed over the filesystem
+/// image itself, so it applies equally to a bare .raw and to the layer inside
+/// a .kab. Defaults to false; absent on every existing config.
+pub fn get_ext_image_verity(ext_config: &serde_yaml::Value) -> bool {
+    ext_config
+        .get("image")
+        .and_then(|v| v.get("verity"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Extract image args from extension config (image.args field).
 /// These are passed directly to kabtool (before -k and -z which are appended by CLI).
 pub fn get_ext_image_args(ext_config: &serde_yaml::Value) -> Option<String> {

@@ -1434,6 +1434,10 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
 if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
     cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
     echo "  Copied: {ext_name}-{ext_version}.{ext_suffix}"
+    # dm-verity sidecars (image.verity: true): hash tree + root hash travel with the image
+    for sc in verity roothash; do
+        [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
+    done
 fi"#
                         ));
                         processed_extensions.insert(ext_name.to_string());
@@ -1451,6 +1455,9 @@ fi"#
 if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
     cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
     echo "  Copied: {versioned_name}.raw"
+    for sc in verity roothash; do
+        [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
+    done
 else
     echo "ERROR: Extension image not found: $AVOCADO_PREFIX/output/extensions/{versioned_name}.raw"
     exit 1
@@ -1464,6 +1471,9 @@ if [ -n "$EXT_FILE" ]; then
     EXT_BASENAME=$(basename "$EXT_FILE")
     cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
     echo "  Copied: $EXT_BASENAME"
+    for sc in verity roothash; do
+        [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
+    done
 fi"#
                     ));
                 }
@@ -1802,6 +1812,17 @@ for pair in ext_pairs:
     shutil.copy2(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
+    # dm-verity: the hash tree sidecar lands as <image_id>.verity, which is
+    # exactly where avocadoctl's ManifestExtension::resolve_verity_path looks
+    # (image path with the extension swapped), and the root hash goes in the
+    # manifest entry. Only the manifest carries the hash, so a tampered
+    # sidecar cannot vouch for a tampered image.
+    base = img_file[: -len(ext_suffix)]
+    if os.path.isfile(base + ".verity") and os.path.isfile(base + ".roothash"):
+        shutil.copy2(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
+        with open(base + ".roothash") as rf:
+            entry["root_hash"] = rf.read().strip()
+        print("  Verity: " + name + "-" + version + " root hash " + entry["root_hash"][:16] + "...")
     if image_type != "raw":
         entry["image_type"] = image_type
     if name in ext_disabled:
