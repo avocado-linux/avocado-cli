@@ -160,6 +160,21 @@ impl ConnectUploadCommand {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        // Extension dm-verity trees (<image_id>.verity) are not published by
+        // this path yet - only the images are - and a device given a root_hash
+        // without its tree refuses the extension. Refuse here, where the
+        // author can act on it.
+        let has_verity = manifest
+            .get("extensions")
+            .and_then(|e| e.as_array())
+            .map(|exts| exts.iter().any(|e| e.get("root_hash").is_some()))
+            .unwrap_or(false);
+        if has_verity {
+            return Err(anyhow::anyhow!(
+                "this runtime has extensions with image.verity: true; connect upload does not publish their dm-verity hash trees yet, so the device would refuse them. Provision instead, or build without verity."
+            ));
+        }
+
         progress("Discovering artifacts...", OutputLevel::Normal);
         let artifact_infos = discover_artifacts(&artifacts_dir, &manifest)?;
 

@@ -299,13 +299,20 @@ pub fn generate_rootfs_build_script(
     ROOTFS_VERITY="${ROOTFS_OUTPUT%.*}.verity"
     ROOTFS_ROOTHASH_FILE="${ROOTFS_OUTPUT%.*}.roothash"
     rm -f "$ROOTFS_VERITY" "$ROOTFS_ROOTHASH_FILE"
-    veritysetup format --salt=0000000000000000000000000000000000000000000000000000000000000000         --root-hash-file="$ROOTFS_ROOTHASH_FILE" "$ROOTFS_OUTPUT" "$ROOTFS_VERITY" > /dev/null
+    veritysetup format \
+        --salt=0000000000000000000000000000000000000000000000000000000000000000 \
+        --uuid=00000000-0000-0000-0000-000000000000 \
+        --root-hash-file="$ROOTFS_ROOTHASH_FILE" "$ROOTFS_OUTPUT" "$ROOTFS_VERITY" > /dev/null
     export AVOCADO_ROOTFS_ROOTHASH="$(cat "$ROOTFS_ROOTHASH_FILE")"
     export AVOCADO_ROOTFS_VERITY="$ROOTFS_VERITY"
     echo "rootfs dm-verity root hash: $AVOCADO_ROOTFS_ROOTHASH"
 "#
     } else {
-        ""
+        // Verity off: drop any tree from an earlier verity-on build so stone
+        // ships the placeholder from avocado-img-bootfiles, not a stale tree.
+        r#"
+    rm -f "${ROOTFS_OUTPUT%.*}.verity" "${ROOTFS_OUTPUT%.*}.roothash"
+"#
     };
     format!(
         r#"
@@ -561,7 +568,11 @@ impl RootfsImageCommand {
             &rootfs_filesystem,
             post_install.as_deref(),
             &permissions_section,
-            rootfs_node.map(get_ext_image_verity).unwrap_or(false),
+            rootfs_node
+                .map(get_ext_image_verity)
+                .transpose()
+                .context("rootfs")?
+                .unwrap_or(false),
         );
 
         // If the avocado.yaml asks for a kab-wrapped rootfs, validate the

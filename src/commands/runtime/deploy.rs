@@ -698,6 +698,13 @@ if [ -z "$RUNTIME_UUID" ]; then
     echo "ERROR: Could not determine runtime UUID from active symlink" >&2
     exit 1
 fi
+# Extension dm-verity trees (<image_id>.verity) are not published by this path
+# yet - only the images are - and a device given a root_hash without its tree
+# refuses the extension. Refuse here instead, where the author can act on it.
+if grep -q '"root_hash"' "$MANIFEST_FILE"; then
+    echo "ERROR: this runtime has extensions with image.verity: true; deploy does not publish their dm-verity hash trees yet, so the device would refuse them. Provision instead, or build without verity." >&2
+    exit 1
+fi
 
 # Read root.json
 ROOT_JSON_FILE="$VAR_STAGING/lib/avocado/metadata/root.json"

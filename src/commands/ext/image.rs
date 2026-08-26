@@ -514,7 +514,8 @@ impl ExtImageCommand {
         let image_type = crate::utils::config::get_ext_image_type(&ext_config)
             .unwrap_or_else(|| "raw".to_string());
         let image_args = crate::utils::config::get_ext_image_args(&ext_config);
-        let verity = crate::utils::config::get_ext_image_verity(&ext_config);
+        let verity = crate::utils::config::get_ext_image_verity(&ext_config)
+            .with_context(|| format!("Extension '{}'", self.extension))?;
 
         match image_type.as_str() {
             "raw" | "kab" => {}
@@ -973,9 +974,11 @@ mksquashfs \
         // serves both image types. Sidecars sit next to the image under the
         // same stem (.verity = hash tree, .roothash = hex root hash); the
         // runtime build copies them alongside and puts the root hash in the
-        // manifest. Salt is fixed at zero so the tree, and therefore the root
-        // hash, is reproducible for identical image bytes - the manifest,
+        // manifest. Salt and superblock UUID are fixed so the tree and the root
+        // hash are both reproducible for identical image bytes - the manifest,
         // not the sidecar, is the trust anchor, so a public salt costs nothing.
+        // (--no-superblock is not an option: systemd-dissect reads salt,
+        // algorithm and block sizes from the superblock.)
         let verity_step = if verity {
             r#"
 # --- dm-verity ---
@@ -983,11 +986,15 @@ echo "Computing dm-verity hash tree..."
 VERITY_FILE="${OUTPUT_FILE%.raw}.verity"
 ROOTHASH_FILE="${OUTPUT_FILE%.raw}.roothash"
 rm -f "$VERITY_FILE" "$ROOTHASH_FILE"
-veritysetup format --salt=0000000000000000000000000000000000000000000000000000000000000000     --root-hash-file="$ROOTHASH_FILE" "$OUTPUT_FILE" "$VERITY_FILE" > /dev/null
+veritysetup format     --salt=0000000000000000000000000000000000000000000000000000000000000000     --uuid=00000000-0000-0000-0000-000000000000     --root-hash-file="$ROOTHASH_FILE" "$OUTPUT_FILE" "$VERITY_FILE" > /dev/null
 echo "dm-verity root hash: $(cat "$ROOTHASH_FILE")"
 "#
         } else {
-            ""
+            // Verity off: make sure no sidecar from an earlier verity-on build of
+            // this extension survives next to the fresh image.
+            r#"
+rm -f "${OUTPUT_FILE%.raw}.verity" "${OUTPUT_FILE%.raw}.roothash"
+"#
         };
 
         let kab_wrapping = if image_type == "kab" {

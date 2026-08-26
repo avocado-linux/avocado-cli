@@ -1463,8 +1463,10 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
 if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
     cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
     echo "  Copied: {ext_name}-{ext_version}.{ext_suffix}"
-    # dm-verity sidecars (image.verity: true): hash tree + root hash travel with the image
+    # dm-verity sidecars (image.verity: true): hash tree + root hash travel with
+    # the image; stale ones from an earlier build never survive here.
     for sc in verity roothash; do
+        rm -f "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
         [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
     done
 fi"#
@@ -1485,6 +1487,7 @@ if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
     cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
     echo "  Copied: {versioned_name}.raw"
     for sc in verity roothash; do
+        rm -f "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
         [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
     done
 else
@@ -1501,6 +1504,7 @@ if [ -n "$EXT_FILE" ]; then
     cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
     echo "  Copied: $EXT_BASENAME"
     for sc in verity roothash; do
+        rm -f "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
         [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
     done
 fi"#
@@ -1544,15 +1548,25 @@ fi"#
                 } else {
                     (versioned_name.clone(), "0.0.0".to_string())
                 };
-                // Look up image type from parsed config (image.type field)
-                let image_type = parsed
-                    .get("extensions")
-                    .and_then(|e| e.get(&name))
+                // Look up image type and verity flag from parsed config. The
+                // flag travels explicitly: the manifest step must not infer it
+                // from sidecar presence (stale sidecars would attach a wrong
+                // root_hash; a missing one would silently ship unverified).
+                let ext_cfg = parsed.get("extensions").and_then(|e| e.get(&name));
+                let image_type = ext_cfg
                     .and_then(crate::utils::config::get_ext_image_type)
                     .unwrap_or_else(|| "raw".to_string());
-                format!("{name}:{version}:{image_type}")
+                let verity = ext_cfg
+                    .map(crate::utils::config::get_ext_image_verity)
+                    .transpose()
+                    .with_context(|| format!("Extension '{name}'"))?
+                    .unwrap_or(false);
+                Ok(format!(
+                    "{name}:{version}:{image_type}:{}",
+                    if verity { "verity" } else { "plain" }
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<String>>>()?;
         let ext_info_str = ext_info_pairs.join(" ");
 
         // Space-separated, interpolated names that should land as
@@ -1759,7 +1773,7 @@ SIGNEOF
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil, struct
+import json, hashlib, uuid, os, shutil, struct, sys
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1826,9 +1840,10 @@ ext_disabled = set(os.environ.get("AVOCADO_EXT_DISABLED", "").split())
 
 extensions = []
 for pair in ext_pairs:
-    parts = pair.split(":", 2)
+    parts = pair.split(":", 3)
     name, version = parts[0], parts[1]
     image_type = parts[2] if len(parts) > 2 else "raw"
+    verity = len(parts) > 3 and parts[3] == "verity"
     ext_suffix = ".kab" if image_type == "kab" else ".raw"
     img_file = os.path.join(runtime_ext_dir, name + "-" + version + ext_suffix)
     if not os.path.isfile(img_file):
@@ -1841,13 +1856,19 @@ for pair in ext_pairs:
     shutil.copy2(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
-    # dm-verity: the hash tree sidecar lands as <image_id>.verity, which is
-    # exactly where avocadoctl's ManifestExtension::resolve_verity_path looks
-    # (image path with the extension swapped), and the root hash goes in the
-    # manifest entry. Only the manifest carries the hash, so a tampered
-    # sidecar cannot vouch for a tampered image.
+    # dm-verity, driven by the configured flag (never by sidecar presence): the
+    # hash tree lands as <image_id>.verity, exactly where avocadoctl's
+    # ManifestExtension::resolve_verity_path looks (image path with the
+    # extension swapped), and the root hash goes in the manifest entry. Only
+    # the manifest carries the hash, so a tampered sidecar cannot vouch for a
+    # tampered image. With the flag set both sidecars are required - shipping
+    # an unverified entry for an extension that asked for verity is the failure
+    # this guards against; without it, sidecars are ignored.
     base = img_file[: -len(ext_suffix)]
-    if os.path.isfile(base + ".verity") and os.path.isfile(base + ".roothash"):
+    if verity:
+        if not (os.path.isfile(base + ".verity") and os.path.isfile(base + ".roothash")):
+            sys.exit("ERROR: extension " + name + "-" + version + " has image.verity: true but its hash tree "
+                     "(.verity/.roothash) is missing next to " + img_file + " - rebuild it with `avocado ext image`")
         shutil.copy2(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
         with open(base + ".roothash") as rf:
             entry["root_hash"] = rf.read().strip()
@@ -1945,12 +1966,14 @@ current_image_files = set()
 for ext in extensions:
     suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
     current_image_files.add(ext["image_id"] + suffix)
+    if ext.get("root_hash"):
+        current_image_files.add(ext["image_id"] + ".verity")
 for entry in (rootfs_entry, initramfs_entry, kernel_entry):
     if entry:
         sfx = ".kab" if entry.get("image_type") == "kab" else ".raw"
         current_image_files.add(entry["image_id"] + sfx)
 for fname in os.listdir(images_dir):
-    if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
+    if fname.endswith((".raw", ".kab", ".verity")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
         os.remove(stale_path)
         print("  Removed stale image: " + fname)
@@ -2471,6 +2494,8 @@ echo "Docker image priming complete.""#,
         let rootfs_verity = rootfs_section
             .as_ref()
             .map(crate::utils::config::get_ext_image_verity)
+            .transpose()
+            .context("rootfs")?
             .unwrap_or(false);
         let rootfs_build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
@@ -4429,7 +4454,7 @@ extensions:
         assert!(script.contains("manifest.json"));
         assert!(script.contains("manifest_version=2"));
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
-        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw\""));
+        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw:plain\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
 
         // rootfs / initramfs / kernel blocks: same content-addressing as

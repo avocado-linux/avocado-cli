@@ -1278,16 +1278,22 @@ pub fn get_ext_image_type(ext_config: &serde_yaml::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Whether the extension image is dm-verity protected (image.verity: true).
+/// Whether the image is dm-verity protected (image.verity: true).
 /// Orthogonal to image.type: the hash tree is computed over the filesystem
 /// image itself, so it applies equally to a bare .raw and to the layer inside
-/// a .kab. Defaults to false; absent on every existing config.
-pub fn get_ext_image_verity(ext_config: &serde_yaml::Value) -> bool {
-    ext_config
-        .get("image")
-        .and_then(|v| v.get("verity"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+/// a .kab. Absent means false. A present but non-boolean value is an error:
+/// this is a security opt-in, and `verity: "true"`, `verity: 1` or `verity: yes`
+/// (a string under serde_yaml 0.9) silently reading as "off" would ship an
+/// unprotected image the author believed was protected.
+pub fn get_ext_image_verity(ext_config: &serde_yaml::Value) -> anyhow::Result<bool> {
+    match ext_config.get("image").and_then(|v| v.get("verity")) {
+        None => Ok(false),
+        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(anyhow::anyhow!(
+            "image.verity must be a boolean (true/false), got {:?}",
+            other
+        )),
+    }
 }
 
 /// Extract image args from extension config (image.args field).
@@ -5979,6 +5985,26 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_verity_is_strict_bool() {
+        use super::get_ext_image_verity;
+        let ok: serde_yaml::Value = serde_yaml::from_str("image:\n  verity: true").unwrap();
+        assert!(get_ext_image_verity(&ok).unwrap());
+        let absent: serde_yaml::Value = serde_yaml::from_str("image:\n  type: raw").unwrap();
+        assert!(!get_ext_image_verity(&absent).unwrap());
+        for bad in [
+            "image:\n  verity: \"true\"",
+            "image:\n  verity: 1",
+            "image:\n  verity: yes",
+        ] {
+            let v: serde_yaml::Value = serde_yaml::from_str(bad).unwrap();
+            assert!(
+                get_ext_image_verity(&v).is_err(),
+                "{bad} must be rejected, not read as false"
+            );
+        }
+    }
+
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
