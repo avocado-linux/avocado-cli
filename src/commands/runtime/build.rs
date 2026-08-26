@@ -2437,11 +2437,13 @@ echo "Docker image priming complete.""#,
                 .iter()
                 .any(|n| n == &self.runtime_name)
         };
+        // Same fallback as var_encrypt_runtimes: no `target:` means default_target.
         let declared_target = config
             .runtimes
             .as_ref()
             .and_then(|r| r.get(&self.runtime_name))
-            .and_then(|r| r.target.as_deref());
+            .and_then(|r| r.target.as_deref())
+            .or(config.default_target.as_deref());
         if let Some(declared) = declared_target.filter(|d| *d != target_arch) {
             if var_encrypt(declared) {
                 anyhow::bail!(

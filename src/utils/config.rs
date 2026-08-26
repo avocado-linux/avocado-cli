@@ -3933,8 +3933,8 @@ impl Config {
     /// disagree on the flag or on the target.
     ///
     /// Target: sysroots are installed once per target and shared by every
-    /// runtime on it, so a runtime counts iff its declared `target:` is this
-    /// one (or absent, meaning `default_target`). Only some feeds publish
+    /// runtime on it, so a runtime counts iff its declared `target:` — or
+    /// `default_target` when it has none — is this one. Only some feeds publish
     /// `cryptsetup-var`, so a Jetson opt-in must not reach a qemu sysroot.
     ///
     /// Flag: read from `parsed` (the composed YAML) with `target-<x>:`
@@ -3951,7 +3951,14 @@ impl Config {
         };
         let mut names: Vec<String> = runtimes
             .iter()
-            .filter(|(_, r)| r.target.is_none() || r.target.as_deref() == Some(target))
+            .filter(|(_, r)| {
+                // An omitted `target:` means `default_target`, not "any target".
+                // Only with neither set does a runtime count for every target.
+                r.target
+                    .as_deref()
+                    .or(self.default_target.as_deref())
+                    .is_none_or(|t| t == target)
+            })
             .filter(|(name, r)| {
                 let node = parsed
                     .and_then(|p| p.get("runtimes")?.get(name.as_str()))
@@ -11872,10 +11879,34 @@ runtimes:
             .contains_key("cryptsetup-var"));
 
         // A runtime without `target:` builds for default_target, so it counts
-        // for whichever target the sysroot is installed for.
+        // for that target only — not for a sibling's.
         let untargeted: Config = serde_yaml::from_str(
             r#"
-default_target: qemux86-64
+default_target: jetson-orin-nx
+runtimes:
+  prod:
+    var:
+      encrypt: true
+  dev:
+    target: qemux86-64
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            untargeted.var_encrypt_runtimes(None, "jetson-orin-nx"),
+            vec!["prod".to_string()]
+        );
+        assert!(untargeted
+            .var_encrypt_runtimes(None, "qemux86-64")
+            .is_empty());
+        assert!(!untargeted
+            .get_initramfs_packages(None, "qemux86-64")
+            .contains_key("cryptsetup-var"));
+
+        // With neither `target:` nor `default_target`, the runtime is built for
+        // whatever --target says, so it counts for any.
+        let anytarget: Config = serde_yaml::from_str(
+            r#"
 runtimes:
   prod:
     var:
@@ -11884,7 +11915,7 @@ runtimes:
         )
         .unwrap();
         assert_eq!(
-            untargeted.var_encrypt_runtimes(None, "qemux86-64"),
+            anytarget.var_encrypt_runtimes(None, "qemux86-64"),
             vec!["prod".to_string()]
         );
     }
