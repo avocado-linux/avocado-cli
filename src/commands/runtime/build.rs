@@ -1,10 +1,15 @@
 use crate::commands::initramfs::image::generate_initramfs_build_script;
 use crate::commands::rootfs::image::{generate_rootfs_build_script, NAMESPACE_UUID};
+use crate::commands::rootfs::install::{
+    compute_sysroot_install_inputs, sysroot_packages, SysrootStampContext,
+};
 use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::get_post_install;
+use crate::utils::snapshot::pinned_releasever;
 use crate::utils::{
     config::{ComposedConfig, Config, ImageConfig},
     container::{RunConfig, SdkContainer, TuiContext},
+    lockfile::{LockFile, SysrootType},
     output::{print_error, print_info, print_success, print_warning, OutputLevel},
     permissions::{mapping_from_map, render_users_groups_script},
     runs_on::RunsOnContext,
@@ -12,7 +17,7 @@ use crate::utils::{
         compute_runtime_build_input_hash, compute_runtime_install_input_hash,
         generate_batch_read_stamps_script, generate_write_stamp_script,
         resolve_required_stamps_for_runtime_build, validate_stamps_batch, CurrentInput, Stamp,
-        StampCommand, StampComponent, StampOutputs,
+        StampCommand, StampComponent, StampInputs, StampOutputs,
     },
     target::resolve_target_required,
     tui::{TaskId, TuiGuard},
@@ -27,6 +32,9 @@ pub struct RuntimeBuildCommand {
     config_path: String,
     verbose: bool,
     target: Option<String>,
+    /// Reaches overlay interpolation, so the install stamps' hashes fold it
+    /// in — a build blind to it reads the sysroot as stale.
+    target_board: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
     no_stamps: bool,
@@ -52,6 +60,7 @@ impl RuntimeBuildCommand {
             config_path,
             verbose,
             target,
+            target_board: None,
             container_args,
             dnf_args,
             no_stamps: false,
@@ -61,6 +70,12 @@ impl RuntimeBuildCommand {
             composed_config: None,
             tui_context: None,
         }
+    }
+
+    /// Set the CLI target board override
+    pub fn with_target_board(mut self, target_board: Option<String>) -> Self {
+        self.target_board = target_board;
+        self
     }
 
     /// Set the no_stamps flag
@@ -123,9 +138,14 @@ impl RuntimeBuildCommand {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref()).with_context(
-                    || format!("Failed to load composed config from {}", self.config_path),
-                )?,
+                Config::load_composed_with_board(
+                    &self.config_path,
+                    self.target.as_deref(),
+                    self.target_board.as_deref(),
+                )
+                .with_context(|| {
+                    format!("Failed to load composed config from {}", self.config_path)
+                })?,
             ),
         };
         let config = &composed.config;
@@ -212,6 +232,62 @@ impl RuntimeBuildCommand {
         result
     }
 
+    /// The rootfs and initramfs install stamps' current input hashes, built
+    /// through the helper the install writes with so the two cannot drift.
+    ///
+    /// Errors propagate rather than degrading to an existence check: an
+    /// unreadable lock or overlay would otherwise let a stale sysroot
+    /// validate, which is the failure this comparison exists to catch.
+    ///
+    /// `--dnf-args` is the one input a build cannot recover — the stamp
+    /// records what the *install* was passed — so this passes its own, and a
+    /// mismatch clears with a plain `avocado install`.
+    fn sysroot_install_inputs(
+        &self,
+        config: &Config,
+        parsed: &serde_yaml::Value,
+        target_arch: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+    ) -> Result<Vec<(StampComponent, StampInputs)>> {
+        let src_dir = config.project_root(&self.config_path);
+        let lock_file = LockFile::load(&src_dir)?;
+
+        // An install exports the pin through AVOCADO_RELEASEVER before
+        // reading `repo_release`; build resolves nothing, so it reads the pin
+        // from the lock. The pin must win over the live value.
+        let pinned = pinned_releasever(config, &lock_file, target_arch);
+        let repo_release = pinned.as_deref().or(repo_release.map(String::as_str));
+
+        let mut inputs = Vec::new();
+        for (component, sysroot_type) in [
+            (StampComponent::Rootfs, SysrootType::Rootfs),
+            (StampComponent::Initramfs, SysrootType::Initramfs),
+        ] {
+            let Some(packages) = sysroot_packages(config, &sysroot_type) else {
+                continue;
+            };
+            if let Some(computed) = compute_sysroot_install_inputs(
+                &SysrootStampContext {
+                    sysroot_type: &sysroot_type,
+                    config,
+                    parsed,
+                    src_dir: &src_dir,
+                    target: target_arch,
+                    target_board: self.target_board.as_deref(),
+                    repo_url: repo_url.map(String::as_str),
+                    repo_release,
+                    dnf_args: self.dnf_args.as_deref(),
+                    lock_file: &lock_file,
+                },
+                &packages,
+            )? {
+                inputs.push((component, computed));
+            }
+        }
+        Ok(inputs)
+    }
+
     /// Internal implementation of the build logic
     #[allow(clippy::too_many_arguments)]
     async fn execute_build_internal(
@@ -268,7 +344,8 @@ impl RuntimeBuildCommand {
 
             // Compute current inputs for staleness detection so that changes to
             // extension packages (e.g. from path-based sources) are detected.
-            // Only compare against Runtime stamps — SDK/compile-deps stamps use their own hash.
+            // SDK/compile-deps and extension stamps stay existence-only —
+            // their content hashes were checked when they were written.
             // Use get_merged_runtime_config to match how the install stamp was created.
             let merged_runtime = config
                 .get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)
@@ -281,12 +358,18 @@ impl RuntimeBuildCommand {
             let build_inputs = merged_runtime.as_ref().and_then(|mr| {
                 compute_runtime_build_input_hash(mr, &self.runtime_name, parsed, &project_root).ok()
             });
+            let sysroot_inputs =
+                self.sysroot_install_inputs(config, parsed, target_arch, repo_url, repo_release)?;
+
             let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
             if let Some(ref i) = install_inputs {
                 current_inputs.push((StampComponent::Runtime, StampCommand::Install, i));
             }
             if let Some(ref i) = build_inputs {
                 current_inputs.push((StampComponent::Runtime, StampCommand::Build, i));
+            }
+            for (component, inputs) in &sysroot_inputs {
+                current_inputs.push((*component, StampCommand::Install, inputs));
             }
             let validation =
                 validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &current_inputs);
@@ -3100,6 +3183,507 @@ mod tests {
         let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
+    }
+
+    const REPO_URL: &str = "https://example.invalid/feed";
+
+    /// A pinnable feed (`distro` release + channel) and no `src_dir`.
+    const PINNED_CONFIG: &str = r#"
+default_target: qemux86-64
+distro:
+  release: '2026'
+  channel: edge
+sdk:
+  image: avocado-sdk:latest
+rootfs:
+  overlay:
+    dir: rootfs-overlay
+    preprocess: true
+initramfs:
+  packages:
+    avocado-pkg-initramfs: '*'
+runtimes:
+  dev:
+    target: qemux86-64
+"#;
+
+    /// Preprocessed overlay, so the digest folds in interpolated values too.
+    /// `src_dir` is set and the overlay lives under it, so these tests fail if
+    /// the build resolves the project root as the config's own parent.
+    const OVERLAY_CONFIG: &str = r#"
+default_target: qemux86-64
+default_target_board: boardv1
+src_dir: nested-src
+sdk:
+  image: avocado-sdk:latest
+rootfs:
+  overlay:
+    dir: rootfs-overlay
+    preprocess: true
+initramfs:
+  packages:
+    avocado-pkg-initramfs: '*'
+runtimes:
+  dev:
+    target: qemux86-64
+"#;
+
+    /// An overlay edit has to move these inputs; `build` previously accepted
+    /// the stale stamp and shipped the previous content.
+    #[test]
+    fn test_sysroot_install_inputs_track_overlay_content() {
+        let temp = TempDir::new().unwrap();
+        let overlay = temp.path().join("nested-src/rootfs-overlay/etc");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("probe.conf"), "baseline\n").unwrap();
+        let config_path = create_test_config_file(&temp, OVERLAY_CONFIG);
+
+        let inputs_now = || {
+            let composed = Config::load_composed(&config_path, Some("qemux86-64")).unwrap();
+            RuntimeBuildCommand::new(
+                "dev".to_string(),
+                config_path.clone(),
+                false,
+                Some("qemux86-64".to_string()),
+                None,
+                None,
+            )
+            .sysroot_install_inputs(
+                &composed.config,
+                &composed.merged_value,
+                "qemux86-64",
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let hash_of = |v: &[(StampComponent, StampInputs)], want: StampComponent| {
+            v.iter()
+                .find(|(c, _)| *c == want)
+                .unwrap_or_else(|| panic!("no {want} entry"))
+                .1
+                .config_hash
+                .clone()
+        };
+
+        let before = inputs_now();
+        assert_eq!(before.len(), 2, "both sysroot install stamps are compared");
+
+        fs::write(overlay.join("probe.conf"), "edited\n").unwrap();
+        let after = inputs_now();
+
+        assert_ne!(
+            hash_of(&before, StampComponent::Rootfs),
+            hash_of(&after, StampComponent::Rootfs),
+            "an overlay content edit must invalidate the rootfs install stamp"
+        );
+        // Over-invalidating is its own failure: a stale verdict aborts.
+        assert_eq!(
+            hash_of(&before, StampComponent::Initramfs),
+            hash_of(&after, StampComponent::Initramfs),
+            "a rootfs overlay edit must not invalidate the initramfs stamp"
+        );
+    }
+
+    /// An unchanged project must keep comparing equal — a stale verdict
+    /// aborts the build, so a reconstruction mismatch breaks every build.
+    #[test]
+    fn test_sysroot_install_inputs_are_stable_across_calls() {
+        let temp = TempDir::new().unwrap();
+        let overlay = temp.path().join("nested-src/rootfs-overlay/etc");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(
+            overlay.join("probe.conf"),
+            "board={{ avocado.target.board }}\n",
+        )
+        .unwrap();
+        let config_path = create_test_config_file(&temp, OVERLAY_CONFIG);
+
+        let composed = Config::load_composed(&config_path, Some("qemux86-64")).unwrap();
+        let cmd = || {
+            RuntimeBuildCommand::new(
+                "dev".to_string(),
+                config_path.clone(),
+                false,
+                Some("qemux86-64".to_string()),
+                None,
+                None,
+            )
+        };
+        let inputs_for = |c: RuntimeBuildCommand| {
+            c.sysroot_install_inputs(
+                &composed.config,
+                &composed.merged_value,
+                "qemux86-64",
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let a = inputs_for(cmd());
+        let b = inputs_for(cmd());
+        assert_eq!(a.len(), 2);
+        for ((ca, ia), (cb, ib)) in a.iter().zip(b.iter()) {
+            assert_eq!(ca, cb);
+            assert_eq!(ia.config_hash, ib.config_hash, "{ca} hash is not stable");
+            assert_eq!(ia.package_list_hash, ib.package_list_hash);
+        }
+
+        // Proof the field is threaded rather than dropped.
+        let boarded = inputs_for(cmd().with_target_board(Some("boardv2".to_string())));
+        assert_ne!(
+            a[0].1.config_hash, boarded[0].1.config_hash,
+            "a --target-board override must reach the overlay digest"
+        );
+    }
+
+    /// An install records the snapshot-qualified releasever; a build that
+    /// hashed the live `<release>/<channel>` instead would report stale on
+    /// every build of a pinned project, unclearable by reinstalling.
+    #[test]
+    fn test_sysroot_install_inputs_apply_the_recorded_snapshot_pin() {
+        use crate::utils::lockfile::RepoSnapshot;
+
+        let temp = TempDir::new().unwrap();
+        let overlay = temp.path().join("rootfs-overlay/etc");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("probe.conf"), "baseline\n").unwrap();
+        let config_path = create_test_config_file(&temp, PINNED_CONFIG);
+        let composed = Config::load_composed(&config_path, Some("qemux86-64")).unwrap();
+
+        // From the config's own feed, so an AVOCADO_DISTRO_* override cannot
+        // turn this into a PinStatus::Mismatch and make the test vacuous.
+        let release = composed.config.get_distro_release().unwrap();
+        let channel = composed.config.get_distro_channel().unwrap();
+        let mut lock = LockFile::new();
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: release.clone(),
+                channel: channel.clone(),
+                snapshot: "20260531T120000Z-qemux86-64".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        lock.save(temp.path()).unwrap();
+
+        // Passing the live value is what makes the pin's precedence testable;
+        // with None both orderings agree.
+        let live = composed
+            .config
+            .get_sdk_repo_release()
+            .expect("derived from distro release/channel");
+        let got = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            config_path.clone(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        )
+        .sysroot_install_inputs(
+            &composed.config,
+            &composed.merged_value,
+            "qemux86-64",
+            None,
+            Some(&live),
+        )
+        .unwrap();
+
+        let pinned = crate::utils::snapshot::effective_releasever(
+            &release,
+            &channel,
+            "20260531T120000Z-qemux86-64",
+        );
+        assert_ne!(live, pinned, "the test is vacuous unless these differ");
+        let packages =
+            sysroot_packages(&composed.config, &SysrootType::Rootfs).expect("rootfs packages");
+        let want = compute_sysroot_install_inputs(
+            &SysrootStampContext {
+                sysroot_type: &SysrootType::Rootfs,
+                config: &composed.config,
+                parsed: &composed.merged_value,
+                src_dir: temp.path(),
+                target: "qemux86-64",
+                target_board: None,
+                repo_url: None,
+                repo_release: Some(&pinned),
+                dnf_args: None,
+                lock_file: &lock,
+            },
+            &packages,
+        )
+        .unwrap()
+        .unwrap();
+
+        let rootfs = got
+            .iter()
+            .find(|(c, _)| *c == StampComponent::Rootfs)
+            .expect("no Rootfs entry");
+        assert_eq!(
+            rootfs.1.config_hash, want.config_hash,
+            "the build must hash the pinned releasever the install recorded"
+        );
+
+        // A pin for a feed the config no longer names: the resolver warns and
+        // leaves AVOCADO_RELEASEVER alone, so the install hashes the live
+        // value and the build has to as well. Returning the stale pin here
+        // would be a false stale on every build.
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "1999".to_string(),
+                channel: "ancient".to_string(),
+                snapshot: "20260531T120000Z-qemux86-64".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        lock.save(temp.path()).unwrap();
+        let mismatched = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            config_path.clone(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        )
+        .sysroot_install_inputs(
+            &composed.config,
+            &composed.merged_value,
+            "qemux86-64",
+            None,
+            Some(&live),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|(c, _)| *c == StampComponent::Rootfs)
+        .expect("no Rootfs entry")
+        .1;
+        let want_live = compute_sysroot_install_inputs(
+            &SysrootStampContext {
+                sysroot_type: &SysrootType::Rootfs,
+                config: &composed.config,
+                parsed: &composed.merged_value,
+                src_dir: temp.path(),
+                target: "qemux86-64",
+                target_board: None,
+                repo_url: None,
+                repo_release: Some(&live),
+                dnf_args: None,
+                lock_file: &lock,
+            },
+            &packages,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mismatched.config_hash, want_live.config_hash,
+            "a pin for another feed must fall back to the live releasever"
+        );
+    }
+
+    /// Absolute assertions, not symmetry ones. A corruption applied to the
+    /// shared helper moves both sides together and survives every round-trip
+    /// check, so what the build-side hash must depend on is pinned here.
+    #[test]
+    fn test_sysroot_install_inputs_depend_on_repo_url_and_lock_pins() {
+        let temp = TempDir::new().unwrap();
+        let overlay = temp.path().join("nested-src/rootfs-overlay/etc");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("probe.conf"), "baseline\n").unwrap();
+        let config_path = create_test_config_file(&temp, OVERLAY_CONFIG);
+        let composed = Config::load_composed(&config_path, Some("qemux86-64")).unwrap();
+        let src_dir = composed.config.project_root(&config_path);
+
+        let rootfs_inputs = |repo_url: Option<&String>, repo_release: Option<&String>| {
+            RuntimeBuildCommand::new(
+                "dev".to_string(),
+                config_path.clone(),
+                false,
+                Some("qemux86-64".to_string()),
+                None,
+                None,
+            )
+            .sysroot_install_inputs(
+                &composed.config,
+                &composed.merged_value,
+                "qemux86-64",
+                repo_url,
+                repo_release,
+            )
+            .unwrap()
+            .into_iter()
+            .find(|(c, _)| *c == StampComponent::Rootfs)
+            .expect("no Rootfs entry")
+            .1
+        };
+
+        let base = rootfs_inputs(None, None);
+        let url = REPO_URL.to_string();
+        assert_ne!(
+            base.config_hash,
+            rootfs_inputs(Some(&url), None).config_hash,
+            "the feed URL must reach the build-side config hash"
+        );
+        let release = "2026/edge".to_string();
+        assert_ne!(
+            base.config_hash,
+            rootfs_inputs(None, Some(&release)).config_hash,
+            "the releasever must reach the build-side config hash"
+        );
+
+        let mut lock = LockFile::load(&src_dir).unwrap();
+        lock.update_sysroot_versions(
+            "qemux86-64",
+            &SysrootType::Rootfs,
+            HashMap::from([("avocado-pkg-rootfs".to_string(), "2026.9-r0.0".to_string())]),
+        );
+        lock.save(&src_dir).unwrap();
+        assert_ne!(
+            base.package_list_hash,
+            rootfs_inputs(None, None).package_list_hash,
+            "a rootfs lock pin must reach the build-side package list hash"
+        );
+
+        // A lock the build cannot read must abort rather than degrade to an
+        // existence check, which would let the stale sysroot it exists to
+        // catch validate anyway.
+        fs::write(src_dir.join("avocado.lock"), "<<<<<<< HEAD\n").unwrap();
+        assert!(RuntimeBuildCommand::new(
+            "dev".to_string(),
+            config_path.clone(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        )
+        .sysroot_install_inputs(
+            &composed.config,
+            &composed.merged_value,
+            "qemux86-64",
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    /// The end-to-end contract: a stamp written from the install side
+    /// validates against what the build reconstructs, then goes stale on an
+    /// overlay edit. Catches asymmetric wiring; a corruption applied to the
+    /// shared helper moves both sides and is caught by the pin assertions
+    /// below instead.
+    #[test]
+    fn test_install_written_stamps_validate_then_go_stale() {
+        use crate::utils::stamps::StampRequirement;
+
+        let temp = TempDir::new().unwrap();
+        let overlay = temp.path().join("nested-src/rootfs-overlay/etc");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("probe.conf"), "baseline\n").unwrap();
+        let config_path = create_test_config_file(&temp, OVERLAY_CONFIG);
+        let composed = Config::load_composed(&config_path, Some("qemux86-64")).unwrap();
+
+        // Written the way an install writes them.
+        let src_dir = composed.config.project_root(&config_path);
+        let mut lock = LockFile::load(&src_dir).unwrap();
+        lock.update_sysroot_versions(
+            "qemux86-64",
+            &SysrootType::Rootfs,
+            HashMap::from([("avocado-pkg-rootfs".to_string(), "2026.9-r0.0".to_string())]),
+        );
+        lock.save(&src_dir).unwrap();
+        let stamp_json = |sysroot_type: SysrootType| {
+            let packages =
+                sysroot_packages(&composed.config, &sysroot_type).expect("sysroot packages");
+            let inputs = compute_sysroot_install_inputs(
+                &SysrootStampContext {
+                    sysroot_type: &sysroot_type,
+                    config: &composed.config,
+                    parsed: &composed.merged_value,
+                    src_dir: &src_dir,
+                    target: "qemux86-64",
+                    target_board: None,
+                    repo_url: Some(REPO_URL),
+                    repo_release: None,
+                    dnf_args: None,
+                    lock_file: &lock,
+                },
+                &packages,
+            )
+            .unwrap()
+            .unwrap();
+            let stamp = match sysroot_type {
+                SysrootType::Initramfs => {
+                    Stamp::initramfs_install("qemux86-64", inputs, StampOutputs::default())
+                }
+                _ => Stamp::rootfs_install("qemux86-64", inputs, StampOutputs::default()),
+            };
+            serde_json::to_string(&stamp).unwrap()
+        };
+        let batch = format!(
+            "rootfs/install.stamp:::{}\ninitramfs/install.stamp:::{}",
+            stamp_json(SysrootType::Rootfs),
+            stamp_json(SysrootType::Initramfs)
+        );
+
+        let required = vec![
+            StampRequirement::rootfs_install(),
+            StampRequirement::initramfs_install(),
+        ];
+        let validate = || {
+            let inputs = RuntimeBuildCommand::new(
+                "dev".to_string(),
+                config_path.clone(),
+                false,
+                Some("qemux86-64".to_string()),
+                None,
+                None,
+            )
+            .sysroot_install_inputs(
+                &composed.config,
+                &composed.merged_value,
+                "qemux86-64",
+                Some(&REPO_URL.to_string()),
+                None,
+            )
+            .unwrap();
+            let current: Vec<CurrentInput<'_>> = inputs
+                .iter()
+                .map(|(component, i)| (*component, StampCommand::Install, i))
+                .collect();
+            validate_stamps_batch(&required, &batch, &current)
+        };
+
+        let before = validate();
+        assert!(
+            before.is_satisfied(),
+            "an unchanged project must validate; stale={:?}",
+            before.stale
+        );
+
+        fs::write(overlay.join("probe.conf"), "edited\n").unwrap();
+        let after = validate();
+        assert!(
+            after.missing.is_empty(),
+            "both stamps still exist; only staleness changed"
+        );
+        assert!(
+            after
+                .stale
+                .iter()
+                .any(|(r, _)| *r == StampRequirement::rootfs_install()),
+            "an overlay edit must make the rootfs install stamp stale"
+        );
+        assert!(
+            !after
+                .stale
+                .iter()
+                .any(|(r, _)| *r == StampRequirement::initramfs_install()),
+            "the initramfs stamp must not be collateral damage"
+        );
     }
 
     #[test]

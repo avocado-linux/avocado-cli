@@ -125,9 +125,7 @@ impl InitramfsInstallCommand {
             None
         };
 
-        let src_dir = std::path::Path::new(&self.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
+        let src_dir = &config.project_root(&self.config_path);
         let mut lock_file = LockFile::load(src_dir)?;
 
         let prefetched_stamp = read_sysroot_install_stamp(

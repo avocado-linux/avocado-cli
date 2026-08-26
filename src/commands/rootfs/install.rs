@@ -355,6 +355,66 @@ async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) -> 
     }
 }
 
+/// The effective package set for a sysroot; `None` for a type with no
+/// install of its own. The install and the stamp hash both read it through
+/// here so they cannot pick different sets.
+pub fn sysroot_packages(
+    config: &Config,
+    sysroot_type: &SysrootType,
+) -> Option<HashMap<String, serde_yaml::Value>> {
+    match sysroot_type {
+        SysrootType::Rootfs => Some(config.get_rootfs_packages()),
+        SysrootType::Initramfs => Some(config.get_initramfs_packages()),
+        _ => None,
+    }
+}
+
+/// The ingredients of a sysroot install stamp's input hash, for callers that
+/// have not run an install. Both sides build it here, so a new input cannot
+/// reach one side only.
+pub struct SysrootStampContext<'a> {
+    pub sysroot_type: &'a SysrootType,
+    pub config: &'a Config,
+    pub parsed: &'a serde_yaml::Value,
+    /// `Config::project_root`, matching every install path.
+    pub src_dir: &'a Path,
+    pub target: &'a str,
+    pub target_board: Option<&'a str>,
+    pub repo_url: Option<&'a str>,
+    pub repo_release: Option<&'a str>,
+    pub dnf_args: Option<&'a [String]>,
+    pub lock_file: &'a LockFile,
+}
+
+/// `None` for a sysroot type that has no install stamp.
+pub fn compute_sysroot_install_inputs(
+    ctx: &SysrootStampContext<'_>,
+    packages: &HashMap<String, serde_yaml::Value>,
+) -> Result<Option<StampInputs>> {
+    let resolved = SysrootStampInputs {
+        packages,
+        repo_url: ctx.repo_url,
+        repo_release: ctx.repo_release,
+        disable_weak_dependencies: ctx.config.get_sdk_disable_weak_dependencies(),
+        dnf_args: ctx.dnf_args,
+        locked_packages: ctx
+            .lock_file
+            .get_sysroot_versions(ctx.target, ctx.sysroot_type),
+    };
+
+    let inputs = match ctx.sysroot_type {
+        SysrootType::Rootfs => {
+            compute_rootfs_input_hash(ctx.parsed, ctx.src_dir, ctx.target_board, &resolved)?
+        }
+        SysrootType::Initramfs => {
+            compute_initramfs_input_hash(ctx.parsed, ctx.src_dir, ctx.target_board, &resolved)?
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(inputs))
+}
+
 /// Compute this sysroot's install-stamp inputs from the config, the SDK feed
 /// identity, and the lockfile pins **as they stand at call time**.
 ///
@@ -374,28 +434,21 @@ fn compute_install_stamp_inputs(
         return Ok(None);
     };
 
-    let resolved = SysrootStampInputs {
+    compute_sysroot_install_inputs(
+        &SysrootStampContext {
+            sysroot_type: &params.sysroot_type,
+            config: params.config,
+            parsed,
+            src_dir: params.src_dir,
+            target: params.target,
+            target_board: params.target_board,
+            repo_url: params.repo_url,
+            repo_release: params.repo_release,
+            dnf_args: params.dnf_args.as_deref(),
+            lock_file: params.lock_file,
+        },
         packages,
-        repo_url: params.repo_url,
-        repo_release: params.repo_release,
-        disable_weak_dependencies: params.config.get_sdk_disable_weak_dependencies(),
-        dnf_args: params.dnf_args.as_deref(),
-        locked_packages: params
-            .lock_file
-            .get_sysroot_versions(params.target, &params.sysroot_type),
-    };
-
-    let inputs = match params.sysroot_type {
-        SysrootType::Rootfs => {
-            compute_rootfs_input_hash(parsed, params.src_dir, params.target_board, &resolved)?
-        }
-        SysrootType::Initramfs => {
-            compute_initramfs_input_hash(parsed, params.src_dir, params.target_board, &resolved)?
-        }
-        _ => return Ok(None),
-    };
-
-    Ok(Some(inputs))
+    )
 }
 
 /// Probe the target repo for `package_name` via repoquery (metadata-only, no
@@ -547,10 +600,8 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
 
     // Get packages from config (the effective set — absent config yields the
     // default meta-package).
-    let packages = match params.sysroot_type {
-        SysrootType::Rootfs => params.config.get_rootfs_packages(),
-        SysrootType::Initramfs => params.config.get_initramfs_packages(),
-        _ => unreachable!(),
+    let Some(packages) = sysroot_packages(params.config, &params.sysroot_type) else {
+        unreachable!("sysroot_type was narrowed to rootfs/initramfs above")
     };
 
     // Short-circuit: nothing to do when the stamp on record still matches the
@@ -1220,9 +1271,7 @@ impl RootfsInstallCommand {
             None
         };
 
-        let src_dir = std::path::Path::new(&self.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
+        let src_dir = &config.project_root(&self.config_path);
         let mut lock_file = LockFile::load(src_dir)?;
 
         let prefetched_stamp = read_sysroot_install_stamp(
