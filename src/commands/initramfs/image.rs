@@ -702,7 +702,7 @@ mod tests {
     /// spurious every-build OTAs in the other.
     #[test]
     fn test_ownership_is_hashed_iff_the_image_records_it() {
-        let initramfs = generate_initramfs_build_script("ns", "cpio.zst", None, "");
+        let initramfs = generate_initramfs_build_script("ns", "cpio.zst", None, "", false);
         let rootfs = crate::commands::rootfs::image::generate_rootfs_build_script(
             "ns",
             "erofs-lz4",
