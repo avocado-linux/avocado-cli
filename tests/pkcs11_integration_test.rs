@@ -512,6 +512,7 @@ fn test_tpm_key_registration_and_removal() {
         Some("test-key-label".to_string()),
         false, // don't generate, reference existing
         "none".to_string(),
+        "ed25519".to_string(),
     );
 
     // First, generate the key in TPM directly
@@ -574,6 +575,7 @@ fn test_tpm_key_registration_and_removal() {
         Some("test-key-label-2".to_string()),
         false,
         "none".to_string(),
+        "ed25519".to_string(),
     );
 
     let (_public_key_bytes2, keyid2, _algo_str2) =

@@ -4,9 +4,11 @@
 //! stored in the global avocado configuration.
 
 pub mod create;
+pub mod import;
 pub mod list;
 pub mod remove;
 
 pub use create::SigningKeysCreateCommand;
+pub use import::SigningKeysImportCommand;
 pub use list::SigningKeysListCommand;
 pub use remove::SigningKeysRemoveCommand;

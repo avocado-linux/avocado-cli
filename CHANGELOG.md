@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.0-rc.2] - 2026-08-28
 
 ### Added
+- **`runtimes.<name>.signing.fit_key` — boot-FIT signing from the key registry.**
+  Names an RSA PEM key (`avocado signing-keys import <name> --key --cert`, or
+  `signing-keys create <name> --algorithm rsa2048`) that the runtime build
+  materializes as `FIT.key`/`FIT.crt` for `mkimage`, so a signed boot image is
+  reproducible from `avocado.yaml` alone. `signing.fit_unsigned: true` is the
+  explicit opt-out. Replaces the interim `AVOCADO_FIT_KEY_DIR` /
+  `AVOCADO_FIT_UNSIGNED` environment variables, which are no longer read.
 - **`runtimes.<name>.var.encrypt: true` — encrypted `/var`.** Opts a runtime
   into a LUKS2 `/var` sealed to the target's hardware key store (OP-TEE fTPM
   on Jetson). The cli adds `cryptsetup-var` to the initramfs and

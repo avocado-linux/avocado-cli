@@ -576,6 +576,18 @@ pub struct SigningConfig {
     /// this key for targets/snapshot/timestamp roles. Overrides connect.server_key.
     #[serde(default)]
     pub server_key: Option<String>,
+    /// Key that signs this runtime's boot FIT (FIT-booting machines only): a
+    /// registry name or key id of an RSA PEM key (`avocado signing-keys import`
+    /// / `create --algorithm rsa2048`). The build materializes it as the
+    /// `FIT.key`/`FIT.crt` pair `mkimage -k` expects. Required when
+    /// `rootfs.image.verity` is on, since the root hash rides in the FIT.
+    #[serde(default)]
+    pub fit_key: Option<String>,
+    /// Build this runtime's boot FIT unsigned. Only boots on a U-Boot that
+    /// enforces no key; mutually exclusive with `fit_key`. Explicit so an
+    /// unsigned boot image is never the accidental result of a missing key.
+    #[serde(default)]
+    pub fit_unsigned: Option<bool>,
 }
 
 fn default_checksum_algorithm() -> String {
@@ -4176,6 +4188,22 @@ impl Config {
             .filter(|key| !key.trim().is_empty())
     }
 
+    /// The runtime's boot-FIT signing choice: `(fit_key, fit_unsigned)`.
+    /// Both set is a configuration error, reported by the caller.
+    pub fn get_runtime_fit_signing(&self, runtime_name: &str) -> (Option<String>, bool) {
+        let signing = self
+            .runtimes
+            .as_ref()
+            .and_then(|r| r.get(runtime_name))
+            .and_then(|r| r.signing.as_ref());
+        (
+            signing
+                .and_then(|s| s.fit_key.clone())
+                .filter(|k| !k.trim().is_empty()),
+            signing.and_then(|s| s.fit_unsigned).unwrap_or(false),
+        )
+    }
+
     /// Get the declared content key name for a runtime (for signing delegated-targets only).
     ///
     /// Returns Some(key_name) if the runtime has a content_key configured,
@@ -5985,6 +6013,29 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fit_signing_reads_key_and_explicit_unsigned_per_runtime() {
+        let yaml = r#"
+default_target: imx8mp-evk
+runtimes:
+  prod:
+    signing:
+      fit_key: product-fit
+  lab:
+    signing:
+      fit_unsigned: true
+  plain: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.get_runtime_fit_signing("prod"),
+            (Some("product-fit".to_string()), false)
+        );
+        assert_eq!(config.get_runtime_fit_signing("lab"), (None, true));
+        assert_eq!(config.get_runtime_fit_signing("plain"), (None, false));
+        assert_eq!(config.get_runtime_fit_signing("missing"), (None, false));
+    }
+
     #[test]
     fn image_verity_is_strict_bool() {
         use super::get_ext_image_verity;

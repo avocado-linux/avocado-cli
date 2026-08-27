@@ -9,6 +9,33 @@ The avocado CLI supports managing signing keys for runtime image signing through
 
 ## Global Key Management
 
+### Boot-FIT signing keys (RSA)
+
+FIT-booting machines (i.MX) verify the boot image with an RSA key embedded in
+U-Boot. The runtime build signs the FIT it assembles with a key from this same
+registry:
+
+```bash
+# Generate (needs openssl on the host) ...
+avocado signing-keys create product-fit --algorithm rsa2048
+# ... or import an existing PEM key and certificate
+avocado signing-keys import product-fit --key FIT.key --cert FIT.crt
+```
+
+```yaml
+runtimes:
+  prod:
+    signing:
+      fit_key: product-fit      # or: fit_unsigned: true
+```
+
+The build copies the key pair into a private temp dir mounted read-only into
+the SDK as `FIT.key`/`FIT.crt` (the template's `key-name-hint`). With
+`rootfs.image.verity: true` one of the two settings is required, since the
+root hash rides in the FIT. RSA keys are file-based only: `mkimage` cannot use
+a PKCS#11 URI.
+
+
 ### Creating Keys
 
 ```bash

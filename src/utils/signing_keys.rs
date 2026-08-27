@@ -631,3 +631,138 @@ mod tests {
         assert_eq!(keyid.len(), 64, "keyid should be 64 hex characters");
     }
 }
+
+// ---------------------------------------------------------------------------
+// PEM keys for external signers (U-Boot mkimage FIT signing)
+// ---------------------------------------------------------------------------
+
+/// Algorithms whose material is a PEM RSA private key + X.509 certificate,
+/// consumed by external tools (`mkimage -k <dir>` expects `<hint>.key` and
+/// `<hint>.crt`) rather than by the cli's own ed25519 signer.
+pub fn is_pem_algorithm(algorithm: &str) -> bool {
+    matches!(algorithm, "rsa2048" | "rsa4096")
+}
+
+/// Key ID for a certificate: SHA-256 of its DER (the PEM body decoded), so the
+/// same certificate imported twice gets the same id regardless of line
+/// wrapping or trailing whitespace.
+pub fn keyid_for_pem_cert(cert_pem: &str) -> Result<String> {
+    let body: String = cert_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .map(str::trim)
+        .collect();
+    let der = BASE64_STANDARD
+        .decode(body.as_bytes())
+        .context("certificate is not a PEM-encoded X.509 certificate")?;
+    if der.is_empty() {
+        anyhow::bail!("certificate PEM body is empty");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&der);
+    Ok(hex::encode(&hasher.finalize()))
+}
+
+/// Store a PEM private key and certificate under the registry as
+/// `<keyid>.key` (0600) and `<keyid>.crt`. Returns the base path the registry
+/// URI points at.
+pub fn save_pem_keypair(keyid: &str, key_pem: &[u8], cert_pem: &[u8]) -> Result<PathBuf> {
+    if !key_pem.starts_with(b"-----BEGIN") {
+        anyhow::bail!("private key is not PEM (expected -----BEGIN ... PRIVATE KEY-----)");
+    }
+    let keys_dir = get_signing_keys_dir()?;
+    fs::create_dir_all(&keys_dir).with_context(|| {
+        format!(
+            "Failed to create signing keys directory: {}",
+            keys_dir.display()
+        )
+    })?;
+    let base_path = get_key_file_path(keyid)?;
+    let key_path = base_path.with_extension("key");
+    let cert_path = base_path.with_extension("crt");
+    fs::write(&key_path, key_pem)
+        .with_context(|| format!("Failed to write private key: {}", key_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
+    }
+    fs::write(&cert_path, cert_pem)
+        .with_context(|| format!("Failed to write certificate: {}", cert_path.display()))?;
+    Ok(base_path)
+}
+
+/// The PEM files behind a registry entry, for handing to an external signer.
+///
+/// Resolves `name` as a registry name or a key id. Refuses anything that is
+/// not a file-backed PEM key: the ed25519 seeds are for the cli's own signer,
+/// and a PKCS#11 URI cannot be handed to `mkimage` as a directory.
+pub fn pem_key_files(name: &str) -> Result<(PathBuf, PathBuf)> {
+    let entries = get_key_entries(std::slice::from_ref(&name.to_string()))?;
+    let (registry_name, entry) = entries
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("signing key '{name}' is not in the registry"))?;
+    if !is_pem_algorithm(&entry.algorithm) {
+        anyhow::bail!(
+            "signing key '{registry_name}' is {} - FIT signing needs an RSA PEM key \
+             (rsa2048/rsa4096). Import one with `avocado signing-keys import`.",
+            entry.algorithm
+        );
+    }
+    if !is_file_uri(&entry.uri) {
+        anyhow::bail!(
+            "signing key '{registry_name}' is {} - FIT signing needs a file-backed PEM key; \
+             mkimage cannot use a PKCS#11 URI",
+            entry.uri
+        );
+    }
+    let base = PathBuf::from(entry.uri.trim_start_matches("file://"));
+    let key = base.with_extension("key");
+    let cert = base.with_extension("crt");
+    for f in [&key, &cert] {
+        if !f.is_file() {
+            anyhow::bail!(
+                "signing key '{registry_name}' is registered but {} is missing",
+                f.display()
+            );
+        }
+    }
+    Ok((key, cert))
+}
+
+#[cfg(test)]
+mod pem_tests {
+    use super::*;
+
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nAAECAwQFBgc=\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn a_cert_keyid_is_the_sha256_of_its_der() {
+        let id = keyid_for_pem_cert(CERT).unwrap();
+        let mut h = Sha256::new();
+        h.update([0u8, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(id, hex::encode(&h.finalize()));
+        // Same certificate, different wrapping and whitespace: same id.
+        let rewrapped =
+            "-----BEGIN CERTIFICATE-----\nAAEC\n AwQF\nBgc= \n-----END CERTIFICATE-----";
+        assert_eq!(keyid_for_pem_cert(rewrapped).unwrap(), id);
+    }
+
+    #[test]
+    fn a_non_certificate_is_refused() {
+        assert!(keyid_for_pem_cert("hello").is_err());
+        assert!(
+            keyid_for_pem_cert("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").is_err()
+        );
+    }
+
+    #[test]
+    fn only_rsa_is_a_pem_algorithm() {
+        assert!(is_pem_algorithm("rsa2048"));
+        assert!(is_pem_algorithm("rsa4096"));
+        assert!(!is_pem_algorithm("ed25519"));
+        assert!(!is_pem_algorithm("ecdsa-p256"));
+    }
+}

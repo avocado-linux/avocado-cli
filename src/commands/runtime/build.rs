@@ -722,31 +722,55 @@ impl RuntimeBuildCommand {
         };
 
         // FIT signing key for the boot image assembled below (FIT machines
-        // only). AVOCADO_FIT_KEY_DIR names a host directory holding
-        // FIT.key/FIT.crt - the key-name-hint the feed's FIT template uses -
-        // and is bind-mounted read-only at /tmp/fit-keys. Optional: without
-        // it the FIT is assembled unsigned, which only boots on a U-Boot with
-        // no embedded key. Env rather than config until signing_keys can
-        // materialize PEM for external tools.
-        if std::env::var("AVOCADO_FIT_UNSIGNED").as_deref() == Ok("1") {
+        // only), from `runtimes.<r>.signing.fit_key`: an RSA PEM key in the
+        // signing-key registry, materialized as the FIT.key/FIT.crt pair the
+        // feed's FIT template names (key-name-hint "FIT") in a private temp dir
+        // that is bind-mounted read-only at /tmp/fit-keys. `signing.fit_unsigned`
+        // is the explicit opt-out; without either the FIT is left as the feed
+        // built it (or the build fails, when verity needs the FIT rebuilt).
+        for stale in ["AVOCADO_FIT_KEY_DIR", "AVOCADO_FIT_UNSIGNED"] {
+            if std::env::var_os(stale).is_some() {
+                print_info(
+                    &format!(
+                        "{stale} is no longer read; set runtimes.{}.signing.fit_key (or fit_unsigned: true) in avocado.yaml instead.",
+                        self.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+        let (fit_key_name, fit_unsigned) = config.get_runtime_fit_signing(&self.runtime_name);
+        if fit_key_name.is_some() && fit_unsigned {
+            return Err(anyhow::anyhow!(
+                "runtime '{}' sets both signing.fit_key and signing.fit_unsigned; pick one.",
+                self.runtime_name
+            ));
+        }
+        if fit_unsigned {
             env_vars.insert("AVOCADO_FIT_UNSIGNED".to_string(), "1".to_string());
         }
-        let fit_keydir_host_path: Option<String> = match std::env::var("AVOCADO_FIT_KEY_DIR") {
-            Ok(dir) => {
-                if !std::path::Path::new(&dir).join("FIT.key").is_file() {
-                    return Err(anyhow::anyhow!(
-                        "AVOCADO_FIT_KEY_DIR points to '{}' but it has no FIT.key.",
-                        dir
-                    ));
-                }
+        let fit_keys_tempdir: Option<tempfile::TempDir> = match fit_key_name {
+            Some(ref name) => {
+                let (key, cert) = crate::utils::signing_keys::pem_key_files(name)?;
+                let dir = tempfile::Builder::new()
+                    .prefix("avocado-fit-keys-")
+                    .tempdir()
+                    .context("Failed to create a temp dir for the FIT signing key")?;
+                std::fs::copy(&key, dir.path().join("FIT.key"))
+                    .with_context(|| format!("Failed to stage {}", key.display()))?;
+                std::fs::copy(&cert, dir.path().join("FIT.crt"))
+                    .with_context(|| format!("Failed to stage {}", cert.display()))?;
                 env_vars.insert(
                     "AVOCADO_FIT_KEY_DIR".to_string(),
                     "/tmp/fit-keys".to_string(),
                 );
                 Some(dir)
             }
-            Err(_) => None,
+            None => None,
         };
+        let fit_keydir_host_path: Option<String> = fit_keys_tempdir
+            .as_ref()
+            .map(|d| d.path().to_string_lossy().into_owned());
 
         // The in-container sign_amf shell helper checks
         // $AVOCADO_AMF_KOS. Only kos runtimes set it; everyone else
@@ -3321,10 +3345,10 @@ FIT_ITS="$OUTPUT_DIR/fit-image.its"
 if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
     if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
         if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
-            echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set AVOCADO_FIT_KEY_DIR to a directory holding FIT.key/FIT.crt, or AVOCADO_FIT_UNSIGNED=1 if this machine's U-Boot enforces no key." >&2
+            echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set runtimes.<name>.signing.fit_key to an RSA key in the signing-key registry, or signing.fit_unsigned: true if this machine's U-Boot enforces no key." >&2
             exit 1
         fi
-        echo "WARNING: boot FIT not rebuilt (no AVOCADO_FIT_KEY_DIR, AVOCADO_FIT_UNSIGNED not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
+        echo "WARNING: boot FIT not rebuilt (no signing.fit_key, signing.fit_unsigned not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
     else
         echo "Assembling boot FIT from $FIT_ITS..."
         FIT_WORK_ITS="$OUTPUT_DIR/fit-image.project.its"
