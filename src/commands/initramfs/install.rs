@@ -149,10 +149,10 @@ impl InitramfsInstallCommand {
         // `runs_on` NFS server and remote mount, and an early return here would
         // skip it — the next `--runs-on` run picks a fresh nfs_port and stacks
         // another one on top. Carried into `result` and returned past teardown.
-        let result = match prefetched_stamp {
-            Err(e) => Err(e),
+        let (result, pins_recorded) = match prefetched_stamp {
+            Err(e) => (Err(e), false),
             Ok(prefetched_stamp) => {
-                install_sysroot(&mut SysrootInstallParams {
+                let mut params = SysrootInstallParams {
                     sysroot_type: SysrootType::Initramfs,
                     config,
                     lock_file: &mut lock_file,
@@ -173,17 +173,37 @@ impl InitramfsInstallCommand {
                     parsed: Some(&composed.merged_value),
                     prefetched_stamp,
                     tui_context: None,
-                })
-                .await
+                    pins_recorded: false,
+                };
+                let outcome = install_sysroot(&mut params).await;
+                // Copied out before `params` drops: it holds the `&mut` on
+                // `lock_file`, which the save below needs back.
+                let pins_recorded = params.pins_recorded;
+                (outcome, pins_recorded)
             }
         };
 
         // Persist the lockfile the install updated — `install_sysroot` leaves
         // saving to its caller. Folded into `result` rather than `?` so a save
         // failure still reaches the teardown below.
-        let result = match result {
-            Ok(()) => lock_file.save(src_dir),
-            Err(e) => Err(e),
+        //
+        // Also saved when the install failed *after* recording pins: they
+        // describe the packages that actually landed, and dropping them makes
+        // the next run re-resolve the kernel against feed head with no
+        // `prev_pinned_kver` to compare against. The install error is the one
+        // returned — it is what the user has to act on.
+        let result = match (result, pins_recorded) {
+            (Ok(()), _) => lock_file.save(src_dir),
+            (Err(e), true) => {
+                if let Err(save_err) = lock_file.save(src_dir) {
+                    print_error(
+                        &format!("Failed to save lock file: {save_err}"),
+                        OutputLevel::Normal,
+                    );
+                }
+                Err(e)
+            }
+            (Err(e), false) => Err(e),
         };
 
         if let Some(ref mut context) = runs_on_context {

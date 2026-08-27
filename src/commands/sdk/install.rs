@@ -550,6 +550,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             parsed: Some(&composed.merged_value),
             prefetched_stamp: rootfs_stamp,
             tui_context: rootfs_tui,
+            pins_recorded: false,
         };
         let mut initramfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Initramfs,
@@ -572,6 +573,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             parsed: Some(&composed.merged_value),
             prefetched_stamp: initramfs_stamp,
             tui_context: initramfs_tui,
+            pins_recorded: false,
         };
 
         // Build the target-dev future (or a no-op if not needed)
@@ -666,6 +668,12 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // Merge lock file changes back into a single lock file for saving
         let mut final_lock = lock_file.clone();
 
+        // A sysroot install that failed *after* recording its pins still has
+        // pins worth merging — they describe the packages that landed. See
+        // `SysrootInstallParams::pins_recorded`.
+        let rootfs_landed = rootfs_result.is_ok() || rootfs_params.pins_recorded;
+        let initramfs_landed = initramfs_result.is_ok() || initramfs_params.pins_recorded;
+
         // Merge SDK packages lock
         if sdk_pkg_result.is_ok() {
             if let Some(target_locks) = sdk_pkg_lock.targets.get(target) {
@@ -678,7 +686,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // `kernels` entries staged from the rootfs install (Phase 2c) — they
         // live on the clone too and would otherwise be dropped on the merge
         // floor.
-        if rootfs_result.is_ok() {
+        if rootfs_landed {
             if let Some(target_locks) = rootfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
                 entry.rootfs = target_locks.rootfs.clone();
@@ -706,7 +714,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
         // Merge initramfs lock.
-        if initramfs_result.is_ok() {
+        if initramfs_landed {
             if let Some(target_locks) = initramfs_lock.targets.get(target) {
                 let entry = final_lock.targets.entry(target.to_string()).or_default();
                 entry.initramfs = target_locks.initramfs.clone();

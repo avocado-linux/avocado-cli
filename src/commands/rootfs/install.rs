@@ -96,6 +96,14 @@ pub struct SysrootInstallParams<'a> {
     pub prefetched_stamp: Option<Stamp>,
     /// TUI context for output capture (if TUI is active).
     pub tui_context: Option<crate::utils::container::TuiContext>,
+    /// Set by [`install_sysroot`] once the packages have landed and it has
+    /// recorded this sysroot's pins into `lock_file`. It stays set when the
+    /// install then fails, because the pins describe what is genuinely on
+    /// disk: a caller that drops them leaves the next run to re-resolve the
+    /// kernel against feed head with no `prev_pinned_kver` to compare against
+    /// and install additively on top. Callers must persist (or merge) the lock
+    /// whenever this is true, whatever the returned `Result` says.
+    pub pins_recorded: bool,
 }
 
 impl SysrootInstallParams<'_> {
@@ -266,6 +274,53 @@ fi
     );
 
     Ok(())
+}
+
+/// Why an install that placed its packages still must not report success.
+///
+/// `None` means every claim the install stamp makes holds: the packages are on
+/// disk, the lock records their versions, and (for rootfs with a pinned
+/// kernel) the kernel sysroot is staged. `Some(reason)` means one of them does
+/// not, so no stamp is written and `runtime build` will refuse to build.
+///
+/// Split out of [`install_sysroot`] to keep the wording under test: it is the
+/// only place a user learns why an install that looked fine left the build
+/// unable to proceed.
+fn incomplete_install_reason(
+    install_is_clean: bool,
+    versions_recorded: bool,
+    kernel_staging_error: Option<&str>,
+) -> Option<String> {
+    if !install_is_clean {
+        // Checked first: a sysroot that could not be cleaned may be carrying
+        // packages from a previous config, which makes the other two signals
+        // describe the wrong tree.
+        Some("the sysroot could not be cleaned first, so stale contents may remain".to_string())
+    } else if !versions_recorded {
+        Some("the installed package versions could not be read".to_string())
+    } else {
+        kernel_staging_error.map(|detail| {
+            format!(
+                "the kernel sysroot could not be staged ({detail}). The rootfs sysroot's /boot \
+                 has no kernel image for this kernel version, so the packages that were \
+                 installed do not include a bootable kernel"
+            )
+        })
+    }
+}
+
+/// The error an install that placed its packages but could not finish reports.
+///
+/// Kept next to [`incomplete_install_reason`] and under test because this text
+/// is the whole remedy path: without it the user sees a passing `install` and a
+/// `build` that names `<sysroot> install` as missing, whose printed fix is the
+/// command that just passed.
+fn incomplete_install_error(label: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Installed the {label} sysroot's packages, but the install did not complete: {reason}. \
+         No install stamp was recorded, so `avocado build` will keep reporting `{label} install` \
+         as missing until this succeeds."
+    )
 }
 
 /// Detect package removals by comparing the **effective** package set for
@@ -1050,7 +1105,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         // stamp anyway latches the broken state: every later run reports "up to
         // date" and the user is wedged until they guess --no-stamps.
         let versions_recorded = !installed_versions.is_empty();
-        let mut kernel_staging_ok = true;
+        let mut kernel_staging_error: Option<String> = None;
         let install_is_clean = clean_ok;
 
         if versions_recorded {
@@ -1059,6 +1114,10 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 &params.sysroot_type,
                 installed_versions,
             );
+            // From here the lock describes what is on disk. Everything below
+            // can still fail the install, so tell the caller to keep the pins
+            // regardless of what this function returns.
+            params.pins_recorded = true;
             if params.verbose {
                 print_info(
                     &format!("Updated lock file with {label} package versions."),
@@ -1107,14 +1166,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 )
                 .await
                 {
-                    print_error(
-                        &format!(
-                            "Kernel sysroot staging failed: {e}. \
-                             provision may fall back to reading the Image from the rootfs sysroot."
-                        ),
-                        OutputLevel::Normal,
-                    );
-                    kernel_staging_ok = false;
+                    kernel_staging_error = Some(e.to_string());
                 }
             }
         }
@@ -1125,32 +1177,38 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         // derived: the install just re-pinned this sysroot's packages, and the
         // stamp has to record the lock state the *next* run will compare
         // against.
-        let stamp_is_trustworthy = versions_recorded && kernel_staging_ok && install_is_clean;
-
-        if !params.no_stamps && !stamp_is_trustworthy {
-            print_warning(
-                &format!(
-                    "Not recording an install stamp for {label}: {}. \
-                     The next run will reinstall rather than report it up to date.",
-                    if !install_is_clean {
-                        "the sysroot could not be cleaned first, so stale contents may remain"
-                    } else if !versions_recorded {
-                        "the installed package versions could not be read"
-                    } else {
-                        "kernel sysroot staging failed"
-                    }
-                ),
-                OutputLevel::Normal,
-            );
+        // Fail rather than return a success the stamp contradicts.
+        //
+        // Each of these means the sysroot on disk is not the one the config
+        // asked for, so no stamp is written -- and `runtime build` refuses to
+        // build without one. Reporting the step as succeeded left the two
+        // commands disagreeing: a green `install` followed by `build` naming
+        // `rootfs install` as missing, with `avocado rootfs install` as the
+        // suggested remedy -- the command that had just "succeeded". Nothing in
+        // that loop names the actual fault, so it reads as user error, and the
+        // reason (a `print_warning`) is invisible whenever the TUI is active,
+        // which is the default for `avocado install`.
+        //
+        // Failing here surfaces the reason through the failed-task rendering
+        // and stops the loop at the command that can still explain itself.
+        // `--no-stamps` does not suppress it: these are install failures, and
+        // the stamp is only how they became visible.
+        if let Some(reason) = incomplete_install_reason(
+            install_is_clean,
+            versions_recorded,
+            kernel_staging_error.as_deref(),
+        ) {
+            return Err(incomplete_install_error(label, &reason));
         }
 
-        // Deliberately not `?` anywhere below. The pins recorded above are only
-        // persisted by the caller when this function returns Ok, so propagating a
-        // stamp-write failure would discard the pins for an install that already
-        // landed — the next run would re-resolve the kernel against feed head with
-        // no prev_pinned_kver to compare against and install additively on top.
-        // A missing stamp is the benign outcome: the next run reinstalls.
-        if !params.no_stamps && stamp_is_trustworthy {
+        // Deliberately not `?`. Unlike the checks above -- which report a
+        // sysroot that is not what the config asked for -- a stamp-write
+        // failure leaves a correct sysroot that simply is not recorded, and the
+        // next run reinstalls. Failing here would add nothing and cost the
+        // teardown the callers run on the way out.
+        //
+        // Reaching this line means `incomplete_install_reason` returned None.
+        if !params.no_stamps {
             if let Err(e) = write_install_stamp(params, &packages, label).await {
                 print_warning(
                     &format!(
@@ -1302,10 +1360,10 @@ impl RootfsInstallCommand {
         // `runs_on` NFS server and remote mount, and an early return here would
         // skip it — the next `--runs-on` run picks a fresh nfs_port and stacks
         // another one on top. Carried into `result` and returned past teardown.
-        let result = match prefetched_stamp {
-            Err(e) => Err(e),
+        let (result, pins_recorded) = match prefetched_stamp {
+            Err(e) => (Err(e), false),
             Ok(prefetched_stamp) => {
-                install_sysroot(&mut SysrootInstallParams {
+                let mut params = SysrootInstallParams {
                     sysroot_type: SysrootType::Rootfs,
                     config,
                     lock_file: &mut lock_file,
@@ -1326,8 +1384,13 @@ impl RootfsInstallCommand {
                     parsed: Some(&composed.merged_value),
                     prefetched_stamp,
                     tui_context: None,
-                })
-                .await
+                    pins_recorded: false,
+                };
+                let outcome = install_sysroot(&mut params).await;
+                // Copied out before `params` drops: it holds the `&mut` on
+                // `lock_file`, which the save below needs back.
+                let pins_recorded = params.pins_recorded;
+                (outcome, pins_recorded)
             }
         };
 
@@ -1335,9 +1398,24 @@ impl RootfsInstallCommand {
         // longer saves for itself — under `avocado sdk install` it runs on a
         // clone that the caller merges and saves once. Folded into `result`
         // rather than `?` so a save failure still reaches the teardown below.
-        let result = match result {
-            Ok(()) => lock_file.save(src_dir),
-            Err(e) => Err(e),
+        //
+        // Also saved when the install failed *after* recording pins: they
+        // describe the packages that actually landed, and dropping them makes
+        // the next run re-resolve the kernel against feed head with no
+        // `prev_pinned_kver` to compare against. The install error is the one
+        // returned — it is what the user has to act on.
+        let result = match (result, pins_recorded) {
+            (Ok(()), _) => lock_file.save(src_dir),
+            (Err(e), true) => {
+                if let Err(save_err) = lock_file.save(src_dir) {
+                    print_error(
+                        &format!("Failed to save lock file: {save_err}"),
+                        OutputLevel::Normal,
+                    );
+                }
+                Err(e)
+            }
+            (Err(e), false) => Err(e),
         };
 
         // Always teardown runs_on context
@@ -1356,9 +1434,70 @@ impl RootfsInstallCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_overlay_script, detect_sysroot_package_removals, parse_probe_output};
+    use super::{
+        build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
+        incomplete_install_reason, parse_probe_output,
+    };
     use crate::utils::lockfile::{LockFile, SysrootType};
     use std::collections::{HashMap, HashSet};
+
+    // A sysroot install that places its packages but cannot finish the job must
+    // not report success: no stamp is written for it, and `runtime build`
+    // refuses to build without one. Returning Ok here is what produced a green
+    // `avocado install` followed by `avocado build` reporting `rootfs install`
+    // as missing and suggesting the very command that had just passed.
+    #[test]
+    fn a_complete_install_has_no_reason_to_fail() {
+        assert_eq!(incomplete_install_reason(true, true, None), None);
+    }
+
+    #[test]
+    fn kernel_staging_failure_is_reported_with_its_cause() {
+        let reason = incomplete_install_reason(
+            true,
+            true,
+            Some("Failed to stage kernel sysroot for kernel-version '6.18.37'"),
+        )
+        .expect("staging failure must not be silent");
+        // The underlying error is carried, not swallowed — it is the only part
+        // that names which kernel version had no image.
+        assert!(reason.contains("6.18.37"), "{reason}");
+        assert!(reason.contains("/boot"), "{reason}");
+    }
+
+    #[test]
+    fn an_unreadable_package_list_and_an_unclean_sysroot_each_fail() {
+        assert!(incomplete_install_reason(true, false, None)
+            .expect("unread versions must not be silent")
+            .contains("package versions"));
+        assert!(incomplete_install_reason(false, true, None)
+            .expect("an unclean sysroot must not be silent")
+            .contains("cleaned"));
+    }
+
+    #[test]
+    fn an_unclean_sysroot_outranks_the_later_signals() {
+        // Order matters: a sysroot that could not be cleaned may hold packages
+        // from a previous config, which makes the other two signals describe
+        // the wrong tree. Report the cause, not a symptom of it.
+        let reason = incomplete_install_reason(false, false, Some("staging blew up"))
+            .expect("must not be silent");
+        assert!(reason.contains("cleaned"), "{reason}");
+        assert!(!reason.contains("staging blew up"), "{reason}");
+    }
+
+    #[test]
+    fn the_failure_names_the_sysroot_and_the_remedy_loop_it_breaks() {
+        let msg = incomplete_install_error("rootfs", "the kernel sysroot could not be staged")
+            .to_string();
+        assert!(msg.contains("rootfs"), "{msg}");
+        // Says the packages did land — otherwise it reads as "nothing worked".
+        assert!(msg.contains("Installed the rootfs sysroot"), "{msg}");
+        // And ties the install-time fault to the build-time symptom, so the
+        // user does not go looking for a mistake of their own.
+        assert!(msg.contains("No install stamp"), "{msg}");
+        assert!(msg.contains("avocado build"), "{msg}");
+    }
 
     const KVER: &str = "6.8.12-l4t-r39.2.0-1021.21";
     const TARGET: &str = "jetson-agx-thor";
