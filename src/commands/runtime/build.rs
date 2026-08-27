@@ -2687,6 +2687,14 @@ kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
 {post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
 FINAL_MB=$(( FINAL_SIZE / 1048576 ))
+# The var partition is sized from the image (stone --partition-size) and only
+# grown to the disk later, by whatever runs on the device. A runtime that
+# encrypts /var on first boot needs room the image does not have: the LUKS2
+# header goes in front of the data (cryptsetup reencrypt --reduce-device-size
+# 32M), so the partition must be larger than the filesystem that fills it -
+# 64 MiB covers the header and the shrink granularity btrfs needs. Plaintext
+# runtimes keep the exact image size, so their layout is unchanged.
+VAR_PART_BYTES=$(( FINAL_SIZE + {var_part_headroom} ))
 echo ""
 echo "Built var image: ${{FINAL_MB}}MB"
 
@@ -2740,7 +2748,7 @@ stone bundle \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
     $STONE_OVERLAY_FLAG \
-    --partition-size "var=$FINAL_SIZE" \
+    --partition-size "var=$VAR_PART_BYTES" \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
 
@@ -2843,6 +2851,11 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             update_authority_section = update_authority_section,
             docker_section = docker_section,
             device_tree_overlay_section = device_tree_overlay_section,
+            var_part_headroom = if var_encrypt(target_arch) {
+                64 * 1024 * 1024
+            } else {
+                0
+            },
         );
 
         Ok(script)
@@ -4144,6 +4157,48 @@ runtimes:
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
+    }
+
+    #[test]
+    fn var_encrypt_gives_the_var_partition_headroom_for_the_luks_header() {
+        let temp_dir = TempDir::new().unwrap();
+        let on = r#"
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    var:
+      encrypt: true
+"#;
+        let build = |content: &str| {
+            let config_path = create_test_config_file(&temp_dir, content);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let cmd = RuntimeBuildCommand::new(
+                "test-runtime".to_string(),
+                config_path,
+                false,
+                Some("x86_64".to_string()),
+                None,
+                None,
+            );
+            let config = Config::load(&cmd.config_path).unwrap();
+            cmd.create_build_script(&config, &parsed, "x86_64", &[])
+                .unwrap()
+        };
+        let script = build(on);
+        assert!(
+            script.contains("VAR_PART_BYTES=$(( FINAL_SIZE + 67108864 ))"),
+            "encrypted /var gets 64 MiB of headroom for the LUKS2 header"
+        );
+        assert!(script.contains("--partition-size \"var=$VAR_PART_BYTES\""));
+
+        let script = build(&on.replace("encrypt: true", "encrypt: false"));
+        assert!(
+            script.contains("VAR_PART_BYTES=$(( FINAL_SIZE + 0 ))"),
+            "a plaintext runtime keeps the exact image size"
+        );
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other
