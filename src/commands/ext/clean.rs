@@ -391,8 +391,9 @@ impl ExtCleanCommand {
 # Clean extension sysroot
 rm -rf "$AVOCADO_EXT_SYSROOTS/{ext}"
 
-# Clean extension output files (built .raw images)
-rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw
+# Clean extension output files (built images and any dm-verity sidecars)
+rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw "$AVOCADO_PREFIX/output/extensions/{ext}"-*.kab \
+      "$AVOCADO_PREFIX/output/extensions/{ext}"-*.verity "$AVOCADO_PREFIX/output/extensions/{ext}"-*.roothash
 
 # Clean extension stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
@@ -447,8 +448,9 @@ rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
 # Clean extension sysroot
 rm -rf "$AVOCADO_EXT_SYSROOTS/{ext}"
 
-# Clean extension output files (built .raw images)
-rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw
+# Clean extension output files (built images and any dm-verity sidecars)
+rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw "$AVOCADO_PREFIX/output/extensions/{ext}"-*.kab \
+      "$AVOCADO_PREFIX/output/extensions/{ext}"-*.verity "$AVOCADO_PREFIX/output/extensions/{ext}"-*.roothash
 
 # Clean extension stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"

@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/etc/avocado/var-encrypt` marker into that runtime's initramfs; first boot
   encrypts the flashed var image in place, so seeded content survives. Unset
   is byte-identical to before. See `docs/features/encrypted-var.md`.
+- **`image.verity: true` for extensions and the rootfs.** `avocado ext image`
+  and the rootfs build run `veritysetup format` over the finished image and
+  emit a hash tree (`<image>.verity`) plus its root hash. Extension root hashes
+  land in the runtime manifest (`root_hash`, with the tree stored as
+  `<image_id>.verity`); the rootfs root hash goes into the boot FIT as
+  `avocado,roothash` and the tree into the machine's per-slot hash partition.
+  Requires `veritysetup` in the SDK and `CONFIG_DM_VERITY` on the target.
+  Provisioning carries everything; `avocado deploy` and `avocado connect
+  upload` refuse a runtime with verity extensions until they publish the
+  trees too.
+- **The runtime build assembles the boot FIT** on machines whose feed ships a
+  `fit-image.its` template, with this runtime's initramfs (previously a FIT
+  machine booted the feed's initramfs), the rootfs root hash when set, and a
+  signature from `AVOCADO_FIT_KEY_DIR` (`FIT.key`/`FIT.crt`) when given.
 - **Build commit in `avocado --version`.** The version line now reports the
   commit the binary was built from and its date, following rustc's shape:
   `avocado 1.0.0-rc.1 (abc1234 2026-03-05)`. A bug report now identifies the

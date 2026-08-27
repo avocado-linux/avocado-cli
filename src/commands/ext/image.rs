@@ -514,6 +514,8 @@ impl ExtImageCommand {
         let image_type = crate::utils::config::get_ext_image_type(&ext_config)
             .unwrap_or_else(|| "raw".to_string());
         let image_args = crate::utils::config::get_ext_image_args(&ext_config);
+        let verity = crate::utils::config::get_ext_image_verity(&ext_config)
+            .with_context(|| format!("Extension '{}'", self.extension))?;
 
         match image_type.as_str() {
             "raw" | "kab" => {}
@@ -624,6 +626,7 @@ impl ExtImageCommand {
                 &effective_tui_context,
                 &image_type,
                 image_args.as_deref(),
+                verity,
                 &kab_env_vars,
             )
             .await?;
@@ -823,6 +826,7 @@ impl ExtImageCommand {
         effective_tui_context: &Option<TuiContext>,
         image_type: &str,
         image_args: Option<&str>,
+        verity: bool,
         extra_env_vars: &Option<std::collections::HashMap<String, String>>,
     ) -> Result<bool> {
         // Create the build script
@@ -834,6 +838,7 @@ impl ExtImageCommand {
             var_files,
             image_type,
             image_args,
+            verity,
         );
 
         // Execute the build script in the SDK container
@@ -873,6 +878,7 @@ impl ExtImageCommand {
         var_files: &[String],
         image_type: &str,
         image_args: Option<&str>,
+        verity: bool,
     ) -> String {
         // Build exclude flags for var_files patterns (these go on the var partition, not in the .raw image)
         let var_excludes = var_files
@@ -961,6 +967,36 @@ mksquashfs \
             }
         };
 
+        // dm-verity hash tree over the finished filesystem image, before any
+        // KAB wrapping: the KAB layer is this same file byte-for-byte (copied
+        // in as layer.img), and avocadoctl mounts it through the same
+        // systemd-dissect call with --root-hash/--verity-data, so one tree
+        // serves both image types. Sidecars sit next to the image under the
+        // same stem (.verity = hash tree, .roothash = hex root hash); the
+        // runtime build copies them alongside and puts the root hash in the
+        // manifest. Salt and superblock UUID are fixed so the tree and the root
+        // hash are both reproducible for identical image bytes - the manifest,
+        // not the sidecar, is the trust anchor, so a public salt costs nothing.
+        // (--no-superblock is not an option: systemd-dissect reads salt,
+        // algorithm and block sizes from the superblock.)
+        let verity_step = if verity {
+            r#"
+# --- dm-verity ---
+echo "Computing dm-verity hash tree..."
+VERITY_FILE="${OUTPUT_FILE%.raw}.verity"
+ROOTHASH_FILE="${OUTPUT_FILE%.raw}.roothash"
+rm -f "$VERITY_FILE" "$ROOTHASH_FILE"
+veritysetup format     --salt=0000000000000000000000000000000000000000000000000000000000000000     --uuid=00000000-0000-0000-0000-000000000000     --root-hash-file="$ROOTHASH_FILE" "$OUTPUT_FILE" "$VERITY_FILE" > /dev/null
+echo "dm-verity root hash: $(cat "$ROOTHASH_FILE")"
+"#
+        } else {
+            // Verity off: make sure no sidecar from an earlier verity-on build of
+            // this extension survives next to the fresh image.
+            r#"
+rm -f "${OUTPUT_FILE%.raw}.verity" "${OUTPUT_FILE%.raw}.roothash"
+"#
+        };
+
         let kab_wrapping = if image_type == "kab" {
             let kab_args = image_args
                 .unwrap_or(r#"-b -t kos.layer -v "$EXT_VERSION" --tag "$AVOCADO_TARGET""#);
@@ -1031,11 +1067,12 @@ export SOURCE_DATE_EPOCH={source_date_epoch}
 {mkfs_command}
 
 echo "Created extension image: $OUTPUT_FILE"
-{kab_wrapping}"#,
+{verity_step}{kab_wrapping}"#,
             self.extension,
             ext_version,
             source_date_epoch = source_date_epoch,
             mkfs_command = mkfs_command,
+            verity_step = verity_step,
             kab_wrapping = kab_wrapping,
         )
     }
@@ -1044,6 +1081,37 @@ echo "Created extension image: $OUTPUT_FILE"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_verity_step_emitted_only_when_requested() {
+        let cmd = ExtImageCommand::new(
+            "test-ext".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+        let with = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, true);
+        assert!(
+            with.contains("veritysetup format"),
+            "verity requested but no veritysetup step"
+        );
+        assert!(
+            with.contains(".roothash"),
+            "root hash file must be produced for the manifest"
+        );
+        // The tree is built on the .raw before any KAB wrapping would run, so the
+        // step must precede the KAB section and come after the image is created.
+        let created = with.find("Created extension image").unwrap();
+        assert!(with.find("veritysetup format").unwrap() > created);
+        let without =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+        assert!(
+            !without.contains("veritysetup"),
+            "verity step must be opt-in"
+        );
+    }
 
     fn make_cmd(extension: &str) -> ExtImageCommand {
         ExtImageCommand::new(
@@ -1059,7 +1127,8 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1082,7 +1151,8 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_lz4_includes_compression() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-lz4", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs-lz4", &[], "raw", None, false);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1101,7 +1171,8 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_zst_includes_compression() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs-zst", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs-zst", &[], "raw", None, false);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1120,7 +1191,8 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_uncompressed_no_z_flag() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1135,7 +1207,8 @@ mod tests {
     #[test]
     fn test_create_build_script_squashfs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
         assert!(
             script.contains("mksquashfs"),
@@ -1163,7 +1236,8 @@ mod tests {
     fn test_create_build_script_defaults_to_squashfs() {
         let cmd = make_cmd("my-ext");
         // Passing "squashfs" simulates the default behavior
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
         assert!(
             script.contains("mksquashfs"),
@@ -1185,7 +1259,8 @@ mod tests {
     #[test]
     fn test_pkg_state_excluded_from_erofs_image() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
 
         for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
             assert!(
@@ -1198,7 +1273,8 @@ mod tests {
     #[test]
     fn test_pkg_state_excluded_from_squashfs_image() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
         for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
             assert!(
@@ -1214,8 +1290,9 @@ mod tests {
     fn test_var_files_excludes_survive_alongside_pkg_state() {
         let cmd = make_cmd("my-ext");
         let var_files = vec!["var/lib/myapp/**".to_string()];
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &var_files, "raw", None);
+        let script = cmd.create_build_script(
+            "1.0.0", "sysext", 0, "erofs", &var_files, "raw", None, false,
+        );
 
         assert!(
             script.contains("--exclude-path=var/lib/myapp"),
@@ -1230,7 +1307,8 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_default() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=0"),
@@ -1245,8 +1323,16 @@ mod tests {
     #[test]
     fn test_create_build_script_source_date_epoch_custom() {
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 1700000000, "erofs", &[], "raw", None);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            1700000000,
+            "erofs",
+            &[],
+            "raw",
+            None,
+            false,
+        );
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=1700000000"),
@@ -1261,7 +1347,8 @@ mod tests {
     #[test]
     fn test_create_build_script_extension_name_and_version() {
         let cmd = make_cmd("test-extension");
-        let script = cmd.create_build_script("2.3.4", "sysext", 0, "squashfs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("2.3.4", "sysext", 0, "squashfs", &[], "raw", None, false);
 
         assert!(
             script.contains("EXT_NAME=\"test-extension\""),
@@ -1276,7 +1363,8 @@ mod tests {
     #[test]
     fn test_create_build_script_output_path() {
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
         assert!(
             script.contains("OUTPUT_FILE=\"$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw\""),
@@ -1291,8 +1379,9 @@ mod tests {
             "var/lib/docker/**".to_string(),
             "var/lib/myapp/data".to_string(),
         ];
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &var_files, "raw", None);
+        let script = cmd.create_build_script(
+            "1.0.0", "sysext", 0, "squashfs", &var_files, "raw", None, false,
+        );
 
         assert!(
             script.contains("-e \"var/lib/docker\""),
@@ -1308,8 +1397,9 @@ mod tests {
     fn test_create_build_script_erofs_var_files_excludes() {
         let cmd = make_cmd("my-ext");
         let var_files = vec!["var/lib/docker/**".to_string()];
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &var_files, "raw", None);
+        let script = cmd.create_build_script(
+            "1.0.0", "sysext", 0, "erofs", &var_files, "raw", None, false,
+        );
 
         assert!(
             script.contains("--exclude-path=var/lib/docker"),
@@ -1324,7 +1414,8 @@ mod tests {
         // are now always excluded, so the surviving guarantee is the narrower
         // one: nothing beyond them is excluded when no var_files are configured.
         let cmd = make_cmd("my-ext");
-        let script = cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None);
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
         assert_eq!(
             script.matches("-e \"").count(),

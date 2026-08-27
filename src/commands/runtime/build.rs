@@ -721,6 +721,33 @@ impl RuntimeBuildCommand {
             }
         };
 
+        // FIT signing key for the boot image assembled below (FIT machines
+        // only). AVOCADO_FIT_KEY_DIR names a host directory holding
+        // FIT.key/FIT.crt - the key-name-hint the feed's FIT template uses -
+        // and is bind-mounted read-only at /tmp/fit-keys. Optional: without
+        // it the FIT is assembled unsigned, which only boots on a U-Boot with
+        // no embedded key. Env rather than config until signing_keys can
+        // materialize PEM for external tools.
+        if std::env::var("AVOCADO_FIT_UNSIGNED").as_deref() == Ok("1") {
+            env_vars.insert("AVOCADO_FIT_UNSIGNED".to_string(), "1".to_string());
+        }
+        let fit_keydir_host_path: Option<String> = match std::env::var("AVOCADO_FIT_KEY_DIR") {
+            Ok(dir) => {
+                if !std::path::Path::new(&dir).join("FIT.key").is_file() {
+                    return Err(anyhow::anyhow!(
+                        "AVOCADO_FIT_KEY_DIR points to '{}' but it has no FIT.key.",
+                        dir
+                    ));
+                }
+                env_vars.insert(
+                    "AVOCADO_FIT_KEY_DIR".to_string(),
+                    "/tmp/fit-keys".to_string(),
+                );
+                Some(dir)
+            }
+            Err(_) => None,
+        };
+
         // The in-container sign_amf shell helper checks
         // $AVOCADO_AMF_KOS. Only kos runtimes set it; everyone else
         // treats sign_amf as a no-op.
@@ -769,6 +796,11 @@ impl RuntimeBuildCommand {
             if let Some(ref keyset_path) = kab_keyset_host_path {
                 args.push("-v".to_string());
                 args.push(format!("{keyset_path}:/tmp/kab.keyset:ro"));
+                modified = true;
+            }
+            if let Some(ref keydir) = fit_keydir_host_path {
+                args.push("-v".to_string());
+                args.push(format!("{keydir}:/tmp/fit-keys:ro"));
                 modified = true;
             }
             if modified {
@@ -1434,6 +1466,12 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
 if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
     cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
     echo "  Copied: {ext_name}-{ext_version}.{ext_suffix}"
+    # dm-verity sidecars (image.verity: true): hash tree + root hash travel with
+    # the image; stale ones from an earlier build never survive here.
+    for sc in verity roothash; do
+        rm -f "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
+        [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
+    done
 fi"#
                         ));
                         processed_extensions.insert(ext_name.to_string());
@@ -1451,6 +1489,10 @@ fi"#
 if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
     cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
     echo "  Copied: {versioned_name}.raw"
+    for sc in verity roothash; do
+        rm -f "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
+        [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
+    done
 else
     echo "ERROR: Extension image not found: $AVOCADO_PREFIX/output/extensions/{versioned_name}.raw"
     exit 1
@@ -1464,6 +1506,10 @@ if [ -n "$EXT_FILE" ]; then
     EXT_BASENAME=$(basename "$EXT_FILE")
     cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
     echo "  Copied: $EXT_BASENAME"
+    for sc in verity roothash; do
+        rm -f "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
+        [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
+    done
 fi"#
                     ));
                 }
@@ -1505,15 +1551,25 @@ fi"#
                 } else {
                     (versioned_name.clone(), "0.0.0".to_string())
                 };
-                // Look up image type from parsed config (image.type field)
-                let image_type = parsed
-                    .get("extensions")
-                    .and_then(|e| e.get(&name))
+                // Look up image type and verity flag from parsed config. The
+                // flag travels explicitly: the manifest step must not infer it
+                // from sidecar presence (stale sidecars would attach a wrong
+                // root_hash; a missing one would silently ship unverified).
+                let ext_cfg = parsed.get("extensions").and_then(|e| e.get(&name));
+                let image_type = ext_cfg
                     .and_then(crate::utils::config::get_ext_image_type)
                     .unwrap_or_else(|| "raw".to_string());
-                format!("{name}:{version}:{image_type}")
+                let verity = ext_cfg
+                    .map(crate::utils::config::get_ext_image_verity)
+                    .transpose()
+                    .with_context(|| format!("Extension '{name}'"))?
+                    .unwrap_or(false);
+                Ok(format!(
+                    "{name}:{version}:{image_type}:{}",
+                    if verity { "verity" } else { "plain" }
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<String>>>()?;
         let ext_info_str = ext_info_pairs.join(" ");
 
         // Space-separated, interpolated names that should land as
@@ -1720,7 +1776,7 @@ SIGNEOF
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil, struct
+import json, hashlib, uuid, os, shutil, struct, sys
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1787,9 +1843,10 @@ ext_disabled = set(os.environ.get("AVOCADO_EXT_DISABLED", "").split())
 
 extensions = []
 for pair in ext_pairs:
-    parts = pair.split(":", 2)
+    parts = pair.split(":", 3)
     name, version = parts[0], parts[1]
     image_type = parts[2] if len(parts) > 2 else "raw"
+    verity = len(parts) > 3 and parts[3] == "verity"
     ext_suffix = ".kab" if image_type == "kab" else ".raw"
     img_file = os.path.join(runtime_ext_dir, name + "-" + version + ext_suffix)
     if not os.path.isfile(img_file):
@@ -1802,6 +1859,23 @@ for pair in ext_pairs:
     shutil.copy2(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
+    # dm-verity, driven by the configured flag (never by sidecar presence): the
+    # hash tree lands as <image_id>.verity, exactly where avocadoctl's
+    # ManifestExtension::resolve_verity_path looks (image path with the
+    # extension swapped), and the root hash goes in the manifest entry. Only
+    # the manifest carries the hash, so a tampered sidecar cannot vouch for a
+    # tampered image. With the flag set both sidecars are required - shipping
+    # an unverified entry for an extension that asked for verity is the failure
+    # this guards against; without it, sidecars are ignored.
+    base = img_file[: -len(ext_suffix)]
+    if verity:
+        if not (os.path.isfile(base + ".verity") and os.path.isfile(base + ".roothash")):
+            sys.exit("ERROR: extension " + name + "-" + version + " has image.verity: true but its hash tree "
+                     "(.verity/.roothash) is missing next to " + img_file + " - rebuild it with `avocado ext image`")
+        shutil.copy2(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
+        with open(base + ".roothash") as rf:
+            entry["root_hash"] = rf.read().strip()
+        print("  Verity: " + name + "-" + version + " root hash " + entry["root_hash"][:16] + "...")
     if image_type != "raw":
         entry["image_type"] = image_type
     if name in ext_disabled:
@@ -1857,6 +1931,10 @@ rootfs_entry = add_image_entry(
     version_id,
     os.environ.get("AVOCADO_ROOTFS_IMAGE_TYPE", "raw"),
 )
+# rootfs.image.verity: record the root hash the signed FIT carries, so the
+# manifest states what the device is expected to have verified at boot.
+if rootfs_entry and os.environ.get("AVOCADO_ROOTFS_ROOTHASH"):
+    rootfs_entry["root_hash"] = os.environ["AVOCADO_ROOTFS_ROOTHASH"]
 initramfs_entry = add_image_entry(
     os.environ.get("AVOCADO_INITRAMFS_IMAGE", ""),
     version_id,
@@ -1891,12 +1969,14 @@ current_image_files = set()
 for ext in extensions:
     suffix = ".kab" if ext.get("image_type") == "kab" else ".raw"
     current_image_files.add(ext["image_id"] + suffix)
+    if ext.get("root_hash"):
+        current_image_files.add(ext["image_id"] + ".verity")
 for entry in (rootfs_entry, initramfs_entry, kernel_entry):
     if entry:
         sfx = ".kab" if entry.get("image_type") == "kab" else ".raw"
         current_image_files.add(entry["image_id"] + sfx)
 for fname in os.listdir(images_dir):
-    if (fname.endswith(".raw") or fname.endswith(".kab")) and fname not in current_image_files:
+    if fname.endswith((".raw", ".kab", ".verity")) and fname not in current_image_files:
         stale_path = os.path.join(images_dir, fname)
         os.remove(stale_path)
         print("  Removed stale image: " + fname)
@@ -2414,12 +2494,20 @@ echo "Docker image priming complete.""#,
         // how the image tag override is applied above.
         let rootfs_post_install = get_post_install(rootfs_section.as_ref());
         let rootfs_permissions_section = render_perms(resolved_rootfs, "$ROOTFS_WORK/etc");
+        let rootfs_verity = rootfs_section
+            .as_ref()
+            .map(crate::utils::config::get_ext_image_verity)
+            .transpose()
+            .context("rootfs")?
+            .unwrap_or(false);
         let rootfs_build_section = generate_rootfs_build_script(
             NAMESPACE_UUID,
             &config.get_rootfs_filesystem(),
             rootfs_post_install.as_deref(),
             &rootfs_permissions_section,
+            rootfs_verity,
         );
+        let fit_section = generate_fit_assembly_script();
 
         let initramfs_post_install = get_post_install(initramfs_section.as_ref());
         let initramfs_permissions_section = render_perms(resolved_initramfs, "$INITRAMFS_WORK/etc");
@@ -2496,6 +2584,7 @@ echo "Copying required extension images to runtime-specific directory..."
 # Build rootfs and initramfs images from package sysroots
 {rootfs_build_section}
 {initramfs_build_section}
+{fit_section}
 
 # Resolve kernel image staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
 # Done in shell so the optional KAB wrap below can rewrite the env var
@@ -2699,6 +2788,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             runtime_version = runtime_version,
             copy_section = copy_section,
             rootfs_build_section = rootfs_build_section,
+            fit_section = fit_section,
             initramfs_build_section = initramfs_build_section,
             rootfs_kab_wrap = rootfs_kab_wrap,
             initramfs_kab_wrap = initramfs_kab_wrap,
@@ -3207,8 +3297,92 @@ async fn run_container_command_capture(
     }
 }
 
+/// Assemble the boot FIT for machines that boot one (the feed ships the
+/// `fit-image.its` it built its own `fitImage` from, plus `linux.bin` and the
+/// dtbs it references, into the runtime dir). Re-using that template with the
+/// PROJECT's initramfs is what makes `initramfs:` config reach a FIT machine
+/// at all - the feed's fitImage carries the feed's initramfs. When the rootfs
+/// is verity-protected the root hash is added to every configuration node as
+/// `avocado,roothash`, which the U-Boot env reads back after the FIT has been
+/// verified and folds into the kernel cmdline - so the hash is covered by the
+/// FIT signature. Signed with the project's key when AVOCADO_FIT_KEY_DIR is
+/// set; otherwise the signature nodes are dropped and the FIT is unsigned.
+/// No-op on machines without a FIT template.
+pub fn generate_fit_assembly_script() -> String {
+    r#"
+# Boot FIT: rebuild the feed's fitImage with this runtime's initramfs (and the
+# rootfs root hash when verity is on). Only on machines whose feed ships the
+# fit-image.its template, and only when the result can be signed
+# (AVOCADO_FIT_KEY_DIR) or an unsigned FIT is explicitly asked for
+# (AVOCADO_FIT_UNSIGNED=1): a distro built with verified-boot embeds its key in
+# U-Boot, and an unsigned FIT would not boot there. Without either, the feed's
+# FIT is left alone - which also means this runtime's initramfs is not in it.
+FIT_ITS="$OUTPUT_DIR/fit-image.its"
+if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
+    if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
+        if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
+            echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set AVOCADO_FIT_KEY_DIR to a directory holding FIT.key/FIT.crt, or AVOCADO_FIT_UNSIGNED=1 if this machine's U-Boot enforces no key." >&2
+            exit 1
+        fi
+        echo "WARNING: boot FIT not rebuilt (no AVOCADO_FIT_KEY_DIR, AVOCADO_FIT_UNSIGNED not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
+    else
+        echo "Assembling boot FIT from $FIT_ITS..."
+        FIT_WORK_ITS="$OUTPUT_DIR/fit-image.project.its"
+        # The template's ramdisk node points at the distro build's initramfs by an
+        # absolute path that does not exist here; point it at ours, and make
+        # sure the rewrite actually matched.
+        sed -E "s#/incbin/\(\"[^\"]*initramfs[^\"]*\"\)#/incbin/(\"$AVOCADO_INITRAMFS_IMAGE\")#" "$FIT_ITS" > "$FIT_WORK_ITS"
+        grep -qF "/incbin/(\"$AVOCADO_INITRAMFS_IMAGE\")" "$FIT_WORK_ITS" \
+            || { echo "ERROR: could not find the initramfs node to replace in $FIT_ITS" >&2; exit 1; }
+        if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
+            # One property per configuration node, right after its opening line.
+            sed -i -E "s#^([[:space:]]*conf-[^[:space:]]+ \{)\$#\1\n\t\t\tavocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\";#" "$FIT_WORK_ITS"
+            grep -qF "avocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\"" "$FIT_WORK_ITS" \
+                || { echo "ERROR: no conf-* configuration node in $FIT_ITS to carry the rootfs root hash" >&2; exit 1; }
+        fi
+        FIT_SIGN_ARGS=""
+        if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
+            FIT_SIGN_ARGS="-k $AVOCADO_FIT_KEY_DIR -r"
+        else
+            # Explicitly unsigned: strip the signature nodes so mkimage does not look for a key.
+            sed -i -E '/^[[:space:]]*signature-[0-9]+ \{/,/^[[:space:]]*\};/d' "$FIT_WORK_ITS"
+        fi
+        rm -f "$OUTPUT_DIR/fitImage"
+        (cd "$OUTPUT_DIR" && mkimage -f "$FIT_WORK_ITS" $FIT_SIGN_ARGS "$OUTPUT_DIR/fitImage" > /dev/null) \
+            || { echo "ERROR: mkimage failed to assemble the boot FIT" >&2; exit 1; }
+        [ -s "$OUTPUT_DIR/fitImage" ] || { echo "ERROR: boot FIT was not produced" >&2; exit 1; }
+        mkimage -l "$OUTPUT_DIR/fitImage" | grep -E 'Default Configuration|Sign algo' | head -2 | sed 's/^/  /'
+        echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
+    fi
+fi
+"#
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fit_assembly_script_is_gated_and_handles_signing_both_ways() {
+        let s = super::generate_fit_assembly_script();
+        assert!(
+            s.contains("if [ -f \"$FIT_ITS\" ]"),
+            "must be a no-op without a FIT template"
+        );
+        assert!(
+            s.contains("AVOCADO_INITRAMFS_IMAGE"),
+            "project initramfs must replace the template's"
+        );
+        assert!(
+            s.contains("avocado,roothash"),
+            "rootfs root hash must be embedded in the FIT"
+        );
+        assert!(s.contains("-k $AVOCADO_FIT_KEY_DIR -r"), "signing path");
+        assert!(
+            s.contains("signature-[0-9]+"),
+            "unsigned path must strip signature nodes"
+        );
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;
@@ -4302,7 +4476,7 @@ extensions:
         assert!(script.contains("manifest.json"));
         assert!(script.contains("manifest_version=2"));
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"test-runtime\""));
-        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw\""));
+        assert!(script.contains("AVOCADO_EXT_PAIRS=\"test-ext:1.0.0:raw:plain\""));
         assert!(script.contains("AVOCADO_NS_UUID="));
 
         // rootfs / initramfs / kernel blocks: same content-addressing as

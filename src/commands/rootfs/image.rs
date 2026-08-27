@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::utils::{
-    config::{get_ext_image_args, get_ext_image_type, get_post_install, Config},
+    config::{
+        get_ext_image_args, get_ext_image_type, get_ext_image_verity, get_post_install, Config,
+    },
     container::{RunConfig, SdkContainer},
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
@@ -276,9 +278,48 @@ pub fn generate_rootfs_build_script(
     rootfs_filesystem: &str,
     post_install: Option<&str>,
     permissions_section: &str,
+    verity: bool,
 ) -> String {
     let post = resolve_install_hooks(post_install, DEFAULT_ROOTFS_POST_INSTALL);
     let post_install_block = render_hook_block("post_install", &post);
+    // rootfs.image.verity: dm-verity hash tree over the finished rootfs image.
+    // With verity off nothing is written: a machine whose stone manifest names
+    // the hash image ships a zero placeholder in avocado-img-bootfiles, and a
+    // real tree written here simply replaces it.
+    // Same producer as extensions (fixed zero salt, reproducible root hash),
+    // but the consumer is different: the kernel mounts the rootfs from
+    // root=/dev/mapper/root set up by systemd-veritysetup-generator from the
+    // cmdline, so the hash tree must be a block device of its own (a per-slot
+    // hash partition the stone manifest fills from the .verity image) and the
+    // root hash must reach the cmdline from inside the signed FIT - the FIT
+    // assembly step in the runtime build picks AVOCADO_ROOTFS_ROOTHASH up.
+    let verity_step = if verity {
+        r#"
+    echo "Computing dm-verity hash tree for the rootfs..."
+    ROOTFS_VERITY="${ROOTFS_OUTPUT%.*}.verity"
+    ROOTFS_ROOTHASH_FILE="${ROOTFS_OUTPUT%.*}.roothash"
+    rm -f "$ROOTFS_VERITY" "$ROOTFS_ROOTHASH_FILE"
+    veritysetup format \
+        --salt=0000000000000000000000000000000000000000000000000000000000000000 \
+        --uuid=00000000-0000-0000-0000-000000000000 \
+        --root-hash-file="$ROOTFS_ROOTHASH_FILE" "$ROOTFS_OUTPUT" "$ROOTFS_VERITY" > /dev/null \
+        || { echo "ERROR: veritysetup format failed on $ROOTFS_OUTPUT" >&2; exit 1; }
+    # This block runs without set -e in the runtime build: an empty root hash
+    # here would mean no root_hash in the manifest, no avocado,roothash in the
+    # FIT, and a device booting unverified with verity: true in config.
+    AVOCADO_ROOTFS_ROOTHASH="$(cat "$ROOTFS_ROOTHASH_FILE" 2>/dev/null)"
+    [ -n "$AVOCADO_ROOTFS_ROOTHASH" ] || { echo "ERROR: veritysetup produced no root hash for $ROOTFS_OUTPUT" >&2; exit 1; }
+    export AVOCADO_ROOTFS_ROOTHASH
+    export AVOCADO_ROOTFS_VERITY="$ROOTFS_VERITY"
+    echo "rootfs dm-verity root hash: $AVOCADO_ROOTFS_ROOTHASH"
+"#
+    } else {
+        // Verity off: drop any tree from an earlier verity-on build so stone
+        // ships the placeholder from avocado-img-bootfiles, not a stale tree.
+        r#"
+    rm -f "${ROOTFS_OUTPUT%.*}.verity" "${ROOTFS_OUTPUT%.*}.roothash"
+"#
+    };
     format!(
         r#"
 # Build rootfs image from shared sysroot.
@@ -400,7 +441,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 
     rm -rf "$ROOTFS_WORK"
     export AVOCADO_ROOTFS_IMAGE="$ROOTFS_OUTPUT"
-    export AVOCADO_ROOTFS_FILESYSTEM="$ROOTFS_FS"
+{verity_step}    export AVOCADO_ROOTFS_FILESYSTEM="$ROOTFS_FS"
     export AVOCADO_OS_BUILD_ID="$OS_BUILD_ID"
     echo "Built rootfs: $ROOTFS_OUTPUT (AVOCADO_OS_BUILD_ID=$OS_BUILD_ID)"
 else
@@ -408,6 +449,7 @@ else
 fi"#,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
+        verity_step = verity_step,
         permissions_section = permissions_section,
         purge_paths = render_build_state_purge("ROOTFS_WORK"),
         build_id_block = render_build_id_block(&BuildIdSpec {
@@ -532,6 +574,11 @@ impl RootfsImageCommand {
             &rootfs_filesystem,
             post_install.as_deref(),
             &permissions_section,
+            rootfs_node
+                .map(get_ext_image_verity)
+                .transpose()
+                .context("rootfs")?
+                .unwrap_or(false),
         );
 
         // If the avocado.yaml asks for a kab-wrapped rootfs, validate the
@@ -726,13 +773,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_rootfs_verity_step_is_opt_in_and_exports_root_hash() {
+        let with = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", true);
+        assert!(with.contains("veritysetup format"));
+        assert!(with.contains("export AVOCADO_ROOTFS_ROOTHASH"));
+        // The tree is computed over the final image, so it must come after mkfs
+        // and after AVOCADO_ROOTFS_IMAGE is set.
+        assert!(
+            with.find("veritysetup format").unwrap()
+                > with.find("export AVOCADO_ROOTFS_IMAGE").unwrap()
+        );
+        let without = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", false);
+        assert!(!without.contains("veritysetup"));
+        for script in [&with, &without] {
+            let ok = std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(true);
+            assert!(ok, "generated rootfs script must be valid shell");
+        }
+    }
+
+    #[test]
     fn test_rootfs_script_reads_source_date_epoch_from_the_env() {
         // The other half of `inject_source_date_epoch`. Injection and
         // consumption have to agree on the variable name, and a mismatch in
         // either half fails silently — the script just falls back to 0 and the
         // configured stamp is quietly ignored, which is the bug this pairing
         // exists to fix. Pin the name on this side too.
-        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "");
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", false);
         // Counted, not just `contains`. Both mkfs branches (erofs-zst and
         // erofs-lz4) are emitted unconditionally, so a `contains` check passes
         // even if one branch loses the flag — asserting the count is what
@@ -750,7 +822,7 @@ mod tests {
     /// build rather than being normalized to root.
     #[test]
     fn test_rootfs_image_reproducibility_flags_are_pinned() {
-        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "");
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", false);
 
         assert_eq!(
             script
@@ -778,6 +850,7 @@ mod tests {
             "erofs-lz4",
             None,
             "# permissions placeholder\n",
+            false,
         );
 
         assert!(
@@ -807,6 +880,7 @@ mod tests {
             "erofs-lz4",
             None,
             "",
+            false,
         );
 
         for path in BUILD_STATE_PATHS {
@@ -850,6 +924,7 @@ mod tests {
             "erofs-lz4",
             None,
             marker,
+            false,
         );
 
         let guard_pos = script
@@ -868,6 +943,7 @@ mod tests {
             "erofs-lz4",
             None,
             "",
+            false,
         )
     }
 
