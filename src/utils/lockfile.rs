@@ -334,7 +334,7 @@ pub struct RepoSnapshot {
 }
 
 /// Source metadata for a fetched extension in the lock file
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionSourceLock {
     /// Source type (e.g., "package")
     #[serde(rename = "type")]

@@ -34,7 +34,7 @@ pub struct ExtFetchCommand {
     pub runs_on: Option<String>,
     /// NFS port for remote execution
     pub nfs_port: Option<u16>,
-    /// Refuse to update the lock; fail on dependency drift instead.
+    /// Refuse to update the lock; fail on any lock drift instead.
     pub locked: bool,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
@@ -71,8 +71,10 @@ impl ExtFetchCommand {
         self
     }
 
-    /// Fail rather than update the lock when a locked dependency cannot
-    /// satisfy a new requirement.
+    /// Fail rather than update the lock. A declared extension with no lock
+    /// entry, a pinned version that moved, and a pin that cannot satisfy the
+    /// current requirements are all errors, and `avocado.lock` is never
+    /// written.
     pub fn with_locked(mut self, locked: bool) -> Self {
         self.locked = locked;
         self
@@ -191,6 +193,8 @@ impl ExtFetchCommand {
         let mut lock_file =
             LockFile::load(&lock_src_dir).with_context(|| "Failed to load lock file")?;
         let mut lock_file_dirty = false;
+        let lock_exists = LockFile::get_path(&lock_src_dir).exists()
+            || LockFile::legacy_path(&lock_src_dir).exists();
 
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
@@ -233,29 +237,45 @@ impl ExtFetchCommand {
             // discovered on the way — those were just installed.
             let force_this_round = self.force && round == 1;
 
+            // A declared extension with no pinned version falls through to
+            // its config spec below and resolves to whatever the feed serves
+            // today — the drift --locked exists to catch. Refuse before the
+            // transaction, so the lock is untouched by construction.
+            // Per round, because a revealed extension takes the same path.
+            if self.locked {
+                let unpinned = unlocked_declared(&round_targets, &lock_file, &target);
+                if !unpinned.is_empty() {
+                    let heading = if lock_exists {
+                        "avocado.lock does not pin declared extension(s):"
+                    } else {
+                        "avocado.lock does not exist, so no declared extension is pinned:"
+                    };
+                    return Err(anyhow::anyhow!(
+                        "{heading}\n{}\n\
+                         --locked forbids resolving them. Re-run without --locked to update the lock.",
+                        unpinned.join("\n")
+                    ));
+                }
+            }
+
             // Package-source extensions are collected and installed in ONE dnf
             // transaction rather than one container run each. That is what lets the
             // depsolver pull in each package's `Requires: avocado-ext(<dep>)`
             // closure — inter-extension dependencies are materialized by dnf, not
             // by repeated fetch/recompose/discover rounds.
             let mut package_batch: Vec<PackageFetchEntry> = Vec::new();
-            // Every AUTHOR-DECLARED package-source extension this round saw —
-            // including ones skipped because they are already installed. The
-            // implied/prune classification below must key on authorship, not
-            // batch membership: on a second fetch the installed authored app
-            // is absent from the batch, and classifying it from the batch
-            // marked it implied and let the prune clear its source lock.
-            let mut authored_package_exts: HashSet<String> = HashSet::new();
 
             for (ext_name, source) in &round_targets {
                 if !attempted.insert(ext_name.clone()) {
                     continue;
                 }
-                if matches!(source, ExtensionSource::Package { .. }) {
-                    authored_package_exts.insert(ext_name.clone());
-                }
-                // Check if already installed
+                // Check if already installed. Not under --locked: a skipped
+                // extension never reaches the lock compare below, so a retry
+                // after a failed --locked run (installroot already mutated)
+                // would see everything installed and pass with the lock still
+                // stale. Re-requesting an installed exact NEVRA is a dnf no-op.
                 if !force_this_round
+                    && !self.locked
                     && ExtensionFetcher::is_extension_installed(&extensions_dir, ext_name)
                 {
                     if self.verbose {
@@ -375,17 +395,19 @@ impl ExtFetchCommand {
             // a fresh tree lets the depsolver choose freely and quietly
             // produces a different closure than the lock describes.
             //
-            // Declared extensions are skipped: they are already in the batch
-            // carrying the author's own constraint, which outranks the lock.
-            // Authorship set, not batch membership: an authored extension
-            // skipped as already-installed is still authored.
-            let declared: HashSet<String> = authored_package_exts.clone();
+            // Skipped only for this round's extensions, which already carry
+            // their lock version from the loop above. A declared extension
+            // OUTSIDE the round (excluded by the `--extension` filter; `sdk
+            // install` fetches one extension at a time) whose entry an older
+            // fetch flagged implied must still be replayed, or the depsolver
+            // resolves it freely when a batch member pulls it in.
+            let round_package_exts = package_source_names(&round_targets);
             // Everything up to here is author-declared; pins are appended
             // after, so the two groups can be separated again if the pinned
             // solve has to be retried without them.
             let declared_count = package_batch.len();
             for (name, pin) in lock_file.implied_extension_sources(&target) {
-                if declared.contains(&name) {
+                if round_package_exts.contains(&name) {
                     continue;
                 }
                 let Some(version) = pin.version.as_deref() else {
@@ -406,6 +428,11 @@ impl ExtFetchCommand {
             }
 
             let pinned_count = package_batch.len() - declared_count;
+
+            // The post-transaction recompose doubles as the round-end
+            // discovery below; composing can read extension configs through
+            // a container, so it is not done twice.
+            let mut round_composed: Option<ComposedConfig> = None;
 
             // One transaction for every package-source extension. dnf resolves and
             // installs any dependency extensions beyond those named here.
@@ -514,6 +541,26 @@ impl ExtFetchCommand {
                     );
                 }
 
+                // Authorship is a property of the config, not of a round's
+                // batch: a filtered or later-round fetch sees only a slice of
+                // the config, and classifying from the slice marked a declared
+                // dependency implied. Taken from a recompose AFTER the
+                // transaction: a just-materialized extension's own avocado.yaml
+                // may declare a package source the depsolver also pulled in,
+                // and the pre-fetch config would call it implied on a clean
+                // tree and declared on every later fetch.
+                let recomposed = Config::load_composed(&self.config_path, Some(&target))
+                    .with_context(|| {
+                        format!(
+                            "Failed to reload config from {} after fetch",
+                            self.config_path
+                        )
+                    })?;
+                let declared = package_source_names(
+                    &Config::discover_remote_extensions_from_value(&recomposed.merged_value)?,
+                );
+                round_composed = Some(recomposed);
+
                 // Record what the installroot actually holds — the only
                 // reproducible answer. It covers extensions the depsolver
                 // pulled in unasked, and resolves `version: "*"` to a real
@@ -530,6 +577,7 @@ impl ExtFetchCommand {
                     .values()
                     .flat_map(|p| p.requires_exts.iter().map(String::as_str))
                     .collect();
+                let mut locked_changes: Vec<String> = Vec::new();
                 for (pkg_name, installed) in &resolved {
                     let entry = requested.get(pkg_name.as_str());
                     // Extension identity, in precedence order: the declared
@@ -561,22 +609,41 @@ impl ExtFetchCommand {
                     // sits in the installroot until a --force re-fetch clears
                     // it, but the lock stops asserting it, so it no longer
                     // replays into future solves.
-                    if implied && !required_caps.contains(ext_name.as_str()) {
-                        lock_file.clear_extension_source(&target, &ext_name);
-                        lock_file_dirty = true;
-                        continue;
-                    }
-                    lock_file.set_extension_source(
-                        &target,
-                        &ext_name,
-                        ExtensionSourceLock {
+                    let planned = if implied && !required_caps.contains(ext_name.as_str()) {
+                        None
+                    } else {
+                        Some(ExtensionSourceLock {
                             source_type: "package".to_string(),
                             package: Some(pkg_name.clone()),
                             version: Some(installed.version.clone()),
                             implied,
-                        },
-                    );
+                        })
+                    };
+                    // --locked never mutates the lock: whatever the plain
+                    // path would have written differently is reported.
+                    if self.locked {
+                        let existing = lock_file.get_extension_source(&target, &ext_name);
+                        if let Some(line) =
+                            locked_source_change(&ext_name, existing, planned.as_ref())
+                        {
+                            locked_changes.push(line);
+                        }
+                        continue;
+                    }
+                    match planned {
+                        None => lock_file.clear_extension_source(&target, &ext_name),
+                        Some(source) => lock_file.set_extension_source(&target, &ext_name, source),
+                    }
                     lock_file_dirty = true;
+                }
+
+                if !locked_changes.is_empty() {
+                    locked_changes.sort();
+                    return Err(anyhow::anyhow!(
+                        "avocado.lock is out of date; --locked forbids updating it:\n{}\n\
+                         Re-run without --locked to update the lock.",
+                        locked_changes.join("\n")
+                    ));
                 }
 
                 print_success(
@@ -588,22 +655,26 @@ impl ExtFetchCommand {
                 );
             }
 
-            // Recompose and see whether materializing the round revealed any
-            // remote extension that was not visible before we started.
-            let recomposed =
-                Config::load_composed(&self.config_path, Some(&target)).with_context(|| {
-                    format!(
-                        "Failed to reload config from {} after fetch",
-                        self.config_path
-                    )
-                })?;
-            round_targets =
-                Config::discover_remote_extensions_from_value(&recomposed.merged_value)?
-                    .into_iter()
-                    .filter(|(name, _)| {
-                        !visible_at_start.contains(name) && !attempted.contains(name)
-                    })
-                    .collect();
+            // See whether materializing the round revealed any remote
+            // extension that was not visible before we started. Nothing
+            // touches the tree after the transaction, so its recompose is
+            // current; only a round with no transaction composes here.
+            let recomposed = match round_composed {
+                Some(composed) => composed,
+                None => {
+                    Config::load_composed(&self.config_path, Some(&target)).with_context(|| {
+                        format!(
+                            "Failed to reload config from {} after fetch",
+                            self.config_path
+                        )
+                    })?
+                }
+            };
+            let revealed = Config::discover_remote_extensions_from_value(&recomposed.merged_value)?;
+            round_targets = revealed
+                .into_iter()
+                .filter(|(name, _)| !visible_at_start.contains(name) && !attempted.contains(name))
+                .collect();
 
             if !round_targets.is_empty() && self.verbose {
                 print_info(
@@ -633,8 +704,9 @@ impl ExtFetchCommand {
             ));
         }
 
-        // Save lock file if we recorded any source metadata
-        if lock_file_dirty {
+        // Nothing above dirties the lock under --locked; the guard keeps that
+        // an invariant rather than a property of each path remembering to.
+        if lock_file_dirty && !self.locked {
             lock_file
                 .save(&lock_src_dir)
                 .with_context(|| "Failed to save lock file")?;
@@ -665,6 +737,82 @@ impl ExtFetchCommand {
     }
 }
 
+/// Names of the package-source extensions in a discovered extension list.
+fn package_source_names(extensions: &[(String, ExtensionSource)]) -> HashSet<String> {
+    extensions
+        .iter()
+        .filter(|(_, source)| matches!(source, ExtensionSource::Package { .. }))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Declared package-source extensions the lock does not pin — the ones a
+/// fetch would resolve from the feed instead of the lock. A `"*"` entry
+/// counts: an older CLI wrote the request back instead of the resolved NEVRA,
+/// and it pins nothing. One diagnostic line each, sorted.
+fn unlocked_declared(
+    declared: &[(String, ExtensionSource)],
+    lock_file: &LockFile,
+    target: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = declared
+        .iter()
+        .filter(|(_, source)| matches!(source, ExtensionSource::Package { .. }))
+        .filter_map(|(name, _)| {
+            match lock_file
+                .get_extension_source(target, name)
+                .and_then(|s| s.version.as_deref())
+            {
+                None => Some(format!("  {name}")),
+                Some("*") => Some(format!("  {name} (locked as \"*\", which pins nothing)")),
+                Some(_) => None,
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The `name: was -> now` line a `--locked` run reports when the entry the
+/// plain path would write differs from the one on disk. `None` when they
+/// agree. Either side may be absent: a new implied dependency has no
+/// `existing`, a pruned one has no `planned`.
+fn locked_source_change(
+    ext_name: &str,
+    existing: Option<&ExtensionSourceLock>,
+    planned: Option<&ExtensionSourceLock>,
+) -> Option<String> {
+    if existing == planned {
+        return None;
+    }
+    // A `source.package` rename at the same version would otherwise read
+    // as `1.0-r0 -> 1.0-r0`.
+    let renamed = matches!(
+        (
+            existing.and_then(|s| s.package.as_deref()),
+            planned.and_then(|s| s.package.as_deref()),
+        ),
+        (Some(was), Some(now)) if was != now
+    );
+    let describe = |source: Option<&ExtensionSourceLock>| match source {
+        None => "(none)".to_string(),
+        Some(s) => format!(
+            "{}{}{}",
+            match (&s.package, renamed) {
+                (Some(package), true) => format!("{package} "),
+                _ => String::new(),
+            },
+            s.version.as_deref().unwrap_or("(unpinned)"),
+            if s.implied { " (implied)" } else { "" }
+        ),
+    };
+    Some(format!(
+        "  {ext_name}: {} -> {}",
+        describe(existing),
+        describe(planned)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +832,138 @@ mod tests {
         assert_eq!(cmd.extension, Some("test-ext".to_string()));
         assert!(cmd.verbose);
         assert!(!cmd.force);
+    }
+
+    fn package(name: &str) -> (String, ExtensionSource) {
+        (
+            name.to_string(),
+            ExtensionSource::Package {
+                version: "*".to_string(),
+                package: None,
+                repo_name: None,
+                include: None,
+            },
+        )
+    }
+
+    fn entry(version: Option<&str>, implied: bool) -> ExtensionSourceLock {
+        ExtensionSourceLock {
+            source_type: "package".to_string(),
+            package: None,
+            version: version.map(str::to_string),
+            implied,
+        }
+    }
+
+    #[test]
+    fn unlocked_declared_names_package_sources_without_a_pinned_version() {
+        let mut lock = LockFile::new();
+        lock.set_extension_source("t", "pinned", entry(Some("1.0-r0"), false));
+        lock.set_extension_source("t", "versionless", entry(None, false));
+        lock.set_extension_source("t", "wildcard", entry(Some("*"), false));
+        lock.set_extension_source("other", "other-target", entry(Some("1.0-r0"), false));
+        let declared = vec![
+            package("other-target"),
+            package("versionless"),
+            package("wildcard"),
+            package("pinned"),
+            (
+                "from-git".to_string(),
+                ExtensionSource::Git {
+                    url: "https://example.invalid/ext.git".to_string(),
+                    git_ref: None,
+                    sparse_checkout: None,
+                    include: None,
+                },
+            ),
+            package("absent"),
+        ];
+
+        assert_eq!(
+            unlocked_declared(&declared, &lock, "t"),
+            vec![
+                "  absent",
+                "  other-target",
+                "  versionless",
+                "  wildcard (locked as \"*\", which pins nothing)",
+            ]
+        );
+    }
+
+    /// An absent lockfile loads as an empty lock, so every declared
+    /// package extension is unpinned — the missing-file case needs no
+    /// separate path.
+    #[test]
+    fn unlocked_declared_reports_everything_against_an_empty_lock() {
+        let declared = vec![package("b"), package("a")];
+        assert_eq!(
+            unlocked_declared(&declared, &LockFile::new(), "t"),
+            vec!["  a", "  b"]
+        );
+    }
+
+    #[test]
+    fn locked_source_change_is_silent_when_disk_and_plan_agree() {
+        let same = entry(Some("1.0-r0"), false);
+        assert_eq!(locked_source_change("a", Some(&same), Some(&same)), None);
+        assert_eq!(locked_source_change("a", None, None), None);
+    }
+
+    #[test]
+    fn locked_source_change_names_missing_moved_pruned_and_reclassified_entries() {
+        let v1 = entry(Some("1.0-r0"), false);
+        let v2 = entry(Some("1.1-r0"), false);
+        let v1_implied = entry(Some("1.0-r0"), true);
+        let wildcard = entry(Some("*"), false);
+
+        assert_eq!(
+            locked_source_change("a", None, Some(&v1)).as_deref(),
+            Some("  a: (none) -> 1.0-r0")
+        );
+        assert_eq!(
+            locked_source_change("a", Some(&v1), Some(&v2)).as_deref(),
+            Some("  a: 1.0-r0 -> 1.1-r0")
+        );
+        assert_eq!(
+            locked_source_change("a", Some(&v1_implied), None).as_deref(),
+            Some("  a: 1.0-r0 (implied) -> (none)")
+        );
+        assert_eq!(
+            locked_source_change("a", Some(&v1), Some(&v1_implied)).as_deref(),
+            Some("  a: 1.0-r0 -> 1.0-r0 (implied)")
+        );
+        // A lock written by an older CLI recorded the request, not the
+        // resolved NEVRA; it pins nothing and must read as drift.
+        assert_eq!(
+            locked_source_change("a", Some(&wildcard), Some(&v1)).as_deref(),
+            Some("  a: * -> 1.0-r0")
+        );
+    }
+
+    /// Same version, different `source.package`: the package must appear
+    /// or the line reads as no change at all.
+    #[test]
+    fn locked_source_change_names_the_package_on_a_rename() {
+        let old = ExtensionSourceLock {
+            package: Some("old-app".to_string()),
+            ..entry(Some("1.0-r0"), false)
+        };
+        let new = ExtensionSourceLock {
+            package: Some("new-app".to_string()),
+            ..entry(Some("1.0-r0"), false)
+        };
+        assert_eq!(
+            locked_source_change("app", Some(&old), Some(&new)).as_deref(),
+            Some("  app: old-app 1.0-r0 -> new-app 1.0-r0")
+        );
+        // Only a rename names the package; a plain version move stays terse.
+        let moved = ExtensionSourceLock {
+            version: Some("1.1-r0".to_string()),
+            ..old.clone()
+        };
+        assert_eq!(
+            locked_source_change("app", Some(&old), Some(&moved)).as_deref(),
+            Some("  app: 1.0-r0 -> 1.1-r0")
+        );
     }
 }
