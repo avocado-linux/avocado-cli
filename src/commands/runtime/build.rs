@@ -2688,13 +2688,14 @@ kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
 FINAL_MB=$(( FINAL_SIZE / 1048576 ))
 # The var partition is sized from the image (stone --partition-size) and only
-# grown to the disk later, by whatever runs on the device. A runtime that
-# encrypts /var on first boot needs room the image does not have: the LUKS2
-# header goes in front of the data (cryptsetup reencrypt --reduce-device-size
-# 32M), so the partition must be larger than the filesystem that fills it -
-# 64 MiB covers the header and the shrink granularity btrfs needs. Plaintext
-# runtimes keep the exact image size, so their layout is unchanged.
-VAR_PART_BYTES=$(( FINAL_SIZE + {var_part_headroom} ))
+# grown to the disk later, by whatever runs on the device. Always leave room
+# for a LUKS2 header in front of the data (cryptsetup reencrypt
+# --reduce-device-size 32M; 64 MiB covers it and the shrink granularity btrfs
+# needs), whether or not this runtime encrypts: a device flashed plaintext must
+# still be able to turn var.encrypt on over an update later, and its partition
+# may never have been grown. var is the last partition, so nothing else moves;
+# the cost is 64 MiB of a sparse-flashed image.
+VAR_PART_BYTES=$(( FINAL_SIZE + 67108864 ))
 echo ""
 echo "Built var image: ${{FINAL_MB}}MB"
 
@@ -2851,11 +2852,6 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             update_authority_section = update_authority_section,
             docker_section = docker_section,
             device_tree_overlay_section = device_tree_overlay_section,
-            var_part_headroom = if var_encrypt(target_arch) {
-                64 * 1024 * 1024
-            } else {
-                0
-            },
         );
 
         Ok(script)
@@ -4160,45 +4156,34 @@ runtimes:
     }
 
     #[test]
-    fn var_encrypt_gives_the_var_partition_headroom_for_the_luks_header() {
+    fn the_var_partition_always_leaves_room_for_a_luks_header() {
         let temp_dir = TempDir::new().unwrap();
-        let on = r#"
+        let content = r#"
 connect:
   org: test
 
 runtimes:
   test-runtime:
     target: "x86_64"
-    var:
-      encrypt: true
 "#;
-        let build = |content: &str| {
-            let config_path = create_test_config_file(&temp_dir, content);
-            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
-            let cmd = RuntimeBuildCommand::new(
-                "test-runtime".to_string(),
-                config_path,
-                false,
-                Some("x86_64".to_string()),
-                None,
-                None,
-            );
-            let config = Config::load(&cmd.config_path).unwrap();
-            cmd.create_build_script(&config, &parsed, "x86_64", &[])
-                .unwrap()
-        };
-        let script = build(on);
-        assert!(
-            script.contains("VAR_PART_BYTES=$(( FINAL_SIZE + 67108864 ))"),
-            "encrypted /var gets 64 MiB of headroom for the LUKS2 header"
+        let config_path = create_test_config_file(&temp_dir, content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
         );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &[])
+            .unwrap();
+        // Even a plaintext runtime: the device must be able to turn var.encrypt
+        // on later, and its partition may never have been grown by then.
+        assert!(script.contains("VAR_PART_BYTES=$(( FINAL_SIZE + 67108864 ))"));
         assert!(script.contains("--partition-size \"var=$VAR_PART_BYTES\""));
-
-        let script = build(&on.replace("encrypt: true", "encrypt: false"));
-        assert!(
-            script.contains("VAR_PART_BYTES=$(( FINAL_SIZE + 0 ))"),
-            "a plaintext runtime keeps the exact image size"
-        );
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other
