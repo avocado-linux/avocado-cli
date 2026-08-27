@@ -35,6 +35,16 @@ the SDK as `FIT.key`/`FIT.crt` (the template's `key-name-hint`). With
 root hash rides in the FIT. RSA keys are file-based only: `mkimage` cannot use
 a PKCS#11 URI.
 
+With `fit_key` set the build also rebuilds the feed's bootloader so U-Boot
+*requires* that key (`signing.fit_key_in_bootloader`, default `true`): on
+i.MX8M the public key is injected into the U-Boot control DTB and `imx-boot`
+is re-packed from the feed's own inputs with the procedure the feed ships
+(`imx-boot-tools/rekey-imx-boot.sh`). The re-packed images take the feed's
+file names, so `avocado provision` flashes a bootloader that is closed to the
+project key from the first boot. Set it to `false` to keep the distro
+bootloader (a feed built with `verified-boot` enforces the distro key
+instead).
+
 
 ### Creating Keys
 

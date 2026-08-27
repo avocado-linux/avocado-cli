@@ -751,7 +751,13 @@ impl RuntimeBuildCommand {
         }
         let fit_keys_tempdir: Option<tempfile::TempDir> = match fit_key_name {
             Some(ref name) => {
-                let (key, cert) = crate::utils::signing_keys::pem_key_files(name)?;
+                let (key, cert, algorithm) = crate::utils::signing_keys::pem_key_files(name)?;
+                // mkimage's algo string for the FIT signature nodes and for
+                // fdt_add_pubkey: "<hash>,<rsaNNNN>".
+                env_vars.insert(
+                    "AVOCADO_FIT_ALGO".to_string(),
+                    format!("sha256,{algorithm}"),
+                );
                 let dir = tempfile::Builder::new()
                     .prefix("avocado-fit-keys-")
                     .tempdir()
@@ -771,6 +777,11 @@ impl RuntimeBuildCommand {
         let fit_keydir_host_path: Option<String> = fit_keys_tempdir
             .as_ref()
             .map(|d| d.path().to_string_lossy().into_owned());
+        if fit_keys_tempdir.is_some()
+            && config.get_runtime_fit_key_in_bootloader(&self.runtime_name)
+        {
+            env_vars.insert("AVOCADO_FIT_KEY_IN_BOOTLOADER".to_string(), "1".to_string());
+        }
 
         // The in-container sign_amf shell helper checks
         // $AVOCADO_AMF_KOS. Only kos runtimes set it; everyone else
@@ -3367,6 +3378,35 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
         FIT_SIGN_ARGS=""
         if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
             FIT_SIGN_ARGS="-k $AVOCADO_FIT_KEY_DIR -r"
+            # A feed built without verified-boot ships a template whose
+            # configuration nodes carry no signature-* subnode, and mkimage -r
+            # then signs nothing without complaint. Give every configuration
+            # one (algo, key-name-hint "FIT", sign-images = the image
+            # properties that configuration actually names) unless the
+            # template already has them. The result is checked below.
+            if ! grep -qE '^[[:space:]]*signature-[0-9]+ \{' "$FIT_WORK_ITS"; then
+                awk -v algo="${AVOCADO_FIT_ALGO:-sha256,rsa2048}" '
+                    /^[[:space:]]*conf-[^[:space:]]+ \{$/ { inconf=1; imgs=""; depth=0 }
+                    inconf && /^[[:space:]]*(kernel|fdt|ramdisk|loadables) = / {
+                        p=$1; imgs = imgs (imgs==""?"":", ") "\"" p "\""
+                    }
+                    inconf && /\{[[:space:]]*$/ { depth++ }
+                    inconf && /^[[:space:]]*\};/ {
+                        depth--
+                        if (depth==0) {
+                            print "\t\t\tsignature-1 {"
+                            print "\t\t\t\talgo = \"" algo "\";"
+                            print "\t\t\t\tkey-name-hint = \"FIT\";"
+                            print "\t\t\t\tsign-images = " imgs ";"
+                            print "\t\t\t};"
+                            inconf=0
+                        }
+                    }
+                    { print }
+                ' "$FIT_WORK_ITS" > "$FIT_WORK_ITS.signed" && mv "$FIT_WORK_ITS.signed" "$FIT_WORK_ITS"
+                grep -qE '^[[:space:]]*signature-1 \{' "$FIT_WORK_ITS" \
+                    || { echo "ERROR: could not add signature nodes to the FIT configurations in $FIT_ITS" >&2; exit 1; }
+            fi
         else
             # Explicitly unsigned: strip the signature nodes so mkimage does not look for a key.
             sed -i -E '/^[[:space:]]*signature-[0-9]+ \{/,/^[[:space:]]*\};/d' "$FIT_WORK_ITS"
@@ -3376,7 +3416,36 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
             || { echo "ERROR: mkimage failed to assemble the boot FIT" >&2; exit 1; }
         [ -s "$OUTPUT_DIR/fitImage" ] || { echo "ERROR: boot FIT was not produced" >&2; exit 1; }
         mkimage -l "$OUTPUT_DIR/fitImage" | grep -E 'Default Configuration|Sign algo' | head -2 | sed 's/^/  /'
+        if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
+            # Prove the signature exists rather than trust mkimage's silence.
+            mkimage -l "$OUTPUT_DIR/fitImage" | grep -q 'Sign algo' \
+                || { echo "ERROR: boot FIT was built but carries no configuration signature" >&2; exit 1; }
+        fi
         echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
+        # Make the bootloader enforce that key. The feed ships the procedure and
+        # its inputs (imx-boot-tools/rekey-imx-boot.sh + rekey.env, i.MX8M); the
+        # re-packed images take the feed's file names, so stone's imx_boot* image
+        # keys resolve to them ahead of the SDK's copies. A feed without the
+        # tooling is an error, not a silent distro bootloader: a project that
+        # asked for its key in the bootloader must not ship one that ignores it.
+        if [ "${AVOCADO_FIT_KEY_IN_BOOTLOADER:-0}" = "1" ]; then
+            REKEY="$OUTPUT_DIR/imx-boot-tools/rekey-imx-boot.sh"
+            if [ ! -x "$REKEY" ]; then
+                echo "ERROR: signing.fit_key_in_bootloader is on but this feed ships no imx-boot-tools/rekey-imx-boot.sh for $TARGET_ARCH. Set signing.fit_key_in_bootloader: false to keep the distro bootloader." >&2
+                exit 1
+            fi
+            echo "Rebuilding the bootloader to enforce the FIT key..."
+            "$REKEY" "$OUTPUT_DIR/imx-boot-tools" "$AVOCADO_FIT_KEY_DIR" "$OUTPUT_DIR" "${AVOCADO_FIT_ALGO:-sha256,rsa2048}" \
+                || { echo "ERROR: bootloader re-key failed" >&2; exit 1; }
+            # The keyed control DTB is what U-Boot will verify with; run that
+            # verification here so a mismatch fails the build, not the boot.
+            KEYED_DTB=$(ls "$OUTPUT_DIR"/u-boot-*.dtb.keyed 2>/dev/null | head -1)
+            if [ -n "$KEYED_DTB" ] && command -v fit_check_sign >/dev/null 2>&1; then
+                fit_check_sign -f "$OUTPUT_DIR/fitImage" -k "$KEYED_DTB" >/dev/null 2>&1 \
+                    || { echo "ERROR: the re-keyed bootloader does not verify this runtime's boot FIT" >&2; exit 1; }
+                echo "Bootloader re-keyed: fitImage verifies against $(basename "$KEYED_DTB")"
+            fi
+        fi
     fi
 fi
 "#
@@ -3401,6 +3470,10 @@ mod tests {
             "rootfs root hash must be embedded in the FIT"
         );
         assert!(s.contains("-k $AVOCADO_FIT_KEY_DIR -r"), "signing path");
+        assert!(
+            s.contains("rekey-imx-boot.sh") && s.contains("AVOCADO_FIT_KEY_IN_BOOTLOADER"),
+            "bootloader re-key runs only when asked, and fails closed without the feed tooling"
+        );
         assert!(
             s.contains("signature-[0-9]+"),
             "unsigned path must strip signature nodes"

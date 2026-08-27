@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reproducible from `avocado.yaml` alone. `signing.fit_unsigned: true` is the
   explicit opt-out. Replaces the interim `AVOCADO_FIT_KEY_DIR` /
   `AVOCADO_FIT_UNSIGNED` environment variables, which are no longer read.
+  With `fit_key` set the build also re-packs the feed's bootloader so U-Boot
+  enforces that key (`signing.fit_key_in_bootloader`, default true; i.MX8M via
+  the feed's `imx-boot-tools/rekey-imx-boot.sh`), so provisioning writes a
+  bootloader closed to the project key from the first flash.
 - **`runtimes.<name>.var.encrypt: true` — encrypted `/var`.** Opts a runtime
   into a LUKS2 `/var` sealed to the target's hardware key store (OP-TEE fTPM
   on Jetson). The cli adds `cryptsetup-var` to the initramfs and

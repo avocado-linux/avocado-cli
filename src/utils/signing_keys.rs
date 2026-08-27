@@ -698,7 +698,7 @@ pub fn save_pem_keypair(keyid: &str, key_pem: &[u8], cert_pem: &[u8]) -> Result<
 /// Resolves `name` as a registry name or a key id. Refuses anything that is
 /// not a file-backed PEM key: the ed25519 seeds are for the cli's own signer,
 /// and a PKCS#11 URI cannot be handed to `mkimage` as a directory.
-pub fn pem_key_files(name: &str) -> Result<(PathBuf, PathBuf)> {
+pub fn pem_key_files(name: &str) -> Result<(PathBuf, PathBuf, String)> {
     let entries = get_key_entries(std::slice::from_ref(&name.to_string()))?;
     let (registry_name, entry) = entries
         .into_iter()
@@ -729,7 +729,7 @@ pub fn pem_key_files(name: &str) -> Result<(PathBuf, PathBuf)> {
             );
         }
     }
-    Ok((key, cert))
+    Ok((key, cert, entry.algorithm))
 }
 
 #[cfg(test)]

@@ -588,6 +588,15 @@ pub struct SigningConfig {
     /// unsigned boot image is never the accidental result of a missing key.
     #[serde(default)]
     pub fit_unsigned: Option<bool>,
+    /// Also rebuild the feed's bootloader so U-Boot enforces `fit_key`
+    /// (i.MX8M: the public key goes into the control DTB and imx-boot is
+    /// re-packed from the feed's own inputs, using the tooling the feed ships
+    /// in `imx-boot-tools/`). Default true whenever `fit_key` is set: a signed
+    /// FIT that the bootloader does not require is only half the feature.
+    /// Set false to keep the distro bootloader (e.g. a feed built with
+    /// `verified-boot`, where the distro key is the one enforced).
+    #[serde(default)]
+    pub fit_key_in_bootloader: Option<bool>,
 }
 
 fn default_checksum_algorithm() -> String {
@@ -4202,6 +4211,17 @@ impl Config {
                 .filter(|k| !k.trim().is_empty()),
             signing.and_then(|s| s.fit_unsigned).unwrap_or(false),
         )
+    }
+
+    /// Whether the bootloader should be rebuilt to enforce `fit_key`
+    /// (`signing.fit_key_in_bootloader`, default true).
+    pub fn get_runtime_fit_key_in_bootloader(&self, runtime_name: &str) -> bool {
+        self.runtimes
+            .as_ref()
+            .and_then(|r| r.get(runtime_name))
+            .and_then(|r| r.signing.as_ref())
+            .and_then(|s| s.fit_key_in_bootloader)
+            .unwrap_or(true)
     }
 
     /// Get the declared content key name for a runtime (for signing delegated-targets only).
