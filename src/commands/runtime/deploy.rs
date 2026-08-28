@@ -703,14 +703,31 @@ fi
 # refuses the extension. Refuse here instead, where the author can act on it.
 # Only EXTENSION root hashes matter: the manifest's top-level root_hash is the
 # rootfs verity hash, which travels in the boot FIT and needs no sidecar here.
-if python3 -c '
+# Exit 0: an extension carries root_hash (key present, as `connect upload`
+# tests it). Exit 1: none does. Exit 2: the manifest could not be read or is
+# not the expected shape - that must stop the deploy too, never pass as "no
+# verity".
+python3 -c '
 import json, sys
-m = json.load(open(sys.argv[1]))
-sys.exit(0 if any(e.get("root_hash") for e in m.get("extensions", [])) else 1)
-' "$MANIFEST_FILE"; then
-    echo "ERROR: this runtime has extensions with image.verity: true; deploy does not publish their dm-verity hash trees yet, so the device would refuse them. Provision instead, or build without verity." >&2
-    exit 1
-fi
+try:
+    m = json.load(open(sys.argv[1]))
+    exts = m["extensions"]
+    if not isinstance(exts, list):
+        raise TypeError("extensions is not a list")
+except Exception as e:
+    print("manifest %s: %s" % (sys.argv[1], e), file=sys.stderr)
+    sys.exit(2)
+sys.exit(0 if any(isinstance(e, dict) and "root_hash" in e for e in exts) else 1)
+' "$MANIFEST_FILE"
+case $? in
+    0)
+        echo "ERROR: this runtime has extensions with image.verity: true; deploy does not publish their dm-verity hash trees yet, so the device would refuse them. Provision instead, or build without verity." >&2
+        exit 1 ;;
+    1) ;;
+    *)
+        echo "ERROR: could not read the runtime manifest to check for extension verity" >&2
+        exit 1 ;;
+esac
 
 # Read root.json
 ROOT_JSON_FILE="$VAR_STAGING/lib/avocado/metadata/root.json"
@@ -1160,8 +1177,12 @@ mod tests {
         );
         let s = cmd.create_hash_collection_script("x86_64");
         assert!(
-            s.contains("m.get(\"extensions\", [])"),
-            "checks extensions, not the whole file"
+            s.contains("\"root_hash\" in e for e in exts"),
+            "checks key presence on extensions, not the whole file"
+        );
+        assert!(
+            s.contains("sys.exit(2)"),
+            "an unreadable manifest is its own failure"
         );
         assert!(!s.contains("grep -q '\"root_hash\"'"), "no whole-file grep");
     }
