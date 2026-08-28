@@ -2687,15 +2687,10 @@ kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
 {post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
 FINAL_MB=$(( FINAL_SIZE / 1048576 ))
-# The var partition is sized from the image (stone --partition-size) and only
-# grown to the disk later, by whatever runs on the device. Always leave room
-# for a LUKS2 header in front of the data (cryptsetup reencrypt
-# --reduce-device-size 32M; 64 MiB covers it and the shrink granularity btrfs
-# needs), whether or not this runtime encrypts: a device flashed plaintext must
-# still be able to turn var.encrypt on over an update later, and its partition
-# may never have been grown. var is the last partition, so nothing else moves;
-# the cost is 64 MiB of a sparse-flashed image.
-VAR_PART_BYTES=$(( FINAL_SIZE + 67108864 ))
+# The var partition is sized from the image: stone adds the headroom a later
+# in-place LUKS2 conversion needs (see stone's resolve_partition_size_bytes),
+# so the same policy applies here and to `avocado provision`.
+VAR_PART_BYTES=$FINAL_SIZE
 echo ""
 echo "Built var image: ${{FINAL_MB}}MB"
 
@@ -4153,37 +4148,6 @@ runtimes:
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
-    }
-
-    #[test]
-    fn the_var_partition_always_leaves_room_for_a_luks_header() {
-        let temp_dir = TempDir::new().unwrap();
-        let content = r#"
-connect:
-  org: test
-
-runtimes:
-  test-runtime:
-    target: "x86_64"
-"#;
-        let config_path = create_test_config_file(&temp_dir, content);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
-        let cmd = RuntimeBuildCommand::new(
-            "test-runtime".to_string(),
-            config_path,
-            false,
-            Some("x86_64".to_string()),
-            None,
-            None,
-        );
-        let config = Config::load(&cmd.config_path).unwrap();
-        let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &[])
-            .unwrap();
-        // Even a plaintext runtime: the device must be able to turn var.encrypt
-        // on later, and its partition may never have been grown by then.
-        assert!(script.contains("VAR_PART_BYTES=$(( FINAL_SIZE + 67108864 ))"));
-        assert!(script.contains("--partition-size \"var=$VAR_PART_BYTES\""));
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other
