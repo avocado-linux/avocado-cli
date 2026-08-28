@@ -701,7 +701,13 @@ fi
 # Extension dm-verity trees (<image_id>.verity) are not published by this path
 # yet - only the images are - and a device given a root_hash without its tree
 # refuses the extension. Refuse here instead, where the author can act on it.
-if grep -q '"root_hash"' "$MANIFEST_FILE"; then
+# Only EXTENSION root hashes matter: the manifest's top-level root_hash is the
+# rootfs verity hash, which travels in the boot FIT and needs no sidecar here.
+if python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+sys.exit(0 if any(e.get("root_hash") for e in m.get("extensions", [])) else 1)
+' "$MANIFEST_FILE"; then
     echo "ERROR: this runtime has extensions with image.verity: true; deploy does not publish their dm-verity hash trees yet, so the device would refuse them. Provision instead, or build without verity." >&2
     exit 1
 fi
@@ -1139,6 +1145,27 @@ async fn prepare_mac_deploy_net(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hash_collection_refuses_only_extension_root_hashes() {
+        // A rootfs verity hash lives at the manifest's top level and needs no
+        // sidecar; only extensions[].root_hash must trip the refusal.
+        let cmd = RuntimeDeployCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            "root@host".to_string(),
+            None,
+            None,
+        );
+        let s = cmd.create_hash_collection_script("x86_64");
+        assert!(
+            s.contains("m.get(\"extensions\", [])"),
+            "checks extensions, not the whole file"
+        );
+        assert!(!s.contains("grep -q '\"root_hash\"'"), "no whole-file grep");
+    }
+
     use super::*;
 
     // --- DeviceSpec parsing tests ---
