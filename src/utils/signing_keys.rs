@@ -647,11 +647,18 @@ pub fn is_pem_algorithm(algorithm: &str) -> bool {
 /// same certificate imported twice gets the same id regardless of line
 /// wrapping or trailing whitespace.
 pub fn keyid_for_pem_cert(cert_pem: &str) -> Result<String> {
-    let body: String = cert_pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .map(str::trim)
-        .collect();
+    // Insist on the CERTIFICATE label: a private key or any other PEM block
+    // would also base64-decode, and a key id silently derived from the wrong
+    // file only surfaces later as a FIT that does not verify.
+    let mut lines = cert_pem.lines().map(str::trim).filter(|l| !l.is_empty());
+    match lines.next() {
+        Some("-----BEGIN CERTIFICATE-----") => {}
+        Some(other) => anyhow::bail!(
+            "expected a PEM X.509 certificate (-----BEGIN CERTIFICATE-----), found {other:?}"
+        ),
+        None => anyhow::bail!("certificate file is empty"),
+    }
+    let body: String = lines.take_while(|l| !l.starts_with("-----END")).collect();
     let der = BASE64_STANDARD
         .decode(body.as_bytes())
         .context("certificate is not a PEM-encoded X.509 certificate")?;
@@ -680,11 +687,26 @@ pub fn save_pem_keypair(keyid: &str, key_pem: &[u8], cert_pem: &[u8]) -> Result<
     let base_path = get_key_file_path(keyid)?;
     let key_path = base_path.with_extension("key");
     let cert_path = base_path.with_extension("crt");
-    fs::write(&key_path, key_pem)
+    // Create the key file 0600 from the start rather than tightening after the
+    // write: with a permissive umask the bytes would otherwise be readable in
+    // the window between the two.
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&key_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(key_pem)
+        })
         .with_context(|| format!("Failed to write private key: {}", key_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // An existing file keeps its old mode through OpenOptions; make sure.
         fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
     }
@@ -756,6 +778,12 @@ mod pem_tests {
         assert!(
             keyid_for_pem_cert("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").is_err()
         );
+        // A PEM block that is not a certificate - the private key handed in by
+        // mistake - is refused by its label, not accepted because it decodes.
+        assert!(keyid_for_pem_cert(
+            "-----BEGIN PRIVATE KEY-----\nAAECAwQFBgc=\n-----END PRIVATE KEY-----\n"
+        )
+        .is_err());
     }
 
     #[test]
