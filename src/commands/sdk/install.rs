@@ -628,10 +628,17 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 async {
                     let result = $fut.await;
                     if let Some(r) = crate::utils::tui::get_active_renderer() {
-                        if result.is_ok() {
-                            r.set_status(&$task_id, TaskStatus::Success);
-                        } else {
-                            r.set_status(&$task_id, TaskStatus::Failed);
+                        match &result {
+                            Ok(_) => r.set_status(&$task_id, TaskStatus::Success),
+                            Err(e) => {
+                                // Same shape as the scheduler executor: the
+                                // message must be set for --json to emit a
+                                // step_error event; a bare Failed status
+                                // carries no reason and print_error is
+                                // suppressed in that mode.
+                                r.set_error(&$task_id, format!("{e:#}"));
+                                r.set_status(&$task_id, TaskStatus::Failed);
+                            }
                         }
                     }
                     result

@@ -274,6 +274,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy surfaces container script stderr instead of a generic failure;
   `connect auth` honors `--org` before the zero-orgs shortcut; PTY allocation
   derives from the environment; abandoned build volumes are reaped.
+- **`avocado install` / `rootfs install` / `initramfs install` exit non-zero
+  when a sysroot install could not finish.** Three cases previously reported
+  success and wrote a current install stamp: the sysroot could not be cleaned
+  before a kernel change, the installed package versions could not be read
+  back, or the kernel sysroot could not be staged. Each now fails with the
+  reason (also emitted under `--json`) and leaves no stamp, so the next run
+  repairs instead of reporting "up to date". The lock is still saved whenever
+  packages landed, so a failed run cannot leave the kernel pin out of step
+  with the disk.
 - **`source_date_epoch` is honored outside extension images.** The key was
   read only by `ext image`, which exports it inside its own script. The rootfs
   build script has always passed `-T "${SOURCE_DATE_EPOCH:-0}"` to

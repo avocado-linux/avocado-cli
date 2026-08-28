@@ -7,7 +7,7 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
     lockfile::{LockFile, SysrootType},
-    output::{print_error, OutputLevel},
+    output::{print_error, print_warning_stderr, OutputLevel},
     runs_on::RunsOnContext,
     target::validate_and_log_target,
 };
@@ -196,10 +196,9 @@ impl InitramfsInstallCommand {
             (Ok(()), _) => lock_file.save(src_dir),
             (Err(e), true) => {
                 if let Err(save_err) = lock_file.save(src_dir) {
-                    print_error(
-                        &format!("Failed to save lock file: {save_err}"),
-                        OutputLevel::Normal,
-                    );
+                    // stderr, not print_error: under --json print_error is
+                    // suppressed and this notice must survive.
+                    print_warning_stderr(&format!("Failed to save lock file: {save_err}"));
                 }
                 Err(e)
             }

@@ -53,7 +53,9 @@ use crate::utils::{
     kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
     kernel_version::substitute_kernel_version,
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
-    output::{print_error, print_info, print_success, print_warning, OutputLevel},
+    output::{
+        print_error, print_info, print_success, print_warning, print_warning_stderr, OutputLevel,
+    },
     prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
@@ -96,12 +98,14 @@ pub struct SysrootInstallParams<'a> {
     pub prefetched_stamp: Option<Stamp>,
     /// TUI context for output capture (if TUI is active).
     pub tui_context: Option<crate::utils::container::TuiContext>,
-    /// Set by [`install_sysroot`] once the packages have landed and it has
-    /// recorded this sysroot's pins into `lock_file`. It stays set when the
-    /// install then fails, because the pins describe what is genuinely on
-    /// disk: a caller that drops them leaves the next run to re-resolve the
-    /// kernel against feed head with no `prev_pinned_kver` to compare against
-    /// and install additively on top. Callers must persist (or merge) the lock
+    /// Set by [`install_sysroot`] the moment the package install has landed on
+    /// disk. From then on `lock_file` describes that disk - the kernel pin
+    /// chosen for it, the sections cleared for a clean reinstall, and (when
+    /// they could be read) the installed package versions - so it must be
+    /// persisted whatever happens next. It stays set when the install then
+    /// fails: a caller that drops the lock leaves disk holding kernel B while
+    /// the lock still says A, and the next run honors A's pin and installs
+    /// additively on top of B. Callers must persist (or merge) the lock
     /// whenever this is true, whatever the returned `Result` says.
     pub pins_recorded: bool,
 }
@@ -301,9 +305,9 @@ fn incomplete_install_reason(
     } else {
         kernel_staging_error.map(|detail| {
             format!(
-                "the kernel sysroot could not be staged ({detail}). The rootfs sysroot's /boot \
-                 has no kernel image for this kernel version, so the packages that were \
-                 installed do not include a bootable kernel"
+                "the kernel sysroot could not be staged ({detail}). Verify that the rootfs \
+                 sysroot's /boot contains a kernel image for this kernel version; without one \
+                 the packages that were installed do not include a bootable kernel"
             )
         })
     }
@@ -1080,6 +1084,10 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
 
     if success {
         print_success(&format!("Installed {label} sysroot."), OutputLevel::Normal);
+        // Packages are on disk: the lock's kernel pin and cleared sections now
+        // describe it, whether or not the version query below succeeds. Tell
+        // the caller before anything else can fail.
+        params.pins_recorded = true;
 
         // Query installed versions for ALL config packages and update lock file
         let installed_versions = params
@@ -1114,10 +1122,6 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 &params.sysroot_type,
                 installed_versions,
             );
-            // From here the lock describes what is on disk. Everything below
-            // can still fail the install, so tell the caller to keep the pins
-            // regardless of what this function returns.
-            params.pins_recorded = true;
             if params.verbose {
                 print_info(
                     &format!("Updated lock file with {label} package versions."),
@@ -1408,10 +1412,9 @@ impl RootfsInstallCommand {
             (Ok(()), _) => lock_file.save(src_dir),
             (Err(e), true) => {
                 if let Err(save_err) = lock_file.save(src_dir) {
-                    print_error(
-                        &format!("Failed to save lock file: {save_err}"),
-                        OutputLevel::Normal,
-                    );
+                    // stderr, not print_error: under --json print_error is
+                    // suppressed and this notice must survive.
+                    print_warning_stderr(&format!("Failed to save lock file: {save_err}"));
                 }
                 Err(e)
             }
