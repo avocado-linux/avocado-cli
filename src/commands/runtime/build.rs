@@ -2682,15 +2682,24 @@ mkfs.btrfs -r "$VAR_DIR" \
 {mkfs_flags} \
 {global_compress_flag}    -f "$VAR_IMAGE"
 
+# var.encrypt: the first boot converts this filesystem to LUKS2 in place, which
+# needs 32 MiB in front of the data (cryptsetup reencrypt --reduce-device-size)
+# that cryptsetup-var obtains by shrinking the filesystem. `mkfs.btrfs -r`
+# packs its chunks to the content, so a tight image has nothing to shrink into;
+# rebuild it at the tight size plus 64 MiB so the room is inside the filesystem
+# the runtime declared it needs. The partition stays exactly the image size.
+if [ "{var_luks_room}" = "1" ]; then
+    VAR_TIGHT_SIZE=$(stat -c%s "$VAR_IMAGE")
+    mkfs.btrfs -r "$VAR_DIR" \
+{mkfs_flags} \
+{global_compress_flag}    -b $(( VAR_TIGHT_SIZE + 67108864 )) -f "$VAR_IMAGE"
+fi
+
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
 
 {post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
 FINAL_MB=$(( FINAL_SIZE / 1048576 ))
-# The var partition is sized from the image: stone adds the headroom a later
-# in-place LUKS2 conversion needs (see stone's resolve_partition_size_bytes),
-# so the same policy applies here and to `avocado provision`.
-VAR_PART_BYTES=$FINAL_SIZE
 echo ""
 echo "Built var image: ${{FINAL_MB}}MB"
 
@@ -2744,7 +2753,7 @@ stone bundle \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
     $STONE_OVERLAY_FLAG \
-    --partition-size "var=$VAR_PART_BYTES" \
+    --partition-size "var=$FINAL_SIZE" \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
 
@@ -2847,6 +2856,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             update_authority_section = update_authority_section,
             docker_section = docker_section,
             device_tree_overlay_section = device_tree_overlay_section,
+            var_luks_room = if var_encrypt(target_arch) { "1" } else { "0" },
         );
 
         Ok(script)
@@ -4148,6 +4158,52 @@ runtimes:
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
+    }
+
+    #[test]
+    fn var_encrypt_builds_the_var_image_with_room_to_shrink_for_the_luks_header() {
+        let temp_dir = TempDir::new().unwrap();
+        let on = r#"
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    var:
+      encrypt: true
+"#;
+        let build = |content: &str| {
+            let config_path = create_test_config_file(&temp_dir, content);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let cmd = RuntimeBuildCommand::new(
+                "test-runtime".to_string(),
+                config_path,
+                false,
+                Some("x86_64".to_string()),
+                None,
+                None,
+            );
+            let config = Config::load(&cmd.config_path).unwrap();
+            cmd.create_build_script(&config, &parsed, "x86_64", &[])
+                .unwrap()
+        };
+        let script = build(on);
+        assert!(
+            script.contains("if [ \"1\" = \"1\" ]; then"),
+            "second mkfs pass is armed"
+        );
+        assert!(script.contains("-b $(( VAR_TIGHT_SIZE + 67108864 ))"));
+        assert!(
+            script.contains("--partition-size \"var=$FINAL_SIZE\""),
+            "partition stays the image size"
+        );
+
+        let script = build(&on.replace("encrypt: true", "encrypt: false"));
+        assert!(
+            script.contains("if [ \"0\" = \"1\" ]; then"),
+            "plaintext runtime keeps the tight image"
+        );
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other
