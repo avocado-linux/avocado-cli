@@ -23,7 +23,7 @@ use tokio::process::Command as AsyncCommand;
 use crate::utils::config::Config;
 use crate::utils::output::{print_info, OutputLevel};
 use crate::utils::output_format::{emit_json_object, OutputFormat};
-use crate::utils::target::resolve_target;
+use crate::utils::target::resolve_target as resolve_config_target;
 use crate::utils::volume::VolumeState;
 
 pub struct ProfilesListCommand {
@@ -184,16 +184,6 @@ impl ProfilesListCommand {
     /// helpful prose message in human mode. Always exits Ok so the
     /// desktop app can distinguish "no profiles yet" from "command
     /// failed" via the JSON shape rather than process exit code.
-    /// The target whose stone manifest `--list` reads.
-    ///
-    /// Delegates to [`resolve_target`] so this command agrees with the rest of
-    /// the CLI -- and with the interpolation that produced its own composed
-    /// config, which reads AVOCADO_TARGET too. A local
-    /// flag-then-`default_target` chain here made the two disagree.
-    fn resolve_target(&self, config: &Config) -> Option<String> {
-        resolve_target(self.target.as_deref(), config)
-    }
-
     fn bail_unavailable(&self, target: Option<&str>, reason: &str) -> Result<()> {
         if self.output.is_json() {
             emit_json_object(&json!({
@@ -205,6 +195,16 @@ impl ProfilesListCommand {
             print_info(reason, OutputLevel::Normal);
         }
         Ok(())
+    }
+
+    /// The target whose stone manifest `--list` reads.
+    ///
+    /// Delegates to [`resolve_config_target`] so this command agrees with the
+    /// rest of the CLI -- and with the interpolation that produced its own
+    /// composed config, which reads AVOCADO_TARGET too. A local
+    /// flag-then-`default_target` chain here made the two disagree.
+    fn resolve_target(&self, config: &Config) -> Option<String> {
+        resolve_config_target(self.target.as_deref(), config)
     }
 
     /// Spin up a one-shot container with the project's SDK volume
@@ -434,7 +434,10 @@ mod tests {
     fn default_target_still_applies_when_nothing_overrides_it() {
         let config = Config::load_from_str("default_target: imx8mp-evk\n").unwrap();
         std::env::remove_var("AVOCADO_TARGET");
-        assert_eq!(resolve_target(None, &config).as_deref(), Some("imx8mp-evk"));
+        assert_eq!(
+            cmd(None).resolve_target(&config).as_deref(),
+            Some("imx8mp-evk")
+        );
     }
 
     #[test]
