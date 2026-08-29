@@ -2584,6 +2584,7 @@ echo "Docker image priming complete.""#,
             initramfs_post_install.as_deref(),
             &initramfs_permissions_section,
             var_encrypt(target_arch),
+            &config.get_runtime_var_hardware(&self.runtime_name),
         );
 
         let script = format!(

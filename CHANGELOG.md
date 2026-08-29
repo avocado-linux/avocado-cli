@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.0-rc.2] - 2026-08-28
 
 ### Added
+- **`runtimes.<name>.var.recovery` and `avocado var-key` — an operator-held
+  recovery key for the encrypted `/var`.** `var.recovery` names a registry
+  secret (`avocado signing-keys create <name> --algorithm hmac-sha256`, a new
+  secret key kind) that is a *master*; nothing derived from it enters a build.
+  `avocado var-key enroll <runtime> --device user@host` reads the device's SoC
+  UID over SSH, derives that unit's passphrase as HMAC-SHA256(master, UID) and
+  hands it to `avocadoctl var-key enroll`, which adds it as a LUKS2 keyslot
+  (token `avocado-recovery`). `avocado var-key derive <runtime> --uid <UID>
+  [--raw]` reproduces it on a bench to recover a unit whose hardware keyslot is
+  gone. Once enrolled, the initrd retires the SoC-UID-derived keyslot.
+- **`runtimes.<name>.var.hardware`** — `auto` (default: bind to whatever engine
+  the machine ships, degrade and report), `caam` / `tpm2` (that engine must
+  hold a keyslot; the initrd refuses to boot `/var` on the derived key when it
+  is missing), `none` (no hardware keyslot; requires `var.recovery`). Validated
+  at config load; an explicit choice rides in the initramfs as
+  `/etc/avocado/var-hardware`.
 - **`runtimes.<name>.signing.fit_key` — boot-FIT signing from the key registry.**
   Names an RSA PEM key (`avocado signing-keys import <name> --key --cert`, or
   `signing-keys create <name> --algorithm rsa2048`) that the runtime build

@@ -81,6 +81,7 @@ use commands::signing_keys::{
 use commands::unlock::UnlockCommand;
 use commands::update::UpdateCommand;
 use commands::upgrade::UpgradeCommand;
+use commands::var_key::{VarKeyDeriveCommand, VarKeyEnrollCommand};
 
 #[derive(Parser)]
 #[command(name = "avocado")]
@@ -504,6 +505,12 @@ enum Commands {
     SigningKeys {
         #[command(subcommand)]
         command: SigningKeysCommands,
+    },
+    /// Operator-held recovery key for an encrypted /var (runtimes.<r>.var.recovery)
+    #[command(name = "var-key")]
+    VarKey {
+        #[command(subcommand)]
+        command: VarKeyCommands,
     },
     /// Sign runtime images (shortcut for 'runtime sign')
     Sign {
@@ -1441,6 +1448,38 @@ enum ConnectAuthCommands {
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum VarKeyCommands {
+    /// Enrol this device's recovery keyslot: derive HMAC(master, SoC UID) and hand it to avocadoctl over SSH
+    Enroll {
+        /// Runtime whose var.recovery names the master secret
+        runtime: String,
+        /// Device to enrol, as user@host[:port]
+        #[arg(short, long)]
+        device: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Show the device's output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Print the recovery passphrase for a device UID (bench recovery of a unit's /var)
+    Derive {
+        /// Runtime whose var.recovery names the master secret
+        runtime: String,
+        /// The device's SoC UID as it reports it (device tree serial-number, or soc0 serial_number)
+        #[arg(long)]
+        uid: String,
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config: String,
+        /// Emit the raw 32 bytes instead of hex, for `cryptsetup --key-file -`
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -2495,6 +2534,35 @@ async fn main() -> Result<()> {
             deploy_cmd.execute().await?;
             Ok(())
         }
+        Commands::VarKey { command } => match command {
+            VarKeyCommands::Enroll {
+                runtime,
+                device,
+                config,
+                verbose,
+            } => {
+                VarKeyEnrollCommand {
+                    config_path: config,
+                    runtime,
+                    device,
+                    verbose,
+                }
+                .execute()
+                .await
+            }
+            VarKeyCommands::Derive {
+                runtime,
+                uid,
+                config,
+                raw,
+            } => VarKeyDeriveCommand {
+                config_path: config,
+                runtime,
+                uid,
+                raw,
+            }
+            .execute(),
+        },
         Commands::SigningKeys { command } => match command {
             SigningKeysCommands::Create {
                 name,

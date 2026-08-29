@@ -904,3 +904,166 @@ mod pem_tests {
         assert!(!is_pem_algorithm("ecdsa-p256"));
     }
 }
+// ---------------------------------------------------------------------------
+// Secret (symmetric) keys: `--algorithm hmac-sha256`. A master the operator
+// holds; per-device material is *derived* from it and never stored.
+// ---------------------------------------------------------------------------
+
+/// The one secret-key algorithm the registry knows.
+pub const SECRET_ALGORITHM: &str = "hmac-sha256";
+pub const SECRET_KEY_BYTES: usize = 32;
+/// Domain separator so a var recovery passphrase can never collide with any
+/// other derivation from the same master.
+const VAR_RECOVERY_INFO: &[u8] = b"avocado-var-recovery\0";
+
+pub fn is_secret_algorithm(algorithm: &str) -> bool {
+    algorithm == SECRET_ALGORITHM
+}
+
+/// keyid of a secret: SHA-256 over a fixed prefix and the secret, so the id is
+/// stable, never equal to a hash anyone else computes over the bare bytes, and
+/// leaks nothing about a 256-bit random master.
+pub fn keyid_for_secret(secret: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"avocado-secret-keyid\0");
+    h.update(secret);
+    hex::encode(&h.finalize()[..])
+}
+
+/// Store a secret master as `<keyid>.secret`, mode 0600, and return the file URI.
+pub fn save_secret_key(keyid: &str, secret: &[u8]) -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = get_key_file_path(keyid)?.with_extension("secret");
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    f.write_all(secret)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path_to_file_uri(&path))
+}
+
+/// The master bytes of a registry secret. File-backed only for now; a
+/// `pkcs11:` secret is refused with a pointer to what is missing rather than
+/// pretending (the HSM would compute the HMAC itself, see the recovery-key brief).
+pub fn secret_key_bytes(name: &str) -> Result<Vec<u8>> {
+    let entries = get_key_entries(std::slice::from_ref(&name.to_string()))?;
+    let (registry_name, entry) = entries
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("key '{name}' is not in the registry"))?;
+    if !is_secret_algorithm(&entry.algorithm) {
+        anyhow::bail!(
+            "key '{registry_name}' is {} - a var recovery master must be a secret key \
+             (`avocado signing-keys create {registry_name} --algorithm {SECRET_ALGORITHM}`)",
+            entry.algorithm
+        );
+    }
+    if !is_file_uri(&entry.uri) {
+        anyhow::bail!(
+            "key '{registry_name}' is {} - deriving a recovery passphrase from a PKCS#11 \
+             secret is not supported yet (the token would have to compute the HMAC)",
+            entry.uri
+        );
+    }
+    let path = PathBuf::from(entry.uri.trim_start_matches("file://"));
+    let bytes = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() >= 16,
+        "secret '{registry_name}' at {} is too short to be a master key",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+/// HMAC-SHA256 (RFC 2104) over sha2 - no extra dependency for ten lines.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key)[..]);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    let inner = Sha256::new()
+        .chain_update(&ipad)
+        .chain_update(msg)
+        .finalize();
+    let mac = Sha256::new()
+        .chain_update(&opad)
+        .chain_update(&inner[..])
+        .finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac[..]);
+    out
+}
+
+/// The /var recovery passphrase of one device: HMAC(master, info || SoC UID).
+/// The device only ever sees this value; recovering any unit later is the same
+/// computation from its UID. 32 raw bytes, fed to the device verbatim.
+pub fn derive_var_recovery_passphrase(master: &[u8], soc_uid: &str) -> [u8; 32] {
+    let uid = soc_uid.trim();
+    let mut msg = Vec::with_capacity(VAR_RECOVERY_INFO.len() + uid.len());
+    msg.extend_from_slice(VAR_RECOVERY_INFO);
+    msg.extend_from_slice(uid.as_bytes());
+    hmac_sha256(master, &msg)
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_handles_a_key_longer_than_the_block() {
+        // RFC 4231 case 6: 131-byte key.
+        let mac = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex::encode(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn recovery_passphrase_is_per_device_and_stable() {
+        let master = [7u8; 32];
+        let a = derive_var_recovery_passphrase(&master, "0a16040100000100");
+        let b = derive_var_recovery_passphrase(&master, "0a16040100000100\n");
+        let c = derive_var_recovery_passphrase(&master, "0a16040100000101");
+        assert_eq!(a, b, "surrounding whitespace on the UID must not matter");
+        assert_ne!(a, c, "a different UID yields a different passphrase");
+        assert_ne!(
+            a,
+            hmac_sha256(&master, b"0a16040100000100"),
+            "domain-separated"
+        );
+    }
+
+    #[test]
+    fn secret_keyid_is_not_a_bare_hash_of_the_secret() {
+        use sha2::{Digest, Sha256};
+        let secret = [1u8; 32];
+        assert_ne!(
+            keyid_for_secret(&secret),
+            hex::encode(&Sha256::digest(secret)[..])
+        );
+        assert_eq!(keyid_for_secret(&secret).len(), 64);
+    }
+}

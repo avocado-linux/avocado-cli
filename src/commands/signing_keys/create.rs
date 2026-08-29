@@ -95,9 +95,26 @@ impl SigningKeysCreateCommand {
 
         let mut registry = KeysRegistry::load()?;
 
-        let (keyid, uri, algorithm, key_type) = if crate::utils::signing_keys::is_pem_algorithm(
+        let (keyid, uri, algorithm, key_type) = if crate::utils::signing_keys::is_secret_algorithm(
             &self.algorithm,
         ) {
+            if self.pkcs11_device.is_some() || self.uri.is_some() {
+                anyhow::bail!(
+                    "--algorithm {} is a file-backed secret for now; it cannot be combined with PKCS#11 options",
+                    self.algorithm
+                );
+            }
+            // A 256-bit random master. Per-device material is derived from it
+            // (see derive_var_recovery_passphrase); the master itself never
+            // leaves this machine's registry.
+            let secret: [u8; crate::utils::signing_keys::SECRET_KEY_BYTES] = {
+                use rand::RngExt;
+                rand::rng().random()
+            };
+            let keyid = crate::utils::signing_keys::keyid_for_secret(&secret);
+            let uri = crate::utils::signing_keys::save_secret_key(&keyid, &secret)?;
+            (keyid, uri, self.algorithm.clone(), "file".to_string())
+        } else if crate::utils::signing_keys::is_pem_algorithm(&self.algorithm) {
             if self.pkcs11_device.is_some() || self.uri.is_some() {
                 anyhow::bail!(
                     "--algorithm {} is file-based; it cannot be combined with PKCS#11 options",
@@ -108,7 +125,7 @@ impl SigningKeysCreateCommand {
             (keyid, uri, self.algorithm.clone(), "file".to_string())
         } else if self.algorithm != "ed25519" {
             anyhow::bail!(
-                "--algorithm {}: expected ed25519, rsa2048 or rsa4096",
+                "--algorithm {}: expected ed25519, rsa2048, rsa4096 or hmac-sha256",
                 self.algorithm
             );
         } else if let Some(device_type_str) = &self.pkcs11_device {
