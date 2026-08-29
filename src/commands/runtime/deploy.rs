@@ -706,7 +706,9 @@ fi
 # Exit 0: an extension carries root_hash (key present, as `connect upload`
 # tests it). Exit 1: none does. Exit 2: the manifest could not be read or is
 # not the expected shape - that must stop the deploy too, never pass as "no
-# verity".
+# verity". The script runs under set -e, so the probe's non-zero exits must be
+# captured, not allowed to abort the script.
+VERITY_RC=0
 python3 -c '
 import json, sys
 try:
@@ -718,8 +720,8 @@ except Exception as e:
     print("manifest %s: %s" % (sys.argv[1], e), file=sys.stderr)
     sys.exit(2)
 sys.exit(0 if any(isinstance(e, dict) and "root_hash" in e for e in exts) else 1)
-' "$MANIFEST_FILE"
-case $? in
+' "$MANIFEST_FILE" || VERITY_RC=$?
+case $VERITY_RC in
     0)
         echo "ERROR: this runtime has extensions with image.verity: true; deploy does not publish their dm-verity hash trees yet, so the device would refuse them. Provision instead, or build without verity." >&2
         exit 1 ;;
@@ -1188,6 +1190,88 @@ mod tests {
     }
 
     use super::*;
+
+    /// Runs the extension-verity probe exactly as the container does: under
+    /// `set -e`. The probe exits 1 for the ordinary "no extension verity" case,
+    /// which must not abort the script - a regression here fails every deploy
+    /// of a runtime without extension verity, with an empty stderr.
+    fn run_verity_guard(manifest: &str) -> (i32, String, bool) {
+        let cmd = RuntimeDeployCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            "root@host".to_string(),
+            None,
+            None,
+        );
+        let s = cmd.create_hash_collection_script("x86_64");
+        let start = s.find("VERITY_RC=0").expect("probe start");
+        let end = s[start..].find("esac").expect("probe end") + start + "esac".len();
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "avocado-verity-guard-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mf = dir.join("manifest.json");
+        std::fs::write(&mf, manifest).unwrap();
+        let script = format!(
+            "set -e\nMANIFEST_FILE='{}'\n{}\necho REACHED_END",
+            mf.display(),
+            &s[start..end]
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            String::from_utf8_lossy(&out.stdout).contains("REACHED_END"),
+        )
+    }
+
+    #[test]
+    fn verity_guard_lets_a_runtime_without_extension_verity_through_under_set_e() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (code, err, reached) =
+            run_verity_guard(r#"{"root_hash":"abc","extensions":[{"name":"dev"}]}"#);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(reached, "script must continue past the probe");
+    }
+
+    #[test]
+    fn verity_guard_refuses_extension_root_hash_and_unreadable_manifest() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (code, err, reached) =
+            run_verity_guard(r#"{"extensions":[{"name":"sec","root_hash":"abc"}]}"#);
+        assert_eq!(code, 1);
+        assert!(!reached);
+        assert!(err.contains("image.verity: true"), "stderr: {err}");
+        let (code, err, reached) = run_verity_guard("not json");
+        assert_eq!(code, 1);
+        assert!(!reached);
+        assert!(
+            err.contains("could not read the runtime manifest"),
+            "stderr: {err}"
+        );
+    }
 
     // --- DeviceSpec parsing tests ---
 
