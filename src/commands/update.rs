@@ -183,6 +183,14 @@ fn metadata_refresh_script() -> &'static str {
     r#"
 $DNF_SDK_HOST $DNF_SDK_HOST_REPO_CONF clean expire-cache
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF clean expire-cache
+# The sysroot install stamps record "these inputs produced this sysroot"; a
+# feed that changed under them is not an input they can see, so a stamp that
+# still reads current would make the next install skip dnf altogether. Moving
+# forward means the next install has to run - drop them (same as
+# `avocado clean --stamps`).
+if [ -d "$AVOCADO_PREFIX/.stamps" ]; then
+    rm -rf "$AVOCADO_PREFIX/.stamps"
+fi
 "#
 }
 
@@ -204,6 +212,10 @@ mod tests {
         assert!(
             !s.contains("clean all"),
             "packages stay cached; only metadata expires"
+        );
+        assert!(
+            s.contains("rm -rf \"$AVOCADO_PREFIX/.stamps\""),
+            "install stamps are dropped so the next install cannot skip dnf: {s}"
         );
     }
 }
