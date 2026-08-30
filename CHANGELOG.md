@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repairs instead of reporting "up to date". The lock is still saved whenever
   packages landed, so a failed run cannot leave the kernel pin out of step
   with the disk.
+- **`avocado install` follows the feed after `avocado update`.** `update` clears a
+  target's version pins so the next install resolves the newest packages, but
+  install only ran `dnf install`, which is additive and never moves packages that
+  are already in the sysroot — so a rebuilt feed changed nothing until `clean`.
+  When no pins are recorded (after `update`, or on a first install) the install
+  now runs a `dnf distro-sync` on the sysroot in the same container pass; with
+  pins present the lock stays authoritative and nothing is synced.
 
 ## [1.0.0-rc.2] - 2026-08-28
 
