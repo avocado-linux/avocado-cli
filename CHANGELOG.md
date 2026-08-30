@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`avocado install` / `rootfs install` / `initramfs install` exit non-zero
+  when a sysroot install could not finish.** Three cases previously reported
+  success and wrote a current install stamp: the sysroot could not be cleaned
+  before a kernel change, the installed package versions could not be read
+  back, or the kernel sysroot could not be staged. Each now fails with the
+  reason (also emitted under `--json`) and leaves no stamp, so the next run
+  repairs instead of reporting "up to date". The lock is still saved whenever
+  packages landed, so a failed run cannot leave the kernel pin out of step
+  with the disk.
+
 ## [1.0.0-rc.2] - 2026-08-28
 
 ### Added

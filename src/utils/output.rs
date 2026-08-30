@@ -17,7 +17,9 @@ pub enum OutputLevel {
 
 /// When a TUI renderer is active, info/success/warning/plain messages are
 /// suppressed — the TUI task status lines are the progress indicator.
-/// Errors always print (via `print_above`) so they're visible immediately.
+/// `print_error` is suppressed too (the error is reported through task state
+/// at shutdown); a notice that must survive both modes goes through
+/// `print_warning_stderr` / `print_info_stderr`.
 ///
 /// Also returns true when JSON output mode is active: prose would interleave
 /// with the NDJSON event stream and confuse consumers, so we treat JSON
