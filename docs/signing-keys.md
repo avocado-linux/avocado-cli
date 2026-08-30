@@ -22,6 +22,10 @@ avocado signing-keys create product-fit --algorithm rsa2048
 avocado signing-keys import product-fit --key FIT.key --cert FIT.crt
 ```
 
+`import` checks that the key belongs to the certificate and reads the key size
+from it (`--algorithm` may only confirm); a certificate that is already
+registered is refused, since both names would share one private key on disk.
+
 ```yaml
 runtimes:
   prod:
@@ -41,9 +45,12 @@ i.MX8M the public key is injected into the U-Boot control DTB and `imx-boot`
 is re-packed from the feed's own inputs with the procedure the feed ships
 (`imx-boot-tools/rekey-imx-boot.sh`). The re-packed images take the feed's
 file names, so `avocado provision` flashes a bootloader that is closed to the
-project key from the first boot. Set it to `false` to keep the distro
-bootloader (a feed built with `verified-boot` enforces the distro key
-instead).
+project key from the first boot. Set it to `false` only when the bootloader
+already enforces `fit_key`: a `verified-boot` feed ships U-Boot with the
+distro key embedded under the same key name (`FIT`), so `fit_key` pointing at
+a different key with `fit_key_in_bootloader: false` signs a FIT that U-Boot
+rejects, with nothing at build time to reveal the mismatch. Import a copy of
+that distro key if the distro bootloader is what you want.
 
 
 ### Creating Keys
@@ -219,7 +226,7 @@ Registered signing keys:
     Created:   2025-12-17 15:10:22 UTC
 ```
 
-**Note:** Key IDs are the full SHA-256 hash of the public key, base16/hex encoded (64 characters). When you create a key without specifying a `--name`, the key ID is used as the default name.
+**Note:** Key IDs are the full SHA-256 hash of the public key (for RSA entries: of the X.509 certificate's DER), base16/hex encoded (64 characters). When you create a key without specifying a `--name`, the key ID is used as the default name.
 
 ### Removing Keys
 
@@ -255,7 +262,7 @@ This action cannot be undone. Continue? [y/N]:
 
 The `signing_keys` section creates a local mapping between friendly names and key references.
 Key references can be:
-- **Key IDs**: The full 64-character hex-encoded SHA-256 hash of the public key
+- **Key IDs**: The full 64-character hex-encoded SHA-256 hash of the public key (of the certificate's DER for RSA entries)
 - **Global registry names**: The name used when creating the key with `avocado signing-keys create --name <name>`
 
 ```yaml
@@ -349,7 +356,7 @@ The global registry is stored in `keys.json`:
 }
 ```
 
-**Note:** The `keyid` is the full SHA-256 hash of the public key, base16/hex encoded (64 characters). If no name is provided when creating a key, the key ID is used as the registry name.
+**Note:** The `keyid` is the full SHA-256 hash of the public key (for RSA entries: of the X.509 certificate's DER), base16/hex encoded (64 characters). If no name is provided when creating a key, the key ID is used as the registry name.
 
 ## API Usage
 

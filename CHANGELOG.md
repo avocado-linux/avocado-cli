@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The runtime build assembles the boot FIT** on machines whose feed ships a
   `fit-image.its` template, with this runtime's initramfs (previously a FIT
   machine booted the feed's initramfs), the rootfs root hash when set, and a
-  signature from `AVOCADO_FIT_KEY_DIR` (`FIT.key`/`FIT.crt`) when given.
+  signature with the key `runtimes.<name>.signing.fit_key` names.
 - **Inter-extension dependencies via `depends_on`.** An extension can declare
   the extensions it builds on (`depends_on: [weston-base]`, optionally with a
   semver range); the CLI expands the closure everywhere it matters — fetch

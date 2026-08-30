@@ -5,24 +5,26 @@ use chrono::Utc;
 use std::path::PathBuf;
 
 use crate::utils::signing_keys::{
-    is_pem_algorithm, keyid_for_pem_cert, path_to_file_uri, save_pem_keypair, KeyEntry,
-    KeysRegistry,
+    is_pem_algorithm, keyid_for_pem_cert, path_to_file_uri, rsa_pem_pair_bits, save_pem_keypair,
+    KeyEntry, KeysRegistry,
 };
 
 /// `avocado signing-keys import <name> --key FIT.key --cert FIT.crt`
 ///
 /// Registers an RSA private key / X.509 certificate pair under the registry so
 /// a runtime can name it in `signing.fit_key`. The key id is the SHA-256 of the
-/// certificate's DER.
+/// certificate's DER. The key is checked against the certificate and the
+/// algorithm comes from the actual modulus size; `--algorithm` may only
+/// confirm it.
 pub struct SigningKeysImportCommand {
     pub name: String,
     pub key: PathBuf,
     pub cert: PathBuf,
-    pub algorithm: String,
+    pub algorithm: Option<String>,
 }
 
 impl SigningKeysImportCommand {
-    pub fn new(name: String, key: PathBuf, cert: PathBuf, algorithm: String) -> Self {
+    pub fn new(name: String, key: PathBuf, cert: PathBuf, algorithm: Option<String>) -> Self {
         Self {
             name,
             key,
@@ -32,11 +34,18 @@ impl SigningKeysImportCommand {
     }
 
     pub fn execute(&self) -> Result<()> {
-        if !is_pem_algorithm(&self.algorithm) {
+        let bits = rsa_pem_pair_bits(&self.key, &self.cert)?;
+        let algorithm = format!("rsa{bits}");
+        if !is_pem_algorithm(&algorithm) {
             anyhow::bail!(
-                "--algorithm {}: import handles RSA PEM keys only (rsa2048, rsa4096)",
-                self.algorithm
+                "{} is an RSA-{bits} key; FIT signing supports rsa2048 and rsa4096",
+                self.key.display()
             );
+        }
+        if let Some(claimed) = &self.algorithm {
+            if *claimed != algorithm {
+                anyhow::bail!("--algorithm {claimed} does not match the key, which is {algorithm}");
+            }
         }
         let key_pem = std::fs::read(&self.key)
             .with_context(|| format!("Failed to read {}", self.key.display()))?;
@@ -48,12 +57,20 @@ impl SigningKeysImportCommand {
         if registry.get_key(&self.name).is_some() {
             anyhow::bail!("A key with name '{}' already exists", self.name);
         }
+        // Same certificate, same key id, same files on disk: a second name
+        // would share the private key and lose it when either is removed.
+        if let Some((existing, _)) = registry.keys.iter().find(|(_, e)| e.keyid == keyid) {
+            anyhow::bail!(
+                "This certificate is already registered as '{existing}' (key id {keyid}); \
+                 use that name in signing.fit_key"
+            );
+        }
         let base_path = save_pem_keypair(&keyid, &key_pem, cert_pem.as_bytes())?;
         registry.add_key(
             self.name.clone(),
             KeyEntry {
                 keyid: keyid.clone(),
-                algorithm: self.algorithm.clone(),
+                algorithm: algorithm.clone(),
                 created_at: Utc::now(),
                 uri: path_to_file_uri(&base_path),
             },
@@ -63,7 +80,7 @@ impl SigningKeysImportCommand {
         println!("Imported signing key:");
         println!("  Name:      {}", self.name);
         println!("  Key ID:    {keyid}");
-        println!("  Algorithm: {}", self.algorithm);
+        println!("  Algorithm: {algorithm}");
         println!(
             "  Files:     {}.key / {}.crt",
             base_path.display(),

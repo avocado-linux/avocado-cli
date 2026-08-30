@@ -1483,9 +1483,9 @@ enum SigningKeysCommands {
         /// PEM X.509 certificate for that key
         #[arg(long, value_name = "FILE")]
         cert: std::path::PathBuf,
-        /// rsa2048 or rsa4096
-        #[arg(long, default_value = "rsa2048", value_name = "ALGORITHM")]
-        algorithm: String,
+        /// Expected key size (rsa2048 or rsa4096); read from the key when omitted
+        #[arg(long, value_name = "ALGORITHM")]
+        algorithm: Option<String>,
     },
     /// List all registered signing keys
     List,

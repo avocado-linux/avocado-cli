@@ -2611,6 +2611,10 @@ mkdir -p "$RUNTIME_EXT_DIR"
 # Clean up stale extensions to ensure fresh copies
 echo "Cleaning up stale extensions..."
 rm -f "$RUNTIME_EXT_DIR"/*.raw "$RUNTIME_EXT_DIR"/*.kab 2>/dev/null || true
+# Re-keyed bootloader outputs from an earlier build (the feed's re-key script writes
+# them here, where stone resolves them ahead of the SDK's copies). A build that
+# does not re-key must not ship a bootloader closed to the previous key.
+rm -f "$OUTPUT_DIR"/imx-boot-*.bin-* "$OUTPUT_DIR"/imx-boot "$OUTPUT_DIR"/u-boot-*.dtb.keyed 2>/dev/null || true
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
@@ -4122,6 +4126,14 @@ runtimes:
         assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
         // No var.encrypt: the plaintext path writes no marker.
         assert!(!script.contains("/etc/avocado/var-encrypt"));
+        // A previous build's re-keyed bootloader is removed before stone can
+        // pick it up, unconditionally and ahead of the FIT assembly that may
+        // regenerate it.
+        let rm = script
+            .find("rm -f \"$OUTPUT_DIR\"/imx-boot-*.bin-* \"$OUTPUT_DIR\"/imx-boot \"$OUTPUT_DIR\"/u-boot-*.dtb.keyed")
+            .expect("re-key outputs are cleaned up");
+        assert!(rm < script.find("rekey-imx-boot.sh").unwrap());
+        assert!(rm < script.find("stone bundle").unwrap());
     }
 
     #[test]

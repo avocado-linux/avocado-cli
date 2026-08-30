@@ -23,7 +23,8 @@ const SIGNING_KEYS_DIR: &str = "signing-keys";
 /// Represents a single signing key entry in the registry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyEntry {
-    /// Unique key identifier (SHA-256 hash of public key)
+    /// Unique key identifier: SHA-256 of the public key, or of the X.509
+    /// certificate's DER for RSA (`rsa2048`/`rsa4096`) entries
     pub keyid: String,
     /// Cryptographic algorithm used (e.g., "ed25519", "ecdsa-p256", "ecdsa-p384", "rsa2048", "rsa4096")
     pub algorithm: String,
@@ -236,27 +237,20 @@ pub fn ensure_dev_signing_key() -> Result<String> {
 
 /// Delete key files from disk
 pub fn delete_key_files(keyid: &str) -> Result<()> {
-    let base_path = get_key_file_path(keyid)?;
-    let private_key_path = base_path.with_extension("key");
-    let public_key_path = base_path.with_extension("pub");
+    delete_key_files_at(&get_key_file_path(keyid)?)
+}
 
-    // Remove private key if it exists
-    if private_key_path.exists() {
-        fs::remove_file(&private_key_path).with_context(|| {
-            format!(
-                "Failed to delete private key: {}",
-                private_key_path.display()
-            )
-        })?;
+/// Every file a file-backed entry may own: ed25519 `.key`/`.pub`, RSA `.key`/`.crt`.
+pub const KEY_FILE_EXTENSIONS: &[&str] = &["key", "pub", "crt"];
+
+fn delete_key_files_at(base_path: &Path) -> Result<()> {
+    for ext in KEY_FILE_EXTENSIONS {
+        let path = base_path.with_extension(ext);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete key file: {}", path.display()))?;
+        }
     }
-
-    // Remove public key if it exists
-    if public_key_path.exists() {
-        fs::remove_file(&public_key_path).with_context(|| {
-            format!("Failed to delete public key: {}", public_key_path.display())
-        })?;
-    }
-
     Ok(())
 }
 
@@ -689,9 +683,10 @@ pub fn save_pem_keypair(keyid: &str, key_pem: &[u8], cert_pem: &[u8]) -> Result<
     let cert_path = base_path.with_extension("crt");
     // Create the key file 0600 from the start rather than tightening after the
     // write: with a permissive umask the bytes would otherwise be readable in
-    // the window between the two.
+    // the window between the two. Never overwrite: the key id is the
+    // certificate's, so an existing file is another entry's private key.
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -703,16 +698,66 @@ pub fn save_pem_keypair(keyid: &str, key_pem: &[u8], cert_pem: &[u8]) -> Result<
             f.write_all(key_pem)
         })
         .with_context(|| format!("Failed to write private key: {}", key_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // An existing file keeps its old mode through OpenOptions; make sure.
-        fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
-    }
     fs::write(&cert_path, cert_pem)
         .with_context(|| format!("Failed to write certificate: {}", cert_path.display()))?;
     Ok(base_path)
+}
+
+/// Check that `key` is the private key of `cert` and return the RSA modulus
+/// size in bits. Uses the host `openssl` that `signing-keys create` already
+/// needs: the FIT is signed with `.key` while U-Boot gets `.crt`, and nothing
+/// downstream compares the two, so a mismatch here means a board that does
+/// not boot with no build-time error.
+pub fn rsa_pem_pair_bits(key: &Path, cert: &Path) -> Result<u32> {
+    fn openssl(args: &[&std::ffi::OsStr]) -> Result<String> {
+        let out = std::process::Command::new("openssl")
+            .args(args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("could not run openssl ({e}); it is needed to check the key against the certificate"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "openssl {}: {}",
+                args[0].to_string_lossy(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    let from_key = openssl(&[
+        "pkey".as_ref(),
+        "-in".as_ref(),
+        key.as_os_str(),
+        "-pubout".as_ref(),
+    ])?;
+    let from_cert = openssl(&[
+        "x509".as_ref(),
+        "-in".as_ref(),
+        cert.as_os_str(),
+        "-noout".as_ref(),
+        "-pubkey".as_ref(),
+    ])?;
+    if from_key.trim() != from_cert.trim() {
+        anyhow::bail!(
+            "{} is not the private key of {}",
+            key.display(),
+            cert.display()
+        );
+    }
+    let text = openssl(&[
+        "x509".as_ref(),
+        "-in".as_ref(),
+        cert.as_os_str(),
+        "-noout".as_ref(),
+        "-text".as_ref(),
+    ])?;
+    if !text.contains("rsaEncryption") {
+        anyhow::bail!("{} is not an RSA certificate", cert.display());
+    }
+    text.split("Public-Key: (")
+        .nth(1)
+        .and_then(|rest| rest.split(" bit").next())
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not read the RSA key size from {}", cert.display()))
 }
 
 /// The PEM files behind a registry entry, for handing to an external signer.
@@ -784,6 +829,71 @@ mod pem_tests {
             "-----BEGIN PRIVATE KEY-----\nAAECAwQFBgc=\n-----END PRIVATE KEY-----\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn removing_an_entry_deletes_its_certificate_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("abc");
+        for ext in KEY_FILE_EXTENSIONS {
+            fs::write(base.with_extension(ext), b"x").unwrap();
+        }
+        delete_key_files_at(&base).unwrap();
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+        // Nothing to delete is not an error.
+        delete_key_files_at(&base).unwrap();
+    }
+
+    #[test]
+    fn a_second_pair_cannot_overwrite_a_stored_private_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k.key");
+        fs::write(&key, b"old").unwrap();
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        assert!(opts.open(&key).is_err());
+        assert_eq!(fs::read(&key).unwrap(), b"old");
+    }
+
+    /// Needs the host openssl, like the command under test; skipped without it.
+    #[test]
+    fn a_key_is_checked_against_its_certificate() {
+        if std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gen = |n: &str, bits: &str| {
+            let (k, c) = (
+                dir.path().join(format!("{n}.key")),
+                dir.path().join(format!("{n}.crt")),
+            );
+            let ok = std::process::Command::new("openssl")
+                .args([
+                    "req", "-batch", "-new", "-x509", "-nodes", "-days", "1", "-subj", "/CN=t",
+                ])
+                .arg("-newkey")
+                .arg(format!("rsa:{bits}"))
+                .arg("-keyout")
+                .arg(&k)
+                .arg("-out")
+                .arg(&c)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            (k, c)
+        };
+        let (k1, c1) = gen("a", "2048");
+        let (k2, c2) = gen("b", "2048");
+        assert_eq!(rsa_pem_pair_bits(&k1, &c1).unwrap(), 2048);
+        // The wrong key for the certificate is refused, not registered.
+        assert!(rsa_pem_pair_bits(&k1, &c2).is_err());
+        assert!(rsa_pem_pair_bits(&k2, &c1).is_err());
     }
 
     #[test]
