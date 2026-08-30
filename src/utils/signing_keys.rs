@@ -240,8 +240,9 @@ pub fn delete_key_files(keyid: &str) -> Result<()> {
     delete_key_files_at(&get_key_file_path(keyid)?)
 }
 
-/// Every file a file-backed entry may own: ed25519 `.key`/`.pub`, RSA `.key`/`.crt`.
-pub const KEY_FILE_EXTENSIONS: &[&str] = &["key", "pub", "crt"];
+/// Every file a file-backed entry may own: ed25519 `.key`/`.pub`, RSA
+/// `.key`/`.crt`, hmac-sha256 `.secret`.
+pub const KEY_FILE_EXTENSIONS: &[&str] = &["key", "pub", "crt", "secret"];
 
 fn delete_key_files_at(base_path: &Path) -> Result<()> {
     for ext in KEY_FILE_EXTENSIONS {
@@ -934,12 +935,15 @@ pub fn keyid_for_secret(secret: &[u8]) -> String {
 /// Store a secret master as `<keyid>.secret`, mode 0600, and return the file URI.
 pub fn save_secret_key(keyid: &str, secret: &[u8]) -> Result<String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let path = get_key_file_path(keyid)?.with_extension("secret");
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(&path)
         .with_context(|| format!("Failed to create {}", path.display()))?;
     f.write_all(secret)

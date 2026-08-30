@@ -2,7 +2,8 @@
 //!
 //! `runtimes.<r>.var.recovery` names a registry secret - the *master*. Nothing
 //! derived from it is part of a build: this command talks to one present
-//! device, reads its SoC UID, derives HMAC(master, UID) and hands that to
+//! device, reads its SoC UID, derives
+//! HMAC-SHA256(master, "avocado-var-recovery\0" || UID) and hands that to
 //! `avocadoctl var-key enroll` over the SSH session, which adds the keyslot.
 //! Recovering a unit later is `avocado var-key derive` with the same UID on a
 //! bench that holds the master. Provision-side by construction: it needs the
@@ -17,9 +18,21 @@ use anyhow::{Context, Result};
 /// the bootloader from the chip id on i.MX and Jetson) first, soc0's
 /// serial_number (OCOTP / fuse driver) second - the same order and sources
 /// the initramfs var-key.sh uses, so both sides name the same device.
-pub const READ_SOC_UID: &str =
-    "tr -d '\\0\\n' < /sys/firmware/devicetree/base/serial-number 2>/dev/null \
-    || tr -d '\\0\\n' < /sys/devices/soc0/serial_number 2>/dev/null";
+pub const SOC_UID_SOURCES: &[&str] = &[
+    "/sys/firmware/devicetree/base/serial-number",
+    "/sys/devices/soc0/serial_number",
+];
+
+/// Shell that prints the first non-empty UID among `sources`. A present but
+/// empty file falls through to the next source (a plain `a || b` would not:
+/// `tr` exits 0 on empty input).
+pub fn read_soc_uid_command(sources: &[&str]) -> String {
+    format!(
+        "for f in {}; do u=$(tr -d '\\0\\n' < \"$f\" 2>/dev/null); \
+         [ -n \"$u\" ] && {{ printf %s \"$u\"; exit 0; }}; done; exit 1",
+        sources.join(" ")
+    )
+}
 
 /// The token kind avocadoctl records, so a later reader knows what to derive.
 pub const DERIVATION_KIND: &str = "hmac-sha256-uid";
@@ -50,7 +63,7 @@ impl VarKeyEnrollCommand {
         ssh.check_connectivity().await?;
 
         let uid = ssh
-            .run_command(READ_SOC_UID)
+            .run_command(&read_soc_uid_command(SOC_UID_SOURCES))
             .await
             .context("reading the device's SoC UID")?;
         let uid = uid.trim();
@@ -123,12 +136,38 @@ mod tests {
 
     #[test]
     fn uid_read_prefers_the_device_tree_then_soc0() {
-        let dt = READ_SOC_UID.find("devicetree/base/serial-number").unwrap();
-        let soc = READ_SOC_UID.find("soc0/serial_number").unwrap();
+        let cmd = read_soc_uid_command(SOC_UID_SOURCES);
+        let dt = cmd.find("devicetree/base/serial-number").unwrap();
+        let soc = cmd.find("soc0/serial_number").unwrap();
         assert!(dt < soc);
-        assert!(
-            READ_SOC_UID.contains("tr -d"),
-            "NULs and newlines stripped so the UID is exact"
-        );
+    }
+
+    #[cfg(unix)]
+    fn run_uid_read(sources: &[&std::path::Path]) -> Option<String> {
+        let sources: Vec<String> = sources.iter().map(|p| p.display().to_string()).collect();
+        let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(read_soc_uid_command(&sources))
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uid_read_skips_empty_sources_and_strips_nul_and_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dt, soc) = (dir.path().join("dt"), dir.path().join("soc"));
+        std::fs::write(&dt, b"").unwrap();
+        std::fs::write(&soc, b"0123abcd\n").unwrap();
+        // An empty device-tree node falls through to soc0.
+        assert_eq!(run_uid_read(&[&dt, &soc]).as_deref(), Some("0123abcd"));
+        std::fs::write(&dt, b"deadbeef\0").unwrap();
+        assert_eq!(run_uid_read(&[&dt, &soc]).as_deref(), Some("deadbeef"));
+        // Nothing readable anywhere is a failure, not an empty UID.
+        assert_eq!(run_uid_read(&[&dir.path().join("missing")]), None);
     }
 }

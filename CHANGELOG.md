@@ -36,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secret (`avocado signing-keys create <name> --algorithm hmac-sha256`, a new
   secret key kind) that is a *master*; nothing derived from it enters a build.
   `avocado var-key enroll <runtime> --device user@host` reads the device's SoC
-  UID over SSH, derives that unit's passphrase as HMAC-SHA256(master, UID) and
-  hands it to `avocadoctl var-key enroll`, which adds it as a LUKS2 keyslot
+  UID over SSH, derives that unit's passphrase as
+  HMAC-SHA256(master, "avocado-var-recovery\0" || UID) and hands it to `avocadoctl var-key enroll`, which adds it as a LUKS2 keyslot
   (token `avocado-recovery`). `avocado var-key derive <runtime> --uid <UID>
   [--raw]` reproduces it on a bench to recover a unit whose hardware keyslot is
   gone. Once enrolled, the initrd retires the SoC-UID-derived keyslot.
