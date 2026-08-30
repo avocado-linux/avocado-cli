@@ -47,6 +47,70 @@ echo \"Created /init -> /sbin/init symlink\"; \
 else echo \"WARNING: /sbin/init not found in initramfs — kernel may not find init\"; fi; fi",
 ];
 
+/// Release files that may carry the initramfs identity.
+///
+/// The id is appended to whichever of these exist, and the build-id strip
+/// removes it from the same set before the tree hash is taken - the two must
+/// stay in step or a rebuild would hash the previous build's id and the
+/// "deterministic" id would move on every build.
+///
+/// `usr/lib/os-release` is in the list because that is what actually ships:
+/// `/etc/initrd-release` is a symlink to it (an initrd's release file IS its
+/// os-release), and the dedicated `initrd-release` / `os-release-initrd` files
+/// need not exist at all.
+const INITRAMFS_IDENTITY_FILES: &[&str] = &[
+    "usr/lib/initrd-release",
+    "usr/lib/os-release-initrd",
+    "usr/lib/os-release",
+];
+
+/// Shell that writes `AVOCADO_OS_BUILD_ID` into the initrd's release files.
+///
+/// Follows `/etc/initrd-release` when it is a symlink, but only writes a target
+/// that is itself one of [`INITRAMFS_IDENTITY_FILES`] inside the work tree: an
+/// absolute symlink must not lead the build to append to the SDK's own
+/// os-release, and a file the strip does not cover must not reach the hash.
+///
+/// Fails the build when nothing could be written. The previous version guarded
+/// each append with `[ -f ]` and wrote nothing on the layout that ships, so
+/// images went out with no identity at all - unreadable by the boot-time
+/// initramfs verification and by `/run/avocado/initramfs-build-id`.
+fn render_identity_injection(work_var: &str, id_var: &str) -> String {
+    let loop_list = INITRAMFS_IDENTITY_FILES
+        .iter()
+        .map(|f| format!("\"${work_var}/{f}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Colon-delimited so the membership test is a plain glob; none of these
+    // paths can contain a colon.
+    let allowed = INITRAMFS_IDENTITY_FILES
+        .iter()
+        .map(|f| format!("${work_var}/{f}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        r#"    # Inject identity into the initrd's release files (see render_identity_injection).
+    _avocado_allowed=":{allowed}:"
+    _avocado_identity_written=0
+    for _avocado_f in {loop_list} "${work_var}/etc/initrd-release"; do
+        [ -e "$_avocado_f" ] || continue
+        _avocado_t=$(readlink -f "$_avocado_f") || continue
+        case "$_avocado_allowed" in
+            *":$_avocado_t:"*) ;;
+            *) continue ;;
+        esac
+        grep -q '^AVOCADO_OS_BUILD_ID=' "$_avocado_t" && continue
+        echo "AVOCADO_OS_BUILD_ID=${id_var}" >> "$_avocado_t" || exit 1
+        _avocado_identity_written=1
+    done
+    if [ "$_avocado_identity_written" -eq 0 ]; then
+        echo "ERROR: no release file in the initramfs can carry AVOCADO_OS_BUILD_ID (looked in $_avocado_allowed and ${work_var}/etc/initrd-release). The image would ship with no identity: both the boot-time initramfs verification and /run/avocado/initramfs-build-id read it back from there." >&2
+        exit 1
+    fi
+"#
+    )
+}
+
 /// Generate the shell script fragment that builds an initramfs image from the shared sysroot.
 ///
 /// The generated script expects these shell variables to be set:
@@ -138,13 +202,7 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
 
 {build_id_block}
 
-    # Inject identity into initrd-release and os-release-initrd
-    if [ -f "$INITRAMFS_WORK/usr/lib/initrd-release" ]; then
-        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/initrd-release"
-    fi
-    if [ -f "$INITRAMFS_WORK/usr/lib/os-release-initrd" ]; then
-        echo "AVOCADO_OS_BUILD_ID=$INITRAMFS_BUILD_ID" >> "$INITRAMFS_WORK/usr/lib/os-release-initrd"
-    fi
+{identity_injection}
 
     # Normalize mtimes across the staged tree so the cpio is reproducible.
     #
@@ -214,13 +272,14 @@ fi"#,
         permissions_section = permissions_section,
         var_encrypt_block = var_encrypt_block,
         purge_paths = render_build_state_purge("INITRAMFS_WORK"),
+        identity_injection = render_identity_injection("INITRAMFS_WORK", "INITRAMFS_BUILD_ID"),
         build_id_block = render_build_id_block(&BuildIdSpec {
             namespace_uuid,
             work_var: "INITRAMFS_WORK",
             sysroot_var: "INITRAMFS_SYSROOT",
             rpm_args: "",
             id_var: "INITRAMFS_BUILD_ID",
-            identity_files: &["usr/lib/initrd-release", "usr/lib/os-release-initrd"],
+            identity_files: INITRAMFS_IDENTITY_FILES,
             // Unlike erofs, cpio has no --all-root: every newc header carries
             // uid/gid and nothing in this script chowns the tree, so ownership
             // reaches the image and must reach the id with it.
@@ -798,6 +857,132 @@ mod tests {
                 .find("find . | LC_ALL=C sort | cpio --reproducible")
                 .expect("cpio present");
             assert!(touch_at < cpio_at, "{fs}: normalization must precede cpio");
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_injection_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// Run the rendered injection against a fake work tree and report what the
+    /// release files ended up containing.
+    fn run_injection(build: impl Fn(&std::path::Path)) -> (bool, String, Vec<(String, String)>) {
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        fs::create_dir_all(work.join("usr/lib")).unwrap();
+        fs::create_dir_all(work.join("etc")).unwrap();
+        build(&work);
+        let script = format!(
+            "set -u\nINITRAMFS_WORK={}\nINITRAMFS_BUILD_ID=initramfs-xyz\n{}",
+            work.display(),
+            render_identity_injection("INITRAMFS_WORK", "INITRAMFS_BUILD_ID")
+        );
+        let out = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        let contents = INITRAMFS_IDENTITY_FILES
+            .iter()
+            .filter_map(|f| {
+                fs::read_to_string(work.join(f))
+                    .ok()
+                    .map(|c| (f.to_string(), c))
+            })
+            .collect();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+            contents,
+        )
+    }
+
+    #[test]
+    fn the_id_reaches_the_file_etc_initrd_release_points_at() {
+        // The layout that actually ships: no usr/lib/initrd-release, and
+        // /etc/initrd-release is a symlink to the initrd's own os-release. The
+        // guarded appends this replaces wrote nothing here, silently.
+        let (ok, stderr, files) = run_injection(|work| {
+            fs::write(work.join("usr/lib/os-release"), "ID=avocado\n").unwrap();
+            std::os::unix::fs::symlink("../usr/lib/os-release", work.join("etc/initrd-release"))
+                .unwrap();
+        });
+        assert!(ok, "injection failed: {stderr}");
+        let os_release = files
+            .iter()
+            .find(|(f, _)| f == "usr/lib/os-release")
+            .expect("os-release still present");
+        assert!(
+            os_release.1.contains("AVOCADO_OS_BUILD_ID=initramfs-xyz"),
+            "id did not reach the symlink target: {:?}",
+            os_release.1
+        );
+    }
+
+    #[test]
+    fn a_dedicated_initrd_release_still_gets_the_id_exactly_once() {
+        let (ok, stderr, files) = run_injection(|work| {
+            fs::write(work.join("usr/lib/initrd-release"), "ID=avocado\n").unwrap();
+            std::os::unix::fs::symlink(
+                "../usr/lib/initrd-release",
+                work.join("etc/initrd-release"),
+            )
+            .unwrap();
+        });
+        assert!(ok, "injection failed: {stderr}");
+        let c = &files
+            .iter()
+            .find(|(f, _)| f == "usr/lib/initrd-release")
+            .unwrap()
+            .1;
+        assert_eq!(
+            c.matches("AVOCADO_OS_BUILD_ID=").count(),
+            1,
+            "the symlink and its target must not both append: {c:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_symlink_out_of_the_tree_is_refused() {
+        // Appending to the SDK's own /usr/lib/os-release would corrupt the
+        // build container, not the image.
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("os-release");
+        fs::write(&victim, "ID=sdk\n").unwrap();
+        let (ok, stderr, _) = run_injection(|work| {
+            std::os::unix::fs::symlink(&victim, work.join("etc/initrd-release")).unwrap();
+        });
+        assert!(!ok, "a build with nowhere safe to write must fail closed");
+        assert!(stderr.contains("no release file"), "{stderr}");
+        assert!(
+            !fs::read_to_string(&victim)
+                .unwrap()
+                .contains("AVOCADO_OS_BUILD_ID"),
+            "wrote outside the work tree"
+        );
+    }
+
+    #[test]
+    fn no_release_file_at_all_fails_the_build() {
+        let (ok, stderr, _) = run_injection(|_| {});
+        assert!(!ok, "shipping an initramfs with no identity must not pass");
+        assert!(stderr.contains("AVOCADO_OS_BUILD_ID"), "{stderr}");
+    }
+
+    #[test]
+    fn every_injected_file_is_also_stripped_before_hashing() {
+        // If the injection can write a file the strip does not clear, the next
+        // build hashes this build's id and the id moves on every rebuild.
+        let script = generate_initramfs_build_script("ns", "cpio.zst", None, "", false);
+        for f in INITRAMFS_IDENTITY_FILES {
+            assert!(
+                script.contains("sed -i '/^AVOCADO_OS_BUILD_ID=/d"),
+                "strip missing"
+            );
+            assert!(
+                script.contains(&format!("\"$INITRAMFS_WORK/{f}\"")),
+                "{f} is injectable but not stripped"
+            );
         }
     }
 }
