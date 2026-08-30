@@ -192,8 +192,14 @@ fn metadata_refresh_script() -> &'static str {
 if [ -d "$AVOCADO_PREFIX/.stamps" ]; then
     rm -rf "$AVOCADO_PREFIX/.stamps"
 fi
-$DNF_SDK_HOST $DNF_SDK_HOST_REPO_CONF clean expire-cache
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF clean expire-cache
+# dnf keeps every repo's metadata under $DNF_SDK_HOST_PREFIX/var/cache/<repo>-<hash>/repodata
+# (host and target repos alike). Removing just the repodata directories is
+# what `dnf clean expire-cache` achieves without depending on how the dnf
+# wrapper composes its arguments: the next dnf run sees no metadata and
+# fetches repomd again; downloaded packages stay.
+if [ -d "$DNF_SDK_HOST_PREFIX/var/cache" ]; then
+    find "$DNF_SDK_HOST_PREFIX/var/cache" -mindepth 2 -maxdepth 2 -name repodata -type d -exec rm -rf {} +
+fi
 "#
 }
 
@@ -202,15 +208,15 @@ mod tests {
     use super::metadata_refresh_script;
 
     #[test]
-    fn update_expires_both_repo_sets_metadata_without_dropping_packages() {
+    fn update_drops_cached_repodata_and_stamps_without_dropping_packages() {
         let s = metadata_refresh_script();
         assert!(
-            s.contains("$DNF_SDK_HOST_REPO_CONF clean expire-cache"),
-            "{s}"
+            s.contains("-name repodata -type d -exec rm -rf {} +"),
+            "cached repodata is removed under the SDK dnf cache: {s}"
         );
         assert!(
-            s.contains("$DNF_SDK_TARGET_REPO_CONF clean expire-cache"),
-            "{s}"
+            s.contains("$DNF_SDK_HOST_PREFIX/var/cache"),
+            "the shared host/target cache dir: {s}"
         );
         assert!(
             !s.contains("clean all"),
