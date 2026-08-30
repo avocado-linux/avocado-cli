@@ -23,6 +23,7 @@ use tokio::process::Command as AsyncCommand;
 use crate::utils::config::Config;
 use crate::utils::output::{print_info, OutputLevel};
 use crate::utils::output_format::{emit_json_object, OutputFormat};
+use crate::utils::target::resolve_target as resolve_config_target;
 use crate::utils::volume::VolumeState;
 
 pub struct ProfilesListCommand {
@@ -31,25 +32,40 @@ pub struct ProfilesListCommand {
     pub output: OutputFormat,
 }
 
+/// What to tell the user when the SDK volume holds no manifest for `target`.
+///
+/// Names the target: the reason a manifest is missing is as often "this is not
+/// the target you installed" as it is an incomplete install, and the human
+/// output prints only this string -- the structured `target` field that
+/// [`ProfilesListCommand::bail_unavailable`] emits is JSON-only.
+fn manifest_missing_reason(target: &str) -> String {
+    format!(
+        "No stone manifest for target '{target}' in the SDK volume. Either `avocado install` \
+         has not completed for '{target}', or '{target}' is not the target you meant -- it comes \
+         from --target, else AVOCADO_TARGET, else `default_target` in avocado.yaml."
+    )
+}
+
 impl ProfilesListCommand {
     pub async fn execute(&self) -> Result<()> {
-        // Resolve the target the same way the rest of the CLI does:
-        // explicit flag wins, then the config's `default_target`, then
-        // bail with a helpful message.
         let composed = Config::load_composed(&self.config_path, self.target.as_deref())
             .with_context(|| format!("Failed to load config at {}", self.config_path))?;
         let config = &composed.config;
 
-        let target = match self
-            .target
-            .clone()
-            .or_else(|| config.default_target.clone())
-        {
+        // `resolve_target`, not a local flag-then-`default_target` chain: that
+        // chain skipped AVOCADO_TARGET, which every other command honors --
+        // including the interpolation that produced `composed` just above, so
+        // this function looked up one target while holding a config resolved
+        // for another. With the env var set and a different `default_target`
+        // in avocado.yaml, the manifest read went to a target the user never
+        // asked for and reported its SDK install as incomplete.
+        let target = match self.resolve_target(config) {
             Some(t) => t,
             None => {
                 return self.bail_unavailable(
                     None,
-                    "No target specified and no `default_target` in avocado.yaml.",
+                    "No target specified. Use --target, set AVOCADO_TARGET, or set \
+                     `default_target` in avocado.yaml.",
                 );
             }
         };
@@ -90,10 +106,7 @@ impl ProfilesListCommand {
         {
             Ok(Some(s)) => s,
             Ok(None) => {
-                return self.bail_unavailable(
-                    Some(&target),
-                    "Stone manifest not found in the SDK volume. The SDK install may not have completed for this target.",
-                );
+                return self.bail_unavailable(Some(&target), &manifest_missing_reason(&target));
             }
             Err(e) => {
                 return self.bail_unavailable(
@@ -182,6 +195,16 @@ impl ProfilesListCommand {
             print_info(reason, OutputLevel::Normal);
         }
         Ok(())
+    }
+
+    /// The target whose stone manifest `--list` reads.
+    ///
+    /// Delegates to [`resolve_config_target`] so this command agrees with the
+    /// rest of the CLI -- and with the interpolation that produced its own
+    /// composed config, which reads AVOCADO_TARGET too. A local
+    /// flag-then-`default_target` chain here made the two disagree.
+    fn resolve_target(&self, config: &Config) -> Option<String> {
+        resolve_config_target(self.target.as_deref(), config)
     }
 
     /// Spin up a one-shot container with the project's SDK volume
@@ -371,6 +394,62 @@ fn extract_placeholders(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// The command under test — only `target` matters for resolution.
+    fn cmd(target: Option<&str>) -> ProfilesListCommand {
+        ProfilesListCommand {
+            config_path: "avocado.yaml".to_string(),
+            target: target.map(str::to_string),
+            output: OutputFormat::default(),
+        }
+    }
+
+    // Regression: `--list` resolved the target with a local
+    // flag-then-`default_target` chain that skipped AVOCADO_TARGET, so with
+    // the env var set it read the manifest for a different target and blamed
+    // the SDK install for the miss.
+    #[test]
+    #[serial]
+    fn the_env_target_wins_over_default_target() {
+        let config = Config::load_from_str("default_target: imx8mp-evk\n").unwrap();
+        std::env::set_var("AVOCADO_TARGET", "rubikpi3");
+        let resolved = cmd(None).resolve_target(&config);
+        std::env::remove_var("AVOCADO_TARGET");
+        assert_eq!(resolved.as_deref(), Some("rubikpi3"));
+    }
+
+    #[test]
+    #[serial]
+    fn an_explicit_flag_still_wins_over_the_env_target() {
+        let config = Config::load_from_str("default_target: imx8mp-evk\n").unwrap();
+        std::env::set_var("AVOCADO_TARGET", "rubikpi3");
+        let resolved = cmd(Some("qemuarm64")).resolve_target(&config);
+        std::env::remove_var("AVOCADO_TARGET");
+        assert_eq!(resolved.as_deref(), Some("qemuarm64"));
+    }
+
+    #[test]
+    #[serial]
+    fn default_target_still_applies_when_nothing_overrides_it() {
+        let config = Config::load_from_str("default_target: imx8mp-evk\n").unwrap();
+        std::env::remove_var("AVOCADO_TARGET");
+        assert_eq!(
+            cmd(None).resolve_target(&config).as_deref(),
+            Some("imx8mp-evk")
+        );
+    }
+
+    #[test]
+    fn the_missing_manifest_reason_names_the_target_and_where_it_came_from() {
+        let reason = manifest_missing_reason("rubikpi3");
+        assert!(reason.contains("rubikpi3"), "{reason}");
+        // The miss is as often a target mix-up as an incomplete install, so
+        // the text has to point at both, and at what sets the target.
+        assert!(reason.contains("avocado install"), "{reason}");
+        assert!(reason.contains("AVOCADO_TARGET"), "{reason}");
+        assert!(reason.contains("default_target"), "{reason}");
+    }
 
     #[test]
     fn extracts_placeholders() {
