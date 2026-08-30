@@ -37,6 +37,10 @@ pub fn read_soc_uid_command(sources: &[&str]) -> String {
 /// The token kind avocadoctl records, so a later reader knows what to derive.
 pub const DERIVATION_KIND: &str = "hmac-sha256-uid";
 
+/// The LUKS2 token avocadoctl records for the recovery keyslot; the enroll
+/// verifies the device reports it before claiming success.
+pub const RECOVERY_TOKEN_TYPE: &str = "avocado-recovery";
+
 fn master_for(config_path: &str, runtime: &str) -> Result<Vec<u8>> {
     let config = Config::load(config_path)?;
     let key = config.get_runtime_var_recovery(runtime).ok_or_else(|| {
@@ -88,6 +92,19 @@ impl VarKeyEnrollCommand {
         if self.verbose && !out.trim().is_empty() {
             print_info(out.trim(), OutputLevel::Normal);
         }
+        // An avocadoctl too old to know `var-key` prints its help and exits 0,
+        // so a zero status is not evidence that a keyslot exists. Ask the
+        // device what the header says before reporting success.
+        let listed = ssh
+            .run_command("avocadoctl var-key list")
+            .await
+            .context("avocadoctl var-key list on the device")?;
+        anyhow::ensure!(
+            listed.contains(RECOVERY_TOKEN_TYPE),
+            "the device reports no {RECOVERY_TOKEN_TYPE} keyslot after enrolling - \
+             is avocadoctl on the device new enough to have `var-key`? It said:\n{}",
+            listed.trim()
+        );
         print_success(
             &format!(
                 "Recovery keyslot enrolled on {} for runtime '{}'. Recover later with: \
