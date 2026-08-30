@@ -353,7 +353,7 @@ PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} distro-sync
+    {dnf_args_str} --refresh {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} distro-sync
 "#
     )
 }
@@ -1074,6 +1074,14 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         .lock_file
         .get_locked_package_names(params.target, &params.sysroot_type)
         .is_empty();
+    // dnf keeps its own expiry bookkeeping (default 48 h) in the SDK's
+    // persistdir, so a feed whose contents changed under the same URL - a dev
+    // repo rebuilt in place, a channel head between snapshots - stays invisible
+    // however the cache directory is groomed: every run reports "Last metadata
+    // expiration check: 6:55:04 ago" and resolves against the old package set.
+    // When there is nothing pinned to be reproducible about, ask dnf to re-read
+    // the metadata instead of guessing whether it is stale.
+    let refresh = if fresh_resolve { "--refresh" } else { "" };
     let sync_snippet = dnf_sync_step(fresh_resolve, sysroot_dir, &dnf_args_str, yes, &exclude_str);
     let command = format!(
         r#"
@@ -1091,7 +1099,7 @@ PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
+    {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
 {sync_snippet}{overlay_snippet}"#
     );
 
@@ -1571,7 +1579,7 @@ mod tests {
             "{fresh}"
         );
         assert!(
-            fresh.contains("--best -y --exclude=foo"),
+            fresh.contains("--best --refresh -y --exclude=foo"),
             "same args and excludes as the install: {fresh}"
         );
         assert!(
