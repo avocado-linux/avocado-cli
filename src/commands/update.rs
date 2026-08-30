@@ -154,7 +154,10 @@ impl UpdateCommand {
             target: target.to_string(),
             command: metadata_refresh_script().to_string(),
             verbose: self.verbose,
-            source_environment: true,
+            // The entrypoint defines DNF_SDK_HOST & co. natively; sourcing the
+            // environment file instead mangles those multi-line exports (the
+            // sysroot installs run the same way).
+            source_environment: false,
             interactive: false,
             ..Default::default()
         };
@@ -181,8 +184,6 @@ impl UpdateCommand {
 /// marks metadata stale, so the next dnf run re-fetches repomd and nothing else.
 fn metadata_refresh_script() -> &'static str {
     r#"
-$DNF_SDK_HOST $DNF_SDK_HOST_REPO_CONF clean expire-cache
-$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF clean expire-cache
 # The sysroot install stamps record "these inputs produced this sysroot"; a
 # feed that changed under them is not an input they can see, so a stamp that
 # still reads current would make the next install skip dnf altogether. Moving
@@ -191,6 +192,8 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF clean expire-cache
 if [ -d "$AVOCADO_PREFIX/.stamps" ]; then
     rm -rf "$AVOCADO_PREFIX/.stamps"
 fi
+$DNF_SDK_HOST $DNF_SDK_HOST_REPO_CONF clean expire-cache
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF clean expire-cache
 "#
 }
 
