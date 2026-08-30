@@ -479,12 +479,12 @@ if [ -n "${AVOCADO_REPO_CA_B64:-}" ]; then
     mkdir -p "$(dirname "$_avocado_ca_bundle")"
     if ! grep -q "BEGIN AVOCADO_REPO_CA" "$_avocado_ca_bundle" 2>/dev/null; then
         { echo "# BEGIN AVOCADO_REPO_CA"; printf '%s' "$AVOCADO_REPO_CA_B64" | base64 -d; echo; echo "# END AVOCADO_REPO_CA"; } >> "$_avocado_ca_bundle"
-        echo "[INFO] Added custom repo CA to the SDK trust bundle."
+        echo "[INFO] Added custom repo CA to the SDK trust bundle." >&2
     fi
 fi
 if [ "${AVOCADO_REPO_INSECURE:-}" = "1" ]; then
     export DNF_SDK_HOST="${DNF_SDK_HOST} --setopt=sslverify=0"
-    echo "[WARN] AVOCADO_REPO_INSECURE=1: TLS verification DISABLED for all dnf operations."
+    echo "[WARN] AVOCADO_REPO_INSECURE=1: TLS verification DISABLED for all dnf operations." >&2
 fi
 "##;
 
@@ -2266,7 +2266,7 @@ impl SdkContainer {
         } else {
             format!(
                 r#"if ! command -v bindfs >/dev/null 2>&1; then
-    echo "[ERROR] bindfs is not installed in this container image."
+    echo "[ERROR] bindfs is not installed in this container image." >&2
     echo ""
     echo "To resolve this, update the SDK container by running one of the following:"
     echo ""
@@ -2343,7 +2343,7 @@ trap 'cleanup 143' TERM
 trap 'cleanup 130' INT
 
 # Remote execution mode - NFS volumes mounted
-if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Remote execution mode - using NFS-mounted volumes"; fi
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Remote execution mode - using NFS-mounted volumes" >&2; fi
 
 # Remount source directory with permission translation via bindfs
 # This maps host UID/GID to root inside the container for seamless file access
@@ -2351,7 +2351,7 @@ mkdir -p /opt/src
 
 # Check if bindfs is available
 if ! command -v bindfs >/dev/null 2>&1; then
-    echo "[ERROR] bindfs is not installed in this container image."
+    echo "[ERROR] bindfs is not installed in this container image." >&2
     echo ""
     echo "To resolve this, update the SDK container by running one of the following:"
     echo ""
@@ -2365,17 +2365,17 @@ if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
     # If host user is already root (UID 0), no mapping needed - just bind mount
     if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
         mount --bind /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)"; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)" >&2; fi
     else
         # Use --map with colon-separated user and group mappings
         # Maps host UID -> 0 (root) and host GID -> 0 (root group)
         bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src with UID/GID mapping ($AVOCADO_HOST_UID:$AVOCADO_HOST_GID -> 0:0)"; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src with UID/GID mapping ($AVOCADO_HOST_UID:$AVOCADO_HOST_GID -> 0:0)" >&2; fi
     fi
 else
     # Fallback: simple bind mount without permission translation
     mount --bind /mnt/src /opt/src
-    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)"; fi
+    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)" >&2; fi
 fi
 
 # Mount extension source paths with bindfs (for path-based remote extensions)
@@ -2395,17 +2395,17 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
             if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
                 if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
                     mount --bind "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)"; fi
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
                 else
                     bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping"; fi
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping" >&2; fi
                 fi
             else
                 mount --bind "$mnt_path" "$target_path"
-                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)"; fi
+                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)" >&2; fi
             fi
         else
-            echo "[WARNING] Extension mount path not found: $mnt_path"
+            echo "[WARNING] Extension mount path not found: $mnt_path" >&2
         fi
     done
 fi
@@ -2414,7 +2414,7 @@ fi
 # when unset), so there is no literal default to drift here.
 REPO_URL="$AVOCADO_SDK_REPO_URL"
 
-if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'"; fi
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'" >&2; fi
 
 # Get repo release from environment or default to prod
 if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
@@ -2429,7 +2429,7 @@ else
     REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
 
-if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'" >&2; fi
 
 export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
 export AVOCADO_SDK_ARCH="$(uname -m)"
@@ -2638,7 +2638,7 @@ mkdir -p /opt/src
 
 # Check if bindfs is available
 if ! command -v bindfs >/dev/null 2>&1; then
-    echo "[ERROR] bindfs is not installed in this container image."
+    echo "[ERROR] bindfs is not installed in this container image." >&2
     echo ""
     echo "To resolve this, update the SDK container by running one of the following:"
     echo ""
@@ -2652,18 +2652,18 @@ if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
     # If host user is already root (UID 0), no mapping needed - just bind mount
     if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
         mount --bind /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)"; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)" >&2; fi
     else
         # Use --map with colon-separated user and group mappings
         # Maps host UID -> 0 (root) and host GID -> 0 (root group)
         # Format: --map=uid1/uid2:@gid1/@gid2
         bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src with UID/GID mapping ($AVOCADO_HOST_UID:$AVOCADO_HOST_GID -> 0:0)"; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src with UID/GID mapping ($AVOCADO_HOST_UID:$AVOCADO_HOST_GID -> 0:0)" >&2; fi
     fi
 else
     # Fallback: simple bind mount without permission translation
     mount --bind /mnt/src /opt/src
-    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)"; fi
+    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)" >&2; fi
 fi
 
 # Mount extension source paths with bindfs (for path-based remote extensions)
@@ -2683,17 +2683,17 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
             if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
                 if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
                     mount --bind "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)"; fi
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
                 else
                     bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping"; fi
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping" >&2; fi
                 fi
             else
                 mount --bind "$mnt_path" "$target_path"
-                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)"; fi
+                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)" >&2; fi
             fi
         else
-            echo "[WARNING] Extension mount path not found: $mnt_path"
+            echo "[WARNING] Extension mount path not found: $mnt_path" >&2
         fi
     done
 fi
@@ -2702,7 +2702,7 @@ fi
 # when unset), so there is no literal default to drift here.
 REPO_URL="$AVOCADO_SDK_REPO_URL"
 
-if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'"; fi
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo URL: '$REPO_URL'" >&2; fi
 
 # Get repo release from environment or default to prod
 if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
@@ -2717,7 +2717,7 @@ else
     REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
 
-if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'"; fi
+if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Using repo release: '$REPO_RELEASE'" >&2; fi
 
 export AVOCADO_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}"
 export AVOCADO_SDK_ARCH="$(uname -m)"
@@ -3544,6 +3544,37 @@ extensions:
         assert!(script
             .contains("bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src"));
         assert!(script.contains("mkdir -p /opt/src"));
+    }
+
+    #[test]
+    fn test_entrypoint_diagnostics_go_to_stderr() {
+        // Capture callers (deploy's hash collection, runtime build) parse the
+        // container's stdout as JSON. A single "[INFO] Mounted ..." line there —
+        // which AVOCADO_VERBOSE turns on — makes that parse fail, so every
+        // diagnostic in these scripts must be redirected to stderr.
+        let container = SdkContainer::new();
+        let scripts = [
+            container.create_entrypoint_script(true, Some("ext"), None, "x86_64", false, false),
+            container.create_entrypoint_script_for_remote(
+                true,
+                Some("ext"),
+                None,
+                "x86_64",
+                false,
+                false,
+            ),
+            REPO_TLS_SETUP_SNIPPET.to_string(),
+        ];
+        for script in scripts {
+            for line in script.lines() {
+                if let Some(pos) = line.find("echo \"[") {
+                    assert!(
+                        line[pos..].contains(">&2"),
+                        "diagnostic reaches stdout and would corrupt a captured parse: {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
