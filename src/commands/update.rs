@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::utils::{
     config::Config,
+    container::{RunConfig, SdkContainer},
     lockfile::LockFile,
     output::{print_info, print_success, OutputLevel},
     snapshot,
@@ -62,6 +63,14 @@ impl UpdateCommand {
         // re-locks within the new snapshot.
         lock_file.clear_all(&target);
 
+        // The SDK keeps dnf's repodata cache on the persistent volume, so a feed
+        // whose contents were replaced under the same URL (a dev repo, or a
+        // channel head between snapshots) stays invisible until the metadata
+        // expires - days. "Move forward" has to include forgetting what the
+        // feed used to say; the next install re-reads it. Best-effort: a
+        // missing SDK image or container is reported, not fatal.
+        self.refresh_sdk_metadata(&config, &target).await;
+
         match latest {
             Some(new_pin) => {
                 let new_id = new_pin.snapshot.clone();
@@ -118,5 +127,83 @@ impl UpdateCommand {
         }
 
         Ok(())
+    }
+
+    async fn refresh_sdk_metadata(&self, config: &Config, target: &str) {
+        let Some(container_image) = config.get_sdk_image() else {
+            if self.verbose {
+                print_info(
+                    "No SDK image configured; not refreshing the SDK's dnf metadata cache.",
+                    OutputLevel::Normal,
+                );
+            }
+            return;
+        };
+        let helper = match SdkContainer::from_config(&self.config_path, config) {
+            Ok(h) => h.verbose(self.verbose),
+            Err(e) => {
+                print_info(
+                    &format!("Not refreshing the SDK's dnf metadata cache: {e}"),
+                    OutputLevel::Normal,
+                );
+                return;
+            }
+        };
+        let run = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: metadata_refresh_script().to_string(),
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            ..Default::default()
+        };
+        match helper.run_in_container(run).await {
+            Ok(true) => {
+                if self.verbose {
+                    print_info("Expired the SDK's dnf metadata cache.", OutputLevel::Normal);
+                }
+            }
+            Ok(false) => print_info(
+                "Could not expire the SDK's dnf metadata cache; the next install may still see the previous feed contents.",
+                OutputLevel::Normal,
+            ),
+            Err(e) => print_info(
+                &format!("Could not expire the SDK's dnf metadata cache ({e}); the next install may still see the previous feed contents."),
+                OutputLevel::Normal,
+            ),
+        }
+    }
+}
+
+/// Expire dnf's cached repodata for both repo sets the SDK uses (host tools and
+/// target sysroots). `clean expire-cache` keeps the downloaded packages and only
+/// marks metadata stale, so the next dnf run re-fetches repomd and nothing else.
+fn metadata_refresh_script() -> &'static str {
+    r#"
+$DNF_SDK_HOST $DNF_SDK_HOST_REPO_CONF clean expire-cache
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF clean expire-cache
+"#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metadata_refresh_script;
+
+    #[test]
+    fn update_expires_both_repo_sets_metadata_without_dropping_packages() {
+        let s = metadata_refresh_script();
+        assert!(
+            s.contains("$DNF_SDK_HOST_REPO_CONF clean expire-cache"),
+            "{s}"
+        );
+        assert!(
+            s.contains("$DNF_SDK_TARGET_REPO_CONF clean expire-cache"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("clean all"),
+            "packages stay cached; only metadata expires"
+        );
     }
 }

@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   When no pins are recorded (after `update`, or on a first install) the install
   now runs a `dnf distro-sync` on the sysroot in the same container pass; with
   pins present the lock stays authoritative and nothing is synced.
+  `avocado update` also expires the SDK's dnf metadata cache (kept on the
+  persistent SDK volume, default 48 h), so a feed whose contents changed under
+  the same URL is re-read on the next install instead of days later.
 
 ## [1.0.0-rc.2] - 2026-08-28
 
