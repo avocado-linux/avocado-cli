@@ -24,9 +24,14 @@ pub struct SigningKeysCreateCommand {
     pub generate: bool,
     /// Authentication method for PKCS#11 device
     pub auth: String,
+    /// Key algorithm: ed25519 (default, the cli's own signer) or rsa2048/rsa4096
+    /// (a PEM key + self-signed certificate for boot-FIT signing, generated
+    /// with the host's `openssl`).
+    pub algorithm: String,
 }
 
 impl SigningKeysCreateCommand {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: Option<String>,
         uri: Option<String>,
@@ -35,6 +40,7 @@ impl SigningKeysCreateCommand {
         key_label: Option<String>,
         generate: bool,
         auth: String,
+        algorithm: String,
     ) -> Self {
         Self {
             name,
@@ -44,7 +50,40 @@ impl SigningKeysCreateCommand {
             key_label,
             generate,
             auth,
+            algorithm,
         }
+    }
+
+    /// RSA: `openssl req -x509 -newkey rsa:N` into a temp dir, then the same
+    /// storage path as `import`. Returns (keyid, uri).
+    fn create_rsa_pem(&self) -> Result<(String, String)> {
+        use crate::utils::signing_keys::{keyid_for_pem_cert, save_pem_keypair};
+        let bits = self.algorithm.trim_start_matches("rsa");
+        let subject = format!("/CN={}", self.name.as_deref().unwrap_or("avocado-fit"));
+        let dir = tempfile::Builder::new()
+            .prefix("avocado-rsa-key-")
+            .tempdir()?;
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req", "-batch", "-new", "-x509", "-sha256", "-nodes", "-days", "3650",
+                "-newkey", &format!("rsa:{bits}"), "-subj", &subject,
+            ])
+            .arg("-keyout").arg(&key)
+            .arg("-out").arg(&cert)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .map_err(|e| anyhow::anyhow!("could not run openssl ({e}); install it, or generate the key elsewhere and use `avocado signing-keys import`"))?;
+        if !status.success() {
+            anyhow::bail!("openssl failed to generate the {} key", self.algorithm);
+        }
+        let key_pem = std::fs::read(&key)?;
+        let cert_pem = std::fs::read_to_string(&cert)?;
+        let keyid = keyid_for_pem_cert(&cert_pem)?;
+        let base = save_pem_keypair(&keyid, &key_pem, cert_pem.as_bytes())?;
+        Ok((keyid, path_to_file_uri(&base)))
     }
 
     pub fn execute(&self) -> Result<()> {
@@ -56,7 +95,23 @@ impl SigningKeysCreateCommand {
 
         let mut registry = KeysRegistry::load()?;
 
-        let (keyid, uri, algorithm, key_type) = if let Some(device_type_str) = &self.pkcs11_device {
+        let (keyid, uri, algorithm, key_type) = if crate::utils::signing_keys::is_pem_algorithm(
+            &self.algorithm,
+        ) {
+            if self.pkcs11_device.is_some() || self.uri.is_some() {
+                anyhow::bail!(
+                    "--algorithm {} is file-based; it cannot be combined with PKCS#11 options",
+                    self.algorithm
+                );
+            }
+            let (keyid, uri) = self.create_rsa_pem()?;
+            (keyid, uri, self.algorithm.clone(), "file".to_string())
+        } else if self.algorithm != "ed25519" {
+            anyhow::bail!(
+                "--algorithm {}: expected ed25519, rsa2048 or rsa4096",
+                self.algorithm
+            );
+        } else if let Some(device_type_str) = &self.pkcs11_device {
             // PKCS#11 hardware device flow
             let device_type = DeviceType::from_str(device_type_str)?;
             let auth_method = Pkcs11AuthMethod::from_str(&self.auth)?;

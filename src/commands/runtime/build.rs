@@ -722,31 +722,66 @@ impl RuntimeBuildCommand {
         };
 
         // FIT signing key for the boot image assembled below (FIT machines
-        // only). AVOCADO_FIT_KEY_DIR names a host directory holding
-        // FIT.key/FIT.crt - the key-name-hint the feed's FIT template uses -
-        // and is bind-mounted read-only at /tmp/fit-keys. Optional: without
-        // it the FIT is assembled unsigned, which only boots on a U-Boot with
-        // no embedded key. Env rather than config until signing_keys can
-        // materialize PEM for external tools.
-        if std::env::var("AVOCADO_FIT_UNSIGNED").as_deref() == Ok("1") {
+        // only), from `runtimes.<r>.signing.fit_key`: an RSA PEM key in the
+        // signing-key registry, materialized as the FIT.key/FIT.crt pair the
+        // feed's FIT template names (key-name-hint "FIT") in a private temp dir
+        // that is bind-mounted read-only at /tmp/fit-keys. `signing.fit_unsigned`
+        // is the explicit opt-out; without either the FIT is left as the feed
+        // built it (or the build fails, when verity needs the FIT rebuilt).
+        for stale in ["AVOCADO_FIT_KEY_DIR", "AVOCADO_FIT_UNSIGNED"] {
+            if std::env::var_os(stale).is_some() {
+                print_info(
+                    &format!(
+                        "{stale} is no longer read; set runtimes.{}.signing.fit_key (or fit_unsigned: true) in avocado.yaml instead.",
+                        self.runtime_name
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+        let (fit_key_name, fit_unsigned) = config.get_runtime_fit_signing(&self.runtime_name);
+        if fit_key_name.is_some() && fit_unsigned {
+            return Err(anyhow::anyhow!(
+                "runtime '{}' sets both signing.fit_key and signing.fit_unsigned; pick one.",
+                self.runtime_name
+            ));
+        }
+        if fit_unsigned {
             env_vars.insert("AVOCADO_FIT_UNSIGNED".to_string(), "1".to_string());
         }
-        let fit_keydir_host_path: Option<String> = match std::env::var("AVOCADO_FIT_KEY_DIR") {
-            Ok(dir) => {
-                if !std::path::Path::new(&dir).join("FIT.key").is_file() {
-                    return Err(anyhow::anyhow!(
-                        "AVOCADO_FIT_KEY_DIR points to '{}' but it has no FIT.key.",
-                        dir
-                    ));
-                }
+        let fit_keys_tempdir: Option<tempfile::TempDir> = match fit_key_name {
+            Some(ref name) => {
+                let (key, cert, algorithm) = crate::utils::signing_keys::pem_key_files(name)?;
+                // mkimage's algo string for the FIT signature nodes and for
+                // fdt_add_pubkey: "<hash>,<rsaNNNN>".
+                env_vars.insert(
+                    "AVOCADO_FIT_ALGO".to_string(),
+                    format!("sha256,{algorithm}"),
+                );
+                let dir = tempfile::Builder::new()
+                    .prefix("avocado-fit-keys-")
+                    .tempdir()
+                    .context("Failed to create a temp dir for the FIT signing key")?;
+                std::fs::copy(&key, dir.path().join("FIT.key"))
+                    .with_context(|| format!("Failed to stage {}", key.display()))?;
+                std::fs::copy(&cert, dir.path().join("FIT.crt"))
+                    .with_context(|| format!("Failed to stage {}", cert.display()))?;
                 env_vars.insert(
                     "AVOCADO_FIT_KEY_DIR".to_string(),
                     "/tmp/fit-keys".to_string(),
                 );
                 Some(dir)
             }
-            Err(_) => None,
+            None => None,
         };
+        let fit_keydir_host_path: Option<String> = fit_keys_tempdir
+            .as_ref()
+            .map(|d| d.path().to_string_lossy().into_owned());
+        if fit_keys_tempdir.is_some()
+            && config.get_runtime_fit_key_in_bootloader(&self.runtime_name)
+        {
+            env_vars.insert("AVOCADO_FIT_KEY_IN_BOOTLOADER".to_string(), "1".to_string());
+        }
 
         // The in-container sign_amf shell helper checks
         // $AVOCADO_AMF_KOS. Only kos runtimes set it; everyone else
@@ -2576,6 +2611,10 @@ mkdir -p "$RUNTIME_EXT_DIR"
 # Clean up stale extensions to ensure fresh copies
 echo "Cleaning up stale extensions..."
 rm -f "$RUNTIME_EXT_DIR"/*.raw "$RUNTIME_EXT_DIR"/*.kab 2>/dev/null || true
+# Re-keyed bootloader outputs from an earlier build (the feed's re-key script writes
+# them here, where stone resolves them ahead of the SDK's copies). A build that
+# does not re-key must not ship a bootloader closed to the previous key.
+rm -f "$OUTPUT_DIR"/imx-boot-*.bin-* "$OUTPUT_DIR"/imx-boot "$OUTPUT_DIR"/u-boot-*.dtb.keyed 2>/dev/null || true
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
@@ -2646,6 +2685,19 @@ _PROGRESS_PID=$!
 mkfs.btrfs -r "$VAR_DIR" \
 {mkfs_flags} \
 {global_compress_flag}    -f "$VAR_IMAGE"
+
+# var.encrypt: the first boot converts this filesystem to LUKS2 in place, which
+# needs 32 MiB in front of the data (cryptsetup reencrypt --reduce-device-size)
+# that cryptsetup-var obtains by shrinking the filesystem. `mkfs.btrfs -r`
+# packs its chunks to the content, so a tight image has nothing to shrink into;
+# rebuild it at the tight size plus 64 MiB so the room is inside the filesystem
+# the runtime declared it needs. The partition stays exactly the image size.
+if [ "{var_luks_room}" = "1" ]; then
+    VAR_TIGHT_SIZE=$(stat -c%s "$VAR_IMAGE")
+    mkfs.btrfs -r "$VAR_DIR" \
+{mkfs_flags} \
+{global_compress_flag}    -b $(( VAR_TIGHT_SIZE + 67108864 )) -f "$VAR_IMAGE"
+fi
 
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
 
@@ -2808,6 +2860,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             update_authority_section = update_authority_section,
             docker_section = docker_section,
             device_tree_overlay_section = device_tree_overlay_section,
+            var_luks_room = if var_encrypt(target_arch) { "1" } else { "0" },
         );
 
         Ok(script)
@@ -3321,10 +3374,10 @@ FIT_ITS="$OUTPUT_DIR/fit-image.its"
 if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
     if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
         if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
-            echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set AVOCADO_FIT_KEY_DIR to a directory holding FIT.key/FIT.crt, or AVOCADO_FIT_UNSIGNED=1 if this machine's U-Boot enforces no key." >&2
+            echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set runtimes.<name>.signing.fit_key to an RSA key in the signing-key registry, or signing.fit_unsigned: true if this machine's U-Boot enforces no key." >&2
             exit 1
         fi
-        echo "WARNING: boot FIT not rebuilt (no AVOCADO_FIT_KEY_DIR, AVOCADO_FIT_UNSIGNED not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
+        echo "WARNING: boot FIT not rebuilt (no signing.fit_key, signing.fit_unsigned not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
     else
         echo "Assembling boot FIT from $FIT_ITS..."
         FIT_WORK_ITS="$OUTPUT_DIR/fit-image.project.its"
@@ -3343,6 +3396,35 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
         FIT_SIGN_ARGS=""
         if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
             FIT_SIGN_ARGS="-k $AVOCADO_FIT_KEY_DIR -r"
+            # A feed built without verified-boot ships a template whose
+            # configuration nodes carry no signature-* subnode, and mkimage -r
+            # then signs nothing without complaint. Give every configuration
+            # one (algo, key-name-hint "FIT", sign-images = the image
+            # properties that configuration actually names) unless the
+            # template already has them. The result is checked below.
+            if ! grep -qE '^[[:space:]]*signature-[0-9]+ \{' "$FIT_WORK_ITS"; then
+                awk -v algo="${AVOCADO_FIT_ALGO:-sha256,rsa2048}" '
+                    /^[[:space:]]*conf-[^[:space:]]+ \{$/ { inconf=1; imgs=""; depth=0 }
+                    inconf && /^[[:space:]]*(kernel|fdt|ramdisk|loadables) = / {
+                        p=$1; imgs = imgs (imgs==""?"":", ") "\"" p "\""
+                    }
+                    inconf && /\{[[:space:]]*$/ { depth++ }
+                    inconf && /^[[:space:]]*\};/ {
+                        depth--
+                        if (depth==0) {
+                            print "\t\t\tsignature-1 {"
+                            print "\t\t\t\talgo = \"" algo "\";"
+                            print "\t\t\t\tkey-name-hint = \"FIT\";"
+                            print "\t\t\t\tsign-images = " imgs ";"
+                            print "\t\t\t};"
+                            inconf=0
+                        }
+                    }
+                    { print }
+                ' "$FIT_WORK_ITS" > "$FIT_WORK_ITS.signed" && mv "$FIT_WORK_ITS.signed" "$FIT_WORK_ITS"
+                grep -qE '^[[:space:]]*signature-1 \{' "$FIT_WORK_ITS" \
+                    || { echo "ERROR: could not add signature nodes to the FIT configurations in $FIT_ITS" >&2; exit 1; }
+            fi
         else
             # Explicitly unsigned: strip the signature nodes so mkimage does not look for a key.
             sed -i -E '/^[[:space:]]*signature-[0-9]+ \{/,/^[[:space:]]*\};/d' "$FIT_WORK_ITS"
@@ -3352,7 +3434,36 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
             || { echo "ERROR: mkimage failed to assemble the boot FIT" >&2; exit 1; }
         [ -s "$OUTPUT_DIR/fitImage" ] || { echo "ERROR: boot FIT was not produced" >&2; exit 1; }
         mkimage -l "$OUTPUT_DIR/fitImage" | grep -E 'Default Configuration|Sign algo' | head -2 | sed 's/^/  /'
+        if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
+            # Prove the signature exists rather than trust mkimage's silence.
+            mkimage -l "$OUTPUT_DIR/fitImage" | grep -q 'Sign algo' \
+                || { echo "ERROR: boot FIT was built but carries no configuration signature" >&2; exit 1; }
+        fi
         echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
+        # Make the bootloader enforce that key. The feed ships the procedure and
+        # its inputs (imx-boot-tools/rekey-imx-boot.sh + rekey.env, i.MX8M); the
+        # re-packed images take the feed's file names, so stone's imx_boot* image
+        # keys resolve to them ahead of the SDK's copies. A feed without the
+        # tooling is an error, not a silent distro bootloader: a project that
+        # asked for its key in the bootloader must not ship one that ignores it.
+        if [ "${AVOCADO_FIT_KEY_IN_BOOTLOADER:-0}" = "1" ]; then
+            REKEY="$OUTPUT_DIR/imx-boot-tools/rekey-imx-boot.sh"
+            if [ ! -x "$REKEY" ]; then
+                echo "ERROR: signing.fit_key_in_bootloader is on but this feed ships no imx-boot-tools/rekey-imx-boot.sh for $TARGET_ARCH. Set signing.fit_key_in_bootloader: false to keep the distro bootloader." >&2
+                exit 1
+            fi
+            echo "Rebuilding the bootloader to enforce the FIT key..."
+            "$REKEY" "$OUTPUT_DIR/imx-boot-tools" "$AVOCADO_FIT_KEY_DIR" "$OUTPUT_DIR" "${AVOCADO_FIT_ALGO:-sha256,rsa2048}" \
+                || { echo "ERROR: bootloader re-key failed" >&2; exit 1; }
+            # The keyed control DTB is what U-Boot will verify with; run that
+            # verification here so a mismatch fails the build, not the boot.
+            KEYED_DTB=$(ls "$OUTPUT_DIR"/u-boot-*.dtb.keyed 2>/dev/null | head -1)
+            if [ -n "$KEYED_DTB" ] && command -v fit_check_sign >/dev/null 2>&1; then
+                fit_check_sign -f "$OUTPUT_DIR/fitImage" -k "$KEYED_DTB" >/dev/null 2>&1 \
+                    || { echo "ERROR: the re-keyed bootloader does not verify this runtime's boot FIT" >&2; exit 1; }
+                echo "Bootloader re-keyed: fitImage verifies against $(basename "$KEYED_DTB")"
+            fi
+        fi
     fi
 fi
 "#
@@ -3377,6 +3488,10 @@ mod tests {
             "rootfs root hash must be embedded in the FIT"
         );
         assert!(s.contains("-k $AVOCADO_FIT_KEY_DIR -r"), "signing path");
+        assert!(
+            s.contains("rekey-imx-boot.sh") && s.contains("AVOCADO_FIT_KEY_IN_BOOTLOADER"),
+            "bootloader re-key runs only when asked, and fails closed without the feed tooling"
+        );
         assert!(
             s.contains("signature-[0-9]+"),
             "unsigned path must strip signature nodes"
@@ -4011,6 +4126,14 @@ runtimes:
         assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
         // No var.encrypt: the plaintext path writes no marker.
         assert!(!script.contains("/etc/avocado/var-encrypt"));
+        // A previous build's re-keyed bootloader is removed before stone can
+        // pick it up, unconditionally and ahead of the FIT assembly that may
+        // regenerate it.
+        let rm = script
+            .find("rm -f \"$OUTPUT_DIR\"/imx-boot-*.bin-* \"$OUTPUT_DIR\"/imx-boot \"$OUTPUT_DIR\"/u-boot-*.dtb.keyed")
+            .expect("re-key outputs are cleaned up");
+        assert!(rm < script.find("rekey-imx-boot.sh").unwrap());
+        assert!(rm < script.find("stone bundle").unwrap());
     }
 
     #[test]
@@ -4047,6 +4170,52 @@ runtimes:
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
+    }
+
+    #[test]
+    fn var_encrypt_builds_the_var_image_with_room_to_shrink_for_the_luks_header() {
+        let temp_dir = TempDir::new().unwrap();
+        let on = r#"
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    var:
+      encrypt: true
+"#;
+        let build = |content: &str| {
+            let config_path = create_test_config_file(&temp_dir, content);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let cmd = RuntimeBuildCommand::new(
+                "test-runtime".to_string(),
+                config_path,
+                false,
+                Some("x86_64".to_string()),
+                None,
+                None,
+            );
+            let config = Config::load(&cmd.config_path).unwrap();
+            cmd.create_build_script(&config, &parsed, "x86_64", &[])
+                .unwrap()
+        };
+        let script = build(on);
+        assert!(
+            script.contains("if [ \"1\" = \"1\" ]; then"),
+            "second mkfs pass is armed"
+        );
+        assert!(script.contains("-b $(( VAR_TIGHT_SIZE + 67108864 ))"));
+        assert!(
+            script.contains("--partition-size \"var=$FINAL_SIZE\""),
+            "partition stays the image size"
+        );
+
+        let script = build(&on.replace("encrypt: true", "encrypt: false"));
+        assert!(
+            script.contains("if [ \"0\" = \"1\" ]; then"),
+            "plaintext runtime keeps the tight image"
+        );
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other

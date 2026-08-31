@@ -75,7 +75,8 @@ use commands::sdk::{
 };
 use commands::sign::SignCommand;
 use commands::signing_keys::{
-    SigningKeysCreateCommand, SigningKeysListCommand, SigningKeysRemoveCommand,
+    SigningKeysCreateCommand, SigningKeysImportCommand, SigningKeysListCommand,
+    SigningKeysRemoveCommand,
 };
 use commands::unlock::UnlockCommand;
 use commands::update::UpdateCommand;
@@ -1467,6 +1468,24 @@ enum SigningKeysCommands {
         /// Authentication method for PKCS#11 device (none, prompt, env)
         #[arg(long, default_value = "prompt", value_name = "METHOD")]
         auth: String,
+        /// Key algorithm: ed25519 (default), or rsa2048 / rsa4096 for boot-FIT
+        /// signing (a PEM key + self-signed certificate, generated with openssl)
+        #[arg(long, default_value = "ed25519", value_name = "ALGORITHM")]
+        algorithm: String,
+    },
+    /// Import an existing RSA PEM key and certificate (for boot-FIT signing)
+    Import {
+        /// Name for the key, referenced from `runtimes.<name>.signing.fit_key`
+        name: String,
+        /// PEM private key file
+        #[arg(long, value_name = "FILE")]
+        key: std::path::PathBuf,
+        /// PEM X.509 certificate for that key
+        #[arg(long, value_name = "FILE")]
+        cert: std::path::PathBuf,
+        /// Expected key size (rsa2048 or rsa4096); read from the key when omitted
+        #[arg(long, value_name = "ALGORITHM")]
+        algorithm: Option<String>,
     },
     /// List all registered signing keys
     List,
@@ -2485,6 +2504,7 @@ async fn main() -> Result<()> {
                 key_label,
                 generate,
                 auth,
+                algorithm,
             } => {
                 let cmd = SigningKeysCreateCommand::new(
                     name,
@@ -2494,8 +2514,18 @@ async fn main() -> Result<()> {
                     key_label,
                     generate,
                     auth,
+                    algorithm,
                 );
                 cmd.execute()?;
+                Ok(())
+            }
+            SigningKeysCommands::Import {
+                name,
+                key,
+                cert,
+                algorithm,
+            } => {
+                SigningKeysImportCommand::new(name, key, cert, algorithm).execute()?;
                 Ok(())
             }
             SigningKeysCommands::List => {
