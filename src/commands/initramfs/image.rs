@@ -49,15 +49,12 @@ else echo \"WARNING: /sbin/init not found in initramfs — kernel may not find i
 
 /// Release files that may carry the initramfs identity.
 ///
-/// The id is appended to whichever of these exist, and the build-id strip
-/// removes it from the same set before the tree hash is taken - the two must
-/// stay in step or a rebuild would hash the previous build's id and the
-/// "deterministic" id would move on every build.
+/// The injection and the build-id strip must both use this list: a file that
+/// can be written but is not stripped puts the previous build's id into the
+/// tree hash, and the "deterministic" id then moves on every build.
 ///
-/// `usr/lib/os-release` is in the list because that is what actually ships:
-/// `/etc/initrd-release` is a symlink to it (an initrd's release file IS its
-/// os-release), and the dedicated `initrd-release` / `os-release-initrd` files
-/// need not exist at all.
+/// `usr/lib/os-release` is here because `/etc/initrd-release` is a symlink to
+/// it; the dedicated files need not exist.
 const INITRAMFS_IDENTITY_FILES: &[&str] = &[
     "usr/lib/initrd-release",
     "usr/lib/os-release-initrd",
@@ -66,15 +63,13 @@ const INITRAMFS_IDENTITY_FILES: &[&str] = &[
 
 /// Shell that writes `AVOCADO_OS_BUILD_ID` into the initrd's release files.
 ///
-/// Follows `/etc/initrd-release` when it is a symlink, but only writes a target
-/// that is itself one of [`INITRAMFS_IDENTITY_FILES`] inside the work tree: an
-/// absolute symlink must not lead the build to append to the SDK's own
-/// os-release, and a file the strip does not cover must not reach the hash.
+/// Follows `/etc/initrd-release` when it is a symlink, but writes only a target
+/// that is itself one of [`INITRAMFS_IDENTITY_FILES`] resolved inside the work
+/// tree: an absolute symlink must not reach the SDK's own os-release, and a
+/// file the strip does not cover must not reach the hash.
 ///
-/// Fails the build when nothing could be written. The previous version guarded
-/// each append with `[ -f ]` and wrote nothing on the layout that ships, so
-/// images went out with no identity at all - unreadable by the boot-time
-/// initramfs verification and by `/run/avocado/initramfs-build-id`.
+/// Fails the build when nothing could be written, because an image with no
+/// identity is unreadable to everything that reads the id back.
 fn render_identity_injection(work_var: &str, id_var: &str) -> String {
     let loop_list = INITRAMFS_IDENTITY_FILES
         .iter()
@@ -1008,16 +1003,47 @@ mod identity_injection_tests {
     fn every_injected_file_is_also_stripped_before_hashing() {
         // If the injection can write a file the strip does not clear, the next
         // build hashes this build's id and the id moves on every rebuild.
+        //
+        // The expectation is read out of the INJECTION's own rendered allowlist
+        // rather than from INITRAMFS_IDENTITY_FILES: both sides derive from that
+        // const today, so a test that iterates it cannot fail. What can actually
+        // break is the two drifting apart - render_build_id_block being handed a
+        // different list - and that is what this catches.
         let script = generate_initramfs_build_script("ns", "cpio.zst", None, "", false);
-        for f in INITRAMFS_IDENTITY_FILES {
+        let allowed_line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("_avocado_allowed="))
+            .expect("the injection renders an allowlist");
+        let injectable: Vec<String> = allowed_line
+            .trim()
+            .trim_start_matches("_avocado_allowed=\"")
+            .trim_end_matches('"')
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.trim_start_matches("$_avocado_work/").to_string())
+            .collect();
+        assert!(
+            !injectable.is_empty(),
+            "parsed no injectable paths from: {allowed_line}"
+        );
+
+        let stanza = |f: &str| {
+            format!(
+                "if [ -f \"$INITRAMFS_WORK/{f}\" ]; then\n        sed -i \
+                 '/^AVOCADO_OS_BUILD_ID=/d;/^AVOCADO_RUNTIME_NAME=/d;/^AVOCADO_RUNTIME_VERSION=/d' \
+                 \"$INITRAMFS_WORK/{f}\"\n    fi"
+            )
+        };
+        for f in &injectable {
             assert!(
-                script.contains("sed -i '/^AVOCADO_OS_BUILD_ID=/d"),
-                "strip missing"
-            );
-            assert!(
-                script.contains(&format!("\"$INITRAMFS_WORK/{f}\"")),
-                "{f} is injectable but not stripped"
+                script.contains(&stanza(f)),
+                "{f} can be injected but is not stripped before the hash"
             );
         }
+        // The assertion must be capable of failing.
+        assert!(
+            !script.contains(&stanza("usr/lib/not-an-identity-file")),
+            "the stanza check matches a file that is not in the strip list"
+        );
     }
 }
