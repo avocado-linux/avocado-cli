@@ -78,21 +78,25 @@ const INITRAMFS_IDENTITY_FILES: &[&str] = &[
 fn render_identity_injection(work_var: &str, id_var: &str) -> String {
     let loop_list = INITRAMFS_IDENTITY_FILES
         .iter()
-        .map(|f| format!("\"${work_var}/{f}\""))
+        .map(|f| format!("\"$_avocado_work/{f}\""))
         .collect::<Vec<_>>()
         .join(" ");
     // Colon-delimited so the membership test is a plain glob; none of these
     // paths can contain a colon.
     let allowed = INITRAMFS_IDENTITY_FILES
         .iter()
-        .map(|f| format!("${work_var}/{f}"))
+        .map(|f| format!("$_avocado_work/{f}"))
         .collect::<Vec<_>>()
         .join(":");
     format!(
         r#"    # Inject identity into the initrd's release files (see render_identity_injection).
+    # readlink -f canonicalizes, so the allowlist has to be canonical too: a
+    # relative work dir, or one reached through a symlinked component, would
+    # otherwise never match its own resolved paths and fail the build below.
+    _avocado_work=$(readlink -f "${work_var}" 2>/dev/null || printf '%s' "${work_var}")
     _avocado_allowed=":{allowed}:"
     _avocado_identity_written=0
-    for _avocado_f in {loop_list} "${work_var}/etc/initrd-release"; do
+    for _avocado_f in {loop_list} "$_avocado_work/etc/initrd-release"; do
         [ -e "$_avocado_f" ] || continue
         _avocado_t=$(readlink -f "$_avocado_f") || continue
         case "$_avocado_allowed" in
@@ -104,7 +108,7 @@ fn render_identity_injection(work_var: &str, id_var: &str) -> String {
         _avocado_identity_written=1
     done
     if [ "$_avocado_identity_written" -eq 0 ]; then
-        echo "ERROR: no release file in the initramfs can carry AVOCADO_OS_BUILD_ID (looked in $_avocado_allowed and ${work_var}/etc/initrd-release). The image would ship with no identity: both the boot-time initramfs verification and /run/avocado/initramfs-build-id read it back from there." >&2
+        echo "ERROR: no release file in the initramfs can carry AVOCADO_OS_BUILD_ID (looked in $_avocado_allowed and $_avocado_work/etc/initrd-release). The image would ship with no identity: both the boot-time initramfs verification and /run/avocado/initramfs-build-id read it back from there." >&2
         exit 1
     fi
 "#
@@ -861,7 +865,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod identity_injection_tests {
     use super::*;
     use std::fs;
@@ -940,6 +944,37 @@ mod identity_injection_tests {
             1,
             "the symlink and its target must not both append: {c:?}"
         );
+    }
+
+    #[test]
+    fn a_work_root_reached_through_a_symlink_still_matches() {
+        // readlink -f canonicalizes the target, so an allowlist built from a
+        // non-canonical work root would never match and every build would fail
+        // with "no release file". Reproduces a symlinked build directory.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-work");
+        fs::create_dir_all(real.join("usr/lib")).unwrap();
+        fs::create_dir_all(real.join("etc")).unwrap();
+        fs::write(real.join("usr/lib/os-release"), "ID=avocado\n").unwrap();
+        std::os::unix::fs::symlink("../usr/lib/os-release", real.join("etc/initrd-release"))
+            .unwrap();
+        let via_link = tmp.path().join("work-link");
+        std::os::unix::fs::symlink(&real, &via_link).unwrap();
+
+        let script = format!(
+            "set -u\nINITRAMFS_WORK={}\nINITRAMFS_BUILD_ID=initramfs-xyz\n{}",
+            via_link.display(),
+            render_identity_injection("INITRAMFS_WORK", "INITRAMFS_BUILD_ID")
+        );
+        let out = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        assert!(
+            out.status.success(),
+            "symlinked work root rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(fs::read_to_string(real.join("usr/lib/os-release"))
+            .unwrap()
+            .contains("AVOCADO_OS_BUILD_ID=initramfs-xyz"));
     }
 
     #[test]
