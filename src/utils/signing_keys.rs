@@ -19,6 +19,8 @@ const KEYS_REGISTRY_FILE: &str = "keys.json";
 
 /// Subdirectory name for signing keys within the avocado config
 const SIGNING_KEYS_DIR: &str = "signing-keys";
+/// Host-only store for secret masters; never mounted into a build container.
+const SECRETS_DIR: &str = "secrets";
 
 /// Represents a single signing key entry in the registry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +119,75 @@ pub fn get_signing_keys_dir() -> Result<PathBuf> {
     // Otherwise use the host path
     let config_dir = get_avocado_config_dir()?;
     Ok(config_dir.join(SIGNING_KEYS_DIR))
+}
+
+/// Directory for secret masters (`--algorithm hmac-sha256`).
+///
+/// Deliberately NOT [`get_signing_keys_dir`]: that directory is bind-mounted
+/// into every SDK container at `/opt/signing-keys`, so anything a build runs -
+/// a `post_install` hook, an extension's build script - can read what is in it.
+/// A recovery master has no build-time purpose, and it is fleet-wide: with it
+/// and a device's SoC UID, which is not secret, any unit's `/var` can be opened.
+///
+/// This also ignores `AVOCADO_SIGNING_KEYS_DIR` on purpose. That variable is how
+/// a container tells the cli where the mount is; honouring it here would put the
+/// secrets back inside the mount the moment a build looked one up.
+pub fn get_secrets_dir() -> Result<PathBuf> {
+    Ok(get_avocado_config_dir()?.join(SECRETS_DIR))
+}
+
+/// The path a secret master is stored at, host-only.
+pub fn secret_key_path(keyid: &str) -> Result<PathBuf> {
+    Ok(get_secrets_dir()?.join(keyid).with_extension("secret"))
+}
+
+/// Where a secret at `path` belongs, if it is still in the pre-move location.
+///
+/// `None` when it is already outside the mounted directory - the common case
+/// after the first run.
+fn secret_needs_moving(config_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let legacy_dir = config_dir.join(SIGNING_KEYS_DIR);
+    let name = path.file_name()?;
+    path.starts_with(&legacy_dir)
+        .then(|| config_dir.join(SECRETS_DIR).join(name))
+}
+
+/// Move a secret master out of the bind-mounted signing-keys directory.
+///
+/// Returns the path to read. Anyone who created a master before it was
+/// host-only has one sitting in a directory every build container can read, and
+/// the fix should not require them to know that: the next `avocado var-key`
+/// run relocates it. A failure to move is reported and the old path is used, so
+/// recovery still works on a read-only home - losing the move is better than
+/// losing access to the key that opens a fleet's /var.
+fn relocate_secret_if_needed(config_dir: &Path, path: &Path) -> (PathBuf, Option<String>) {
+    let Some(dest) = secret_needs_moving(config_dir, path) else {
+        return (path.to_path_buf(), None);
+    };
+    if !path.exists() {
+        return (path.to_path_buf(), None);
+    }
+    let moved = dest
+        .parent()
+        .ok_or_else(|| "no parent".to_string())
+        .and_then(|dir| fs::create_dir_all(dir).map_err(|e| e.to_string()))
+        .and_then(|_| fs::rename(path, &dest).map_err(|e| e.to_string()));
+    match moved {
+        Ok(()) => (
+            dest.clone(),
+            Some(format!(
+                "moved the recovery master out of the SDK-mounted key directory to {}",
+                dest.display()
+            )),
+        ),
+        Err(e) => (
+            path.to_path_buf(),
+            Some(format!(
+                "could not move the recovery master to {} ({e}); it stays readable inside SDK builds until it is moved by hand",
+                dest.display()
+            )),
+        ),
+    }
 }
 
 /// Get the path to the keys registry file
@@ -359,6 +430,7 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_generate_keyid() {
@@ -405,6 +477,82 @@ mod tests {
         assert!(is_pkcs11_uri("pkcs11:token=YubiKey"));
         assert!(!is_pkcs11_uri("file:///path/to/key"));
         assert!(!is_pkcs11_uri("/path/to/key"));
+    }
+
+    #[test]
+    fn a_secret_never_lands_in_the_directory_the_sdk_mounts() {
+        // The container tells the cli where the mount is with
+        // AVOCADO_SIGNING_KEYS_DIR. get_secrets_dir must ignore it: honouring it
+        // would put the recovery master back inside /opt/signing-keys, which is
+        // bind-mounted into every build and readable by any build hook.
+        //
+        // Asserts on the real functions rather than on the two constants - a
+        // constants-only check passes even if get_secrets_dir returns the
+        // mounted directory.
+        let mount = TempDir::new().unwrap();
+        let previous = std::env::var_os("AVOCADO_SIGNING_KEYS_DIR");
+        std::env::set_var("AVOCADO_SIGNING_KEYS_DIR", mount.path());
+
+        let mounted_dir = get_signing_keys_dir().unwrap();
+        let secret = secret_key_path("abc123").unwrap();
+        let secrets_dir = get_secrets_dir().unwrap();
+
+        // Restore before asserting, so a failure cannot leak the var into the
+        // rest of this test binary.
+        match previous {
+            Some(v) => std::env::set_var("AVOCADO_SIGNING_KEYS_DIR", v),
+            None => std::env::remove_var("AVOCADO_SIGNING_KEYS_DIR"),
+        }
+
+        assert_eq!(
+            mounted_dir,
+            mount.path(),
+            "the mount override should still drive the signing-keys directory"
+        );
+        assert!(
+            !secret.starts_with(&mounted_dir),
+            "the recovery master landed inside the mounted directory: {}",
+            secret.display()
+        );
+        assert!(
+            !secrets_dir.starts_with(&mounted_dir),
+            "the secrets directory is inside the mount: {}",
+            secrets_dir.display()
+        );
+        assert!(secret.starts_with(&secrets_dir));
+    }
+
+    #[test]
+    fn a_secret_in_the_mounted_directory_is_relocated_once() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let legacy = base.join(SIGNING_KEYS_DIR);
+        fs::create_dir_all(&legacy).unwrap();
+        let old = legacy.join("abc123.secret");
+        fs::write(&old, b"master-bytes").unwrap();
+
+        let (path, note) = relocate_secret_if_needed(base, &old);
+        assert_eq!(path, base.join(SECRETS_DIR).join("abc123.secret"));
+        assert!(note.unwrap().contains("moved"));
+        assert!(!old.exists(), "the copy inside the mount must not survive");
+        assert_eq!(fs::read(&path).unwrap(), b"master-bytes");
+
+        // Second run has nothing to do and says nothing.
+        let (again, note) = relocate_secret_if_needed(base, &path);
+        assert_eq!(again, path);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_missing_legacy_secret_is_left_alone() {
+        // The registry can name a path that no longer exists; that is the
+        // loader's error to report, not something to silently "migrate".
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let absent = base.join(SIGNING_KEYS_DIR).join("gone.secret");
+        let (path, note) = relocate_secret_if_needed(base, &absent);
+        assert_eq!(path, absent);
+        assert!(note.is_none());
     }
 
     #[test]
@@ -935,10 +1083,10 @@ pub fn keyid_for_secret(secret: &[u8]) -> String {
 /// Store a secret master as `<keyid>.secret`, mode 0600, and return the file URI.
 pub fn save_secret_key(keyid: &str, secret: &[u8]) -> Result<String> {
     use std::io::Write;
-    let path = get_key_file_path(keyid)?.with_extension("secret");
-    // The ed25519 and PEM paths create this first; without it the very first
-    // `signing-keys create --algorithm hmac-sha256` on a clean install fails
-    // with ENOENT, since there is no registry directory yet.
+    let path = secret_key_path(keyid)?;
+    // Created here because this directory is new on an existing install and
+    // absent on a clean one; without it the very first
+    // `signing-keys create --algorithm hmac-sha256` fails with ENOENT.
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     }
@@ -981,6 +1129,21 @@ pub fn secret_key_bytes(name: &str) -> Result<Vec<u8>> {
         );
     }
     let path = PathBuf::from(entry.uri.trim_start_matches("file://"));
+    // A master created before secrets became host-only still lives in the
+    // mounted directory; move it and record the new location.
+    let (path, note) = match get_avocado_config_dir() {
+        Ok(config_dir) => relocate_secret_if_needed(&config_dir, &path),
+        Err(_) => (path, None),
+    };
+    if let Some(note) = note {
+        eprintln!("[INFO] {registry_name}: {note}");
+        if let Ok(mut registry) = KeysRegistry::load() {
+            if let Some(e) = registry.keys.get_mut(&registry_name) {
+                e.uri = format!("file://{}", path.display());
+                let _ = registry.save();
+            }
+        }
+    }
     let bytes = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     anyhow::ensure!(
         bytes.len() >= 16,
