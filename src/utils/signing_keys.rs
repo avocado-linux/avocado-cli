@@ -141,55 +141,6 @@ pub fn secret_key_path(keyid: &str) -> Result<PathBuf> {
     Ok(get_secrets_dir()?.join(keyid).with_extension("secret"))
 }
 
-/// Where a secret at `path` belongs, if it is still in the pre-move location.
-///
-/// `None` when it is already outside the mounted directory - the common case
-/// after the first run.
-fn secret_needs_moving(config_dir: &Path, path: &Path) -> Option<PathBuf> {
-    let legacy_dir = config_dir.join(SIGNING_KEYS_DIR);
-    let name = path.file_name()?;
-    path.starts_with(&legacy_dir)
-        .then(|| config_dir.join(SECRETS_DIR).join(name))
-}
-
-/// Move a secret master out of the bind-mounted signing-keys directory.
-///
-/// Returns the path to read. Anyone who created a master before it was
-/// host-only has one sitting in a directory every build container can read, and
-/// the fix should not require them to know that: the next `avocado var-key`
-/// run relocates it. A failure to move is reported and the old path is used, so
-/// recovery still works on a read-only home - losing the move is better than
-/// losing access to the key that opens a fleet's /var.
-fn relocate_secret_if_needed(config_dir: &Path, path: &Path) -> (PathBuf, Option<String>) {
-    let Some(dest) = secret_needs_moving(config_dir, path) else {
-        return (path.to_path_buf(), None);
-    };
-    if !path.exists() {
-        return (path.to_path_buf(), None);
-    }
-    let moved = dest
-        .parent()
-        .ok_or_else(|| "no parent".to_string())
-        .and_then(|dir| fs::create_dir_all(dir).map_err(|e| e.to_string()))
-        .and_then(|_| fs::rename(path, &dest).map_err(|e| e.to_string()));
-    match moved {
-        Ok(()) => (
-            dest.clone(),
-            Some(format!(
-                "moved the recovery master out of the SDK-mounted key directory to {}",
-                dest.display()
-            )),
-        ),
-        Err(e) => (
-            path.to_path_buf(),
-            Some(format!(
-                "could not move the recovery master to {} ({e}); it stays readable inside SDK builds until it is moved by hand",
-                dest.display()
-            )),
-        ),
-    }
-}
-
 /// Get the path to the keys registry file
 pub fn get_registry_path() -> Result<PathBuf> {
     let keys_dir = get_signing_keys_dir()?;
@@ -308,7 +259,12 @@ pub fn ensure_dev_signing_key() -> Result<String> {
 
 /// Delete key files from disk
 pub fn delete_key_files(keyid: &str) -> Result<()> {
-    delete_key_files_at(&get_key_file_path(keyid)?)
+    delete_key_files_at(&get_key_file_path(keyid)?)?;
+    // Secret masters live outside the signing-keys directory, so the path above
+    // does not reach them. Without this, `signing-keys remove --delete` reports
+    // "Deleted key files from disk" while a fleet-wide recovery master stays on
+    // disk - the one failure mode where a false success is worst.
+    delete_key_files_at(&secret_key_path(keyid)?)
 }
 
 /// Every file a file-backed entry may own: ed25519 `.key`/`.pub`, RSA
@@ -523,36 +479,30 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_in_the_mounted_directory_is_relocated_once() {
+    fn removing_a_key_deletes_the_secret_outside_the_signing_keys_directory() {
+        // `signing-keys remove --delete` used to look only under signing-keys/,
+        // so it reported success while a fleet-wide recovery master stayed on
+        // disk. delete_key_files_at is the unit under test here; the wiring that
+        // calls it for both locations is delete_key_files.
         let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let legacy = base.join(SIGNING_KEYS_DIR);
-        fs::create_dir_all(&legacy).unwrap();
-        let old = legacy.join("abc123.secret");
-        fs::write(&old, b"master-bytes").unwrap();
+        let secrets = tmp.path().join(SECRETS_DIR);
+        let keys = tmp.path().join(SIGNING_KEYS_DIR);
+        fs::create_dir_all(&secrets).unwrap();
+        fs::create_dir_all(&keys).unwrap();
+        let secret = secrets.join("abc123.secret");
+        let pubkey = keys.join("abc123.pub");
+        fs::write(&secret, b"master").unwrap();
+        fs::write(&pubkey, b"public").unwrap();
 
-        let (path, note) = relocate_secret_if_needed(base, &old);
-        assert_eq!(path, base.join(SECRETS_DIR).join("abc123.secret"));
-        assert!(note.unwrap().contains("moved"));
-        assert!(!old.exists(), "the copy inside the mount must not survive");
-        assert_eq!(fs::read(&path).unwrap(), b"master-bytes");
+        delete_key_files_at(&keys.join("abc123")).unwrap();
+        assert!(!pubkey.exists(), "the signing-keys side was not deleted");
+        assert!(
+            secret.exists(),
+            "sanity: the secrets side is a separate path"
+        );
 
-        // Second run has nothing to do and says nothing.
-        let (again, note) = relocate_secret_if_needed(base, &path);
-        assert_eq!(again, path);
-        assert!(note.is_none());
-    }
-
-    #[test]
-    fn a_missing_legacy_secret_is_left_alone() {
-        // The registry can name a path that no longer exists; that is the
-        // loader's error to report, not something to silently "migrate".
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let absent = base.join(SIGNING_KEYS_DIR).join("gone.secret");
-        let (path, note) = relocate_secret_if_needed(base, &absent);
-        assert_eq!(path, absent);
-        assert!(note.is_none());
+        delete_key_files_at(&secrets.join("abc123")).unwrap();
+        assert!(!secret.exists(), "the recovery master survived removal");
     }
 
     #[test]
@@ -1129,19 +1079,27 @@ pub fn secret_key_bytes(name: &str) -> Result<Vec<u8>> {
         );
     }
     let path = PathBuf::from(entry.uri.trim_start_matches("file://"));
-    // A master created before secrets became host-only still lives in the
-    // mounted directory; move it and record the new location.
-    let (path, note) = match get_avocado_config_dir() {
-        Ok(config_dir) => relocate_secret_if_needed(&config_dir, &path),
-        Err(_) => (path, None),
-    };
-    if let Some(note) = note {
-        eprintln!("[INFO] {registry_name}: {note}");
-        if let Ok(mut registry) = KeysRegistry::load() {
-            if let Some(e) = registry.keys.get_mut(&registry_name) {
-                e.uri = format!("file://{}", path.display());
-                let _ = registry.save();
-            }
+    // Refuse a master still inside the bind-mounted signing-keys directory
+    // rather than moving it here. Moving is a rename plus a registry rewrite,
+    // and a failure between the two leaves the registry pointing at a file that
+    // is gone - losing the key that opens a fleet's /var. No released version
+    // put a secret there, so this is a one-line fix for whoever hits it.
+    if let Ok(config_dir) = get_avocado_config_dir() {
+        if path.starts_with(config_dir.join(SIGNING_KEYS_DIR)) {
+            let dest = secret_key_path(&entry.keyid)?;
+            anyhow::bail!(
+                "the recovery master for '{registry_name}' is in the signing-keys \
+                 directory, which is bind-mounted into every SDK build container - \
+                 any build hook can read it. Move it out and point the registry at \
+                 the new location:\n  mkdir -p {}\n  mv {} {}\n  then set the entry's \
+                 uri to file://{}",
+                dest.parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                path.display(),
+                dest.display(),
+                dest.display()
+            );
         }
     }
     let bytes = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
