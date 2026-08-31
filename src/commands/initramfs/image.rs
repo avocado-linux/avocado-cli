@@ -1041,7 +1041,7 @@ mod identity_injection_tests {
         // const today, so a test that iterates it cannot fail. What can actually
         // break is the two drifting apart - render_build_id_block being handed a
         // different list - and that is what this catches.
-        let script = generate_initramfs_build_script("ns", "cpio.zst", None, "", false);
+        let script = generate_initramfs_build_script("ns", "cpio.zst", None, "", false, "auto");
         let allowed_line = script
             .lines()
             .find(|l| l.trim_start().starts_with("_avocado_allowed="))
