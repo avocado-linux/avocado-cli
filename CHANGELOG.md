@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`avocado deploy --verbose` no longer fails with "Failed to parse hash
+  collection output".** The SDK entrypoint's `[INFO]`/`[WARNING]`/`[ERROR]`
+  diagnostics were written to stdout, which the deploy's hash collection and
+  the runtime build read back as JSON, so any command that turned them on
+  (`--verbose`, or a missing extension mount path, which warns unconditionally)
+  corrupted the parse. They now go to stderr.
 - **`avocado install` / `rootfs install` / `initramfs install` exit non-zero
   when a sysroot install could not finish.** Three cases previously reported
   success and wrote a current install stamp: the sysroot could not be cleaned
