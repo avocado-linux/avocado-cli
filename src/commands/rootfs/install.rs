@@ -327,6 +327,45 @@ fn incomplete_install_error(label: &str, reason: &str) -> anyhow::Error {
     )
 }
 
+/// Whether a configured version is an explicit pin rather than "follow the feed".
+///
+/// `"*"` (or nothing) asks for whatever the feed has; anything else is a
+/// version the project chose and the sync must not walk away from.
+fn is_explicit_version(version: Option<&str>) -> bool {
+    matches!(version.map(str::trim), Some(v) if !v.is_empty() && v != "*")
+}
+
+/// The dnf pass that makes an existing sysroot follow the feed after
+/// `avocado update` (or on a first install, where it is a no-op): a
+/// distro-sync of everything already in the sysroot, same environment and
+/// excludes as the install line. Empty when the lock carries pins - then the
+/// lock, not the feed, says which versions belong in the sysroot.
+fn dnf_sync_step(
+    fresh_resolve: bool,
+    sysroot_dir: &str,
+    dnf_args_str: &str,
+    yes: &str,
+    exclude_str: &str,
+) -> String {
+    if !fresh_resolve {
+        return String::new();
+    }
+    format!(
+        r#"
+# No version pins for this sysroot (first install, or `avocado update` cleared
+# them): bring already-installed packages in line with the feed too.
+RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/{sysroot_dir} \
+AVOCADO_SYSROOT_SCRIPTS=1 \
+PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
+    {dnf_args_str} --refresh {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} distro-sync
+"#
+    )
+}
+
 /// Detect package removals by comparing the **effective** package set for
 /// this sysroot against what the lockfile recorded. A non-empty result means
 /// the sysroot must be cleaned and reinstalled from scratch, because dnf
@@ -1032,6 +1071,46 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         off_kernel_excludes.join(" ")
     };
 
+    // No version pins recorded for this sysroot means "resolve fresh": the
+    // first install, or `avocado update` just cleared them so the next install
+    // moves to the newest feed contents. `dnf install` alone cannot do that on
+    // an existing sysroot - it is additive and leaves already-installed
+    // dependencies at whatever version they have - so follow it with a
+    // distro-sync in the same container run. With pins present the lock is
+    // authoritative and nothing is synced.
+    let fresh_resolve = params
+        .lock_file
+        .get_locked_package_names(params.target, &params.sysroot_type)
+        .is_empty();
+    // dnf keeps its own expiry bookkeeping (default 48 h) in the SDK's
+    // persistdir, so a feed whose contents changed under the same URL - a dev
+    // repo rebuilt in place, a channel head between snapshots - stays invisible
+    // however the cache directory is groomed: every run reports "Last metadata
+    // expiration check: 6:55:04 ago" and resolves against the old package set.
+    // When there is nothing pinned to be reproducible about, ask dnf to re-read
+    // the metadata instead of guessing whether it is stale.
+    let refresh = if fresh_resolve { "--refresh" } else { "" };
+    // The sync follows the feed for everything already installed, which would
+    // walk a package the config pins to an explicit version straight to the
+    // repo's latest, one line after the install placed the requested one. Hold
+    // those out of the sync; a wildcard is a request to follow the feed and
+    // stays in. Sorted so the command is stable across runs.
+    let mut sync_excludes: Vec<String> = off_kernel_excludes.clone();
+    let mut pinned: Vec<String> = packages
+        .iter()
+        .filter(|(_, version)| is_explicit_version(version.as_str()))
+        .map(|(name, _)| format!("--exclude={}", resolve_name(name)))
+        .collect();
+    pinned.sort();
+    sync_excludes.extend(pinned);
+    let sync_exclude_str = sync_excludes.join(" ");
+    let sync_snippet = dnf_sync_step(
+        fresh_resolve,
+        sysroot_dir,
+        &dnf_args_str,
+        yes,
+        &sync_exclude_str,
+    );
     let command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
@@ -1048,8 +1127,8 @@ PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
-    {dnf_args_str} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
-{overlay_snippet}"#
+    {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
+{sync_snippet}{overlay_snippet}"#
     );
 
     let mut run_config = RunConfig {
@@ -1517,6 +1596,42 @@ mod tests {
 
     fn name_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn fresh_resolve_adds_a_distro_sync_after_install_and_pins_do_not() {
+        use super::dnf_sync_step;
+        use super::is_explicit_version;
+
+        // A configured `foo: "1.0"` must be held out of the sync, or the sync
+        // moves it to the feed's latest one line after the install placed 1.0.
+        assert!(is_explicit_version(Some("1.0")));
+        assert!(is_explicit_version(Some("1.0-r2.0")));
+        assert!(
+            !is_explicit_version(Some("*")),
+            "a wildcard follows the feed"
+        );
+        assert!(!is_explicit_version(Some(" * ")), "whitespace is not a pin");
+        assert!(!is_explicit_version(Some("")));
+        assert!(!is_explicit_version(None));
+
+        let fresh = dnf_sync_step(true, "rootfs", "--best", "-y", "--exclude=foo");
+        assert!(
+            fresh.contains("--installroot $AVOCADO_PREFIX/rootfs distro-sync"),
+            "{fresh}"
+        );
+        assert!(
+            fresh.contains("--best --refresh -y --exclude=foo"),
+            "same args and excludes as the install: {fresh}"
+        );
+        assert!(
+            fresh.contains("RPM_ETCCONFIGDIR=\"$DNF_SDK_TARGET_PREFIX\""),
+            "same environment: {fresh}"
+        );
+        assert!(
+            dnf_sync_step(false, "rootfs", "--best", "-y", "").is_empty(),
+            "pins present: the lock rules"
+        );
     }
 
     #[test]
