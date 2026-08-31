@@ -936,6 +936,12 @@ pub fn keyid_for_secret(secret: &[u8]) -> String {
 pub fn save_secret_key(keyid: &str, secret: &[u8]) -> Result<String> {
     use std::io::Write;
     let path = get_key_file_path(keyid)?.with_extension("secret");
+    // The ed25519 and PEM paths create this first; without it the very first
+    // `signing-keys create --algorithm hmac-sha256` on a clean install fails
+    // with ENOENT, since there is no registry directory yet.
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]

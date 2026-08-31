@@ -3755,6 +3755,39 @@ impl Config {
             .unwrap_or_else(|| "auto".to_string())
     }
 
+    /// `var.hardware` for a runtime as it resolves FOR THIS TARGET.
+    ///
+    /// The typed field above is the base document, so a `target-<name>`
+    /// override of `var.hardware` is invisible to it. `var.encrypt` right next
+    /// to it is read through the resolved value (see [`var_encrypt_runtimes`]),
+    /// so reading this one unresolved silently drops a per-target `caam` and
+    /// builds an initramfs that degrades to `auto` instead of failing closed.
+    pub fn get_runtime_var_hardware_for_target(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        runtime_name: &str,
+        target: &str,
+    ) -> String {
+        let resolved = parsed
+            .and_then(|p| p.get("runtimes")?.get(runtime_name))
+            .cloned()
+            .map(|node| {
+                self.resolve_overrides_in_value(
+                    node,
+                    target,
+                    None,
+                    &format!("runtimes.{runtime_name}"),
+                )
+            })
+            .and_then(|v| {
+                v.get("var")
+                    .and_then(|v| v.get("hardware"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        resolved.unwrap_or_else(|| self.get_runtime_var_hardware(runtime_name))
+    }
+
     /// Resolve an [`ImageConfig`]'s `permissions:` reference to a borrowed
     /// [`PermissionsConfig`]. Returns the inline body for `Inline(_)`, looks
     /// up the top-level map for `Named(_)`, and `None` when no permissions
@@ -13090,6 +13123,44 @@ runtimes:
                 && err.contains("'ghost'")
                 && err.contains("no top-level"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn var_hardware_follows_a_target_override() {
+        // var.encrypt beside it is read through the resolved value, so reading
+        // var.hardware off the base document dropped a per-target `caam` and
+        // built an initramfs on `auto` - losing the fail-closed policy the
+        // override asked for.
+        let yaml = r#"
+default_target: qemux86-64
+
+runtimes:
+  dev:
+    var:
+      encrypt: true
+      hardware: auto
+    target-imx8mp-evk:
+      var:
+        hardware: caam
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.get_runtime_var_hardware_for_target(Some(&parsed), "dev", "imx8mp-evk"),
+            "caam",
+            "the target override must win"
+        );
+        assert_eq!(
+            config.get_runtime_var_hardware_for_target(Some(&parsed), "dev", "qemux86-64"),
+            "auto",
+            "other targets keep the base value"
+        );
+        // No parsed document (callers that only hold the typed config) still
+        // gets the base value rather than nothing.
+        assert_eq!(
+            config.get_runtime_var_hardware_for_target(None, "dev", "imx8mp-evk"),
+            "auto"
         );
     }
 

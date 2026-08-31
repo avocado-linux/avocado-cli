@@ -129,8 +129,18 @@ impl VarKeyDeriveCommand {
     /// `cryptsetup open --key-file <(xxd -r -p)`), raw bytes with `--raw` for
     /// piping straight into `cryptsetup --key-file -`.
     pub fn execute(&self) -> Result<()> {
+        // Deriving from an empty UID yields a passphrase over the domain
+        // separator alone: it looks like a recovery key, and opens nothing.
+        // `enroll` reads the UID off the device and rejects an empty one, so
+        // this is the only way to get one.
+        let uid = self.uid.trim();
+        if uid.is_empty() {
+            anyhow::bail!(
+                "--uid is empty: pass the device's SoC UID (its device-tree serial-number, or /sys/devices/soc0/serial_number)"
+            );
+        }
         let master = master_for(&self.config_path, &self.runtime)?;
-        let passphrase = derive_var_recovery_passphrase(&master, &self.uid);
+        let passphrase = derive_var_recovery_passphrase(&master, uid);
         if self.raw {
             use std::io::Write;
             std::io::stdout().write_all(&passphrase)?;
@@ -149,6 +159,26 @@ impl VarKeyDeriveCommand {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn derive_refuses_an_empty_uid() {
+        // A UID of "" derives over the domain separator alone: it prints a
+        // plausible recovery key that opens nothing. enroll reads the UID off
+        // the device, so this command is the only way to supply one by hand.
+        for uid in ["", "   ", "\t\n"] {
+            let cmd = VarKeyDeriveCommand {
+                config_path: "/nonexistent/avocado.yaml".to_string(),
+                runtime: "dev".to_string(),
+                uid: uid.to_string(),
+                raw: false,
+            };
+            let err = cmd.execute().unwrap_err().to_string();
+            assert!(
+                err.contains("--uid is empty"),
+                "expected the UID to be rejected before the config is read, got: {err}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -1457,7 +1457,7 @@ enum VarKeyCommands {
     Enroll {
         /// Runtime whose var.recovery names the master secret
         runtime: String,
-        /// Device to enrol, as user@host[:port]
+        /// Device to enrol, as user@host
         #[arg(short, long)]
         device: String,
         /// Path to avocado.yaml configuration file
@@ -1507,8 +1507,10 @@ enum SigningKeysCommands {
         /// Authentication method for PKCS#11 device (none, prompt, env)
         #[arg(long, default_value = "prompt", value_name = "METHOD")]
         auth: String,
-        /// Key algorithm: ed25519 (default), or rsa2048 / rsa4096 for boot-FIT
-        /// signing (a PEM key + self-signed certificate, generated with openssl)
+        /// Key algorithm: ed25519 (default), rsa2048 / rsa4096 for boot-FIT
+        /// signing (a PEM key + self-signed certificate, generated with
+        /// openssl), or hmac-sha256 for the secret master a runtime's
+        /// var.recovery names
         #[arg(long, default_value = "ed25519", value_name = "ALGORITHM")]
         algorithm: String,
     },
