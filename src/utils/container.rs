@@ -2267,12 +2267,12 @@ impl SdkContainer {
             format!(
                 r#"if ! command -v bindfs >/dev/null 2>&1; then
     echo "[ERROR] bindfs is not installed in this container image." >&2
-    echo ""
-    echo "To resolve this, update the SDK container by running one of the following:"
-    echo ""
-    echo "  avocado fetch"
-    echo "  docker pull $AVOCADO_SDK_IMAGE"
-    echo ""
+    echo "" >&2
+    echo "To resolve this, update the SDK container by running one of the following:" >&2
+    echo "" >&2
+    echo "  avocado fetch" >&2
+    echo "  docker pull $AVOCADO_SDK_IMAGE" >&2
+    echo "" >&2
     exit 1
 fi
 mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src && {command}"#
@@ -2352,12 +2352,12 @@ mkdir -p /opt/src
 # Check if bindfs is available
 if ! command -v bindfs >/dev/null 2>&1; then
     echo "[ERROR] bindfs is not installed in this container image." >&2
-    echo ""
-    echo "To resolve this, update the SDK container by running one of the following:"
-    echo ""
-    echo "  avocado fetch"
-    echo "  docker pull $AVOCADO_SDK_IMAGE"
-    echo ""
+    echo "" >&2
+    echo "To resolve this, update the SDK container by running one of the following:" >&2
+    echo "" >&2
+    echo "  avocado fetch" >&2
+    echo "  docker pull $AVOCADO_SDK_IMAGE" >&2
+    echo "" >&2
     exit 1
 fi
 
@@ -2639,12 +2639,12 @@ mkdir -p /opt/src
 # Check if bindfs is available
 if ! command -v bindfs >/dev/null 2>&1; then
     echo "[ERROR] bindfs is not installed in this container image." >&2
-    echo ""
-    echo "To resolve this, update the SDK container by running one of the following:"
-    echo ""
-    echo "  avocado fetch"
-    echo "  docker pull $AVOCADO_SDK_IMAGE"
-    echo ""
+    echo "" >&2
+    echo "To resolve this, update the SDK container by running one of the following:" >&2
+    echo "" >&2
+    echo "  avocado fetch" >&2
+    echo "  docker pull $AVOCADO_SDK_IMAGE" >&2
+    echo "" >&2
     exit 1
 fi
 
@@ -3567,12 +3567,19 @@ extensions:
         ];
         for script in scripts {
             for line in script.lines() {
-                if let Some(pos) = line.find("echo \"[") {
-                    assert!(
-                        line[pos..].contains(">&2"),
-                        "diagnostic reaches stdout and would corrupt a captured parse: {line}"
-                    );
+                let t = line.trim_start();
+                if !t.starts_with("echo ") {
+                    continue;
                 }
+                // Writing to a file is not a diagnostic; everything else that
+                // echoes must go to stderr, tags or not - the remediation text
+                // under an error corrupts a captured parse exactly as its
+                // "[ERROR]" line does.
+                let writes_to_file = t.contains("> /") || t.contains("> $") || t.contains("> \"");
+                assert!(
+                    writes_to_file || t.contains(">&2"),
+                    "echo reaches stdout and would corrupt a captured parse: {line}"
+                );
             }
         }
     }
