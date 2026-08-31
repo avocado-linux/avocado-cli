@@ -327,6 +327,14 @@ fn incomplete_install_error(label: &str, reason: &str) -> anyhow::Error {
     )
 }
 
+/// Whether a configured version is an explicit pin rather than "follow the feed".
+///
+/// `"*"` (or nothing) asks for whatever the feed has; anything else is a
+/// version the project chose and the sync must not walk away from.
+fn is_explicit_version(version: Option<&str>) -> bool {
+    matches!(version.map(str::trim), Some(v) if !v.is_empty() && v != "*")
+}
+
 /// The dnf pass that makes an existing sysroot follow the feed after
 /// `avocado update` (or on a first install, where it is a no-op): a
 /// distro-sync of everything already in the sysroot, same environment and
@@ -1082,7 +1090,27 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // When there is nothing pinned to be reproducible about, ask dnf to re-read
     // the metadata instead of guessing whether it is stale.
     let refresh = if fresh_resolve { "--refresh" } else { "" };
-    let sync_snippet = dnf_sync_step(fresh_resolve, sysroot_dir, &dnf_args_str, yes, &exclude_str);
+    // The sync follows the feed for everything already installed, which would
+    // walk a package the config pins to an explicit version straight to the
+    // repo's latest, one line after the install placed the requested one. Hold
+    // those out of the sync; a wildcard is a request to follow the feed and
+    // stays in. Sorted so the command is stable across runs.
+    let mut sync_excludes: Vec<String> = off_kernel_excludes.clone();
+    let mut pinned: Vec<String> = packages
+        .iter()
+        .filter(|(_, version)| is_explicit_version(version.as_str()))
+        .map(|(name, _)| format!("--exclude={}", resolve_name(name)))
+        .collect();
+    pinned.sort();
+    sync_excludes.extend(pinned);
+    let sync_exclude_str = sync_excludes.join(" ");
+    let sync_snippet = dnf_sync_step(
+        fresh_resolve,
+        sysroot_dir,
+        &dnf_args_str,
+        yes,
+        &sync_exclude_str,
+    );
     let command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
@@ -1573,6 +1601,20 @@ mod tests {
     #[test]
     fn fresh_resolve_adds_a_distro_sync_after_install_and_pins_do_not() {
         use super::dnf_sync_step;
+        use super::is_explicit_version;
+
+        // A configured `foo: "1.0"` must be held out of the sync, or the sync
+        // moves it to the feed's latest one line after the install placed 1.0.
+        assert!(is_explicit_version(Some("1.0")));
+        assert!(is_explicit_version(Some("1.0-r2.0")));
+        assert!(
+            !is_explicit_version(Some("*")),
+            "a wildcard follows the feed"
+        );
+        assert!(!is_explicit_version(Some(" * ")), "whitespace is not a pin");
+        assert!(!is_explicit_version(Some("")));
+        assert!(!is_explicit_version(None));
+
         let fresh = dnf_sync_step(true, "rootfs", "--best", "-y", "--exclude=foo");
         assert!(
             fresh.contains("--installroot $AVOCADO_PREFIX/rootfs distro-sync"),
