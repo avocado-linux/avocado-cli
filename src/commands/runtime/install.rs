@@ -680,6 +680,23 @@ impl RuntimeInstallCommand {
                     off_kernel_excludes.join(" ")
                 };
 
+                // Same reasoning as the SDK and rootfs sysroots: `avocado update`
+                // clears this runtime's pins, and `dnf install` is additive, so an
+                // already-installed *transitive* dependency stays where it is.
+                // avocado-img-bootfiles arrives that way under avocado-runtime and
+                // carries tegraflash-tools/, so a rebuilt flash helper never reached
+                // the runtime and provisioning kept running the old one.
+                let runtime_fresh_resolve = lock_file
+                    .get_locked_package_names(&target_arch, &sysroot)
+                    .is_empty();
+                let sync_snippet = runtime_dnf_sync_step(
+                    runtime_fresh_resolve,
+                    &installroot_path,
+                    &dnf_args_str,
+                    yes,
+                    &exclude_str,
+                );
+
                 let dnf_command = format!(
                     r#"\
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
@@ -693,7 +710,8 @@ $DNF_SDK_HOST \
     {} \
     install \
     {} \
-    {}"#,
+    {}
+{sync_snippet}"#,
                     dnf_args_str,
                     exclude_str,
                     yes,
@@ -828,6 +846,40 @@ async fn run_container_command(
     }
 }
 
+/// The dnf pass that makes an existing runtime sysroot follow the feed after
+/// `avocado update` (or on a first install, where it is a no-op). Empty when the
+/// lock carries pins - then the lock, not the feed, says which versions belong.
+///
+/// Mirrors dnf_sync_step() in commands/rootfs/install.rs and sdk_dnf_sync_step()
+/// in commands/sdk/install.rs, down to the excludes and repo config, so the sync
+/// resolves against exactly what the install line saw.
+fn runtime_dnf_sync_step(
+    fresh_resolve: bool,
+    installroot_path: &str,
+    dnf_args_str: &str,
+    yes: &str,
+    exclude_str: &str,
+) -> String {
+    if !fresh_resolve {
+        return String::new();
+    }
+    format!(
+        r#"
+# No version pins for this runtime (first install, or `avocado update` cleared
+# them): bring already-installed packages in line with the feed too.
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST \
+    $DNF_NO_SCRIPTS \
+    $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
+    --installroot={installroot_path} \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
+    --refresh {dnf_args_str} {exclude_str} {yes} \
+    distro-sync
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +890,36 @@ mod tests {
         let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
+    }
+
+    /// avocado-img-bootfiles arrives transitively under avocado-runtime and
+    /// carries tegraflash-tools/. Without the sync a rebuilt flash helper never
+    /// reaches the runtime and provisioning silently runs the old one.
+    #[test]
+    fn fresh_resolve_adds_a_distro_sync_and_pins_do_not() {
+        let fresh = runtime_dnf_sync_step(
+            true,
+            "$AVOCADO_PREFIX/runtimes/dev",
+            "",
+            "-y",
+            "--exclude=kernel-module-foo",
+        );
+        assert!(fresh.contains("distro-sync"), "{fresh}");
+        assert!(fresh.contains("--refresh"), "{fresh}");
+        assert!(
+            fresh.contains("--installroot=$AVOCADO_PREFIX/runtimes/dev"),
+            "the sync must target the same installroot as the install: {fresh}"
+        );
+        assert!(
+            fresh.contains("--exclude=kernel-module-foo"),
+            "off-kernel excludes must carry over or the sync pulls in a second \
+             kernel's modules: {fresh}"
+        );
+        assert_eq!(
+            runtime_dnf_sync_step(false, "$AVOCADO_PREFIX/runtimes/dev", "", "-y", ""),
+            "",
+            "with pins present the lock is authoritative and nothing is synced"
+        );
     }
 
     #[test]

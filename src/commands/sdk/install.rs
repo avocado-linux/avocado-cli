@@ -1031,6 +1031,14 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
         let sdk_init_command = r#"
 echo "[INFO] Initializing Avocado SDK."
 mkdir -p $AVOCADO_SDK_PREFIX/etc
+# $AVOCADO_EXT_SYSROOTS is a symlink into the active runtime. `avocado runtime
+# clean` deletes that runtime and leaves the symlink dangling, and `mkdir -p`
+# fails on a dangling symlink ("File exists") rather than following it -- so a
+# clean followed by an install died in SDK init, before installing anything.
+# Create the link target instead; `mkdir -p` below then succeeds either way.
+if [ -L "$AVOCADO_EXT_SYSROOTS" ] && [ ! -d "$AVOCADO_EXT_SYSROOTS" ]; then
+    mkdir -p "$(readlink "$AVOCADO_EXT_SYSROOTS")"
+fi
 mkdir -p $AVOCADO_EXT_SYSROOTS
 cp /etc/rpmrc $AVOCADO_SDK_PREFIX/etc
 cp -r /etc/rpm $AVOCADO_SDK_PREFIX/etc
