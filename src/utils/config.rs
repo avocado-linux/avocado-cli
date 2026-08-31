@@ -695,6 +695,16 @@ pub enum PermissionsRef {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub target: Option<String>,
+    /// Targets this runtime is scoped to, when it spans more than one. Used by
+    /// target-scoped opt-ins such as `var.encrypt`, which must be evaluated per
+    /// target because sysroots are installed once per target and shared by every
+    /// runtime on it.
+    ///
+    /// Precedence: `targets` > `target` > unscoped. Unscoped means every target
+    /// the runtime is built for -- deliberately NOT `default_target`, which is
+    /// "what to build when the user does not say" and has no bearing on which
+    /// targets a runtime belongs to.
+    pub targets: Option<Vec<String>>,
     /// Optional board variant within `target`. Surfaces through
     /// `{{ avocado.target.board }}` interpolation when this runtime is the
     /// resolved one; falls back to top-level `default_target_board`, then to
@@ -3574,6 +3584,7 @@ impl Config {
 
         let synth = RuntimeConfig {
             target: Some(target),
+            targets: None,
             target_board: None,
             version: None,
             dependencies: None,
@@ -4073,9 +4084,12 @@ impl Config {
     /// disagree on the flag or on the target.
     ///
     /// Target: sysroots are installed once per target and shared by every
-    /// runtime on it, so a runtime counts iff its declared `target:` — or
-    /// `default_target` when it has none — is this one. Only some feeds publish
-    /// `cryptsetup-var`, so a Jetson opt-in must not reach a qemu sysroot.
+    /// runtime on it, so a runtime counts iff this target is in its declared
+    /// scope — `targets:` if present, else `target:`, else every target. Only
+    /// some feeds publish `cryptsetup-var`, so a runtime that must not reach a
+    /// given sysroot says so with `targets:`/`target:`; an unscoped opt-in that
+    /// lands on a feed without the package fails loudly at install rather than
+    /// being silently narrowed here.
     ///
     /// Flag: read from `parsed` (the composed YAML) with `target-<x>:`
     /// overrides resolved, exactly as `var.compression` / `var.subvolumes` /
@@ -4092,12 +4106,21 @@ impl Config {
         let mut names: Vec<String> = runtimes
             .iter()
             .filter(|(_, r)| {
-                // An omitted `target:` means `default_target`, not "any target".
-                // Only with neither set does a runtime count for every target.
-                r.target
-                    .as_deref()
-                    .or(self.default_target.as_deref())
-                    .is_none_or(|t| t == target)
+                // Scope is declared, never inferred: `targets:` (a list) wins,
+                // then `target:`, and an unscoped runtime counts for every
+                // target it is built for.
+                //
+                // `default_target` is deliberately NOT consulted. It means "what
+                // to build when the user does not say", so using it here made an
+                // unrelated convenience field silently narrow a security opt-in:
+                // a project with several supported_targets could encrypt on only
+                // one of them, and a `target-<x>:` override for any other target
+                // was rejected by this filter before its flag was ever read.
+                match (r.targets.as_deref(), r.target.as_deref()) {
+                    (Some(list), _) => list.iter().any(|t| t == target),
+                    (None, Some(t)) => t == target,
+                    (None, None) => true,
+                }
             })
             .filter(|(name, r)| {
                 let node = parsed
@@ -12121,8 +12144,10 @@ runtimes:
             .get_initramfs_packages(None, "jetson-orin-nx")
             .contains_key("cryptsetup-var"));
 
-        // A runtime without `target:` builds for default_target, so it counts
-        // for that target only — not for a sibling's.
+        // `default_target` does NOT scope the opt-in: it says what to build when
+        // the user does not, and has no bearing on which targets a runtime
+        // belongs to. An unscoped runtime counts for every target it is built
+        // for, so a multi-target project can encrypt on all of them.
         let untargeted: Config = serde_yaml::from_str(
             r#"
 default_target: jetson-orin-nx
@@ -12130,8 +12155,6 @@ runtimes:
   prod:
     var:
       encrypt: true
-  dev:
-    target: qemux86-64
 "#,
         )
         .unwrap();
@@ -12139,10 +12162,37 @@ runtimes:
             untargeted.var_encrypt_runtimes(None, "jetson-orin-nx"),
             vec!["prod".to_string()]
         );
-        assert!(untargeted
-            .var_encrypt_runtimes(None, "qemux86-64")
-            .is_empty());
-        assert!(!untargeted
+        assert_eq!(
+            untargeted.var_encrypt_runtimes(None, "jetson-agx-thor"),
+            vec!["prod".to_string()],
+            "default_target must not narrow an unscoped opt-in"
+        );
+
+        // `targets:` is how a runtime that spans several targets declares them,
+        // and it still excludes everything outside the list.
+        let listed: Config = serde_yaml::from_str(
+            r#"
+default_target: jetson-agx-thor
+runtimes:
+  prod:
+    targets: [jetson-agx-thor, jetson-agx-orin]
+    var:
+      encrypt: true
+"#,
+        )
+        .unwrap();
+        for t in ["jetson-agx-thor", "jetson-agx-orin"] {
+            assert_eq!(
+                listed.var_encrypt_runtimes(None, t),
+                vec!["prod".to_string()],
+                "targets: must cover every target it lists ({t})"
+            );
+        }
+        assert!(
+            listed.var_encrypt_runtimes(None, "qemux86-64").is_empty(),
+            "targets: must still exclude a target outside the list"
+        );
+        assert!(!listed
             .get_initramfs_packages(None, "qemux86-64")
             .contains_key("cryptsetup-var"));
 
