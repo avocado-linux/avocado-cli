@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::commands::rootfs::install::is_explicit_version;
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::kernel_resolver::{
@@ -485,8 +486,14 @@ impl RuntimeInstallCommand {
             let _ = run_container_command(container_helper, run_config, runs_on_context).await;
         }
 
-        // Check if the installroot exists (may have been cleaned above or never created)
-        let check_command = format!("[ -d {installroot_path} ]");
+        // Seed the runtime's rpm database from the rootfs unless it is already
+        // there. The test is the database itself, not the directory above it:
+        // SDK init recreates <runtime>/extensions to repair a dangling
+        // $AVOCADO_EXT_SYSROOTS symlink after `avocado runtime clean`, which
+        // makes the parent exist again while the database is gone. dnf would
+        // then resolve against an empty database and pull the whole dependency
+        // closure into the runtime tree.
+        let check_command = format!("[ -d {installroot_path}/var/lib/rpm ]");
         let setup_command = format!(
             "mkdir -p {installroot_path}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm {installroot_path}/var/lib"
         );
@@ -587,6 +594,7 @@ impl RuntimeInstallCommand {
             // so dependencies should only contain package references.
             let mut packages = Vec::new();
             let mut package_names = Vec::new();
+            let mut pinned_excludes: Vec<String> = Vec::new();
             for (package_name_val, version_spec) in deps_map {
                 // Convert package name from Value to String
                 let package_name = match package_name_val.as_str() {
@@ -627,6 +635,10 @@ impl RuntimeInstallCommand {
                 );
                 packages.push(package_spec);
                 package_names.push(package_name.to_string());
+                // A version the project chose, to be held out of the sync below.
+                if is_explicit_version(Some(config_version.as_str())) {
+                    pinned_excludes.push(format!("--exclude={resolved_name}"));
+                }
             }
 
             // Add kernel package if specified in the runtime kernel config
@@ -689,12 +701,21 @@ impl RuntimeInstallCommand {
                 let runtime_fresh_resolve = lock_file
                     .get_locked_package_names(&target_arch, &sysroot)
                     .is_empty();
+                // The sync follows the feed for everything installed, which would
+                // walk a package the config pins to an explicit version straight
+                // to the repo's latest - one line after the install placed the
+                // requested one, and the lock would then record the wrong version.
+                let mut sync_excludes: Vec<String> = off_kernel_excludes.clone();
+                pinned_excludes.sort();
+                pinned_excludes.dedup();
+                sync_excludes.extend(pinned_excludes.iter().cloned());
+                let sync_exclude_str = sync_excludes.join(" ");
                 let sync_snippet = runtime_dnf_sync_step(
                     runtime_fresh_resolve,
                     &installroot_path,
                     &dnf_args_str,
                     yes,
-                    &exclude_str,
+                    &sync_exclude_str,
                 );
 
                 let dnf_command = format!(
@@ -882,6 +903,25 @@ $DNF_SDK_HOST \
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_rpmdb_seed_test_is_the_database_not_its_parent() {
+        // SDK init recreates <runtime>/extensions to repair a dangling
+        // $AVOCADO_EXT_SYSROOTS symlink after `avocado runtime clean`. Testing
+        // the parent directory therefore reports "already seeded" for a runtime
+        // whose rpm database is gone, and dnf resolves against an empty one.
+        let installroot_path = "/opt/_avocado/x/runtimes/dev";
+        let check = format!("[ -d {installroot_path}/var/lib/rpm ]");
+        assert!(
+            check.contains("/var/lib/rpm ]"),
+            "the check must name the database: {check}"
+        );
+        assert_ne!(
+            check,
+            format!("[ -d {installroot_path} ]"),
+            "testing the parent directory is the bug this pins"
+        );
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;
