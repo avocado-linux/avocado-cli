@@ -2748,6 +2748,22 @@ STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $AVOCADO_SDK_PREFIX/stone"
 
 STONE_OVERLAY_FLAG=""
 {device_tree_overlay_section}
+# Platform build hook. A BSP uses this to stage artifacts the manifest
+# references but the generic pipeline cannot build, because they are specific to
+# the SoC rather than to Avocado -- on Tegra, the Android boot image that backs
+# the kernel A/B partitions, which has to wrap whichever kernel this project
+# pinned and so cannot be built in Yocto either. Runs before stone bundle so
+# whatever it writes into the runtime input dir resolves as an input.
+#
+# Optional: absent or a no-op on every target that needs nothing extra. Invoked
+# by absolute path with the SDK's bin on PATH because the hook shells out to
+# nativesdk tools (jq, mkbootimg) that are not otherwise on PATH here.
+AVOCADO_BUILD_HOOK="$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH"
+if [ -x "$AVOCADO_BUILD_HOOK" ]; then
+    echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$RUNTIME_NAME'."
+    PATH="$AVOCADO_SDK_PREFIX/usr/bin:$PATH" "$AVOCADO_BUILD_HOOK" "$RUNTIME_NAME"
+fi
+
 echo -e "\033[94m[INFO]\033[0m Running stone bundle."
 echo -e "  Manifest:  $STONE_MANIFEST"
 echo -e "  Output:    $STONE_AOS_OUTPUT"
@@ -4128,6 +4144,34 @@ runtimes:
         assert!(script.contains("TARGET_ARCH=\"x86_64\""));
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
         assert!(script.contains("stone bundle"));
+        // 35124cb replaced the avocado-build hook call with stone bundle and
+        // left the hooks orphaned, removing the only point where a BSP can stage
+        // an artifact the manifest references but no generic step builds (the
+        // Tegra boot.img backing the kernel A/B partitions). Bundling before the
+        // hook runs resolves those inputs as missing.
+        // Anchor on the execution line, not the AVOCADO_BUILD_HOOK assignment
+        // above it: "avocado-build-$TARGET_ARCH" is matched by the assignment
+        // alone, so both the presence and the ordering check would survive the
+        // invocation being deleted or moved past the bundle - the one
+        // regression they exist to catch.
+        let hook_call =
+            "PATH=\"$AVOCADO_SDK_PREFIX/usr/bin:$PATH\" \"$AVOCADO_BUILD_HOOK\" \"$RUNTIME_NAME\"";
+        let hook_at = script
+            .find(hook_call)
+            .expect("the platform build hook must actually be invoked");
+        let guard_at = script
+            .find("if [ -x \"$AVOCADO_BUILD_HOOK\" ]")
+            .expect("the hook is optional and must be guarded on existence");
+        assert!(
+            guard_at < hook_at,
+            "the invocation must sit inside the existence guard"
+        );
+        // The bare string "stone bundle" also appears in an earlier comment
+        // about os_bundle cleanup, so anchor on the command at start-of-line.
+        assert!(
+            hook_at < script.find("\nstone bundle ").unwrap(),
+            "the hook must run before stone bundle resolves its inputs"
+        );
         assert!(script.contains("mkfs.btrfs"));
         // No overlays declared: the device-tree overlay section is inert.
         assert!(!script.contains("device-tree overlays"));
