@@ -331,7 +331,7 @@ fn incomplete_install_error(label: &str, reason: &str) -> anyhow::Error {
 ///
 /// `"*"` (or nothing) asks for whatever the feed has; anything else is a
 /// version the project chose and the sync must not walk away from.
-fn is_explicit_version(version: Option<&str>) -> bool {
+pub(crate) fn is_explicit_version(version: Option<&str>) -> bool {
     matches!(version.map(str::trim), Some(v) if !v.is_empty() && v != "*")
 }
 

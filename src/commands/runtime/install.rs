@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::commands::rootfs::install::is_explicit_version;
 use crate::utils::config::{ComposedConfig, Config};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::kernel_resolver::{
@@ -485,8 +486,14 @@ impl RuntimeInstallCommand {
             let _ = run_container_command(container_helper, run_config, runs_on_context).await;
         }
 
-        // Check if the installroot exists (may have been cleaned above or never created)
-        let check_command = format!("[ -d {installroot_path} ]");
+        // Seed the runtime's rpm database from the rootfs unless it is already
+        // there. The test is the database itself, not the directory above it:
+        // SDK init recreates <runtime>/extensions to repair a dangling
+        // $AVOCADO_EXT_SYSROOTS symlink after `avocado runtime clean`, which
+        // makes the parent exist again while the database is gone. dnf would
+        // then resolve against an empty database and pull the whole dependency
+        // closure into the runtime tree.
+        let check_command = rpmdb_seeded_check(&installroot_path);
         let setup_command = format!(
             "mkdir -p {installroot_path}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm {installroot_path}/var/lib"
         );
@@ -587,6 +594,20 @@ impl RuntimeInstallCommand {
             // so dependencies should only contain package references.
             let mut packages = Vec::new();
             let mut package_names = Vec::new();
+            // (resolved package name, version the config asked for) for every
+            // package on the install line.
+            let mut pinned_candidates: Vec<(String, String)> = Vec::new();
+            // The one way to put a package on the install line. The kernel is
+            // appended separately from the dependency loop, and recording its
+            // pin was simply forgotten there; going through here means a caller
+            // cannot add a package without its version reaching the sync's
+            // exclude set.
+            let mut add_package =
+                |spec: String, config_name: &str, resolved_name: &str, version: &str| {
+                    packages.push(spec);
+                    package_names.push(config_name.to_string());
+                    pinned_candidates.push((resolved_name.to_string(), version.to_string()));
+                };
             for (package_name_val, version_spec) in deps_map {
                 // Convert package name from Value to String
                 let package_name = match package_name_val.as_str() {
@@ -625,8 +646,7 @@ impl RuntimeInstallCommand {
                     &resolved_name,
                     &config_version,
                 );
-                packages.push(package_spec);
-                package_names.push(package_name.to_string());
+                add_package(package_spec, package_name, &resolved_name, &config_version);
             }
 
             // Add kernel package if specified in the runtime kernel config
@@ -653,8 +673,7 @@ impl RuntimeInstallCommand {
                             ),
                             OutputLevel::Normal,
                         );
-                        packages.push(package_spec);
-                        package_names.push(kernel_package.to_string());
+                        add_package(package_spec, kernel_package, &resolved_name, kernel_version);
                     }
                 }
             }
@@ -680,6 +699,30 @@ impl RuntimeInstallCommand {
                     off_kernel_excludes.join(" ")
                 };
 
+                // Same reasoning as the SDK and rootfs sysroots: `avocado update`
+                // clears this runtime's pins, and `dnf install` is additive, so an
+                // already-installed *transitive* dependency stays where it is.
+                // avocado-img-bootfiles arrives that way under avocado-runtime and
+                // carries tegraflash-tools/, so a rebuilt flash helper never reached
+                // the runtime and provisioning kept running the old one.
+                let runtime_fresh_resolve = lock_file
+                    .get_locked_package_names(&target_arch, &sysroot)
+                    .is_empty();
+                // The sync follows the feed for everything installed, which would
+                // walk a package the config pins to an explicit version straight
+                // to the repo's latest - one line after the install placed the
+                // requested one, and the lock would then record the wrong version.
+                let mut sync_excludes: Vec<String> = off_kernel_excludes.clone();
+                sync_excludes.extend(pinned_sync_excludes(&pinned_candidates));
+                let sync_exclude_str = sync_excludes.join(" ");
+                let sync_snippet = runtime_dnf_sync_step(
+                    runtime_fresh_resolve,
+                    &installroot_path,
+                    &dnf_args_str,
+                    yes,
+                    &sync_exclude_str,
+                );
+
                 let dnf_command = format!(
                     r#"\
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
@@ -693,7 +736,8 @@ $DNF_SDK_HOST \
     {} \
     install \
     {} \
-    {}"#,
+    {}
+{sync_snippet}"#,
                     dnf_args_str,
                     exclude_str,
                     yes,
@@ -828,8 +872,114 @@ async fn run_container_command(
     }
 }
 
+/// The shell test for "is this runtime's rpm database already seeded".
+///
+/// Named rather than inlined so the test below asserts the string production
+/// actually uses. The test must be the database itself, not the directory
+/// above it: SDK init recreates `<runtime>/extensions` to repair a dangling
+/// `$AVOCADO_EXT_SYSROOTS` symlink after `avocado runtime clean`, which makes
+/// the parent exist again while the database is gone. dnf would then resolve
+/// against an empty database and pull the whole dependency closure into the
+/// runtime tree.
+fn rpmdb_seeded_check(installroot_path: &str) -> String {
+    format!("[ -d {installroot_path}/var/lib/rpm ]")
+}
+
+/// The `--exclude` flags that hold config-pinned packages out of the sync.
+///
+/// The sync follows the feed for everything installed, which would walk a
+/// package the config pins to an explicit version straight to the repo's
+/// latest - one line after the install placed the requested one, and the
+/// query would then record the moved version in the lock. A wildcard is a
+/// request to follow the feed and stays in.
+///
+/// Both the dependency loop and the separately-appended kernel package go
+/// through here: applying the predicate only where the packages are gathered
+/// in a loop is what let an explicit `kernel.version` slip through. Sorted and
+/// deduped so the command is stable across runs.
+fn pinned_sync_excludes(packages: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = packages
+        .iter()
+        .filter(|(_, version)| is_explicit_version(Some(version.as_str())))
+        .map(|(resolved_name, _)| format!("--exclude={resolved_name}"))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The dnf pass that makes an existing runtime sysroot follow the feed after
+/// `avocado update` (or on a first install, where it is a no-op). Empty when the
+/// lock carries pins - then the lock, not the feed, says which versions belong.
+///
+/// Mirrors dnf_sync_step() in commands/rootfs/install.rs and sdk_dnf_sync_step()
+/// in commands/sdk/install.rs, down to the excludes and repo config, so the sync
+/// resolves against exactly what the install line saw.
+fn runtime_dnf_sync_step(
+    fresh_resolve: bool,
+    installroot_path: &str,
+    dnf_args_str: &str,
+    yes: &str,
+    exclude_str: &str,
+) -> String {
+    if !fresh_resolve {
+        return String::new();
+    }
+    format!(
+        r#"
+# No version pins for this runtime (first install, or `avocado update` cleared
+# them): bring already-installed packages in line with the feed too.
+RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
+$DNF_SDK_HOST \
+    $DNF_NO_SCRIPTS \
+    $DNF_SDK_TARGET_REPO_CONF \
+    --setopt=sslcacert=${{SSL_CERT_FILE}} \
+    --installroot={installroot_path} \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
+    --refresh {dnf_args_str} {exclude_str} {yes} \
+    distro-sync
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_rpmdb_seed_test_is_the_database_not_its_parent() {
+        // Asserts the production string, not a copy of it: SDK init recreates
+        // <runtime>/extensions to repair a dangling $AVOCADO_EXT_SYSROOTS
+        // symlink after `avocado runtime clean`, so testing the parent
+        // directory reports "already seeded" for a runtime whose rpm database
+        // is gone and dnf resolves against an empty one.
+        assert_eq!(
+            super::rpmdb_seeded_check("/opt/_avocado/x/runtimes/dev"),
+            "[ -d /opt/_avocado/x/runtimes/dev/var/lib/rpm ]"
+        );
+    }
+
+    /// The kernel package is appended to the install line outside the
+    /// dependency loop, so a pin predicate applied only to that loop leaves an
+    /// explicit `kernel.version` to be installed at the requested version and
+    /// then walked to the feed's latest by the sync - with the lock recording
+    /// the moved version.
+    #[test]
+    fn an_explicit_kernel_version_is_held_out_of_the_sync() {
+        assert_eq!(
+            super::pinned_sync_excludes(&[
+                ("avocado-runtime".to_string(), "*".to_string()),
+                ("kernel-image-6.6.0".to_string(), "6.6.0-r0".to_string()),
+                ("some-app".to_string(), "1.2".to_string()),
+            ]),
+            vec!["--exclude=kernel-image-6.6.0", "--exclude=some-app"],
+            "an explicit kernel.version must be excluded, a wildcard must not"
+        );
+        assert!(
+            super::pinned_sync_excludes(&[("avocado-runtime".to_string(), "*".to_string())])
+                .is_empty(),
+            "a wildcard is a request to follow the feed"
+        );
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;
@@ -838,6 +988,36 @@ mod tests {
         let config_path = temp_dir.path().join("avocado.yaml");
         fs::write(&config_path, content).unwrap();
         config_path.to_string_lossy().to_string()
+    }
+
+    /// avocado-img-bootfiles arrives transitively under avocado-runtime and
+    /// carries tegraflash-tools/. Without the sync a rebuilt flash helper never
+    /// reaches the runtime and provisioning silently runs the old one.
+    #[test]
+    fn fresh_resolve_adds_a_distro_sync_and_pins_do_not() {
+        let fresh = runtime_dnf_sync_step(
+            true,
+            "$AVOCADO_PREFIX/runtimes/dev",
+            "",
+            "-y",
+            "--exclude=kernel-module-foo",
+        );
+        assert!(fresh.contains("distro-sync"), "{fresh}");
+        assert!(fresh.contains("--refresh"), "{fresh}");
+        assert!(
+            fresh.contains("--installroot=$AVOCADO_PREFIX/runtimes/dev"),
+            "the sync must target the same installroot as the install: {fresh}"
+        );
+        assert!(
+            fresh.contains("--exclude=kernel-module-foo"),
+            "off-kernel excludes must carry over or the sync pulls in a second \
+             kernel's modules: {fresh}"
+        );
+        assert_eq!(
+            runtime_dnf_sync_step(false, "$AVOCADO_PREFIX/runtimes/dev", "", "-y", ""),
+            "",
+            "with pins present the lock is authoritative and nothing is synced"
+        );
     }
 
     #[test]

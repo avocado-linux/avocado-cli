@@ -1031,6 +1031,14 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
         let sdk_init_command = r#"
 echo "[INFO] Initializing Avocado SDK."
 mkdir -p $AVOCADO_SDK_PREFIX/etc
+# $AVOCADO_EXT_SYSROOTS is a symlink into the active runtime. `avocado runtime
+# clean` deletes that runtime and leaves the symlink dangling, and `mkdir -p`
+# fails on a dangling symlink ("File exists") rather than following it -- so a
+# clean followed by an install died in SDK init, before installing anything.
+# Create the link target instead; `mkdir -p` below then succeeds either way.
+if [ -L "$AVOCADO_EXT_SYSROOTS" ] && [ ! -d "$AVOCADO_EXT_SYSROOTS" ]; then
+    mkdir -p "$(readlink "$AVOCADO_EXT_SYSROOTS")"
+fi
 mkdir -p $AVOCADO_EXT_SYSROOTS
 cp /etc/rpmrc $AVOCADO_SDK_PREFIX/etc
 cp -r /etc/rpm $AVOCADO_SDK_PREFIX/etc
@@ -1506,6 +1514,27 @@ MACROS_EOF
             sdk_target_config_version,
         );
 
+        // `avocado update` clears this sysroot's pins (LockFile::clear_all), so an
+        // empty set means "follow the feed", exactly as it does for the rootfs.
+        //
+        // `dnf install` cannot express that on an existing SDK: it is additive and
+        // leaves an already-installed package at whatever version it has. That is
+        // invisible for the packages named above -- they are pinned or wildcarded
+        // and dnf reinstalls them -- but avocado-sdk-target arrives *transitively*
+        // through avocado-sdk-{target}, and it owns the two files a BSP rebuild
+        // most often changes: stone-<target>.json and the avocado-build-<target> /
+        // avocado-provision-<target> hooks. So a rebuilt-and-republished feed
+        // updated every sysroot except the one holding the build manifest, and the
+        // build kept running against a stale manifest with no diagnostic.
+        //
+        // Mirrors dnf_sync_step() in commands/rootfs/install.rs. Combined repo conf
+        // because avocado-sdk-target is built for SDKPKGARCH and published to the
+        // per-target SDK repo, which only target-repoconf carries.
+        let sdk_fresh_resolve = lock_file
+            .get_locked_package_names(target, &sdk_sysroot)
+            .is_empty();
+        let sdk_sync_snippet = sdk_dnf_sync_step(sdk_fresh_resolve);
+
         let sdk_target_command = format!(
             r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
@@ -1516,7 +1545,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     -y \
     install \
     {sdk_target_pkg}
-"#
+{sdk_sync_snippet}"#
         );
 
         let run_config = RunConfig {
@@ -2006,11 +2035,61 @@ async fn run_container_command(
     }
 }
 
+/// The dnf pass that makes an existing SDK sysroot follow the feed after
+/// `avocado update` (or on a first install, where it is a no-op). Empty when the
+/// lock carries pins - then the lock, not the feed, says which versions belong.
+///
+/// Combined repo conf on purpose: avocado-sdk-target is built for SDKPKGARCH and
+/// published to the per-target SDK repo, which only target-repoconf carries.
+fn sdk_dnf_sync_step(fresh_resolve: bool) -> &'static str {
+    if !fresh_resolve {
+        return "";
+    }
+    r#"
+# No version pins for the SDK sysroot (first install, or `avocado update` cleared
+# them): bring already-installed packages in line with the feed too.
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+$DNF_SDK_HOST $DNF_NO_SCRIPTS \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_COMBINED_REPO_CONF \
+    --refresh -y \
+    distro-sync
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_yaml::Value;
     use std::collections::HashMap;
+
+    /// A feed rebuilt in place advances avocado-sdk-target, which arrives
+    /// transitively and so is never named on the install line. Without the
+    /// distro-sync the SDK keeps the old stone manifest and build hook.
+    #[test]
+    fn fresh_resolve_adds_a_distro_sync_and_pins_do_not() {
+        let fresh = sdk_dnf_sync_step(true);
+        assert!(
+            fresh.contains("distro-sync"),
+            "cleared pins must sync the SDK sysroot: {fresh}"
+        );
+        assert!(
+            fresh.contains("--refresh"),
+            "dnf keeps its own expiry bookkeeping; a feed rebuilt under the same \
+             URL stays invisible without --refresh: {fresh}"
+        );
+        assert!(
+            fresh.contains("$DNF_SDK_COMBINED_REPO_CONF"),
+            "avocado-sdk-target lives in the per-target SDK repo, which only \
+             target-repoconf carries: {fresh}"
+        );
+        assert_eq!(
+            sdk_dnf_sync_step(false),
+            "",
+            "with pins present the lock is authoritative and nothing is synced"
+        );
+    }
 
     #[test]
     fn test_build_package_list_with_lock() {
