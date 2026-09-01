@@ -2560,20 +2560,42 @@ echo "Docker image priming complete.""#,
                 .iter()
                 .any(|n| n == &self.runtime_name)
         };
-        // Same fallback as var_encrypt_runtimes: no `target:` means default_target.
-        let declared_target = config
+        // The shared scope rule - see config::runtime_in_scope. `default_target`
+        // is not consulted: it says what to build, not which targets a runtime
+        // belongs to.
+        let declared_scope: Option<Vec<String>> = config
             .runtimes
             .as_ref()
             .and_then(|r| r.get(&self.runtime_name))
-            .and_then(|r| r.target.as_deref())
-            .or(config.default_target.as_deref());
-        if let Some(declared) = declared_target.filter(|d| *d != target_arch) {
-            if var_encrypt(declared) {
+            .and_then(crate::utils::config::declared_runtime_scope);
+        // Resolved for target_arch itself, deliberately bypassing the scope
+        // filter in var_encrypt_runtimes: a `target-<x>:` override that opts in
+        // for a target OUTSIDE the declared scope is invisible to that filter,
+        // which drops the runtime before the override is ever resolved. Reading
+        // it directly is the only way to see config that asks for encryption on
+        // the target actually being built.
+        let opts_in_for_this_target =
+            config.var_encrypt_for_target(Some(parsed), &self.runtime_name, target_arch);
+        // Only a runtime that opts in somewhere, yet is being built for a target
+        // outside its scope, is a silent-plaintext risk: no marker would be
+        // written and /var would come up plaintext despite the opt-in. An
+        // unscoped runtime covers every target, so it can never land here.
+        if let Some(scope) = declared_scope.filter(|s| !s.iter().any(|t| t == target_arch)) {
+            if scope.iter().any(|t| var_encrypt(t)) {
                 anyhow::bail!(
-                    "Runtime '{}' sets var.encrypt for its target '{declared}' but is being \
-                     built for '{target_arch}'. The '{target_arch}' sysroot carries no \
-                     cryptsetup-var, so the initramfs would boot a plaintext /var despite the \
-                     opt-in. Build it with `--target {declared}`.",
+                    "Runtime '{}' sets var.encrypt but is scoped to {scope:?}, and is being \
+                     built for '{target_arch}'. No encrypt marker is written outside that \
+                     scope, so /var would come up plaintext despite the opt-in. Add \
+                     '{target_arch}' to the runtime's `targets:` list, or build one of {scope:?}.",
+                    self.runtime_name
+                );
+            }
+            if opts_in_for_this_target {
+                anyhow::bail!(
+                    "Runtime '{}' opts in to var.encrypt for '{target_arch}' (a `target-{target_arch}:` \
+                     override), but the runtime is scoped to {scope:?}, which does not include it. \
+                     No encrypt marker is written outside the declared scope, so /var would come up \
+                     plaintext despite the opt-in. Add '{target_arch}' to the runtime's `targets:` list.",
                     self.runtime_name
                 );
             }
@@ -4347,13 +4369,125 @@ runtimes:
             .expect_err("building an encrypt-opted runtime for a foreign target must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("var.encrypt"), "{msg}");
-        assert!(msg.contains("--target jetson-orin-nx"), "{msg}");
+        assert!(msg.contains("jetson-orin-nx"), "{msg}");
 
         // For its own target the same runtime builds and gets the marker.
         let script = cmd
             .create_build_script(&config, &parsed, "jetson-orin-nx", &[])
             .unwrap();
         assert!(script.contains("/etc/avocado/var-encrypt"));
+    }
+
+    /// A runtime scoped to several targets with `targets:` builds for each of
+    /// them and gets the encrypt marker. Regression: scope used to fall back to
+    /// `default_target`, so a project with several supported targets could only
+    /// encrypt on its default one and was refused for every sibling — with a
+    /// message claiming the sibling sysroot had no cryptsetup-var when it did.
+    #[test]
+    fn var_encrypt_spans_every_target_it_is_scoped_to() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+default_target: "jetson-agx-thor"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  dev:
+    targets: [jetson-agx-thor, jetson-agx-orin]
+    var:
+      encrypt: true
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            config_path,
+            false,
+            Some("jetson-agx-orin".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+
+        for t in ["jetson-agx-thor", "jetson-agx-orin"] {
+            let script = cmd
+                .create_build_script(&config, &parsed, t, &[])
+                .unwrap_or_else(|e| panic!("{t} is in scope and must build: {e:#}"));
+            assert!(
+                script.contains("/etc/avocado/var-encrypt"),
+                "the encrypt marker must be written for {t}"
+            );
+        }
+
+        // Outside the declared scope it is still refused, since no marker would
+        // be written and /var would come up plaintext despite the opt-in.
+        let err = cmd
+            .create_build_script(&config, &parsed, "qemux86-64", &[])
+            .expect_err("a target outside `targets:` must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("var.encrypt"), "{msg}");
+        assert!(msg.contains("qemux86-64"), "{msg}");
+        // The refusal must not blame an override that does not exist: this
+        // config opts in with a plain base `var.encrypt`, and
+        // var_encrypt_for_target resolves the base flag too, so both bail
+        // conditions are true here and only ordering decides which fires.
+        assert!(
+            !msg.contains("target-qemux86-64:"),
+            "a base-flag opt-in must not be reported as an override: {msg}"
+        );
+    }
+
+    /// The override-blaming refusal is for the case where an out-of-scope
+    /// `target-<x>:` override is the *sole* reason the build would be
+    /// plaintext - no in-scope target sets the base flag. The generic refusal
+    /// covers everything else and is asserted above.
+    #[test]
+    fn an_out_of_scope_override_is_named_as_the_cause() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+default_target: "jetson-agx-thor"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  dev:
+    targets: [jetson-agx-thor]
+    target-qemux86-64:
+      var:
+        encrypt: true
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            config_path,
+            false,
+            Some("jetson-agx-thor".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+
+        let err = cmd
+            .create_build_script(&config, &parsed, "qemux86-64", &[])
+            .expect_err("an out-of-scope override opt-in must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("target-qemux86-64:"),
+            "the override is the sole cause and must be named: {msg}"
+        );
+
+        // The in-scope target never opted in, so it still builds plaintext.
+        let script = cmd
+            .create_build_script(&config, &parsed, "jetson-agx-thor", &[])
+            .expect("the in-scope target has no opt-in and must build");
+        assert!(!script.contains("/etc/avocado/var-encrypt"));
     }
 
     #[test]

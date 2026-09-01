@@ -237,6 +237,7 @@ mod tests {
             name.to_string(),
             RuntimeConfig {
                 target: None,
+                targets: None,
                 target_board: None,
                 version: None,
                 dependencies: None,

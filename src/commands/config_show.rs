@@ -83,7 +83,7 @@ fn build_base_payload(config_path: &str, cfg: &Config) -> serde_json::Value {
             let mut list: Vec<_> = m
                 .iter()
                 .map(|(name, r)| {
-                    json!({
+                    let mut entry = json!({
                         "name": name,
                         "target": r.target,
                         "target_board": r.target_board,
@@ -92,7 +92,16 @@ fn build_base_payload(config_path: &str, cfg: &Config) -> serde_json::Value {
                         // the same way the deploy nudge does (per-runtime signing key,
                         // falling back to connect.server_key) so the two agree.
                         "signing_enabled": cfg.get_server_key_for_runtime(name).is_some(),
-                    })
+                    });
+                    // Scope is `targets:` > `target:` > unscoped, and a
+                    // `targets:`-scoped runtime would otherwise report
+                    // target:null, indistinguishable from unscoped. Emitted
+                    // only when set, so a config that never uses the field
+                    // keeps the byte-identical payload promised above.
+                    if let Some(ref targets) = r.targets {
+                        entry["targets"] = json!(targets);
+                    }
+                    entry
                 })
                 .collect();
             // Stable ordering so the UI doesn't dance around.
@@ -367,8 +376,17 @@ fn print_human_summary(payload: &serde_json::Value) {
             println!("  runtimes:");
             for r in rs {
                 let name = r["name"].as_str().unwrap_or("?");
-                let target = r["target"].as_str().unwrap_or("(inherits default)");
-                println!("    - {name} → {target}");
+                // `targets:` wins, then `target:`, then unscoped - which means
+                // every target the runtime is built for, not the default one.
+                let scope = match r["targets"].as_array() {
+                    Some(list) if !list.is_empty() => list
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => r["target"].as_str().unwrap_or("(all targets)").to_string(),
+                };
+                println!("    - {name} → {scope}");
             }
         }
     }

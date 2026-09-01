@@ -142,16 +142,11 @@ impl SignCommand {
                         )?;
 
                         if let Some(merged_value) = merged_runtime {
-                            // Check if runtime has explicit target
-                            if let Some(runtime_target) =
-                                merged_value.get("target").and_then(|t| t.as_str())
-                            {
-                                // Runtime has explicit target - only include if it matches
-                                if runtime_target == target {
-                                    runtimes_to_sign.push(runtime_name.to_string());
-                                }
-                            } else {
-                                // Runtime has no target specified - include for all targets
+                            // The shared scope rule: `targets:` > `target:` >
+                            // unscoped. Reading only `target` here left a
+                            // `targets:`-scoped runtime unsigned on the very
+                            // targets it is scoped to.
+                            if crate::utils::config::runtime_value_in_scope(&merged_value, target) {
                                 runtimes_to_sign.push(runtime_name.to_string());
                             }
                         }
