@@ -553,4 +553,6 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
 - **`ext-paths.json`.** Extension path mounts are now derived from config; the
   sidecar file is no longer written or read.
 
+[1.0.0-rc.3]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.3
+[1.0.0-rc.2]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.1
