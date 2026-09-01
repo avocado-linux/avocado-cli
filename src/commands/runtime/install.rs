@@ -493,7 +493,7 @@ impl RuntimeInstallCommand {
         // makes the parent exist again while the database is gone. dnf would
         // then resolve against an empty database and pull the whole dependency
         // closure into the runtime tree.
-        let check_command = format!("[ -d {installroot_path}/var/lib/rpm ]");
+        let check_command = rpmdb_seeded_check(&installroot_path);
         let setup_command = format!(
             "mkdir -p {installroot_path}/var/lib && cp -rf $AVOCADO_PREFIX/rootfs/var/lib/rpm {installroot_path}/var/lib"
         );
@@ -594,7 +594,20 @@ impl RuntimeInstallCommand {
             // so dependencies should only contain package references.
             let mut packages = Vec::new();
             let mut package_names = Vec::new();
-            let mut pinned_excludes: Vec<String> = Vec::new();
+            // (resolved package name, version the config asked for) for every
+            // package on the install line.
+            let mut pinned_candidates: Vec<(String, String)> = Vec::new();
+            // The one way to put a package on the install line. The kernel is
+            // appended separately from the dependency loop, and recording its
+            // pin was simply forgotten there; going through here means a caller
+            // cannot add a package without its version reaching the sync's
+            // exclude set.
+            let mut add_package =
+                |spec: String, config_name: &str, resolved_name: &str, version: &str| {
+                    packages.push(spec);
+                    package_names.push(config_name.to_string());
+                    pinned_candidates.push((resolved_name.to_string(), version.to_string()));
+                };
             for (package_name_val, version_spec) in deps_map {
                 // Convert package name from Value to String
                 let package_name = match package_name_val.as_str() {
@@ -633,12 +646,7 @@ impl RuntimeInstallCommand {
                     &resolved_name,
                     &config_version,
                 );
-                packages.push(package_spec);
-                package_names.push(package_name.to_string());
-                // A version the project chose, to be held out of the sync below.
-                if is_explicit_version(Some(config_version.as_str())) {
-                    pinned_excludes.push(format!("--exclude={resolved_name}"));
-                }
+                add_package(package_spec, package_name, &resolved_name, &config_version);
             }
 
             // Add kernel package if specified in the runtime kernel config
@@ -665,8 +673,7 @@ impl RuntimeInstallCommand {
                             ),
                             OutputLevel::Normal,
                         );
-                        packages.push(package_spec);
-                        package_names.push(kernel_package.to_string());
+                        add_package(package_spec, kernel_package, &resolved_name, kernel_version);
                     }
                 }
             }
@@ -706,9 +713,7 @@ impl RuntimeInstallCommand {
                 // to the repo's latest - one line after the install placed the
                 // requested one, and the lock would then record the wrong version.
                 let mut sync_excludes: Vec<String> = off_kernel_excludes.clone();
-                pinned_excludes.sort();
-                pinned_excludes.dedup();
-                sync_excludes.extend(pinned_excludes.iter().cloned());
+                sync_excludes.extend(pinned_sync_excludes(&pinned_candidates));
                 let sync_exclude_str = sync_excludes.join(" ");
                 let sync_snippet = runtime_dnf_sync_step(
                     runtime_fresh_resolve,
@@ -874,6 +879,42 @@ async fn run_container_command(
 /// Mirrors dnf_sync_step() in commands/rootfs/install.rs and sdk_dnf_sync_step()
 /// in commands/sdk/install.rs, down to the excludes and repo config, so the sync
 /// resolves against exactly what the install line saw.
+/// The shell test for "is this runtime's rpm database already seeded".
+///
+/// Named rather than inlined so the test below asserts the string production
+/// actually uses. The test must be the database itself, not the directory
+/// above it: SDK init recreates `<runtime>/extensions` to repair a dangling
+/// `$AVOCADO_EXT_SYSROOTS` symlink after `avocado runtime clean`, which makes
+/// the parent exist again while the database is gone. dnf would then resolve
+/// against an empty database and pull the whole dependency closure into the
+/// runtime tree.
+fn rpmdb_seeded_check(installroot_path: &str) -> String {
+    format!("[ -d {installroot_path}/var/lib/rpm ]")
+}
+
+/// The `--exclude` flags that hold config-pinned packages out of the sync.
+///
+/// The sync follows the feed for everything installed, which would walk a
+/// package the config pins to an explicit version straight to the repo's
+/// latest - one line after the install placed the requested one, and the
+/// query would then record the moved version in the lock. A wildcard is a
+/// request to follow the feed and stays in.
+///
+/// Both the dependency loop and the separately-appended kernel package go
+/// through here: applying the predicate only where the packages are gathered
+/// in a loop is what let an explicit `kernel.version` slip through. Sorted and
+/// deduped so the command is stable across runs.
+fn pinned_sync_excludes(packages: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = packages
+        .iter()
+        .filter(|(_, version)| is_explicit_version(Some(version.as_str())))
+        .map(|(resolved_name, _)| format!("--exclude={resolved_name}"))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn runtime_dnf_sync_step(
     fresh_resolve: bool,
     installroot_path: &str,
@@ -905,20 +946,37 @@ $DNF_SDK_HOST \
 mod tests {
     #[test]
     fn the_rpmdb_seed_test_is_the_database_not_its_parent() {
-        // SDK init recreates <runtime>/extensions to repair a dangling
-        // $AVOCADO_EXT_SYSROOTS symlink after `avocado runtime clean`. Testing
-        // the parent directory therefore reports "already seeded" for a runtime
-        // whose rpm database is gone, and dnf resolves against an empty one.
-        let installroot_path = "/opt/_avocado/x/runtimes/dev";
-        let check = format!("[ -d {installroot_path}/var/lib/rpm ]");
-        assert!(
-            check.contains("/var/lib/rpm ]"),
-            "the check must name the database: {check}"
+        // Asserts the production string, not a copy of it: SDK init recreates
+        // <runtime>/extensions to repair a dangling $AVOCADO_EXT_SYSROOTS
+        // symlink after `avocado runtime clean`, so testing the parent
+        // directory reports "already seeded" for a runtime whose rpm database
+        // is gone and dnf resolves against an empty one.
+        assert_eq!(
+            super::rpmdb_seeded_check("/opt/_avocado/x/runtimes/dev"),
+            "[ -d /opt/_avocado/x/runtimes/dev/var/lib/rpm ]"
         );
-        assert_ne!(
-            check,
-            format!("[ -d {installroot_path} ]"),
-            "testing the parent directory is the bug this pins"
+    }
+
+    /// The kernel package is appended to the install line outside the
+    /// dependency loop, so a pin predicate applied only to that loop leaves an
+    /// explicit `kernel.version` to be installed at the requested version and
+    /// then walked to the feed's latest by the sync - with the lock recording
+    /// the moved version.
+    #[test]
+    fn an_explicit_kernel_version_is_held_out_of_the_sync() {
+        assert_eq!(
+            super::pinned_sync_excludes(&[
+                ("avocado-runtime".to_string(), "*".to_string()),
+                ("kernel-image-6.6.0".to_string(), "6.6.0-r0".to_string()),
+                ("some-app".to_string(), "1.2".to_string()),
+            ]),
+            vec!["--exclude=kernel-image-6.6.0", "--exclude=some-app"],
+            "an explicit kernel.version must be excluded, a wildcard must not"
+        );
+        assert!(
+            super::pinned_sync_excludes(&[("avocado-runtime".to_string(), "*".to_string())])
+                .is_empty(),
+            "a wildcard is a request to follow the feed"
         );
     }
 
