@@ -872,13 +872,6 @@ async fn run_container_command(
     }
 }
 
-/// The dnf pass that makes an existing runtime sysroot follow the feed after
-/// `avocado update` (or on a first install, where it is a no-op). Empty when the
-/// lock carries pins - then the lock, not the feed, says which versions belong.
-///
-/// Mirrors dnf_sync_step() in commands/rootfs/install.rs and sdk_dnf_sync_step()
-/// in commands/sdk/install.rs, down to the excludes and repo config, so the sync
-/// resolves against exactly what the install line saw.
 /// The shell test for "is this runtime's rpm database already seeded".
 ///
 /// Named rather than inlined so the test below asserts the string production
@@ -915,6 +908,13 @@ fn pinned_sync_excludes(packages: &[(String, String)]) -> Vec<String> {
     out
 }
 
+/// The dnf pass that makes an existing runtime sysroot follow the feed after
+/// `avocado update` (or on a first install, where it is a no-op). Empty when the
+/// lock carries pins - then the lock, not the feed, says which versions belong.
+///
+/// Mirrors dnf_sync_step() in commands/rootfs/install.rs and sdk_dnf_sync_step()
+/// in commands/sdk/install.rs, down to the excludes and repo config, so the sync
+/// resolves against exactly what the install line saw.
 fn runtime_dnf_sync_step(
     fresh_resolve: bool,
     installroot_path: &str,
