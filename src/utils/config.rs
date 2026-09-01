@@ -3718,6 +3718,20 @@ impl Config {
         // device's first boot.
         if let Some(runtimes) = &self.runtimes {
             for (name, rt) in runtimes {
+                // An empty `targets:` scopes the runtime to nothing, so every
+                // target-scoped opt-in on it silently does nothing: var_encrypt_runtimes
+                // filters it out for every target, and the build guard cannot trip
+                // either because there is no target in scope to have opted in. For
+                // `var.encrypt` that means a plaintext /var from config that reads as
+                // asking for an encrypted one. Omit the key to mean "every target".
+                if rt.targets.as_deref().is_some_and(<[String]>::is_empty) {
+                    return Err(anyhow::anyhow!(
+                        "runtimes.{name}.targets is empty - that scopes the runtime to no \
+                         target at all, so anything scoped to it (var.encrypt) would be \
+                         silently skipped. Omit `targets:` to mean every target, or list \
+                         the targets it is for"
+                    ));
+                }
                 let Some(var) = rt.var.as_ref() else { continue };
                 if let Some(hw) = var.hardware.as_deref() {
                     if !VAR_HARDWARE_VALUES.contains(&hw) {
@@ -12114,6 +12128,46 @@ runtimes:
     /// Sysroots are installed per target. An opt-in on a Jetson runtime must
     /// not ask a qemu feed (which does not publish cryptsetup-var) for the
     /// packages, or the qemu sysroot install fails on an unrelated runtime.
+    /// `targets: []` scopes a runtime to nothing, so every target-scoped opt-in
+    /// on it silently does nothing - var_encrypt_runtimes returns empty for every
+    /// target and the build guard cannot trip either, because no target in scope
+    /// opted in. For var.encrypt that is a plaintext /var from config that reads
+    /// as asking for an encrypted one, so it must fail at load.
+    #[test]
+    fn empty_targets_list_is_rejected() {
+        let yaml = r#"
+default_target: jetson-agx-thor
+runtimes:
+  dev:
+    targets: []
+    var:
+      encrypt: true
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg
+            .validate_runtime_refs()
+            .expect_err("an empty targets list must not load");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("runtimes.dev.targets is empty"), "{msg}");
+
+        // Omitting the key entirely is the way to say "every target".
+        let ok: Config = serde_yaml::from_str(
+            r#"
+default_target: jetson-agx-thor
+runtimes:
+  dev:
+    var:
+      encrypt: true
+"#,
+        )
+        .unwrap();
+        assert!(ok.validate_runtime_refs().is_ok());
+        assert_eq!(
+            ok.var_encrypt_runtimes(None, "jetson-agx-orin"),
+            vec!["dev".to_string()]
+        );
+    }
+
     #[test]
     fn test_var_encrypt_union_is_scoped_to_the_sysroot_target() {
         let config: Config = serde_yaml::from_str(
