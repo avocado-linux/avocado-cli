@@ -4141,20 +4141,27 @@ runtimes:
         // an artifact the manifest references but no generic step builds (the
         // Tegra boot.img backing the kernel A/B partitions). Bundling before the
         // hook runs resolves those inputs as missing.
+        // Anchor on the execution line, not the AVOCADO_BUILD_HOOK assignment
+        // above it: "avocado-build-$TARGET_ARCH" is matched by the assignment
+        // alone, so both the presence and the ordering check would survive the
+        // invocation being deleted or moved past the bundle - the one
+        // regression they exist to catch.
+        let hook_call =
+            "PATH=\"$AVOCADO_SDK_PREFIX/usr/bin:$PATH\" \"$AVOCADO_BUILD_HOOK\" \"$RUNTIME_NAME\"";
+        let hook_at = script
+            .find(hook_call)
+            .expect("the platform build hook must actually be invoked");
+        let guard_at = script
+            .find("if [ -x \"$AVOCADO_BUILD_HOOK\" ]")
+            .expect("the hook is optional and must be guarded on existence");
         assert!(
-            script.contains("avocado-build-$TARGET_ARCH"),
-            "the platform build hook must be invoked"
+            guard_at < hook_at,
+            "the invocation must sit inside the existence guard"
         );
+        // The bare string "stone bundle" also appears in an earlier comment
+        // about os_bundle cleanup, so anchor on the command at start-of-line.
         assert!(
-            script.contains("if [ -x \"$AVOCADO_BUILD_HOOK\" ]"),
-            "the hook is optional and must be guarded on existence"
-        );
-        // Anchor on the invocation at start-of-line: the bare string "stone
-        // bundle" also appears in an earlier comment about os_bundle cleanup and
-        // would satisfy this ordering check for the wrong reason.
-        assert!(
-            script.find("avocado-build-$TARGET_ARCH").unwrap()
-                < script.find("\nstone bundle ").unwrap(),
+            hook_at < script.find("\nstone bundle ").unwrap(),
             "the hook must run before stone bundle resolves its inputs"
         );
         assert!(script.contains("mkfs.btrfs"));
