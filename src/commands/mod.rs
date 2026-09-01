@@ -24,4 +24,5 @@ pub mod signing_keys;
 pub mod unlock;
 pub mod update;
 pub mod upgrade;
+pub mod var_key;
 pub mod vm;

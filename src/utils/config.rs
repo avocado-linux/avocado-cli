@@ -978,7 +978,25 @@ pub struct VarConfig {
     /// is encrypted in place, so seeded content (subvolumes, var_files,
     /// primed images) survives.
     pub encrypt: Option<bool>,
+    /// Name of a registry secret (`avocado signing-keys create <name>
+    /// --algorithm hmac-sha256`) that is the *master* for an operator-held
+    /// recovery keyslot. Nothing derived from it enters the build: `avocado
+    /// var-key enroll --device` derives this unit's passphrase as
+    /// HMAC(master, SoC UID) and enrols it over the device session. Recovers a
+    /// unit whose hardware keyslot is lost, and lets the SoC-UID-derived slot
+    /// be retired. Omitted: no recovery slot, today's behaviour.
+    #[serde(default)]
+    pub recovery: Option<String>,
+    /// Which hardware key engine binds /var: `auto` (default: whatever the
+    /// machine ships and probes OK, degrade to Argon2id and report), `caam`
+    /// or `tpm2` (fail closed if that engine is missing), `none` (no hardware
+    /// slot; requires `recovery`).
+    #[serde(default)]
+    pub hardware: Option<String>,
 }
+
+/// Accepted values of `runtimes.<r>.var.hardware`.
+pub const VAR_HARDWARE_VALUES: &[&str] = &["auto", "caam", "tpm2", "none"];
 
 /// A subvolume entry supporting shorthand and full forms.
 ///
@@ -3684,7 +3702,90 @@ impl Config {
         check_perms("rootfs", self.rootfs.as_ref())?;
         check_perms("initramfs", self.initramfs.as_ref())?;
 
+        // var.hardware / var.recovery: only the combinations that leave /var
+        // recoverable are accepted, and typos fail here rather than on a
+        // device's first boot.
+        if let Some(runtimes) = &self.runtimes {
+            for (name, rt) in runtimes {
+                let Some(var) = rt.var.as_ref() else { continue };
+                if let Some(hw) = var.hardware.as_deref() {
+                    if !VAR_HARDWARE_VALUES.contains(&hw) {
+                        return Err(anyhow::anyhow!(
+                            "runtimes.{name}.var.hardware: '{hw}' is not one of {}",
+                            VAR_HARDWARE_VALUES.join(", ")
+                        ));
+                    }
+                    if hw == "none" && var.recovery.as_deref().is_none_or(|r| r.trim().is_empty()) {
+                        return Err(anyhow::anyhow!(
+                            "runtimes.{name}.var.hardware: 'none' needs var.recovery - without a \
+                             hardware keyslot or an operator recovery key /var would be unrecoverable"
+                        ));
+                    }
+                }
+                if var.recovery.is_some() && var.encrypt != Some(true) {
+                    return Err(anyhow::anyhow!(
+                        "runtimes.{name}.var.recovery is set but var.encrypt is not true - there is \
+                         no encrypted /var to enrol a recovery key on"
+                    ));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// `runtimes.<r>.var.recovery`: the registry secret that is this runtime's
+    /// /var recovery master, if configured.
+    pub fn get_runtime_var_recovery(&self, runtime_name: &str) -> Option<String> {
+        self.runtimes
+            .as_ref()
+            .and_then(|r| r.get(runtime_name))
+            .and_then(|r| r.var.as_ref())
+            .and_then(|v| v.recovery.clone())
+            .filter(|k| !k.trim().is_empty())
+    }
+
+    /// `runtimes.<r>.var.hardware`, defaulting to `auto`.
+    pub fn get_runtime_var_hardware(&self, runtime_name: &str) -> String {
+        self.runtimes
+            .as_ref()
+            .and_then(|r| r.get(runtime_name))
+            .and_then(|r| r.var.as_ref())
+            .and_then(|v| v.hardware.clone())
+            .unwrap_or_else(|| "auto".to_string())
+    }
+
+    /// `var.hardware` for a runtime as it resolves FOR THIS TARGET.
+    ///
+    /// The typed field above is the base document, so a `target-<name>`
+    /// override of `var.hardware` is invisible to it. `var.encrypt` right next
+    /// to it is read through the resolved value (see [`var_encrypt_runtimes`]),
+    /// so reading this one unresolved silently drops a per-target `caam` and
+    /// builds an initramfs that degrades to `auto` instead of failing closed.
+    pub fn get_runtime_var_hardware_for_target(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        runtime_name: &str,
+        target: &str,
+    ) -> String {
+        let resolved = parsed
+            .and_then(|p| p.get("runtimes")?.get(runtime_name))
+            .cloned()
+            .map(|node| {
+                self.resolve_overrides_in_value(
+                    node,
+                    target,
+                    None,
+                    &format!("runtimes.{runtime_name}"),
+                )
+            })
+            .and_then(|v| {
+                v.get("var")
+                    .and_then(|v| v.get("hardware"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        resolved.unwrap_or_else(|| self.get_runtime_var_hardware(runtime_name))
     }
 
     /// Resolve an [`ImageConfig`]'s `permissions:` reference to a borrowed
@@ -11875,6 +11976,39 @@ var:
     }
 
     #[test]
+    fn var_hardware_and_recovery_are_validated_at_load() {
+        let base = r#"
+distro: { release: 2026, channel: edge }
+default_target: qemux86-64
+runtimes:
+  dev:
+    var:
+      encrypt: true
+"#;
+        let with = |extra: &str| -> Result<()> {
+            let yaml = format!("{base}      {extra}\n");
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate_runtime_refs()
+        };
+        assert!(with("hardware: auto").is_ok());
+        assert!(with("hardware: caam").is_ok());
+        let err = with("hardware: tpm").unwrap_err().to_string();
+        assert!(err.contains("is not one of"), "{err}");
+        let err = with("hardware: none").unwrap_err().to_string();
+        assert!(err.contains("needs var.recovery"), "{err}");
+        assert!(with("hardware: none\n      recovery: product-var-master").is_ok());
+
+        let cfg: Config = serde_yaml::from_str(
+            "distro: { release: 2026, channel: edge }\nruntimes:\n  dev:\n    var:\n      recovery: k\n",
+        )
+        .unwrap();
+        let err = cfg.validate_runtime_refs().unwrap_err().to_string();
+        assert!(err.contains("var.encrypt is not true"), "{err}");
+        assert_eq!(cfg.get_runtime_var_recovery("dev").as_deref(), Some("k"));
+        assert_eq!(cfg.get_runtime_var_hardware("dev"), "auto");
+    }
+
+    #[test]
     fn test_var_config_deserialization() {
         let yaml = r#"
 compression: zstd
@@ -12989,6 +13123,44 @@ runtimes:
                 && err.contains("'ghost'")
                 && err.contains("no top-level"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn var_hardware_follows_a_target_override() {
+        // var.encrypt beside it is read through the resolved value, so reading
+        // var.hardware off the base document dropped a per-target `caam` and
+        // built an initramfs on `auto` - losing the fail-closed policy the
+        // override asked for.
+        let yaml = r#"
+default_target: qemux86-64
+
+runtimes:
+  dev:
+    var:
+      encrypt: true
+      hardware: auto
+    target-imx8mp-evk:
+      var:
+        hardware: caam
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.get_runtime_var_hardware_for_target(Some(&parsed), "dev", "imx8mp-evk"),
+            "caam",
+            "the target override must win"
+        );
+        assert_eq!(
+            config.get_runtime_var_hardware_for_target(Some(&parsed), "dev", "qemux86-64"),
+            "auto",
+            "other targets keep the base value"
+        );
+        // No parsed document (callers that only hold the typed config) still
+        // gets the base value rather than nothing.
+        assert_eq!(
+            config.get_runtime_var_hardware_for_target(None, "dev", "imx8mp-evk"),
+            "auto"
         );
     }
 

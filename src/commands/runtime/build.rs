@@ -2584,6 +2584,14 @@ echo "Docker image priming complete.""#,
             initramfs_post_install.as_deref(),
             &initramfs_permissions_section,
             var_encrypt(target_arch),
+            // Target-resolved, like var_encrypt above it: a `target-<name>`
+            // override of var.hardware would otherwise be dropped and the
+            // initramfs built with `auto`, losing the fail-closed policy.
+            &config.get_runtime_var_hardware_for_target(
+                Some(parsed),
+                &self.runtime_name,
+                target_arch,
+            ),
         );
 
         let script = format!(

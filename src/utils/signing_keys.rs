@@ -19,6 +19,8 @@ const KEYS_REGISTRY_FILE: &str = "keys.json";
 
 /// Subdirectory name for signing keys within the avocado config
 const SIGNING_KEYS_DIR: &str = "signing-keys";
+/// Host-only store for secret masters; never mounted into a build container.
+const SECRETS_DIR: &str = "secrets";
 
 /// Represents a single signing key entry in the registry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +119,26 @@ pub fn get_signing_keys_dir() -> Result<PathBuf> {
     // Otherwise use the host path
     let config_dir = get_avocado_config_dir()?;
     Ok(config_dir.join(SIGNING_KEYS_DIR))
+}
+
+/// Directory for secret masters (`--algorithm hmac-sha256`).
+///
+/// Deliberately NOT [`get_signing_keys_dir`]: that directory is bind-mounted
+/// into every SDK container at `/opt/signing-keys`, so anything a build runs -
+/// a `post_install` hook, an extension's build script - can read what is in it.
+/// A recovery master has no build-time purpose, and it is fleet-wide: with it
+/// and a device's SoC UID, which is not secret, any unit's `/var` can be opened.
+///
+/// This also ignores `AVOCADO_SIGNING_KEYS_DIR` on purpose. That variable is how
+/// a container tells the cli where the mount is; honouring it here would put the
+/// secrets back inside the mount the moment a build looked one up.
+pub fn get_secrets_dir() -> Result<PathBuf> {
+    Ok(get_avocado_config_dir()?.join(SECRETS_DIR))
+}
+
+/// The path a secret master is stored at, host-only.
+pub fn secret_key_path(keyid: &str) -> Result<PathBuf> {
+    Ok(get_secrets_dir()?.join(keyid).with_extension("secret"))
 }
 
 /// Get the path to the keys registry file
@@ -237,11 +259,17 @@ pub fn ensure_dev_signing_key() -> Result<String> {
 
 /// Delete key files from disk
 pub fn delete_key_files(keyid: &str) -> Result<()> {
-    delete_key_files_at(&get_key_file_path(keyid)?)
+    delete_key_files_at(&get_key_file_path(keyid)?)?;
+    // Secret masters live outside the signing-keys directory, so the path above
+    // does not reach them. Without this, `signing-keys remove --delete` reports
+    // "Deleted key files from disk" while a fleet-wide recovery master stays on
+    // disk - the one failure mode where a false success is worst.
+    delete_key_files_at(&secret_key_path(keyid)?)
 }
 
-/// Every file a file-backed entry may own: ed25519 `.key`/`.pub`, RSA `.key`/`.crt`.
-pub const KEY_FILE_EXTENSIONS: &[&str] = &["key", "pub", "crt"];
+/// Every file a file-backed entry may own: ed25519 `.key`/`.pub`, RSA
+/// `.key`/`.crt`, hmac-sha256 `.secret`.
+pub const KEY_FILE_EXTENSIONS: &[&str] = &["key", "pub", "crt", "secret"];
 
 fn delete_key_files_at(base_path: &Path) -> Result<()> {
     for ext in KEY_FILE_EXTENSIONS {
@@ -358,6 +386,7 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_generate_keyid() {
@@ -404,6 +433,76 @@ mod tests {
         assert!(is_pkcs11_uri("pkcs11:token=YubiKey"));
         assert!(!is_pkcs11_uri("file:///path/to/key"));
         assert!(!is_pkcs11_uri("/path/to/key"));
+    }
+
+    #[test]
+    fn a_secret_never_lands_in_the_directory_the_sdk_mounts() {
+        // The container tells the cli where the mount is with
+        // AVOCADO_SIGNING_KEYS_DIR. get_secrets_dir must ignore it: honouring it
+        // would put the recovery master back inside /opt/signing-keys, which is
+        // bind-mounted into every build and readable by any build hook.
+        //
+        // Asserts on the real functions rather than on the two constants - a
+        // constants-only check passes even if get_secrets_dir returns the
+        // mounted directory.
+        let mount = TempDir::new().unwrap();
+        let previous = std::env::var_os("AVOCADO_SIGNING_KEYS_DIR");
+        std::env::set_var("AVOCADO_SIGNING_KEYS_DIR", mount.path());
+
+        let mounted_dir = get_signing_keys_dir().unwrap();
+        let secret = secret_key_path("abc123").unwrap();
+        let secrets_dir = get_secrets_dir().unwrap();
+
+        // Restore before asserting, so a failure cannot leak the var into the
+        // rest of this test binary.
+        match previous {
+            Some(v) => std::env::set_var("AVOCADO_SIGNING_KEYS_DIR", v),
+            None => std::env::remove_var("AVOCADO_SIGNING_KEYS_DIR"),
+        }
+
+        assert_eq!(
+            mounted_dir,
+            mount.path(),
+            "the mount override should still drive the signing-keys directory"
+        );
+        assert!(
+            !secret.starts_with(&mounted_dir),
+            "the recovery master landed inside the mounted directory: {}",
+            secret.display()
+        );
+        assert!(
+            !secrets_dir.starts_with(&mounted_dir),
+            "the secrets directory is inside the mount: {}",
+            secrets_dir.display()
+        );
+        assert!(secret.starts_with(&secrets_dir));
+    }
+
+    #[test]
+    fn removing_a_key_deletes_the_secret_outside_the_signing_keys_directory() {
+        // `signing-keys remove --delete` used to look only under signing-keys/,
+        // so it reported success while a fleet-wide recovery master stayed on
+        // disk. delete_key_files_at is the unit under test here; the wiring that
+        // calls it for both locations is delete_key_files.
+        let tmp = TempDir::new().unwrap();
+        let secrets = tmp.path().join(SECRETS_DIR);
+        let keys = tmp.path().join(SIGNING_KEYS_DIR);
+        fs::create_dir_all(&secrets).unwrap();
+        fs::create_dir_all(&keys).unwrap();
+        let secret = secrets.join("abc123.secret");
+        let pubkey = keys.join("abc123.pub");
+        fs::write(&secret, b"master").unwrap();
+        fs::write(&pubkey, b"public").unwrap();
+
+        delete_key_files_at(&keys.join("abc123")).unwrap();
+        assert!(!pubkey.exists(), "the signing-keys side was not deleted");
+        assert!(
+            secret.exists(),
+            "sanity: the secrets side is a separate path"
+        );
+
+        delete_key_files_at(&secrets.join("abc123")).unwrap();
+        assert!(!secret.exists(), "the recovery master survived removal");
     }
 
     #[test]
@@ -902,5 +1001,200 @@ mod pem_tests {
         assert!(is_pem_algorithm("rsa4096"));
         assert!(!is_pem_algorithm("ed25519"));
         assert!(!is_pem_algorithm("ecdsa-p256"));
+    }
+}
+// ---------------------------------------------------------------------------
+// Secret (symmetric) keys: `--algorithm hmac-sha256`. A master the operator
+// holds; per-device material is *derived* from it and never stored.
+// ---------------------------------------------------------------------------
+
+/// The one secret-key algorithm the registry knows.
+pub const SECRET_ALGORITHM: &str = "hmac-sha256";
+pub const SECRET_KEY_BYTES: usize = 32;
+/// Domain separator so a var recovery passphrase can never collide with any
+/// other derivation from the same master.
+const VAR_RECOVERY_INFO: &[u8] = b"avocado-var-recovery\0";
+
+pub fn is_secret_algorithm(algorithm: &str) -> bool {
+    algorithm == SECRET_ALGORITHM
+}
+
+/// keyid of a secret: SHA-256 over a fixed prefix and the secret, so the id is
+/// stable, never equal to a hash anyone else computes over the bare bytes, and
+/// leaks nothing about a 256-bit random master.
+pub fn keyid_for_secret(secret: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"avocado-secret-keyid\0");
+    h.update(secret);
+    hex::encode(&h.finalize()[..])
+}
+
+/// Store a secret master as `<keyid>.secret`, mode 0600, and return the file URI.
+pub fn save_secret_key(keyid: &str, secret: &[u8]) -> Result<String> {
+    use std::io::Write;
+    let path = secret_key_path(keyid)?;
+    // Created here because this directory is new on an existing install and
+    // absent on a clean one; without it the very first
+    // `signing-keys create --algorithm hmac-sha256` fails with ENOENT.
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&path)
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    f.write_all(secret)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path_to_file_uri(&path))
+}
+
+/// The master bytes of a registry secret. File-backed only for now; a
+/// `pkcs11:` secret is refused with a pointer to what is missing rather than
+/// pretending (the HSM would compute the HMAC itself, see the recovery-key brief).
+pub fn secret_key_bytes(name: &str) -> Result<Vec<u8>> {
+    let entries = get_key_entries(std::slice::from_ref(&name.to_string()))?;
+    let (registry_name, entry) = entries
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("key '{name}' is not in the registry"))?;
+    if !is_secret_algorithm(&entry.algorithm) {
+        anyhow::bail!(
+            "key '{registry_name}' is {} - a var recovery master must be a secret key \
+             (`avocado signing-keys create {registry_name} --algorithm {SECRET_ALGORITHM}`)",
+            entry.algorithm
+        );
+    }
+    if !is_file_uri(&entry.uri) {
+        anyhow::bail!(
+            "key '{registry_name}' is {} - deriving a recovery passphrase from a PKCS#11 \
+             secret is not supported yet (the token would have to compute the HMAC)",
+            entry.uri
+        );
+    }
+    let path = PathBuf::from(entry.uri.trim_start_matches("file://"));
+    // Refuse a master still inside the bind-mounted signing-keys directory
+    // rather than moving it here. Moving is a rename plus a registry rewrite,
+    // and a failure between the two leaves the registry pointing at a file that
+    // is gone - losing the key that opens a fleet's /var. No released version
+    // put a secret there, so this is a one-line fix for whoever hits it.
+    if let Ok(config_dir) = get_avocado_config_dir() {
+        if path.starts_with(config_dir.join(SIGNING_KEYS_DIR)) {
+            let dest = secret_key_path(&entry.keyid)?;
+            anyhow::bail!(
+                "the recovery master for '{registry_name}' is in the signing-keys \
+                 directory, which is bind-mounted into every SDK build container - \
+                 any build hook can read it. Move it out and point the registry at \
+                 the new location:\n  mkdir -p {}\n  mv {} {}\n  then set the entry's \
+                 uri to file://{}",
+                dest.parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                path.display(),
+                dest.display(),
+                dest.display()
+            );
+        }
+    }
+    let bytes = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() >= 16,
+        "secret '{registry_name}' at {} is too short to be a master key",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+/// HMAC-SHA256 (RFC 2104) over sha2 - no extra dependency for ten lines.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key)[..]);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    let inner = Sha256::new()
+        .chain_update(&ipad)
+        .chain_update(msg)
+        .finalize();
+    let mac = Sha256::new()
+        .chain_update(&opad)
+        .chain_update(&inner[..])
+        .finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac[..]);
+    out
+}
+
+/// The /var recovery passphrase of one device: HMAC(master, info || SoC UID).
+/// The device only ever sees this value; recovering any unit later is the same
+/// computation from its UID. 32 raw bytes, fed to the device verbatim.
+pub fn derive_var_recovery_passphrase(master: &[u8], soc_uid: &str) -> [u8; 32] {
+    let uid = soc_uid.trim();
+    let mut msg = Vec::with_capacity(VAR_RECOVERY_INFO.len() + uid.len());
+    msg.extend_from_slice(VAR_RECOVERY_INFO);
+    msg.extend_from_slice(uid.as_bytes());
+    hmac_sha256(master, &msg)
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_handles_a_key_longer_than_the_block() {
+        // RFC 4231 case 6: 131-byte key.
+        let mac = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex::encode(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn recovery_passphrase_is_per_device_and_stable() {
+        let master = [7u8; 32];
+        let a = derive_var_recovery_passphrase(&master, "0a16040100000100");
+        let b = derive_var_recovery_passphrase(&master, "0a16040100000100\n");
+        let c = derive_var_recovery_passphrase(&master, "0a16040100000101");
+        assert_eq!(a, b, "surrounding whitespace on the UID must not matter");
+        assert_ne!(a, c, "a different UID yields a different passphrase");
+        assert_ne!(
+            a,
+            hmac_sha256(&master, b"0a16040100000100"),
+            "domain-separated"
+        );
+    }
+
+    #[test]
+    fn secret_keyid_is_not_a_bare_hash_of_the_secret() {
+        use sha2::{Digest, Sha256};
+        let secret = [1u8; 32];
+        assert_ne!(
+            keyid_for_secret(&secret),
+            hex::encode(&Sha256::digest(secret)[..])
+        );
+        assert_eq!(keyid_for_secret(&secret).len(), 64);
     }
 }

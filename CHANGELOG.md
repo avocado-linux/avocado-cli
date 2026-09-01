@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`runtimes.<name>.var.recovery` and `avocado var-key` — an operator-held
+  recovery key for the encrypted `/var`.** `var.recovery` names a registry
+  secret (`avocado signing-keys create <name> --algorithm hmac-sha256`, a new
+  secret key kind) that is a *master*; nothing derived from it enters a build.
+  It is stored host-only, outside the signing-keys directory the SDK
+  bind-mounts into build containers, so no build hook can read it. A master
+  found in the old location is refused with the commands to move it, rather
+  than migrated automatically: the move is a rename plus a registry rewrite,
+  and a failure between the two would lose the key that opens a fleet's `/var`.
+  `avocado var-key enroll <runtime> --device user@host` reads the device's SoC
+  UID over SSH, derives that unit's passphrase as
+  HMAC-SHA256(master, "avocado-var-recovery\0" || UID) and hands it to `avocadoctl var-key enroll`, which adds it as a LUKS2 keyslot
+  (token `avocado-recovery`). `avocado var-key derive <runtime> --uid <UID>
+  [--raw]` reproduces it on a bench to recover a unit whose hardware keyslot is
+  gone. Once enrolled, the initrd retires the SoC-UID-derived keyslot.
+- **`runtimes.<name>.var.hardware`** — `auto` (default: bind to whatever engine
+  the machine ships, degrade and report), `caam` / `tpm2` (that engine must
+  hold a keyslot; the initrd refuses to boot `/var` on the derived key when it
+  is missing), `none` (no hardware keyslot; requires `var.recovery`). Validated
+  at config load; an explicit choice rides in the initramfs as
+  `/etc/avocado/var-hardware`.
+
 ### Fixed
 - **`avocado deploy --verbose` no longer fails with "Failed to parse hash
   collection output".** The SDK entrypoint's `[INFO]`/`[WARNING]`/`[ERROR]`

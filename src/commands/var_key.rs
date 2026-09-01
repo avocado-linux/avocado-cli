@@ -1,0 +1,220 @@
+//! `avocado var-key`: the operator side of the /var recovery keyslot.
+//!
+//! `runtimes.<r>.var.recovery` names a registry secret - the *master*. Nothing
+//! derived from it is part of a build: this command talks to one present
+//! device, reads its SoC UID, derives
+//! HMAC-SHA256(master, "avocado-var-recovery\0" || UID) and hands that to
+//! `avocadoctl var-key enroll` over the SSH session, which adds the keyslot.
+//! Recovering a unit later is `avocado var-key derive` with the same UID on a
+//! bench that holds the master. Provision-side by construction: it needs the
+//! device, never the image.
+use crate::utils::config::Config;
+use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::remote::{RemoteHost, SshClient};
+use crate::utils::signing_keys::{derive_var_recovery_passphrase, secret_key_bytes};
+use anyhow::{Context, Result};
+
+/// How the device reports its SoC UID: the device tree's serial-number (set by
+/// the bootloader from the chip id on i.MX and Jetson) first, soc0's
+/// serial_number (OCOTP / fuse driver) second - the same order and sources
+/// the initramfs var-key.sh uses, so both sides name the same device.
+pub const SOC_UID_SOURCES: &[&str] = &[
+    "/sys/firmware/devicetree/base/serial-number",
+    "/sys/devices/soc0/serial_number",
+];
+
+/// Shell that prints the first non-empty UID among `sources`. A present but
+/// empty file falls through to the next source (a plain `a || b` would not:
+/// `tr` exits 0 on empty input).
+pub fn read_soc_uid_command(sources: &[&str]) -> String {
+    format!(
+        "for f in {}; do u=$(tr -d '\\0\\n' < \"$f\" 2>/dev/null); \
+         [ -n \"$u\" ] && {{ printf %s \"$u\"; exit 0; }}; done; exit 1",
+        sources.join(" ")
+    )
+}
+
+/// The token kind avocadoctl records, so a later reader knows what to derive.
+pub const DERIVATION_KIND: &str = "hmac-sha256-uid";
+
+/// The LUKS2 token avocadoctl records for the recovery keyslot; the enroll
+/// verifies the device reports it before claiming success.
+pub const RECOVERY_TOKEN_TYPE: &str = "avocado-recovery";
+
+fn master_for(config_path: &str, runtime: &str) -> Result<Vec<u8>> {
+    let config = Config::load(config_path)?;
+    let key = config.get_runtime_var_recovery(runtime).ok_or_else(|| {
+        anyhow::anyhow!(
+            "runtimes.{runtime}.var.recovery is not set in {config_path}; name a registry secret \
+             (`avocado signing-keys create <name> --algorithm hmac-sha256`) to enrol a recovery key"
+        )
+    })?;
+    secret_key_bytes(&key).with_context(|| format!("var.recovery key '{key}'"))
+}
+
+pub struct VarKeyEnrollCommand {
+    pub config_path: String,
+    pub runtime: String,
+    pub device: String,
+    pub verbose: bool,
+}
+
+impl VarKeyEnrollCommand {
+    pub async fn execute(&self) -> Result<()> {
+        let master = master_for(&self.config_path, &self.runtime)?;
+        let remote = RemoteHost::parse(&self.device)?;
+        let ssh = SshClient::new(remote).with_verbose(self.verbose);
+        ssh.check_connectivity().await?;
+
+        let uid = ssh
+            .run_command(&read_soc_uid_command(SOC_UID_SOURCES))
+            .await
+            .context("reading the device's SoC UID")?;
+        let uid = uid.trim();
+        anyhow::ensure!(
+            !uid.is_empty(),
+            "the device reports no SoC UID (neither /sys/firmware/devicetree/base/serial-number nor \
+             /sys/devices/soc0/serial_number); refusing to derive a passphrase that would not be per-device"
+        );
+        print_info(
+            &format!("Device UID {uid}: deriving its recovery passphrase"),
+            OutputLevel::Normal,
+        );
+
+        let passphrase = derive_var_recovery_passphrase(&master, uid);
+        let out = ssh
+            .run_command_with_stdin(
+                &format!("avocadoctl var-key enroll --kind {DERIVATION_KIND}"),
+                &passphrase,
+            )
+            .await
+            .context("avocadoctl var-key enroll on the device")?;
+        if self.verbose && !out.trim().is_empty() {
+            print_info(out.trim(), OutputLevel::Normal);
+        }
+        // An avocadoctl too old to know `var-key` prints its help and exits 0,
+        // so a zero status is not evidence that a keyslot exists. Ask the
+        // device what the header says before reporting success.
+        let listed = ssh
+            .run_command("avocadoctl var-key list")
+            .await
+            .context("avocadoctl var-key list on the device")?;
+        anyhow::ensure!(
+            listed.contains(RECOVERY_TOKEN_TYPE),
+            "the device reports no {RECOVERY_TOKEN_TYPE} keyslot after enrolling - \
+             is avocadoctl on the device new enough to have `var-key`? It said:\n{}",
+            listed.trim()
+        );
+        print_success(
+            &format!(
+                "Recovery keyslot enrolled on {} for runtime '{}'. Recover later with: \
+                 avocado var-key derive {} --uid {uid}",
+                self.device, self.runtime, self.runtime
+            ),
+            OutputLevel::Normal,
+        );
+        Ok(())
+    }
+}
+
+pub struct VarKeyDeriveCommand {
+    pub config_path: String,
+    pub runtime: String,
+    pub uid: String,
+    pub raw: bool,
+}
+
+impl VarKeyDeriveCommand {
+    /// Prints the passphrase for a device UID: hex by default (paste into
+    /// `cryptsetup open --key-file <(xxd -r -p)`), raw bytes with `--raw` for
+    /// piping straight into `cryptsetup --key-file -`.
+    pub fn execute(&self) -> Result<()> {
+        // Deriving from an empty UID yields a passphrase over the domain
+        // separator alone: it looks like a recovery key, and opens nothing.
+        // `enroll` reads the UID off the device and rejects an empty one, so
+        // this is the only way to get one.
+        let uid = self.uid.trim();
+        if uid.is_empty() {
+            anyhow::bail!(
+                "--uid is empty: pass the device's SoC UID (its device-tree serial-number, or /sys/devices/soc0/serial_number)"
+            );
+        }
+        let master = master_for(&self.config_path, &self.runtime)?;
+        let passphrase = derive_var_recovery_passphrase(&master, uid);
+        if self.raw {
+            use std::io::Write;
+            std::io::stdout().write_all(&passphrase)?;
+        } else {
+            println!(
+                "{}",
+                passphrase
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn derive_refuses_an_empty_uid() {
+        // A UID of "" derives over the domain separator alone: it prints a
+        // plausible recovery key that opens nothing. enroll reads the UID off
+        // the device, so this command is the only way to supply one by hand.
+        for uid in ["", "   ", "\t\n"] {
+            let cmd = VarKeyDeriveCommand {
+                config_path: "/nonexistent/avocado.yaml".to_string(),
+                runtime: "dev".to_string(),
+                uid: uid.to_string(),
+                raw: false,
+            };
+            let err = cmd.execute().unwrap_err().to_string();
+            assert!(
+                err.contains("--uid is empty"),
+                "expected the UID to be rejected before the config is read, got: {err}"
+            );
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn uid_read_prefers_the_device_tree_then_soc0() {
+        let cmd = read_soc_uid_command(SOC_UID_SOURCES);
+        let dt = cmd.find("devicetree/base/serial-number").unwrap();
+        let soc = cmd.find("soc0/serial_number").unwrap();
+        assert!(dt < soc);
+    }
+
+    #[cfg(unix)]
+    fn run_uid_read(sources: &[&std::path::Path]) -> Option<String> {
+        let sources: Vec<String> = sources.iter().map(|p| p.display().to_string()).collect();
+        let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(read_soc_uid_command(&sources))
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uid_read_skips_empty_sources_and_strips_nul_and_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dt, soc) = (dir.path().join("dt"), dir.path().join("soc"));
+        std::fs::write(&dt, b"").unwrap();
+        std::fs::write(&soc, b"0123abcd\n").unwrap();
+        // An empty device-tree node falls through to soc0.
+        assert_eq!(run_uid_read(&[&dt, &soc]).as_deref(), Some("0123abcd"));
+        std::fs::write(&dt, b"deadbeef\0").unwrap();
+        assert_eq!(run_uid_read(&[&dt, &soc]).as_deref(), Some("deadbeef"));
+        // Nothing readable anywhere is a failure, not an empty UID.
+        assert_eq!(run_uid_read(&[&dir.path().join("missing")]), None);
+    }
+}
