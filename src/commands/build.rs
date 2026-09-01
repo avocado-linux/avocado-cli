@@ -475,29 +475,14 @@ impl BuildCommand {
                 let merged_runtime =
                     config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
                 if let Some(merged_value) = merged_runtime {
-                    if let Some(runtime_target) =
-                        merged_value.get("target").and_then(|t| t.as_str())
-                    {
-                        // Runtime has explicit target - only include if it matches
-                        if runtime_target == target {
-                            target_runtimes.push(runtime_name.to_string());
-                        }
-                    } else {
-                        // Runtime has no target specified - include for all targets
+                    // The shared scope rule: `targets:` > `target:` > unscoped.
+                    if crate::utils::config::runtime_value_in_scope(&merged_value, target) {
                         target_runtimes.push(runtime_name.to_string());
                     }
                 } else {
                     // If there's no merged config, check the base runtime config
                     if let Some(runtime_config) = runtime_section.get(runtime_name_val) {
-                        if let Some(runtime_target) =
-                            runtime_config.get("target").and_then(|t| t.as_str())
-                        {
-                            // Runtime has explicit target - only include if it matches
-                            if runtime_target == target {
-                                target_runtimes.push(runtime_name.to_string());
-                            }
-                        } else {
-                            // Runtime has no target specified - include for all targets
+                        if crate::utils::config::runtime_value_in_scope(runtime_config, target) {
                             target_runtimes.push(runtime_name.to_string());
                         }
                     }

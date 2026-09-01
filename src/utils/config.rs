@@ -1909,6 +1909,14 @@ impl Config {
             .with_context(|| "Failed to deserialize composed configuration")?;
 
         config.validate_cli_requirement()?;
+        // `avocado build` and `avocado install` load exclusively through this
+        // path, and BuildCommand threads its composed config into every
+        // RuntimeBuildCommand, so the per-runtime Config::load never runs.
+        // Without this, an empty `targets:` reached the build: the scope
+        // filtered the runtime out of the package union, the encrypt guard
+        // could not trip because no in-scope target had opted in, and /var came
+        // up plaintext from config asking for encryption.
+        config.validate_runtime_refs()?;
 
         // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
         // env so the container env-builders pick them up the same as the env-var form.
@@ -4109,6 +4117,39 @@ impl Config {
     /// overrides resolved, exactly as `var.compression` / `var.subvolumes` /
     /// `var_files` are read at build time. Without `parsed` it falls back to
     /// the typed `runtimes.<r>.var.encrypt`, where overrides are invisible.
+    /// Is `var.encrypt` true for this one runtime on this one target, with
+    /// `target-<x>:` overrides resolved and **no scope filtering**?
+    ///
+    /// [`Self::var_encrypt_runtimes`] drops out-of-scope runtimes before it
+    /// ever resolves the flag, so an override opting in for a target outside
+    /// the declared scope is invisible there. The build guard needs to see
+    /// exactly that case to refuse it instead of quietly building plaintext.
+    pub fn var_encrypt_for_target(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        runtime: &str,
+        target: &str,
+    ) -> bool {
+        let node = parsed
+            .and_then(|p| p.get("runtimes")?.get(runtime))
+            .cloned();
+        match node {
+            Some(node) => self
+                .resolve_overrides_in_value(node, target, None, &format!("runtimes.{runtime}"))
+                .get("var")
+                .and_then(|v| v.get("encrypt"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            None => self
+                .runtimes
+                .as_ref()
+                .and_then(|r| r.get(runtime))
+                .and_then(|r| r.var.as_ref())
+                .and_then(|v| v.encrypt)
+                .unwrap_or(false),
+        }
+    }
+
     pub fn var_encrypt_runtimes(
         &self,
         parsed: Option<&serde_yaml::Value>,
@@ -4130,11 +4171,7 @@ impl Config {
                 // a project with several supported_targets could encrypt on only
                 // one of them, and a `target-<x>:` override for any other target
                 // was rejected by this filter before its flag was ever read.
-                match (r.targets.as_deref(), r.target.as_deref()) {
-                    (Some(list), _) => list.iter().any(|t| t == target),
-                    (None, Some(t)) => t == target,
-                    (None, None) => true,
-                }
+                runtime_in_scope(r, target)
             })
             .filter(|(name, r)| {
                 let node = parsed
@@ -5952,6 +5989,65 @@ fn declares_target_only_for_other_targets(
     names_another_target
 }
 
+/// Does a runtime belong on `target`?
+///
+/// The one scope rule: `targets:` (a list) wins, then `target:`, and a runtime
+/// declaring neither is unscoped - it belongs on every target it is built for.
+/// `default_target` is never consulted: it says what to build when the user
+/// does not, not which targets a runtime belongs to.
+///
+/// Every selection site goes through here. Each used to answer this by reading
+/// only the `target` key, so a `targets:`-scoped runtime looked unscoped to
+/// build, install and sign selection while the encrypt guard saw the list - the
+/// runtime was then never built, installed or signed on the targets it was
+/// actually scoped to.
+fn scope_contains(targets: Option<Vec<&str>>, target_key: Option<&str>, target: &str) -> bool {
+    match (targets, target_key) {
+        (Some(list), _) => list.contains(&target),
+        (None, Some(t)) => t == target,
+        (None, None) => true,
+    }
+}
+
+/// [`scope_contains`] for the typed runtime config.
+pub fn runtime_in_scope(runtime: &RuntimeConfig, target: &str) -> bool {
+    scope_contains(
+        runtime
+            .targets
+            .as_ref()
+            .map(|l| l.iter().map(String::as_str).collect()),
+        runtime.target.as_deref(),
+        target,
+    )
+}
+
+/// [`scope_contains`] for a runtime node in the composed YAML.
+pub fn runtime_value_in_scope(runtime: &serde_yaml::Value, target: &str) -> bool {
+    scope_contains(
+        runtime
+            .get("targets")
+            .and_then(|t| t.as_sequence())
+            .map(|s| s.iter().filter_map(|v| v.as_str()).collect()),
+        runtime.get("target").and_then(|t| t.as_str()),
+        target,
+    )
+}
+
+/// Whether a runtime node declares any scope at all, so callers can tell
+/// "scoped elsewhere" from "unscoped" without repeating the key names.
+pub fn runtime_value_declares_scope(runtime: &serde_yaml::Value) -> bool {
+    runtime.get("targets").is_some() || runtime.get("target").is_some()
+}
+
+/// The targets a runtime declares, or None when it is unscoped. Same
+/// precedence as [`scope_contains`]; used for messages that name the scope.
+pub fn declared_runtime_scope(runtime: &RuntimeConfig) -> Option<Vec<String>> {
+    runtime
+        .targets
+        .clone()
+        .or_else(|| runtime.target.clone().map(|t| vec![t]))
+}
+
 /// Find runtimes that are relevant for the specified target.
 ///
 /// A runtime is relevant if:
@@ -5988,10 +6084,8 @@ pub fn find_target_relevant_runtimes(
                 let merged_runtime =
                     config.get_merged_runtime_config(runtime_name, target, config_path)?;
                 if let Some(merged_value) = merged_runtime {
-                    if let Some(runtime_target) =
-                        merged_value.get("target").and_then(|t| t.as_str())
-                    {
-                        if runtime_target == target {
+                    if runtime_value_declares_scope(&merged_value) {
+                        if runtime_value_in_scope(&merged_value, target) {
                             relevant_runtimes.push(runtime_name.to_string());
                         }
                     } else if !declares_target_only_for_other_targets(
@@ -6004,13 +6098,7 @@ pub fn find_target_relevant_runtimes(
                 } else {
                     // No merged config - check the base runtime config
                     if let Some(runtime_config) = runtime_section.get(runtime_name_val) {
-                        if let Some(runtime_target) =
-                            runtime_config.get("target").and_then(|t| t.as_str())
-                        {
-                            if runtime_target == target {
-                                relevant_runtimes.push(runtime_name.to_string());
-                            }
-                        } else {
+                        if runtime_value_in_scope(runtime_config, target) {
                             relevant_runtimes.push(runtime_name.to_string());
                         }
                     }
@@ -12321,6 +12409,153 @@ runtimes:
         assert!(config
             .var_encrypt_runtimes(Some(&parsed), "jetson-orin-nx")
             .is_empty());
+    }
+
+    /// `avocado build` and `avocado install` load exclusively through
+    /// `load_composed*`, which validated only the CLI requirement. An empty
+    /// `targets:` therefore reached the build: the empty scope filtered the
+    /// runtime out of the package union, the encrypt guard could not trip
+    /// because no in-scope target had opted in, and no marker was written -
+    /// a plaintext /var from config asking for encryption.
+    ///
+    /// Asserted through the composed path on purpose: calling
+    /// `validate_runtime_refs` directly passes either way, which is exactly why
+    /// this gap survived the first round of tests.
+    #[test]
+    fn the_composed_path_rejects_an_empty_targets_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            r#"
+default_target: qemux86-64
+runtimes:
+  dev:
+    targets: []
+    var:
+      encrypt: true
+"#,
+        )
+        .unwrap();
+
+        let err = Config::load_composed(&path, Some("qemux86-64"))
+            .expect_err("an empty targets: must not reach the build");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("targets is empty"),
+            "expected the empty-scope refusal, got: {msg}"
+        );
+
+        // Omitting the key entirely is the documented way to mean every target,
+        // and must still load.
+        std::fs::write(
+            &path,
+            r#"
+default_target: qemux86-64
+runtimes:
+  dev:
+    var:
+      encrypt: true
+"#,
+        )
+        .unwrap();
+        Config::load_composed(&path, Some("qemux86-64"))
+            .expect("an unscoped runtime means every target and must load");
+    }
+
+    /// Every runtime-selection site must answer scope with the same rule.
+    /// Build, install and sign each used to read only the `target` key, so a
+    /// `targets:`-scoped runtime looked unscoped to all three: it was selected
+    /// for targets it is not scoped to, and a stale `target:` alongside a new
+    /// `targets:` meant it was never built on the targets it was scoped to.
+    #[test]
+    fn every_selection_site_uses_the_same_scope_rule() {
+        let scoped: RuntimeConfig = serde_yaml::from_str(
+            "targets: [jetson-agx-thor, jetson-agx-orin]\nvar: {encrypt: true}\n",
+        )
+        .unwrap();
+        assert!(runtime_in_scope(&scoped, "jetson-agx-thor"));
+        assert!(runtime_in_scope(&scoped, "jetson-agx-orin"));
+        assert!(!runtime_in_scope(&scoped, "qemux86-64"));
+
+        // `targets:` wins over a stale `target:` left beside it, so scoping and
+        // selection cannot disagree about which targets the runtime is for.
+        let stale: RuntimeConfig =
+            serde_yaml::from_str("target: qemux86-64\ntargets: [jetson-agx-thor]\n").unwrap();
+        assert!(runtime_in_scope(&stale, "jetson-agx-thor"));
+        assert!(!runtime_in_scope(&stale, "qemux86-64"));
+
+        // Unscoped means every target, not the default one.
+        let unscoped: RuntimeConfig = serde_yaml::from_str("version: \"1.0\"\n").unwrap();
+        assert!(runtime_in_scope(&unscoped, "anything"));
+
+        // The YAML-node form must agree with the typed form everywhere.
+        for (yaml, target, want) in [
+            ("targets: [a, b]", "b", true),
+            ("targets: [a, b]", "c", false),
+            ("target: a", "a", true),
+            ("target: a", "b", false),
+            ("target: b\ntargets: [a]", "a", true),
+            ("target: b\ntargets: [a]", "b", false),
+            ("version: \"1\"", "anything", true),
+        ] {
+            let node: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let typed: RuntimeConfig = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(runtime_value_in_scope(&node, target), want, "node: {yaml}");
+            assert_eq!(runtime_in_scope(&typed, target), want, "typed: {yaml}");
+        }
+    }
+
+    /// Migrating `target: x` to `targets: [x]` must not turn an out-of-scope
+    /// build from a skip into a hard failure: selection has to drop the runtime
+    /// before the encrypt guard can ever see it.
+    #[test]
+    fn a_targets_scoped_runtime_is_skipped_outside_its_scope_not_failed() {
+        let yaml = r#"
+runtimes:
+  dev:
+    targets: [jetson-agx-thor]
+    var:
+      encrypt: true
+  qemu:
+    target: qemux86-64
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        // Building qemu selects only the qemu runtime; `dev` is out of scope and
+        // is simply not built, exactly as the old `target:` form behaved.
+        assert!(config
+            .var_encrypt_runtimes(Some(&parsed), "qemux86-64")
+            .is_empty());
+        let dev = config.runtimes.as_ref().unwrap().get("dev").unwrap();
+        assert!(!runtime_in_scope(dev, "qemux86-64"));
+        assert!(runtime_in_scope(dev, "jetson-agx-thor"));
+    }
+
+    /// The scope filter in `var_encrypt_runtimes` drops an out-of-scope runtime
+    /// before resolving its overrides, so a `target-<x>:` opt-in for a target
+    /// outside the declared scope is invisible there. The build guard reads the
+    /// flag for the built target directly, which is the only way to see it.
+    #[test]
+    fn var_encrypt_for_target_sees_an_out_of_scope_override() {
+        let yaml = r#"
+runtimes:
+  dev:
+    targets: [jetson-agx-thor]
+    target-qemux86-64:
+      var:
+        encrypt: true
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        // Scope-filtered view cannot see it - that is the bug being guarded.
+        assert!(config
+            .var_encrypt_runtimes(Some(&parsed), "qemux86-64")
+            .is_empty());
+        // Unfiltered view does, so the guard can refuse instead of building
+        // plaintext from config that reads as an explicit qemu opt-in.
+        assert!(config.var_encrypt_for_target(Some(&parsed), "dev", "qemux86-64"));
+        assert!(!config.var_encrypt_for_target(Some(&parsed), "dev", "jetson-agx-thor"));
     }
 
     // --- kernel.version tests ---

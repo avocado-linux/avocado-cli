@@ -20,8 +20,12 @@ runtimes:
   whatever its key store needs (Jetson: `tpm2-tools`), so the cli stays
   target-agnostic. The initramfs/rootfs sysroots are installed once per
   target, so sibling runtimes **on the same target** receive the package too —
-  dormant without the marker below. Runtimes on other targets are unaffected:
-  a Jetson opt-in never asks a qemu feed for `cryptsetup-var`.
+  dormant without the marker below. Which targets a runtime reaches is its
+  declared scope: `targets:` (a list) wins, then `target:`, and a runtime that
+  declares neither is unscoped and reaches **every** target it is built for.
+  An unscoped opt-in therefore does ask a qemu feed for `cryptsetup-var`, and
+  fails loudly at install if that feed does not publish it — scope is declared,
+  never inferred, so narrowing is the project's decision to state.
 - Writes `/etc/avocado/var-encrypt` into **this runtime's** initramfs work
   copy during `runtime build`. That marker is what the initrd keys on.
   `/etc/avocado-security-capabilities` is deliberately left alone: it states
@@ -50,10 +54,23 @@ agx-thor) does as of meta-avocado wrynose.
 
 ## Limitations
 
-- `runtimes.<name>.target` does not choose the build target (`--target` >
-  `AVOCADO_TARGET` > `default_target` does). A runtime that opts in for its
-  declared `target:` must be built for that target; `runtime build` for any
-  other target fails rather than shipping an initramfs whose marker has no
-  `cryptsetup-var` behind it. `encrypt:` under a `target-<x>:` override is
-  honored like every other `var:` key.
+- A runtime's scope does not choose the build target (`--target` >
+  `AVOCADO_TARGET` > `default_target` does). Scope is `targets:` > `target:` >
+  unscoped:
+
+  ```yaml
+  runtimes:
+    dev:
+      targets: [jetson-agx-thor, jetson-agx-orin]
+      var: { encrypt: true }
+  ```
+
+  `default_target` is never consulted — it says what to build when you do not,
+  not which targets a runtime belongs to. Building a scoped runtime for a
+  target outside its scope fails rather than shipping an initramfs whose
+  marker has no `cryptsetup-var` behind it, and an empty `targets: []` is
+  rejected outright because it would silently skip every opt-in on the
+  runtime. `encrypt:` under a `target-<x>:` override is honored like every
+  other `var:` key; an override opting in for a target outside the declared
+  scope is an error, not a silent plaintext build.
 - Device must be re-provisioned to go back to plaintext.

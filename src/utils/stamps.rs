@@ -1677,6 +1677,17 @@ pub fn compute_runtime_install_input_hash(
             target.clone(),
         );
     }
+    // The encrypt marker and the package union both depend on the declared
+    // scope, so a `targets:` edit has to invalidate the stamp: narrowing a
+    // scope otherwise leaves a stale initramfs carrying its encrypt marker,
+    // and widening one leaves the marker missing until something else forces
+    // a rebuild.
+    if let Some(targets) = merged_runtime.get("targets") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.targets")),
+            targets.clone(),
+        );
+    }
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
@@ -1709,6 +1720,17 @@ pub fn compute_runtime_build_input_hash(
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.target")),
             target.clone(),
+        );
+    }
+    // The encrypt marker and the package union both depend on the declared
+    // scope, so a `targets:` edit has to invalidate the stamp: narrowing a
+    // scope otherwise leaves a stale initramfs carrying its encrypt marker,
+    // and widening one leaves the marker missing until something else forces
+    // a rebuild.
+    if let Some(targets) = merged_runtime.get("targets") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.targets")),
+            targets.clone(),
         );
     }
 
@@ -4184,6 +4206,44 @@ initramfs:
             b_a, b_b,
             "runtime build SHOULD invalidate on filesystem swap"
         );
+    }
+
+    /// The encrypt marker and the package union both depend on the declared
+    /// scope, so editing `targets:` has to invalidate both stamps. Without it,
+    /// narrowing a scope leaves a stale initramfs still carrying its encrypt
+    /// marker, and widening one leaves the marker missing until some unrelated
+    /// edit forces a rebuild.
+    #[test]
+    fn a_targets_scope_edit_invalidates_the_runtime_stamps() {
+        let node = |yaml: &str| -> serde_yaml::Value { serde_yaml::from_str(yaml).unwrap() };
+        let empty = node("{}");
+        let narrow = node("targets: [jetson-agx-thor]\n");
+        let wide = node("targets: [jetson-agx-thor, jetson-agx-orin]\n");
+
+        let install = |n: &serde_yaml::Value| {
+            compute_runtime_install_input_hash(n, "dev")
+                .unwrap()
+                .config_hash
+        };
+        let build = |n: &serde_yaml::Value| {
+            compute_runtime_build_input_hash(n, "dev", &empty, std::path::Path::new("."))
+                .unwrap()
+                .config_hash
+        };
+
+        assert_ne!(
+            install(&narrow),
+            install(&wide),
+            "runtime install must invalidate when the declared scope changes"
+        );
+        assert_ne!(
+            build(&narrow),
+            build(&wide),
+            "runtime build writes the encrypt marker, so it must invalidate too"
+        );
+        // Adding a scope where there was none also counts.
+        assert_ne!(install(&empty), install(&narrow));
+        assert_ne!(build(&empty), build(&narrow));
     }
 
     #[test]

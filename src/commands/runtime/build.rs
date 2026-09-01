@@ -2560,23 +2560,36 @@ echo "Docker image priming complete.""#,
                 .iter()
                 .any(|n| n == &self.runtime_name)
         };
-        // Same scope rule as var_encrypt_runtimes: `targets:` > `target:` >
-        // unscoped. `default_target` is not consulted - it says what to build,
-        // not which targets a runtime belongs to.
+        // The shared scope rule - see config::runtime_in_scope. `default_target`
+        // is not consulted: it says what to build, not which targets a runtime
+        // belongs to.
         let declared_scope: Option<Vec<String>> = config
             .runtimes
             .as_ref()
             .and_then(|r| r.get(&self.runtime_name))
-            .and_then(|r| {
-                r.targets
-                    .clone()
-                    .or_else(|| r.target.clone().map(|t| vec![t]))
-            });
-        // Only a runtime that opts in for some target in its scope, yet is being
-        // built for a target outside it, is a silent-plaintext risk: no marker
-        // would be written and /var would come up plaintext despite the opt-in.
-        // An unscoped runtime covers every target, so it can never land here.
+            .and_then(crate::utils::config::declared_runtime_scope);
+        // Resolved for target_arch itself, deliberately bypassing the scope
+        // filter in var_encrypt_runtimes: a `target-<x>:` override that opts in
+        // for a target OUTSIDE the declared scope is invisible to that filter,
+        // which drops the runtime before the override is ever resolved. Reading
+        // it directly is the only way to see config that asks for encryption on
+        // the target actually being built.
+        let opts_in_for_this_target =
+            config.var_encrypt_for_target(Some(parsed), &self.runtime_name, target_arch);
+        // Only a runtime that opts in somewhere, yet is being built for a target
+        // outside its scope, is a silent-plaintext risk: no marker would be
+        // written and /var would come up plaintext despite the opt-in. An
+        // unscoped runtime covers every target, so it can never land here.
         if let Some(scope) = declared_scope.filter(|s| !s.iter().any(|t| t == target_arch)) {
+            if opts_in_for_this_target {
+                anyhow::bail!(
+                    "Runtime '{}' opts in to var.encrypt for '{target_arch}' (a `target-{target_arch}:` \
+                     override), but the runtime is scoped to {scope:?}, which does not include it. \
+                     No encrypt marker is written outside the declared scope, so /var would come up \
+                     plaintext despite the opt-in. Add '{target_arch}' to the runtime's `targets:` list.",
+                    self.runtime_name
+                );
+            }
             if scope.iter().any(|t| var_encrypt(t)) {
                 anyhow::bail!(
                     "Runtime '{}' sets var.encrypt but is scoped to {scope:?}, and is being \

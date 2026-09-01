@@ -86,6 +86,11 @@ fn build_base_payload(config_path: &str, cfg: &Config) -> serde_json::Value {
                     json!({
                         "name": name,
                         "target": r.target,
+                        // Scope is `targets:` > `target:` > unscoped. Without
+                        // this a `targets:`-scoped runtime reported target:null,
+                        // indistinguishable from unscoped. The desktop consumes
+                        // this payload.
+                        "targets": r.targets,
                         "target_board": r.target_board,
                         "version": r.version,
                         // Desktop gates "Sign via Connect" on this signal. Resolved
@@ -367,8 +372,17 @@ fn print_human_summary(payload: &serde_json::Value) {
             println!("  runtimes:");
             for r in rs {
                 let name = r["name"].as_str().unwrap_or("?");
-                let target = r["target"].as_str().unwrap_or("(inherits default)");
-                println!("    - {name} → {target}");
+                // `targets:` wins, then `target:`, then unscoped - which means
+                // every target the runtime is built for, not the default one.
+                let scope = match r["targets"].as_array() {
+                    Some(list) if !list.is_empty() => list
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => r["target"].as_str().unwrap_or("(all targets)").to_string(),
+                };
+                println!("    - {name} → {scope}");
             }
         }
     }
