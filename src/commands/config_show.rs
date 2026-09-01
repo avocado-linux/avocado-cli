@@ -83,21 +83,25 @@ fn build_base_payload(config_path: &str, cfg: &Config) -> serde_json::Value {
             let mut list: Vec<_> = m
                 .iter()
                 .map(|(name, r)| {
-                    json!({
+                    let mut entry = json!({
                         "name": name,
                         "target": r.target,
-                        // Scope is `targets:` > `target:` > unscoped. Without
-                        // this a `targets:`-scoped runtime reported target:null,
-                        // indistinguishable from unscoped. The desktop consumes
-                        // this payload.
-                        "targets": r.targets,
                         "target_board": r.target_board,
                         "version": r.version,
                         // Desktop gates "Sign via Connect" on this signal. Resolved
                         // the same way the deploy nudge does (per-runtime signing key,
                         // falling back to connect.server_key) so the two agree.
                         "signing_enabled": cfg.get_server_key_for_runtime(name).is_some(),
-                    })
+                    });
+                    // Scope is `targets:` > `target:` > unscoped, and a
+                    // `targets:`-scoped runtime would otherwise report
+                    // target:null, indistinguishable from unscoped. Emitted
+                    // only when set, so a config that never uses the field
+                    // keeps the byte-identical payload promised above.
+                    if let Some(ref targets) = r.targets {
+                        entry["targets"] = json!(targets);
+                    }
+                    entry
                 })
                 .collect();
             // Stable ordering so the UI doesn't dance around.
