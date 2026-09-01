@@ -31,19 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is missing), `none` (no hardware keyslot; requires `var.recovery`). Validated
   at config load; an explicit choice rides in the initramfs as
   `/etc/avocado/var-hardware`.
-- **`runtimes.<name>.signing.fit_key` — the boot FIT is signed from the key
-  registry.** The FIT key used to arrive through `AVOCADO_FIT_KEY_DIR` /
-  `AVOCADO_FIT_UNSIGNED`, so a signed boot image was not reproducible from
-  `avocado.yaml`. Name a registry entry instead, with `fit_unsigned: true` as
-  the explicit, mutually-exclusive opt-out. The registry gains RSA PEM entries
-  (`rsa2048`/`rsa4096`) stored as `<keyid>.key` (0600) / `<keyid>.crt`, the key
-  id being the SHA-256 of the certificate DER; `avocado signing-keys import
-  <name> --key K --cert C` verifies the pair actually matches and reads the
-  algorithm off the certificate's modulus rather than trusting `--algorithm`.
-  The runtime build stages the pair read-only at `/tmp/fit-keys` where the FIT
-  assembly already looks. ed25519 and PKCS#11 entries are refused for FIT
-  signing with a message saying why, and the environment variables are no
-  longer read - a hint names the config keys.
+- **`runtimes.<name>.signing.fit_key` — boot-FIT signing from the key registry.**
+  Names an RSA PEM key (`avocado signing-keys import <name> --key --cert`, or
+  `signing-keys create <name> --algorithm rsa2048`) that the runtime build
+  materializes as `FIT.key`/`FIT.crt` for `mkimage`, so a signed boot image is
+  reproducible from `avocado.yaml` alone. `signing.fit_unsigned: true` is the
+  explicit, mutually-exclusive opt-out. Replaces the interim
+  `AVOCADO_FIT_KEY_DIR` / `AVOCADO_FIT_UNSIGNED` environment variables, which
+  are no longer read - a hint names the config keys. Registry entries are
+  stored as `<keyid>.key` (0600) / `<keyid>.crt`, the key id being the SHA-256
+  of the certificate DER; `import` verifies the key and certificate actually
+  match and reads the algorithm off the certificate's modulus rather than
+  trusting `--algorithm`. ed25519 and PKCS#11 entries are refused for FIT
+  signing with a message saying why. With `fit_key` set the build also re-packs
+  the feed's bootloader so U-Boot enforces that key
+  (`signing.fit_key_in_bootloader`, default true; i.MX8M via the feed's
+  `imx-boot-tools/rekey-imx-boot.sh`), so provisioning writes a bootloader
+  closed to the project key from the first flash.
 - **`runtimes.<name>.targets` — a runtime's target scope, declared as a list.**
   Scope is `targets:` > `target:` > unscoped, and unscoped means every target
   the runtime is built for. `default_target` is never consulted for scope; it
@@ -148,17 +152,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.0-rc.2] - 2026-08-28
 
 ### Added
-- **`runtimes.<name>.signing.fit_key` — boot-FIT signing from the key registry.**
-  Names an RSA PEM key (`avocado signing-keys import <name> --key --cert`, or
-  `signing-keys create <name> --algorithm rsa2048`) that the runtime build
-  materializes as `FIT.key`/`FIT.crt` for `mkimage`, so a signed boot image is
-  reproducible from `avocado.yaml` alone. `signing.fit_unsigned: true` is the
-  explicit opt-out. Replaces the interim `AVOCADO_FIT_KEY_DIR` /
-  `AVOCADO_FIT_UNSIGNED` environment variables, which are no longer read.
-  With `fit_key` set the build also re-packs the feed's bootloader so U-Boot
-  enforces that key (`signing.fit_key_in_bootloader`, default true; i.MX8M via
-  the feed's `imx-boot-tools/rekey-imx-boot.sh`), so provisioning writes a
-  bootloader closed to the project key from the first flash.
 - **`runtimes.<name>.var.encrypt: true` — encrypted `/var`.** Opts a runtime
   into a LUKS2 `/var` sealed to the target's hardware key store (OP-TEE fTPM
   on Jetson). The cli adds `cryptsetup-var` to the initramfs and
