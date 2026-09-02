@@ -193,6 +193,10 @@ impl RuntimeProvisionCommand {
                         &format!("Cannot provision runtime '{}'", self.config.runtime_name),
                         self.config.runs_on.as_deref(),
                     )
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        &container_helper,
+                        &target_arch,
+                    ))
                     .print_and_exit();
             }
         }

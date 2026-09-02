@@ -135,6 +135,10 @@ impl ExtCheckoutCommand {
                 if !validation.is_satisfied() {
                     validation
                         .into_error(&format!("Cannot checkout extension '{}'", self.extension))
+                        .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                            &container_helper,
+                            &target,
+                        ))
                         .print_and_exit();
                 }
             }

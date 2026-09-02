@@ -345,8 +345,12 @@ impl ExtBuildCommand {
                 validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &current_inputs);
 
             if !validation.is_satisfied() {
-                let err =
-                    validation.into_error(&format!("Cannot build extension '{}'", self.extension));
+                let err = validation
+                    .into_error(&format!("Cannot build extension '{}'", self.extension))
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        &container_helper,
+                        &target,
+                    ));
                 return Err(anyhow::anyhow!("{err}"));
             }
         }

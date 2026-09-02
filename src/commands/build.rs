@@ -209,8 +209,12 @@ impl BuildCommand {
             .validate(&required, &[]);
 
             if !validation.is_satisfied() {
-                let error =
-                    validation.into_error_with_runs_on("Cannot build", self.runs_on.as_deref());
+                let error = validation
+                    .into_error_with_runs_on("Cannot build", self.runs_on.as_deref())
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        &container_helper,
+                        &target,
+                    ));
                 // Print the error with fix commands (includes "avocado install")
                 error.print_and_exit();
             }

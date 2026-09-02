@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
 
+use crate::utils::container::SdkContainer;
+use crate::utils::volume::VolumeState;
+
 /// Get the local machine's CPU architecture
 ///
 /// Returns the architecture string (e.g., "x86_64", "aarch64") for the current machine.
@@ -612,6 +615,9 @@ pub enum StampStatus {
     },
     /// Stamp does not exist
     Missing,
+    /// Stamp exists but its JSON does not parse. Kept apart from `Missing`
+    /// so the error can say the file is there and cannot be read.
+    Unreadable { reason: String },
 }
 
 /// Result of validating all required stamps
@@ -623,6 +629,8 @@ pub struct StampValidationResult {
     pub missing: Vec<StampRequirement>,
     /// Requirements that are stale
     pub stale: Vec<(StampRequirement, String)>,
+    /// Requirements whose stamp exists but could not be parsed
+    pub unreadable: Vec<(StampRequirement, String)>,
 }
 
 impl StampValidationResult {
@@ -632,7 +640,7 @@ impl StampValidationResult {
 
     /// Check if all requirements are satisfied
     pub fn is_satisfied(&self) -> bool {
-        self.missing.is_empty() && self.stale.is_empty()
+        self.missing.is_empty() && self.stale.is_empty() && self.unreadable.is_empty()
     }
 
     /// Add a satisfied requirement
@@ -650,7 +658,11 @@ impl StampValidationResult {
         self.stale.push((req, reason));
     }
 
-    /// Convert to an error with actionable messages
+    /// Add a requirement whose stamp exists but could not be parsed
+    pub fn add_unreadable(&mut self, req: StampRequirement, reason: String) {
+        self.unreadable.push((req, reason));
+    }
+
     /// Convert to an error with actionable messages
     pub fn into_error(self, context: &str) -> StampValidationError {
         self.into_error_with_runs_on(context, None)
@@ -666,8 +678,83 @@ impl StampValidationResult {
             context: context.to_string(),
             missing: self.missing,
             stale: self.stale,
+            unreadable: self.unreadable,
             runs_on: runs_on.map(|s| s.to_string()),
+            search_root: None,
         }
+    }
+}
+
+/// Which docker daemon a stamp read went through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StampDaemon {
+    /// No `DOCKER_HOST` in the environment: the host's default daemon.
+    Host,
+    /// `DOCKER_HOST` is the avocado-vm's forwarded socket.
+    AvocadoVm,
+    /// `DOCKER_HOST` points somewhere other than the avocado-vm socket.
+    DockerHost(String),
+}
+
+impl StampDaemon {
+    /// The daemon `docker` resolves to in this process. `DOCKER_HOST` is set
+    /// process-wide by VM routing, so reading the environment here sees the
+    /// effective value.
+    pub fn current() -> Self {
+        if crate::utils::container::is_vm_routing_active() {
+            return Self::AvocadoVm;
+        }
+        match std::env::var("DOCKER_HOST") {
+            Ok(host) if !host.is_empty() => Self::DockerHost(host),
+            _ => Self::Host,
+        }
+    }
+}
+
+impl fmt::Display for StampDaemon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Host => write!(f, "the host docker daemon"),
+            Self::AvocadoVm => write!(f, "the avocado-vm docker daemon"),
+            Self::DockerHost(host) => write!(f, "the docker daemon at DOCKER_HOST={host}"),
+        }
+    }
+}
+
+/// Where a stamp read looked. Stamps live at `/opt/_avocado/<target>/.stamps`
+/// inside the project's docker volume, on whichever daemon the process routed
+/// to. A stamp written under a different target, volume or daemon is
+/// invisible to the read, and that is the usual reason one is "missing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampSearchRoot {
+    pub target: String,
+    /// `None` when the project directory has no `.avocado-state`.
+    pub volume: Option<String>,
+    pub daemon: StampDaemon,
+}
+
+impl StampSearchRoot {
+    /// The root `container` reads stamps from for `target`.
+    ///
+    /// The volume name comes from `.avocado-state` in `container.cwd`, which is
+    /// the directory `get_or_create_volume` keys on (not `src_dir`). Only ever
+    /// read it here: `get_or_create_volume` would mint a fresh, empty volume
+    /// from inside an error path.
+    pub fn for_container(container: &SdkContainer, target: &str) -> Self {
+        let volume = VolumeState::load_from_dir(&container.cwd)
+            .ok()
+            .flatten()
+            .map(|state| state.volume_name);
+        Self {
+            target: target.to_string(),
+            volume,
+            daemon: StampDaemon::current(),
+        }
+    }
+
+    /// The `$AVOCADO_PREFIX/.stamps` directory inside the container.
+    pub fn stamps_dir(&self) -> String {
+        format!("/opt/_avocado/{}/.stamps", self.target)
     }
 }
 
@@ -677,13 +764,44 @@ pub struct StampValidationError {
     pub context: String,
     pub missing: Vec<StampRequirement>,
     pub stale: Vec<(StampRequirement, String)>,
+    pub unreadable: Vec<(StampRequirement, String)>,
     /// Remote host if using --runs-on (for fix command suggestions)
     pub runs_on: Option<String>,
+    /// Where the read looked, when the caller knows.
+    pub search_root: Option<StampSearchRoot>,
 }
 
 impl std::error::Error for StampValidationError {}
 
 impl StampValidationError {
+    /// Record where the failed read looked so the message can name it.
+    pub fn with_search_root(mut self, root: StampSearchRoot) -> Self {
+        self.search_root = Some(root);
+        self
+    }
+
+    /// Lines naming the searched root. Shared by both renderers so the prose
+    /// and JSON paths cannot drift.
+    fn search_root_lines(&self) -> Vec<String> {
+        let Some(root) = &self.search_root else {
+            return Vec::new();
+        };
+        let mut looked = format!("Looked in {} (target {})", root.stamps_dir(), root.target);
+        if let Some(volume) = &root.volume {
+            looked.push_str(&format!(", docker volume {volume}"));
+        }
+        looked.push_str(&format!(", via {}", root.daemon));
+        if let Some(remote) = &self.runs_on {
+            looked.push_str(&format!(", exported over NFS to {remote} (--runs-on)"));
+        }
+        looked.push('.');
+        vec![
+            looked,
+            "Stamps written under a different target, volume or daemon are not found here."
+                .to_string(),
+        ]
+    }
+
     /// Collect unique fix commands, using runs_on hint for SDK install commands
     fn fix_commands(&self) -> Vec<String> {
         let runs_on_ref = self.runs_on.as_deref();
@@ -693,6 +811,7 @@ impl StampValidationError {
             .missing
             .iter()
             .chain(self.stale.iter().map(|(req, _)| req))
+            .chain(self.unreadable.iter().map(|(req, _)| req))
             .flat_map(|req| {
                 // For SDK install stamps with a different architecture than local,
                 // offer both --runs-on and --sdk-arch alternatives
@@ -771,6 +890,28 @@ impl StampValidationError {
             }
         }
 
+        if !self.unreadable.is_empty() {
+            print_warning(
+                "Unreadable steps (stamp exists but could not be parsed; rerunning the step rewrites it):",
+                OutputLevel::Normal,
+            );
+            for (req, reason) in &self.unreadable {
+                print_warning(
+                    &format!(
+                        "  - {} ({}: {})",
+                        req.description(),
+                        req.relative_path(),
+                        reason
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
+        for line in self.search_root_lines() {
+            print_info(&line, OutputLevel::Normal);
+        }
+
         print_info("To fix:", OutputLevel::Normal);
         for fix in self.fix_commands() {
             print_info(&format!("  {fix}"), OutputLevel::Normal);
@@ -802,6 +943,31 @@ impl fmt::Display for StampValidationError {
                     req.relative_path(),
                     reason
                 )?;
+            }
+            writeln!(f)?;
+        }
+
+        if !self.unreadable.is_empty() {
+            writeln!(
+                f,
+                "  Unreadable steps (stamp exists but could not be parsed; rerunning the step rewrites it):"
+            )?;
+            for (req, reason) in &self.unreadable {
+                writeln!(
+                    f,
+                    "    - {} ({}: {})",
+                    req.description(),
+                    req.relative_path(),
+                    reason
+                )?;
+            }
+            writeln!(f)?;
+        }
+
+        let search_root_lines = self.search_root_lines();
+        if !search_root_lines.is_empty() {
+            for line in &search_root_lines {
+                writeln!(f, "  {line}")?;
             }
             writeln!(f)?;
         }
@@ -2204,10 +2370,9 @@ pub fn validate_stamp(
                         StampStatus::Current(stamp)
                     }
                 }
-                Err(_) => {
-                    // Failed to parse, treat as missing
-                    StampStatus::Missing
-                }
+                Err(e) => StampStatus::Unreadable {
+                    reason: format!("{e:#}"),
+                },
             }
         }
         _ => StampStatus::Missing,
@@ -2230,6 +2395,9 @@ pub fn check_stamp_requirement(
         }
         StampStatus::Missing => {
             result.add_missing(req.clone());
+        }
+        StampStatus::Unreadable { reason } => {
+            result.add_unreadable(req.clone(), reason);
         }
     }
 }
@@ -3293,6 +3461,188 @@ runtime/my-runtime/build.stamp:::null"#,
         assert!(msg.contains("Missing steps:"));
         assert!(msg.contains("Stale steps"));
         assert!(msg.contains("config hash changed"));
+    }
+
+    // ========================================================================
+    // Unreadable stamps and the searched root
+    // ========================================================================
+
+    #[test]
+    fn test_validate_stamp_unreadable_is_not_missing() {
+        let req = StampRequirement::sdk_install();
+
+        let status = validate_stamp(&req, Some("{not json"), None);
+        assert!(
+            matches!(status, StampStatus::Unreadable { .. }),
+            "malformed JSON must not be reported as missing: {status:?}"
+        );
+
+        // Valid JSON that is not a stamp is unreadable too, not missing.
+        let status = validate_stamp(&req, Some(r#"{"command":"install"}"#), None);
+        assert!(
+            matches!(status, StampStatus::Unreadable { .. }),
+            "{status:?}"
+        );
+
+        if let StampStatus::Unreadable { reason } = validate_stamp(&req, Some("{not json"), None) {
+            assert!(reason.contains("parse"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn test_unreadable_stamp_makes_validation_unsatisfied() {
+        let req = StampRequirement::runtime_build("dev");
+        let mut result = StampValidationResult::new();
+        check_stamp_requirement(&req, Some("{not json"), None, &mut result);
+
+        assert!(!result.is_satisfied());
+        assert_eq!(result.unreadable.len(), 1);
+        assert!(result.missing.is_empty());
+        assert!(result.stale.is_empty());
+        assert_eq!(
+            result.unreadable[0].0.relative_path(),
+            "runtime/dev/build.stamp"
+        );
+    }
+
+    #[test]
+    fn test_unreadable_stamp_has_its_own_section_and_a_fix_command() {
+        let mut result = StampValidationResult::new();
+        check_stamp_requirement(
+            &StampRequirement::runtime_build("dev"),
+            Some("{not json"),
+            None,
+            &mut result,
+        );
+        let msg = result.into_error("Cannot deploy runtime 'dev'").to_string();
+
+        assert!(msg.contains("Unreadable steps"), "{msg}");
+        assert!(msg.contains("runtime/dev/build.stamp"), "{msg}");
+        assert!(!msg.contains("Missing steps"), "{msg}");
+        assert!(msg.contains("avocado runtime build dev"), "{msg}");
+    }
+
+    fn search_root(volume: Option<&str>) -> StampSearchRoot {
+        StampSearchRoot {
+            target: "qemuarm64".to_string(),
+            volume: volume.map(|v| v.to_string()),
+            daemon: StampDaemon::AvocadoVm,
+        }
+    }
+
+    #[test]
+    fn test_error_display_names_the_searched_root() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::runtime_build("dev"));
+        let error = result
+            .into_error("Cannot deploy runtime 'dev'")
+            .with_search_root(search_root(Some("avo-0123-test")));
+        let msg = error.to_string();
+
+        assert!(msg.contains("/opt/_avocado/qemuarm64/.stamps"), "{msg}");
+        assert!(msg.contains("target qemuarm64"), "{msg}");
+        assert!(msg.contains("docker volume avo-0123-test"), "{msg}");
+        assert!(msg.contains("avocado-vm docker daemon"), "{msg}");
+        assert!(!msg.contains("--runs-on"), "{msg}");
+    }
+
+    #[test]
+    fn test_error_display_without_search_root_is_unchanged() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::runtime_build("dev"));
+        let msg = result.into_error("Cannot deploy runtime 'dev'").to_string();
+        assert!(!msg.contains("Looked in"), "{msg}");
+    }
+
+    #[test]
+    fn test_json_error_event_message_carries_the_searched_root() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::runtime_build("dev"));
+        let event = result
+            .into_error("Cannot deploy runtime 'dev'")
+            .with_search_root(search_root(Some("avo-0123-test")))
+            .json_error_event();
+
+        // The desktop renders only `message`; sibling fields would be dropped.
+        assert_eq!(event["event"], "error");
+        assert!(event.get("target").is_none());
+        let msg = event["message"].as_str().expect("message is a string");
+        assert!(msg.contains("/opt/_avocado/qemuarm64/.stamps"), "{msg}");
+        assert!(msg.contains("avo-0123-test"), "{msg}");
+    }
+
+    #[test]
+    fn test_search_root_without_volume_omits_the_volume_clause() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::runtime_build("dev"));
+        let msg = result
+            .into_error("Cannot deploy runtime 'dev'")
+            .with_search_root(search_root(None))
+            .to_string();
+
+        assert!(msg.contains("/opt/_avocado/qemuarm64/.stamps"), "{msg}");
+        assert!(msg.contains("target qemuarm64"), "{msg}");
+        assert!(!msg.contains("docker volume"), "{msg}");
+    }
+
+    #[test]
+    fn test_search_root_names_the_runs_on_host() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::runtime_build("dev"));
+        let msg = result
+            .into_error_with_runs_on("Cannot provision runtime 'dev'", Some("user@remote"))
+            .with_search_root(StampSearchRoot {
+                daemon: StampDaemon::Host,
+                ..search_root(Some("avo-0123-test"))
+            })
+            .to_string();
+
+        assert!(msg.contains("host docker daemon"), "{msg}");
+        assert!(
+            msg.contains("exported over NFS to user@remote (--runs-on)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_daemon_display_names_a_custom_docker_host() {
+        let daemon = StampDaemon::DockerHost("tcp://10.0.0.5:2375".to_string());
+        assert_eq!(
+            daemon.to_string(),
+            "the docker daemon at DOCKER_HOST=tcp://10.0.0.5:2375"
+        );
+    }
+
+    #[test]
+    fn test_search_root_for_container_reads_avocado_state_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let container = SdkContainer {
+            cwd: dir.path().to_path_buf(),
+            ..SdkContainer::new()
+        };
+
+        // No .avocado-state: no volume, and none gets written.
+        let root = StampSearchRoot::for_container(&container, "qemuarm64");
+        assert_eq!(root.target, "qemuarm64");
+        assert_eq!(root.volume, None);
+        assert_eq!(root.stamps_dir(), "/opt/_avocado/qemuarm64/.stamps");
+        assert!(!dir.path().join(".avocado-state").exists());
+
+        // With one, the recorded name is reported verbatim.
+        VolumeState::new(dir.path().to_path_buf(), "docker".to_string())
+            .save_to_dir(dir.path())
+            .unwrap();
+        let expected = VolumeState::load_from_dir(dir.path())
+            .unwrap()
+            .unwrap()
+            .volume_name;
+        let root = StampSearchRoot::for_container(&container, "qemuarm64");
+        assert_eq!(root.volume, Some(expected));
+
+        // A corrupt state file degrades to "no volume" rather than failing.
+        std::fs::write(dir.path().join(".avocado-state"), "{not json").unwrap();
+        let root = StampSearchRoot::for_container(&container, "qemuarm64");
+        assert_eq!(root.volume, None);
     }
 
     // ========================================================================
