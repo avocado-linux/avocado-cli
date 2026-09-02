@@ -399,6 +399,22 @@ impl RuntimeProvisionCommand {
             }
         }
 
+        // Kernel command line, for the provision hook.
+        //
+        // Also exported at build time (see runtime/build.rs) -- a target that
+        // bakes the line into a UKI wants it there so the UKI is a manifest
+        // artifact. Exported here too because a target that assembles its boot
+        // image at provision time needs the same value, and because a provision
+        // must produce the same boot configuration a build would have.
+        let (kernel_cmdline, kernel_cmdline_extra) =
+            config.effective_kernel_cmdline(Some(&self.config.runtime_name));
+        if let Some(cmdline) = kernel_cmdline {
+            env_vars.insert("AVOCADO_KERNEL_CMDLINE".to_string(), cmdline);
+        }
+        if let Some(extra) = kernel_cmdline_extra {
+            env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
+        }
+
         // Determine state file path and container location if a provision profile is set
         let state_file_info = if let Some(profile) = &self.config.provision_profile {
             let state_file_path = self

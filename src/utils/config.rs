@@ -163,7 +163,21 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["package", "version", "compile", "install", "image"],
+        // Every field of KernelConfig must appear here: this list is what
+        // distinguishes `kernel: {<field>: ...}` (one anonymous block) from
+        // `kernel: {<name>: {...}}` (a map of named kernels). Omitting a field
+        // makes a block that sets only that field parse as a kernel *named*
+        // after it, failing with "invalid type: string, expected struct
+        // KernelConfig".
+        &[
+            "package",
+            "version",
+            "compile",
+            "install",
+            "image",
+            "cmdline",
+            "cmdline_extra",
+        ],
         "kernel",
     )
 }
@@ -624,12 +638,24 @@ pub struct KernelConfig {
     /// lands in the manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<serde_yaml::Value>,
+    /// Complete kernel command line, replacing whatever the platform would
+    /// otherwise boot with. Mutually exclusive with `cmdline_extra`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    /// Kernel command line arguments appended to the platform's own line.
+    ///
+    /// The common case: a project wants `isolcpus=`/`nohz_full=` or an
+    /// `earlycon` without restating the board-specific `root=`/`console=` that
+    /// only the BSP knows. Mutually exclusive with `cmdline`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline_extra: Option<String>,
 }
 
 impl KernelConfig {
     /// Validate that the kernel config is well-formed:
     /// - `package` and `compile` are mutually exclusive
     /// - `compile` requires `install`
+    /// - `cmdline` and `cmdline_extra` are mutually exclusive
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.package.is_some() && self.compile.is_some() {
             return Err(ConfigError::ValidationError(
@@ -641,7 +667,20 @@ impl KernelConfig {
                 "kernel config: 'compile' requires 'install' to be set".to_string(),
             ));
         }
-        if self.package.is_none() && self.compile.is_none() {
+        if self.cmdline.is_some() && self.cmdline_extra.is_some() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: 'cmdline' and 'cmdline_extra' are mutually exclusive; \
+                 'cmdline' replaces the platform's line, 'cmdline_extra' appends to it"
+                    .to_string(),
+            ));
+        }
+        // A block that only sets command line arguments is legitimate: the
+        // kernel itself still comes from the resolver (or from the platform),
+        // and the project is only amending how it boots. Requiring `package`
+        // or `compile` here would force every project that wants an extra
+        // kernel argument to also restate where its kernel comes from.
+        let only_cmdline = self.cmdline.is_some() || self.cmdline_extra.is_some();
+        if self.package.is_none() && self.compile.is_none() && !only_cmdline {
             return Err(ConfigError::ValidationError(
                 "kernel config: either 'package' or 'compile' must be set".to_string(),
             ));
@@ -1568,6 +1607,33 @@ impl Config {
     /// Returns `None` when the runtime doesn't exist, has no `kernel:` field,
     /// or the named ref doesn't resolve. (Phase 0e adds load-time validation
     /// so unresolved named refs become hard errors before reaching this path.)
+    /// The kernel command line this project wants, as (replace, append).
+    ///
+    /// Same precedence as [`Self::effective_kernel_spec`]: a runtime-level
+    /// `kernel:` wins over the top-level one, so one project can boot two
+    /// runtimes with different arguments off the same kernel. Returns the
+    /// pair rather than a merged string because the two mean different things
+    /// to the platform hook -- `cmdline` replaces the board's line outright,
+    /// `cmdline_extra` is appended to it -- and only the hook knows the base.
+    pub fn effective_kernel_cmdline(
+        &self,
+        runtime_name: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        if let Some(name) = runtime_name {
+            if let Some(kc) = self.resolve_runtime_kernel(name) {
+                if kc.cmdline.is_some() || kc.cmdline_extra.is_some() {
+                    return (kc.cmdline.clone(), kc.cmdline_extra.clone());
+                }
+            }
+        }
+        if let Some(top) = self.kernel_default() {
+            if top.cmdline.is_some() || top.cmdline_extra.is_some() {
+                return (top.cmdline.clone(), top.cmdline_extra.clone());
+            }
+        }
+        (None, None)
+    }
+
     pub fn resolve_runtime_kernel(&self, runtime_name: &str) -> Option<&KernelConfig> {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.kernel.as_ref()? {
@@ -11398,6 +11464,8 @@ sdk:
             compile: None,
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -11410,6 +11478,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -11422,6 +11492,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_err());
     }
@@ -11434,6 +11506,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("'compile' requires 'install'"));
@@ -11447,6 +11521,8 @@ sdk:
             compile: None,
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("either 'package' or 'compile'"));
@@ -13125,6 +13201,8 @@ runtimes:
                 compile: None,
                 install: None,
                 image: None,
+                cmdline: None,
+                cmdline_extra: None,
             },
         );
         let kc = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
@@ -13865,5 +13943,76 @@ extensions:
             }
             other => panic!("expected Git source, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod kernel_cmdline_tests {
+    use super::*;
+
+    fn cfg(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("config parses")
+    }
+
+    /// A `kernel:` block that only amends the command line is valid. Requiring
+    /// `package`/`compile` here would force every project that wants one extra
+    /// kernel argument to also restate where its kernel comes from.
+    #[test]
+    fn cmdline_only_block_is_valid() {
+        let k = KernelConfig {
+            package: None,
+            version: None,
+            compile: None,
+            install: None,
+            image: None,
+            cmdline: None,
+            cmdline_extra: Some("isolcpus=4-6".to_string()),
+        };
+        assert!(k.validate().is_ok());
+    }
+
+    /// Replacing and appending are different operations; asking for both is a
+    /// mistake the platform hook cannot resolve.
+    #[test]
+    fn cmdline_and_cmdline_extra_conflict() {
+        let k = KernelConfig {
+            package: Some("kernel-image".to_string()),
+            version: None,
+            compile: None,
+            install: None,
+            image: None,
+            cmdline: Some("root=/dev/x".to_string()),
+            cmdline_extra: Some("earlycon".to_string()),
+        };
+        assert!(k.validate().is_err());
+    }
+
+    #[test]
+    fn top_level_cmdline_extra_is_used_when_no_runtime_override() {
+        let c = cfg("kernel:\n  cmdline_extra: \"earlycon\"\n");
+        let (replace, extra) = c.effective_kernel_cmdline(Some("prod"));
+        assert_eq!(replace, None);
+        assert_eq!(extra.as_deref(), Some("earlycon"));
+    }
+
+    /// Two runtimes off one kernel can boot with different arguments -- the
+    /// reason this resolves per-runtime rather than once per project.
+    #[test]
+    fn runtime_level_cmdline_overrides_top_level() {
+        let c = cfg(concat!(
+            "kernel:\n  cmdline_extra: \"earlycon\"\n",
+            "runtimes:\n  rt:\n    kernel:\n      cmdline_extra: \"isolcpus=4-6 nohz_full=4-6\"\n",
+        ));
+        let (_, extra) = c.effective_kernel_cmdline(Some("rt"));
+        assert_eq!(extra.as_deref(), Some("isolcpus=4-6 nohz_full=4-6"));
+        // a runtime with no kernel block of its own still sees the top level
+        let (_, other) = c.effective_kernel_cmdline(Some("nonexistent"));
+        assert_eq!(other.as_deref(), Some("earlycon"));
+    }
+
+    #[test]
+    fn absent_kernel_block_yields_nothing() {
+        let c = cfg("default_target: qemuarm64\n");
+        assert_eq!(c.effective_kernel_cmdline(Some("rt")), (None, None));
     }
 }
