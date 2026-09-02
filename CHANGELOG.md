@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.3] - 2026-09-01
+
 ### Added
 - **`runtimes.<name>.var.recovery` and `avocado var-key` — an operator-held
   recovery key for the encrypted `/var`.** `var.recovery` names a registry
@@ -29,6 +31,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is missing), `none` (no hardware keyslot; requires `var.recovery`). Validated
   at config load; an explicit choice rides in the initramfs as
   `/etc/avocado/var-hardware`.
+- **`runtimes.<name>.signing.fit_key` — boot-FIT signing from the key registry.**
+  Names an RSA PEM key (`avocado signing-keys import <name> --key --cert`, or
+  `signing-keys create <name> --algorithm rsa2048`) that the runtime build
+  materializes as `FIT.key`/`FIT.crt` for `mkimage`, so a signed boot image is
+  reproducible from `avocado.yaml` alone. `signing.fit_unsigned: true` is the
+  explicit, mutually-exclusive opt-out. Replaces the interim
+  `AVOCADO_FIT_KEY_DIR` / `AVOCADO_FIT_UNSIGNED` environment variables, which
+  are no longer read - a hint names the config keys. Registry entries are
+  stored as `<keyid>.key` (0600) / `<keyid>.crt`, the key id being the SHA-256
+  of the certificate DER; `import` verifies the key and certificate actually
+  match and reads the algorithm off the certificate's modulus rather than
+  trusting `--algorithm`. ed25519 and PKCS#11 entries are refused for FIT
+  signing with a message saying why. With `fit_key` set the build also re-packs
+  the feed's bootloader so U-Boot enforces that key
+  (`signing.fit_key_in_bootloader`, default true; i.MX8M via the feed's
+  `imx-boot-tools/rekey-imx-boot.sh`), so provisioning writes a bootloader
+  closed to the project key from the first flash.
+- **`runtimes.<name>.targets` — a runtime's target scope, declared as a list.**
+  Scope is `targets:` > `target:` > unscoped, and unscoped means every target
+  the runtime is built for. `default_target` is never consulted for scope; it
+  says what to build when you do not, which is a different question. An empty
+  `targets: []` is refused, because it would silently skip every target-scoped
+  opt-in on the runtime. `avocado config show` reports the field.
 
 ### Fixed
 - **`avocado deploy --verbose` no longer fails with "Failed to parse hash
@@ -56,21 +81,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `avocado update` also expires the SDK's dnf metadata cache (kept on the
   persistent SDK volume, default 48 h), so a feed whose contents changed under
   the same URL is re-read on the next install instead of days later.
+- **`avocado install` follows the feed for the SDK and runtime sysroots too.**
+  The same additive-`dnf install` problem the rootfs and initramfs sysroots
+  were given a `distro-sync` for. It is invisible for packages the install line
+  names, and not invisible for ones that arrive transitively and are therefore
+  never named: `avocado-sdk-target` (which owns `stone-<target>.json` and the
+  build/provision hooks) and `avocado-img-bootfiles` (which owns
+  `tegraflash-tools/`, including `initrd-flash`). Both are exactly what a BSP
+  rebuild changes, and both silently stayed at their old version - a rebuilt
+  `initrd-flash` never reached the runtime and provisioning kept flashing with
+  the old one. Packages the config pins to an explicit version, the kernel
+  included, are held out of the sync so it cannot walk them to the feed's
+  latest and record the moved version in the lock.
+- **`avocado sdk install` after `avocado runtime clean`.**
+  `$AVOCADO_EXT_SYSROOTS` is a symlink into the active runtime; cleaning that
+  runtime left it dangling, and `mkdir -p` fails on a dangling symlink with
+  `File exists` rather than following it - so a routine recovery step died in
+  SDK init before installing anything. Runtime install also now checks for the
+  seeded `var/lib/rpm` database rather than only its parent directory, so a
+  recreated-but-empty runtime tree is re-seeded instead of leaving dnf to
+  resolve against an empty database.
+- **The platform build hook runs again, before `stone bundle`.** Replacing the
+  `avocado-build-<target>` hook call with a direct `stone bundle` invocation
+  left the hooks installed but never invoked, removing the only point where a
+  BSP can stage an artifact the stone manifest references but no generic step
+  produces. On Tegra that is the Android boot image backing the kernel A/B
+  partitions, which has to wrap whichever kernel the project pinned and so
+  cannot be built in Yocto either; without it a Thor build died with
+  `Image file 'boot.img' for artifact 'boot' not found in any input directory`.
+  The hook is invoked by absolute path with the SDK's bin on `PATH`, guarded on
+  being executable so targets needing nothing extra are unaffected. Requires
+  meta-avocado #349.
+- **`var.encrypt` is scoped by what the runtime declares, not by
+  `default_target`.** Falling back to `default_target` meant a multi-target
+  project could encrypt on exactly one target, a `target-<x>:` override of the
+  flag silently did nothing because the target filter rejected the runtime
+  before the override was read, and setting or unsetting an unrelated
+  convenience field narrowed or widened a security opt-in. Scope is now
+  declared (see `targets:` above) and one rule answers it everywhere - build,
+  install and sign selection included, so a `targets:`-scoped runtime is
+  actually built, installed and signed on the targets it names. An opt-in for a
+  target outside the declared scope is a loud refusal rather than a plaintext
+  `/var`, and editing the scope invalidates the runtime install and build
+  stamps.
+- **The initramfs build id is actually written into the shipped image.** The
+  injection appended `AVOCADO_OS_BUILD_ID` to `usr/lib/initrd-release` and
+  `usr/lib/os-release-initrd`, each behind an `[ -f ]` guard - and the shipped
+  initramfs has neither: `/etc/initrd-release` is a symlink to
+  `usr/lib/os-release`. Both guards failed and the image went out with no
+  identity, silently, since 0.28.0. Nothing read it back, so nothing noticed:
+  the manifest's `initramfs_build_id` comes from the build environment, not
+  from the image. Injection and the build-id strip now render from one list, so
+  a file that can be written is always also cleared before the tree hash;
+  `/etc/initrd-release` is followed through its symlink, accepting only a
+  target inside the work tree that is itself on the list; and a build where
+  nothing could be written now fails rather than shipping an anonymous image.
+- **`avocado provision --list` resolves its target like every other command.**
+  It used its own chain - `--target` then `default_target` - skipping
+  `AVOCADO_TARGET`, while the interpolation behind `Config::load_composed` read
+  the env var. With `AVOCADO_TARGET` set to anything else, the command
+  interpolated its config for one target and read the manifest path for
+  another, then blamed the miss on an incomplete SDK install. It now goes
+  through `resolve_target`, and the message names the target and what sets one.
+- **`avocado deploy` no longer refuses a runtime for rootfs verity.** The guard
+  grepped the whole manifest for `root_hash`, but the rootfs verity hash is
+  recorded at the manifest's top level and travels in the boot FIT, with no
+  sidecar involved. It now checks `extensions[].root_hash` only, as `connect
+  upload` already did, so `rootfs.image.verity: true` deploys.
 
 ## [1.0.0-rc.2] - 2026-08-28
 
 ### Added
-- **`runtimes.<name>.signing.fit_key` — boot-FIT signing from the key registry.**
-  Names an RSA PEM key (`avocado signing-keys import <name> --key --cert`, or
-  `signing-keys create <name> --algorithm rsa2048`) that the runtime build
-  materializes as `FIT.key`/`FIT.crt` for `mkimage`, so a signed boot image is
-  reproducible from `avocado.yaml` alone. `signing.fit_unsigned: true` is the
-  explicit opt-out. Replaces the interim `AVOCADO_FIT_KEY_DIR` /
-  `AVOCADO_FIT_UNSIGNED` environment variables, which are no longer read.
-  With `fit_key` set the build also re-packs the feed's bootloader so U-Boot
-  enforces that key (`signing.fit_key_in_bootloader`, default true; i.MX8M via
-  the feed's `imx-boot-tools/rekey-imx-boot.sh`), so provisioning writes a
-  bootloader closed to the project key from the first flash.
 - **`runtimes.<name>.var.encrypt: true` — encrypted `/var`.** Opts a runtime
   into a LUKS2 `/var` sealed to the target's hardware key store (OP-TEE fTPM
   on Jetson). The cli adds `cryptsetup-var` to the initramfs and
@@ -472,4 +553,6 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
 - **`ext-paths.json`.** Extension path mounts are now derived from config; the
   sidecar file is no longer written or read.
 
+[1.0.0-rc.3]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.3
+[1.0.0-rc.2]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.1
