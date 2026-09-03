@@ -885,34 +885,31 @@ echo "Successfully fetched extension '{ext_name}' from git"
             );
         }
 
-        // Resolve the source path relative to src_dir (or config dir if src_dir not set)
+        // Base for a relative source path: src_dir if set, else the config's
+        // directory. Same rule as `SdkContainer::derive_ext_path_mounts`.
+        let base_dir = self.src_dir.clone().unwrap_or_else(|| {
+            Path::new(&self.config_path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        });
         let resolved_source = if Path::new(source_path).is_absolute() {
             PathBuf::from(source_path)
         } else {
-            // Use src_dir if available, otherwise fall back to config directory
-            if let Some(ref src_dir) = self.src_dir {
-                src_dir.join(source_path)
-            } else {
-                let config_dir = Path::new(&self.config_path)
-                    .parent()
-                    .unwrap_or(Path::new("."));
-                config_dir.join(source_path)
-            }
+            base_dir.join(source_path)
         };
 
         // Canonicalize the path to get the absolute path
         let resolved_source = resolved_source.canonicalize().unwrap_or(resolved_source);
 
         if !resolved_source.exists() {
-            return Err(anyhow::anyhow!(
-                "Extension source path does not exist: {}\n\
-                 Path was resolved relative to: {}",
-                resolved_source.display(),
-                self.src_dir
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "config directory".to_string())
-            ));
+            return Err(anyhow::anyhow!(missing_path_source_message(
+                source_path,
+                &resolved_source,
+                &base_dir,
+                Path::new(&self.config_path),
+            )));
         }
 
         // Check that the path contains an avocado.yaml or avocado.yml file
@@ -950,9 +947,116 @@ echo "Successfully fetched extension '{ext_name}' from git"
     }
 }
 
+/// Absolute form of `p` without requiring it to exist (`canonicalize` fails on
+/// a missing path, which is exactly the case we report on).
+fn absolutize(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    // Drop the `.` components a config-dir fallback leaves behind, so the
+    // reported path is one a user can copy into a shell.
+    abs.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// A directory is usable as a `type: path` extension source only if it holds an
+/// avocado config.
+fn is_ext_source_dir(p: &Path) -> bool {
+    p.join("avocado.yaml").is_file() || p.join("avocado.yml").is_file()
+}
+
+/// Message for a `type: path` extension whose source directory is missing.
+///
+/// What a relative `path:` is resolved against (`src_dir`, else the config
+/// file's own directory) is invisible from the config, so name the base and
+/// show the absolute result rather than echoing the path back. When the
+/// directory does exist somewhere obvious under that base, point at it: a
+/// wrong prefix (`extensions/foo` for a top-level `foo`) is the usual miss.
+pub fn missing_path_source_message(
+    source_path: &str,
+    resolved: &Path,
+    base_dir: &Path,
+    config_path: &Path,
+) -> String {
+    let mut msg = format!(
+        "source path '{source_path}' does not exist\n  \
+         resolved to: {}\n  relative to: {}\n  declared in: {}",
+        absolutize(resolved).display(),
+        absolutize(base_dir).display(),
+        absolutize(config_path).display(),
+    );
+    if let Some(hint) = Path::new(source_path)
+        .file_name()
+        .map(|name| ["", "extensions"].map(|prefix| base_dir.join(prefix).join(name)))
+        .and_then(|candidates| {
+            candidates
+                .into_iter()
+                .find(|c| c != resolved && is_ext_source_dir(c))
+        })
+    {
+        msg.push_str(&format!(
+            "\n  did you mean: {}",
+            absolutize(&hint).display()
+        ));
+    }
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mistake this message exists for: the source lives at `<base>/foo`
+    /// and the config says `extensions/foo`. The old text echoed the joined
+    /// path and called the base "config directory" without saying where that
+    /// was, which is what made this hard to get right.
+    #[test]
+    fn missing_path_source_names_the_base_and_suggests_the_real_dir() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("foo")).unwrap();
+        std::fs::write(base.path().join("foo/avocado.yaml"), "").unwrap();
+
+        let resolved = base.path().join("extensions/foo");
+        let msg = missing_path_source_message(
+            "extensions/foo",
+            &resolved,
+            base.path(),
+            &base.path().join("avocado.yaml"),
+        );
+
+        assert!(msg.contains("'extensions/foo'"), "{msg}");
+        assert!(msg.contains(&resolved.display().to_string()), "{msg}");
+        assert!(
+            msg.contains(&format!("relative to: {}", base.path().display())),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "did you mean: {}",
+                base.path().join("foo").display()
+            )),
+            "{msg}"
+        );
+    }
+
+    /// No suggestion beats a wrong one: a bare name with nothing matching it
+    /// under the base must not invent a candidate.
+    #[test]
+    fn missing_path_source_suggests_nothing_when_no_candidate_exists() {
+        let base = tempfile::tempdir().unwrap();
+        let msg = missing_path_source_message(
+            "nowhere",
+            &base.path().join("nowhere"),
+            base.path(),
+            &base.path().join("avocado.yaml"),
+        );
+        assert!(!msg.contains("did you mean"), "{msg}");
+    }
 
     // ---- post-install resolved-version report ---------------------------
 
