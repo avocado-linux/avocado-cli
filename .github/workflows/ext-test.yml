@@ -43,6 +43,9 @@ jobs:
       matrix:
         include:
           - { target: qemux86-64, distro-release: "2024", distro-channel: next }
+          # Both feeds the release publishes into get a build leg, so a package
+          # that only breaks on one is caught before the tag.
+          - { target: qemux86-64, distro-release: "2026", distro-channel: next }
           # Keep a cross-arch leg. A same-arch target cannot catch a host/target
           # toolchain mix-up in avocado-cli-compile.sh: on qemux86-64 the target
           # gcc runs natively, so picking the wrong one still builds. On aarch64
