@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `avocado signing-keys create` no longer generates a key before discovering
+  the name is taken. A duplicate name is rejected up front, so a repeated
+  `create <name> --algorithm rsa2048` no longer leaves an orphaned
+  `.key`/`.crt` pair behind, and `--pkcs11-device --generate` no longer
+  consumes a slot on the token before failing.
+
 ## [1.0.0-rc.3] - 2026-09-01
 
 ### Added
