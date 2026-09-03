@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- An extension with a `source: { type: path }` now mounts over an
+  `includes/<ext>` left populated by an earlier `package` or `git` fetch of the
+  same extension. bindfs on libfuse2 refused the non-empty mountpoint
+  (`fuse: mountpoint is not empty`), which made `avocado clean` the only way
+  forward.
+- A `type: path` source that cannot be resolved now reports the absolute path
+  it resolved to, the directory it was resolved against, and the config that
+  declared it — and names the directory when it exists one level off, e.g.
+  `extensions/foo` for a top-level `foo`.
+
 ## [1.0.0-rc.3] - 2026-09-01
 
 ### Added
