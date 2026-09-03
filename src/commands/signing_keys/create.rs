@@ -95,6 +95,17 @@ impl SigningKeysCreateCommand {
 
         let mut registry = KeysRegistry::load()?;
 
+        // Before generating anything: a duplicate name is fatal, and key
+        // generation (RSA via openssl, or a hardware key in the device) is
+        // expensive and leaves files behind. When no name is given it defaults
+        // to the keyid, which isn't known until after generation; add_key still
+        // catches that case.
+        if let Some(name) = &self.name {
+            if registry.get_key(name).is_some() {
+                anyhow::bail!("A key with name '{name}' already exists");
+            }
+        }
+
         let (keyid, uri, algorithm, key_type) = if crate::utils::signing_keys::is_secret_algorithm(
             &self.algorithm,
         ) {
@@ -204,11 +215,6 @@ impl SigningKeysCreateCommand {
 
         // Determine the name (use provided name or fall back to keyid)
         let name = self.name.clone().unwrap_or_else(|| keyid.clone());
-
-        // Check if name already exists
-        if registry.get_key(&name).is_some() {
-            anyhow::bail!("A key with name '{name}' already exists");
-        }
 
         // Create the key entry
         let entry = KeyEntry {
