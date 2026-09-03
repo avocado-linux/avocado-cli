@@ -465,9 +465,10 @@ fn add_security_opts(container_cmd: &mut Vec<String>) {
 }
 
 /// Shared bash that bindfs-mounts every `source: { type: path }` extension from
-/// `/mnt/ext/<ext>` onto `$AVOCADO_PREFIX/includes/<ext>`, named in
-/// `$AVOCADO_EXT_PATH_MOUNTS`. Used by both entrypoint scripts (local and
-/// remote), which mount identically.
+/// `/mnt/ext/<ext>` onto `/opt/_avocado/$AVOCADO_TARGET/includes/<ext>`, named
+/// in `$AVOCADO_EXT_PATH_MOUNTS`. That target is spelled out rather than taken
+/// from `$AVOCADO_PREFIX`, which both entrypoint scripts export further down.
+/// Used by both, which mount identically.
 ///
 /// `includes/<ext>` is usually NOT empty: flipping an extension from a package
 /// or git source to a path source leaves the previously fetched tree there, and
@@ -478,9 +479,10 @@ fn add_security_opts(container_cmd: &mut Vec<String>) {
 /// default, hence the plain retry.
 pub const EXT_PATH_MOUNT_SNIPPET: &str = r##"
 # Mount extension source paths with bindfs (for path-based extensions)
-# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
+# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to the
+# target's includes dir. AVOCADO_PREFIX is exported further down, so build the
+# path from AVOCADO_TARGET here.
 if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
-    # AVOCADO_PREFIX must be set before this - use the target from environment
     EXT_PREFIX="/opt/_avocado/${AVOCADO_TARGET}/includes"
     for ext_name in $AVOCADO_EXT_PATH_MOUNTS; do
         mnt_path="/mnt/ext/$ext_name"
@@ -497,9 +499,13 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
                     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
                 else
                     _map="--map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0"
-                    bindfs -o nonempty $_map "$mnt_path" "$target_path" 2>/dev/null \
-                        || bindfs $_map "$mnt_path" "$target_path" \
-                        || { echo "[ERROR] Failed to mount extension '$ext_name' from $mnt_path onto $target_path." >&2; exit 1; }
+                    # Keep both attempts' stderr and print neither unless the
+                    # mount actually fails: which one is informative depends on
+                    # the libfuse version, and the other ("mountpoint is not
+                    # empty", "unknown option") sends the reader the wrong way.
+                    _err=$(bindfs -o nonempty $_map "$mnt_path" "$target_path" 2>&1) \
+                        || _err="$_err; $(bindfs $_map "$mnt_path" "$target_path" 2>&1)" \
+                        || { echo "[ERROR] Failed to mount extension '$ext_name' from $mnt_path onto $target_path: $_err" >&2; exit 1; }
                     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping" >&2; fi
                 fi
             else
@@ -841,7 +847,7 @@ impl SdkContainer {
             if !resolved.is_dir() {
                 crate::utils::output::print_warning(
                     &format!(
-                        "Extension '{name}': {} — skipping mount",
+                        "Extension '{name}' not mounted: {}",
                         crate::utils::ext_fetch::missing_path_source_message(
                             path,
                             &resolved,
@@ -3538,7 +3544,8 @@ extensions:
                 "extension mount must not fail on a non-empty includes/<ext>"
             );
             // libfuse3 rejects `nonempty` and allows non-empty by default.
-            assert!(script.contains(r#"|| bindfs $_map "$mnt_path" "$target_path""#));
+            assert!(script
+                .contains(r#"|| _err="$_err; $(bindfs $_map "$mnt_path" "$target_path" 2>&1)""#));
         }
     }
 

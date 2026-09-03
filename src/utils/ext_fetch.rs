@@ -970,7 +970,8 @@ fn is_ext_source_dir(p: &Path) -> bool {
     p.join("avocado.yaml").is_file() || p.join("avocado.yml").is_file()
 }
 
-/// Message for a `type: path` extension whose source directory is missing.
+/// Message for a `type: path` extension whose source directory is unusable —
+/// missing, or present but not a directory.
 ///
 /// What a relative `path:` is resolved against (`src_dir`, else the config
 /// file's own directory) is invisible from the config, so name the base and
@@ -983,8 +984,15 @@ pub fn missing_path_source_message(
     base_dir: &Path,
     config_path: &Path,
 ) -> String {
+    // `is_dir()` is false for a file or a symlink to one; saying "does not
+    // exist" about a path that is right there sends the reader hunting.
+    let problem = if resolved.exists() {
+        "is not a directory"
+    } else {
+        "does not exist"
+    };
     let mut msg = format!(
-        "source path '{source_path}' does not exist\n  \
+        "source path '{source_path}' {problem}\n  \
          resolved to: {}\n  relative to: {}\n  declared in: {}",
         absolutize(resolved).display(),
         absolutize(base_dir).display(),
@@ -1042,6 +1050,24 @@ mod tests {
             )),
             "{msg}"
         );
+    }
+
+    /// `is_dir()` is also false for a file, and the mount derivation reports
+    /// through this message; "does not exist" about a path that is right there
+    /// is a wrong lead.
+    #[test]
+    fn a_path_source_that_is_a_file_is_not_reported_as_missing() {
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("ext.yaml");
+        std::fs::write(&file, "").unwrap();
+        let msg = missing_path_source_message(
+            "ext.yaml",
+            &file,
+            base.path(),
+            &base.path().join("avocado.yaml"),
+        );
+        assert!(msg.contains("is not a directory"), "{msg}");
+        assert!(!msg.contains("does not exist"), "{msg}");
     }
 
     /// No suggestion beats a wrong one: a bare name with nothing matching it
