@@ -464,6 +464,55 @@ fn add_security_opts(container_cmd: &mut Vec<String>) {
     }
 }
 
+/// Shared bash that bindfs-mounts every `source: { type: path }` extension from
+/// `/mnt/ext/<ext>` onto `$AVOCADO_PREFIX/includes/<ext>`, named in
+/// `$AVOCADO_EXT_PATH_MOUNTS`. Used by both entrypoint scripts (local and
+/// remote), which mount identically.
+///
+/// `includes/<ext>` is usually NOT empty: flipping an extension from a package
+/// or git source to a path source leaves the previously fetched tree there, and
+/// bindfs on libfuse2 refuses a non-empty mountpoint outright ("fuse: mountpoint
+/// is not empty"), which used to force an `avocado clean`. `-o nonempty` lets
+/// the path source shadow whatever is underneath, which is what a path source
+/// means. libfuse3 dropped the option and allows non-empty mountpoints by
+/// default, hence the plain retry.
+pub const EXT_PATH_MOUNT_SNIPPET: &str = r##"
+# Mount extension source paths with bindfs (for path-based extensions)
+# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
+if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
+    # AVOCADO_PREFIX must be set before this - use the target from environment
+    EXT_PREFIX="/opt/_avocado/${AVOCADO_TARGET}/includes"
+    for ext_name in $AVOCADO_EXT_PATH_MOUNTS; do
+        mnt_path="/mnt/ext/$ext_name"
+        target_path="$EXT_PREFIX/$ext_name"
+
+        if [ -d "$mnt_path" ]; then
+            # Create target if it doesn't exist. Avoid rm -rf because parallel
+            # containers share this volume and would race on the same paths.
+            # Stale files underneath are shadowed by the mount (-o nonempty).
+            mkdir -p "$target_path"
+            if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
+                if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
+                    mount --bind "$mnt_path" "$target_path"
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
+                else
+                    _map="--map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0"
+                    bindfs -o nonempty $_map "$mnt_path" "$target_path" 2>/dev/null \
+                        || bindfs $_map "$mnt_path" "$target_path" \
+                        || { echo "[ERROR] Failed to mount extension '$ext_name' from $mnt_path onto $target_path." >&2; exit 1; }
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping" >&2; fi
+                fi
+            else
+                mount --bind "$mnt_path" "$target_path"
+                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)" >&2; fi
+            fi
+        else
+            echo "[WARNING] Extension mount path not found: $mnt_path" >&2
+        fi
+    done
+fi
+"##;
+
 /// Shared bash that wires a custom repo CA / insecure TLS into EVERY dnf phase. Centralized:
 /// every dnf call trusts `$SSL_CERT_FILE` / `$CURL_CA_BUNDLE` (the SDK bundle) — and explicit
 /// `--setopt=sslcacert=$SSL_CERT_FILE` sites point at the same file — so appending the CA to
@@ -792,10 +841,13 @@ impl SdkContainer {
             if !resolved.is_dir() {
                 crate::utils::output::print_warning(
                     &format!(
-                        "Extension '{name}' path source does not exist: {} — skipping mount \
-                         (check `source.path` in {})",
-                        resolved.display(),
-                        config_path.display()
+                        "Extension '{name}': {} — skipping mount",
+                        crate::utils::ext_fetch::missing_path_source_message(
+                            path,
+                            &resolved,
+                            &base_dir,
+                            &config_path,
+                        )
                     ),
                     OutputLevel::Normal,
                 );
@@ -2327,6 +2379,7 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
         // For remote execution:
         // - NFS src volume is mounted to /mnt/src (needs bindfs for UID mapping)
         // - NFS state volume is mounted directly to /opt/_avocado (no mapping needed)
+        let ext_path_mounts = EXT_PATH_MOUNT_SNIPPET;
         let mut script = format!(
             r#"
 set -e
@@ -2378,37 +2431,7 @@ else
     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)" >&2; fi
 fi
 
-# Mount extension source paths with bindfs (for path-based remote extensions)
-# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
-if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
-    # AVOCADO_PREFIX must be set before this - use the target from environment
-    EXT_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}/includes"
-    for ext_name in $AVOCADO_EXT_PATH_MOUNTS; do
-        mnt_path="/mnt/ext/$ext_name"
-        target_path="$EXT_PREFIX/$ext_name"
-
-        if [ -d "$mnt_path" ]; then
-            # Create target if it doesn't exist. Avoid rm -rf because parallel
-            # containers share this volume and would race on the same paths.
-            # Stale package-sourced files are harmless — bindfs overlays them.
-            mkdir -p "$target_path"
-            if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
-                if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
-                    mount --bind "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
-                else
-                    bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping" >&2; fi
-                fi
-            else
-                mount --bind "$mnt_path" "$target_path"
-                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)" >&2; fi
-            fi
-        else
-            echo "[WARNING] Extension mount path not found: $mnt_path" >&2
-        fi
-    done
-fi
+{ext_path_mounts}
 
 # Repo URL is always supplied by the CLI env-builder (Config::DEFAULT_REPO_URL
 # when unset), so there is no literal default to drift here.
@@ -2617,6 +2640,7 @@ fi
             ""
         };
 
+        let ext_path_mounts = EXT_PATH_MOUNT_SNIPPET;
         let mut script = format!(
             r#"
 set -e
@@ -2666,37 +2690,7 @@ else
     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)" >&2; fi
 fi
 
-# Mount extension source paths with bindfs (for path-based remote extensions)
-# These are mounted at /mnt/ext/<ext_name> and need to be bindfs'd to $AVOCADO_PREFIX/includes/<ext_name>
-if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
-    # AVOCADO_PREFIX must be set before this - use the target from environment
-    EXT_PREFIX="/opt/_avocado/${{AVOCADO_TARGET}}/includes"
-    for ext_name in $AVOCADO_EXT_PATH_MOUNTS; do
-        mnt_path="/mnt/ext/$ext_name"
-        target_path="$EXT_PREFIX/$ext_name"
-
-        if [ -d "$mnt_path" ]; then
-            # Create target if it doesn't exist. Avoid rm -rf because parallel
-            # containers share this volume and would race on the same paths.
-            # Stale package-sourced files are harmless — bindfs overlays them.
-            mkdir -p "$target_path"
-            if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
-                if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
-                    mount --bind "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
-                else
-                    bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path with UID/GID mapping" >&2; fi
-                fi
-            else
-                mount --bind "$mnt_path" "$target_path"
-                if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (no UID/GID mapping)" >&2; fi
-            fi
-        else
-            echo "[WARNING] Extension mount path not found: $mnt_path" >&2
-        fi
-    done
-fi
+{ext_path_mounts}
 
 # Repo URL is always supplied by the CLI env-builder (Config::DEFAULT_REPO_URL
 # when unset), so there is no literal default to drift here.
@@ -3526,6 +3520,51 @@ extensions:
         // Verify source mount uses /mnt/src (bindfs will remount to /opt/src)
         let has_mnt_src_mount = cmd.iter().any(|s| s.contains(":/mnt/src:"));
         assert!(has_mnt_src_mount, "Source should be mounted to /mnt/src");
+    }
+
+    /// `includes/<ext>` still holds the tree from an earlier package/git fetch
+    /// when an extension is flipped to a path source, and bindfs on libfuse2
+    /// refuses to mount over it ("fuse: mountpoint is not empty"), which used
+    /// to leave `avocado clean` as the only way forward.
+    #[test]
+    fn ext_path_mount_tolerates_a_non_empty_mountpoint() {
+        let container = SdkContainer::new();
+        for script in [
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false),
+            container.create_entrypoint_script_for_remote(true, None, None, "x86_64", false, false),
+        ] {
+            assert!(
+                script.contains(r#"bindfs -o nonempty $_map "$mnt_path" "$target_path""#),
+                "extension mount must not fail on a non-empty includes/<ext>"
+            );
+            // libfuse3 rejects `nonempty` and allows non-empty by default.
+            assert!(script.contains(r#"|| bindfs $_map "$mnt_path" "$target_path""#));
+        }
+    }
+
+    /// Both entrypoint scripts are `bash -c`'d in the container; a quoting slip
+    /// in a snippet only shows up at runtime otherwise.
+    #[test]
+    fn entrypoint_scripts_parse() {
+        use std::io::Write;
+        let container = SdkContainer::new();
+        for script in [
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false),
+            container.create_entrypoint_script_for_remote(true, None, None, "x86_64", false, false),
+        ] {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-n")
+                .arg(f.path())
+                .output()
+                .expect("bash");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]
