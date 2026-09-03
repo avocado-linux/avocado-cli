@@ -159,6 +159,10 @@ impl SdkCompileCommand {
             if !validation.is_satisfied() {
                 validation
                     .into_error("Cannot run SDK compile")
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        &container_helper,
+                        &target,
+                    ))
                     .print_and_exit();
             }
         }

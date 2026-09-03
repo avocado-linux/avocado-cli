@@ -228,6 +228,10 @@ impl ExtCleanCommand {
         if !validation.is_satisfied() {
             validation
                 .into_error("Cannot run clean scripts for compile dependencies")
+                .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                    &container_helper,
+                    target,
+                ))
                 .print_and_exit();
         }
 

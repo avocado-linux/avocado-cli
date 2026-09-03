@@ -378,6 +378,10 @@ impl RuntimeBuildCommand {
             if !validation.is_satisfied() {
                 validation
                     .into_error(&format!("Cannot build runtime '{}'", self.runtime_name))
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        container_helper,
+                        target_arch,
+                    ))
                     .print_and_exit();
             }
         }

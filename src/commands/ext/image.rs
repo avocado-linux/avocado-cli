@@ -355,6 +355,10 @@ impl ExtImageCommand {
                         "Cannot create image for extension '{}'",
                         self.extension
                     ))
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        &container_helper,
+                        &target,
+                    ))
                     .print_and_exit();
             }
         }

@@ -306,7 +306,13 @@ impl RuntimeDeployCommand {
                 let msg = format!("Cannot deploy runtime '{}'", self.runtime_name);
                 Self::emit_phase_error(PHASE_STAMPS, &msg);
                 Self::emit_phase_status(PHASE_STAMPS, "failed");
-                validation.into_error(&msg).print_and_exit();
+                validation
+                    .into_error(&msg)
+                    .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
+                        &container_helper,
+                        &target_arch,
+                    ))
+                    .print_and_exit();
             }
             Self::emit_phase_status(PHASE_STAMPS, "success");
         }

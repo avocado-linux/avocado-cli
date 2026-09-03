@@ -12,7 +12,7 @@ use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
     generate_batch_read_stamps_script, parse_batch_stamps_output, validate_stamps_parsed,
-    CurrentInput, Stamp, StampRequirement, StampValidationResult,
+    CurrentInput, Stamp, StampRequirement, StampSearchRoot, StampValidationResult,
 };
 
 /// Stamps read from the SDK container in a single invocation, keyed by
@@ -129,6 +129,7 @@ pub async fn check_prerequisites<T: TaskPrerequisites>(
     if !validation.is_satisfied() {
         validation
             .into_error(&task.task_description())
+            .with_search_root(StampSearchRoot::for_container(container, target))
             .print_and_exit();
     }
 
