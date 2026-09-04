@@ -96,6 +96,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about ten days, and an SBOM is a component inventory of a shipped product.
   Whether a given document can be published is the operator's call, on a
   document they can read first.
+- **`avocado sbom` now emits a `software_Sbom` per runtime and per extension,
+  not only one for the whole device.** (ENG-2219) Connect needs something
+  narrower than "everything on the device" to ingest, and each SBOM now says
+  whether it describes what is running or what was built.
+
+  More elements in the one existing document rather than a file each, for the
+  same reason `avocado sbom` already writes one document: a package in both
+  `rootfs` and a runtime is one package in two places, and a scanner unioning
+  files would count it twice. A runtime's SBOM roots itself, `rootfs`,
+  `initramfs` and every extension it carries; every extension gets one of its
+  own as well, including a legacy `ext:<name>` and a remote `includes:<name>`
+  — neither names a runtime, so no runtime's SBOM claims them. With
+  `--include-sdk` the build-host scopes get one too, typed `build` rather than
+  `deployed`. Nothing mints new elements: the added lists only reference ids
+  the device-wide document already emits. A group whose own defining scope is
+  empty is left out, since a document named for it would name nothing.
+
+  The pre-existing device-wide `software_Sbom` is unchanged apart from the
+  same plain-language `comment`, and is still the first in `@graph`.
+- **`avocado connect upload` attaches the uploaded runtime's own SBOM to the
+  create-runtime request.** (ENG-2219) The runtime-scoped slice of the same
+  document is sent as `runtime.sbom` on `POST .../runtimes`; `RuntimeParams`
+  carries no runtime name for a server to scope an unfiltered one by.
+
+  Never allowed to fail the upload. Building it is best-effort: any error
+  warns and the field is left off, so a server that does not read it yet
+  (ENG-2284) sees today's request unchanged. If the server refuses the call
+  with any 4xx while an SBOM was attached, the upload retries once without it
+  — gated on the status, via a new `HttpStatus` error type, rather than on
+  message text. Any 4xx and not an enumerated list, because the likeliest
+  refusal is `413 Payload Too Large`: ~400 packages of SPDX is megabytes into
+  a body that is otherwise kilobytes. A 4xx also means the first attempt
+  created nothing, so the retry risks no duplicate runtime. Both notices use
+  `print_warning_above`, since `print_warning` is suppressed under
+  `--output json` — the one path where a silently SBOM-less upload would go
+  unnoticed. The `--file` host path never builds one: that tarball may have
+  been built elsewhere. `AVOCADO_UPLOAD_NO_SBOM=1` skips the build.
 
 ### Changed
 - **Extension images no longer ship package-manager state.** `var/lib/rpm`,
