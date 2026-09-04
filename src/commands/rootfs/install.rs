@@ -665,9 +665,9 @@ async fn verify_var_key_attestation(
     match outcome {
         Ok(true) => Ok(()),
         Ok(false) => Err(anyhow::anyhow!(
-            "The composed {sysroot_dir} declares encrypted-var but its var-key \
-             provider does not match the attestation the build wrote beside it. \
-             See the diagnostic above."
+            "The composed {sysroot_dir} declares encrypted-var but one or more \
+             scripts on its /var unlock path failed attestation. See the \
+             diagnostic above, which names the file and the reason."
         )),
         Err(e) => Err(e).context("could not run the var-key attestation check"),
     }
@@ -738,11 +738,22 @@ async fn write_install_stamp(
 /// in avocado-security-capabilities.bb, which exists because the image-scope
 /// artifact never reached a jetson-orin-nano.
 ///
-/// What survives into the RPM is `var-key.sh` plus the `var-key.sh.sha256`
-/// that cryptsetup-var's do_install writes AFTER every deliverability check
-/// passes. Checking the pair here is what re-arms the gate for this path: a
-/// provider swapped after validation no longer matches, and a missing
-/// attestation means the build-time check never completed over this provider.
+/// What survives into the RPM is every script on the unlock path plus the
+/// `.sha256` that cryptsetup-var's do_install writes beside each one AFTER
+/// every deliverability check passes. Checking the pairs here is what re-arms
+/// the gate for this path: a script swapped after validation no longer
+/// matches, and a missing attestation means the build-time check never
+/// completed over that file.
+///
+/// The set is deliberately wider than the provider. `var-key.sh` only derives
+/// 64 bytes; `cryptsetup-var.sh` decides whether it is called, what happens to
+/// the result, and whether to refuse - so a constant key file substituted there
+/// ships a fleet-wide /var key with `var-key.sh.sha256` still matching. It
+/// mirrors `avocado_var_key_attested_components()` in meta-avocado's
+/// avocado-security-capabilities.bbclass, which carries the reasoning and the
+/// reason `avocado-posture-publish.sh` is not on the list. The two lists are
+/// separate copies in separate repos; a component added there and not here
+/// silently stops being checked on this path.
 ///
 /// `require_provider` mirrors the build-side rule - only the initramfs must
 /// carry a provider, while a rootfs legitimately ships the udev and posture
@@ -764,7 +775,7 @@ async fn write_install_stamp(
 fn generate_var_key_attestation_script(sysroot_dir: &str, require_provider: bool) -> String {
     let missing_provider = if require_provider {
         r#"    echo "avocado: this sysroot declares encrypted-var but ships no" >&2
-    echo "avocado: $REL - cryptsetup-var.sh reads the declaration at boot," >&2
+    echo "avocado: $DIR - cryptsetup-var.sh reads the declaration at boot," >&2
     echo "avocado: finds no way to derive a key, and /var never unlocks." >&2
     exit 1"#
     } else {
@@ -774,41 +785,157 @@ fn generate_var_key_attestation_script(sysroot_dir: &str, require_provider: bool
     format!(
         r#"
 set -eu
-SYSROOT="$AVOCADO_PREFIX/{sysroot_dir}"
+# Canonicalised once, because the parent-directory check below compares a
+# resolved path against this one. Comparing against the RAW prefix refused a
+# perfectly good sysroot whenever $AVOCADO_PREFIX carried a trailing slash or a
+# symlinked component - measured rc=1 on an untampered tree under both. The
+# build-side half never had this bug: it realpath()s both sides and
+# prefix-compares.
+RAW="$AVOCADO_PREFIX/{sysroot_dir}"
+
+# Nothing composed at this path: nothing to check, and NOT a refusal. Tested
+# before the canonicalisation below because `readlink -f` exits non-zero on a
+# dangling path, which under `set -e` killed the script with rc=1 and an empty
+# stderr - a refusal the caller reports as a failed attestation with no
+# diagnostic to show for it. Observed in the SDK container against a prefix
+# whose symlink resolved outside the mount.
+[ -d "$RAW" ] || exit 0
+SYSROOT=$(readlink -f "$RAW")
 CAPS="$SYSROOT/etc/avocado-security-capabilities"
-REL="usr/libexec/cryptsetup-var/var-key.sh"
-PROV="$SYSROOT/$REL"
+DIR="usr/libexec/cryptsetup-var"
+UNITDIR="usr/lib/systemd/system"
+
+# One entry per attested component, mirroring
+# avocado_var_key_attested_components() in meta-avocado's
+# avocado-security-capabilities.bbclass. Two directories, because the unit that
+# RUNS the unlock path does not live beside the scripts - and binding the
+# scripts while leaving the unit unbound is the same mistake one level up as
+# binding var-key.sh while leaving cryptsetup-var.sh unbound.
+COMPONENTS="\
+$DIR/cryptsetup-var.sh:yes \
+$DIR/var-key.sh:yes \
+$DIR/var-hwkey.sh:no \
+$UNITDIR/cryptsetup-var.service:yes"
 
 # Undeclared, or unmigrated: nothing to check.
 [ -f "$CAPS" ] || exit 0
 grep -qw 'encrypted-var' "$CAPS" || exit 0
 
-if [ ! -e "$PROV" ]; then
+# Decide on the SET, not on the provider. Gating the component checks on
+# var-key.sh made the higher-value target checkable only when the smaller one
+# was present: measured, a rootfs sysroot with a substituted cryptsetup-var.sh,
+# a stale digest and no var-key.sh passed with rc=0 and no stderr. Restoring an
+# untouched var-key.sh flipped the same tree to rc=1.
+#
+# `-L` as well as `-e` throughout, because a DANGLING symlink satisfies neither
+# `-e` nor `-f` and would count as absent. A link named var-key.sh is something
+# shipped, not something missing; check_component is what refuses it.
+shipped=
+for _entry in $COMPONENTS; do
+    _rel=${{_entry%:*}}
+    if [ -e "$SYSROOT/$_rel" ] || [ -L "$SYSROOT/$_rel" ]; then
+        shipped="$shipped $_rel"
+    fi
+done
+
+# Nothing from cryptsetup-var reached this sysroot. Only the initramfs is
+# required to carry the unlock path; a rootfs legitimately ships the udev and
+# posture packages without it.
+if [ -z "$shipped" ]; then
 {missing_provider}
 fi
 
-# A symlink at any component makes this check and the device read different
-# files, the same reason the build-side gates resolve rather than lstat.
-if [ "$(readlink -f "$PROV")" != "$PROV" ]; then
-    echo "avocado: $REL resolves outside the sysroot; refusing to ship it" >&2
-    exit 1
-fi
+# Every refusal calls `exit`, never `return`. A `return 1` leaves the refusal
+# depending on `set -e` still being armed at the call site, and this is a
+# security gate: a later `|| true`, a wrapping `if`, or a caller that drops
+# errexit would turn every refusal into an unread warning on stderr while the
+# script still exited 0 - because the last call, `var-hwkey.sh no`, returns 0
+# on every machine that ships no hardware backend. `exit` inside a function
+# terminates the script regardless of how it was called, which is the property
+# a gate needs.
+check_component() {{
+    rel="$1"
+    required="$2"
+    path="$SYSROOT/$rel"
 
-if [ ! -f "$PROV.sha256" ]; then
-    echo "avocado: $REL has no attestation beside it. cryptsetup-var writes" >&2
-    echo "avocado: one only after its deliverability checks pass, so its" >&2
-    echo "avocado: absence means those checks did not run over this provider." >&2
-    exit 1
-fi
+    # Before the existence test, not after. A dangling symlink fails `-e`, so
+    # testing existence first reports it as an absent file and an optional
+    # component would then be skipped outright - the one shape where "not
+    # there" and "there and wrong" are the same syscall away.
+    if [ -L "$path" ]; then
+        echo "avocado: $rel is a symlink. This check would read the link's" >&2
+        echo "avocado: target on the build host and the device would read" >&2
+        echo "avocado: whatever the same path resolves to at boot, so a" >&2
+        echo "avocado: match here says nothing. Ship it as a regular file." >&2
+        exit 1
+    fi
 
-recorded=$(cat "$PROV.sha256")
-actual=$(sha256sum "$PROV" | cut -d' ' -f1)
-if [ "$recorded" != "$actual" ]; then
-    echo "avocado: $REL is NOT the file the build validated." >&2
-    echo "avocado: attested $recorded" >&2
-    echo "avocado: shipped  $actual" >&2
-    echo "avocado: whatever it declares about itself, it has not been shown" >&2
-    echo "avocado: to derive a device-unique key." >&2
+    if [ ! -e "$path" ]; then
+        if [ "$required" = no ]; then
+            # A machine with no key-wrapping engine ships no var-hwkey.sh and
+            # that is correct. One that DOES ship it still has to attest it,
+            # which is why absence is skipped here and not the whole component.
+            return 0
+        fi
+        echo "avocado: this sysroot ships$shipped but no $rel. They install" >&2
+        echo "avocado: from one package, so the directory was edited after" >&2
+        echo "avocado: packaging. Nothing calls the provider without" >&2
+        echo "avocado: cryptsetup-var.sh, and cryptsetup-var.sh has nothing" >&2
+        echo "avocado: to call without var-key.sh, so /var never unlocks." >&2
+        exit 1
+    fi
+
+    # The leaf is a regular file by here, so what this still catches is a
+    # symlinked PARENT DIRECTORY - the shape a leaf-only guard reads straight
+    # through, and the one the build-side tiers had to be widened for too.
+    case "$(readlink -f "$path")" in
+        "$SYSROOT"/*) : ;;
+        *)
+        echo "avocado: $rel resolves outside the sysroot; refusing to ship it" >&2
+        exit 1 ;;
+    esac
+
+    if [ ! -f "$path.sha256" ]; then
+        echo "avocado: $rel has no attestation beside it. cryptsetup-var" >&2
+        echo "avocado: writes one for every script on the unlock path, only" >&2
+        echo "avocado: after its deliverability checks pass, so its absence" >&2
+        echo "avocado: means those checks did not run over this file." >&2
+        exit 1
+    fi
+
+    recorded=$(cat "$path.sha256")
+    actual=$(sha256sum "$path" | cut -d' ' -f1)
+    if [ "$recorded" != "$actual" ]; then
+        echo "avocado: $rel is NOT the file the build validated." >&2
+        echo "avocado: attested $recorded" >&2
+        echo "avocado: shipped  $actual" >&2
+        echo "avocado: whatever it declares about itself, it has not been" >&2
+        echo "avocado: shown to derive a device-unique key." >&2
+        exit 1
+    fi
+    return 0
+}}
+
+# Only ever one component is reported: every refusal exits, so the first one
+# wrong is the last thing printed. Order therefore decides WHICH failure an
+# operator sees, and cryptsetup-var.sh is the script an attacker substitutes.
+for _entry in $COMPONENTS; do
+    check_component "${{_entry%:*}}" "${{_entry##*:}}"
+done
+
+# Attesting the unit is not enough on its own: the same edit that repoints
+# ExecStart can instead delete the symlink that pulls the unit into the initrd,
+# which leaves every digest matching and the unit simply never started. The
+# build stages that link by hand because the systemd preset does not create it
+# for a WantedBy=initrd-root-fs.target unit, so its absence is never
+# legitimate when the unit itself is present.
+LINK="$UNITDIR/initrd-root-fs.target.wants/cryptsetup-var.service"
+if [ -e "$SYSROOT/$UNITDIR/cryptsetup-var.service" ] \
+    && [ ! -e "$SYSROOT/$LINK" ] && [ ! -L "$SYSROOT/$LINK" ]; then
+    echo "avocado: this sysroot ships cryptsetup-var.service but not the" >&2
+    echo "avocado: $LINK symlink" >&2
+    echo "avocado: that pulls it into the initrd. Every digest still matches" >&2
+    echo "avocado: and /var is simply never unlocked." >&2
     exit 1
 fi
 "#
@@ -1684,6 +1811,289 @@ mod tests {
 
         assert!(initramfs.contains("$AVOCADO_PREFIX/initramfs"));
         assert!(rootfs.contains("$AVOCADO_PREFIX/rootfs"));
+    }
+
+    /// Everything above asserts on the TEXT of the generated script, which is
+    /// worth exactly as much as a mutation can prove. Measured: replacing the
+    /// whole `check_component` body with `return 0` left both text tests green,
+    /// so the gate could be gutted without failing anything.
+    ///
+    /// This one runs it. `sh` against real fixture trees, one case per decision
+    /// branch, because every defect found in this script - the dangling-symlink
+    /// misclassification, the non-canonical prefix false refusal, the provider
+    /// gating the whole check - was found by executing it and none of them was
+    /// visible in its text.
+    #[test]
+    fn attestation_script_refuses_each_tampered_sysroot() {
+        use std::os::unix::fs::symlink;
+
+        // (case name, sysroot kind, mutate, expected refusal)
+        // `None` expects acceptance.
+        /// One executing case: what it is called, whether the sysroot is an
+        /// initramfs, how to damage it, and the refusal it must produce
+        /// (`None` meaning the sysroot must be accepted).
+        type Case = (
+            &'static str,
+            bool,
+            fn(&std::path::Path),
+            Option<&'static str>,
+        );
+
+        let cases: Vec<Case> = vec![
+            ("clean initramfs", true, |_| {}, None),
+            (
+                "unlock script tampered",
+                true,
+                |d| {
+                    std::fs::write(d.join("cryptsetup-var.sh"), "#!/bin/sh\nevil\n").unwrap();
+                },
+                Some("is NOT the file the build validated"),
+            ),
+            (
+                "unlock script unattested",
+                true,
+                |d| std::fs::remove_file(d.join("cryptsetup-var.sh.sha256")).unwrap(),
+                Some("has no attestation beside it"),
+            ),
+            (
+                "provider tampered",
+                true,
+                |d| {
+                    std::fs::write(d.join("var-key.sh"), "#!/bin/sh\nevil\n").unwrap();
+                },
+                Some("is NOT the file the build validated"),
+            ),
+            (
+                "optional backend present and unattested",
+                true,
+                |d| std::fs::write(d.join("var-hwkey.sh"), "#!/bin/sh\n").unwrap(),
+                Some("has no attestation beside it"),
+            ),
+            (
+                "unit file tampered",
+                true,
+                |d| {
+                    let units = d
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("usr/lib/systemd/system");
+                    std::fs::write(
+                        units.join("cryptsetup-var.service"),
+                        "[Unit]\nConditionPathExists=/nowhere\n",
+                    )
+                    .unwrap();
+                },
+                Some("is NOT the file the build validated"),
+            ),
+            (
+                "unit enabled-symlink deleted",
+                true,
+                |d| {
+                    let units = d
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("usr/lib/systemd/system");
+                    std::fs::remove_file(
+                        units.join("initrd-root-fs.target.wants/cryptsetup-var.service"),
+                    )
+                    .unwrap();
+                },
+                Some("never unlocked"),
+            ),
+            (
+                "component is a symlink",
+                true,
+                |d| {
+                    std::fs::remove_file(d.join("var-key.sh")).unwrap();
+                    symlink("/nowhere/var-key.sh", d.join("var-key.sh")).unwrap();
+                },
+                Some("is a symlink"),
+            ),
+        ];
+
+        for (name, initramfs, mutate, want) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let dir = build_attestation_fixture(root.path(), initramfs);
+            mutate(&dir);
+            let (code, err) = run_attestation_script(root.path(), initramfs);
+            match want {
+                None => assert_eq!(code, 0, "{name}: expected accept, stderr: {err}"),
+                Some(needle) => {
+                    assert_eq!(code, 1, "{name}: expected refusal, stderr: {err}");
+                    assert!(err.contains(needle), "{name}: wrong branch, stderr: {err}");
+                }
+            }
+        }
+    }
+
+    /// A rootfs shipping the unlock script but no provider must still be
+    /// checked. The first version gated every component on `var-key.sh`, so
+    /// deleting it disarmed the `cryptsetup-var.sh` check entirely - measured
+    /// rc=0 on a sysroot whose unlock script had been substituted.
+    #[test]
+    fn a_rootfs_unlock_script_is_checked_without_a_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = build_attestation_fixture(root.path(), false);
+        std::fs::remove_file(dir.join("var-key.sh")).unwrap();
+        std::fs::remove_file(dir.join("var-key.sh.sha256")).unwrap();
+
+        let (code, err) = run_attestation_script(root.path(), false);
+        assert_eq!(code, 1, "expected refusal, stderr: {err}");
+        assert!(err.contains("but no"), "wrong branch, stderr: {err}");
+
+        // And a rootfs shipping none of it is the legitimate case.
+        let bare = tempfile::tempdir().unwrap();
+        let caps = bare.path().join("rootfs/etc");
+        std::fs::create_dir_all(&caps).unwrap();
+        std::fs::write(
+            caps.join("avocado-security-capabilities"),
+            "encrypted-var\n",
+        )
+        .unwrap();
+        let (code, err) = run_attestation_script(bare.path(), false);
+        assert_eq!(code, 0, "bare rootfs should pass, stderr: {err}");
+    }
+
+    /// A non-canonical `AVOCADO_PREFIX` must not refuse a clean sysroot. The
+    /// parent-directory check compared `readlink -f` output against the raw
+    /// path, so a symlinked component or a trailing slash refused every
+    /// component with "resolves outside the sysroot" - measured on a tree with
+    /// no symlink in it.
+    #[test]
+    fn a_non_canonical_prefix_does_not_refuse_a_clean_sysroot() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        build_attestation_fixture(&real, true);
+
+        let (code, err) = run_attestation_script(&real, true);
+        assert_eq!(code, 0, "canonical prefix, stderr: {err}");
+
+        let link = root.path().join("link");
+        symlink(&real, &link).unwrap();
+        let (code, err) = run_attestation_script(&link, true);
+        assert_eq!(code, 0, "symlinked prefix, stderr: {err}");
+
+        // A prefix with no sysroot under it must exit 0 silently, not die on
+        // `readlink -f`. Under `set -e` that produced rc=1 with an empty
+        // stderr, which the caller renders as a failed attestation carrying no
+        // reason - strictly worse than the silent pass it replaced.
+        let absent = tempfile::tempdir().unwrap();
+        let (code, err) = run_attestation_script(absent.path(), true);
+        assert_eq!(code, 0, "absent sysroot, stderr: {err}");
+        assert!(err.is_empty(), "absent sysroot should be silent: {err}");
+
+        let dangling = root.path().join("dangling");
+        symlink(root.path().join("nowhere"), &dangling).unwrap();
+        let (code, err) = run_attestation_script(&dangling, true);
+        assert_eq!(code, 0, "dangling prefix, stderr: {err}");
+
+        let trailing = format!("{}/", real.display());
+        let (code, err) = run_attestation_script(std::path::Path::new(&trailing), true);
+        assert_eq!(code, 0, "trailing slash, stderr: {err}");
+    }
+
+    /// Writes a sysroot the script should accept: the capability declared, and
+    /// both required scripts present with matching attestations.
+    fn build_attestation_fixture(prefix: &std::path::Path, initramfs: bool) -> std::path::PathBuf {
+        let sysroot = prefix.join(if initramfs { "initramfs" } else { "rootfs" });
+        let dir = sysroot.join("usr/libexec/cryptsetup-var");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(sysroot.join("etc")).unwrap();
+        std::fs::write(
+            sysroot.join("etc/avocado-security-capabilities"),
+            "encrypted-var\n",
+        )
+        .unwrap();
+        for name in ["cryptsetup-var.sh", "var-key.sh"] {
+            let body = format!("#!/bin/sh\n# {name}\n");
+            std::fs::write(dir.join(name), &body).unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.sha256")),
+                format!("{}\n", sha256_hex(body.as_bytes())),
+            )
+            .unwrap();
+        }
+
+        // The unit and the symlink that enables it. The build stages the link
+        // by hand because the preset does not create one for a
+        // WantedBy=initrd-root-fs.target unit.
+        let units = sysroot.join("usr/lib/systemd/system");
+        let wants = units.join("initrd-root-fs.target.wants");
+        std::fs::create_dir_all(&wants).unwrap();
+        let unit = "[Unit]\nConditionPathExists=/etc/avocado/var-encrypt\n";
+        std::fs::write(units.join("cryptsetup-var.service"), unit).unwrap();
+        std::fs::write(
+            units.join("cryptsetup-var.service.sha256"),
+            format!("{}\n", sha256_hex(unit.as_bytes())),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../cryptsetup-var.service",
+            wants.join("cryptsetup-var.service"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn run_attestation_script(prefix: &std::path::Path, initramfs: bool) -> (i32, String) {
+        let script = generate_var_key_attestation_script(
+            if initramfs { "initramfs" } else { "rootfs" },
+            initramfs,
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", prefix)
+            .output()
+            .expect("sh");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    /// The provider is the smaller target. cryptsetup-var.sh decides whether
+    /// the provider is called at all and what happens to the 64 bytes it
+    /// returns, so a check that binds only var-key.sh passes a sysroot whose
+    /// unlock script was replaced with one that writes a constant key.
+    ///
+    /// Asserting on the invocation lines rather than on the shared function
+    /// body: the body is written once, so a single `contains` there stays true
+    /// after a component is dropped from the call list, which is exactly the
+    /// regression this pins.
+    #[test]
+    fn attestation_script_checks_every_script_on_the_unlock_path() {
+        let script = generate_var_key_attestation_script("initramfs", true);
+
+        assert!(script.contains("$DIR/cryptsetup-var.sh:yes"));
+        assert!(script.contains("$DIR/var-key.sh:yes"));
+        // Optional in one direction only: a machine with no key-wrapping
+        // engine ships no var-hwkey.sh, but one that ships it must attest it.
+        assert!(script.contains("$DIR/var-hwkey.sh:no"));
+        // The unit decides whether any of the above runs at all.
+        assert!(script.contains("$UNITDIR/cryptsetup-var.service:yes"));
     }
 
     use super::{
