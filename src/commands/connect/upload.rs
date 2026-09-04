@@ -7,11 +7,15 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, RuntimeParams, UploadPartError,
+    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, HttpStatus, RuntimeParams,
+    UploadPartError,
 };
+use crate::commands::sbom::generate::{in_runtime, SbomCommand};
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
-use crate::utils::output::{print_success, print_warning, tui_is_active, OutputLevel};
+use crate::utils::output::{
+    print_success, print_warning, print_warning_above, tui_is_active, OutputLevel,
+};
 use crate::utils::output_format::{
     emit_json_event, emit_step, emit_step_error, emit_task_registered, is_json_output_active,
     JsonOutputGuard, OutputFormat,
@@ -220,6 +224,9 @@ impl ConnectUploadCommand {
                         &d.content_keyid,
                     )
                 }),
+                // `--file` may point at a tarball built elsewhere, so this
+                // machine's sysroots would be a false claim about it.
+                None,
             )
             .await?;
 
@@ -298,9 +305,10 @@ impl ConnectUploadCommand {
             None
         };
 
-        // Phase B: Create runtime via API
-        let (runtime, num_artifacts) = run_phase(
-            PHASE_CREATE,
+        // Phase B: Create runtime via API. The SBOM (ENG-2219) is built in
+        // this phase rather than one of its own.
+        let (runtime, num_artifacts) = run_phase(PHASE_CREATE, async {
+            let sbom = self.build_sbom().await;
             self.create_runtime_api(
                 connect,
                 version,
@@ -318,8 +326,10 @@ impl ConnectUploadCommand {
                     })
                     .collect::<Vec<_>>(),
                 delegation_refs,
-            ),
-        )
+                sbom,
+            )
+            .await
+        })
         .await?;
 
         if runtime.status == "draft" {
@@ -349,6 +359,7 @@ impl ConnectUploadCommand {
 
     /// Create a runtime via the Connect API. Returns the runtime data and
     /// artifact count.
+    #[allow(clippy::too_many_arguments)]
     async fn create_runtime_api(
         &self,
         connect: &ConnectClient,
@@ -357,6 +368,7 @@ impl ConnectUploadCommand {
         manifest: &serde_json::Value,
         artifacts: &[ArtifactParam],
         delegation: Option<(&String, &String, &String)>,
+        sbom: Option<serde_json::Value>,
     ) -> Result<(client::RuntimeCreateData, usize)> {
         progress(
             &format!("Creating runtime {version}..."),
@@ -376,12 +388,30 @@ impl ConnectUploadCommand {
                 content_keyid: delegation.map(|(_, _, kid)| kid.clone()),
                 config,
                 lockfile,
+                sbom,
             },
         };
-        let runtime = connect
+
+        match connect
             .create_runtime(&self.org, &self.project, &create_req)
-            .await?;
-        Ok((runtime, num_artifacts))
+            .await
+        {
+            Ok(runtime) => Ok((runtime, num_artifacts)),
+            // The server rejecting the SBOM must never fail the upload.
+            Err(e) if create_req.runtime.sbom.is_some() && is_client_error(&e) => {
+                print_warning_above(&format!(
+                    "Connect rejected the runtime with an SBOM attached ({e:#}); retrying \
+                     without it."
+                ));
+                let mut retry_req = create_req;
+                retry_req.runtime.sbom = None;
+                let runtime = connect
+                    .create_runtime(&self.org, &self.project, &retry_req)
+                    .await?;
+                Ok((runtime, num_artifacts))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Read `avocado.yaml` (converted YAML→JSON) and the lock file
@@ -427,6 +457,48 @@ impl ConnectUploadCommand {
         };
 
         Ok((Some(config_json), lockfile_json))
+    }
+
+    /// The runtime's SBOM, or `None` on any failure — a document Connect
+    /// cannot ingest yet is worth less than the upload it would block, the
+    /// contract `read_config_and_lockfile` already has for the lockfile.
+    ///
+    /// `AVOCADO_UPLOAD_NO_SBOM=1` skips the build outright.
+    async fn build_sbom(&self) -> Option<serde_json::Value> {
+        if std::env::var("AVOCADO_UPLOAD_NO_SBOM").as_deref() == Ok("1") {
+            return None;
+        }
+        match self.scan_runtime_sbom().await {
+            Ok(doc) => Some(doc),
+            Err(e) => {
+                // Not `print_warning`: that one is suppressed under
+                // `--output json`, hiding the skipped check from the reader
+                // most likely to act on it.
+                print_warning_above(&format!(
+                    "Could not build the runtime's SBOM ({e:#}); uploading without it."
+                ));
+                None
+            }
+        }
+    }
+
+    /// `avocado sbom`'s document, filtered to this runtime by `in_runtime`.
+    async fn scan_runtime_sbom(&self) -> Result<serde_json::Value> {
+        let cmd = SbomCommand::new(
+            self.config_path.clone(),
+            self.target.clone(),
+            None,
+            false,
+            false,
+            None,
+            OutputFormat::Human,
+        );
+        let (scopes, target, snapshot) = cmd.scan().await?;
+        let kept: Vec<_> = scopes
+            .into_iter()
+            .filter(|s| in_runtime(&s.name, &self.runtime))
+            .collect();
+        Ok(cmd.build_document(&kept, &target, snapshot.as_ref()))
     }
 
     /// Handle the case where the runtime is already in draft status (full dedup).
@@ -1433,6 +1505,15 @@ fn read_delegation_info(artifacts_dir: &Path) -> Option<DelegationInfo> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Any 4xx, not an enumerated list: the likeliest refusal of a request
+/// carrying an SBOM is 413, since ~400 packages of SPDX is megabytes into a
+/// body that is otherwise kilobytes. 4xx also means the server created
+/// nothing, so retrying this non-idempotent POST leaves no duplicate runtime.
+fn is_client_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<HttpStatus>()
+        .is_some_and(|s| s.0.is_client_error())
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut size = bytes as f64;
@@ -1518,5 +1599,29 @@ mod tests {
         // Verify the part checksum matches an independently computed base64 SHA-256
         let expected = BASE64_STANDARD.encode(Sha256::digest(&data));
         assert_eq!(parts[0], expected);
+    }
+
+    #[test]
+    fn a_runtime_with_no_sbom_sends_no_sbom_key() {
+        // A server that does not read `sbom` yet must see today's request
+        // unchanged when the build produced `None`.
+        let params = RuntimeParams {
+            version: "1.0.0".to_string(),
+            build_id: None,
+            description: None,
+            manifest: None,
+            artifacts: Vec::new(),
+            delegated_targets_json: None,
+            content_key_hex: None,
+            content_keyid: None,
+            config: None,
+            lockfile: None,
+            sbom: None,
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert!(
+            value.as_object().unwrap().get("sbom").is_none(),
+            "got: {value}"
+        );
     }
 }

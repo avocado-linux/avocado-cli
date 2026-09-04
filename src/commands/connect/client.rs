@@ -45,6 +45,19 @@ pub(crate) fn classify_upload_part_error(status: u16, body: &str) -> UploadPartE
     }
 }
 
+/// Lets a caller branch on a failed request's status instead of on message
+/// text, which the server is free to reword (ENG-2219).
+#[derive(Debug)]
+pub struct HttpStatus(pub reqwest::StatusCode);
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.0)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
 const CONFIG_FILE: &str = "credentials.json";
 
 // ---------------------------------------------------------------------------
@@ -443,6 +456,10 @@ pub struct RuntimeParams {
     pub config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lockfile: Option<serde_json::Value>,
+    /// The runtime's SPDX 3.0.1 SBOM (ENG-2219). Skipped when absent, so a
+    /// server that does not read it yet sees today's request unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sbom: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1203,7 +1220,8 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to create runtime (HTTP {status}): {body}");
+            return Err(anyhow::Error::new(HttpStatus(status))
+                .context(format!("Failed to create runtime (HTTP {status}): {body}")));
         }
 
         let resp: CreateRuntimeResponse = res.json().await?;
