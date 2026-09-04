@@ -626,6 +626,53 @@ fn parse_probe_output(text: &str) -> Option<bool> {
 /// `?`-ing out of the caller: the install has already landed and its lock pins
 /// are recorded in memory by this point, and the caller only persists them when
 /// `install_sysroot` returns `Ok`.
+/// Run the var-key attestation check inside the SDK container.
+///
+/// Separate from the build-time tiers on purpose: those run in BitBake and
+/// never see this sysroot, because avocado-cli composes from feed RPMs rather
+/// than building a Yocto image.
+async fn verify_var_key_attestation(
+    params: &SysrootInstallParams<'_>,
+    sysroot_dir: &str,
+) -> Result<()> {
+    let config = RunConfig {
+        container_image: params.container_image.to_string(),
+        target: params.target.to_string(),
+        command: generate_var_key_attestation_script(
+            sysroot_dir,
+            matches!(params.sysroot_type, SysrootType::Initramfs),
+        ),
+        verbose: params.verbose,
+        source_environment: true,
+        interactive: false,
+        repo_url: params.repo_url.map(|s| s.to_string()),
+        repo_release: params.repo_release.map(|s| s.to_string()),
+        container_args: params.merged_container_args.clone(),
+        sdk_arch: params.sdk_arch.cloned(),
+        tui_context: params.tui_context.clone(),
+        ..Default::default()
+    };
+
+    let outcome = if let Some(context) = params.runs_on_context {
+        params
+            .container_helper
+            .run_in_container_with_context(&config, context)
+            .await
+    } else {
+        params.container_helper.run_in_container(config).await
+    };
+
+    match outcome {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(anyhow::anyhow!(
+            "The composed {sysroot_dir} declares encrypted-var but its var-key \
+             provider does not match the attestation the build wrote beside it. \
+             See the diagnostic above."
+        )),
+        Err(e) => Err(e).context("could not run the var-key attestation check"),
+    }
+}
+
 async fn write_install_stamp(
     params: &SysrootInstallParams<'_>,
     packages: &HashMap<String, serde_yaml::Value>,
@@ -679,6 +726,93 @@ async fn write_install_stamp(
         );
     }
     Ok(())
+}
+
+/// Shell that verifies the composed sysroot's var-key provider against the
+/// attestation the build wrote beside it.
+///
+/// meta-avocado gates this at three tiers, and all three hang off a Yocto
+/// *image* recipe or the cryptsetup-var recipe's own datastore. avocado-cli
+/// composes a sysroot from the feed's RPMs and builds no image, so none of
+/// them runs on the path a device actually receives - the tree says so itself
+/// in avocado-security-capabilities.bb, which exists because the image-scope
+/// artifact never reached a jetson-orin-nano.
+///
+/// What survives into the RPM is `var-key.sh` plus the `var-key.sh.sha256`
+/// that cryptsetup-var's do_install writes AFTER every deliverability check
+/// passes. Checking the pair here is what re-arms the gate for this path: a
+/// provider swapped after validation no longer matches, and a missing
+/// attestation means the build-time check never completed over this provider.
+///
+/// `require_provider` mirrors the build-side rule - only the initramfs must
+/// carry a provider, while a rootfs legitimately ships the udev and posture
+/// packages without one, and validates it when it does have one.
+///
+/// ROLLOUT ORDER IS NOT OPTIONAL. A feed built before meta-avocado wrote the
+/// attestation has no `.sha256`, and this refuses it rather than warning -
+/// measured, rc=1, against a sysroot composed from a real pre-change RPM. So
+/// meta-avocado ships first and feeds rebuild before this check goes live.
+/// Softening the missing-attestation case to a warning would reintroduce
+/// exactly the silent pass the check exists to remove, and would do it on the
+/// louder of the two signals: the build writes the attestation LAST, so its
+/// absence means the deliverability checks did not complete.
+///
+/// The utilities below are present in the SDK container and verified there,
+/// not assumed: sha256sum, readlink, grep, cat and cut all resolve under
+/// /usr/bin in avocadolinux/sdk:2024-edge, `readlink -f` resolves, and
+/// sha256sum emits the two-field output `cut -d' ' -f1` expects.
+fn generate_var_key_attestation_script(sysroot_dir: &str, require_provider: bool) -> String {
+    let missing_provider = if require_provider {
+        r#"    echo "avocado: this sysroot declares encrypted-var but ships no" >&2
+    echo "avocado: $REL - cryptsetup-var.sh reads the declaration at boot," >&2
+    echo "avocado: finds no way to derive a key, and /var never unlocks." >&2
+    exit 1"#
+    } else {
+        r#"    exit 0"#
+    };
+
+    format!(
+        r#"
+set -eu
+SYSROOT="$AVOCADO_PREFIX/{sysroot_dir}"
+CAPS="$SYSROOT/etc/avocado-security-capabilities"
+REL="usr/libexec/cryptsetup-var/var-key.sh"
+PROV="$SYSROOT/$REL"
+
+# Undeclared, or unmigrated: nothing to check.
+[ -f "$CAPS" ] || exit 0
+grep -qw 'encrypted-var' "$CAPS" || exit 0
+
+if [ ! -e "$PROV" ]; then
+{missing_provider}
+fi
+
+# A symlink at any component makes this check and the device read different
+# files, the same reason the build-side gates resolve rather than lstat.
+if [ "$(readlink -f "$PROV")" != "$PROV" ]; then
+    echo "avocado: $REL resolves outside the sysroot; refusing to ship it" >&2
+    exit 1
+fi
+
+if [ ! -f "$PROV.sha256" ]; then
+    echo "avocado: $REL has no attestation beside it. cryptsetup-var writes" >&2
+    echo "avocado: one only after its deliverability checks pass, so its" >&2
+    echo "avocado: absence means those checks did not run over this provider." >&2
+    exit 1
+fi
+
+recorded=$(cat "$PROV.sha256")
+actual=$(sha256sum "$PROV" | cut -d' ' -f1)
+if [ "$recorded" != "$actual" ]; then
+    echo "avocado: $REL is NOT the file the build validated." >&2
+    echo "avocado: attested $recorded" >&2
+    echo "avocado: shipped  $actual" >&2
+    echo "avocado: whatever it declares about itself, it has not been shown" >&2
+    echo "avocado: to derive a device-unique key." >&2
+    exit 1
+fi
+"#
+    )
 }
 
 /// Install a sysroot (rootfs or initramfs) via DNF into the SDK container volume.
@@ -1284,6 +1418,14 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             return Err(incomplete_install_error(label, &reason));
         }
 
+        // This one IS `?`, unlike the stamp write below. A sysroot whose
+        // var-key provider does not match the attestation the build wrote is
+        // not a recording problem - it is a sysroot that must not ship, and
+        // letting it through here is the whole gap this check exists to close.
+        // Placed before the stamp so a refused sysroot cannot be recorded
+        // fresh and skipped on the next run.
+        verify_var_key_attestation(params, sysroot_dir).await?;
+
         // Deliberately not `?`. Unlike the checks above -- which report a
         // sysroot that is not what the config asked for -- a stamp-write
         // failure leaves a correct sysroot that simply is not recorded, and the
@@ -1516,6 +1658,34 @@ impl RootfsInstallCommand {
 
 #[cfg(test)]
 mod tests {
+    use super::generate_var_key_attestation_script;
+
+    /// The initramfs must carry a provider; a rootfs legitimately ships the
+    /// udev and posture packages without one. Getting this backwards fails
+    /// every rootfs build on a declaring machine, so the two scripts must
+    /// actually differ on that branch and agree everywhere else.
+    #[test]
+    fn attestation_script_requires_a_provider_only_for_the_initramfs() {
+        let initramfs = generate_var_key_attestation_script("initramfs", true);
+        let rootfs = generate_var_key_attestation_script("rootfs", false);
+
+        assert!(initramfs.contains("declares encrypted-var but ships no"));
+        assert!(!rootfs.contains("declares encrypted-var but ships no"));
+
+        // Everything after the absent-provider branch is shared, and is what
+        // validates a provider that IS present - so a rootfs that ships one is
+        // still checked rather than waved through.
+        for script in [&initramfs, &rootfs] {
+            assert!(script.contains("is NOT the file the build validated"));
+            assert!(script.contains("has no attestation beside it"));
+            assert!(script.contains("resolves outside the sysroot"));
+            assert!(script.contains("grep -qw 'encrypted-var'"));
+        }
+
+        assert!(initramfs.contains("$AVOCADO_PREFIX/initramfs"));
+        assert!(rootfs.contains("$AVOCADO_PREFIX/rootfs"));
+    }
+
     use super::{
         build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
         incomplete_install_reason, parse_probe_output,
