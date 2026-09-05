@@ -519,6 +519,11 @@ pub fn inject_feed_env(
     env_vars: &mut std::collections::HashMap<String, String>,
     feeds: Option<&crate::utils::feeds::FeedMaterialization>,
 ) {
+    // Identity rides on every run, named feeds or not.
+    env_vars.insert(
+        "AVOCADO_FEED_UA".to_string(),
+        crate::utils::feeds::user_agent(),
+    );
     let Some(feeds) = feeds else { return };
     for (k, v) in &feeds.env {
         env_vars.insert(k.clone(), v.clone());

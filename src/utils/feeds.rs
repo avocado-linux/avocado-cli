@@ -51,6 +51,34 @@ pub const CONTAINER_FEEDS_DIR: &str = "/run/avocado-feeds";
 /// reaches the developer's machine rather than the container itself.
 pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 
+/// The User-Agent every feed request carries. Version always; when a Connect
+/// profile is logged in, a non-secret per-token key id so usage attributes to
+/// an account (fast, per-machine counters at the edge; roll-up to org via
+/// `user_api_tokens.token_hash`). Space-free on purpose: it rides in
+/// `$DNF_SDK_HOST`, which the entrypoint word-splits.
+///
+/// The key id is the first 12 hex chars of SHA-256(token) — the same digest
+/// Connect already stores as `token_hash`, so it joins server-side with no
+/// new endpoint, and reveals nothing about the token.
+pub fn user_agent() -> String {
+    let base = concat!("avocado-cli/", env!("CARGO_PKG_VERSION"));
+    // tier/1 = authenticated, tier not yet assigned by Connect. The edge
+    // routes on `tier/<n>`, so without it a logged-in client would share the
+    // anonymous bucket; Connect raises it once it hands the CLI a real tier.
+    match feed_key_id() {
+        Some(id) => format!("{base};key/{id};tier/1"),
+        None => base.to_string(),
+    }
+}
+
+fn feed_key_id() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let cfg = crate::commands::connect::client::load_config().ok()??;
+    let (_, profile) = cfg.resolve_profile(None, None).ok()?;
+    let digest = Sha256::digest(profile.token.as_bytes());
+    Some(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
+}
+
 /// Priority step between consecutive `distro.feeds` entries. The distro feed's
 /// built-in repos keep their relative order inside one step (sdk, target, tune,
 /// noarch, ext = base+0..4), so a step of 10 leaves headroom.
@@ -569,6 +597,11 @@ pub fn rewrite_loopback(url: &str) -> (String, bool) {
 /// [`FeedMaterialization`]. The entrypoint has no `set -e`, so every write
 /// fails closed explicitly.
 pub const FEEDS_SETUP_SNIPPET: &str = r##"
+# --- feed identity: every dnf request carries the CLI version and, when
+# logged in, a non-secret key id (see utils::feeds::user_agent) ---
+if [ -n "${AVOCADO_FEED_UA:-}" ]; then
+    export DNF_SDK_HOST="${DNF_SDK_HOST} --setopt=user_agent=${AVOCADO_FEED_UA}"
+fi
 # --- named feeds (repos: / distro.feeds) ---
 # Always drop last run's generated files: a feed removed from config must not
 # survive in the sysroot's yum.repos.d (which persists in the docker volume).
@@ -799,6 +832,16 @@ distro:
         );
         assert!(!rewrite_loopback("https://repo.avocadolinux.org/x").1);
         assert!(!rewrite_loopback("file:///opt/x").1);
+    }
+
+    #[test]
+    fn user_agent_is_space_free_and_versioned() {
+        let ua = user_agent();
+        assert!(ua.starts_with(concat!("avocado-cli/", env!("CARGO_PKG_VERSION"))));
+        assert!(
+            !ua.contains(' '),
+            "UA rides in a word-split shell var: {ua}"
+        );
     }
 
     #[test]

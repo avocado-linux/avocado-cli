@@ -130,7 +130,7 @@ fn releasever_is_overridden(config: &Config) -> bool {
 fn build_client(config: &Config) -> Result<reqwest::Client> {
     let mut builder = reqwest::ClientBuilder::new()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent(concat!("avocado-cli/", env!("CARGO_PKG_VERSION")));
+        .user_agent(crate::utils::feeds::user_agent());
     if config.get_repo_insecure() {
         builder = builder.danger_accept_invalid_certs(true);
     }
