@@ -1,5 +1,6 @@
 //! Initramfs sysroot install command (delegates to shared sysroot install).
 
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -111,6 +112,7 @@ impl InitramfsInstallCommand {
 
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config.feeds_for(&target, FeedStage::Initramfs, &self.config_path)?;
 
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
@@ -136,6 +138,7 @@ impl InitramfsInstallCommand {
                 container_image: container_image.to_string(),
                 target: target.to_string(),
                 repo_url: repo_url.clone(),
+                feeds: feeds.clone(),
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
@@ -163,6 +166,7 @@ impl InitramfsInstallCommand {
                     target_board: self.target_board.as_deref(),
                     repo_url: repo_url.as_deref(),
                     repo_release: repo_release.as_deref(),
+                    feeds: feeds.as_ref(),
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     verbose: self.verbose,

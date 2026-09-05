@@ -1636,6 +1636,13 @@ pub struct SysrootStampInputs<'a> {
     pub dnf_args: Option<&'a [String]>,
     /// Locked NVR pins for this sysroot, as recorded in `avocado.lock`.
     pub locked_packages: Option<&'a std::collections::HashMap<String, String>>,
+    /// The per-stage projection of the named feed set (`repos:` /
+    /// `distro.feeds`) — `ResolvedFeedSet::stage_projection_json`. `None` when
+    /// the project declares no feeds, which folds exactly as before. Feed
+    /// order (dnf priority), gpg settings, credential identity and stage
+    /// scoping all change what dnf resolves without moving `repo_url` or
+    /// `repo_release`, so they have to move this instead.
+    pub feed_projection: Option<&'a str>,
 }
 
 /// Digest of a sysroot's lockfile pins as `name=version` lines ordered by
@@ -1736,6 +1743,7 @@ fn compute_sysroot_install_input_hash(
     for (key, value) in [
         ("sdk.repo_url", resolved.repo_url),
         ("sdk.repo_release", resolved.repo_release),
+        ("feeds", resolved.feed_projection),
     ] {
         if let Some(v) = value {
             hash_data.insert(
@@ -2428,6 +2436,7 @@ mod tests {
             disable_weak_dependencies: false,
             dnf_args: None,
             locked_packages: None,
+            feed_projection: None,
         }
     }
 
@@ -4768,6 +4777,49 @@ rootfs:
     }
 
     #[test]
+    fn rootfs_hash_moves_with_feed_projection() {
+        let config: serde_yaml::Value = serde_yaml::from_str("sdk:\n  image: foo\n").unwrap();
+        let root = std::path::Path::new(".");
+        let packages = default_rootfs_packages();
+        let hash_of = |resolved: &SysrootStampInputs<'_>| {
+            compute_rootfs_input_hash(&config, root, None, resolved)
+                .unwrap()
+                .config_hash
+        };
+        // No named feeds: the fold is byte-for-byte what it was.
+        let h_none = hash_of(&test_sysroot_inputs(&packages));
+        assert_eq!(h_none, hash_of(&test_sysroot_inputs(&packages)));
+
+        // Reordering distro.feeds changes which repo wins a package, so the
+        // existing sysroot skip must not fire. This is the regression the
+        // projection exists to close.
+        let yaml = |feeds: &str| {
+            format!(
+                "distro:\n  release: 2026\n  channel: next\n  feeds: {feeds}\nrepos:\n  a:\n    url: https://a.example\n  b:\n    url: https://b.example\n"
+            )
+        };
+        let proj = |feeds: &str| {
+            let c: crate::utils::config::Config = serde_yaml::from_str(&yaml(feeds)).unwrap();
+            crate::utils::feeds::ResolvedFeedSet::resolve(&c, "t", root)
+                .unwrap()
+                .unwrap()
+                .stage_projection_json(crate::utils::feeds::FeedStage::Rootfs)
+                .unwrap()
+        };
+        let (p_ab, p_ba) = (proj("[a, b]"), proj("[b, a]"));
+        let h_ab = hash_of(&SysrootStampInputs {
+            feed_projection: Some(&p_ab),
+            ..test_sysroot_inputs(&packages)
+        });
+        let h_ba = hash_of(&SysrootStampInputs {
+            feed_projection: Some(&p_ba),
+            ..test_sysroot_inputs(&packages)
+        });
+        assert_ne!(h_none, h_ab, "declaring feeds must invalidate");
+        assert_ne!(h_ab, h_ba, "reordering distro.feeds must invalidate");
+    }
+
+    #[test]
     fn rootfs_hash_changes_on_feed_identity_and_weak_deps() {
         let config: serde_yaml::Value = serde_yaml::from_str("sdk:\n  image: foo\n").unwrap();
         let root = std::path::Path::new(".");
@@ -4786,18 +4838,21 @@ rootfs:
         // `avocado update` land instead of being skipped as up to date.
         let h_release = hash_of(&SysrootStampInputs {
             repo_release: Some("2026.9.20260727"),
+            feed_projection: None,
             ..test_sysroot_inputs(&packages)
         });
         assert_ne!(h_base, h_release, "repo_release must invalidate");
 
         let h_url = hash_of(&SysrootStampInputs {
             repo_url: Some("https://repo.avocadolinux.org/2026/next"),
+            feed_projection: None,
             ..test_sysroot_inputs(&packages)
         });
         assert_ne!(h_base, h_url, "repo_url must invalidate");
 
         let h_weak = hash_of(&SysrootStampInputs {
             disable_weak_dependencies: true,
+            feed_projection: None,
             ..test_sysroot_inputs(&packages)
         });
         assert_ne!(
@@ -4810,6 +4865,7 @@ rootfs:
         let args = ["--enablerepo=extra".to_string()];
         let h_dnf = hash_of(&SysrootStampInputs {
             dnf_args: Some(&args),
+            feed_projection: None,
             ..test_sysroot_inputs(&packages)
         });
         assert_ne!(
@@ -4822,6 +4878,7 @@ rootfs:
         let empty: [String; 0] = [];
         let h_empty = hash_of(&SysrootStampInputs {
             dnf_args: Some(&empty),
+            feed_projection: None,
             ..test_sysroot_inputs(&packages)
         });
         assert_eq!(
@@ -4875,6 +4932,7 @@ rootfs:
                 None,
                 &SysrootStampInputs {
                     locked_packages: locked,
+                    feed_projection: None,
                     ..test_sysroot_inputs(&packages)
                 },
             )

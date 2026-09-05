@@ -1,3 +1,4 @@
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -200,6 +201,7 @@ impl ExtInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config.feeds_for(&target, FeedStage::Ext, &self.config_path)?;
 
         // Determine which extensions to install (with their locations)
         let extensions_to_install: Vec<(String, ExtensionLocation)> =
@@ -450,6 +452,7 @@ impl ExtInstallCommand {
                 &target,
                 repo_url.as_ref(),
                 repo_release.as_ref(),
+                feeds.as_ref(),
                 &merged_container_args,
                 runs_on_context.as_ref(),
                 &effective_tui_context,
@@ -489,6 +492,7 @@ impl ExtInstallCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
         effective_tui_context: &Option<TuiContext>,
@@ -535,6 +539,7 @@ impl ExtInstallCommand {
                     target,
                     repo_url,
                     repo_release,
+                    feeds,
                     merged_container_args,
                     config.get_sdk_disable_weak_dependencies(),
                     &mut lock_file,
@@ -590,6 +595,7 @@ impl ExtInstallCommand {
                     source_environment: true,
                     interactive: false,
                     repo_url: repo_url.cloned(),
+                    feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
@@ -698,6 +704,7 @@ impl ExtInstallCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         disable_weak_dependencies: bool,
         lock_file: &mut LockFile,
@@ -760,6 +767,7 @@ impl ExtInstallCommand {
                 source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
@@ -826,6 +834,7 @@ impl ExtInstallCommand {
             source_environment: false,
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -845,6 +854,7 @@ impl ExtInstallCommand {
                 source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
@@ -1134,6 +1144,7 @@ $DNF_SDK_HOST \
                     source_environment: false, // don't source environment
                     interactive: !self.force,  // interactive if not forced
                     repo_url: repo_url.cloned(),
+                    feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),

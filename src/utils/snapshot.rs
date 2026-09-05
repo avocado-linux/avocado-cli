@@ -113,8 +113,9 @@ fn releasever_is_overridden(config: &Config) -> bool {
     let distro_override = config
         .distro
         .as_ref()
-        .and_then(|d| d.repo.as_ref())
+        .and_then(|d| d.repo_inline())
         .and_then(|r| r.releasever.as_ref())
+        .or_else(|| config.distro_feed_def().and_then(|d| d.releasever.as_ref()))
         .is_some();
     let sdk_override = config
         .sdk

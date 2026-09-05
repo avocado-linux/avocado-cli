@@ -55,3 +55,6 @@ docs/_build/
 
 # Local development
 .local/
+
+# Scratch dir of scripts/local-feeds/run.sh
+.local-feeds-test/

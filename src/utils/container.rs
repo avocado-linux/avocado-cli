@@ -513,6 +513,28 @@ pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, Stri
     }
 }
 
+/// Inject the named-feeds env (see FEEDS_SETUP_SNIPPET) and fold the feeds'
+/// dnf args into `AVOCADO_DNF_ARGS`, which every `$DNF_SDK_HOST` call carries.
+pub fn inject_feed_env(
+    env_vars: &mut std::collections::HashMap<String, String>,
+    feeds: Option<&crate::utils::feeds::FeedMaterialization>,
+) {
+    let Some(feeds) = feeds else { return };
+    for (k, v) in &feeds.env {
+        env_vars.insert(k.clone(), v.clone());
+    }
+    if !feeds.dnf_args.is_empty() {
+        let extra = feeds.dnf_args.join(" ");
+        env_vars
+            .entry("AVOCADO_DNF_ARGS".to_string())
+            .and_modify(|existing| {
+                existing.push(' ');
+                existing.push_str(&extra);
+            })
+            .or_insert(extra);
+    }
+}
+
 /// Inject `SOURCE_DATE_EPOCH` into a container's env map when the project sets it.
 ///
 /// Read today by the rootfs script's `mkfs.erofs -T "${SOURCE_DATE_EPOCH:-0}"`.
@@ -571,6 +593,9 @@ pub struct RunConfig {
     /// TUI context for managed output capture. When set, container output is
     /// piped and fed to the TUI renderer instead of inheriting stdio.
     pub tui_context: Option<TuiContext>,
+    /// Named feeds (`repos:` / `distro.feeds`) materialized for this run:
+    /// generated `.repo` files to mount, env, dnf args. None = no named feeds.
+    pub feeds: Option<crate::utils::feeds::FeedMaterialization>,
 }
 
 impl Default for RunConfig {
@@ -604,6 +629,7 @@ impl Default for RunConfig {
             sdk_arch: None,
             ext_path_mounts: None,
             tui_context: None,
+            feeds: None,
         }
     }
 }
@@ -917,10 +943,13 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            config
-                .repo_url
-                .clone()
-                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            crate::utils::feeds::rewrite_loopback(
+                &config
+                    .repo_url
+                    .clone()
+                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            )
+            .0,
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -930,6 +959,7 @@ impl SdkContainer {
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
+        inject_feed_env(&mut env_vars, config.feeds.as_ref());
         if config.verbose || self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
@@ -1102,10 +1132,13 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            config
-                .repo_url
-                .clone()
-                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            crate::utils::feeds::rewrite_loopback(
+                &config
+                    .repo_url
+                    .clone()
+                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            )
+            .0,
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -1115,6 +1148,7 @@ impl SdkContainer {
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
+        inject_feed_env(&mut env_vars, config.feeds.as_ref());
         if config.verbose || self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
@@ -1397,6 +1431,38 @@ impl SdkContainer {
             }
         }
 
+        // Named feeds: generated .repo files (and any path: feed dirs), read-only.
+        // Outermost mount first so nested path: mounts land inside it.
+        let mut add_hosts: Vec<String> = Vec::new();
+        if let Some(feeds) = &config.feeds {
+            for (host, in_container) in &feeds.mounts {
+                container_cmd.push("-v".to_string());
+                container_cmd.push(format!(
+                    "{}:{}:ro",
+                    translate_bind_for_vm(host).display(),
+                    in_container
+                ));
+            }
+            add_hosts.extend(feeds.add_hosts.iter().cloned());
+        }
+        // A loopback distro feed (`distro.repo.url: http://localhost:…`) is
+        // rewritten to the host-gateway alias in the env; the alias needs a route.
+        if config
+            .repo_url
+            .as_deref()
+            .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
+        {
+            add_hosts.push(format!(
+                "{}:host-gateway",
+                crate::utils::feeds::HOST_GATEWAY_ALIAS
+            ));
+        }
+        add_hosts.sort();
+        add_hosts.dedup();
+        for h in add_hosts {
+            container_cmd.push(format!("--add-host={h}"));
+        }
+
         // Note: Working directory is handled in the entrypoint script based on sysroot parameters
 
         // Add environment variables
@@ -1529,10 +1595,13 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            config
-                .repo_url
-                .clone()
-                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            crate::utils::feeds::rewrite_loopback(
+                &config
+                    .repo_url
+                    .clone()
+                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            )
+            .0,
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -1542,6 +1611,7 @@ impl SdkContainer {
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
+        inject_feed_env(&mut env_vars, config.feeds.as_ref());
         if config.verbose || self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
@@ -1821,10 +1891,13 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            config
-                .repo_url
-                .clone()
-                .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            crate::utils::feeds::rewrite_loopback(
+                &config
+                    .repo_url
+                    .clone()
+                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+            )
+            .0,
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -1834,6 +1907,7 @@ impl SdkContainer {
         if let Some(dnf_args) = &config.dnf_args {
             env_vars.insert("AVOCADO_DNF_ARGS".to_string(), dnf_args.join(" "));
         }
+        inject_feed_env(&mut env_vars, config.feeds.as_ref());
         if config.verbose || self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
@@ -2596,6 +2670,11 @@ fi
             // Custom repo CA / insecure TLS, applied across all dnf phases.
             script.push_str(REPO_TLS_SETUP_SNIPPET);
         }
+        // Named feeds: purge stale generated .repo files, renumber built-ins
+        // when something precedes the distro feed, copy in this run's files.
+        // Unconditional: dnf also runs without the SDK environment sourced
+        // (`ext dnf`, rpm queries), and the feeds must reach every invocation.
+        script.push_str(crate::utils::feeds::FEEDS_SETUP_SNIPPET);
 
         script
     }
@@ -2884,6 +2963,11 @@ fi
             // Custom repo CA / insecure TLS, applied across all dnf phases.
             script.push_str(REPO_TLS_SETUP_SNIPPET);
         }
+        // Named feeds: purge stale generated .repo files, renumber built-ins
+        // when something precedes the distro feed, copy in this run's files.
+        // Unconditional: dnf also runs without the SDK environment sourced
+        // (`ext dnf`, rpm queries), and the feeds must reach every invocation.
+        script.push_str(crate::utils::feeds::FEEDS_SETUP_SNIPPET);
 
         script
     }
@@ -3488,6 +3572,7 @@ extensions:
             nfs_port: None,
             sdk_arch: None,
             ext_path_mounts: None,
+            feeds: None,
             tui_context: None,
         };
 
@@ -3564,6 +3649,7 @@ extensions:
                 false,
             ),
             REPO_TLS_SETUP_SNIPPET.to_string(),
+            crate::utils::feeds::FEEDS_SETUP_SNIPPET.to_string(),
         ];
         for script in scripts {
             for line in script.lines() {

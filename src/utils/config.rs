@@ -899,8 +899,34 @@ pub struct DistroConfig {
         deserialize_with = "deserialize_string_or_int"
     )]
     pub release: Option<String>,
+    /// The distro feed: either an inline `{url, releasever, ca, tls_verify}`
+    /// block (today's grammar) or the name of a feed defined under `repos:`.
     #[serde(default)]
-    pub repo: Option<DistroRepoConfig>,
+    pub repo: Option<DistroRepoRef>,
+    /// Ordered list of enabled feed names; position is dnf priority (first
+    /// wins). The distro feed is implicitly first unless listed explicitly.
+    /// Absent with `repos:` present means only the distro feed is enabled.
+    #[serde(default)]
+    pub feeds: Option<Vec<String>>,
+}
+
+impl DistroConfig {
+    /// The inline repo block, when `distro.repo` is not a name reference.
+    pub fn repo_inline(&self) -> Option<&DistroRepoConfig> {
+        match self.repo.as_ref()? {
+            DistroRepoRef::Inline(c) => Some(c),
+            DistroRepoRef::Named(_) => None,
+        }
+    }
+}
+
+/// `distro.repo`: a feed name or an inline repo block. Untagged so a bare
+/// string and a mapping both parse.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DistroRepoRef {
+    Named(String),
+    Inline(DistroRepoConfig),
 }
 
 /// Deserialize a value that may be a string or integer into Option<String>
@@ -954,6 +980,37 @@ pub struct DistroRepoConfig {
     pub ca: Option<String>,
     /// TLS verification toggle for the repo endpoint. Set false to skip verification
     /// (testing only). Env override: AVOCADO_REPO_INSECURE=1. Default: verify.
+    pub tls_verify: Option<bool>,
+}
+
+/// A named package feed under `repos:`. Exactly one locator — `url`, `org`,
+/// or `path` — selects the kind; `release`/`channel` present makes it
+/// distro-shaped. Config names a credential and never holds one: `username`
+/// and `password` are meant to be `{{ env.X }}` references. See
+/// `utils::feeds` for resolution.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct RepoDef {
+    /// Remote feed. `$releasever` and `$target` are expanded CLI-side.
+    pub url: Option<String>,
+    /// Connect-hosted private feed, resolved through the logged-in profile.
+    pub org: Option<String>,
+    /// Directory of RPMs (with `repodata/`) on disk, relative to the config
+    /// file; bind-mounted into the container.
+    pub path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_int")]
+    pub release: Option<String>,
+    pub channel: Option<String>,
+    pub releasever: Option<String>,
+    pub gpgkey: Option<String>,
+    /// Defaults to true when `gpgkey` is set, false otherwise.
+    pub gpgcheck: Option<bool>,
+    /// Only enable for these targets.
+    pub targets: Option<Vec<String>>,
+    /// Only enable during these stages; absent = all.
+    pub stages: Option<Vec<crate::utils::feeds::FeedStage>>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub ca: Option<String>,
     pub tls_verify: Option<bool>,
 }
 
@@ -1465,6 +1522,10 @@ pub struct Config {
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
     pub distro: Option<DistroConfig>,
+    /// Named package feeds. Definitions only — `distro.feeds` orders and
+    /// enables them. A map so composed/board configs merge by name.
+    #[serde(default)]
+    pub repos: Option<HashMap<String, RepoDef>>,
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
     /// Default runtime name for commands that scope by runtime. Mirrors
@@ -2103,6 +2164,7 @@ impl Config {
                 supported_targets: None,
                 src_dir: None,
                 distro: None,
+                repos: None,
                 runtimes: None,
                 default_runtime: None,
                 sdk: None,
@@ -3911,9 +3973,12 @@ impl Config {
         if let Some(url) = self
             .distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.url.as_ref())
         {
+            return Some(url.clone());
+        }
+        if let Some(url) = self.distro_feed_def().and_then(|d| d.url.as_ref()) {
             return Some(url.clone());
         }
         // Legacy fallback: sdk.repo_url
@@ -3939,8 +4004,9 @@ impl Config {
         }
         self.distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.ca.as_ref())
+            .or_else(|| self.distro_feed_def().and_then(|d| d.ca.as_ref()))
             .cloned()
     }
 
@@ -3952,10 +4018,42 @@ impl Config {
         }
         self.distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.tls_verify)
+            .or_else(|| self.distro_feed_def().and_then(|d| d.tls_verify))
             .map(|verify| !verify)
             .unwrap_or(false)
+    }
+
+    /// The `repos:` definition `distro.repo` names, when it is a name reference.
+    pub(crate) fn distro_feed_def(&self) -> Option<&RepoDef> {
+        let name = match self.distro.as_ref()?.repo.as_ref()? {
+            DistroRepoRef::Named(n) => n,
+            DistroRepoRef::Inline(_) => return None,
+        };
+        self.repos.as_ref()?.get(name)
+    }
+
+    /// Resolve, record, and materialize the named feeds for one container run.
+    /// `None` when the project declares no feeds — the zero-cost path. Writes
+    /// the canonical document to `<config_dir>/.avocado/feeds/<target>.json`
+    /// every time so the build cache always sees the current set.
+    pub fn feeds_for(
+        &self,
+        target: &str,
+        stage: crate::utils::feeds::FeedStage,
+        config_path: &str,
+    ) -> Result<Option<crate::utils::feeds::FeedMaterialization>> {
+        // `path:` feeds resolve against project_root, like every other relative
+        // path in the config; the canonical document lives beside the lockfile.
+        let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
+        let project_root = self.project_root(config_path);
+        let Some(set) = crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root)?
+        else {
+            return Ok(None);
+        };
+        set.write_canonical(config_dir)?;
+        Ok(Some(set.materialize(stage)?))
     }
 
     /// Promote config-file repo TLS settings to the process env so the container
@@ -3988,10 +4086,18 @@ impl Config {
         if let Some(rv) = self
             .distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.releasever.as_ref())
         {
             return Some(rv.clone());
+        }
+        if let Some(d) = self.distro_feed_def() {
+            if let Some(rv) = &d.releasever {
+                return Some(rv.clone());
+            }
+            if let (Some(r), Some(c)) = (&d.release, &d.channel) {
+                return Some(format!("{r}/{c}"));
+            }
         }
         // Legacy fallback: sdk.repo_release
         if let Some(rv) = self.sdk.as_ref().and_then(|s| s.repo_release.as_ref()) {
