@@ -982,6 +982,26 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         if let Some(stamp) = params.prefetched_stamp.as_ref() {
             if let Some(inputs) = compute_install_stamp_inputs(params, &packages)? {
                 if stamp.is_current(&inputs) {
+                    // The attestation check runs even here, and the stamp is
+                    // exactly why it has to. A stamp records install INPUTS -
+                    // the package set and the config that produced them - so it
+                    // is current whenever nothing about the request changed. It
+                    // says nothing about the sysroot's CONTENTS, which is the
+                    // only thing this check looks at.
+                    //
+                    // Skipping it on this path meant a sysroot mutated after
+                    // installation passed forever: the first install verified
+                    // it, and every run after that short-circuited above the
+                    // check. Measured against a real composed sysroot with
+                    // cryptsetup-var.sh substituted in place - rc=0, no
+                    // diagnostic, on the exact overlay-then-install shape the
+                    // check exists to refuse.
+                    //
+                    // This costs one container exec on an otherwise no-op
+                    // install, which is a real regression against the "pays
+                    // nothing" note above and is accepted deliberately: a gate
+                    // that runs only on the first install is not a gate.
+                    verify_var_key_attestation(params, sysroot_dir).await?;
                     print_success(
                         &format!("{label} sysroot is up to date."),
                         OutputLevel::Normal,
