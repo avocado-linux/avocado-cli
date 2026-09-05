@@ -759,20 +759,9 @@ SIZE=$(stat -c '%s' "$MANIFEST_FILE")
 echo -n '{{"name":"manifest.json","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
 FIRST=false
 
-# Hash all image .raw files (content-addressable by UUIDv5)
-if [ -d "$IMAGES_DIR" ]; then
-    for RAW_FILE in "$IMAGES_DIR"/*.raw; do
-        [ -f "$RAW_FILE" ] || continue
-        BASENAME=$(basename "$RAW_FILE")
-        HASH=$(sha256sum "$RAW_FILE" | awk '{{print $1}}')
-        SIZE=$(stat -c '%s' "$RAW_FILE")
-        if [ "$FIRST" = "false" ]; then
-            echo -n ','
-        fi
-        echo -n '{{"name":"'"$BASENAME"'","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
-        FIRST=false
-    done
-fi
+# Image entries (.raw only — this path serves no .kab), read from the manifest
+# rather than re-hashed; see manifest_image_targets_snippet.
+{image_targets}
 
 # Read and escape root.json for embedding
 ROOT_JSON_ESCAPED=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$ROOT_JSON_FILE")
@@ -783,6 +772,7 @@ echo -n ',"runtime_uuid":"'"$RUNTIME_UUID"'"'
 echo -n '}}'
 "#,
             runtime_name = self.runtime_name,
+            image_targets = update_repo::manifest_image_targets_snippet(&["raw"]),
         )
     }
 

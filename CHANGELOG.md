@@ -51,6 +51,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two halves live in `commands/runtime/var_image.rs` behind one context,
   which is the set of things a portable provisioning bundle has to carry — what a
   later `avocado provision --bundle <path>` would source from a bundle.
+  The ~200 lines that did this work moved to `commands/runtime/var_image.rs`
+  behind one entry point taking an explicit context. That context is exactly
+  the set of things a portable provisioning bundle has to carry, which is what
+  a future `avocado provision --bundle <path>` needs.
+  `provision` is gated on a stamp of its own — `runtime/<name>/provisionable.stamp`
+  — rather than a field on the build stamp, so "did a provisionable build run for
+  this runtime?" is a question with a direct answer. It shares the build's input
+  hash, so anything that makes the build stale makes the tail stale. And because
+  a plain rebuild deletes the tail's artifacts, it deletes that stamp too: a step
+  that destroys an output invalidates the stamp claiming it exists.
+
+  `avocado vm` is unaffected — it manages the macOS/Windows helper VM and never
+  reads runtime build artifacts.
+- **`avocado build --ota` / `avocado runtime build --ota` — skip the
+  provisioning tail.** The var image, stone's OS bundle and Docker priming are
+  flash-time artifacts; `avocado deploy` and `avocado connect upload` read only
+  the var-staging directory, which is complete before any of them run. `--ota`
+  gates that tail off, leaving the manifest, its signature, the update
+  authority and the content-addressed images exactly as a full build writes
+  them. The `.btrfs` and `.aos` a previous full build left behind are removed
+  so they cannot be flashed stale, and the runtime build stamp records
+  `ota_only`, which `runtime provision` refuses with the fix. An `--ota`
+  manifest carries no `os_bundle`: extensions update, the OS is left alone.
+
+### Changed
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
 
 ## [1.0.0-rc.3] - 2026-09-01
 
