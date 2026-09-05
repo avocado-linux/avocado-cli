@@ -453,8 +453,29 @@ impl RuntimeProvisionCommand {
         // Initialize SDK container helper
         let container_helper = SdkContainer::new();
 
+        // Build the var image and the OS bundle, then run the stone hook.
+        // `avocado build` produces the deployable set only; this is the
+        // provisioning tail, and it is provisioning's to run.
+        let merged_runtime = config
+            .get_merged_runtime_config(
+                &self.config.runtime_name,
+                &target_arch,
+                &self.config.config_path,
+            )?
+            .unwrap_or_default();
+        let var_section = crate::commands::runtime::var_image::render_var_image(
+            &crate::commands::runtime::var_image::VarImageContext {
+                runtime_name: &self.config.runtime_name,
+                target_arch: &target_arch,
+                config,
+                parsed,
+                merged_runtime: &merged_runtime,
+                ext_list: &resolved_extensions,
+            },
+        )?;
+
         // Create provision script
-        let provision_script = self.create_provision_script(&target_arch)?;
+        let provision_script = self.create_provision_script(&target_arch, &var_section)?;
 
         if self.config.verbose {
             print_info("Executing provision script.", OutputLevel::Normal);
@@ -689,13 +710,23 @@ impl RuntimeProvisionCommand {
         Ok(())
     }
 
-    fn create_provision_script(&self, target_arch: &str) -> Result<String> {
+    /// The provisioning script: build the var image and OS bundle, then hand
+    /// stone the same inputs it has always been handed.
+    ///
+    /// `var_section` runs first and is the work that used to be the tail of
+    /// `runtime build`. Stone is unchanged — it is still invoked through the
+    /// SDK lifecycle hook, after the artifacts it flashes exist.
+    fn create_provision_script(&self, target_arch: &str, var_section: &str) -> Result<String> {
         let script = format!(
             r#"
-echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{}'."
-avocado-provision-{} {}
+{var_section}
+
+echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{name}'."
+avocado-provision-{target_arch} {name}
 "#,
-            self.config.runtime_name, target_arch, self.config.runtime_name
+            var_section = var_section,
+            name = self.config.runtime_name,
+            target_arch = target_arch,
         );
 
         Ok(script)
@@ -1208,7 +1239,9 @@ mod tests {
         };
         let cmd = RuntimeProvisionCommand::new(config);
 
-        let script = cmd.create_provision_script("x86_64").unwrap();
+        let script = cmd
+            .create_provision_script("x86_64", "# var section")
+            .unwrap();
 
         assert!(script.contains("avocado-provision-x86_64 test-runtime"));
         assert!(script.contains("Running SDK lifecycle hook 'avocado-provision'"));
