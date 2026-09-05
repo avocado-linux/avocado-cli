@@ -16,6 +16,7 @@ struct ContainerConfig<'a> {
     target_arch: &'a str,
     repo_url: Option<&'a String>,
     repo_release: Option<&'a String>,
+    feeds: Option<&'a crate::utils::feeds::FeedMaterialization>,
     container_args: &'a Option<Vec<String>>,
 }
 
@@ -102,19 +103,15 @@ impl FetchCommand {
 
         // Pull the latest SDK container image
         self.pull_sdk_image(container_image).await?;
-
-        // Get repo configuration from config
-        let repo_url = config_toml
-            .get("sdk")
-            .and_then(|sdk| sdk.get("repo_url"))
-            .and_then(|url| url.as_str())
-            .map(|s| s.to_string());
-
-        let repo_release = config_toml
-            .get("sdk")
-            .and_then(|sdk| sdk.get("repo_release"))
-            .and_then(|release| release.as_str())
-            .map(|s| s.to_string());
+        // Same resolution every other command uses (env > distro.repo, named or
+        // inline > legacy sdk.*); reading raw `sdk.repo_url` here missed all of those.
+        let repo_url = config.get_sdk_repo_url();
+        let repo_release = config.get_sdk_repo_release();
+        let feeds = config.feeds_for(
+            &target_arch,
+            crate::utils::feeds::FeedStage::Ext,
+            &self.config_path,
+        )?;
 
         // Determine what to fetch based on arguments
         match (&self.extension, &self.runtime) {
@@ -125,6 +122,7 @@ impl FetchCommand {
                     image: container_image,
                     target_arch: &target_arch,
                     repo_url: repo_url.as_ref(),
+                    feeds: feeds.as_ref(),
                     repo_release: repo_release.as_ref(),
                     container_args: &merged_container_args,
                 };
@@ -138,6 +136,7 @@ impl FetchCommand {
                     image: container_image,
                     target_arch: &target_arch,
                     repo_url: repo_url.as_ref(),
+                    feeds: feeds.as_ref(),
                     repo_release: repo_release.as_ref(),
                     container_args: &merged_container_args,
                 };
@@ -151,6 +150,7 @@ impl FetchCommand {
                     image: container_image,
                     target_arch: &target_arch,
                     repo_url: repo_url.as_ref(),
+                    feeds: feeds.as_ref(),
                     repo_release: repo_release.as_ref(),
                     container_args: &merged_container_args,
                 };
@@ -200,6 +200,7 @@ impl FetchCommand {
             source_environment: false,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -251,6 +252,7 @@ $DNF_SDK_HOST \
             source_environment: true,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -305,6 +307,7 @@ $DNF_SDK_HOST \
             source_environment: false,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -355,6 +358,7 @@ $DNF_SDK_HOST \
             source_environment: true,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -505,6 +509,7 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
             source_environment: true,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -537,6 +542,7 @@ $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_HOST_REPO_CONF \
             source_environment: false,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -586,6 +592,7 @@ $DNF_SDK_HOST \
             source_environment: true,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -618,6 +625,7 @@ $DNF_SDK_HOST \
             source_environment: false,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -667,6 +675,7 @@ $DNF_SDK_HOST \
             source_environment: true,
             interactive: false,
             repo_url: container_config.repo_url.cloned(),
+            feeds: container_config.feeds.cloned(),
             repo_release: container_config.repo_release.cloned(),
             container_args: container_config.container_args.clone(),
             dnf_args: self.dnf_args.clone(),

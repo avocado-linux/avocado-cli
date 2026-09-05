@@ -11,6 +11,7 @@
 #   3. `stages:` scoping through the real container plumbing: a feed limited to
 #      [sdk, ext] is invisible at the runtime stage and visible at sdk and ext
 #   4. the canonical document exists, records credential identity, holds no secret
+#   5. `ext fetch` finds a `source: package` extension that exists only in the local feeds
 #
 # Requires: docker, rpmbuild, createrepo_c, python3. Uses this worktree's debug
 # build unless $AVOCADO points elsewhere.
@@ -21,7 +22,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 AVOCADO=${AVOCADO:-$HERE/../../target/debug/avocado}
 WORK=${1:-$PWD/.local-feeds-test}
-PORT=${PORT:-18080}
+# Default to a free ephemeral port so two rigs (e.g. two worktrees) never race on one.
+PORT=${PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1])')}
 TARGET=${TARGET:-qemux86-64}
 USER_=tester
 PASS_=s3cret
@@ -98,6 +100,11 @@ extensions:
   app:
     types: [sysext]
     version: "0.1.0"
+  # source: package — exists only in the local feeds, so ext fetch must find it there
+  hello-feed:
+    source:
+      type: package
+      version: "*"
 
 sdk:
   image: "docker.io/avocadolinux/sdk:2026"
@@ -148,7 +155,14 @@ echo "dnf User-Agent seen by the vendor feed (for Phase 0):"
 grep -o "ua='[^']*'" ../authserve.log | sort -u | head -3
 echo
 
-# 4. stage scoping through the real plumbing
+# 4. extension fetch resolves a `source: package` extension that exists only in the
+#    local feeds (the ExtensionFetcher path, separate from the install commands)
+"$AVOCADO" --no-tui ext fetch -e hello-feed > ext-fetch.out 2> ext-fetch.err \
+  || { cat ext-fetch.err >&2; fail "ext fetch failed"; }
+grep -q "Successfully fetched 1 package extension" ext-fetch.out || { cat ext-fetch.out; fail "ext fetch did not fetch hello-feed from the local feeds"; }
+pass "ext fetch: package extension found in the local feeds"
+
+# 5. stage scoping through the real plumbing
 "$AVOCADO" --no-tui runtime dnf -r dev repoquery --qf "$QF" hello-feed > runtime.out 2> runtime.err \
   || { cat runtime.err >&2; fail "runtime dnf repoquery failed"; }
 grep -q '@local-build' runtime.out || { cat runtime.out; fail "path: feed missing at runtime stage"; }
