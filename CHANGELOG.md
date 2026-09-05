@@ -22,6 +22,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+### Changed
+- **Stamps now hash the files a build reads, not just the paths that name
+  them.** `STAMP_VERSION` moves 2 → 3; every existing stamp reads as stale once
+  and rebuilds. Newly folded: compile-script content (`sdk.compile.<n>.compile`,
+  reached through `packages.<pkg>.compile`), `packages.<pkg>.install` scripts,
+  `kernel.install`, the `package_files` source tree of a compiled extension
+  (patterns expanded with `globstar` semantics), `version: {file}` content,
+  runtime `var_files[].source` content, `permissions` (rootfs, initramfs and
+  top-level), rootfs/initramfs `image` (kab args, dm-verity), runtime
+  `signing`, `sdk.container_args` and `src_dir`, and the extension keys the
+  build turns into unit wiring (`enable_services`, `on_merge`, `sysusers`,
+  `kernel_modules`, `users`, `groups`, …). Editing Rust source under a
+  compiled extension's `package_files` now invalidates its build; flipping
+  `rootfs.image.verity` now invalidates the runtime build.
+- **A declared script that does not exist is an error at the stamp check**,
+  not a `"missing"` sentinel. The sentinel collided — every unresolvable path
+  hashed to the same literal, so all remote extensions' `post_build` scripts
+  read as identical regardless of content. Files the host genuinely cannot see
+  (a `source: {type: git}` extension's, which live in the SDK volume) are no
+  longer hashed at all rather than hashed as missing; `source` itself still
+  is. A `source: {type: path}` extension's files are hashed under its own
+  path, not the project root.
+- **`is_current` compares `package_list_hash` strictly.** A recorded hash on
+  one side and none on the other is stale, never a match by omission.
+- An unreadable directory inside an overlay now fails the stamp check and the
+  materialization instead of being silently dropped from both.
 
 ### Added
 - **`avocado build` produces the deployable set *and* the OTA payload;

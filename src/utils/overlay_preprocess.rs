@@ -159,14 +159,20 @@ fn process_file_bytes(
 /// Walk `overlay_src`, invoking `visit(rel_path, entry)` for every file and
 /// symlink in a deterministic (sorted) order. Directories are visited via their
 /// contained entries only.
-fn sorted_entries(overlay_src: &Path) -> Vec<walkdir::DirEntry> {
-    let mut entries: Vec<_> = walkdir::WalkDir::new(overlay_src)
+///
+/// A walk error (an unreadable subdirectory, a vanished entry) is propagated,
+/// not skipped: silently dropping a subtree from a digest would let an edit
+/// inside it go unnoticed, and dropping it from a materialization would ship
+/// an incomplete overlay. Both callers already fail on an unreadable file;
+/// this makes an unreadable directory fail the same way.
+fn sorted_entries(overlay_src: &Path) -> Result<Vec<walkdir::DirEntry>> {
+    let mut entries = walkdir::WalkDir::new(overlay_src)
         .sort_by_file_name()
         .into_iter()
-        .filter_map(|e| e.ok())
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("Failed to walk overlay: {}", overlay_src.display()))?;
     entries.sort_by(|a, b| a.path().cmp(b.path()));
-    entries
+    Ok(entries)
 }
 
 /// Overlay-relative path as raw bytes, `None` for the overlay root itself.
@@ -244,7 +250,7 @@ pub fn overlay_content_digest(
 
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for entry in sorted_entries(&overlay_src) {
+    for entry in sorted_entries(&overlay_src)? {
         let Some(rel) = rel_bytes(&overlay_src, entry.path()) else {
             continue;
         };
@@ -290,6 +296,77 @@ pub fn overlay_content_digest(
             hasher.update(format!("\0{mode:o}\0").as_bytes());
             hasher.update(file_hash);
         }
+    }
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(out.len() * 2);
+    for b in out.iter() {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(Some(format!("sha256:{hex}")))
+}
+
+/// Content digest of a project-relative path that a build step reads — a single
+/// script, or a whole source tree such as an extension's `package_files` entry.
+/// `Ok(None)` when the path does not exist, so the caller decides whether that
+/// is an error (a declared script) or nothing to fold (an optional input).
+///
+/// Same recipe as the verbatim arm of [`overlay_content_digest`], minus
+/// preprocessing: sorted walk; directories folded with their mode, symlinks with
+/// their target, files with content and mode; read and walk errors propagated
+/// rather than dropped from the digest. A single file hashes as its own
+/// one-entry tree so the two forms cannot collide with each other.
+pub fn path_content_digest(project_root: &Path, rel_path: &str) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let src = project_root.join(rel_path);
+    let meta = match std::fs::symlink_metadata(&src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to stat input: {}", src.display()))
+        }
+    };
+    let mut hasher = Sha256::new();
+    if meta.is_file() {
+        let raw = std::fs::read(&src)
+            .with_context(|| format!("Failed to read input file: {}", src.display()))?;
+        hasher.update(b"F\0\0");
+        hasher.update(format!("{:o}\0", file_mode(&src)).as_bytes());
+        hasher.update(Sha256::digest(&raw));
+    } else if meta.is_dir() {
+        for entry in sorted_entries(&src)? {
+            let Some(rel) = rel_bytes(&src, entry.path()) else {
+                continue;
+            };
+            let ft = entry.file_type();
+            if ft.is_dir() {
+                hasher.update(b"D\0");
+                hasher.update(&rel);
+                hasher.update(format!("\0{:o}\0", file_mode(entry.path())).as_bytes());
+            } else if ft.is_symlink() {
+                let target = std::fs::read_link(entry.path()).with_context(|| {
+                    format!("Failed to read input symlink: {}", entry.path().display())
+                })?;
+                hasher.update(b"L\0");
+                hasher.update(&rel);
+                hasher.update(b"\0");
+                hasher.update(os_bytes(target.as_os_str()));
+                hasher.update(b"\0");
+            } else if ft.is_file() {
+                let raw = std::fs::read(entry.path()).with_context(|| {
+                    format!("Failed to read input file: {}", entry.path().display())
+                })?;
+                hasher.update(b"F\0");
+                hasher.update(&rel);
+                hasher.update(format!("\0{:o}\0", file_mode(entry.path())).as_bytes());
+                hasher.update(Sha256::digest(&raw));
+            }
+        }
+    } else {
+        // A symlink at the top level, a device, a socket: the build cannot use
+        // it as a script or source tree, so fold its kind and let the build fail.
+        hasher.update(b"?\0");
+        hasher.update(format!("{:?}", meta.file_type()).as_bytes());
     }
     let out = hasher.finalize();
     let mut hex = String::with_capacity(out.len() * 2);
@@ -373,7 +450,7 @@ pub fn materialize_preprocessed_overlay(
         )
     })?;
 
-    for entry in sorted_entries(&overlay_src) {
+    for entry in sorted_entries(&overlay_src)? {
         let Some(rel) = rel_str(&overlay_src, entry.path())? else {
             continue;
         };
@@ -443,6 +520,46 @@ fn copy_mode(_src: &Path, _dest: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file and a directory each digest deterministically, distinguish
+    /// content and mode changes, and a missing path is `None` rather than a
+    /// value — so the caller decides whether absence is an error.
+    #[test]
+    fn path_content_digest_covers_files_and_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        std::fs::write(root.join("tree/a.txt"), "a").unwrap();
+        std::fs::write(root.join("tree/sub/b.txt"), "b").unwrap();
+        std::fs::write(root.join("one.sh"), "echo\n").unwrap();
+
+        assert_eq!(path_content_digest(root, "absent").unwrap(), None);
+
+        let f1 = path_content_digest(root, "one.sh").unwrap().unwrap();
+        assert_eq!(f1, path_content_digest(root, "one.sh").unwrap().unwrap());
+        std::fs::write(root.join("one.sh"), "echo hi\n").unwrap();
+        assert_ne!(f1, path_content_digest(root, "one.sh").unwrap().unwrap());
+
+        let t1 = path_content_digest(root, "tree").unwrap().unwrap();
+        assert_eq!(t1, path_content_digest(root, "tree").unwrap().unwrap());
+        std::fs::write(root.join("tree/sub/b.txt"), "B").unwrap();
+        let t2 = path_content_digest(root, "tree").unwrap().unwrap();
+        assert_ne!(t1, t2, "nested content");
+        std::fs::write(root.join("tree/sub/c.txt"), "").unwrap();
+        assert_ne!(
+            t2,
+            path_content_digest(root, "tree").unwrap().unwrap(),
+            "new file"
+        );
+
+        // A file and a one-file directory with identical bytes never collide.
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/one.sh"), "echo hi\n").unwrap();
+        assert_ne!(
+            path_content_digest(root, "one.sh").unwrap(),
+            path_content_digest(root, "d").unwrap()
+        );
+    }
 
     fn ctx() -> AvocadoContext {
         AvocadoContext::from_main_config(&Value::Null, Some("qemux86-64"), None)
