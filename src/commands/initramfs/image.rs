@@ -278,6 +278,7 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     export AVOCADO_INITRAMFS_IMAGE="$INITRAMFS_OUTPUT"
     export AVOCADO_INITRAMFS_FILESYSTEM="$INITRAMFS_FS"
     export AVOCADO_INITRAMFS_BUILD_ID="$INITRAMFS_BUILD_ID"
+{exports_file}
     echo "Built initramfs: $INITRAMFS_OUTPUT"
 else
     echo "No initramfs sysroot found — skipping initramfs image build."
@@ -286,6 +287,14 @@ fi"#,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
         var_encrypt_block = var_encrypt_block,
+        exports_file = crate::commands::rootfs::image::render_exports_file(
+            "$INITRAMFS_OUTPUT",
+            &[
+                "AVOCADO_INITRAMFS_IMAGE",
+                "AVOCADO_INITRAMFS_FILESYSTEM",
+                "AVOCADO_INITRAMFS_BUILD_ID",
+            ],
+        ),
         purge_paths = render_build_state_purge("INITRAMFS_WORK"),
         identity_injection = render_identity_injection("INITRAMFS_WORK", "INITRAMFS_BUILD_ID"),
         build_id_block = render_build_id_block(&BuildIdSpec {

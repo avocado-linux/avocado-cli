@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`runtime build` reuses the rootfs and initramfs images when nothing they
+  depend on has changed.** Each image section now has a stamp whose input is
+  the install step's tree digest plus the resolved image config — filesystem,
+  kab args, verity, permissions, `post_install` content, and the runtime's
+  `var`/`version`/inline `rootfs`/`initramfs` keys including per-target
+  overrides, so a per-target `var.encrypt: true` can never skip the initramfs
+  that must carry its marker. When the stamp is current and the image and its
+  `.exports` file both exist in the volume, the section is replaced by sourcing
+  the exports the last full build recorded; everything downstream sees the same
+  variables. The image digests join the runtime build's own input, so the
+  first build after upgrading re-stamps the runtime once (its inputs gained
+  the two digests); it is stable from the second build on. On the dogfood
+  project this is most of the remaining build time once extension steps skip.
+
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
   the name is taken. A duplicate name is rejected up front, so a repeated

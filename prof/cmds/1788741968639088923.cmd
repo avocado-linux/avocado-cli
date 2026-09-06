@@ -1,0 +1,1 @@
+/opt/_avocado/qemux86-64/includes/avocado-bsp-qemux86-64/avocado.yaml

@@ -49,6 +49,15 @@ pub(crate) const LINK_OR_COPY_PY: &str = r#"def link_or_copy(src, dst):
     except OSError:
         shutil.copy2(real, dst)
 "#;
+/// Which sysroot image sections a runtime build may replace with a reuse stub:
+/// the host found the section's stamp current for every input, install digest
+/// included. The gate still checks in-container that the image and its
+/// `.exports` exist, so a current stamp over a missing image still rebuilds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SysrootImageReuse {
+    pub rootfs: bool,
+    pub initramfs: bool,
+}
 
 pub struct RuntimeBuildCommand {
     runtime_name: String,
@@ -332,6 +341,11 @@ impl RuntimeBuildCommand {
         // check and the write.
         let mut upstream_image_hashes: std::collections::BTreeMap<String, String> =
             Default::default();
+        // Sysroot image reuse decisions and the inputs their stamps are written
+        // with, both from the same batch read. Defaults (no reuse, nothing to
+        // write) hold under `--no-stamps`.
+        let mut image_reuse = SysrootImageReuse::default();
+        let mut image_inputs: Vec<(&str, crate::utils::stamps::StampInputs)> = Vec::new();
 
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
@@ -348,8 +362,18 @@ impl RuntimeBuildCommand {
             // - Versioned extensions: require install only (prebuilt from package repo)
             let required = resolve_required_stamps_for_runtime_build(&self.runtime_name, &ext_deps);
 
-            // Batch all stamp reads into a single container invocation for performance
-            let batch_script = generate_batch_read_stamps_script(&required);
+            // Batch all stamp reads into a single container invocation for
+            // performance. The same round-trip reads the two sysroot image
+            // stamps this build owns, so it can decide whether to rebuild them.
+            let image_reqs = [
+                crate::utils::stamps::StampRequirement::rootfs_image(),
+                crate::utils::stamps::StampRequirement::initramfs_image(),
+            ];
+            let batch_script = format!(
+                "{}\n{}",
+                generate_batch_read_stamps_script(&required),
+                generate_batch_read_stamps_script(&image_reqs),
+            );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target_arch.to_string(),
@@ -385,10 +409,48 @@ impl RuntimeBuildCommand {
             let install_inputs = merged_runtime
                 .as_ref()
                 .and_then(|mr| compute_runtime_install_input_hash(mr, &self.runtime_name).ok());
+            let batch = output.as_deref().unwrap_or("");
             upstream_image_hashes = crate::utils::stamps::ext_content_hashes_from_batch(
-                output.as_deref().unwrap_or(""),
+                batch,
                 ext_deps.iter().map(|d| d.name().to_string()),
             );
+
+            // The rootfs / initramfs image sections: current when their stamp
+            // matches the resolved image config plus the install step's digest.
+            // Their own digests join the runtime build's inputs — the build's
+            // manifest and bundle are downstream of both images.
+            for (section, req, flag) in [
+                ("rootfs", &image_reqs[0], &mut image_reuse.rootfs),
+                ("initramfs", &image_reqs[1], &mut image_reuse.initramfs),
+            ] {
+                let install_req = if section == "rootfs" {
+                    crate::utils::stamps::StampRequirement::rootfs_install()
+                } else {
+                    crate::utils::stamps::StampRequirement::initramfs_install()
+                };
+                let Some(install_digest) =
+                    crate::utils::stamps::content_hash_from_batch(batch, &install_req)
+                else {
+                    continue; // install stamp absent or pre-digest: never reuse
+                };
+                let Some(resolved) = config.resolve_image_section(parsed, section, target_arch)
+                else {
+                    continue;
+                };
+                let inputs = crate::utils::stamps::compute_sysroot_image_input_hash(
+                    section,
+                    &resolved,
+                    &install_digest,
+                    parsed,
+                    Some(&self.runtime_name),
+                    &project_root,
+                )?;
+                *flag = crate::utils::stamps::own_stamp_is_current(batch, req, &inputs);
+                if let Some(h) = crate::utils::stamps::content_hash_from_batch(batch, req) {
+                    upstream_image_hashes.insert(format!("{section}.image"), h);
+                }
+                image_inputs.push((section, inputs));
+            }
             let build_inputs = merged_runtime.as_ref().and_then(|mr| {
                 compute_runtime_build_input_hash(
                     mr,
@@ -633,8 +695,13 @@ impl RuntimeBuildCommand {
             .await?;
 
         // Build var image
-        let mut build_script =
-            self.create_build_script(config, parsed, target_arch, &resolved_extensions)?;
+        let mut build_script = self.create_build_script(
+            config,
+            parsed,
+            target_arch,
+            &resolved_extensions,
+            image_reuse,
+        )?;
         if self.no_stamps {
             build_script = format!(
                 "{}{build_script}",
@@ -970,6 +1037,48 @@ impl RuntimeBuildCommand {
                 StampOutputs::default(),
             );
             let stamp_script = generate_write_stamp_script(&stamp)?;
+
+            // The sysroot image stamps ride in the same container run. Written
+            // only for a section that actually ran — a reused image keeps the
+            // stamp that justified reusing it — and only if the image exists:
+            // a project with no rootfs sysroot builds no rootfs image and gets
+            // no stamp for one. The digest is the image's sha256, the value
+            // the manifest records for it.
+            for (section, image_inputs) in &image_inputs {
+                let reused = if *section == "rootfs" {
+                    image_reuse.rootfs
+                } else {
+                    image_reuse.initramfs
+                };
+                let filesystem = if *section == "rootfs" {
+                    config.get_rootfs_filesystem()
+                } else {
+                    config.get_initramfs_filesystem()
+                };
+                if reused {
+                    continue;
+                }
+                let image = format!(
+                    "$AVOCADO_PREFIX/runtimes/{}/avocado-image-{section}-{target_arch}.{filesystem}",
+                    self.runtime_name
+                );
+                let image_stamp = if *section == "rootfs" {
+                    Stamp::rootfs_image(target_arch, image_inputs.clone(), StampOutputs::default())
+                } else {
+                    Stamp::initramfs_image(
+                        target_arch,
+                        image_inputs.clone(),
+                        StampOutputs::default(),
+                    )
+                };
+                stamp_script.push_str(&format!(
+                    "\nif [ -f \"{image}\" ]; then\n{}\nfi\n",
+                    crate::utils::stamps::generate_write_stamp_script_with_digest(
+                        &image_stamp,
+                        &crate::utils::stamps::render_file_digest_script(&image),
+                    )?
+                ));
+            }
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -1431,6 +1540,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         parsed: &serde_yaml::Value,
         target_arch: &str,
         resolved_extensions: &[String],
+        image_reuse: SysrootImageReuse,
     ) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
         let merged_runtime = config
@@ -2357,12 +2467,19 @@ fi"#,
             .transpose()
             .context("rootfs")?
             .unwrap_or(false);
-        let rootfs_build_section = generate_rootfs_build_script(
-            NAMESPACE_UUID,
-            &config.get_rootfs_filesystem(),
-            rootfs_post_install.as_deref(),
-            &rootfs_permissions_section,
-            rootfs_verity,
+        let rootfs_fs = config.get_rootfs_filesystem();
+        let rootfs_build_section = crate::commands::rootfs::image::gate_image_section(
+            &generate_rootfs_build_script(
+                NAMESPACE_UUID,
+                &rootfs_fs,
+                rootfs_post_install.as_deref(),
+                &rootfs_permissions_section,
+                rootfs_verity,
+            ),
+            &format!("$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{rootfs_fs}"),
+            "ROOTFS_IMAGE_REUSE",
+            "rootfs",
+            image_reuse.rootfs,
         );
         let fit_section = generate_fit_assembly_script();
 
@@ -2422,20 +2539,27 @@ fi"#,
                 );
             }
         }
-        let initramfs_build_section = generate_initramfs_build_script(
-            NAMESPACE_UUID,
-            &config.get_initramfs_filesystem(),
-            initramfs_post_install.as_deref(),
-            &initramfs_permissions_section,
-            var_encrypt(target_arch),
-            // Target-resolved, like var_encrypt above it: a `target-<name>`
-            // override of var.hardware would otherwise be dropped and the
-            // initramfs built with `auto`, losing the fail-closed policy.
-            &config.get_runtime_var_hardware_for_target(
-                Some(parsed),
-                &self.runtime_name,
-                target_arch,
+        let initramfs_fs = config.get_initramfs_filesystem();
+        let initramfs_build_section = crate::commands::rootfs::image::gate_image_section(
+            &generate_initramfs_build_script(
+                NAMESPACE_UUID,
+                &initramfs_fs,
+                initramfs_post_install.as_deref(),
+                &initramfs_permissions_section,
+                var_encrypt(target_arch),
+                // Target-resolved, like var_encrypt above it: a `target-<name>`
+                // override of var.hardware would otherwise be dropped and the
+                // initramfs built with `auto`, losing the fail-closed policy.
+                &config.get_runtime_var_hardware_for_target(
+                    Some(parsed),
+                    &self.runtime_name,
+                    target_arch,
+                ),
             ),
+            &format!("$OUTPUT_DIR/avocado-image-initramfs-$TARGET_ARCH.{initramfs_fs}"),
+            "INITRAMFS_IMAGE_REUSE",
+            "initramfs",
+            image_reuse.initramfs,
         );
 
         let script = format!(
@@ -3795,7 +3919,13 @@ runtimes:
         let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions: Vec<String> = vec![];
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &resolved_extensions,
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
@@ -3892,7 +4022,13 @@ runtimes:
         );
         let config = Config::load(&cmd.config_path).unwrap();
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
@@ -3993,7 +4129,13 @@ extensions:
         );
         let config = Config::load(&cmd.config_path).unwrap();
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &["test-ext-1.0.0".to_string()])
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &["test-ext-1.0.0".to_string()],
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         // Four image stagings: three in the manifest block, one for the
@@ -4018,6 +4160,61 @@ extensions:
         assert!(!hashes.contains("sha256sum \"$IMG_FILE\""));
     }
 
+    /// The reuse decision reaches the script as the two gate variables, the
+    /// full sections are still emitted behind them, and the result parses as
+    /// bash in every combination.
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_image_reuse_gates_both_sections() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = r#"
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+"#;
+        let build = |reuse: SysrootImageReuse| {
+            let config_path = create_test_config_file(&temp_dir, content);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let cmd = RuntimeBuildCommand::new(
+                "test-runtime".to_string(),
+                config_path,
+                false,
+                Some("x86_64".to_string()),
+                None,
+                None,
+            );
+            let config = Config::load(&cmd.config_path).unwrap();
+            cmd.create_build_script(&config, &parsed, "x86_64", &[], reuse)
+                .unwrap()
+        };
+        for (r, i) in [(false, false), (true, false), (false, true), (true, true)] {
+            let s = build(SysrootImageReuse {
+                rootfs: r,
+                initramfs: i,
+            });
+            assert!(s.contains(&format!("ROOTFS_IMAGE_REUSE=\"{}\"", r as u8)));
+            assert!(s.contains(&format!("INITRAMFS_IMAGE_REUSE=\"{}\"", i as u8)));
+            assert!(
+                s.contains("mkfs.erofs") || s.contains("Building rootfs image"),
+                "full section kept"
+            );
+            assert!(s.contains("cpio"), "full initramfs section kept");
+            let path = temp_dir.path().join(format!("s-{r}-{i}.sh"));
+            std::fs::write(&path, &s).unwrap();
+            assert!(
+                std::process::Command::new("bash")
+                    .arg("-n")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "bash -n ({r},{i})"
+            );
+        }
+    }
     /// `encrypt:` under a `target-<x>:` override is honored like every other
     /// `var:` key; the package union reads the same merged source, so the
     /// marker never ships without cryptsetup-var behind it.
@@ -4050,7 +4247,13 @@ runtimes:
         );
         let config = Config::load(&cmd.config_path).unwrap();
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .unwrap();
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         assert!(config
@@ -4091,7 +4294,13 @@ runtimes:
         );
         let config = Config::load(&cmd.config_path).unwrap();
         let err = cmd
-            .create_build_script(&config, &parsed, "x86_64", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .expect_err("building an encrypt-opted runtime for a foreign target must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("var.encrypt"), "{msg}");
@@ -4099,7 +4308,13 @@ runtimes:
 
         // For its own target the same runtime builds and gets the marker.
         let script = cmd
-            .create_build_script(&config, &parsed, "jetson-orin-nx", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "jetson-orin-nx",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .unwrap();
         assert!(script.contains("/etc/avocado/var-encrypt"));
     }
@@ -4140,7 +4355,7 @@ runtimes:
 
         for t in ["jetson-agx-thor", "jetson-agx-orin"] {
             let script = cmd
-                .create_build_script(&config, &parsed, t, &[])
+                .create_build_script(&config, &parsed, t, &[], SysrootImageReuse::default())
                 .unwrap_or_else(|e| panic!("{t} is in scope and must build: {e:#}"));
             assert!(
                 script.contains("/etc/avocado/var-encrypt"),
@@ -4151,7 +4366,13 @@ runtimes:
         // Outside the declared scope it is still refused, since no marker would
         // be written and /var would come up plaintext despite the opt-in.
         let err = cmd
-            .create_build_script(&config, &parsed, "qemux86-64", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "qemux86-64",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .expect_err("a target outside `targets:` must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("var.encrypt"), "{msg}");
@@ -4201,7 +4422,13 @@ runtimes:
         let config = Config::load(&cmd.config_path).unwrap();
 
         let err = cmd
-            .create_build_script(&config, &parsed, "qemux86-64", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "qemux86-64",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .expect_err("an out-of-scope override opt-in must be refused");
         let msg = format!("{err:#}");
         assert!(
@@ -4211,7 +4438,13 @@ runtimes:
 
         // The in-scope target never opted in, so it still builds plaintext.
         let script = cmd
-            .create_build_script(&config, &parsed, "jetson-agx-thor", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "jetson-agx-thor",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .expect("the in-scope target has no opt-in and must build");
         assert!(!script.contains("/etc/avocado/var-encrypt"));
     }
@@ -4252,7 +4485,13 @@ extensions:
         let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &resolved_extensions,
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         assert!(script.contains("test-ext-1.0.0.raw"));
@@ -4298,7 +4537,13 @@ extensions:
         let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &resolved_extensions,
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
@@ -4342,7 +4587,13 @@ extensions:
         let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &resolved_extensions,
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
@@ -4478,7 +4729,13 @@ extensions:
         let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &resolved_extensions,
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         // Manifest should be generated dynamically via Python
@@ -4582,7 +4839,13 @@ runtimes:
         );
         let config = Config::load(&cmd.config_path).unwrap();
         let script = cmd
-            .create_build_script(&config, &parsed, "raspberrypi4", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "raspberrypi4",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         // Wrap section emitted only for rootfs.
@@ -4639,7 +4902,13 @@ runtimes:
         let config = Config::load(&cmd.config_path).unwrap();
         let resolved_extensions: Vec<String> = vec![];
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &resolved_extensions,
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         assert!(script.contains("AVOCADO_RUNTIME_NAME=\"empty-runtime\""));
@@ -4675,7 +4944,13 @@ runtimes:
 
         let config = Config::load(&cmd.config_path).unwrap();
         let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &[])
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &[],
+                SysrootImageReuse::default(),
+            )
             .unwrap();
 
         // The manifest section should set BUILD_ID with a UUID
