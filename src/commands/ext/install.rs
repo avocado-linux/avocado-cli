@@ -20,6 +20,29 @@ use crate::utils::stamps::{
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
 
+/// Shell that clears an extension's sysroot and drops the stamps that vouch for
+/// what was in it.
+///
+/// `ext build`'s output — the extension-release files, unit wiring, the applied
+/// overlay — lives in this sysroot and is *not* restored by the dnf transaction
+/// that follows a clean; only `ext build` puts it back. Its stamp's inputs are
+/// unchanged by a clean, so a surviving stamp would let `ext build` report "up
+/// to date" over a sysroot that no longer holds its work, and `ext image` would
+/// then image an empty extension. Same rule as `--no-stamps`: a step that
+/// destroys an output invalidates the stamp claiming it exists.
+fn clean_ext_sysroot_command(extension: &str) -> String {
+    format!(
+        r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}"
+{build_stamp}{image_stamp}"#,
+        build_stamp = crate::utils::stamps::remove_own_stamp_line(
+            &crate::utils::stamps::StampRequirement::ext_build(extension)
+        ),
+        image_stamp = crate::utils::stamps::remove_own_stamp_line(
+            &crate::utils::stamps::StampRequirement::ext_image(extension)
+        ),
+    )
+}
+
 pub struct ExtInstallCommand {
     extension: Option<String>,
     config_path: String,
@@ -749,8 +772,17 @@ impl ExtInstallCommand {
         // steady state.
         let reseed_required = !direct_deps.is_empty();
         if needs_clean_reinstall || self.force || reseed_required {
-            // Clean the sysroot so it will be recreated fresh below
-            let clean_command = format!(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}""#);
+            // Clean the sysroot so it will be recreated fresh below, and drop
+            // the stamps that vouch for what was in it. `ext build`'s output —
+            // the extension-release files, unit wiring, the overlay — lives in
+            // this sysroot and is not reinstalled by the dnf transaction that
+            // follows; only `ext build` puts it back. Its stamp's inputs are
+            // unchanged by a clean, so leaving the stamp behind lets `ext build`
+            // report "up to date" over a sysroot that no longer holds its work,
+            // and `ext image` then images an empty extension. Same rule as
+            // `--no-stamps`: a step that destroys an output invalidates the
+            // stamp that claims it exists.
+            let clean_command = clean_ext_sysroot_command(extension);
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -1235,5 +1267,25 @@ async fn run_container_command(
             .await
     } else {
         container_helper.run_in_container(config).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clearing the sysroot must take the build and image stamps with it.
+    /// Without this, `install --force` leaves a sysroot holding only package
+    /// state while `ext build`'s stamp still reads current — the skip then
+    /// fires and `ext image` ships an extension with no content in it.
+    #[test]
+    fn clean_ext_sysroot_drops_the_stamps_that_vouch_for_its_contents() {
+        let cmd = clean_ext_sysroot_command("app");
+        assert!(cmd.contains(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/app""#));
+        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/build.stamp""#));
+        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/image.stamp""#));
+        // The install stamp is rewritten by the install that follows; removing
+        // it here would be harmless but is not this function's job.
+        assert!(!cmd.contains("install.stamp"));
     }
 }

@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+- **`ext install` now drops the build and image stamps when it clears an
+  extension's sysroot.** A clean reinstall (`--force`, a changed dependency, a
+  re-seed) removes the sysroot, and the dnf transaction that follows restores
+  only packages — the extension-release files, unit wiring and overlay come
+  from `ext build`, whose stamp inputs a clean does not change. With the skip
+  in place that stamp read as current over a sysroot no longer holding its
+  work, so `ext build` skipped and `ext image` shipped an extension with no
+  content in it. Found by real-project dogfood.
+
+### Fixed
 - **The sysroot digest fails closed and never writes.** A missing sysroot, an
   unreadable file, or any failed pipeline stage now exits non-zero instead of
   digesting nothing into an accepted hash that every downstream step would read
