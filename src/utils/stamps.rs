@@ -47,7 +47,11 @@ pub fn get_local_arch() -> &'static str {
 ///   `image` (kab args, verity), `signing`, `container_args`, `src_dir`, and a
 ///   strict `package_list_hash` comparison. Stamps written without those
 ///   inputs would read as current across edits they never saw.
-pub const STAMP_VERSION: u32 = 3;
+/// - 3 → 4: output digests — steps record `content_hash` and downstream steps
+///   fold it into their inputs. A version-3 image stamp was written without
+///   its upstream's digest in the input, so it cannot be compared with one that
+///   has it.
+pub const STAMP_VERSION: u32 = 4;
 
 /// Command types that can have stamps
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -136,6 +140,18 @@ pub struct StampOutputs {
     /// Number of packages installed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_count: Option<u32>,
+    /// Digest of what the step produced — a sysroot's tree hash, an image's
+    /// sha256. Computed in the container, where the output lives, and folded
+    /// into the *next* step's input hash: a step that re-runs and produces
+    /// identical bytes stops the rebuild there instead of cascading. This is
+    /// the closed half of fingerprinting — it moves iff the bytes moved,
+    /// whatever input caused it, including inputs the host cannot see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Shell variables the step exported for later sections of the same build
+    /// script, recorded so a skipped re-run can replay them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exports: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A stamp representing successful completion of a command
@@ -1607,6 +1623,10 @@ pub fn compute_ext_build_input_hash(
 ///
 /// Includes the build inputs plus image-only inputs: `var_files`,
 /// `subvolumes`, and the resolved `filesystem` format.
+// The interpolation trio (target, runtime, cli_target_board) mirrors
+// `fold_overlay_content_hash`; the upstream digest is the eighth. Same cleanup
+// applies: a context struct once a fourth CLI override lands.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_ext_image_input_hash(
     config: &serde_yaml::Value,
     ext_name: &str,
@@ -1615,6 +1635,7 @@ pub fn compute_ext_image_input_hash(
     target: Option<&str>,
     runtime: Option<&str>,
     cli_target_board: Option<&str>,
+    build_content_hash: Option<&str>,
 ) -> Result<StampInputs> {
     let mut hash_data = ext_build_hash_data(
         config,
@@ -1624,6 +1645,15 @@ pub fn compute_ext_image_input_hash(
         runtime,
         cli_target_board,
     )?;
+    // What `ext build` actually produced. This is the link that lets a
+    // rebuild which changed no bytes stop before re-imaging — and it covers
+    // inputs the host never sees, such as a git-fetched extension's files.
+    if let Some(h) = build_content_hash {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.build_content_hash")),
+            serde_yaml::Value::String(h.to_string()),
+        );
+    }
 
     if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
         if let Some(var_files) = ext.get("var_files") {
@@ -2096,8 +2126,19 @@ pub fn compute_runtime_build_input_hash(
     runtime_name: &str,
     parsed: &serde_yaml::Value,
     project_root: &Path,
+    upstream_content_hashes: &std::collections::BTreeMap<String, String>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
+
+    // What the steps this build consumes actually produced — each required
+    // extension's image digest, keyed by extension name. An extension whose
+    // rebuild left its image byte-identical does not move this.
+    for (name, digest) in upstream_content_hashes {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{name}.image_content_hash")),
+            serde_yaml::Value::String(digest.clone()),
+        );
+    }
 
     // Install inputs are also build inputs.
     if let Some(deps) = merged_runtime.get("packages") {
@@ -2300,6 +2341,121 @@ STAMP_EOF
 # Stamp written (use --verbose to see stamp operations)
 "#
     ))
+}
+
+/// The `outputs.content_hash` recorded on one stamp in a batch-read result, if
+/// that stamp exists and carries one. Downstream steps fold this into their
+/// own input hash — the chain link between what one step produced and what
+/// the next consumed.
+pub fn content_hash_from_batch(batch_output: &str, req: &StampRequirement) -> Option<String> {
+    parse_batch_stamps_output(batch_output)
+        .get(&req.relative_path())
+        .and_then(|json| json.as_deref())
+        .and_then(|json| Stamp::from_json(json).ok())
+        .and_then(|stamp| stamp.outputs.content_hash)
+}
+
+/// The image digests of every extension in `ext_names`, read from one batch
+/// stamp read. Extensions whose image stamp is absent or carries no digest are
+/// simply not present in the map — their absence is itself part of the input.
+pub fn ext_image_content_hashes_from_batch(
+    batch_output: &str,
+    ext_names: impl IntoIterator<Item = String>,
+) -> std::collections::BTreeMap<String, String> {
+    let parsed = parse_batch_stamps_output(batch_output);
+    ext_names
+        .into_iter()
+        .filter_map(|name| {
+            let req = StampRequirement::ext_image(&name);
+            parsed
+                .get(&req.relative_path())
+                .and_then(|json| json.as_deref())
+                .and_then(|json| Stamp::from_json(json).ok())
+                .and_then(|stamp| stamp.outputs.content_hash)
+                .map(|h| (name, h))
+        })
+        .collect()
+}
+
+/// Placeholder the digest-bearing stamp writer substitutes in the container.
+pub const CONTENT_HASH_PLACEHOLDER: &str = "__AVOCADO_CONTENT_HASH__";
+
+/// Like [`generate_write_stamp_script`], but the stamp's `outputs.content_hash`
+/// is computed in the container, where the produced bytes live. `digest_script`
+/// is shell that sets `AVOCADO_CONTENT_HASH` to a hex digest; it runs first,
+/// and the write is refused if it left the variable empty or non-hex — a stamp
+/// with no digest would let every downstream step read "nothing changed".
+///
+/// The JSON stays inside a quoted heredoc and only the placeholder is
+/// substituted, with `sed` on a value that has just been checked to be hex. An
+/// unquoted heredoc would have expanded `$` and backticks in every path the
+/// config happened to name.
+pub fn generate_write_stamp_script_with_digest(
+    stamp: &Stamp,
+    digest_script: &str,
+) -> Result<String> {
+    let mut with_placeholder = stamp.clone();
+    with_placeholder.outputs.content_hash = Some(CONTENT_HASH_PLACEHOLDER.to_string());
+    let stamp_json = with_placeholder.to_json()?;
+    let stamp_path = stamp.relative_path();
+
+    Ok(format!(
+        r#"
+# Digest what this step produced, then write the stamp carrying it.
+{digest_script}
+case "$AVOCADO_CONTENT_HASH" in
+    *[!0-9a-f]*|"") echo "ERROR: content digest for {stamp_path} is empty or not hex: '$AVOCADO_CONTENT_HASH'" >&2; exit 1 ;;
+esac
+mkdir -p "$AVOCADO_PREFIX/.stamps/$(dirname '{stamp_path}')"
+cat > "$AVOCADO_PREFIX/.stamps/{stamp_path}" << 'STAMP_EOF'
+{stamp_json}
+STAMP_EOF
+sed -i "s/{placeholder}/sha256:$AVOCADO_CONTENT_HASH/" "$AVOCADO_PREFIX/.stamps/{stamp_path}"
+"#,
+        placeholder = CONTENT_HASH_PLACEHOLDER,
+    ))
+}
+
+/// Shell that sets `AVOCADO_CONTENT_HASH` to a digest of a sysroot directory:
+/// the sorted NEVRA set from its rpmdb, plus a tree hash of everything the
+/// image would carry. Same recipe as the rootfs/initramfs build id
+/// ([`crate::commands::rootfs::image::render_build_id_block`]) — path, type,
+/// mode, ownership, symlink target, file content — with the package-manager
+/// state pruned, since rpmdb bytes embed install timestamps and would move the
+/// digest on every install that changed nothing. Ownership is hashed: for a
+/// format that flattens it (erofs) that over-invalidates one step, and the
+/// image's own digest stops the cascade there.
+///
+/// `sysroot` is a shell expression for the directory; `rpm_dbpath` the rpmdb's
+/// location inside it (`None` for rpm's default).
+pub fn render_sysroot_digest_script(sysroot: &str, rpm_dbpath: Option<&str>) -> String {
+    let mut prune: Vec<String> = crate::commands::rootfs::image::BUILD_STATE_PATHS
+        .iter()
+        // rpm's default dbpath on newer distributions. The query below must not
+        // be able to perturb the tree it measures: on a root with no database
+        // there, `rpm -qa` creates one.
+        .chain(std::iter::once(&"usr/lib/sysimage/rpm"))
+        .map(|p| format!("-path ./{p}"))
+        .collect();
+    if let Some(db) = rpm_dbpath {
+        prune.push(format!("-path ./{}", db.trim_start_matches('/')));
+    }
+    let prune = prune.join(" -o ");
+    let dbpath = rpm_dbpath
+        .map(|p| format!("--dbpath {p} "))
+        .unwrap_or_default();
+    format!(
+        r#"_avocado_sysroot="{sysroot}"
+_avocado_pkgs=$(rpm {dbpath}-qa --queryformat '%{{NEVRA}}\n' --root "$_avocado_sysroot" 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{{print $1}}')
+_avocado_meta=$(cd "$_avocado_sysroot" && find . \( {prune} \) -prune -o -printf '%y %m %U %G %P\t%l\n' | LC_ALL=C sort)
+_avocado_content=$(cd "$_avocado_sysroot" && find . \( {prune} \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+AVOCADO_CONTENT_HASH=$(printf '%s\n%s\n%s\n' "$_avocado_pkgs" "$_avocado_meta" "$_avocado_content" | sha256sum | awk '{{print $1}}')"#
+    )
+}
+
+/// Shell that sets `AVOCADO_CONTENT_HASH` to the sha256 of one file.
+pub fn render_file_digest_script(path: &str) -> String {
+    format!(r#"AVOCADO_CONTENT_HASH=$(sha256sum "{path}" | awk '{{print $1}}')"#)
 }
 
 /// Generate shell script to write an SDK install stamp with dynamic architecture detection.
@@ -2805,6 +2961,7 @@ mod tests {
         let outputs = StampOutputs {
             installed_packages_hash: Some("sha256:installed789".to_string()),
             package_count: Some(42),
+            ..Default::default()
         };
         let stamp = Stamp::ext_install("test-ext", "qemux86-64", inputs, outputs);
 
@@ -4082,6 +4239,7 @@ kernel:
             "dev",
             &empty_parsed,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap();
         let hash_with = compute_runtime_build_input_hash(
@@ -4089,6 +4247,7 @@ kernel:
             "dev",
             &empty_parsed,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap();
 
@@ -4124,21 +4283,36 @@ kernel:
         let script = dir.path().join("kernel-install.sh");
         std::fs::write(&script, "cp Image $DEST\n").unwrap();
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let hash_package =
-            compute_runtime_build_input_hash(&kernel_package, "dev", &empty_parsed, dir.path())
-                .unwrap();
-        let hash_compile =
-            compute_runtime_build_input_hash(&kernel_compile, "dev", &empty_parsed, dir.path())
-                .unwrap();
+        let hash_package = compute_runtime_build_input_hash(
+            &kernel_package,
+            "dev",
+            &empty_parsed,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+        let hash_compile = compute_runtime_build_input_hash(
+            &kernel_compile,
+            "dev",
+            &empty_parsed,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         // Switching kernel mode should produce a different hash
         assert_ne!(hash_package.config_hash, hash_compile.config_hash);
 
         // The install script's content is an input, not just its path.
         std::fs::write(&script, "cp Image $DEST && depmod\n").unwrap();
-        let hash_edited =
-            compute_runtime_build_input_hash(&kernel_compile, "dev", &empty_parsed, dir.path())
-                .unwrap();
+        let hash_edited = compute_runtime_build_input_hash(
+            &kernel_compile,
+            "dev",
+            &empty_parsed,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_ne!(hash_compile.config_hash, hash_edited.config_hash);
 
         // A declared script that does not exist is an error, not a sentinel.
@@ -4147,7 +4321,8 @@ kernel:
             &kernel_compile,
             "dev",
             &empty_parsed,
-            dir.path()
+            dir.path(),
+            &Default::default()
         )
         .is_err());
     }
@@ -4188,6 +4363,7 @@ extensions:
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let hash_with = compute_ext_image_input_hash(
@@ -4195,6 +4371,7 @@ extensions:
             "my-ext",
             None,
             std::path::Path::new("."),
+            None,
             None,
             None,
             None,
@@ -4248,6 +4425,7 @@ extensions:
             "dev",
             &parsed_without,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap();
         let hash_with = compute_runtime_build_input_hash(
@@ -4255,6 +4433,7 @@ extensions:
             "dev",
             &parsed_with,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap();
 
@@ -4302,10 +4481,22 @@ extensions:
         let dtso = dir.path().join("overlays/spi-fast.dtso");
         std::fs::write(&dtso, "/dts-v1/; /plugin/;\n").unwrap();
 
-        let hash_without =
-            compute_runtime_build_input_hash(&runtime, "dev", &parsed_without, dir.path()).unwrap();
-        let hash_with =
-            compute_runtime_build_input_hash(&runtime, "dev", &parsed_with, dir.path()).unwrap();
+        let hash_without = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed_without,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+        let hash_with = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed_with,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -4317,8 +4508,14 @@ extensions:
             "/dts-v1/; /plugin/; &spi0 {{ status = \"okay\"; }};\n",
         )
         .unwrap();
-        let hash_edited =
-            compute_runtime_build_input_hash(&runtime, "dev", &parsed_with, dir.path()).unwrap();
+        let hash_edited = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed_with,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_ne!(
             hash_with.config_hash, hash_edited.config_hash,
             "editing the .dtso source must change the runtime input hash"
@@ -4353,12 +4550,24 @@ extensions:
         std::fs::create_dir_all(dtso.parent().unwrap()).unwrap();
 
         std::fs::write(&dtso, "/dts-v1/;\n/plugin/;\n/ { /* v1 */ };\n").unwrap();
-        let hash_v1 =
-            compute_runtime_build_input_hash(&runtime, "dev", &parsed, tmp.path()).unwrap();
+        let hash_v1 = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed,
+            tmp.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         std::fs::write(&dtso, "/dts-v1/;\n/plugin/;\n/ { /* v2 edited */ };\n").unwrap();
-        let hash_v2 =
-            compute_runtime_build_input_hash(&runtime, "dev", &parsed, tmp.path()).unwrap();
+        let hash_v2 = compute_runtime_build_input_hash(
+            &runtime,
+            "dev",
+            &parsed,
+            tmp.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             hash_v1.config_hash, hash_v2.config_hash,
@@ -4393,12 +4602,22 @@ var_files:
         std::fs::write(data.join("config.toml"), "mode = 1\n").unwrap();
 
         let empty_parsed = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        let hash_without =
-            compute_runtime_build_input_hash(&runtime_without, "dev", &empty_parsed, dir.path())
-                .unwrap();
-        let hash_with =
-            compute_runtime_build_input_hash(&runtime_with, "dev", &empty_parsed, dir.path())
-                .unwrap();
+        let hash_without = compute_runtime_build_input_hash(
+            &runtime_without,
+            "dev",
+            &empty_parsed,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+        let hash_with = compute_runtime_build_input_hash(
+            &runtime_with,
+            "dev",
+            &empty_parsed,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             hash_without.config_hash, hash_with.config_hash,
@@ -4408,9 +4627,14 @@ var_files:
         // The source directory's content is an input: var_files are copied
         // into the var image, so an edit there must reach the device.
         std::fs::write(data.join("config.toml"), "mode = 2\n").unwrap();
-        let hash_edited =
-            compute_runtime_build_input_hash(&runtime_with, "dev", &empty_parsed, dir.path())
-                .unwrap();
+        let hash_edited = compute_runtime_build_input_hash(
+            &runtime_with,
+            "dev",
+            &empty_parsed,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_ne!(
             hash_with.config_hash, hash_edited.config_hash,
             "editing a var_files source must change the runtime input hash"
@@ -4455,6 +4679,7 @@ extensions:
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let hash_with = compute_ext_image_input_hash(
@@ -4462,6 +4687,7 @@ extensions:
             "my-ext",
             None,
             std::path::Path::new("."),
+            None,
             None,
             None,
             None,
@@ -4503,6 +4729,7 @@ var:
             "dev",
             &empty_parsed,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap();
         let hash_with = compute_runtime_build_input_hash(
@@ -4510,6 +4737,7 @@ var:
             "dev",
             &empty_parsed,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap();
 
@@ -4876,7 +5104,7 @@ extensions:
         let runtime: serde_yaml::Value = serde_yaml::from_str("packages:\n  a: '*'\n").unwrap();
         let hash = |parsed: &str, rt: &serde_yaml::Value| {
             let p: serde_yaml::Value = serde_yaml::from_str(parsed).unwrap();
-            compute_runtime_build_input_hash(rt, "dev", &p, Path::new("."))
+            compute_runtime_build_input_hash(rt, "dev", &p, Path::new("."), &Default::default())
                 .unwrap()
                 .config_hash
         };
@@ -4929,6 +5157,244 @@ extensions:
         assert_ne!(base, h("sdk:\n  image: img\nsrc_dir: ../proj\n"));
     }
 
+    /// Run a generated stamp-writing script the way the container would:
+    /// `$AVOCADO_PREFIX` pointed at a temp dir, bash executing it. Returns the
+    /// exit status and the stamp read back, if one was written.
+    #[cfg(unix)]
+    fn run_stamp_script(prefix: &Path, script: &str) -> (bool, Option<Stamp>) {
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("AVOCADO_PREFIX", prefix)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("bash on PATH");
+        let stamp = std::fs::read_to_string(
+            prefix
+                .join(".stamps")
+                .join(StampRequirement::ext_build("e").relative_path()),
+        )
+        .ok()
+        .map(|j| Stamp::from_json(&j).unwrap());
+        (status.success(), stamp)
+    }
+
+    /// The digest computed in the container lands in `outputs.content_hash`,
+    /// and only there: every other field is exactly what the host serialized —
+    /// including a path that would have been mangled by an unquoted heredoc.
+    /// A digest that is empty or not hex refuses to write anything.
+    #[cfg(unix)]
+    #[test]
+    fn digest_stamp_writer_substitutes_only_the_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = StampInputs::new("c$HOME`whoami`".to_string()); // hostile-looking, must survive
+        let stamp = Stamp::ext_build("e", "qemux86-64", inputs, StampOutputs::default());
+
+        let ok_script =
+            generate_write_stamp_script_with_digest(&stamp, "AVOCADO_CONTENT_HASH=deadbeef")
+                .unwrap();
+        let (ok, written) = run_stamp_script(dir.path(), &ok_script);
+        assert!(ok);
+        let written = written.expect("stamp written");
+        assert_eq!(
+            written.outputs.content_hash.as_deref(),
+            Some("sha256:deadbeef")
+        );
+        assert_eq!(
+            written.inputs.config_hash, "c$HOME`whoami`",
+            "no shell expansion"
+        );
+        assert!(!written
+            .to_json()
+            .unwrap()
+            .contains(CONTENT_HASH_PLACEHOLDER));
+
+        for bad in [
+            "AVOCADO_CONTENT_HASH=",
+            "AVOCADO_CONTENT_HASH='not hex!'",
+            "true",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = generate_write_stamp_script_with_digest(&stamp, bad).unwrap();
+            let (ok, written) = run_stamp_script(dir.path(), &script);
+            assert!(!ok, "{bad}: refused");
+            assert!(written.is_none(), "{bad}: nothing written");
+        }
+    }
+
+    /// The sysroot digest is stable over an unchanged tree, moves on a content
+    /// edit, and does NOT move on package-manager bookkeeping — the rpmdb and
+    /// dnf caches churn on every install, and a digest that followed them would
+    /// never let anything skip.
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_digest_tracks_content_and_ignores_package_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sysroot");
+        for d in [
+            "usr/bin",
+            "etc",
+            "var/lib/rpm",
+            "var/lib/dnf",
+            "var/cache/dnf",
+            "var/lib/extension.d/rpm",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("usr/bin/app"), "binary v1").unwrap();
+        std::fs::write(root.join("etc/app.conf"), "mode=1").unwrap();
+
+        // A stub `rpm` first on PATH: the host's rpm (if any) has its own default
+        // dbpath and would answer for the host, not this tree. The real query runs
+        // inside the SDK; here the property under test is the tree hash.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("rpm"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("rpm"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let path_env = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let digest = |dbpath: Option<&str>| -> String {
+            let script = format!(
+                "{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                render_sysroot_digest_script(&root.display().to_string(), dbpath)
+            );
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", &path_env)
+                .stderr(std::process::Stdio::null())
+                .output()
+                .expect("bash on PATH");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+
+        let d1 = digest(None);
+        assert_eq!(d1.len(), 64, "hex sha256: {d1}");
+        assert_eq!(d1, digest(None), "stable");
+
+        // Package-manager state is pruned.
+        std::fs::write(
+            root.join("var/lib/rpm/Packages"),
+            "rpmdb bytes with timestamps",
+        )
+        .unwrap();
+        std::fs::write(root.join("var/lib/dnf/history"), "x").unwrap();
+        std::fs::write(root.join("var/cache/dnf/repo"), "x").unwrap();
+        assert_eq!(d1, digest(None), "rpmdb/dnf churn must not move the digest");
+        std::fs::write(root.join("var/lib/extension.d/rpm/Packages"), "x").unwrap();
+        assert_eq!(
+            digest(Some("/var/lib/extension.d/rpm")),
+            digest(Some("/var/lib/extension.d/rpm")),
+            "stable with an explicit dbpath"
+        );
+        let with_ext_db = digest(Some("/var/lib/extension.d/rpm"));
+        std::fs::write(root.join("var/lib/extension.d/rpm/Packages"), "y").unwrap();
+        assert_eq!(
+            with_ext_db,
+            digest(Some("/var/lib/extension.d/rpm")),
+            "explicit dbpath pruned"
+        );
+
+        // Real content is not.
+        std::fs::write(root.join("usr/bin/app"), "binary v2").unwrap();
+        let d2 = digest(None);
+        assert_ne!(d1, d2, "file content");
+        std::fs::write(root.join("etc/new.conf"), "").unwrap();
+        assert_ne!(d2, digest(None), "new file");
+    }
+
+    /// Batch-read output is `path:::json` per line, `null` for a missing stamp.
+    fn batch_line(req: &StampRequirement, stamp: Option<&Stamp>) -> String {
+        let body = stamp
+            .map(|s| s.to_json().unwrap().replace('\n', ""))
+            .unwrap_or_else(|| "null".to_string());
+        format!("{}:::{}\n", req.relative_path(), body)
+    }
+
+    /// The chain: an upstream digest read from a batch result is folded into the
+    /// downstream input hash, so a changed digest changes the input and an
+    /// identical one does not.
+    #[test]
+    fn downstream_inputs_fold_upstream_content_hashes() {
+        let with_digest = |h: &str| {
+            Stamp::ext_build(
+                "app",
+                "qemux86-64",
+                StampInputs::new("i".into()),
+                StampOutputs {
+                    content_hash: Some(h.to_string()),
+                    ..Default::default()
+                },
+            )
+        };
+        let batch = batch_line(
+            &StampRequirement::ext_build("app"),
+            Some(&with_digest("sha256:aa")),
+        ) + &batch_line(&StampRequirement::ext_image("app"), None);
+        assert_eq!(
+            content_hash_from_batch(&batch, &StampRequirement::ext_build("app")).as_deref(),
+            Some("sha256:aa")
+        );
+        assert_eq!(
+            content_hash_from_batch(&batch, &StampRequirement::ext_image("app")),
+            None
+        );
+
+        // ext image input moves with the build digest.
+        let cfg: serde_yaml::Value =
+            serde_yaml::from_str("extensions:\n  my-ext:\n    packages:\n      bash: '*'\n")
+                .unwrap();
+        let img = |up: Option<&str>| {
+            compute_ext_image_input_hash(&cfg, "my-ext", None, Path::new("."), None, None, None, up)
+                .unwrap()
+                .config_hash
+        };
+        assert_eq!(img(Some("sha256:aa")), img(Some("sha256:aa")));
+        assert_ne!(img(Some("sha256:aa")), img(Some("sha256:bb")));
+        assert_ne!(img(Some("sha256:aa")), img(None));
+
+        // runtime build input moves with any required extension's image digest.
+        let image_stamp = |h: &str| {
+            Stamp::ext_image(
+                "app",
+                "qemux86-64",
+                StampInputs::new("i".into()),
+                StampOutputs {
+                    content_hash: Some(h.to_string()),
+                    ..Default::default()
+                },
+            )
+        };
+        let batch_a = batch_line(
+            &StampRequirement::ext_image("app"),
+            Some(&image_stamp("sha256:11")),
+        );
+        let batch_b = batch_line(
+            &StampRequirement::ext_image("app"),
+            Some(&image_stamp("sha256:22")),
+        );
+        let map_a = ext_image_content_hashes_from_batch(&batch_a, ["app".to_string()]);
+        let map_b = ext_image_content_hashes_from_batch(&batch_b, ["app".to_string()]);
+        assert_eq!(map_a.get("app").map(String::as_str), Some("sha256:11"));
+        let rt: serde_yaml::Value = serde_yaml::from_str("packages:\n  a: '*'\n").unwrap();
+        let empty = serde_yaml::Value::Mapping(Default::default());
+        let rb = |m: &std::collections::BTreeMap<String, String>| {
+            compute_runtime_build_input_hash(&rt, "dev", &empty, Path::new("."), m)
+                .unwrap()
+                .config_hash
+        };
+        assert_ne!(rb(&map_a), rb(&map_b));
+        assert_ne!(rb(&map_a), rb(&Default::default()));
+    }
+
     /// `is_current` compares `package_list_hash` strictly. A recorded `None`
     /// against a current `Some` (or the reverse) is stale — never a match by
     /// omission.
@@ -4954,6 +5420,7 @@ extensions:
             "my-ext",
             None,
             std::path::Path::new("."),
+            None,
             None,
             None,
             None,
@@ -5121,6 +5588,7 @@ initramfs:
             "dev",
             &parsed_a,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap()
         .config_hash;
@@ -5129,6 +5597,7 @@ initramfs:
             "dev",
             &parsed_b,
             std::path::Path::new("."),
+            &Default::default(),
         )
         .unwrap()
         .config_hash;
@@ -5156,9 +5625,15 @@ initramfs:
                 .config_hash
         };
         let build = |n: &serde_yaml::Value| {
-            compute_runtime_build_input_hash(n, "dev", &empty, std::path::Path::new("."))
-                .unwrap()
-                .config_hash
+            compute_runtime_build_input_hash(
+                n,
+                "dev",
+                &empty,
+                std::path::Path::new("."),
+                &Default::default(),
+            )
+            .unwrap()
+            .config_hash
         };
 
         assert_ne!(

@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
 ### Changed
+- **Stamps now record what a step produced, and the next step's input depends
+  on it.** `STAMP_VERSION` moves 3 → 4. `ext build` records a digest of the
+  built sysroot (sorted NEVRA set plus a tree hash of everything the image
+  would carry, package-manager state pruned); `ext image` records its image's
+  sha256; `rootfs install` and `initramfs install` record the digest of the
+  installed tree, overlay included. `ext image` folds the build digest into its
+  input, and `runtime build` folds every required extension's image digest into
+  its own. The effect is that a rebuild which changes no bytes — a recompile to
+  the same binary, a `touch` — stops at the first step whose output is
+  unchanged instead of cascading into a re-image, a new `image_id`, a new
+  manifest and a fresh upload. It is also the half of fingerprinting that
+  covers inputs the host cannot see: a `source: {type: git}` extension's files
+  live in the SDK volume, and its tree digest is what notices they changed.
+  The digest is computed in the container that writes the stamp; a stamp
+  whose digest is empty or not hex is refused rather than written.
 - **Stamps now hash the files a build reads, not just the paths that name
   them.** `STAMP_VERSION` moves 2 → 3; every existing stamp reads as stale once
   and rebuilds. Newly folded: compile-script content (`sdk.compile.<n>.compile`,
