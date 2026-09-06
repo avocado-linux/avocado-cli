@@ -1036,7 +1036,7 @@ impl RuntimeBuildCommand {
                 inputs,
                 StampOutputs::default(),
             );
-            let stamp_script = generate_write_stamp_script(&stamp)?;
+            let mut stamp_script = generate_write_stamp_script(&stamp)?;
 
             // The sysroot image stamps ride in the same container run. Written
             // only for a section that actually ran — a reused image keeps the
