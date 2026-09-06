@@ -60,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change now invalidates every image by itself.
 
 ### Changed
+- **`ext build` and `ext image` skip when nothing they read has changed.** Each
+  step now reads its own stamp in the batch stamp read it already does for its
+  preconditions, and probes for its output in the same round-trip. When the
+  stamp is current for every input computed now — config, the compile and
+  install scripts' content, the `package_files` source tree, the overlay, and
+  for `ext image` the digest `ext build` recorded — and the output is present,
+  the step reports "up to date" and returns before any container work. The
+  stamp is left as it is. A source edit under a compiled extension reaches the
+  input hash and is never skipped over; a rebuild that changed no bytes stops
+  at `ext image`, which reads the same unchanged digest. `--no-stamps` disables
+  the skip along with everything else. `avocado build` on a project where one
+  extension changed now rebuilds one extension.
 - **Stamps now record what a step produced, and the next step's input depends
   on it.** `STAMP_VERSION` moves 3 → 4. `ext build` records a digest of the
   built sysroot (sorted NEVRA set plus a tree hash of everything the image

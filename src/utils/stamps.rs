@@ -2775,6 +2775,44 @@ pub fn remove_own_stamp_line(req: &StampRequirement) -> String {
     )
 }
 
+/// Key under which [`generate_output_listing_probe`] reports in a batch read.
+pub const OUTPUT_LISTING_KEY: &str = "__outputs__";
+
+/// One more line for a batch stamp-read script: the basenames of the entries
+/// (files or directories) matching `glob_expr` (a shell glob, quoted as the caller wants it expanded),
+/// space-separated, under [`OUTPUT_LISTING_KEY`]. Lets a step learn whether its
+/// output exists in the same container round-trip that reads its stamps —
+/// the second half of "may I skip": a current stamp whose output is gone must
+/// still rebuild.
+pub fn generate_output_listing_probe(glob_expr: &str) -> String {
+    format!(
+        r#"echo -n "{OUTPUT_LISTING_KEY}:::"; for _f in {glob_expr}; do [ -e "$_f" ] && printf '%s ' "$(basename "$_f")"; done; echo"#
+    )
+}
+
+/// The basenames reported by [`generate_output_listing_probe`].
+pub fn output_listing_from_batch(batch_output: &str) -> Vec<String> {
+    parse_batch_stamps_output(batch_output)
+        .get(OUTPUT_LISTING_KEY)
+        .and_then(|v| v.as_deref())
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the stamp at `req` in a batch read exists and is current for
+/// `inputs`. The self-check a step makes before doing its work.
+pub fn own_stamp_is_current(
+    batch_output: &str,
+    req: &StampRequirement,
+    inputs: &StampInputs,
+) -> bool {
+    parse_batch_stamps_output(batch_output)
+        .get(&req.relative_path())
+        .and_then(|json| json.as_deref())
+        .and_then(|json| Stamp::from_json(json).ok())
+        .is_some_and(|stamp| stamp.is_current(inputs))
+}
+
 /// Parse the output from `generate_batch_read_stamps_script` into a map of path -> JSON content
 pub fn parse_batch_stamps_output(
     output: &str,
@@ -5942,6 +5980,67 @@ extensions:
         };
         assert_ne!(rb(&map_a), rb(&map_b));
         assert_ne!(rb(&map_a), rb(&Default::default()));
+    }
+
+    /// The output probe rides in the batch read and reports what exists —
+    /// files and directories both — so a step can refuse to skip over a
+    /// current stamp whose output is gone.
+    #[cfg(unix)]
+    #[test]
+    fn output_listing_probe_reports_existing_files_and_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output/extensions");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("app-1.0.0.raw"), "x").unwrap();
+        std::fs::write(out.join("app-1.0.0.kab"), "x").unwrap();
+        std::fs::write(out.join("other-2.0.0.raw"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("sysroots/app")).unwrap();
+
+        let run = |glob: &str| {
+            let script = generate_output_listing_probe(glob);
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("AVOCADO_PREFIX", dir.path())
+                .output()
+                .unwrap();
+            let mut names = output_listing_from_batch(&String::from_utf8(o.stdout).unwrap());
+            names.sort();
+            names
+        };
+        assert_eq!(
+            run(
+                r#""$AVOCADO_PREFIX/output/extensions/app-"*.raw "$AVOCADO_PREFIX/output/extensions/app-"*.kab"#
+            ),
+            ["app-1.0.0.kab", "app-1.0.0.raw"]
+        );
+        assert_eq!(
+            run(r#""$AVOCADO_PREFIX/sysroots/app""#),
+            ["app"],
+            "a directory counts"
+        );
+        assert!(run(r#""$AVOCADO_PREFIX/sysroots/missing""#).is_empty());
+        assert!(run(r#""$AVOCADO_PREFIX/output/extensions/nope-"*.raw"#).is_empty());
+    }
+
+    /// The self-check: current only when the stamp is present AND its inputs
+    /// match — a stale or absent own stamp never permits a skip.
+    #[test]
+    fn own_stamp_is_current_requires_presence_and_matching_inputs() {
+        let req = StampRequirement::ext_image("app");
+        let inputs = StampInputs::new("h1".into());
+        let stamp = Stamp::ext_image("app", "qemux86-64", inputs.clone(), StampOutputs::default());
+        let batch = batch_line(&req, Some(&stamp));
+        assert!(own_stamp_is_current(&batch, &req, &inputs));
+        assert!(
+            !own_stamp_is_current(&batch, &req, &StampInputs::new("h2".into())),
+            "stale"
+        );
+        assert!(
+            !own_stamp_is_current(&batch_line(&req, None), &req, &inputs),
+            "absent"
+        );
+        assert!(!own_stamp_is_current("", &req, &inputs), "no batch");
     }
 
     /// `is_current` compares `package_list_hash` strictly. A recorded `None`

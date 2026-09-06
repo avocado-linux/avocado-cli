@@ -279,7 +279,18 @@ impl ExtBuildCommand {
             );
 
             // Batch all stamp reads into a single container invocation for performance
-            let batch_script = generate_batch_read_stamps_script(&required);
+            // Same round-trip also reads this step's own stamp and probes for the
+            // sysroot it would build — the two facts the skip below needs.
+            let own_req = crate::utils::stamps::StampRequirement::ext_build(&self.extension);
+            let batch_script = format!(
+                "{}\n{}\n{}",
+                generate_batch_read_stamps_script(&required),
+                generate_batch_read_stamps_script(std::slice::from_ref(&own_req)),
+                crate::utils::stamps::generate_output_listing_probe(&format!(
+                    "\"$AVOCADO_EXT_SYSROOTS/{}\"",
+                    self.extension
+                )),
+            );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target.clone(),
@@ -341,8 +352,8 @@ impl ExtBuildCommand {
             if let Some(ref i) = build_inputs {
                 current_inputs.push((StampComponent::Extension, StampCommand::Build, i));
             }
-            let validation =
-                validate_stamps_batch(&required, output.as_deref().unwrap_or(""), &current_inputs);
+            let batch = output.as_deref().unwrap_or("");
+            let validation = validate_stamps_batch(&required, batch, &current_inputs);
 
             if !validation.is_satisfied() {
                 let err = validation
@@ -352,6 +363,27 @@ impl ExtBuildCommand {
                         &target,
                     ));
                 return Err(anyhow::anyhow!("{err}"));
+            }
+
+            // Skip: this step's own stamp is current for every input computed
+            // above — config, compile and install script content, the
+            // `package_files` source tree, the overlay — and the sysroot it
+            // built is still there. Nothing it would do could change the tree.
+            // A compiled extension's source edit reaches `build_inputs`, so it
+            // is never skipped over one. The stamp is left as it is; `ext image`
+            // reads the same content_hash from it and reaches the same verdict.
+            let sysroot_present = crate::utils::stamps::output_listing_from_batch(batch)
+                .iter()
+                .any(|d| d == &self.extension);
+            if let Some(ref i) = build_inputs {
+                if sysroot_present && crate::utils::stamps::own_stamp_is_current(batch, &own_req, i)
+                {
+                    print_success(
+                        &format!("Extension '{}' is up to date.", self.extension),
+                        OutputLevel::Normal,
+                    );
+                    return Ok(());
+                }
             }
         }
 
