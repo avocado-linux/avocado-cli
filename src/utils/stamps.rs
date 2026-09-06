@@ -364,6 +364,32 @@ impl Stamp {
         )
     }
 
+    /// Create rootfs image stamp
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rootfs_image(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Image,
+            StampComponent::Rootfs,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Create initramfs image stamp
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn initramfs_image(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Image,
+            StampComponent::Initramfs,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
     ///
     /// For SDK stamps, the path includes the target architecture (which represents
@@ -519,6 +545,18 @@ impl StampRequirement {
     /// Initramfs install requirement
     pub fn initramfs_install() -> Self {
         Self::new(StampCommand::Install, StampComponent::Initramfs, None)
+    }
+
+    /// Rootfs image requirement
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rootfs_image() -> Self {
+        Self::new(StampCommand::Image, StampComponent::Rootfs, None)
+    }
+
+    /// Initramfs image requirement
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn initramfs_image() -> Self {
+        Self::new(StampCommand::Image, StampComponent::Initramfs, None)
     }
 
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
@@ -1676,6 +1714,123 @@ pub fn compute_ext_image_input_hash(
         );
     }
 
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for **rootfs image** / **initramfs image**.
+///
+/// `section` is `"rootfs"` / `"initramfs"`; `resolved_section` is what
+/// `Config::resolve_image_section` returns for the build target — never the
+/// raw node, so a `target-<name>:` override reaches the hash. `config` is the
+/// merged config the build reads (`parsed`); `runtime_name` is set on the
+/// `runtime build` path, which inlines both image steps. Folded:
+///
+/// - `<section>.install.content_hash` — the install stamp's digest. What the
+///   step images is the sysroot, which the host cannot see; this chains the
+///   two stamps, overlay and all.
+/// - `<section>.image_section` — the whole resolved section, not a picked
+///   subset, so an image-side key this module has not heard of still
+///   invalidates (over-invalidation is the safe side).
+/// - `<section>.post_install` — by content, so an in-place edit invalidates.
+///   Absent folds nothing, as the install hash does.
+/// - `permissions` — the bodies behind `<section>.permissions: <name>` refs.
+/// - `source_date_epoch` — `mkfs.erofs -T` and the cpio mtime normalization.
+/// - `sdk.image` — the container whose mkfs/cpio/zstd produce the bytes.
+/// - `runtimes.<rt>.{var,version,rootfs,initramfs}`, and the same four under
+///   each `runtimes.<rt>.target-*:` block since the build resolves those
+///   overrides for its target: `var` drives the initramfs encrypt marker,
+///   `version` rides the kab `-v`, `rootfs`/`initramfs` carry inline
+///   per-runtime permissions. Deliberately NOT the whole `runtimes.<rt>` node
+///   — it holds `extensions` and `packages`, and re-imaging the rootfs
+///   because an extension was added is exactly the inner loop this stamp
+///   exists to protect.
+/// - `<section>.kab_keyset` — the keyset file's digest, only when
+///   `image.type` is `kab` and `KAB_KEYSET_FILE` is set: a rotated key must
+///   invalidate and the path alone cannot show it. Set but unreadable is an
+///   error, like a declared script that is missing. Nothing is folded for a
+///   non-kab image, so a stray env var cannot churn it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn compute_sysroot_image_input_hash(
+    section: &str,
+    resolved_section: &serde_yaml::Value,
+    install_content_hash: &str,
+    config: &serde_yaml::Value,
+    runtime_name: Option<&str>,
+    project_root: &Path,
+) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+    hash_data.insert(
+        serde_yaml::Value::String(format!("{section}.install.content_hash")),
+        serde_yaml::Value::String(install_content_hash.to_string()),
+    );
+    hash_data.insert(
+        serde_yaml::Value::String(format!("{section}.image_section")),
+        resolved_section.clone(),
+    );
+    if let Some(post_install) = resolved_section
+        .get("post_install")
+        .and_then(|v| v.as_str())
+    {
+        fold_file_content(
+            &mut hash_data,
+            &format!("{section}.post_install"),
+            project_root,
+            post_install,
+        )?;
+    }
+    for (key, value) in [
+        ("permissions", config.get("permissions")),
+        ("source_date_epoch", config.get("source_date_epoch")),
+        ("sdk.image", config.get("sdk").and_then(|s| s.get("image"))),
+    ] {
+        if let Some(v) = value {
+            hash_data.insert(serde_yaml::Value::String(key.to_string()), v.clone());
+        }
+    }
+    let runtime = runtime_name.and_then(|rt| Some((rt, config.get("runtimes")?.get(rt)?)));
+    if let Some((rt, runtime)) = runtime {
+        // The base block plus every `target-*:` override block: the build
+        // resolves those for its target, and folding all of them
+        // over-invalidates across targets rather than missing an opt-in.
+        let overrides = runtime
+            .as_mapping()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| {
+                let k = k.as_str()?;
+                k.starts_with("target-")
+                    .then(|| (format!("runtimes.{rt}.{k}"), v))
+            });
+        for (prefix, node) in std::iter::once((format!("runtimes.{rt}"), runtime)).chain(overrides)
+        {
+            for k in ["var", "version", "rootfs", "initramfs"] {
+                if let Some(v) = node.get(k) {
+                    hash_data.insert(
+                        serde_yaml::Value::String(format!("{prefix}.{k}")),
+                        v.clone(),
+                    );
+                }
+            }
+        }
+    }
+    let is_kab = resolved_section
+        .get("image")
+        .and_then(|i| i.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("kab");
+    if let Some(keyset) = std::env::var("KAB_KEYSET_FILE").ok().filter(|_| is_kab) {
+        // Against the cwd, which is how the build's own existence check
+        // resolves it.
+        let digest = crate::utils::overlay_preprocess::path_content_digest(Path::new(""), &keyset)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("KAB_KEYSET_FILE points to '{keyset}' but the file does not exist.")
+            })?;
+        hash_data.insert(
+            serde_yaml::Value::String(format!("{section}.kab_keyset")),
+            serde_yaml::Value::String(digest),
+        );
+    }
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }
@@ -6360,5 +6515,282 @@ rootfs:
             !stamp.is_current(&inputs),
             "older stamp version should be reported as stale"
         );
+    }
+
+    /// `compute_sysroot_image_input_hash`'s config hash over a YAML section
+    /// body against config `cfg`, with a fixed upstream digest; `rt` selects
+    /// the runtime-build path.
+    fn image_hash_in(
+        section: &str,
+        yaml: &str,
+        cfg: &str,
+        rt: Option<&str>,
+        root: &Path,
+    ) -> Result<String> {
+        let node: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cfg: serde_yaml::Value = serde_yaml::from_str(cfg).unwrap();
+        Ok(
+            compute_sysroot_image_input_hash(section, &node, "sha256:aa", &cfg, rt, root)?
+                .config_hash,
+        )
+    }
+
+    /// The standalone-command shape: empty config, no runtime.
+    fn image_hash(section: &str, yaml: &str, root: &Path) -> Result<String> {
+        image_hash_in(section, yaml, "{}", None, root)
+    }
+
+    #[test]
+    fn sysroot_image_hash_is_deterministic() {
+        let yaml = "filesystem: erofs\nimage:\n  type: kab\n  args: -v 1\n";
+        let root = Path::new(".");
+        assert_eq!(
+            image_hash("rootfs", yaml, root).unwrap(),
+            image_hash("rootfs", yaml, root).unwrap()
+        );
+    }
+
+    /// The chain edge: the image step's real input is the sysroot, and the
+    /// install stamp's digest is how it reaches the hash.
+    #[test]
+    fn sysroot_image_hash_chains_install_content_hash() {
+        let node: serde_yaml::Value = serde_yaml::from_str("filesystem: erofs\n").unwrap();
+        let empty = serde_yaml::Value::Mapping(Default::default());
+        let hash = |up: &str| {
+            compute_sysroot_image_input_hash("rootfs", &node, up, &empty, None, Path::new("."))
+                .unwrap()
+                .config_hash
+        };
+        assert_ne!(hash("sha256:aa"), hash("sha256:bb"));
+    }
+
+    #[test]
+    fn sysroot_image_hash_tracks_filesystem_image_and_permissions() {
+        let root = Path::new(".");
+        let base = image_hash("rootfs", "filesystem: erofs\n", root).unwrap();
+        for (label, yaml) in [
+            ("filesystem", "filesystem: erofs-lz4\n"),
+            (
+                "image.verity",
+                "filesystem: erofs\nimage:\n  verity: true\n",
+            ),
+            (
+                "image arg",
+                "filesystem: erofs\nimage:\n  type: kab\n  args: -v 1\n",
+            ),
+            (
+                "permissions",
+                "filesystem: erofs\npermissions:\n  users: [{name: app}]\n",
+            ),
+            // Not a key this module picks — the whole resolved section is
+            // folded so an unforeseen image-side key still invalidates.
+            (
+                "unpicked section key",
+                "filesystem: erofs\nfuture_knob: 1\n",
+            ),
+            (
+                "unpicked image key",
+                "filesystem: erofs\nimage:\n  compression: zstd\n",
+            ),
+        ] {
+            assert_ne!(base, image_hash("rootfs", yaml, root).unwrap(), "{label}");
+        }
+    }
+
+    #[test]
+    fn sysroot_image_hash_tracks_post_install_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("post.sh");
+        let yaml = "post_install: post.sh\n";
+
+        std::fs::write(&script, b"echo v1\n").unwrap();
+        let h1 = image_hash("rootfs", yaml, tmp.path()).unwrap();
+        std::fs::write(&script, b"echo v2\n").unwrap();
+        let h2 = image_hash("rootfs", yaml, tmp.path()).unwrap();
+        assert_ne!(h1, h2, "same path, edited content must invalidate");
+
+        std::fs::remove_file(&script).unwrap();
+        assert!(
+            image_hash("rootfs", yaml, tmp.path()).is_err(),
+            "a declared but missing post_install is an error, not a sentinel"
+        );
+    }
+
+    #[test]
+    fn rootfs_and_initramfs_image_hashes_differ_for_identical_inputs() {
+        let yaml = "filesystem: erofs\n";
+        let root = Path::new(".");
+        assert_ne!(
+            image_hash("rootfs", yaml, root).unwrap(),
+            image_hash("initramfs", yaml, root).unwrap()
+        );
+    }
+
+    /// The hash is computed over `Config::resolve_image_section`'s output, so
+    /// a `target-<name>:` override reaches it — the raw node would read the
+    /// same for every target.
+    #[test]
+    fn sysroot_image_hash_sees_target_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("foo.sh"), b"echo foo\n").unwrap();
+        let yaml = "rootfs:\n  filesystem: erofs\n  target-foo:\n    post_install: foo.sh\n";
+        let config = crate::utils::config::Config::load_from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hash = |target: &str| {
+            let section = config
+                .resolve_image_section(&parsed, "rootfs", target)
+                .unwrap();
+            compute_sysroot_image_input_hash(
+                "rootfs",
+                &section,
+                "sha256:aa",
+                &parsed,
+                None,
+                tmp.path(),
+            )
+            .unwrap()
+            .config_hash
+        };
+        assert_ne!(hash("foo"), hash("bar"));
+    }
+
+    /// The inputs the image step reads from outside its own section, each
+    /// moving the hash on its own.
+    #[test]
+    fn sysroot_image_hash_tracks_config_and_runtime_inputs() {
+        let root = Path::new(".");
+        let hash = |cfg: &str| {
+            image_hash_in(
+                "initramfs",
+                "filesystem: cpio.zst\n",
+                cfg,
+                Some("dev"),
+                root,
+            )
+            .unwrap()
+        };
+        let dev = "runtimes:\n  dev:\n    version: '1'\n";
+        let base = hash(dev);
+        for (label, extra) in [
+            ("var.encrypt", "    var:\n      encrypt: true\n"),
+            ("var.hardware", "    var:\n      hardware: caam\n"),
+            // The build resolves `target-<x>:` overrides inside the runtime
+            // block; a per-target opt-in must not be invisible here.
+            (
+                "target-scoped var.encrypt",
+                "    target-foo:\n      var:\n        encrypt: true\n",
+            ),
+            (
+                "inline runtime rootfs permissions",
+                "    rootfs:\n      permissions:\n        users: [{name: app}]\n",
+            ),
+            (
+                "inline runtime initramfs permissions",
+                "    initramfs:\n      permissions:\n        users: [{name: app}]\n",
+            ),
+            ("source_date_epoch", "source_date_epoch: 1700000000\n"),
+            ("sdk.image", "sdk:\n  image: other\n"),
+        ] {
+            assert_ne!(base, hash(&format!("{dev}{extra}")), "{label}");
+        }
+        assert_ne!(
+            base,
+            hash("runtimes:\n  dev:\n    version: '2'\n"),
+            "runtime version"
+        );
+    }
+
+    /// `<section>.permissions: <name>` is only a ref; the body it names lives
+    /// in top-level `permissions:` and an edit there has to invalidate.
+    #[test]
+    fn sysroot_image_hash_tracks_named_permissions_body() {
+        let root = Path::new(".");
+        let hash =
+            |cfg: &str| image_hash_in("rootfs", "permissions: p\n", cfg, None, root).unwrap();
+        assert_ne!(
+            hash("permissions:\n  p:\n    users: [{name: app}]\n"),
+            hash("permissions:\n  p:\n    users: [{name: app, uid: 1001}]\n")
+        );
+    }
+
+    /// `runtimes.<rt>` is folded narrowly. Adding an extension or a package
+    /// to the runtime must not re-image the rootfs — that inner loop is what
+    /// this stamp exists to protect — and the standalone path ignores the
+    /// runtimes block entirely.
+    #[test]
+    fn sysroot_image_hash_ignores_runtime_extensions_and_packages() {
+        let root = Path::new(".");
+        let hash = |cfg: &str, rt: Option<&str>| {
+            image_hash_in("rootfs", "filesystem: erofs\n", cfg, rt, root).unwrap()
+        };
+        let a = "runtimes:\n  dev:\n    version: '1'\n    var:\n      encrypt: true\n";
+        let b = format!(
+            "{a}    extensions:\n      app: {{version: '1'}}\n    packages:\n      vim: '*'\n"
+        );
+        assert_eq!(hash(a, Some("dev")), hash(&b, Some("dev")));
+        assert_eq!(
+            hash(a, None),
+            hash("{}", None),
+            "standalone ignores runtimes"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sysroot_image_hash_tracks_kab_keyset_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keyset = tmp.path().join("kab.keyset");
+        let root = Path::new(".");
+        let kab = "image:\n  type: kab\n  args: -v 1\n";
+        let raw = "image:\n  type: raw\n";
+
+        std::env::set_var("KAB_KEYSET_FILE", &keyset);
+        std::fs::write(&keyset, b"key-v1").unwrap();
+        let h1 = image_hash("rootfs", kab, root).unwrap();
+        std::fs::write(&keyset, b"key-v2").unwrap();
+        assert_ne!(
+            h1,
+            image_hash("rootfs", kab, root).unwrap(),
+            "a rotated keyset must invalidate"
+        );
+        let h_raw = image_hash("rootfs", raw, root).unwrap();
+
+        std::env::set_var("KAB_KEYSET_FILE", tmp.path().join("missing"));
+        assert!(
+            image_hash("rootfs", kab, root).is_err(),
+            "set but unreadable is an error, not a sentinel"
+        );
+        assert_eq!(
+            h_raw,
+            image_hash("rootfs", raw, root).unwrap(),
+            "a non-kab image never reads the keyset"
+        );
+
+        std::env::remove_var("KAB_KEYSET_FILE");
+        assert_eq!(
+            h_raw,
+            image_hash("rootfs", raw, root).unwrap(),
+            "a stray KAB_KEYSET_FILE must not churn non-kab images"
+        );
+    }
+
+    #[test]
+    fn sysroot_image_stamp_paths_and_requirements() {
+        let inputs = StampInputs::new("sha256:abc".to_string());
+        let stamp = Stamp::rootfs_image("qemux86-64", inputs.clone(), StampOutputs::default());
+        assert_eq!(stamp.command, StampCommand::Image);
+        assert_eq!(stamp.component, StampComponent::Rootfs);
+        assert_eq!(stamp.relative_path(), "rootfs/image.stamp");
+        let stamp = Stamp::initramfs_image("qemux86-64", inputs, StampOutputs::default());
+        assert_eq!(stamp.relative_path(), "initramfs/image.stamp");
+
+        let req = StampRequirement::rootfs_image();
+        assert_eq!(req.relative_path(), "rootfs/image.stamp");
+        assert_eq!(req.description(), "rootfs image");
+        assert_eq!(req.fix_command(), "avocado rootfs image");
+        let req = StampRequirement::initramfs_image();
+        assert_eq!(req.relative_path(), "initramfs/image.stamp");
+        assert_eq!(req.description(), "initramfs image");
+        assert_eq!(req.fix_command(), "avocado initramfs image");
     }
 }
