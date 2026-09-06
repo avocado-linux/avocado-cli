@@ -131,7 +131,7 @@ impl RuntimeInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.feeds_for(&target, FeedStage::Runtime, &self.config_path)?;
+        let feeds = config.materialize_feeds(&target, FeedStage::Runtime, &self.config_path)?;
 
         // Check if runtime section exists
         let runtime_section = match parsed.get("runtimes") {
@@ -584,6 +584,7 @@ impl RuntimeInstallCommand {
                     lock_file,
                     repo_url: repo_url.map(|s| s.as_str()),
                     repo_release: repo_release.map(|s| s.as_str()),
+                    feeds,
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     runs_on_context,

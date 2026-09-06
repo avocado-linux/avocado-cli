@@ -4800,7 +4800,7 @@ rootfs:
         };
         let proj = |feeds: &str| {
             let c: crate::utils::config::Config = serde_yaml::from_str(&yaml(feeds)).unwrap();
-            crate::utils::feeds::ResolvedFeedSet::resolve(&c, "t", root)
+            crate::utils::feeds::ResolvedFeedSet::resolve(&c, "t", root, None)
                 .unwrap()
                 .unwrap()
                 .stage_projection_json(crate::utils::feeds::FeedStage::Rootfs)

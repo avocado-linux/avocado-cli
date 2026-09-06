@@ -1881,6 +1881,14 @@ impl SdkContainer {
         std::collections::HashMap<String, String>,
         Vec<String>,
     )> {
+        // The generated .repo files live in a host tempdir that only the local
+        // docker can mount; on the remote daemon dnf would silently see none of
+        // them while the install stamp recorded the full set. Fail closed.
+        if config.feeds.is_some() {
+            anyhow::bail!(
+                "named feeds (repos: / distro.feeds) are not supported with --runs-on yet"
+            );
+        }
         if !context.is_active() {
             anyhow::bail!("RunsOnContext is not active (already torn down)");
         }
@@ -2574,12 +2582,12 @@ export DNF_SDK_HOST_OPTS="\
 
 export DNF_SDK_HOST_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/host}} \
 "
 
 export DNF_SDK_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}} \
 "
 
 # Combined repo config for SDK package installations (nativesdk packages).
@@ -2589,12 +2597,12 @@ export DNF_SDK_REPO_CONF="\
 # This ensures correct arch selection when running --runs-on with cross-arch targets.
 export DNF_SDK_COMBINED_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d,${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d,${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/host}}${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}} \
 "
 
 export DNF_SDK_TARGET_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}} \
 "
 
 mkdir -p /etc/dnf/vars
@@ -2672,11 +2680,14 @@ if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
 fi
 "#,
             );
-            // Custom repo CA / insecure TLS, applied across all dnf phases.
-            script.push_str(REPO_TLS_SETUP_SNIPPET);
         }
-        // Named feeds: purge stale generated .repo files, renumber built-ins
-        // when something precedes the distro feed, copy in this run's files.
+        // Custom repo CA / insecure TLS, applied across all dnf phases — including
+        // runs without the SDK environment sourced (`ext dnf`, rpm queries), which
+        // used to skip this and so ignored AVOCADO_REPO_CA / AVOCADO_REPO_INSECURE.
+        script.push_str(REPO_TLS_SETUP_SNIPPET);
+        // Named feeds: purge copies left by earlier builds and renumber the
+        // built-ins when something precedes the distro feed. The generated files
+        // themselves are served from the mount via the reposdir lists above.
         // Unconditional: dnf also runs without the SDK environment sourced
         // (`ext dnf`, rpm queries), and the feeds must reach every invocation.
         script.push_str(crate::utils::feeds::FEEDS_SETUP_SNIPPET);
@@ -2867,12 +2878,12 @@ export DNF_SDK_HOST_OPTS="\
 
 export DNF_SDK_HOST_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/host}} \
 "
 
 export DNF_SDK_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}} \
 "
 
 # Combined repo config for SDK package installations (nativesdk packages).
@@ -2882,12 +2893,12 @@ export DNF_SDK_REPO_CONF="\
 # This ensures correct arch selection when running --runs-on with cross-arch targets.
 export DNF_SDK_COMBINED_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_HOST_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d,${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_HOST_PREFIX}}/etc/yum.repos.d,${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/host}}${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}} \
 "
 
 export DNF_SDK_TARGET_REPO_CONF="\
 --setopt=varsdir=${{DNF_SDK_TARGET_PREFIX}}/etc/dnf/vars \
---setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d \
+--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}} \
 "
 
 mkdir -p /etc/dnf/vars
@@ -2965,11 +2976,14 @@ if [ -f "${AVOCADO_SDK_PREFIX}/etc/ssl/certs/ca-certificates.crt" ]; then
 fi
 "#,
             );
-            // Custom repo CA / insecure TLS, applied across all dnf phases.
-            script.push_str(REPO_TLS_SETUP_SNIPPET);
         }
-        // Named feeds: purge stale generated .repo files, renumber built-ins
-        // when something precedes the distro feed, copy in this run's files.
+        // Custom repo CA / insecure TLS, applied across all dnf phases — including
+        // runs without the SDK environment sourced (`ext dnf`, rpm queries), which
+        // used to skip this and so ignored AVOCADO_REPO_CA / AVOCADO_REPO_INSECURE.
+        script.push_str(REPO_TLS_SETUP_SNIPPET);
+        // Named feeds: purge copies left by earlier builds and renumber the
+        // built-ins when something precedes the distro feed. The generated files
+        // themselves are served from the mount via the reposdir lists above.
         // Unconditional: dnf also runs without the SDK environment sourced
         // (`ext dnf`, rpm queries), and the feeds must reach every invocation.
         script.push_str(crate::utils::feeds::FEEDS_SETUP_SNIPPET);
@@ -3634,6 +3648,72 @@ extensions:
         assert!(script
             .contains("bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src"));
         assert!(script.contains("mkdir -p /opt/src"));
+    }
+
+    /// Both generated entrypoints must parse, with and without the SDK
+    /// environment sourced, and every dnf conf must pick up the per-run feeds
+    /// mount only when AVOCADO_FEEDS_DIR is set.
+    #[test]
+    fn entrypoints_parse_and_expand_the_feeds_reposdir() {
+        let container = SdkContainer::new();
+        for source_env in [true, false] {
+            for script in [
+                container.create_entrypoint_script(
+                    source_env,
+                    Some("ext"),
+                    None,
+                    "x86_64",
+                    false,
+                    false,
+                ),
+                container.create_entrypoint_script_for_remote(
+                    source_env,
+                    Some("ext"),
+                    None,
+                    "x86_64",
+                    false,
+                    false,
+                ),
+            ] {
+                let status = std::process::Command::new("bash")
+                    .arg("-n")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .and_then(|mut c| {
+                        use std::io::Write;
+                        c.stdin.take().unwrap().write_all(script.as_bytes())?;
+                        c.wait()
+                    })
+                    .expect("bash available");
+                assert!(
+                    status.success(),
+                    "entrypoint failed bash -n (source_env={source_env})"
+                );
+                assert!(script.contains("${AVOCADO_FEEDS_DIR:+,${AVOCADO_FEEDS_DIR}/target}"));
+                assert!(script.contains("${AVOCADO_FEEDS_DIR:+,${AVOCADO_FEEDS_DIR}/host}"));
+                assert!(
+                    script.contains("AVOCADO_REPO_CA_B64"),
+                    "TLS setup reaches non-sourced runs"
+                );
+                assert!(
+                    script.contains("AVOCADO_DISTRO_PRIORITY_BASE"),
+                    "feeds setup reaches non-sourced runs"
+                );
+            }
+        }
+        for (env, want) in [("/f", ",/f/target"), ("", "")] {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "AVOCADO_FEEDS_DIR='{env}'; DNF_SDK_TARGET_PREFIX=/p; printf '%s' \"--setopt=reposdir=${{DNF_SDK_TARGET_PREFIX}}/etc/yum.repos.d${{AVOCADO_FEEDS_DIR:+,${{AVOCADO_FEEDS_DIR}}/target}}\""
+                ))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                format!("--setopt=reposdir=/p/etc/yum.repos.d{want}")
+            );
+        }
     }
 
     #[test]

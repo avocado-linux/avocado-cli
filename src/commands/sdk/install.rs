@@ -204,7 +204,11 @@ impl SdkInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.feeds_for(&target, FeedStage::Sdk, &self.config_path)?;
+        let feeds = config.materialize_feeds(&target, FeedStage::Sdk, &self.config_path)?;
+        // The kernel resolver queries with the target repo conf, so it must see the
+        // feed set the rootfs install will see — not the sdk-stage (host) set.
+        let kernel_feeds =
+            config.materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)?;
 
         // Use the container helper to run the installation
         let container_helper =
@@ -274,6 +278,7 @@ impl SdkInstallCommand {
                 lock_file: &mut bootstrap.lock_file,
                 repo_url: repo_url.as_deref(),
                 repo_release: repo_release.as_deref(),
+                feeds: kernel_feeds.as_ref(),
                 merged_container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 runs_on_context: runs_on_context.as_ref(),
@@ -538,8 +543,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
         // These two run the rootfs/initramfs dnf transactions, so they take
         // their own stage's feeds rather than the sdk-stage set this fn holds.
-        let rootfs_feeds = config.feeds_for(target, FeedStage::Rootfs, &self.config_path)?;
-        let initramfs_feeds = config.feeds_for(target, FeedStage::Initramfs, &self.config_path)?;
+        let rootfs_feeds =
+            config.materialize_feeds(target, FeedStage::Rootfs, &self.config_path)?;
+        let initramfs_feeds =
+            config.materialize_feeds(target, FeedStage::Initramfs, &self.config_path)?;
         let mut rootfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,

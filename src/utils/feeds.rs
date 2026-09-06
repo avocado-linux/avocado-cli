@@ -11,12 +11,16 @@
 //!
 //! Secrets (`username`/`password`) reach dnf only through the generated
 //! `.repo` files, which live in a per-run tempdir bind-mounted read-only into
-//! the container and dropped when it exits. The canonical document written to
+//! the container and dropped when it exits. dnf reads them from that mount
+//! directly — it is appended to every `reposdir` list — so nothing is copied
+//! into the shared, persistent sysroot: concurrent stages (`sdk install` runs
+//! the rootfs and initramfs installs at once) cannot race on one directory,
+//! and credentials never land in the docker volume. The canonical document written to
 //! `.avocado/feeds/<target>.json` never contains them — it is what the build
 //! cache hashes (fast-rebuilds/plan.md §4.0), so it records credential
 //! *identity*, never the credential.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,10 +43,10 @@ pub const DEFAULT_DISTRO_FEED_NAME: &str = "avocado";
 pub const BUILTIN_EXT_FEED: &str = "avocado-ext";
 const BUILTIN_EXT_REPO_GLOB: &str = "*-target-ext";
 
-/// Prefix of every generated `.repo`/CA file. The entrypoint purges files with
-/// this prefix on every run, so a feed removed from config disappears from the
-/// sysroot instead of lingering in the docker volume.
-pub const GENERATED_PREFIX: &str = "avocado-feed-";
+/// Prefix of every generated `.repo`/CA file. Earlier builds copied these into
+/// the sysroot's `yum.repos.d`; the entrypoint still purges that prefix there
+/// so volumes from those builds don't keep serving a stale feed set.
+const GENERATED_PREFIX: &str = "avocado-feed-";
 
 /// In-container mount point for the generated repo files and `path:` feeds.
 pub const CONTAINER_FEEDS_DIR: &str = "/run/avocado-feeds";
@@ -59,7 +63,9 @@ pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 ///
 /// The key id is the first 12 hex chars of SHA-256(token) — the same digest
 /// Connect already stores as `token_hash`, so it joins server-side with no
-/// new endpoint, and reveals nothing about the token.
+/// new endpoint, and reveals nothing about the token. `AVOCADO_CONNECT_TOKEN`
+/// takes precedence over the profile store so CI runners identify without a
+/// `credentials.json`.
 pub fn user_agent() -> String {
     let base = concat!("avocado-cli/", env!("CARGO_PKG_VERSION"));
     // tier/1 = authenticated, tier not yet assigned by Connect. The edge
@@ -72,11 +78,15 @@ pub fn user_agent() -> String {
 }
 
 fn feed_key_id() -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let cfg = crate::commands::connect::client::load_config().ok()??;
-    let (_, profile) = cfg.resolve_profile(None, None).ok()?;
-    let digest = Sha256::digest(profile.token.as_bytes());
-    Some(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
+    let token = match std::env::var("AVOCADO_CONNECT_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            let cfg = crate::commands::connect::client::load_config().ok()??;
+            let (_, profile) = cfg.resolve_profile(None, None).ok()?;
+            profile.token.clone()
+        }
+    };
+    Some(short_sha256(token.as_bytes()))
 }
 
 /// Priority step between consecutive `distro.feeds` entries. The distro feed's
@@ -93,7 +103,6 @@ pub enum FeedStage {
     Runtime,
     Ext,
     Initramfs,
-    Kernel,
 }
 
 impl FeedStage {
@@ -114,7 +123,6 @@ impl std::fmt::Display for FeedStage {
             FeedStage::Runtime => "runtime",
             FeedStage::Ext => "ext",
             FeedStage::Initramfs => "initramfs",
-            FeedStage::Kernel => "kernel",
         };
         f.write_str(s)
     }
@@ -147,6 +155,7 @@ pub struct ResolvedFeed {
     pub kind: FeedKind,
     /// Fully expanded baseurl as dnf sees it (in-container path for `path:` feeds).
     /// For the distro feed: the `{repo_url}/{releasever}` prefix its repos hang off.
+    /// For a built-in re-scope: the repoid glob passed to `--disablerepo`.
     pub baseurl: String,
     pub priority: u32,
     pub gpgcheck: bool,
@@ -154,10 +163,18 @@ pub struct ResolvedFeed {
     /// Empty = every stage.
     pub stages: BTreeSet<FeedStage>,
     pub locality: Locality,
-    /// Who resolves this feed — a username, org, or profile name — or `none`.
-    /// Identity, never the secret.
+    /// Who resolves this feed: `none`, `basic:<sha256(username)[:12]>`, or (Phase 3)
+    /// an org/profile name. Identity for cache keys — never the secret, and not the
+    /// raw username either, which is often an email or a token.
     pub credential_identity: String,
     pub tls_verify: bool,
+    /// `path:` feeds only — the path as written in config (project-relative) and
+    /// the sha256 of its `repodata/repomd.xml`. The local analogue of the snapshot
+    /// pin: a different directory or new RPMs must move the stamp hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
     #[serde(skip)]
     credential: Option<(String, String)>,
     #[serde(skip)]
@@ -228,12 +245,29 @@ pub struct FeedMaterialization {
     pub dnf_args: Vec<String>,
     /// `--add-host` entries the container needs.
     pub add_hosts: Vec<String>,
+    /// SHA-256 of the stage projection this was materialized from. Lets
+    /// process-level caches keyed on the feed identity (kernel_resolver) tell
+    /// two feed sets apart without re-deriving anything.
+    pub fingerprint: String,
 }
 
 impl ResolvedFeedSet {
     /// Resolve the feed set, or `None` when the project declares no feeds
     /// (the zero-cost path: behaviour is exactly today's single implicit feed).
-    pub fn resolve(config: &Config, target: &str, config_dir: &Path) -> Result<Option<Self>> {
+    ///
+    /// `releasever` overrides what `Config::get_releasever()` would return. It
+    /// exists for the stamp hash: install commands export the snapshot pin into
+    /// `AVOCADO_RELEASEVER` before hashing, `runtime build` does not — it reads
+    /// the pin from the lock and passes it explicitly. Both sides must expand
+    /// `$releasever` identically or every pinned project reads as stale at build
+    /// time right after install declared it current. Materialization passes
+    /// `None` (env, which at install time *is* the pin).
+    pub fn resolve(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+    ) -> Result<Option<Self>> {
         let repos = config.repos.as_ref();
         let distro = config.distro.as_ref();
         let feeds_list = distro.and_then(|d| d.feeds.as_ref());
@@ -244,10 +278,31 @@ impl ResolvedFeedSet {
         if repos.is_none() && feeds_list.is_none() && distro_name == DEFAULT_DISTRO_FEED_NAME {
             return Ok(None);
         }
-        let repos = repos.cloned().unwrap_or_default();
+        let empty = HashMap::new();
+        let repos = repos.unwrap_or(&empty);
 
-        // Validate definitions once, independent of enablement.
-        for (name, def) in &repos {
+        // Validate definitions once, independent of enablement — in name order so
+        // the first error reported is the same every run.
+        let mut names: Vec<&String> = repos.keys().collect();
+        names.sort();
+        for name in names {
+            let def = &repos[name];
+            if !is_valid_feed_name(name) {
+                bail!("repos.{name}: feed names must match [A-Za-z0-9][A-Za-z0-9._-]* (they become dnf repo ids and file names)");
+            }
+            // Values are written verbatim into an INI file: a newline would inject options.
+            for (field, value) in [
+                ("url", &def.url),
+                ("gpgkey", &def.gpgkey),
+                ("username", &def.username),
+                ("password", &def.password),
+                ("ca", &def.ca),
+                ("path", &def.path),
+            ] {
+                if value.as_deref().is_some_and(|v| v.contains(['\n', '\r'])) {
+                    bail!("repos.{name}: `{field}` must not contain a newline");
+                }
+            }
             let locators = [def.url.is_some(), def.org.is_some(), def.path.is_some()]
                 .iter()
                 .filter(|b| **b)
@@ -260,6 +315,53 @@ impl ResolvedFeedSet {
             }
             if locators != 1 {
                 bail!("repos.{name}: exactly one of `url`, `org`, or `path` is required");
+            }
+            if name == DEFAULT_DISTRO_FEED_NAME
+                && matches!(
+                    distro.and_then(|d| d.repo.as_ref()),
+                    Some(DistroRepoRef::Inline(_))
+                )
+            {
+                bail!("repos.{name}: conflicts with the inline `distro.repo` block; use `distro.repo: {name}` or drop one");
+            }
+            if let Some(url) = &def.url {
+                if name != distro_name
+                    && (def.release.is_some() || def.channel.is_some() || def.releasever.is_some())
+                    && !url.contains("$releasever")
+                {
+                    bail!(
+                        "repos.{name}: `release`/`channel` are set but `url` has no `$releasever` — write the layout explicitly, e.g. {url}/$releasever/target/$target"
+                    );
+                }
+            }
+            if def.url.as_deref().is_some_and(url_has_userinfo) {
+                bail!("repos.{name}: put credentials in `username`/`password`, not in the URL — a URL is recorded in the canonical document, the stamp hash and dnf's logs");
+            }
+            if name == distro_name {
+                let unsupported: Vec<&str> = [
+                    ("path", def.path.is_some()),
+                    ("username", def.username.is_some()),
+                    ("password", def.password.is_some()),
+                    ("gpgkey", def.gpgkey.is_some()),
+                    ("gpgcheck", def.gpgcheck.is_some()),
+                    ("targets", def.targets.is_some()),
+                    ("stages", def.stages.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(k, set)| set.then_some(k))
+                .collect();
+                if !unsupported.is_empty() {
+                    bail!(
+                        "repos.{name}: the distro feed is served by the SDK image's baked .repo files and supports only url/release/channel/releasever/ca/tls_verify; unsupported here: {}",
+                        unsupported.join(", ")
+                    );
+                }
+            }
+            if def.stages.as_ref().is_some_and(|s| s.is_empty()) {
+                bail!("repos.{name}: `stages` must not be empty; omit it to enable the feed at every stage");
+            }
+            if def.username.is_some() && def.password.as_deref() == Some("") {
+                bail!("repos.{name}: `password` is empty — an unset environment variable interpolates to \"\"");
             }
             if def.org.is_some() {
                 // ponytail: org feeds resolve through Connect (Phase 3); parse, don't serve.
@@ -297,7 +399,9 @@ impl ResolvedFeedSet {
         }
 
         let repo_url = config.effective_repo_url();
-        let distro_releasever = config.get_releasever();
+        let distro_releasever = releasever
+            .map(str::to_string)
+            .or_else(|| config.get_releasever());
         let mut feeds = Vec::new();
         let mut distro_priority_base = None;
 
@@ -321,6 +425,8 @@ impl ResolvedFeedSet {
                     locality: Locality::Shared,
                     credential_identity: "none".into(),
                     tls_verify: !config.get_repo_insecure(),
+                    source: None,
+                    content_digest: None,
                     credential: None,
                     ca: None,
                     mount: None,
@@ -347,22 +453,34 @@ impl ResolvedFeedSet {
                 .username
                 .as_ref()
                 .map(|u| (u.clone(), def.password.clone().unwrap_or_default()));
-            let credential_identity = def.username.clone().unwrap_or_else(|| "none".into());
-            let common = |kind, baseurl, locality, mount, loopback_rewritten| ResolvedFeed {
-                name: name.clone(),
-                kind,
-                baseurl,
-                priority,
-                gpgcheck: def.gpgcheck.unwrap_or(def.gpgkey.is_some()),
-                gpgkey: def.gpgkey.clone(),
-                stages: stages.clone(),
-                locality,
-                credential_identity: credential_identity.clone(),
-                tls_verify: def.tls_verify.unwrap_or(true),
-                credential: credential.clone(),
-                ca: def.ca.as_ref().map(|c| resolve_relative(config_dir, c)),
-                mount,
-                loopback_rewritten,
+            let credential_identity = match &def.username {
+                Some(u) => format!("basic:{}", short_sha256(u.as_bytes())),
+                None => "none".to_string(),
+            };
+            let common = |kind, baseurl, locality, mount: Option<PathBuf>, loopback_rewritten| {
+                ResolvedFeed {
+                    source: def.path.clone(),
+                    // Digest of the repodata as it stands now. Absent repodata is reported
+                    // at materialize time; here it simply leaves the digest unset.
+                    content_digest: mount
+                        .as_ref()
+                        .and_then(|m| fs::read(m.join("repodata").join("repomd.xml")).ok())
+                        .map(|b| short_sha256(&b)),
+                    name: name.clone(),
+                    kind,
+                    baseurl,
+                    priority,
+                    gpgcheck: def.gpgcheck.unwrap_or(def.gpgkey.is_some()),
+                    gpgkey: def.gpgkey.clone(),
+                    stages: stages.clone(),
+                    locality,
+                    credential_identity: credential_identity.clone(),
+                    tls_verify: def.tls_verify.unwrap_or(true),
+                    credential: credential.clone(),
+                    ca: def.ca.as_ref().map(|c| resolve_relative(config_dir, c)),
+                    mount,
+                    loopback_rewritten,
+                }
             };
 
             if let Some(url) = &def.url {
@@ -380,12 +498,6 @@ impl ResolvedFeedSet {
                 ));
             } else if let Some(p) = &def.path {
                 let host = resolve_relative(config_dir, p);
-                if !host.join("repodata").join("repomd.xml").is_file() {
-                    bail!(
-                        "repos.{name}: {} has no repodata/repomd.xml; run `createrepo_c` on it first",
-                        host.display()
-                    );
-                }
                 let in_container = format!("{CONTAINER_FEEDS_DIR}/paths/{name}");
                 feeds.push(common(
                     FeedKind::Path,
@@ -415,6 +527,8 @@ impl ResolvedFeedSet {
                 locality: Locality::Shared,
                 credential_identity: "none".into(),
                 tls_verify: true,
+                source: None,
+                content_digest: None,
                 credential: None,
                 ca: None,
                 mount: None,
@@ -465,8 +579,12 @@ impl ResolvedFeedSet {
         let dir = config_dir.join(".avocado").join("feeds");
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.json", self.target));
-        fs::write(&path, self.canonical_json()?)
-            .with_context(|| format!("writing {}", path.display()))?;
+        // Write-then-rename: the build cache reads this file, and a project may
+        // have two avocado processes resolving at once.
+        let tmp = dir.join(format!("{}.json.tmp", self.target));
+        fs::write(&tmp, self.canonical_json()?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &path).with_context(|| format!("renaming {}", path.display()))?;
         Ok(path)
     }
 
@@ -477,9 +595,12 @@ impl ResolvedFeedSet {
             .prefix("avocado-feeds-")
             .tempdir()
             .context("creating feeds tempdir")?;
+        // Both scope dirs always exist: the entrypoint appends them to the dnf
+        // reposdir lists unconditionally whenever AVOCADO_FEEDS_DIR is set.
         let scope = if stage.is_host() { "host" } else { "target" };
+        fs::create_dir_all(tempdir.path().join("host"))?;
+        fs::create_dir_all(tempdir.path().join("target"))?;
         let dir = tempdir.path().join(scope);
-        fs::create_dir_all(&dir)?;
 
         let mut mounts = vec![(
             tempdir.path().to_path_buf(),
@@ -521,11 +642,21 @@ impl ResolvedFeedSet {
             };
             let repo_path = dir.join(format!("{GENERATED_PREFIX}{}.repo", feed.name));
             fs::write(&repo_path, feed.repo_file(ca_in_container.as_deref()))?;
+            #[cfg(unix)]
             if feed.credential.is_some() {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&repo_path, fs::Permissions::from_mode(0o600))?;
             }
             if let Some(host) = &feed.mount {
+                // Checked here, not at resolve time: the stamp hash resolves too, and a
+                // `runtime build` over a cleaned output dir must compare stamps, not die.
+                if !host.join("repodata").join("repomd.xml").is_file() {
+                    bail!(
+                        "repos.{}: {} has no repodata/repomd.xml; run `createrepo_c` on it first",
+                        feed.name,
+                        host.display()
+                    );
+                }
                 // The outer mount is read-only, so docker cannot create this
                 // mountpoint itself; it has to exist in the tempdir already.
                 fs::create_dir_all(tempdir.path().join("paths").join(&feed.name))?;
@@ -534,17 +665,32 @@ impl ResolvedFeedSet {
                     format!("{CONTAINER_FEEDS_DIR}/paths/{}", feed.name),
                 ));
             }
-            if feed.loopback_rewritten && add_hosts.is_empty() {
-                add_hosts.push(format!("{HOST_GATEWAY_ALIAS}:host-gateway"));
+            if feed.loopback_rewritten {
+                crate::utils::output::print_info(
+                    &format!(
+                        "feed '{}': loopback URL rewritten to {HOST_GATEWAY_ALIAS} so the container reaches this machine",
+                        feed.name
+                    ),
+                    crate::utils::output::OutputLevel::Normal,
+                );
+                if add_hosts.is_empty() {
+                    add_hosts.push(format!("{HOST_GATEWAY_ALIAS}:host-gateway"));
+                }
             }
         }
 
+        let fingerprint = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(self.stage_projection_json(stage)?.as_bytes());
+            digest.iter().map(|b| format!("{b:02x}")).collect()
+        };
         Ok(FeedMaterialization {
             _tempdir: Arc::new(tempdir),
             mounts,
             env,
             dnf_args,
             add_hosts,
+            fingerprint,
         })
     }
 }
@@ -581,7 +727,7 @@ pub fn rewrite_loopback(url: &str) -> (String, bool) {
             None => (hostport, ""),
         }
     };
-    if !matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]") {
+    if !is_loopback_host(host) {
         return (url.to_string(), false);
     }
     let rewritten = format!(
@@ -590,6 +736,41 @@ pub fn rewrite_loopback(url: &str) -> (String, bool) {
         &rest[host_end..]
     );
     (rewritten, true)
+}
+
+fn short_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_end_matches('.');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+/// Feed names become dnf repo ids, `.repo` file names and mount path segments.
+fn is_valid_feed_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// `https://user:pass@host/...` — credentials belong in `username`/`password`.
+fn url_has_userinfo(url: &str) -> bool {
+    let Some(i) = url.find("://") else {
+        return false;
+    };
+    let rest = &url[i + 3..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    authority.contains('@')
 }
 
 /// Shell appended to the container entrypoint after `$DNF_SDK_HOST` and the
@@ -603,8 +784,10 @@ if [ -n "${AVOCADO_FEED_UA:-}" ]; then
     export DNF_SDK_HOST="${DNF_SDK_HOST} --setopt=user_agent=${AVOCADO_FEED_UA}"
 fi
 # --- named feeds (repos: / distro.feeds) ---
-# Always drop last run's generated files: a feed removed from config must not
-# survive in the sysroot's yum.repos.d (which persists in the docker volume).
+# Generated .repo files are served straight from the read-only per-run mount,
+# which the reposdir lists above already include when AVOCADO_FEEDS_DIR is set.
+# Earlier builds copied them into the sysroot's yum.repos.d; drop any leftovers
+# so a volume from then does not keep serving a stale feed set.
 rm -f "${DNF_SDK_HOST_PREFIX}"/etc/yum.repos.d/avocado-feed-*.repo \
       "${DNF_SDK_HOST_PREFIX}"/etc/yum.repos.d/avocado-feed-*.ca.pem \
       "${DNF_SDK_TARGET_PREFIX}"/etc/yum.repos.d/avocado-feed-*.repo \
@@ -619,17 +802,6 @@ if [ -n "${AVOCADO_DISTRO_PRIORITY_BASE:-}" ]; then
             export DNF_SDK_HOST="${DNF_SDK_HOST} --setopt=${_id}.priority=$((AVOCADO_DISTRO_PRIORITY_BASE + _i))"
             _i=$((_i + 1))
         done
-    done
-fi
-if [ -n "${AVOCADO_FEEDS_DIR:-}" ] && [ -d "${AVOCADO_FEEDS_DIR}" ]; then
-    mkdir -p "${DNF_SDK_HOST_PREFIX}/etc/yum.repos.d" "${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d" || exit 1
-    for _f in "${AVOCADO_FEEDS_DIR}"/host/avocado-feed-*; do
-        [ -e "$_f" ] || continue
-        cp "$_f" "${DNF_SDK_HOST_PREFIX}/etc/yum.repos.d/" || exit 1
-    done
-    for _f in "${AVOCADO_FEEDS_DIR}"/target/avocado-feed-*; do
-        [ -e "$_f" ] || continue
-        cp "$_f" "${DNF_SDK_TARGET_PREFIX}/etc/yum.repos.d/" || exit 1
     done
 fi
 "##;
@@ -651,9 +823,11 @@ distro:
     #[test]
     fn no_feeds_is_none() {
         let c = load(BASE);
-        assert!(ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."))
-            .unwrap()
-            .is_none());
+        assert!(
+            ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."), None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -661,7 +835,7 @@ distro:
         let c = load(&format!(
             "{BASE}  feeds: [vendor]\nrepos:\n  vendor:\n    url: https://v.example/$releasever/$target\n"
         ));
-        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."))
+        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."), None)
             .unwrap()
             .unwrap();
         let names: Vec<_> = set
@@ -685,7 +859,7 @@ distro:
         let c = load(&format!(
             "{BASE}  feeds: [local, avocado]\nrepos:\n  local:\n    path: ./out\n"
         ));
-        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", dir.path())
+        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", dir.path(), None)
             .unwrap()
             .unwrap();
         assert_eq!(set.feeds[0].kind, FeedKind::Path);
@@ -707,7 +881,7 @@ distro:
         let c = load(&format!(
             "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v.example\n    stages: [ext]\n  avocado-ext:\n    stages: [ext, runtime]\n"
         ));
-        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."))
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
             .unwrap()
             .unwrap();
         let ext = set.materialize(FeedStage::Ext).unwrap();
@@ -728,12 +902,19 @@ distro:
         let c = load(&format!(
             "{BASE}  feeds: [n]\nrepos:\n  n:\n    url: http://localhost:8080/r\n    username: bob\n    password: hunter2\n"
         ));
-        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."))
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
             .unwrap()
             .unwrap();
         let json = set.canonical_json().unwrap();
         assert!(!json.contains("hunter2"));
-        assert!(json.contains("\"credential_identity\": \"bob\""));
+        assert!(json.contains(&format!(
+            "\"credential_identity\": \"basic:{}\"",
+            short_sha256(b"bob")
+        )));
+        assert!(
+            !json.contains("bob"),
+            "raw username must not reach the canonical document"
+        );
         assert!(json.contains("\"any_credentialed\": true"));
         assert!(json.contains("http://host.docker.internal:8080/r"));
         assert_eq!(json, set.canonical_json().unwrap());
@@ -749,7 +930,7 @@ distro:
         let c = load(&format!(
             "{BASE}  feeds: [a, b]\nrepos:\n  a:\n    url: https://a\n  b:\n    url: https://b\n    stages: [ext]\n"
         ));
-        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."))
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
             .unwrap()
             .unwrap();
         let ext = set.stage_projection_json(FeedStage::Ext).unwrap();
@@ -761,7 +942,7 @@ distro:
         let c2 = load(&format!(
             "{BASE}  feeds: [b, a]\nrepos:\n  a:\n    url: https://a\n  b:\n    url: https://b\n"
         ));
-        let set2 = ResolvedFeedSet::resolve(&c2, "t", Path::new("."))
+        let set2 = ResolvedFeedSet::resolve(&c2, "t", Path::new("."), None)
             .unwrap()
             .unwrap();
         assert_ne!(
@@ -775,29 +956,31 @@ distro:
         let two = load(&format!(
             "{BASE}repos:\n  x:\n    url: https://a\n    path: ./b\n"
         ));
-        assert!(ResolvedFeedSet::resolve(&two, "t", Path::new("."))
+        assert!(ResolvedFeedSet::resolve(&two, "t", Path::new("."), None)
             .unwrap_err()
             .to_string()
             .contains("exactly one"));
         let unknown = load(&format!("{BASE}  feeds: [ghost]\n"));
-        assert!(ResolvedFeedSet::resolve(&unknown, "t", Path::new("."))
-            .unwrap_err()
-            .to_string()
-            .contains("ghost"));
+        assert!(
+            ResolvedFeedSet::resolve(&unknown, "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string()
+                .contains("ghost")
+        );
         let dup = load(&format!(
             "{BASE}  feeds: [a, a]\nrepos:\n  a:\n    url: https://a\n"
         ));
-        assert!(ResolvedFeedSet::resolve(&dup, "t", Path::new("."))
+        assert!(ResolvedFeedSet::resolve(&dup, "t", Path::new("."), None)
             .unwrap_err()
             .to_string()
             .contains("more than once"));
         let org = load(&format!("{BASE}repos:\n  acme:\n    org: acme\n"));
-        assert!(ResolvedFeedSet::resolve(&org, "t", Path::new("."))
+        assert!(ResolvedFeedSet::resolve(&org, "t", Path::new("."), None)
             .unwrap_err()
             .to_string()
             .contains("Connect"));
         let named = load("distro:\n  repo: nope\n");
-        assert!(ResolvedFeedSet::resolve(&named, "t", Path::new("."))
+        assert!(ResolvedFeedSet::resolve(&named, "t", Path::new("."), None)
             .unwrap_err()
             .to_string()
             .contains("nope"));
@@ -808,12 +991,279 @@ distro:
         let c = load(
             "distro:\n  release: 2026\n  channel: next\n  repo: mirror\n  feeds: [only-thor]\nrepos:\n  mirror:\n    url: http://127.0.0.1:9000\n  only-thor:\n    url: https://t.example\n    targets: [jetson-agx-thor]\n",
         );
-        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."))
+        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."), None)
             .unwrap()
             .unwrap();
         assert_eq!(set.feeds.len(), 1);
         assert_eq!(set.feeds[0].name, "mirror");
         assert_eq!(set.feeds[0].kind, FeedKind::Distro);
+    }
+
+    /// The stamp hash passes the pin-aware releasever explicitly; the projection
+    /// must follow it, not the process env, or install-time and build-time hash
+    /// different strings for the same config.
+    #[test]
+    fn explicit_releasever_drives_every_expansion() {
+        let c = load(&format!(
+            "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v.example/$releasever\n"
+        ));
+        let pin = Some("2026/next/snapshots/9");
+        let pinned = ResolvedFeedSet::resolve(&c, "t", Path::new("."), pin)
+            .unwrap()
+            .unwrap();
+        assert!(
+            pinned.feeds[0].baseurl.ends_with("/2026/next/snapshots/9"),
+            "{}",
+            pinned.feeds[0].baseurl
+        );
+        assert_eq!(
+            pinned.feeds[1].baseurl,
+            "https://v.example/2026/next/snapshots/9"
+        );
+        let live = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert!(live.feeds[0].baseurl.ends_with("/2026/next"));
+        assert_ne!(
+            pinned.stage_projection_json(FeedStage::Rootfs).unwrap(),
+            live.stage_projection_json(FeedStage::Rootfs).unwrap()
+        );
+        let again = ResolvedFeedSet::resolve(&c, "t", Path::new("."), pin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pinned.stage_projection_json(FeedStage::Rootfs).unwrap(),
+            again.stage_projection_json(FeedStage::Rootfs).unwrap()
+        );
+    }
+
+    #[test]
+    fn default_named_distro_feed_is_honoured_without_distro_repo() {
+        // repos.avocado with no `distro.repo:` line is the distro feed, not ignored.
+        let c = load("distro:\n  release: 2026\n  channel: next\nrepos:\n  avocado:\n    url: https://mirror.example\n");
+        assert_eq!(c.get_repo_url().as_deref(), Some("https://mirror.example"));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert!(set.feeds[0].baseurl.starts_with("https://mirror.example/"));
+        // …but an inline block plus repos.avocado is a conflict, not a silent winner.
+        let both = load("distro:\n  release: 2026\n  channel: next\n  repo: {url: https://a}\nrepos:\n  avocado:\n    url: https://b\n");
+        assert!(ResolvedFeedSet::resolve(&both, "t", Path::new("."), None)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts"));
+    }
+
+    #[test]
+    fn validation_rejects_injection_and_ambiguity() {
+        let err = |yaml: &str| {
+            ResolvedFeedSet::resolve(&load(yaml), "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            err(&format!("{BASE}repos:\n  \"a b\":\n    url: https://a\n")).contains("feed names")
+        );
+        assert!(
+            err(&format!("{BASE}repos:\n  \"../x\":\n    url: https://a\n")).contains("feed names")
+        );
+        assert!(err(&format!("{BASE}repos:\n  a:\n    url: https://a\n    username: u\n    password: \"x\\nsslverify=0\"\n")).contains("newline"));
+        assert!(
+            err(&format!("{BASE}repos:\n  a:\n    url: https://u:p@h/\n")).contains("username")
+        );
+        assert!(err(&format!(
+            "{BASE}repos:\n  a:\n    url: https://a\n    stages: []\n"
+        ))
+        .contains("must not be empty"));
+        assert!(err(&format!(
+            "{BASE}repos:\n  a:\n    url: https://a\n    username: u\n    password: \"\"\n"
+        ))
+        .contains("empty"));
+        assert!(err(&format!(
+            "{BASE}repos:\n  avocado-ext:\n    url: https://a\n"
+        ))
+        .contains("built-in"));
+        assert!(err(&format!(
+            "{BASE}  feeds: [avocado-ext]\nrepos:\n  avocado-ext:\n    stages: [ext]\n"
+        ))
+        .contains("re-scope"));
+    }
+
+    /// A local feed's identity in the hash is where it points and what it holds:
+    /// another directory, or new RPMs in the same one, must move the projection.
+    #[test]
+    fn path_feed_projection_tracks_directory_and_repodata() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["a", "b"] {
+            fs::create_dir_all(dir.path().join(d).join("repodata")).unwrap();
+            fs::write(
+                dir.path().join(d).join("repodata/repomd.xml"),
+                format!("<repomd>{d}</repomd>"),
+            )
+            .unwrap();
+        }
+        let proj = |p: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [local]\nrepos:\n  local:\n    path: ./{p}\n"
+            ));
+            ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+                .unwrap()
+                .unwrap()
+                .stage_projection_json(FeedStage::Rootfs)
+                .unwrap()
+        };
+        let a1 = proj("a");
+        assert_ne!(
+            a1,
+            proj("b"),
+            "a different directory must change the projection"
+        );
+        fs::write(
+            dir.path().join("a/repodata/repomd.xml"),
+            "<repomd>a2</repomd>",
+        )
+        .unwrap();
+        assert_ne!(
+            a1,
+            proj("a"),
+            "new repodata in the same directory must change the projection"
+        );
+        assert!(a1.contains("\"source\": \"./a\"") && a1.contains("\"content_digest\""));
+    }
+
+    #[test]
+    fn distro_feed_rejects_shapes_the_baked_repos_cannot_serve() {
+        let err = |yaml: &str| {
+            ResolvedFeedSet::resolve(&load(yaml), "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = err("distro:\n  release: 2026\n  channel: next\n  repo: m\nrepos:\n  m:\n    url: https://m\n    username: u\n    password: p\n    gpgkey: https://m/K\n");
+        assert!(
+            e.contains("distro feed") && e.contains("username") && e.contains("gpgkey"),
+            "{e}"
+        );
+        let e =
+            err("distro:\n  release: 2026\n  channel: next\nrepos:\n  avocado:\n    path: ./x\n");
+        assert!(e.contains("path"), "{e}");
+        // ca / tls_verify on the distro feed are fine — the getters honour them.
+        let c = load("distro:\n  release: 2026\n  channel: next\n  repo: m\nrepos:\n  m:\n    url: https://m\n    tls_verify: false\n");
+        assert!(c.get_repo_insecure());
+    }
+
+    #[test]
+    fn url_feed_with_release_needs_the_placeholder() {
+        let err = |yaml: &str| {
+            ResolvedFeedSet::resolve(&load(yaml), "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err(&format!(
+            "{BASE}repos:\n  v:\n    url: https://v/repo\n    release: 2024\n    channel: edge\n"
+        ))
+        .contains("$releasever"));
+        let ok = load(&format!("{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v/$releasever/target/$target\n    release: 2024\n    channel: edge\n"));
+        let set = ResolvedFeedSet::resolve(&ok, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.feeds[1].baseurl, "https://v/2024/edge/target/t");
+    }
+
+    #[test]
+    fn path_feed_repodata_is_checked_at_materialize_not_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("out")).unwrap(); // no repodata
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    path: ./out\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(set
+            .materialize(FeedStage::Rootfs)
+            .unwrap_err()
+            .to_string()
+            .contains("createrepo_c"));
+    }
+
+    #[test]
+    fn repo_file_fields_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("c.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [signed, plain, off]\nrepos:\n  signed:\n    url: https://s/$target\n    gpgkey: https://s/KEY\n    ca: ./c.pem\n    tls_verify: false\n    targets: [t]\n  plain:\n    url: https://p\n  off:\n    url: https://o\n    gpgkey: https://o/KEY\n    gpgcheck: false\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+            .unwrap()
+            .unwrap();
+        let m = set.materialize(FeedStage::Rootfs).unwrap();
+        let read = |n: &str| {
+            fs::read_to_string(m.mounts[0].0.join(format!("target/avocado-feed-{n}.repo"))).unwrap()
+        };
+        let signed = read("signed");
+        assert!(
+            signed.contains("baseurl=https://s/t\n"),
+            "$target expands: {signed}"
+        );
+        assert!(signed.contains("gpgcheck=1\n") && signed.contains("gpgkey=https://s/KEY\n"));
+        assert!(signed.contains("sslcacert=/run/avocado-feeds/target/avocado-feed-signed.ca.pem\n"));
+        assert!(signed.contains("sslverify=0\n"));
+        assert!(m.mounts[0]
+            .0
+            .join("target/avocado-feed-signed.ca.pem")
+            .is_file());
+        assert!(read("plain").contains("gpgcheck=0\n"));
+        assert!(
+            read("off").contains("gpgcheck=0\n"),
+            "explicit gpgcheck: false wins over gpgkey"
+        );
+        assert_eq!(
+            m.fingerprint,
+            set.materialize(FeedStage::Rootfs).unwrap().fingerprint
+        );
+        let scoped = load(&format!(
+            "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v\n    stages: [ext]\n"
+        ));
+        let s2 = ResolvedFeedSet::resolve(&scoped, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            s2.materialize(FeedStage::Ext).unwrap().fingerprint,
+            s2.materialize(FeedStage::Rootfs).unwrap().fingerprint
+        );
+    }
+
+    #[test]
+    fn per_feed_release_overrides_distro_and_literal_stays_when_unresolvable() {
+        let c = load(&format!("{BASE}  feeds: [old]\nrepos:\n  old:\n    url: https://o/$releasever\n    release: 2024\n    channel: edge\n"));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.feeds[1].baseurl, "https://o/2024/edge");
+        let none = load("distro:\n  feeds: [v]\nrepos:\n  v:\n    url: https://v/$releasever\n");
+        let set = ResolvedFeedSet::resolve(&none, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            set.feeds[1].baseurl, "https://v/$releasever",
+            "left for dnf when nothing resolves it"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn connect_token_env_drives_the_key_id() {
+        use sha2::{Digest, Sha256};
+        std::env::set_var("AVOCADO_CONNECT_TOKEN", "tok");
+        let ua = user_agent();
+        std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+        let want: String = Sha256::digest(b"tok")
+            .iter()
+            .take(6)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(ua.ends_with(&format!(";key/{want};tier/1")), "{ua}");
+        assert!(!ua.contains(' '));
     }
 
     #[test]
@@ -832,11 +1282,19 @@ distro:
         );
         assert!(!rewrite_loopback("https://repo.avocadolinux.org/x").1);
         assert!(!rewrite_loopback("file:///opt/x").1);
+        assert!(rewrite_loopback("http://LOCALHOST:1/").1);
+        assert!(rewrite_loopback("http://127.0.0.2:1/").1);
+        assert!(rewrite_loopback("http://[0:0:0:0:0:0:0:1]:1/").1);
+        assert!(rewrite_loopback("http://localhost./").1);
+        assert!(!rewrite_loopback("http://127.example.com/").1);
     }
 
     #[test]
+    #[serial_test::serial]
     fn user_agent_is_space_free_and_versioned() {
+        std::env::set_var("AVOCADO_CONNECT_TOKEN", "x");
         let ua = user_agent();
+        std::env::remove_var("AVOCADO_CONNECT_TOKEN");
         assert!(ua.starts_with(concat!("avocado-cli/", env!("CARGO_PKG_VERSION"))));
         assert!(
             !ua.contains(' '),

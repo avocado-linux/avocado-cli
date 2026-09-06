@@ -44,6 +44,8 @@ pub struct ResolveParams<'a> {
     pub lock_file: &'a mut LockFile,
     pub repo_url: Option<&'a str>,
     pub repo_release: Option<&'a str>,
+    /// Named feeds visible to this sysroot's stage; a kernel may come from one.
+    pub feeds: Option<&'a crate::utils::feeds::FeedMaterialization>,
     pub merged_container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     pub runs_on_context: Option<&'a RunsOnContext>,
@@ -138,7 +140,7 @@ pub async fn resolve_and_pin_kernel_version(
 
 /// Cache key pairing target and repo URL — within a single process these
 /// uniquely identify the available-kernel list the resolver cares about.
-type KernelCacheKey = (String, String);
+type KernelCacheKey = (String, String, String);
 
 /// Process-level cache type alias.
 type KernelVersionCache = Mutex<HashMap<KernelCacheKey, Vec<String>>>;
@@ -196,13 +198,17 @@ pub async fn off_kernel_dnf_excludes(
     Ok(excludes)
 }
 
-/// Cached wrapper around [`query_available_kernel_versions`]. The key pairs
-/// target and repo URL so two avocado commands with different repo configs in
-/// the same process don't cross-pollinate.
+/// Cached wrapper around [`query_available_kernel_versions`]. The key is
+/// target + repo URL + the feed set's fingerprint, so two avocado commands with
+/// different repo configs or feed sets in one process don't cross-pollinate.
 async fn get_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
     let cache_key = (
         params.target.to_string(),
         params.repo_url.unwrap_or("").to_string(),
+        params
+            .feeds
+            .map(|f| f.fingerprint.clone())
+            .unwrap_or_default(),
     );
 
     // Fast path: someone else already ran the query in this process.
@@ -267,6 +273,7 @@ set -eo pipefail
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
         repo_release: params.repo_release.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         container_args: params.merged_container_args.clone(),
         dnf_args: params.dnf_args.clone(),
         sdk_arch: params.sdk_arch.cloned(),

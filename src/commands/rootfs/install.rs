@@ -503,11 +503,17 @@ pub fn compute_sysroot_install_inputs(
     };
     // Resolved in-process rather than read back from .avocado/feeds/<target>.json:
     // that file is rewritten on every resolution, so a hash taken from it could
-    // key on the previous config's feed set and skip a stale sysroot.
-    let feed_projection =
-        crate::utils::feeds::ResolvedFeedSet::resolve(ctx.config, ctx.target, ctx.src_dir)?
-            .map(|set| set.stage_projection_json(stage))
-            .transpose()?;
+    // key on the previous config's feed set and skip a stale sysroot. The
+    // releasever comes from ctx — pin-aware on both the install and the build
+    // side — never from env, which only install exports the pin into.
+    let feed_projection = crate::utils::feeds::ResolvedFeedSet::resolve(
+        ctx.config,
+        ctx.target,
+        ctx.src_dir,
+        ctx.repo_release,
+    )?
+    .map(|set| set.stage_projection_json(stage))
+    .transpose()?;
     let resolved = SysrootStampInputs {
         packages,
         repo_url: ctx.repo_url,
@@ -776,6 +782,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             lock_file: params.lock_file,
             repo_url: params.repo_url,
             repo_release: params.repo_release,
+            feeds: params.feeds,
             merged_container_args: params.merged_container_args.clone(),
             dnf_args: params.dnf_args.clone(),
             runs_on_context: params.runs_on_context,
@@ -1426,7 +1433,7 @@ impl RootfsInstallCommand {
 
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.feeds_for(&target, FeedStage::Rootfs, &self.config_path)?;
+        let feeds = config.materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)?;
 
         let container_helper = SdkContainer::from_config(&self.config_path, config)?
             .verbose(self.verbose)

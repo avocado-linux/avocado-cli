@@ -4027,9 +4027,12 @@ impl Config {
 
     /// The `repos:` definition `distro.repo` names, when it is a name reference.
     pub(crate) fn distro_feed_def(&self) -> Option<&RepoDef> {
-        let name = match self.distro.as_ref()?.repo.as_ref()? {
-            DistroRepoRef::Named(n) => n,
-            DistroRepoRef::Inline(_) => return None,
+        // No `distro.repo` at all means the default name: `repos.avocado` is the
+        // distro feed, exactly as if `distro.repo: avocado` had been written.
+        let name = match self.distro.as_ref().and_then(|d| d.repo.as_ref()) {
+            Some(DistroRepoRef::Named(n)) => n.as_str(),
+            Some(DistroRepoRef::Inline(_)) => return None,
+            None => crate::utils::feeds::DEFAULT_DISTRO_FEED_NAME,
         };
         self.repos.as_ref()?.get(name)
     }
@@ -4038,17 +4041,18 @@ impl Config {
     /// `None` when the project declares no feeds — the zero-cost path. Writes
     /// the canonical document to `<config_dir>/.avocado/feeds/<target>.json`
     /// every time so the build cache always sees the current set.
-    pub fn feeds_for(
+    pub fn materialize_feeds(
         &self,
         target: &str,
         stage: crate::utils::feeds::FeedStage,
         config_path: &str,
     ) -> Result<Option<crate::utils::feeds::FeedMaterialization>> {
         // `path:` feeds resolve against project_root, like every other relative
-        // path in the config; the canonical document lives beside the lockfile.
+        // path in the config; the canonical document goes under <config_dir>/.avocado/.
         let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
         let project_root = self.project_root(config_path);
-        let Some(set) = crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root)?
+        let Some(set) =
+            crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
         else {
             return Ok(None);
         };

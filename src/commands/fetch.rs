@@ -107,7 +107,7 @@ impl FetchCommand {
         // inline > legacy sdk.*); reading raw `sdk.repo_url` here missed all of those.
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.feeds_for(
+        let feeds = config.materialize_feeds(
             &target_arch,
             crate::utils::feeds::FeedStage::Ext,
             &self.config_path,

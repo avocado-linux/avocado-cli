@@ -108,7 +108,8 @@ extensions:
 
 sdk:
   image: "docker.io/avocadolinux/sdk:2026"
-  container_args: [--network=host]
+  # deliberately NOT --network=host: the loopback rewrite + --add-host must work on
+  # docker's default bridge, which is what a fresh avocado init project uses
 YAML
 cd project
 export VENDOR_USER=$USER_ VENDOR_PASS=$PASS_
@@ -136,7 +137,8 @@ DOC=.avocado/feeds/$TARGET.json
 grep -q '"version": 1' "$DOC" || fail "canonical doc has no version"
 grep -q '"any_credentialed": true' "$DOC" || fail "canonical doc does not flag the credentialed feed"
 grep -q '"any_project_local": true' "$DOC" || fail "canonical doc does not flag the path: feed"
-grep -q "\"credential_identity\": \"$USER_\"" "$DOC" || fail "canonical doc lacks credential identity"
+grep -q "\"credential_identity\": \"basic:" "$DOC" || fail "canonical doc lacks credential identity"
+grep -q "\"credential_identity\": \"$USER_\"" "$DOC" && fail "raw username leaked into canonical document"
 grep -q "$PASS_" "$DOC" && fail "SECRET LEAKED into canonical document"
 grep -q 'host.docker.internal' "$DOC" || fail "loopback URL was not rewritten"
 pass "canonical document: versioned, flags set, identity recorded, no secret"

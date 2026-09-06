@@ -201,7 +201,7 @@ impl ExtInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.feeds_for(&target, FeedStage::Ext, &self.config_path)?;
+        let feeds = config.materialize_feeds(&target, FeedStage::Ext, &self.config_path)?;
 
         // Determine which extensions to install (with their locations)
         let extensions_to_install: Vec<(String, ExtensionLocation)> =
@@ -925,6 +925,7 @@ impl ExtInstallCommand {
                 lock_file,
                 repo_url: repo_url.map(|s| s.as_str()),
                 repo_release: repo_release.map(|s| s.as_str()),
+                feeds,
                 merged_container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 runs_on_context,
