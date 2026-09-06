@@ -22,6 +22,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+- **The sysroot digest fails closed and never writes.** A missing sysroot, an
+  unreadable file, or any failed pipeline stage now exits non-zero instead of
+  digesting nothing into an accepted hash that every downstream step would read
+  as "current". The rpm query runs only when the database directory already
+  exists — `rpm -qa` on a root without one creates it, inside the tree being
+  measured — and `ext build` queries rpm's default dbpath, where `ext install`
+  actually records packages, rather than a path that held nothing.
+- **The digest's prune list and the extension image's exclude list are one
+  list.** `var/cache/ldconfig` and rpm's newer default dbpath were pruned from
+  the digest but shipped in the image — bytes no stamp saw. Both now come from
+  `package_state_paths()`. Extension images no longer carry `var/cache/ldconfig`
+  or `usr/lib/sysimage/rpm`.
+- **`runtime build` folds each extension's build digest as well as its image
+  digest.** `var_files` are copied out of the built sysroot into the var
+  partition and never enter the image, so the image digest alone was blind to
+  them.
+- **`--no-stamps` removes the step's own stamp.** An unrecorded run no longer
+  leaves the previous run's output digest for a downstream step to trust and
+  skip over; downstream now either runs with `--no-stamps` too or fails its
+  precondition loudly.
+- **A stamp from an older format is reported as "stamp format changed
+  (vN → vM)"**, not "config hash mismatch", after a CLI upgrade. The heading is
+  now "Stale steps:" since the reason names the cause.
+- `reload_service_manager` — written into the extension release file — is folded
+  into the extension build hash.
+- The digest-bearing stamp writer anchors its substitution on the quoted JSON
+  value, so a field that happens to contain the placeholder text is untouched.
+- Removed the unused `StampOutputs.exports` field.
+- **The extension image hash chains on the build digest and folds only what the
+  imager reads** — `version`, `types`, `image`, `filesystem`, `var_files`,
+  `subvolumes`, the kab keyset when the image is kab, and the exclude list it
+  applies. Build-only inputs (`post_build`, overlay, `package_files`) reach the
+  image through the tree, and the build digest already says whether the tree
+  changed; folding them directly re-imaged on every build-input edit that left
+  the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
+  change now invalidates every image by itself.
 
 ### Changed
 - **Stamps now record what a step produced, and the next step's input depends

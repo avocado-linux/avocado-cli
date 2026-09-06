@@ -651,9 +651,10 @@ async fn write_install_stamp(
         ),
         _ => unreachable!("sysroot type was validated at entry"),
     };
-    // Digest the installed tree, overlay included — the image step folds this
-    // to decide whether the sysroot it would image has changed. Packages alone
-    // would miss the overlay, which this same install applied.
+    // Digest the installed tree, overlay included. This is the chain link the
+    // image step's input hash folds (once that step checks its own stamp), so
+    // it must cover the overlay, which this same install applied — packages
+    // alone would miss it.
     let digest =
         render_sysroot_digest_script(&format!("$AVOCADO_PREFIX/{sysroot_dir}"), rpm_dbpath);
 
@@ -1123,7 +1124,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
-    let command = format!(
+    let mut command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
 # resolve /lib/modules, /sbin, /bin paths within the sysroot
@@ -1142,6 +1143,19 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
 {sync_snippet}{overlay_snippet}"#
     );
+    if params.no_stamps {
+        // See remove_own_stamp_line: an unrecorded install must not leave the
+        // previous stamp's digest for the image step to trust.
+        let own = match params.sysroot_type {
+            SysrootType::Rootfs => crate::utils::stamps::StampRequirement::rootfs_install(),
+            SysrootType::Initramfs => crate::utils::stamps::StampRequirement::initramfs_install(),
+            _ => unreachable!("sysroot type was validated at entry"),
+        };
+        command = format!(
+            "{}{command}",
+            crate::utils::stamps::remove_own_stamp_line(&own)
+        );
+    }
 
     let mut run_config = RunConfig {
         container_image: params.container_image.to_string(),

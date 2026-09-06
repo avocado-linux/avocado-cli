@@ -853,9 +853,11 @@ impl ExtBuildCommand {
             // recompile to the same binary, a `touch`) stops here.
             let stamp_script = generate_write_stamp_script_with_digest(
                 &stamp,
+                // `ext install` records packages under rpm's default dbpath;
+                // the digest must query the same one, and it never creates it.
                 &render_sysroot_digest_script(
                     &format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension),
-                    Some("/var/lib/extension.d/rpm"),
+                    None,
                 ),
             )?;
 
@@ -921,7 +923,7 @@ impl ExtBuildCommand {
         effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
         // Create the build script for sysext extension
-        let build_script = self.create_sysext_build_script(
+        let mut build_script = self.create_sysext_build_script(
             ext_version,
             ext_scopes,
             overlay_config,
@@ -933,6 +935,14 @@ impl ExtBuildCommand {
             reload_service_manager,
             ext_src_path,
         );
+        if self.no_stamps {
+            build_script = format!(
+                "{}{build_script}",
+                crate::utils::stamps::remove_own_stamp_line(
+                    &crate::utils::stamps::StampRequirement::ext_build(&self.extension)
+                )
+            );
+        }
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -994,7 +1004,7 @@ impl ExtBuildCommand {
         effective_tui_context: &Option<TuiContext>,
     ) -> Result<bool> {
         // Create the build script for confext extension
-        let build_script = self.create_confext_build_script(
+        let mut build_script = self.create_confext_build_script(
             ext_version,
             ext_scopes,
             overlay_config,
@@ -1006,6 +1016,14 @@ impl ExtBuildCommand {
             reload_service_manager,
             ext_src_path,
         );
+        if self.no_stamps {
+            build_script = format!(
+                "{}{build_script}",
+                crate::utils::stamps::remove_own_stamp_line(
+                    &crate::utils::stamps::StampRequirement::ext_build(&self.extension)
+                )
+            );
+        }
 
         // Execute the build script in the SDK container
         if self.verbose {

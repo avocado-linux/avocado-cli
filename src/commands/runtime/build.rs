@@ -385,7 +385,7 @@ impl RuntimeBuildCommand {
             let install_inputs = merged_runtime
                 .as_ref()
                 .and_then(|mr| compute_runtime_install_input_hash(mr, &self.runtime_name).ok());
-            upstream_image_hashes = crate::utils::stamps::ext_image_content_hashes_from_batch(
+            upstream_image_hashes = crate::utils::stamps::ext_content_hashes_from_batch(
                 output.as_deref().unwrap_or(""),
                 ext_deps.iter().map(|d| d.name().to_string()),
             );
@@ -633,8 +633,16 @@ impl RuntimeBuildCommand {
             .await?;
 
         // Build var image
-        let build_script =
+        let mut build_script =
             self.create_build_script(config, parsed, target_arch, &resolved_extensions)?;
+        if self.no_stamps {
+            build_script = format!(
+                "{}{build_script}",
+                crate::utils::stamps::remove_own_stamp_line(
+                    &crate::utils::stamps::StampRequirement::runtime_build(&self.runtime_name)
+                )
+            );
+        }
 
         if self.verbose {
             print_info(

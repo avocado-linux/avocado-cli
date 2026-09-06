@@ -851,7 +851,7 @@ impl ExtImageCommand {
         extra_env_vars: &Option<std::collections::HashMap<String, String>>,
     ) -> Result<bool> {
         // Create the build script
-        let build_script = self.create_build_script(
+        let mut build_script = self.create_build_script(
             ext_version,
             extension_type,
             source_date_epoch,
@@ -861,6 +861,14 @@ impl ExtImageCommand {
             image_args,
             verity,
         );
+        if self.no_stamps {
+            build_script = format!(
+                "{}{build_script}",
+                crate::utils::stamps::remove_own_stamp_line(
+                    &crate::utils::stamps::StampRequirement::ext_image(&self.extension)
+                )
+            );
+        }
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -928,9 +936,12 @@ impl ExtImageCommand {
         // mkfs directly against the live sysroot (no work copy, unlike the
         // rootfs and initramfs paths) and later `ext dnf` / `ext install` calls
         // still resolve against that rpmdb.
-        let excludes: Vec<String> = ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"]
-            .iter()
-            .map(|s| (*s).to_string())
+        // The same list the sysroot digest prunes, so the digest and the image
+        // agree about what the image carries — a path pruned from one but
+        // shipped by the other is content no stamp ever sees.
+        let excludes: Vec<String> = crate::utils::stamps::package_state_paths()
+            .into_iter()
+            .map(str::to_string)
             .chain(var_excludes)
             .collect();
 
@@ -1438,10 +1449,17 @@ mod tests {
         let script =
             cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
+        let expected = crate::utils::stamps::package_state_paths();
         assert_eq!(
             script.matches("-e \"").count(),
-            3,
-            "only the three package-manager paths should be excluded"
+            expected.len(),
+            "only the package-state paths should be excluded"
         );
+        for path in expected {
+            assert!(
+                script.contains(&format!("-e \"{path}\"")),
+                "excludes {path}"
+            );
+        }
     }
 }
