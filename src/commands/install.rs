@@ -200,8 +200,8 @@ impl InstallCommand {
         // Register SDK + sysroot tasks upfront (we know these from config).
         // Ext/runtime tasks are added after config reload.
         // Create a renderer when either:
-        //   • TUI mode is on (interactive terminal + --force so dnf gets
-        //     --assumeyes), so the user sees a live checklist; or
+        //   • TUI mode is on (interactive terminal + --force), so the user
+        //     sees a live checklist; or
         //   • JSON output mode is on, so the renderer's state-mutators
         //     emit NDJSON `step` events for the desktop app's step list.
         //

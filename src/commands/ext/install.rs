@@ -1083,7 +1083,10 @@ impl ExtInstallCommand {
 
             if !packages.is_empty() {
                 // Build DNF install command
-                let yes = if self.force { "-y" } else { "" };
+                // dnf never prompts here: this applies the package set avocado.yaml and
+                // avocado.lock already declare, so there is no decision left to make.
+                // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+                let yes = "-y";
                 let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension}");
                 let dnf_args_str = if let Some(args) = &self.dnf_args {
                     format!(" {} ", args.join(" "))

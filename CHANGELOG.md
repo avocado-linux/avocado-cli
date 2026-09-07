@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Installs no longer prompt, and `--force` no longer means "don't prompt".**
+  `avocado install`, `ext install`, `runtime install` and `sdk install` apply
+  the package set `avocado.yaml` and `avocado.lock` already declare, so dnf's
+  confirmation offers no decision: approving it changes nothing and declining
+  it leaves a half-configured sysroot. All four now pass `-y` unconditionally.
+
+  Previously `-y` was passed only under `--force`, which conflated two
+  unrelated things and made the documented invocation the expensive one.
+  `--force` *also* clears every extension's sysroot and drops its build and
+  image stamps, so anyone passing `-f` merely to skip the prompts — which is
+  what our own material tells people to do — discarded all built extension
+  content and paid a full rebuild on the next `avocado build`, every
+  iteration. Measured on a four-extension project: `install -f` then `build`
+  skipped 2 of 10 steps and took 10.2s; without `-f` it skips all 10 and takes
+  6.6s.
+
+  `--force` now means only what its name says: reinstall from scratch. Existing
+  scripts and docs using `-f` keep working, but should drop the flag — its help
+  text now says so. `sdk dnf`, `ext dnf` and `runtime dnf` are unchanged: they
+  pass their arguments to dnf verbatim and still prompt, which is the right
+  behaviour when a person is driving dnf directly.
+
+  No opt-out flag was added. An interactive confirmation cannot be answered
+  usefully in CI or under the TUI — that is why the renderer was gated on
+  `--force` in the first place — and the dnf pass-through commands already
+  cover reviewing a transaction by hand.
+
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
   the name is taken. A duplicate name is rejected up front, so a repeated

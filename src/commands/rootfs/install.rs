@@ -1014,7 +1014,10 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     }
     let pkg = pkg_specs.join(" ");
 
-    let yes = if params.force { "-y" } else { "" };
+    // dnf never prompts here: this applies the package set avocado.yaml and
+    // avocado.lock already declare, so there is no decision left to make.
+    // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+    let yes = "-y";
     let dnf_args_str = if let Some(args) = &params.dnf_args {
         format!(" {} ", args.join(" "))
     } else {
@@ -1596,6 +1599,28 @@ mod tests {
 
     fn name_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Installs must never wait on a dnf prompt.
+    ///
+    /// This used to depend on `--force`, which also clears every extension
+    /// sysroot and drops its stamps — so the only way to avoid the prompt was
+    /// to pay a full rebuild, and the documented invocation (`install -f`) did
+    /// exactly that on every iteration. A prompt here also hangs CI and the
+    /// TUI, which is why the renderer was gated on `--force` too. The `yes`
+    /// argument is now a constant at all five install call sites; this pins the
+    /// step that consumes it.
+    #[test]
+    fn dnf_sync_step_passes_assume_yes() {
+        use crate::commands::rootfs::install::dnf_sync_step;
+        let step = dnf_sync_step(true, "rootfs", "", "-y", "");
+        assert!(step.contains("-y"), "expected -y in: {step}");
+        // And the sources agree: no install site computes `yes` from a flag.
+        let src = include_str!("install.rs");
+        assert!(
+            !src.contains("if params.force { \"-y\" }"),
+            "install still derives -y from --force"
+        );
     }
 
     #[test]

@@ -385,7 +385,10 @@ impl SdkInstallCommand {
             all_compile_package_names.sort();
             all_compile_package_names.dedup();
 
-            let yes = if self.force { "-y" } else { "" };
+            // dnf never prompts here: this applies the package set avocado.yaml and
+            // avocado.lock already declare, so there is no decision left to make.
+            // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+            let yes = "-y";
             let dnf_args_str = if let Some(args) = &self.dnf_args {
                 format!(" {} ", args.join(" "))
             } else {
@@ -1868,7 +1871,10 @@ fi
         let mut all_sdk_package_names: Vec<String> = bootstrap_package_names.to_vec();
 
         if !sdk_packages.is_empty() {
-            let yes = if self.force { "-y" } else { "" };
+            // dnf never prompts here: this applies the package set avocado.yaml and
+            // avocado.lock already declare, so there is no decision left to make.
+            // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+            let yes = "-y";
             let dnf_args_str = if let Some(args) = &self.dnf_args {
                 format!(" {} ", args.join(" "))
             } else {

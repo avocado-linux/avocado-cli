@@ -279,7 +279,11 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Runtime name to install packages into (or sync when no packages given)
@@ -1652,7 +1656,11 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -1726,7 +1734,11 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
@@ -4441,7 +4453,11 @@ enum ExtCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Extension name (deprecated, use positional argument)
@@ -4697,7 +4713,11 @@ enum RootfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -4764,7 +4784,11 @@ enum InitramfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
