@@ -27,7 +27,16 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
-    do_HEAD = do_GET
+    def do_HEAD(self):
+        # Not an alias for do_GET: SimpleHTTPRequestHandler.do_GET always streams
+        # the body, so aliasing sends a body in response to HEAD. Authenticate,
+        # then delegate to the real HEAD.
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="feed"')
+            self.end_headers()
+            return
+        super().do_HEAD()
 
     def log_message(self, fmt, *args):
         sys.stderr.write(

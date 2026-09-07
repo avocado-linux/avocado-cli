@@ -948,13 +948,12 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback(
+            crate::utils::feeds::rewrite_loopback_reported(
                 &config
                     .repo_url
                     .clone()
                     .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            )
-            .0,
+            ),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -1137,13 +1136,12 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback(
+            crate::utils::feeds::rewrite_loopback_reported(
                 &config
                     .repo_url
                     .clone()
                     .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            )
-            .0,
+            ),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -1600,13 +1598,12 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback(
+            crate::utils::feeds::rewrite_loopback_reported(
                 &config
                     .repo_url
                     .clone()
                     .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            )
-            .0,
+            ),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -1904,13 +1901,12 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback(
+            crate::utils::feeds::rewrite_loopback_reported(
                 &config
                     .repo_url
                     .clone()
                     .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            )
-            .0,
+            ),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());

@@ -275,6 +275,31 @@ impl ResolvedFeedSet {
             Some(DistroRepoRef::Named(n)) => n.as_str(),
             _ => DEFAULT_DISTRO_FEED_NAME,
         };
+        // Before the early return, so it covers every project that uses the feeds
+        // system. The distro feed's URL arrives by a different route than
+        // `repos.*.url` — the inline `distro.repo` block, `AVOCADO_REPO_URL`, or
+        // the legacy `sdk.repo_url` — and none of those passed the userinfo check
+        // named feeds get. A URL reaches the canonical document, the stamp hash
+        // and dnf's own logs, so the rule has to hold wherever it came from.
+        // The distro releasever is substituted into every distro-shaped baseurl, so
+        // it is an INI-injection vector even though it never appears in `repos:`.
+        // It can arrive from `distro.release`/`channel`, an explicit `releasever`,
+        // or `AVOCADO_RELEASEVER`.
+        if let Some(rv) = releasever
+            .map(str::to_string)
+            .or_else(|| config.get_releasever())
+        {
+            if rv.contains(['\n', '\r']) {
+                bail!("the distro releasever must not contain a newline — it is substituted into every generated .repo");
+            }
+        }
+        if url_has_userinfo(&config.effective_repo_url()) {
+            bail!(
+                "the distro feed URL carries credentials in the URL — put them in \
+                 `username`/`password` on a named feed instead. A URL is recorded in \
+                 the canonical document, the stamp hash and dnf's logs."
+            );
+        }
         if repos.is_none() && feeds_list.is_none() && distro_name == DEFAULT_DISTRO_FEED_NAME {
             return Ok(None);
         }
@@ -298,18 +323,58 @@ impl ResolvedFeedSet {
                 ("password", &def.password),
                 ("ca", &def.ca),
                 ("path", &def.path),
+                // These reach the .repo through `$releasever` substitution in the
+                // baseurl, so a newline in one injects an option just as surely as
+                // a newline in the url itself.
+                ("channel", &def.channel),
+                ("releasever", &def.releasever),
             ] {
                 if value.as_deref().is_some_and(|v| v.contains(['\n', '\r'])) {
                     bail!("repos.{name}: `{field}` must not contain a newline");
                 }
+            }
+            if def
+                .release
+                .as_deref()
+                .is_some_and(|v| v.contains(['\n', '\r']))
+            {
+                bail!("repos.{name}: `release` must not contain a newline");
             }
             let locators = [def.url.is_some(), def.org.is_some(), def.path.is_some()]
                 .iter()
                 .filter(|b| **b)
                 .count();
             if name == BUILTIN_EXT_FEED {
-                if locators != 0 {
-                    bail!("repos.{name}: '{BUILTIN_EXT_FEED}' is a built-in feed; only `stages` may be set on it");
+                // The message said "only `stages` may be set" while the check only
+                // looked at locators, so username, gpgkey, targets and the rest were
+                // accepted and then silently ignored — the built-in's .repo file is
+                // baked into the SDK image and the CLI never writes one. Silently
+                // ignoring a field a user deliberately set is worse than refusing it.
+                let ignored: Vec<&str> = [
+                    ("url", def.url.is_some()),
+                    ("org", def.org.is_some()),
+                    ("path", def.path.is_some()),
+                    ("release", def.release.is_some()),
+                    ("channel", def.channel.is_some()),
+                    ("releasever", def.releasever.is_some()),
+                    ("gpgkey", def.gpgkey.is_some()),
+                    ("gpgcheck", def.gpgcheck.is_some()),
+                    ("targets", def.targets.is_some()),
+                    ("username", def.username.is_some()),
+                    ("password", def.password.is_some()),
+                    ("ca", def.ca.is_some()),
+                    ("tls_verify", def.tls_verify.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(k, set)| set.then_some(k))
+                .collect();
+                if !ignored.is_empty() {
+                    bail!(
+                        "repos.{name}: '{BUILTIN_EXT_FEED}' is a built-in feed served by the SDK \
+                         image's baked .repo files; only `stages` may be set on it, but {} {} set",
+                        ignored.join(", "),
+                        if ignored.len() == 1 { "is" } else { "are" }
+                    );
                 }
                 continue;
             }
@@ -360,8 +425,15 @@ impl ResolvedFeedSet {
             if def.stages.as_ref().is_some_and(|s| s.is_empty()) {
                 bail!("repos.{name}: `stages` must not be empty; omit it to enable the feed at every stage");
             }
-            if def.username.is_some() && def.password.as_deref() == Some("") {
-                bail!("repos.{name}: `password` is empty — an unset environment variable interpolates to \"\"");
+            // Both halves, not just the empty one: a `username` with no `password`
+            // key at all reaches `credential` as `(user, String::new())` and writes
+            // a bare `password=` into the .repo, which is the same broken auth the
+            // empty check exists to prevent — just arrived at differently.
+            if def.username.is_some() && def.password.as_deref().is_none_or(str::is_empty) {
+                bail!(
+                    "repos.{name}: `username` is set but `password` is empty or missing — \
+                     an unset environment variable interpolates to \"\""
+                );
             }
             if def.org.is_some() {
                 // ponytail: org feeds resolve through Connect (Phase 3); parse, don't serve.
@@ -560,7 +632,27 @@ impl ResolvedFeedSet {
         let mut v = serde_json::to_value(self).context("serializing feed set")?;
         let stage_name = stage.to_string();
         if let Some(feeds) = v.get_mut("feeds").and_then(|f| f.as_array_mut()) {
+            // A built-in that does NOT apply to this stage is not absent from the
+            // build — it is actively disabled with `--disablerepo`, which changes
+            // what dnf resolves. Dropping it here would make "avocado-ext scoped
+            // away from rootfs" hash identically to "no re-scope at all", so the
+            // rootfs sysroot would not rebuild when a user scopes the extension
+            // repositories out of it. Mark it instead of removing it.
+            for f in feeds.iter_mut() {
+                let applies = f.get("stages").and_then(|s| s.as_array()).is_none_or(|s| {
+                    s.is_empty() || s.iter().any(|x| x.as_str() == Some(&stage_name))
+                });
+                let builtin = f.get("kind").and_then(|k| k.as_str()) == Some("builtin");
+                if builtin && !applies {
+                    if let Some(o) = f.as_object_mut() {
+                        o.insert("disabled_at_stage".into(), serde_json::Value::Bool(true));
+                    }
+                }
+            }
             feeds.retain(|f| {
+                if f.get("disabled_at_stage").is_some() {
+                    return true;
+                }
                 f.get("stages").and_then(|s| s.as_array()).is_none_or(|s| {
                     s.is_empty() || s.iter().any(|x| x.as_str() == Some(&stage_name))
                 })
@@ -579,12 +671,20 @@ impl ResolvedFeedSet {
         let dir = config_dir.join(".avocado").join("feeds");
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.json", self.target));
-        // Write-then-rename: the build cache reads this file, and a project may
-        // have two avocado processes resolving at once.
-        let tmp = dir.join(format!("{}.json.tmp", self.target));
-        fs::write(&tmp, self.canonical_json()?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("renaming {}", path.display()))?;
+        // Write-then-rename, with a UNIQUE temp name. A fixed `<target>.json.tmp`
+        // was not actually atomic across processes: two avocado runs resolving the
+        // same target would write the same temp path and one could rename the
+        // other's half-written file into place, or rename it out from under the
+        // other's rename. `NamedTempFile` gives each writer its own.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(&format!("{}.json.", self.target))
+            .suffix(".tmp")
+            .tempfile_in(&dir)
+            .with_context(|| format!("creating a temp file in {}", dir.display()))?;
+        std::io::Write::write_all(tmp.as_file_mut(), self.canonical_json()?.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        tmp.persist(&path)
+            .with_context(|| format!("replacing {}", path.display()))?;
         Ok(path)
     }
 
@@ -704,6 +804,31 @@ fn resolve_relative(config_dir: &Path, p: &str) -> PathBuf {
 
 /// dnf runs inside the container, so a developer's `http://localhost:8080`
 /// would resolve to the container itself. Rewrite loopback hosts to the
+/// Rewrite a loopback URL for container reachability and say so — once.
+///
+/// The distro feed's URL is rewritten at four container-start sites, so logging
+/// at each would repeat the same line several times in one build. Named feeds
+/// report their rewrites at materialization, which happens once; this gives the
+/// distro feed the same single report. Saying nothing was the previous
+/// behaviour, and it made an unreachable localhost feed look like a feed that
+/// was simply down.
+pub fn rewrite_loopback_reported(url: &str) -> String {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    let (rewritten, changed) = rewrite_loopback(url);
+    if changed {
+        let msg = rewritten.clone();
+        REPORTED.call_once(|| {
+            crate::utils::output::print_info(
+                &format!(
+                    "distro feed: loopback URL rewritten to {msg} so the container can reach the host"
+                ),
+                crate::utils::output::OutputLevel::Normal,
+            );
+        });
+    }
+    rewritten
+}
+
 /// host-gateway alias and tell the caller so it can add the `--add-host`.
 pub fn rewrite_loopback(url: &str) -> (String, bool) {
     let Some(scheme_end) = url.find("://") else {
@@ -819,6 +944,158 @@ distro:
   release: 2026
   channel: next
 "#;
+
+    /// A newline anywhere that reaches the generated .repo injects an INI option.
+    /// The url and credential fields were checked; the release fields were not,
+    /// and they reach the baseurl through `$releasever` substitution.
+    #[test]
+    fn a_newline_cannot_reach_the_repo_file_through_the_release_fields() {
+        for (field, value) in [
+            ("channel", "main\nenabled=0"),
+            ("releasever", "2026/next\nenabled=0"),
+            ("release", "2026\nenabled=0"),
+        ] {
+            let c = load(&format!(
+                "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v/$releasever\n    {field}: {value:?}\n"
+            ));
+            let err = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("newline"), "{field} should be refused: {err}");
+        }
+        // And the distro-wide releasever, which never appears under `repos:` but is
+        // substituted into every distro-shaped baseurl.
+        let c = load(&format!(
+            "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v\n"
+        ));
+        let err = ResolvedFeedSet::resolve(&c, "t", Path::new("."), Some("2026\nenabled=0"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("newline"),
+            "distro releasever should be refused: {err}"
+        );
+    }
+
+    /// Two processes resolving the same target must not be able to rename each
+    /// other's half-written document into place.
+    #[test]
+    fn the_canonical_document_write_uses_a_unique_temp_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let path = set.write_canonical(dir.path()).unwrap();
+        assert!(path.is_file());
+        // Writing twice leaves exactly one file and no stray temp files.
+        set.write_canonical(dir.path()).unwrap();
+        let feeds_dir = dir.path().join(".avocado").join("feeds");
+        let names: Vec<String> = fs::read_dir(&feeds_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["t.json".to_string()],
+            "left temp files: {names:?}"
+        );
+    }
+
+    /// The built-in feed's error message promised that only `stages` may be set;
+    /// the check only looked at locators, so everything else was accepted and then
+    /// silently ignored. Silently ignoring a field a user deliberately set is the
+    /// failure mode worth preventing.
+    #[test]
+    fn builtin_feed_rejects_every_field_it_cannot_honour() {
+        for field in [
+            "username: u\n    password: p",
+            "gpgkey: https://k",
+            "targets: [x]",
+            "tls_verify: false",
+            "release: 2026",
+        ] {
+            let c = load(&format!(
+                "{BASE}repos:\n  avocado-ext:\n    stages: [ext]\n    {field}\n"
+            ));
+            let err = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("only `stages` may be set"),
+                "field {field:?} should be refused, got: {err}"
+            );
+        }
+        // stages alone is still the supported case
+        let ok = load(&format!(
+            "{BASE}repos:\n  avocado-ext:\n    stages: [ext]\n"
+        ));
+        assert!(ResolvedFeedSet::resolve(&ok, "t", Path::new("."), None).is_ok());
+    }
+
+    /// Review findings from #241, each as the behaviour rather than the mechanism.
+    #[test]
+    fn credentials_never_travel_in_a_url_whichever_path_the_url_came_from() {
+        // Named feeds were already checked; the distro feed's URL arrives via the
+        // inline block, an env override or the legacy sdk key, and was not.
+        let c = load(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [v]\n  repo:\n    url: https://u:p@example/r\nrepos:\n  v:\n    url: https://v\n",
+        );
+        let err = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credentials in the URL"), "got: {err}");
+    }
+
+    /// A username with no password key at all reaches the .repo as a bare
+    /// `password=`, which is the same broken auth the empty-string check exists
+    /// to prevent.
+    #[test]
+    fn username_without_a_password_is_rejected() {
+        for tail in ["", "\n    password: \"\""] {
+            let c = load(&format!(
+                "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v\n    username: u{tail}\n"
+            ));
+            let err = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("empty or missing"), "got: {err}");
+        }
+    }
+
+    /// Scoping the built-in extension repositories away from a stage changes what
+    /// dnf resolves there, so it must change that stage's hash. Dropping the
+    /// builtin from the projection made it hash identically to a project that
+    /// never re-scoped anything, and the sysroot would not rebuild.
+    #[test]
+    fn disabling_a_builtin_for_a_stage_moves_that_stages_projection() {
+        let scoped = load(&format!(
+            "{BASE}repos:\n  avocado-ext:\n    stages: [ext]\n"
+        ));
+        let plain = load(&format!("{BASE}  feeds: []\n"));
+        let set = ResolvedFeedSet::resolve(&scoped, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let rootfs = set.stage_projection_json(FeedStage::Rootfs).unwrap();
+        let ext = set.stage_projection_json(FeedStage::Ext).unwrap();
+        assert_ne!(
+            rootfs, ext,
+            "rootfs disables the ext repos and ext does not; the projections must differ"
+        );
+        assert!(
+            rootfs.contains("disabled_at_stage"),
+            "the rootfs projection must record the disable: {rootfs}"
+        );
+        if let Ok(Some(plain_set)) = ResolvedFeedSet::resolve(&plain, "t", Path::new("."), None) {
+            assert_ne!(
+                rootfs,
+                plain_set.stage_projection_json(FeedStage::Rootfs).unwrap(),
+                "a re-scoped build must not hash like one that never re-scoped"
+            );
+        }
+    }
 
     #[test]
     fn no_feeds_is_none() {

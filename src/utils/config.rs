@@ -4049,14 +4049,18 @@ impl Config {
     ) -> Result<Option<crate::utils::feeds::FeedMaterialization>> {
         // `path:` feeds resolve against project_root, like every other relative
         // path in the config; the canonical document goes under <config_dir>/.avocado/.
-        let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
+        // Both the resolved feeds and the canonical document key off project_root,
+        // not the config file's directory. `avocado.lock` lives at the top of
+        // `src_dir` and the legacy `.avocado/lock.json` did too, so a project that
+        // sets `src_dir` would otherwise get its feed document beside the config
+        // file while the rest of its build state sits somewhere else.
         let project_root = self.project_root(config_path);
         let Some(set) =
             crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
         else {
             return Ok(None);
         };
-        set.write_canonical(config_dir)?;
+        set.write_canonical(&project_root)?;
         Ok(Some(set.materialize(stage)?))
     }
 
