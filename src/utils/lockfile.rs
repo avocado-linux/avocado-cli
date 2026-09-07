@@ -334,8 +334,9 @@ pub struct LockedFeed {
     pub name: String,
     /// Position in `distro.feeds`, which is its dnf priority order. First wins.
     pub position: u32,
-    /// The resolved URL, with `$releasever` and `$target` already expanded. A
-    /// `file://` path for an on-disk feed, and the `connect://<org>/...`
+    /// The source as configured, not the container's view of it: a `url:` with
+    /// `$releasever` and `$target` expanded but WITHOUT the loopback rewrite, a
+    /// `path:` exactly as written in the config, and the `connect://<org>/...`
     /// placeholder for a Connect feed — never the minted host, which changes per
     /// build and is not an input.
     pub url: String,
@@ -679,13 +680,19 @@ impl LockFile {
             if lock_file.version == LOCKFILE_VERSION {
                 return Ok(lock_file);
             }
-            if lock_file.version == 3 || lock_file.version == 4 || lock_file.version == 6 {
-                // v3 → v4 → v5 → v6 → v7: each of these parses cleanly as the
-                // current shape — the intervening additions (kernel-versions,
-                // kernels/boot, repo-snapshot) are all `#[serde(default)]`, and
-                // v6's runtime shape is already the current one. Only the
-                // `version` field differs, bumped here. (v5's runtime map shape
-                // is incompatible, so it still falls through to migration.)
+            if matches!(lock_file.version, 3 | 4 | 6 | 7) {
+                // v3 → v4 → v5 → v6 → v7 → v8: each of these parses cleanly as
+                // the current shape — the intervening additions (kernel-versions,
+                // kernels/boot, repo-snapshot, feeds) are all `#[serde(default)]`,
+                // and v6's runtime shape is already the current one. Only the
+                // `version` field differs, bumped here. (v5's runtime map shape is
+                // incompatible, so it still falls through to migration.)
+                //
+                // Every version that parses cleanly must be listed here, not just
+                // the ones that needed it when the list was written: a version is
+                // silently covered while it equals LOCKFILE_VERSION and breaks the
+                // moment that changes. Bumping to 8 sent every v7 lockfile — which
+                // is every real project's — to the `bail!` below.
                 lock_file.version = LOCKFILE_VERSION;
                 return Ok(lock_file);
             }
@@ -1889,9 +1896,53 @@ mod tests {
     /// A v7 lockfile has no `feeds` key at all and must still load.
     #[test]
     fn a_lockfile_without_a_feed_set_still_loads() {
-        let json = r#"{"version": 7, "targets": {"t": {"rootfs": {"pkg": "1.0"}}}}"#;
-        let lock: super::LockFile = serde_json::from_str(json).expect("v7 lockfile loads");
-        assert_eq!(lock.get_feeds("t").len(), 0);
+        // Through `load`, not `serde_json` — deserializing directly bypasses
+        // `parse_and_migrate`, which is exactly where a version bump breaks. The
+        // first version of this test deserialized and therefore passed while a v7
+        // lockfile could not actually be loaded at all.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("avocado.lock"),
+            r#"{"version": 7, "distro_release": "2026", "targets": {"t": {"rootfs": {"pkg": "1.0-r0"}}}}"#,
+        )
+        .unwrap();
+        let lock = super::LockFile::load(dir.path()).expect("a v7 lockfile must load");
+        assert_eq!(
+            lock.version,
+            super::LOCKFILE_VERSION,
+            "carried forward to the current version"
+        );
+        assert_eq!(lock.get_feeds("t").len(), 0, "no feed set recorded yet");
+        assert_eq!(
+            lock.get_locked_version("t", &super::SysrootType::Rootfs, "pkg")
+                .map(String::as_str),
+            Some("1.0-r0"),
+            "packages survive the migration"
+        );
+    }
+
+    /// Every version the fast path can carry forward, exercised through `load`.
+    /// The list is easy to under-fill because a version is silently covered while
+    /// it equals `LOCKFILE_VERSION`.
+    #[test]
+    fn every_carryable_lockfile_version_loads() {
+        for v in [3u32, 4, 6, 7] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(
+                dir.path().join("avocado.lock"),
+                format!(
+                    r#"{{"version": {v}, "distro_release": "2026", "targets": {{"t": {{"rootfs": {{"pkg": "1.0-r0"}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+            let lock = super::LockFile::load(dir.path())
+                .unwrap_or_else(|e| panic!("v{v} lockfile must load: {e}"));
+            assert_eq!(
+                lock.version,
+                super::LOCKFILE_VERSION,
+                "v{v} carried forward"
+            );
+        }
     }
 
     use super::*;
