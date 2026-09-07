@@ -2184,12 +2184,21 @@ impl Config {
             queue.iter().map(|(n, _)| n.clone()).collect();
 
         while let Some((ext_name, source)) = queue.pop_front() {
+            // The SDK image to read the extension's config with. Skipped when it
+            // still carries `{{ ... }}`: this runs mid-composition, so the value
+            // may not be interpolated yet, and a literal template is not a
+            // runnable image. The reader falls back in that case.
+            let sdk_image = temp_config
+                .get_sdk_image()
+                .map(String::as_str)
+                .filter(|img| !img.contains("{{"));
             let Some(discovered) = ExtSourceReader::discover(
                 &ext_name,
                 &source,
                 &src_dir,
                 &resolved_target,
                 volume_state.as_ref(),
+                sdk_image,
                 verbose,
             ) else {
                 // Not fetched yet (or unreadable). Skip it — the missing

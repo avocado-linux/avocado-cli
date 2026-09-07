@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Reading an extension's config out of the SDK volume uses the project's own
+  SDK image, not `busybox`/`alpine`.** The volume's host mountpoint is
+  unreadable under rootful Docker and inside the macOS/Windows VM, so this
+  fallback is the normal path — it ran 33 times in one `install` + `build`
+  cycle, each one a container start on a third-party image the project does not
+  control and may have to pull. The SDK image is already present because every
+  other step needs it. The busybox/alpine chain remains only for the case where
+  no config is available to name an image, and a `sdk.image` still carrying
+  `{{ … }}` is treated as unavailable rather than run as a literal.
+
+### Changed
 - **`runtime build` reuses the rootfs and initramfs images when nothing they
   depend on has changed.** Each image section now has a stamp whose input is
   the install step's tree digest plus the resolved image config — filesystem,
