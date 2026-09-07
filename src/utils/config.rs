@@ -4038,6 +4038,66 @@ impl Config {
     }
 }
 
+/// Write the resolved feed set into the lock, and say so when it changed.
+///
+/// Per target, because a feed's resolved URL contains `$target` and `targets:`
+/// can exclude a feed outright, so two targets in one project genuinely resolve
+/// different sets. `repo-snapshot` pins the distro feed's content; nothing
+/// equivalent exists for a third-party or on-disk feed, so without this the lock
+/// records a package's version and nothing about where it came from — and since
+/// declaration order is a strict priority override, the same name and version can
+/// be different bytes purely because the list was reordered.
+///
+/// Failures here are reported and not fatal: a build should not stop because a
+/// provenance record could not be written.
+fn record_feed_set_in_lock(
+    target: &str,
+    set: &crate::utils::feeds::ResolvedFeedSet,
+    project_root: &Path,
+) {
+    let locked = set.locked_feeds();
+    let mut lock = match crate::utils::lockfile::LockFile::load(project_root) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::utils::output::print_info(
+                &format!("could not read the lock to record the feed set: {e}"),
+                crate::utils::output::OutputLevel::Normal,
+            );
+            return;
+        }
+    };
+    let previous = lock.get_feeds(target);
+    if previous == locked.as_slice() {
+        return;
+    }
+    if !previous.is_empty() {
+        // A recorded value nobody reads is only half a record. The reason to write
+        // it down is that reordering feeds silently changes which artifact a name
+        // and version resolve to, and that is the change a user would not notice.
+        let names = |fs: &[crate::utils::lockfile::LockedFeed]| {
+            fs.iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        crate::utils::output::print_info(
+            &format!(
+                "feeds for '{target}' changed since the lock was written: [{}] -> [{}]",
+                names(previous),
+                names(&locked)
+            ),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+    lock.set_feeds(target, locked);
+    if let Err(e) = lock.save(project_root) {
+        crate::utils::output::print_info(
+            &format!("could not record the feed set in the lock: {e}"),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+}
+
 /// One resolved, minted feed set per invocation, per target.
 ///
 /// Resolution is cheap and repeatable; minting is neither. A `.repo` set is
@@ -4095,7 +4155,13 @@ async fn invocation_feeds(
         // The canonical document describes the set this invocation adopted, so it
         // is written here, where that set is decided, and not by the caller.
         set.write_canonical(project_root)?;
-        // No minting here any more: it is per stage, and this cell is per target.
+        // Same for the lock, and once per target per invocation for the same
+        // reason: this is the only place that always runs when feeds resolve,
+        // whichever command is running. Doing it in each install command missed
+        // every other path, which is how the first attempt recorded nothing for a
+        // `sdk install`.
+        record_feed_set_in_lock(target, &set, project_root);
+        // No minting here: it is per stage, and this cell is per target.
         let root = std::sync::Arc::new(
             tempfile::Builder::new()
                 .prefix("avocado-feeds-")
@@ -4137,9 +4203,10 @@ impl Config {
         else {
             return Ok(None);
         };
-        // The canonical document is written inside `invocation_feeds`, before the
-        // mint, so it records what the build depended on (`connect:<org>`) and
-        // never the short-lived token or the host it was served from today.
+        // The canonical document and the lock record are both written inside
+        // `invocation_feeds`, before the mint, so they record what the build
+        // depended on (`connect:<org>`) and never the short-lived token or the
+        // host it was served from today.
         let shared = invocation_feeds(target, set, &project_root).await?;
         // Mint inside the lock: two stages starting at once must not both mint the
         // same feed, and the second must see the first one's token.
