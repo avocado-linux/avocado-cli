@@ -519,10 +519,16 @@ pub fn inject_feed_env(
     env_vars: &mut std::collections::HashMap<String, String>,
     feeds: Option<&crate::utils::feeds::FeedMaterialization>,
 ) {
-    // Identity rides on every run, named feeds or not.
+    // Identity rides on every run, named feeds or not. The tier comes from the
+    // mint when there was one: a hard-coded tier/1 put every authenticated client
+    // in the same rate-limit bucket regardless of what Connect actually issued,
+    // which made the tier in the mint response decorative.
     env_vars.insert(
         "AVOCADO_FEED_UA".to_string(),
-        crate::utils::feeds::user_agent(),
+        crate::utils::feeds::user_agent_for(
+            feeds.and_then(|f| f.key_id.as_deref()),
+            feeds.and_then(|f| f.tier),
+        ),
     );
     let Some(feeds) = feeds else { return };
     for (k, v) in &feeds.env {
