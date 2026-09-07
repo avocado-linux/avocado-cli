@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Session container creation no longer blocks the async runtime.** The
+  registry held one global lock across `docker ps`, `docker run -d` and the
+  mount `docker exec`. `install` runs its steps in parallel, so every step
+  waiting for a container parked a tokio worker on that lock; with enough of
+  them nothing else could be polled, including the scheduler's `select!` —
+  whose Ctrl-C branch then never fired, so the command sat there and could not
+  be interrupted. The map lock is now held only long enough to hand out a
+  per-shape slot, creation happens under that slot's own lock (so two callers
+  wanting one shape still create exactly one container, and callers wanting a
+  different shape are not blocked at all), and the blocking work runs inside
+  `block_in_place` so the worker's queue moves to another thread.
 - **Every container the CLI starts now goes through the session container, not
   just build steps.** Eight sites started their own `docker run` outside the
   reusable path. The worst was reading an extension's `avocado.yaml` out of the

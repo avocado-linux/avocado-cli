@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
@@ -687,8 +688,17 @@ impl Default for RunConfig {
 /// a run — the rpm-platform repair in particular must run before every dnf step,
 /// because dnf's own scriptlets are what break it.
 pub struct SessionContainers {
-    /// shape key -> container name
-    by_shape: std::sync::Mutex<HashMap<String, String>>,
+    /// shape key -> the slot that will hold that shape's container name.
+    ///
+    /// Two locks, deliberately. The map lock is held only long enough to hand
+    /// out a slot; the slot's own lock is held across container creation. That
+    /// keeps a slow `docker run` from blocking callers who want a *different*
+    /// shape, and — because creation is blocking and these calls come from
+    /// async tasks the scheduler runs in parallel — keeps it from parking every
+    /// tokio worker on one mutex. When that happened the scheduler's `select!`
+    /// could no longer be polled, so its Ctrl-C branch never fired and the
+    /// command could not be interrupted.
+    by_shape: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<Option<String>>>>>,
 }
 
 /// Session containers are per-process, and named with the pid so a crashed run's
@@ -723,11 +733,14 @@ impl SessionContainers {
 
     /// Names of every session container this process started, for teardown.
     pub fn active_names() -> Vec<String> {
-        Self::get()
-            .by_shape
-            .lock()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+        let slots: Vec<_> = match Self::get().by_shape.lock() {
+            Ok(m) => m.values().cloned().collect(),
+            Err(_) => return Vec::new(),
+        };
+        slots
+            .iter()
+            .filter_map(|slot| slot.lock().ok().and_then(|n| n.clone()))
+            .collect()
     }
 
     /// Remove session containers left by processes that are no longer running.
@@ -815,20 +828,47 @@ impl SessionContainers {
         with_mounts: bool,
     ) -> Result<String> {
         let key = session_key(shape);
-        let mut map = Self::get()
-            .by_shape
+
+        // Hold the map lock only long enough to hand out this shape's slot.
+        let slot = {
+            let mut map = Self::get()
+                .by_shape
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session container registry is poisoned"))?;
+            let first = map.is_empty();
+            let slot = map.entry(key).or_default().clone();
+            drop(map);
+            // First container of this invocation: clear anything a crashed run
+            // left parked. Outside the map lock — it shells out to `docker ps`.
+            if first {
+                Self::sweep_abandoned(container_tool);
+            }
+            slot
+        };
+
+        // Per-shape lock. Two callers wanting the same shape serialize here, so
+        // exactly one container is created; callers wanting other shapes are
+        // unaffected.
+        let mut held = slot
             .lock()
-            .map_err(|_| anyhow::anyhow!("session container registry is poisoned"))?;
-        if let Some(name) = map.get(&key) {
+            .map_err(|_| anyhow::anyhow!("session container slot is poisoned"))?;
+        if let Some(name) = held.as_ref() {
             return Ok(name.clone());
         }
 
-        // First session container of this invocation: clear anything a crashed
-        // run left parked.
-        if map.is_empty() {
-            Self::sweep_abandoned(container_tool);
-        }
+        let name =
+            block_in_place_if_async(|| Self::create(container_tool, shape, env, with_mounts))?;
+        *held = Some(name.clone());
+        Ok(name)
+    }
 
+    /// Start one container. Blocking, and never called with the map lock held.
+    fn create(
+        container_tool: &str,
+        shape: &[String],
+        env: &HashMap<String, String>,
+        with_mounts: bool,
+    ) -> Result<String> {
         let name = format!(
             "avocado-sess-{}-{}",
             std::process::id(),
@@ -909,7 +949,6 @@ impl SessionContainers {
             }
         }
 
-        map.insert(key, name.clone());
         let _ = TOOL.set(container_tool.to_string());
         ATEXIT.call_once(|| unsafe {
             libc::atexit(atexit_shutdown);
@@ -1012,6 +1051,27 @@ fn build_exec_command(
     cmd.push("-c".to_string());
     cmd.push(command.to_string());
     cmd
+}
+
+/// Run blocking work without parking a tokio worker thread.
+///
+/// Container creation shells out and waits. These calls come from async tasks
+/// that the install scheduler runs in parallel, so doing that work directly on
+/// a worker takes the worker out of circulation; enough of them at once and
+/// nothing else gets polled — including the scheduler's `select!`, whose
+/// Ctrl-C branch is then never reached and the command cannot be interrupted.
+/// `block_in_place` hands the worker's queue to another thread first.
+///
+/// Only valid on the multi-thread runtime, and this is also called from
+/// genuinely synchronous callers (the config reader runs before any runtime
+/// exists), so both cases fall through to calling `f` directly.
+fn block_in_place_if_async<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// The registry key for a shape.
