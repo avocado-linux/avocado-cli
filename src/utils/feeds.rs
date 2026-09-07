@@ -921,7 +921,7 @@ fn is_valid_feed_name(name: &str) -> bool {
 }
 
 /// `https://user:pass@host/...` — credentials belong in `username`/`password`.
-fn url_has_userinfo(url: &str) -> bool {
+pub fn url_has_userinfo(url: &str) -> bool {
     let Some(i) = url.find("://") else {
         return false;
     };
