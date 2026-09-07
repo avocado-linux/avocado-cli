@@ -4071,10 +4071,24 @@ fn record_feed_set_in_lock(
         }
     };
     let previous = lock.get_feeds(target);
-    if previous == locked.as_slice() && lock.has_feed_record(target) == set.is_some() {
+    let recorded = lock.has_feed_record(target);
+    // A project with no named feeds and no record should not gain an empty
+    // `feeds` key it will never use; there is nothing to clear.
+    if set.is_none() && !recorded {
         return;
     }
-    if !previous.is_empty() {
+    // And nothing to write when the lock already says exactly this. Comparing
+    // the record's presence against `set.is_some()` was wrong: `set_feeds`
+    // always writes `Some(..)`, so on the no-feeds path that test never
+    // matched and every invocation re-saved the lock.
+    if recorded && previous == locked.as_slice() {
+        return;
+    }
+    // Reported whenever a record existed before, empty or not. Gating on
+    // `!previous.is_empty()` stayed silent when a target that had resolved no
+    // feeds started resolving some — which is a change, and the message exists
+    // for exactly the changes a user would not otherwise notice.
+    if recorded {
         // A recorded value nobody reads is only half a record. The reason to write
         // it down is that reordering feeds silently changes which artifact a name
         // and version resolve to, and that is the change a user would not notice.
@@ -6582,6 +6596,58 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+
+    /// Recording the feed set must be a no-op when there is nothing to record.
+    ///
+    /// Two ways to get this wrong, and the first shipped: comparing the record's
+    /// *presence* against `set.is_some()` never matched on the no-feeds path,
+    /// because `set_feeds` always writes `Some(..)` — so every container run of
+    /// a project with no named feeds re-saved the lock. And a project that never
+    /// had feeds should not gain an empty `feeds` key it will never use.
+    #[test]
+    fn recording_no_feeds_writes_only_when_there_is_something_to_clear() {
+        use crate::utils::lockfile::{LockFile, LockedFeed};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Nothing recorded, nothing to record: no lock file appears.
+        super::record_feed_set_in_lock("t", None, root);
+        assert!(
+            !root.join("avocado.lock").exists(),
+            "a project with no feeds must not gain a lock just to say so"
+        );
+
+        // A recorded set is cleared, and stays cleared across a reload.
+        let mut lock = LockFile::load(root).unwrap();
+        lock.set_feeds(
+            "t",
+            vec![LockedFeed {
+                name: "vendor".into(),
+                position: 10,
+                url: "https://v".into(),
+                digest: None,
+                stages: None,
+            }],
+        );
+        lock.save(root).unwrap();
+        super::record_feed_set_in_lock("t", None, root);
+        let lock = LockFile::load(root).unwrap();
+        assert!(lock.get_feeds("t").is_empty(), "the removed feed must go");
+        assert!(lock.has_feed_record("t"), "and be recorded as none");
+
+        // Recording "none" again changes nothing, so the mtime does not move.
+        let before = std::fs::metadata(root.join("avocado.lock"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        super::record_feed_set_in_lock("t", None, root);
+        let after = std::fs::metadata(root.join("avocado.lock"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "a no-op must not rewrite the lock");
+    }
     #[test]
     fn fit_signing_reads_key_and_explicit_unsigned_per_runtime() {
         let yaml = r#"
