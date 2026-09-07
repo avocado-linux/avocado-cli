@@ -917,7 +917,7 @@ impl StampValidationError {
         // Same reason as the renderer above: `process::exit` below skips main's
         // cleanup, so a session container started for this invocation would be
         // left parked until the next run swept it.
-        crate::utils::container::SessionContainers::shutdown_blocking(
+        crate::utils::container::SessionContainers::shutdown(
             &crate::utils::container::default_container_tool(),
         );
 

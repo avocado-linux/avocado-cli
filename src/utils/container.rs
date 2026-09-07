@@ -688,56 +688,56 @@ impl Default for RunConfig {
 /// because dnf's own scriptlets are what break it.
 pub struct SessionContainers {
     /// shape key -> container name
-    by_shape: tokio::sync::Mutex<HashMap<String, String>>,
+    by_shape: std::sync::Mutex<HashMap<String, String>>,
 }
 
 /// Session containers are per-process, and named with the pid so a crashed run's
 /// leftovers can be identified and swept by a later one.
 static SESSION: std::sync::OnceLock<SessionContainers> = std::sync::OnceLock::new();
 
-/// Every session container this process created, readable without an async
-/// runtime. `by_shape` sits behind a tokio mutex that is deliberately held
-/// across the container-creation await, so a synchronous exit path cannot lock
-/// it; this mirror exists for those paths.
-static CREATED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The container tool teardown should use, captured from the first container
+/// created. Teardown runs from `atexit`, which takes no arguments.
+static TOOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ATEXIT: std::sync::Once = std::sync::Once::new();
+
+/// Teardown registered with libc `atexit`.
+///
+/// Nine call sites reach `std::process::exit` directly — a stamp failure, a
+/// build failure, `vm shell` forwarding a child's status — and none of them
+/// return to `main`. Rust runs `atexit` handlers for all of them *and* for a
+/// normal return, so registering here once covers every exit path, including
+/// ones added later. A signal that kills the process still skips it; that is
+/// what the pid sweep in [`SessionContainers::sweep_abandoned`] is for.
+extern "C" fn atexit_shutdown() {
+    if let Some(tool) = TOOL.get() {
+        SessionContainers::shutdown(tool);
+    }
+}
 
 impl SessionContainers {
     fn get() -> &'static Self {
         SESSION.get_or_init(|| Self {
-            by_shape: tokio::sync::Mutex::new(HashMap::new()),
+            by_shape: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
     /// Names of every session container this process started, for teardown.
     pub fn active_names() -> Vec<String> {
-        CREATED.lock().map(|c| c.clone()).unwrap_or_default()
-    }
-
-    /// Teardown from a synchronous exit path — `print_and_exit` and friends,
-    /// which call `process::exit` and so never reach main's cleanup. Blocking
-    /// on purpose: the process is going away regardless, and leaving a parked
-    /// container behind is worse than the milliseconds this costs.
-    pub fn shutdown_blocking(container_tool: &str) {
-        for name in Self::active_names() {
-            let _ = std::process::Command::new(container_tool)
-                .args(["rm", "-f", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        if let Ok(mut created) = CREATED.lock() {
-            created.clear();
-        }
+        Self::get()
+            .by_shape
+            .lock()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Remove session containers left by processes that are no longer running.
     ///
     /// A crash or a `SIGKILL` skips [`Self::shutdown`], and `--rm` only fires
-    /// when the container itself exits — a parked `sleep infinity` does not.
-    /// The pid in the name is what makes an orphan identifiable; a live pid is
-    /// never touched, so concurrent invocations do not reap each other.
-    pub async fn sweep_abandoned(container_tool: &str) {
-        let out = AsyncCommand::new(container_tool)
+    /// when the container itself exits — a parked `sleep` does not. The pid in
+    /// the name is what makes an orphan identifiable; a live pid is never
+    /// touched, so concurrent invocations do not reap each other.
+    pub fn sweep_abandoned(container_tool: &str) {
+        let out = std::process::Command::new(container_tool)
             .args([
                 "ps",
                 "-a",
@@ -746,8 +746,7 @@ impl SessionContainers {
                 "--format",
                 "{{.Names}}",
             ])
-            .output()
-            .await;
+            .output();
         let Ok(out) = out else { return };
         for name in String::from_utf8_lossy(&out.stdout).lines() {
             let Some(pid) = name
@@ -760,55 +759,66 @@ impl SessionContainers {
             if pid == std::process::id() as i32 || pid_is_alive(pid) {
                 continue;
             }
-            let _ = AsyncCommand::new(container_tool)
+            let _ = std::process::Command::new(container_tool)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
-                .await;
+                .status();
         }
     }
 
-    /// Remove every container this process started. Called on the way out and
-    /// on Ctrl-C. Best-effort: a container that is already gone is not an error,
-    /// and a failure here must not mask the command's own result.
-    pub async fn shutdown(container_tool: &str) {
-        let names = Self::active_names();
-        for name in &names {
-            let _ = AsyncCommand::new(container_tool)
-                .args(["rm", "-f", name])
+    /// Remove every container this process started. Called on the way out, on
+    /// Ctrl-C, and from the `process::exit` paths that never reach main.
+    ///
+    /// Synchronous on purpose. Teardown has to work from `print_and_exit`,
+    /// which never returns to an async context, and the process is going away
+    /// regardless — the milliseconds this blocks are cheaper than a leaked
+    /// container. Best-effort: a container that is already gone is not an
+    /// error, and a failure here must not mask the command's own result.
+    pub fn shutdown(container_tool: &str) {
+        for name in Self::active_names() {
+            let _ = std::process::Command::new(container_tool)
+                .args(["rm", "-f", &name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
-                .await;
+                .status();
         }
-        Self::get().by_shape.lock().await.clear();
-        if let Ok(mut created) = CREATED.lock() {
-            created.clear();
+        if let Ok(mut map) = Self::get().by_shape.lock() {
+            map.clear();
         }
     }
-}
 
-impl SdkContainer {
-    /// Get (or start) the session container for `shape`, returning its name.
+    /// Get, or start, the session container matching `shape`.
     ///
-    /// Creation runs the mount block once as the container's own first act, then
-    /// parks on `sleep infinity`. `--rm` means the daemon reaps it if it dies;
-    /// [`SessionContainers::shutdown`] removes it on the way out.
+    /// `shape` is the container's identity: every `docker run` flag that
+    /// affects what the container *is* — platform, mounts, devices,
+    /// capabilities, `container_args` — ending with the image. Two callers
+    /// producing the same shape share one container; anything else gets its
+    /// own.
     ///
-    /// The mount-relevant environment has to be present at creation because the
-    /// mount block reads it: the host uid/gid for the bindfs mapping, the target
-    /// for the includes path, and the extension mount list. Those are constant
-    /// for an invocation, or (for the extension list) already reflected in the
-    /// `-v` flags that are part of the shape.
-    async fn session_container(
-        &self,
+    /// `env` is only the environment the *mount block* reads, and only matters
+    /// when `with_mounts` is set. Per-step environment belongs on the exec, not
+    /// here — that is what lets steps with different `AVOCADO_RUNTIME` or
+    /// signing variables share one container.
+    ///
+    /// `with_mounts` is false for containers that only need a volume — reading
+    /// a config, taring a volume out. They have no `/mnt/src` bind for the
+    /// mount block to work on, and running it would fail.
+    ///
+    /// Synchronous so that every caller can reach it, including the config
+    /// reader, which runs before any async context exists. Creating a container
+    /// is one short blocking call, paid once per shape.
+    pub fn get_or_create(
+        container_tool: &str,
         shape: &[String],
-        env_vars: &HashMap<String, String>,
+        env: &HashMap<String, String>,
+        with_mounts: bool,
     ) -> Result<String> {
-        let key = shape.join("\u{1f}");
-        let sessions = SessionContainers::get();
-        let mut map = sessions.by_shape.lock().await;
+        let key = session_key(shape);
+        let mut map = Self::get()
+            .by_shape
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session container registry is poisoned"))?;
         if let Some(name) = map.get(&key) {
             return Ok(name.clone());
         }
@@ -816,7 +826,7 @@ impl SdkContainer {
         // First session container of this invocation: clear anything a crashed
         // run left parked.
         if map.is_empty() {
-            SessionContainers::sweep_abandoned(&self.container_tool).await;
+            Self::sweep_abandoned(container_tool);
         }
 
         let name = format!(
@@ -825,24 +835,25 @@ impl SdkContainer {
             &uuid::Uuid::new_v4().to_string()[..8]
         );
         let mut cmd = vec![
-            self.container_tool.clone(),
             "run".to_string(),
             "-d".to_string(),
             "--rm".to_string(),
             "--name".to_string(),
             name.clone(),
         ];
-        for k in [
-            "AVOCADO_TARGET",
-            "AVOCADO_HOST_UID",
-            "AVOCADO_HOST_GID",
-            "AVOCADO_SRC_DIR",
-            "AVOCADO_EXT_PATH_MOUNTS",
-            "AVOCADO_VERBOSE",
-        ] {
-            if let Some(v) = env_vars.get(k) {
-                cmd.push("-e".to_string());
-                cmd.push(format!("{k}={v}"));
+        if with_mounts {
+            for k in [
+                "AVOCADO_TARGET",
+                "AVOCADO_HOST_UID",
+                "AVOCADO_HOST_GID",
+                "AVOCADO_SRC_DIR",
+                "AVOCADO_EXT_PATH_MOUNTS",
+                "AVOCADO_VERBOSE",
+            ] {
+                if let Some(v) = env.get(k) {
+                    cmd.push("-e".to_string());
+                    cmd.push(format!("{k}={v}"));
+                }
             }
         }
         // shape ends with the image; everything before it is create flags.
@@ -852,17 +863,20 @@ impl SdkContainer {
         // Park immediately, and do the mounts as a separate, synchronous exec
         // below. Running them as the container's own command would race: `run
         // -d` returns as soon as the container starts, not when its command has
-        // finished, so the first step could exec into a container whose
+        // finished, so the first caller could exec into a container whose
         // /opt/src was not mounted yet. The timeout is a backstop for the case
         // where teardown never runs — a leaked container dies within the hour
         // instead of living until the next sweep.
-        cmd.push("sleep".to_string());
-        cmd.push("3600".to_string());
+        //
+        // `sh -c`, not `bash`: this has to work in the fallback images too,
+        // which are reached when no project config names an SDK image.
+        cmd.push("sh".to_string());
+        cmd.push("-c".to_string());
+        cmd.push("sleep 3600".to_string());
 
-        let out = AsyncCommand::new(&cmd[0])
-            .args(&cmd[1..])
+        let out = std::process::Command::new(container_tool)
+            .args(&cmd)
             .output()
-            .await
             .context("failed to start the session container")?;
         if !out.status.success() {
             anyhow::bail!(
@@ -871,37 +885,87 @@ impl SdkContainer {
             );
         }
 
-        // Mounts, once, before any step can use the container.
-        let mount_out = AsyncCommand::new(&self.container_tool)
-            .args([
-                "exec",
-                &name,
-                "bash",
-                "-c",
-                &format!("set -e\n{}\n", Self::render_mount_block()),
-            ])
-            .output()
-            .await;
-        let mounted = matches!(&mount_out, Ok(o) if o.status.success());
-        if !mounted {
-            let detail = match &mount_out {
-                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                Err(e) => e.to_string(),
-            };
-            let _ = AsyncCommand::new(&self.container_tool)
-                .args(["rm", "-f", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            anyhow::bail!("session container mounts failed: {detail}");
+        if with_mounts {
+            let mount_out = std::process::Command::new(container_tool)
+                .args([
+                    "exec",
+                    &name,
+                    "bash",
+                    "-c",
+                    &format!("set -e\n{}\n", SdkContainer::render_mount_block()),
+                ])
+                .output();
+            if !matches!(&mount_out, Ok(o) if o.status.success()) {
+                let detail = match &mount_out {
+                    Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    Err(e) => e.to_string(),
+                };
+                let _ = std::process::Command::new(container_tool)
+                    .args(["rm", "-f", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                anyhow::bail!("session container mounts failed: {detail}");
+            }
         }
 
         map.insert(key, name.clone());
-        if let Ok(mut created) = CREATED.lock() {
-            created.push(name.clone());
-        }
+        let _ = TOOL.set(container_tool.to_string());
+        ATEXIT.call_once(|| unsafe {
+            libc::atexit(atexit_shutdown);
+        });
         Ok(name)
+    }
+
+    /// Reusable container for a command that only needs a volume mounted — a
+    /// config read, a directory listing, a tar of the volume.
+    ///
+    /// `volume_spec` is a whole `-v` value (`"vol:/opt/_avocado:ro"`), because
+    /// callers disagree on both the mountpoint and the mode. It is part of the
+    /// shape, so a read-only and a read-write user of the same volume correctly
+    /// get different containers.
+    ///
+    /// Returns the container's name rather than running the command, so
+    /// streaming callers can own their stdio. Everyone naming the same spec and
+    /// image shares one container: the first use costs a `docker run`, every
+    /// one after it costs an `exec`.
+    pub fn volume_container(
+        container_tool: &str,
+        volume_spec: &str,
+        image: &str,
+    ) -> Result<String> {
+        let shape = vec!["-v".to_string(), volume_spec.to_string(), image.to_string()];
+        Self::get_or_create(container_tool, &shape, &HashMap::new(), false)
+    }
+
+    /// [`Self::volume_container`] plus a captured `exec`, for the common case.
+    pub fn volume_exec(
+        container_tool: &str,
+        volume_spec: &str,
+        image: &str,
+        command: &[&str],
+    ) -> Result<std::process::Output> {
+        let name = Self::volume_container(container_tool, volume_spec, image)?;
+        let mut argv = vec!["exec", name.as_str()];
+        argv.extend_from_slice(command);
+        std::process::Command::new(container_tool)
+            .args(&argv)
+            .output()
+            .context("failed to exec in the volume session container")
+    }
+}
+
+impl SdkContainer {
+    /// Get, or start, this project's build-step session container for `shape`.
+    ///
+    /// Build steps need the mount block, so this always asks for it; callers
+    /// that only mount a volume use [`SessionContainers::volume_container`].
+    fn session_container(
+        &self,
+        shape: &[String],
+        env_vars: &HashMap<String, String>,
+    ) -> Result<String> {
+        SessionContainers::get_or_create(&self.container_tool, shape, env_vars, true)
     }
 }
 
@@ -948,6 +1012,21 @@ fn build_exec_command(
     cmd.push("-c".to_string());
     cmd.push(command.to_string());
     cmd
+}
+
+/// The registry key for a shape.
+///
+/// `AVOCADO_NO_SESSION_CONTAINER=1` has to reach every caller, or the escape
+/// hatch stops meaning what it says. Sharing is what it disables: a key unique
+/// per call gives each caller its own container, still registered for teardown,
+/// which is the debugging property wanted when one container has been poisoned.
+fn session_key(shape: &[String]) -> String {
+    let base = shape.join("\u{1f}");
+    if session_containers_enabled() {
+        base
+    } else {
+        format!("{base}\u{1f}{}", uuid::Uuid::new_v4())
+    }
 }
 
 /// Session containers are on by default; `AVOCADO_NO_SESSION_CONTAINER=1` forces
@@ -1396,7 +1475,7 @@ impl SdkContainer {
             && session_containers_enabled();
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
-                match self.session_container(&shape, &env_vars).await {
+                match self.session_container(&shape, &env_vars) {
                     Ok(name) => {
                         // The same command, minus the mount block the container
                         // already ran, with the environment moved to the exec.
@@ -2048,7 +2127,7 @@ impl SdkContainer {
             && session_containers_enabled();
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
-                match self.session_container(&shape, &env_vars).await {
+                match self.session_container(&shape, &env_vars) {
                     Ok(name) => {
                         // The same command, minus the mount block the container
                         // already ran, with the environment moved to the exec.
@@ -4059,6 +4138,34 @@ extensions:
         assert!(script
             .contains("bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/src /opt/src"));
         assert!(script.contains("mkdir -p /opt/src"));
+    }
+
+    #[test]
+    fn session_key_shares_by_shape_and_the_hatch_stops_sharing() {
+        let a = vec![
+            "-v".to_string(),
+            "vol:/opt/_avocado:ro".to_string(),
+            "img".to_string(),
+        ];
+        let b = vec![
+            "-v".to_string(),
+            "vol:/opt/_avocado".to_string(),
+            "img".to_string(),
+        ];
+
+        // Same shape shares; a different mount mode does not — a read-only and
+        // a read-write user of one volume must not land in the same container.
+        assert_eq!(session_key(&a), session_key(&a));
+        assert_ne!(session_key(&a), session_key(&b));
+
+        // The hatch is read per call, so set it around the assertion only.
+        std::env::set_var("AVOCADO_NO_SESSION_CONTAINER", "1");
+        let disabled = (session_key(&a), session_key(&a));
+        std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
+        assert_ne!(
+            disabled.0, disabled.1,
+            "with the hatch set, two calls for one shape must not share"
+        );
     }
 
     #[test]

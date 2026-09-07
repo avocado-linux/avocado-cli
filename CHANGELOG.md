@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Every container the CLI starts now goes through the session container, not
+  just build steps.** Eight sites started their own `docker run` outside the
+  reusable path. The worst was reading an extension's `avocado.yaml` out of the
+  SDK volume: config composition re-reads every extension discovered so far
+  after each fetch, so an `sdk install` of a project with three remote
+  extensions did that 24 times, each a ~0.52s container start for a ~5ms `cat`
+  — 12.9s of a 19s command. The registry is now synchronous, so callers that
+  run before any async context (the config reader) can reach it, and
+  `SessionContainers::volume_container` / `volume_exec` give anything that just
+  needs a volume mounted a shared container keyed on the volume spec and image.
+  Routed: the config reader, `ext checkout`'s three volume probes and its
+  `docker cp`, `profiles`' stone-manifest read, `save`'s `du` and `tar`, and
+  `host_copy`, which now `docker cp`s straight out of a running container
+  instead of creating and removing one per file. That also removes the
+  `busybox` and `alpine:latest` dependencies from those paths in favour of the
+  project's own SDK image, which is local already. `avocado load` deliberately
+  keeps `busybox`: it restores a project's config as it runs, so the SDK image
+  is not known yet and may not be pulled. On `sdk install` for a three-extension
+  project this is 31 container starts down to 6, and 23.3s down to 9.0s.
+- **Session container teardown is registered with `atexit`.** Nine call sites
+  reach `std::process::exit` directly and never return to `main`, so the
+  explicit teardown there missed them — a failed `sdk install` leaked two
+  parked containers. Rust runs `atexit` handlers for those paths and for a
+  normal return, so one registration covers every exit, including ones added
+  later. A signal that kills the process still skips it; that is what the
+  existing pid-based sweep is for.
 - **Build steps exec into a reused per-shape container instead of starting a
   fresh one each time.** Every step was its own `docker run --rm`, and profiling
   a no-op `avocado build` put 71% of all container time in startup alone: the

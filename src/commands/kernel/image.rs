@@ -280,6 +280,7 @@ echo "KERNEL_BASENAME=$KERNEL_BASENAME" > "$OUTPUT_DIR/.kernel-basename"
             copy_volume_path_to_host(
                 &container_helper.container_tool,
                 volume_name,
+                container_image,
                 &basename_marker,
                 &basename_local,
             )
@@ -310,6 +311,7 @@ echo "KERNEL_BASENAME=$KERNEL_BASENAME" > "$OUTPUT_DIR/.kernel-basename"
             copy_volume_path_to_host(
                 &container_helper.container_tool,
                 volume_name,
+                container_image,
                 &container_path,
                 &host_dir.join(&host_filename),
             )

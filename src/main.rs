@@ -4430,8 +4430,7 @@ async fn main() -> Result<()> {
     // daemon-side reap; this covers the normal exit. A crash or a kill leaves
     // one behind, which the next invocation sweeps by pid — see
     // `SdkContainer::sweep_abandoned_session_containers`.
-    utils::container::SessionContainers::shutdown(&utils::container::default_container_tool())
-        .await;
+    utils::container::SessionContainers::shutdown(&utils::container::default_container_tool());
 
     result
 }

@@ -349,17 +349,17 @@ fn read_via_container(
 
     let mut last_err = String::new();
     for image in images {
-        let output = std::process::Command::new(&state.container_tool)
-            .args([
-                "run",
-                "--rm",
-                "-v",
-                &format!("{}:/opt/_avocado:ro", state.volume_name),
-                image,
-                "cat",
-                container_path,
-            ])
-            .output();
+        // Routed through the session container: composition re-reads every
+        // known extension config after each fetch, so this is called O(n^2)
+        // times in an install. As a `docker run` each read cost ~0.52s of
+        // container startup for a ~5ms `cat`; as an exec into a container the
+        // first read started, it costs ~0.05s.
+        let output = crate::utils::container::SessionContainers::volume_exec(
+            &state.container_tool,
+            &format!("{}:/opt/_avocado:ro", state.volume_name),
+            image,
+            &["cat", container_path],
+        );
 
         match output {
             Ok(out) if out.status.success() => {

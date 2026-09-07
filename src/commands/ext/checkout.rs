@@ -312,17 +312,11 @@ impl ExtCheckoutCommand {
 
     async fn discover_targets_from_volume(&self, volume_name: &str) -> Result<Vec<String>> {
         // List directories in /opt/_avocado/ to find available targets
-        let output = AsyncCommand::new(&self.container_tool)
-            .arg("run")
-            .arg("--rm")
-            .arg("-v")
-            .arg(format!("{volume_name}:/opt/_avocado:ro"))
-            .arg("alpine:latest")
-            .arg("sh")
-            .arg("-c")
-            .arg("ls -1 /opt/_avocado 2>/dev/null || true")
-            .output()
-            .await
+        let output = self
+            .volume_exec(
+                volume_name,
+                &["sh", "-c", "ls -1 /opt/_avocado 2>/dev/null || true"],
+            )
             .context("Failed to list targets in volume")?;
 
         if !output.status.success() {
@@ -366,34 +360,16 @@ impl ExtCheckoutCommand {
 
     async fn check_path_exists(&self, volume_name: &str, path: &str) -> Result<bool> {
         // Create temporary container with volume mounted
-        let output = AsyncCommand::new(&self.container_tool)
-            .arg("run")
-            .arg("--rm")
-            .arg("-v")
-            .arg(format!("{volume_name}:/opt/_avocado:ro"))
-            .arg("alpine:latest")
-            .arg("test")
-            .arg("-e")
-            .arg(path)
-            .output()
-            .await
+        let output = self
+            .volume_exec(volume_name, &["test", "-e", path])
             .context("Failed to check if path exists")?;
 
         Ok(output.status.success())
     }
 
     async fn check_is_directory(&self, volume_name: &str, path: &str) -> Result<bool> {
-        let output = AsyncCommand::new(&self.container_tool)
-            .arg("run")
-            .arg("--rm")
-            .arg("-v")
-            .arg(format!("{volume_name}:/opt/_avocado:ro"))
-            .arg("alpine:latest")
-            .arg("test")
-            .arg("-d")
-            .arg(path)
-            .output()
-            .await
+        let output = self
+            .volume_exec(volume_name, &["test", "-d", path])
             .context("Failed to check if path is directory")?;
 
         Ok(output.status.success())
@@ -407,8 +383,9 @@ impl ExtCheckoutCommand {
         is_directory: bool,
         _container_name: &str,
     ) -> Result<()> {
-        // Create a temporary container to copy files from
-        let temp_container_id = self.create_temp_container(volume_name).await?;
+        // The session container for this volume; shared with the probes above
+        // and removed once, at process exit.
+        let temp_container_id = self.temp_container(volume_name)?;
 
         // Ensure destination directory exists
         if let Some(parent) = dest_path.parent() {
@@ -472,14 +449,6 @@ impl ExtCheckoutCommand {
             .await
             .context("Failed to execute docker cp")?;
 
-        // Clean up the temporary container
-        let _ = AsyncCommand::new(&self.container_tool)
-            .arg("rm")
-            .arg("-f")
-            .arg(&temp_container_id)
-            .output()
-            .await;
-
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow::anyhow!("Docker cp failed: {stderr}"));
@@ -488,26 +457,36 @@ impl ExtCheckoutCommand {
         Ok(())
     }
 
-    async fn create_temp_container(&self, volume_name: &str) -> Result<String> {
-        let output = AsyncCommand::new(&self.container_tool)
-            .arg("create")
-            .arg("-v")
-            .arg(format!("{volume_name}:/opt/_avocado:ro"))
-            .arg("alpine:latest")
-            .arg("true")
-            .output()
-            .await
-            .context("Failed to create temporary container")?;
+    /// The image utility containers for this project's volume run on: the
+    /// configured SDK image, which is already present because every build step
+    /// needs it, falling back to `alpine` only when no config names one.
+    fn volume_image(&self) -> String {
+        self.composed_config
+            .as_ref()
+            .and_then(|c| c.config.get_sdk_image())
+            .filter(|img| !img.contains("{{"))
+            .cloned()
+            .unwrap_or_else(|| "alpine:latest".to_string())
+    }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!(
-                "Failed to create temporary container: {stderr}"
-            ));
-        }
+    /// Run a short command against the volume in the reusable session
+    /// container. `checkout` probes the volume three times and then copies out
+    /// of it; all four shared a shape, so all four now share one container.
+    fn volume_exec(&self, volume_name: &str, command: &[&str]) -> Result<std::process::Output> {
+        crate::utils::container::SessionContainers::volume_exec(
+            &self.container_tool,
+            &format!("{volume_name}:/opt/_avocado:ro"),
+            &self.volume_image(),
+            command,
+        )
+    }
 
-        let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(container_id)
+    fn temp_container(&self, volume_name: &str) -> Result<String> {
+        crate::utils::container::SessionContainers::volume_container(
+            &self.container_tool,
+            &format!("{volume_name}:/opt/_avocado:ro"),
+            &self.volume_image(),
+        )
     }
 
     async fn fix_ownership(&self, path: &Path) -> Result<()> {
