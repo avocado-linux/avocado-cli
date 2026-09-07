@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+
 ### Changed
 - **Stamps now record what a step produced, and the next step's input depends
   on it.** `STAMP_VERSION` moves 3 → 4. `ext build` records a digest of the
@@ -63,6 +64,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one side and none on the other is stale, never a match by omission.
 - An unreadable directory inside an overlay now fails the stamp check and the
   materialization instead of being silently dropped from both.
+
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
+
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
 
 ### Added
 - **`avocado build` produces the deployable set *and* the OTA payload;
@@ -115,20 +142,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they cannot be flashed stale, and the runtime build stamp records
   `ota_only`, which `runtime provision` refuses with the fix. An `--ota`
   manifest carries no `os_bundle`: extensions update, the OS is left alone.
-
-### Changed
-- **Runtime builds stop copying and re-hashing every image.** Per build, each
-  image was written twice into the volume — once into the runtime directory,
-  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
-  manifest step and again by the TUF hash collection; `avocado deploy` hashed
-  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
-  copy on a filesystem that refuses the link), the extension copies and the
-  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
-  and xfs, a plain copy elsewhere), and both hash collections read each
-  image's `sha256` out of the manifest — computed over the same inode — with
-  only `size` still coming from `stat`. A manifest entry whose image is absent
-  from `images/` now fails the hash collection instead of being silently
-  dropped from the published target list.
 
 ## [1.0.0-rc.3] - 2026-09-01
 
