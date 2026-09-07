@@ -262,7 +262,6 @@ impl RpmQueryConfig {
         cmd
     }
 
-    /// Build the rpm -q command with proper environment and flags
     /// A dnf query for each installed package's origin repository.
     ///
     /// `rpm` cannot answer this — it records the package, not where it came from.
@@ -283,6 +282,7 @@ impl RpmQueryConfig {
         ))
     }
 
+    /// Build the rpm -q command with proper environment and flags
     pub fn build_query_command(&self, packages: &[String]) -> String {
         // Build rpm command with query format
         // Output format: NAME VERSION-RELEASE.ARCH
