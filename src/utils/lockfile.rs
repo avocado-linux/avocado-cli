@@ -36,12 +36,15 @@ static LOCKFILE_SAVE_GATE: Mutex<()> = Mutex::new(());
 ///            `RuntimeLock` carrying both `packages` and per-runtime
 ///            `extensions`. Migration from v5 wraps the old flat map as
 ///            `{ packages: <old>, extensions: {} }`.
-/// Version 8: Adds per-target `feeds`, the resolved feed set a target was built
-///            against — name, order, resolved URL, and a content digest for
-///            on-disk feeds. Additive: a v7 lockfile reads as v8 with an empty
-///            list. Per target, not global, because a feed's resolved URL
-///            contains `$target` and `targets:` can exclude a feed entirely, so
-///            two targets in one project genuinely resolve different sets.
+/// Version 8: Adds per-target `feeds`, the feed set a target was built against —
+///            name, order, the locator *as configured*, and a content digest for
+///            on-disk feeds. As configured, not as used: no loopback rewrite, no
+///            minted host, and a `path:` feed exactly as written, because those
+///            are per-machine facts rather than inputs. Additive: a v7 lockfile
+///            reads as v8 with no feed record. Per target, not global, because a
+///            configured locator can contain `$target` and `targets:` can
+///            exclude a feed entirely, so two targets in one project genuinely
+///            resolve different sets.
 /// Version 7: Adds per-target `repo-snapshot`, the immutable channel snapshot
 ///            the target's packages were resolved against. Additive — v6
 ///            lockfiles read as v7 with `repo_snapshot: None` and behave
@@ -662,8 +665,15 @@ pub struct TargetLocks {
     pub repo_snapshot: Option<RepoSnapshot>,
 
     /// The feed set this target was resolved against, in priority order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub feeds: Vec<LockedFeed>,
+    ///
+    /// `None` means "no writer has recorded a feed set for this target"; an empty
+    /// vec means "a writer recorded that this target resolves no named feeds".
+    /// The distinction is load-bearing: [`LockFile::merge_with`] adopts the
+    /// on-disk value only for `None`, so removing the last named feed from a
+    /// config actually clears the record instead of having `save()` resurrect it
+    /// from disk on every subsequent write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feeds: Option<Vec<LockedFeed>>,
 
     /// In-memory only: sysroot sections explicitly cleared during this process
     /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
@@ -1235,9 +1245,12 @@ impl LockFile {
             // explicit clear (unlock) goes through `save_replacing`, which
             // never merges, so a cleared pin stays cleared.
             // Same rule as the snapshot: adopt the other side's record only when
-            // this side has none. An install replaces the set wholesale, so a
-            // merge must not resurrect feeds a later install dropped.
-            if self_target.feeds.is_empty() {
+            // this side has none. `None` is "did not touch feeds"; `Some(vec![])`
+            // is "recorded that there are none", which is why the field is an
+            // Option — treating an empty vec as "untouched" made clearing the
+            // record impossible, since `save()` reloads disk and would resurrect
+            // the old list on every write after the last named feed was removed.
+            if self_target.feeds.is_none() {
                 self_target.feeds = other_target.feeds;
             }
             if self_target.repo_snapshot.is_none() {
@@ -1273,8 +1286,16 @@ impl LockFile {
     pub fn get_feeds(&self, target: &str) -> &[LockedFeed] {
         self.targets
             .get(target)
-            .map(|t| t.feeds.as_slice())
+            .and_then(|t| t.feeds.as_deref())
             .unwrap_or(&[])
+    }
+
+    /// Whether any writer has recorded a feed set for this target, as distinct
+    /// from having recorded that it resolves none. [`Self::get_feeds`] flattens
+    /// the two; the recorder needs them apart to know whether it has anything to
+    /// clear.
+    pub fn has_feed_record(&self, target: &str) -> bool {
+        self.targets.get(target).is_some_and(|t| t.feeds.is_some())
     }
 
     /// Record (or replace) the feed set for a target.
@@ -1283,7 +1304,7 @@ impl LockFile {
     /// and a feed removed from the config has to disappear from the lock, or the
     /// record would accumulate feeds no build uses.
     pub fn set_feeds(&mut self, target: &str, feeds: Vec<LockedFeed>) {
-        self.targets.entry(target.to_string()).or_default().feeds = feeds;
+        self.targets.entry(target.to_string()).or_default().feeds = Some(feeds);
     }
 
     /// Record (or replace) the repo snapshot pin for a target. Used by the
@@ -2076,6 +2097,39 @@ mod tests {
             .map(|x| x.name.as_str())
             .collect();
         assert_eq!(names, vec!["a"], "dropped feed must not linger");
+    }
+
+    /// Removing the last named feed from a config has to clear the record, and
+    /// `save()` merges with disk, so "recorded as empty" must be distinguishable
+    /// from "never recorded". While an empty vec meant "untouched", the merge
+    /// pulled the old list back in and the lock kept describing feeds the build
+    /// no longer used — for every write from then on.
+    #[test]
+    fn an_emptied_feed_set_survives_the_merge_with_disk() {
+        use super::{LockFile, LockedFeed};
+        let feed = LockedFeed {
+            name: "vendor".into(),
+            position: 10,
+            url: "https://v".into(),
+            digest: None,
+            stages: None,
+        };
+        let mut on_disk = LockFile::default();
+        on_disk.set_feeds("t", vec![feed]);
+
+        // A writer that never touched feeds adopts the disk value.
+        let untouched = LockFile::default().merge_with(on_disk.clone());
+        assert_eq!(untouched.get_feeds("t").len(), 1, "None means untouched");
+
+        // A writer that recorded "no feeds" clears it.
+        let mut emptied = LockFile::default();
+        emptied.set_feeds("t", vec![]);
+        let merged = emptied.merge_with(on_disk);
+        assert!(merged.get_feeds("t").is_empty(), "an empty set must stick");
+        assert!(
+            merged.has_feed_record("t"),
+            "and must still read as recorded, not as absent"
+        );
     }
 
     /// A v7 lockfile has no `feeds` key at all and must still load.
