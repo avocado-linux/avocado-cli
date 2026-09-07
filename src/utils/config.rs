@@ -4052,10 +4052,14 @@ impl Config {
 /// provenance record could not be written.
 fn record_feed_set_in_lock(
     target: &str,
-    set: &crate::utils::feeds::ResolvedFeedSet,
+    set: Option<&crate::utils::feeds::ResolvedFeedSet>,
     project_root: &Path,
 ) {
-    let locked = set.locked_feeds();
+    use crate::utils::lockfile::LockedFeed;
+    // `None` is the "this project declares no named feeds" path, and it has to
+    // write too: removing the last feed from a config must clear the record, or
+    // the lock keeps describing a set the build no longer uses.
+    let locked: Vec<LockedFeed> = set.map(|s| s.locked_feeds()).unwrap_or_default();
     let mut lock = match crate::utils::lockfile::LockFile::load(project_root) {
         Ok(l) => l,
         Err(e) => {
@@ -4067,27 +4071,57 @@ fn record_feed_set_in_lock(
         }
     };
     let previous = lock.get_feeds(target);
-    if previous == locked.as_slice() {
+    if previous == locked.as_slice() && lock.has_feed_record(target) == set.is_some() {
         return;
     }
     if !previous.is_empty() {
         // A recorded value nobody reads is only half a record. The reason to write
         // it down is that reordering feeds silently changes which artifact a name
         // and version resolve to, and that is the change a user would not notice.
-        let names = |fs: &[crate::utils::lockfile::LockedFeed]| {
+        //
+        // Names and order first, because that is the change worth reading. But the
+        // record also carries each feed's locator, digest and stage scope, and any
+        // of those moving is equally a change — so when the name list is identical
+        // the message has to say what actually moved, or it prints two identical
+        // lists and reads as a bug.
+        let names = |fs: &[LockedFeed]| {
             fs.iter()
                 .map(|f| f.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        crate::utils::output::print_info(
-            &format!(
-                "feeds for '{target}' changed since the lock was written: [{}] -> [{}]",
-                names(previous),
-                names(&locked)
-            ),
-            crate::utils::output::OutputLevel::Normal,
+        let mut message = format!(
+            "feeds for '{target}' changed since the lock was written: [{}] -> [{}]",
+            names(previous),
+            names(&locked)
         );
+        if names(previous) == names(&locked) {
+            let fields = |a: &LockedFeed, b: &LockedFeed| {
+                [
+                    ("url", a.url != b.url),
+                    ("digest", a.digest != b.digest),
+                    ("stages", a.stages != b.stages),
+                    ("position", a.position != b.position),
+                ]
+                .into_iter()
+                .filter(|(_, moved)| *moved)
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+            };
+            let moved: Vec<String> = previous
+                .iter()
+                .zip(&locked)
+                .filter_map(|(a, b)| {
+                    let f = fields(a, b);
+                    (!f.is_empty()).then(|| format!("{} ({})", a.name, f.join(", ")))
+                })
+                .collect();
+            message = format!(
+                "feeds for '{target}' changed since the lock was written: {}",
+                moved.join("; ")
+            );
+        }
+        crate::utils::output::print_info(&message, crate::utils::output::OutputLevel::Normal);
     }
     lock.set_feeds(target, locked);
     if let Err(e) = lock.save(project_root) {
@@ -4096,6 +4130,26 @@ fn record_feed_set_in_lock(
             crate::utils::output::OutputLevel::Normal,
         );
     }
+}
+
+/// Targets whose feed record has already been reconciled this invocation.
+///
+/// Only the no-feeds path needs this: when feeds resolve, the per-target
+/// `OnceCell` in [`invocation_feeds`] already makes the recording happen once.
+/// Without it, every container run of a project with no named feeds would load
+/// and re-check the lock.
+static FEEDS_RECORDED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn record_empty_feed_set_once(target: &str, project_root: &Path) {
+    let seen = FEEDS_RECORDED.get_or_init(Default::default);
+    {
+        let Ok(mut guard) = seen.lock() else { return };
+        if !guard.insert(target.to_string()) {
+            return;
+        }
+    }
+    record_feed_set_in_lock(target, None, project_root);
 }
 
 /// One resolved, minted feed set per invocation, per target.
@@ -4160,7 +4214,7 @@ async fn invocation_feeds(
         // whichever command is running. Doing it in each install command missed
         // every other path, which is how the first attempt recorded nothing for a
         // `sdk install`.
-        record_feed_set_in_lock(target, &set, project_root);
+        record_feed_set_in_lock(target, Some(&set), project_root);
         // No minting here: it is per stage, and this cell is per target.
         let root = std::sync::Arc::new(
             tempfile::Builder::new()
@@ -4201,6 +4255,10 @@ impl Config {
         let Some(set) =
             crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
         else {
+            // No named feeds. Still a fact worth recording, because it is the fact
+            // that removes a set the lock may still be carrying from a config that
+            // used to declare one.
+            record_empty_feed_set_once(target, &project_root);
             return Ok(None);
         };
         // The canonical document and the lock record are both written inside
