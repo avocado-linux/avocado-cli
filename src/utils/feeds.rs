@@ -169,8 +169,13 @@ pub struct ResolvedFeed {
     pub credential_identity: String,
     pub tls_verify: bool,
     /// `path:` feeds only — the path as written in config (project-relative) and
-    /// the sha256 of its `repodata/repomd.xml`. The local analogue of the snapshot
-    /// pin: a different directory or new RPMs must move the stamp hash.
+    /// the full sha256 of its `repodata/repomd.xml`. The local analogue of the
+    /// snapshot pin: a different directory or new RPMs must move the stamp hash.
+    ///
+    /// Full, not the 12-character prefix used for identifiers elsewhere in this
+    /// module. A truncated identifier only has to be unlikely to collide by
+    /// accident; this one decides whether a rebuild happens, and the content it
+    /// digests can come from a feed someone else controls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,7 +542,7 @@ impl ResolvedFeedSet {
                     content_digest: mount
                         .as_ref()
                         .and_then(|m| fs::read(m.join("repodata").join("repomd.xml")).ok())
-                        .map(|b| short_sha256(&b)),
+                        .map(|b| full_sha256(&b)),
                     name: name.clone(),
                     kind,
                     baseurl,
@@ -827,6 +832,16 @@ pub fn rewrite_loopback_reported(url: &str) -> String {
         });
     }
     rewritten
+}
+
+/// Full sha256, hex. For digests that gate a rebuild, where a truncation would
+/// be a correctness question rather than a readability one.
+fn full_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// host-gateway alias and tell the caller so it can add the `--add-host`.

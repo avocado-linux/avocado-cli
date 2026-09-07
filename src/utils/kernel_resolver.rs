@@ -138,9 +138,10 @@ pub async fn resolve_and_pin_kernel_version(
     Ok(Some(picked))
 }
 
-/// Cache key pairing target and repo URL — within a single process these
-/// uniquely identify the available-kernel list the resolver cares about.
-type KernelCacheKey = (String, String, String);
+/// Cache key: target, repo URL, repo release, feed-set fingerprint. Every input
+/// that reaches the container run has to be here — a key that omits one is a
+/// cache that answers a question it was not asked.
+type KernelCacheKey = (String, String, String, String);
 
 /// Process-level cache type alias.
 type KernelVersionCache = Mutex<HashMap<KernelCacheKey, Vec<String>>>;
@@ -199,12 +200,19 @@ pub async fn off_kernel_dnf_excludes(
 }
 
 /// Cached wrapper around [`query_available_kernel_versions`]. The key is
-/// target + repo URL + the feed set's fingerprint, so two avocado commands with
-/// different repo configs or feed sets in one process don't cross-pollinate.
+/// target + repo URL + repo release + the feed set's fingerprint, so two avocado
+/// commands with different repo configs or feed sets in one process don't
+/// cross-pollinate.
+///
+/// `repo_release` belongs in the key because it is passed into the container run
+/// and selects the releasever the repoquery resolves against — a snapshot pin
+/// changing mid-process would otherwise reuse the kernel list from the previous
+/// one, which is a stale answer that looks authoritative.
 async fn get_available_kernel_versions(params: &ResolveParams<'_>) -> Result<Vec<String>> {
     let cache_key = (
         params.target.to_string(),
         params.repo_url.unwrap_or("").to_string(),
+        params.repo_release.unwrap_or("").to_string(),
         params
             .feeds
             .map(|f| f.fingerprint.clone())

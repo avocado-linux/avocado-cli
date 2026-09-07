@@ -13,7 +13,7 @@
 #   4. the canonical document exists, records credential identity, holds no secret
 #   5. `ext fetch` finds a `source: package` extension that exists only in the local feeds
 #
-# Requires: docker, rpmbuild, createrepo_c, python3. Uses this worktree's debug
+# Requires: docker, rpmbuild, createrepo_c, python3, curl. Uses this worktree's debug
 # build unless $AVOCADO points elsewhere.
 #
 #   scripts/local-feeds/run.sh [workdir]
@@ -32,7 +32,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok   $*"; }
 
 [ -x "$AVOCADO" ] || fail "avocado binary not found at $AVOCADO (cargo build first)"
-for t in docker rpmbuild createrepo_c python3; do command -v "$t" >/dev/null || fail "$t not installed"; done
+for t in docker rpmbuild createrepo_c python3 curl; do command -v "$t" >/dev/null || fail "$t not installed"; done
 
 rm -rf "$WORK"; mkdir -p "$WORK"/{rpmbuild,feed-a,feed-b,project}
 cd "$WORK"
