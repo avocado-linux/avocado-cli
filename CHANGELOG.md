@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Ctrl-C removes the session containers it started.** `atexit` does not run
+  for a signal, so an interrupted run left containers parked and holding the
+  project volume until the next invocation swept them by pid. A SIGINT handler
+  now reaps them and exits 130. It is armed lazily, from the moment this process
+  first creates a session container and only then: registering a SIGINT handler
+  suppresses the default terminate-the-process disposition for the whole
+  process, and commands that never create one of these — `container dev` in
+  particular, which drives its engine shutdown off the same signal — must keep
+  the Ctrl-C behaviour they have.
 - **Session container creation no longer blocks the async runtime.** The
   registry held one global lock across `docker ps`, `docker run -d` and the
   mount `docker exec`. `install` runs its steps in parallel, so every step
@@ -76,7 +85,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no config is available to name an image, and a `sdk.image` still carrying
   `{{ … }}` is treated as unavailable rather than run as a literal.
 
-### Changed
 - **`runtime build` reuses the rootfs and initramfs images when nothing they
   depend on has changed.** Each image section now has a stamp whose input is
   the install step's tree digest plus the resolved image config — filesystem,
@@ -158,7 +166,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped from the published target list.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> b55c437 (fix(container): correct pid liveness, lock starvation and reaper arming)
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 - **Runtime builds stop copying and re-hashing every image.** Per build, each
   image was written twice into the volume — once into the runtime directory,
   once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
@@ -173,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped from the published target list.
 =======
 >>>>>>> eb01340 (fix(stamps): an empty KAB_KEYSET_FILE must not digest the filesystem root)
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> b55c437 (fix(container): correct pid liveness, lock starvation and reaper arming)
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
@@ -235,7 +254,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
   change now invalidates every image by itself.
 
+<<<<<<< HEAD
 >>>>>>> eb01340 (fix(stamps): an empty KAB_KEYSET_FILE must not digest the filesystem root)
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> b55c437 (fix(container): correct pid liveness, lock starvation and reaper arming)
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 
 ### Added
 - **`avocado build` produces the deployable set *and* the OTA payload;
@@ -289,6 +314,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ota_only`, which `runtime provision` refuses with the fix. An `--ota`
   manifest carries no `os_bundle`: extensions update, the OS is left alone.
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 
 ## [1.0.0-rc.3] - 2026-09-01
 

@@ -709,6 +709,7 @@ static SESSION: std::sync::OnceLock<SessionContainers> = std::sync::OnceLock::ne
 /// created. Teardown runs from `atexit`, which takes no arguments.
 static TOOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ATEXIT: std::sync::Once = std::sync::Once::new();
+static SIGINT_REAPER: std::sync::Once = std::sync::Once::new();
 
 /// Teardown registered with libc `atexit`.
 ///
@@ -953,6 +954,7 @@ impl SessionContainers {
         ATEXIT.call_once(|| unsafe {
             libc::atexit(atexit_shutdown);
         });
+        arm_sigint_reaper();
         Ok(name)
     }
 
@@ -987,10 +989,17 @@ impl SessionContainers {
         let name = Self::volume_container(container_tool, volume_spec, image)?;
         let mut argv = vec!["exec", name.as_str()];
         argv.extend_from_slice(command);
-        std::process::Command::new(container_tool)
-            .args(&argv)
-            .output()
-            .context("failed to exec in the volume session container")
+        // Several callers are async — the extension checkout and the profile
+        // reader among them — and this shells out and waits. Done directly on a
+        // worker it takes that worker out of circulation, which is the same
+        // starvation `block_in_place_if_async` exists to prevent for container
+        // creation.
+        block_in_place_if_async(|| {
+            std::process::Command::new(container_tool)
+                .args(&argv)
+                .output()
+                .context("failed to exec in the volume session container")
+        })
     }
 }
 
@@ -1016,7 +1025,15 @@ impl SdkContainer {
 /// signals nothing and only reports whether the process exists.
 #[cfg(unix)]
 fn pid_is_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // Only ESRCH proves the process is gone. `EPERM` means it exists and
+    // belongs to someone else, and any other errno is an answer we cannot
+    // interpret — both have to read as alive, or the sweep reaps the containers
+    // of a build that is still running. Same asymmetry as the non-unix stub
+    // below: a stale container costs memory, reaping a live one breaks a build.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// No cheap equivalent probe here, so never reap: a stale container costs
@@ -1051,6 +1068,43 @@ fn build_exec_command(
     cmd.push("-c".to_string());
     cmd.push(command.to_string());
     cmd
+}
+
+/// Remove session containers when the user interrupts.
+///
+/// `atexit` does not run for a signal, so Ctrl-C left containers parked and
+/// holding the project volume. The `sleep` backstop eventually frees them and
+/// the next invocation sweeps them by pid, but until one of those happens a
+/// dead run still owns the volume.
+///
+/// Armed lazily, from the moment this process first creates a session
+/// container, and *only* then. Registering a SIGINT handler suppresses the
+/// default terminate-the-process disposition for the whole process, so arming
+/// it unconditionally would change Ctrl-C for commands that have their own
+/// handling and never create one of these — `container dev` in particular,
+/// which drives its engine's shutdown off the same signal.
+fn arm_sigint_reaper() {
+    // Checked BEFORE the Once, not inside it. `call_once` is spent whether or
+    // not its closure does anything, so returning early from inside it armed
+    // nothing and permanently prevented arming later — and the first session
+    // container is easily created before a runtime exists (the config reader
+    // runs synchronously). The atexit handler still covers every non-signal
+    // exit, so the cost of not arming is only Ctrl-C cleanup, which is exactly
+    // what this is for.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    SIGINT_REAPER.call_once(|| {
+        handle.spawn(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                if let Some(tool) = TOOL.get() {
+                    SessionContainers::shutdown(tool);
+                }
+                // 130 is the shell's convention for "terminated by SIGINT".
+                std::process::exit(130);
+            }
+        });
+    });
 }
 
 /// Run blocking work without parking a tokio worker thread.
@@ -1121,6 +1175,9 @@ fn split_run_argv(argv: &[String], command_len: usize) -> Option<(Vec<String>, V
     let mut i = 2;
     while i < image_idx {
         match argv[i].as_str() {
+            // The shape must not include stdio flags, or two otherwise identical
+            // steps get separate containers because one had a terminal.
+            // stdio-flags-ok: consuming them out of an argv, not choosing them.
             "--rm" | "-d" | "--detach" | "-i" | "-t" | "-it" => i += 1,
             "--name" => i += 2,
             // Taken from the argv rather than from `RunConfig::env_vars`,
@@ -4143,7 +4200,7 @@ extensions:
     fn ext_path_mount_tolerates_a_non_empty_mountpoint() {
         let container = SdkContainer::new();
         for script in [
-            container.create_entrypoint_script(true, None, None, "x86_64", false, false),
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, true),
             container.create_entrypoint_script_for_remote(true, None, None, "x86_64", false, false),
         ] {
             assert!(
@@ -4154,6 +4211,12 @@ extensions:
             assert!(script
                 .contains(r#"|| _err="$_err; $(bindfs $_map "$mnt_path" "$target_path" 2>&1)""#));
         }
+
+        // The exec-shaped prologue omits every mount, this one included: the
+        // session container ran them once at creation, and bindfs stacks.
+        let exec_shaped =
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, false);
+        assert!(!exec_shaped.contains(r#"bindfs -o nonempty"#));
     }
 
     /// Both entrypoint scripts are `bash -c`'d in the container; a quoting slip
@@ -4163,7 +4226,8 @@ extensions:
         use std::io::Write;
         let container = SdkContainer::new();
         for script in [
-            container.create_entrypoint_script(true, None, None, "x86_64", false, false),
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, true),
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, false),
             container.create_entrypoint_script_for_remote(true, None, None, "x86_64", false, false),
         ] {
             let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -4240,6 +4304,7 @@ extensions:
             "docker",
             "run",
             "--rm",
+            // stdio-flags-ok: fixture argv for the parser above, not a real run.
             "-i",
             "--name",
             "avocado-build-123",
