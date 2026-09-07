@@ -471,8 +471,11 @@ sdk:
             let tl = lock.targets.entry("qemux86-64".to_string()).or_default();
             tl.kernel_versions
                 .insert("rootfs".to_string(), "6.6.123-yocto-standard".to_string());
-            let mut pkgs = std::collections::HashMap::new();
-            pkgs.insert("kernel-image".to_string(), "6.6.123-r0.0".to_string());
+            let mut pkgs = crate::utils::lockfile::PackageVersions::new();
+            pkgs.insert(
+                "kernel-image".to_string(),
+                crate::utils::lockfile::LockedPackage::new("6.6.123-r0.0"),
+            );
             tl.kernels
                 .insert("6.6.123-yocto-standard".to_string(), pkgs);
         }

@@ -260,6 +260,26 @@ impl RpmQueryConfig {
     }
 
     /// Build the rpm -q command with proper environment and flags
+    /// A dnf query for each installed package's origin repository.
+    ///
+    /// `rpm` cannot answer this — it records the package, not where it came from.
+    /// dnf can, because it did the resolution, and it keeps the answer in the
+    /// installroot's own history database. `--disablerepo="*"` makes the query
+    /// entirely local: no metadata fetch, no network, so it cannot fail because a
+    /// feed is unreachable.
+    ///
+    /// Returns `None` for a sysroot with no installroot — the SDK's own packages,
+    /// which come from the SDK image rather than a feed.
+    pub fn build_origin_query_command(&self) -> Option<String> {
+        let root = self.root_path.as_ref()?;
+        // `|| true` for the same reason the rpm query needs it: the entrypoint runs
+        // under `set -e` and a query that matches nothing must not abort the script.
+        Some(format!(
+            "dnf --installroot=\"{root}\" --disablerepo=\"*\" repoquery --installed \
+             --qf '%{{name}}|%{{from_repo}}' 2>/dev/null || true"
+        ))
+    }
+
     pub fn build_query_command(&self, packages: &[String]) -> String {
         // Build rpm command with query format
         // Output format: NAME VERSION-RELEASE.ARCH
@@ -310,7 +330,80 @@ impl RpmQueryConfig {
 }
 
 /// Package versions map: package_name -> version
-pub type PackageVersions = HashMap<String, String>;
+/// A package as the lock records it: its version, and which feed it came from
+/// when that is known.
+///
+/// **Serializes as a bare version string when the origin is unknown.** That keeps
+/// a single-feed project's lockfile byte-identical to what it was before
+/// provenance existed, so existing locks do not churn and diffs stay small; only
+/// packages whose origin we actually resolved take the object form. It
+/// deserializes from either shape, which is what makes the format change
+/// additive.
+///
+/// The origin cannot come from `rpm`, which records the package and not the
+/// repository it was fetched from. It comes from dnf, which knows because it did
+/// the resolution, and which keeps it in the installroot's own history database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedPackage {
+    pub version: String,
+    pub repo: Option<String>,
+}
+
+impl LockedPackage {
+    pub fn new(version: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            repo: None,
+        }
+    }
+
+    pub fn with_repo(version: impl Into<String>, repo: Option<String>) -> Self {
+        Self {
+            version: version.into(),
+            repo,
+        }
+    }
+}
+
+impl Serialize for LockedPackage {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        match &self.repo {
+            // Bare string: identical to the pre-provenance format.
+            None => ser.serialize_str(&self.version),
+            Some(repo) => {
+                use serde::ser::SerializeMap;
+                let mut m = ser.serialize_map(Some(2))?;
+                m.serialize_entry("version", &self.version)?;
+                m.serialize_entry("repo", repo)?;
+                m.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LockedPackage {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Plain(String),
+            Full {
+                version: String,
+                #[serde(default)]
+                repo: Option<String>,
+            },
+        }
+        Ok(match Either::deserialize(de)? {
+            Either::Plain(version) => Self {
+                version,
+                repo: None,
+            },
+            Either::Full { version, repo } => Self { version, repo },
+        })
+    }
+}
+
+pub type PackageVersions = HashMap<String, LockedPackage>;
 
 /// Nested package versions map: sub_key -> package_name -> version
 /// Used for SDK (keyed by host arch) and runtimes (keyed by name)
@@ -780,7 +873,9 @@ impl LockFile {
                         if let Some(packages_map) = packages.as_object() {
                             let pkg_versions: PackageVersions = packages_map
                                 .iter()
-                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.clone(), LockedPackage::new(s)))
+                                })
                                 .collect();
 
                             match key.as_str() {
@@ -850,7 +945,7 @@ impl LockFile {
                                 let pkg_versions: PackageVersions = pkg_map
                                     .iter()
                                     .filter_map(|(k, v)| {
-                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                        v.as_str().map(|s| (k.clone(), LockedPackage::new(s)))
                                     })
                                     .collect();
                                 target_locks.sdk.insert(arch.clone(), pkg_versions);
@@ -862,7 +957,9 @@ impl LockFile {
                     if let Some(rootfs) = target_map.get("rootfs").and_then(|v| v.as_object()) {
                         target_locks.rootfs = rootfs
                             .iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), LockedPackage::new(s)))
+                            })
                             .collect();
                     }
 
@@ -870,7 +967,9 @@ impl LockFile {
                     if let Some(ts) = target_map.get("target-sysroot").and_then(|v| v.as_object()) {
                         target_locks.target_sysroot = ts
                             .iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), LockedPackage::new(s)))
+                            })
                             .collect();
                     }
 
@@ -881,7 +980,7 @@ impl LockFile {
                                 let pkg_versions: PackageVersions = pkg_map
                                     .iter()
                                     .filter_map(|(k, v)| {
-                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                        v.as_str().map(|s| (k.clone(), LockedPackage::new(s)))
                                     })
                                     .collect();
                                 let ext_lock =
@@ -926,7 +1025,7 @@ impl LockFile {
                                 let pkg_versions: PackageVersions = pkg_map
                                     .iter()
                                     .filter_map(|(k, v)| {
-                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                        v.as_str().map(|s| (k.clone(), LockedPackage::new(s)))
                                     })
                                     .collect();
                                 target_locks.runtimes.insert(
@@ -1196,13 +1295,27 @@ impl LockFile {
             .repo_snapshot = Some(snapshot);
     }
 
-    /// Get the locked version for a package in a specific target and sysroot
+    /// Get the locked version for a package in a specific target and sysroot.
+    ///
+    /// Returns the version only, so its ~80 callers are unaffected by the record
+    /// gaining an origin. Use [`Self::get_locked_package`] when the origin matters.
     pub fn get_locked_version(
         &self,
         target: &str,
         sysroot: &SysrootType,
         package: &str,
     ) -> Option<&String> {
+        self.get_locked_package(target, sysroot, package)
+            .map(|p| &p.version)
+    }
+
+    /// The full record for a package, version and origin.
+    pub fn get_locked_package(
+        &self,
+        target: &str,
+        sysroot: &SysrootType,
+        package: &str,
+    ) -> Option<&LockedPackage> {
         let target_locks = self.targets.get(target)?;
 
         match sysroot {
@@ -1369,7 +1482,18 @@ impl LockFile {
     ) {
         let target_locks = self.targets.entry(target.to_string()).or_default();
 
-        let packages = match sysroot {
+        Self::packages_mut_for(target_locks, sysroot)
+            .insert(package.to_string(), LockedPackage::new(version));
+    }
+
+    /// The package map a sysroot's records live in, creating intermediate entries.
+    /// Shared by the setters so they cannot disagree about where a sysroot's
+    /// packages belong.
+    fn packages_mut_for<'a>(
+        target_locks: &'a mut TargetLocks,
+        sysroot: &SysrootType,
+    ) -> &'a mut PackageVersions {
+        match sysroot {
             SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
             SysrootType::Rootfs => &mut target_locks.rootfs,
             SysrootType::Initramfs => &mut target_locks.initramfs,
@@ -1401,9 +1525,7 @@ impl LockFile {
                     .or_default()
                     .packages
             }
-        };
-
-        packages.insert(package.to_string(), version.to_string());
+        }
     }
 
     /// Update multiple package versions for a target and sysroot at once
@@ -1450,7 +1572,43 @@ impl LockFile {
         };
 
         for (package, version) in versions {
-            packages.insert(package, version);
+            // Preserve an origin already recorded for this package: the caller
+            // here has versions only, and dropping the origin would make a second
+            // install erase provenance the first one established.
+            match packages.get_mut(&package) {
+                Some(existing) => existing.version = version,
+                None => {
+                    packages.insert(package, LockedPackage::new(version));
+                }
+            }
+        }
+    }
+
+    /// Record where each package came from, for packages already in the lock.
+    ///
+    /// Applied after the versions, not instead of them: versions are
+    /// authoritative and come from `rpm`, origins are best effort and come from
+    /// dnf. A package with no origin keeps its bare-version form, which is what
+    /// keeps the format additive and a single-feed project's lock unchanged.
+    pub fn set_sysroot_origins(
+        &mut self,
+        target: &str,
+        sysroot: &SysrootType,
+        origins: &HashMap<String, String>,
+    ) {
+        if origins.is_empty() {
+            return;
+        }
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+        let packages = Self::packages_mut_for(target_locks, sysroot);
+        for (name, repo) in origins {
+            // Only for packages the lock already tracks: the origin query returns
+            // everything installed in the sysroot, including dependencies pulled
+            // in transitively, while the lock records the packages the config
+            // named. Adding the rest here would change what the lock is.
+            if let Some(entry) = packages.get_mut(name) {
+                *entry = LockedPackage::with_repo(entry.version.clone(), Some(repo.clone()));
+            }
         }
     }
 
@@ -1461,7 +1619,7 @@ impl LockFile {
         &self,
         target: &str,
         sysroot: &SysrootType,
-    ) -> Option<&HashMap<String, String>> {
+    ) -> Option<&PackageVersions> {
         let target_locks = self.targets.get(target)?;
 
         let result = match sysroot {
@@ -1774,6 +1932,33 @@ impl LockFile {
 /// Expected format: "NAME VERSION-RELEASE.ARCH" per line
 ///
 /// Returns a map of package name -> full version string (including architecture suffix).
+/// Parse `name|repoid` lines from the origin query.
+///
+/// Skips anything that does not look like an answer: dnf writes warnings to
+/// stdout in some configurations, an unexpanded `%{from_repo}` means this dnf
+/// does not support the tag, and `@System` means dnf has no record of where the
+/// package came from — all three are "unknown", not a repository name.
+pub fn parse_origin_query_output(output: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some((name, repo)) = line.split_once('|') else {
+            continue;
+        };
+        if name.is_empty()
+            || repo.is_empty()
+            || repo.starts_with('%')
+            || repo.starts_with('@')
+            || name.contains(' ')
+            || name.starts_with('[')
+        {
+            continue;
+        }
+        result.insert(name.to_string(), repo.to_string());
+    }
+    result
+}
+
 pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
     let mut result = HashMap::new();
 
@@ -1915,10 +2100,105 @@ mod tests {
         assert_eq!(lock.get_feeds("t").len(), 0, "no feed set recorded yet");
         assert_eq!(
             lock.get_locked_version("t", &super::SysrootType::Rootfs, "pkg")
-                .map(String::as_str),
+                .map(|v| v.as_str()),
             Some("1.0-r0"),
             "packages survive the migration"
         );
+    }
+
+    /// A package with no known origin serializes as a bare version string, so a
+    /// single-feed project's lockfile is byte-identical to what it was before
+    /// provenance existed. That is what makes this format change additive: no
+    /// churn, and no diff for anyone who gains nothing from it.
+    #[test]
+    fn a_package_without_an_origin_round_trips_as_a_bare_string() {
+        use super::{LockedPackage, PackageVersions};
+        let plain: PackageVersions =
+            PackageVersions::from([("pkg".to_string(), LockedPackage::new("1.0-r0"))]);
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(
+            json, r#"{"pkg":"1.0-r0"}"#,
+            "bare string, exactly as before"
+        );
+
+        let with_origin: PackageVersions = PackageVersions::from([(
+            "pkg".to_string(),
+            LockedPackage::with_repo("1.0-r0", Some("local-build".into())),
+        )]);
+        let json = serde_json::to_string(&with_origin).unwrap();
+        assert!(json.contains(r#""repo":"local-build""#), "got: {json}");
+
+        // And both shapes read back.
+        for text in [
+            r#"{"pkg":"1.0-r0"}"#,
+            r#"{"pkg":{"version":"1.0-r0","repo":"r"}}"#,
+        ] {
+            let back: PackageVersions = serde_json::from_str(text).unwrap();
+            assert_eq!(back["pkg"].version, "1.0-r0", "from {text}");
+        }
+    }
+
+    /// Origins are applied only to packages the lock already tracks. The query
+    /// returns everything installed in the sysroot, dependencies included, while
+    /// the lock records what the config named — adding the rest would change what
+    /// the lock is.
+    #[test]
+    fn origins_apply_only_to_packages_the_lock_tracks() {
+        use super::{LockFile, SysrootType};
+        let mut lock = LockFile::default();
+        lock.set_locked_version("t", &SysrootType::Rootfs, "named", "1.0-r0");
+        let origins = super::HashMap::from([
+            ("named".to_string(), "local-build".to_string()),
+            ("a-transitive-dep".to_string(), "avocado".to_string()),
+        ]);
+        lock.set_sysroot_origins("t", &SysrootType::Rootfs, &origins);
+        let pkgs = lock
+            .get_sysroot_versions("t", &SysrootType::Rootfs)
+            .unwrap();
+        assert_eq!(pkgs["named"].repo.as_deref(), Some("local-build"));
+        assert!(
+            !pkgs.contains_key("a-transitive-dep"),
+            "not the lock's business"
+        );
+        // An empty map is a no-op, not a wipe: the origin query is best effort.
+        lock.set_sysroot_origins("t", &SysrootType::Rootfs, &super::HashMap::new());
+        let pkgs = lock
+            .get_sysroot_versions("t", &SysrootType::Rootfs)
+            .unwrap();
+        assert_eq!(pkgs["named"].repo.as_deref(), Some("local-build"));
+        // And a later version-only install must not erase it.
+        lock.update_sysroot_versions(
+            "t",
+            &SysrootType::Rootfs,
+            super::HashMap::from([("named".to_string(), "2.0-r0".to_string())]),
+        );
+        let pkgs = lock
+            .get_sysroot_versions("t", &SysrootType::Rootfs)
+            .unwrap();
+        assert_eq!(pkgs["named"].version, "2.0-r0");
+        assert_eq!(
+            pkgs["named"].repo.as_deref(),
+            Some("local-build"),
+            "a version-only update must not drop provenance"
+        );
+    }
+
+    /// The parser treats anything that is not a repository name as unknown: dnf
+    /// warnings on stdout, an unexpanded tag when the tag is unsupported, and
+    /// `@System` when dnf has no record of the origin.
+    #[test]
+    fn the_origin_parser_rejects_non_answers() {
+        let out = super::parse_origin_query_output(
+            "good|local-build\n\
+             unsupported|%{from_repo}\n\
+             unknown|@System\n\
+             [WARNING] something|else\n\
+             malformed-no-pipe\n\
+             |empty-name\n\
+             emptyrepo|",
+        );
+        assert_eq!(out.len(), 1, "got: {out:?}");
+        assert_eq!(out["good"], "local-build");
     }
 
     /// A REAL v7 lockfile from a live project, not a minimal synthetic one.
@@ -2502,8 +2782,14 @@ wget 1.21-r0.core2_64
         assert!(versions.is_some());
         let versions = versions.unwrap();
         assert_eq!(versions.len(), 2);
-        assert_eq!(versions.get("pkg1"), Some(&"1.0.0-r0.x86_64".to_string()));
-        assert_eq!(versions.get("pkg2"), Some(&"2.0.0-r0.x86_64".to_string()));
+        assert_eq!(
+            versions.get("pkg1").map(|p| p.version.as_str()),
+            Some("1.0.0-r0.x86_64")
+        );
+        assert_eq!(
+            versions.get("pkg2").map(|p| p.version.as_str()),
+            Some("2.0.0-r0.x86_64")
+        );
 
         // Non-existent sysroot should return None
         assert!(lock
@@ -2846,7 +3132,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
                 .unwrap()
                 .packages
                 .get("pkg-b")
-                .map(String::as_str),
+                .map(|p| p.version.as_str()),
             Some("2.0")
         );
     }
@@ -3350,7 +3636,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             .unwrap();
         let ext = dev.extensions.get("acme-nfs").unwrap();
         assert_eq!(
-            ext.packages.get("nfs-utils").map(String::as_str),
+            ext.packages.get("nfs-utils").map(|p| p.version.as_str()),
             Some("2.6.1-r0")
         );
     }
@@ -3382,7 +3668,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let prod = target.runtimes.get("prod").unwrap();
         let ext = prod.extensions.get("acme-nfs").unwrap();
         assert_eq!(
-            ext.packages.get("nfs-utils").map(String::as_str),
+            ext.packages.get("nfs-utils").map(|p| p.version.as_str()),
             Some("2.6.1-r0")
         );
 
@@ -3416,7 +3702,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         // Read back
         let versions = lock.get_sysroot_versions("icam-540", &s).unwrap();
         assert_eq!(
-            versions.get("kernel-image").map(String::as_str),
+            versions.get("kernel-image").map(|p| p.version.as_str()),
             Some("6.6.123-r0")
         );
         assert_eq!(
@@ -3591,16 +3877,24 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         assert_eq!(loaded.version, LOCKFILE_VERSION);
         let target = loaded.targets.get("icam-540").unwrap();
         assert_eq!(
-            target.rootfs.get("avocado-pkg-rootfs").map(String::as_str),
+            target
+                .rootfs
+                .get("avocado-pkg-rootfs")
+                .map(|p| p.version.as_str()),
             Some("1.0.0-r0")
         );
         let dev = target.runtimes.get("dev").unwrap();
         assert_eq!(dev.packages.len(), 2);
         assert_eq!(
-            dev.packages.get("avocado-runtime").map(String::as_str),
+            dev.packages
+                .get("avocado-runtime")
+                .map(|p| p.version.as_str()),
             Some("2.0.0-r0")
         );
-        assert_eq!(dev.packages.get("vim").map(String::as_str), Some("9.0-r0"));
+        assert_eq!(
+            dev.packages.get("vim").map(|p| p.version.as_str()),
+            Some("9.0-r0")
+        );
         assert!(dev.extensions.is_empty());
         let prod = target.runtimes.get("prod").unwrap();
         assert_eq!(prod.packages.len(), 1);
@@ -3628,7 +3922,10 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let target = loaded.targets.get("icam-540").unwrap();
         // Existing v4 state preserved.
         assert_eq!(
-            target.rootfs.get("avocado-pkg-rootfs").map(String::as_str),
+            target
+                .rootfs
+                .get("avocado-pkg-rootfs")
+                .map(|p| p.version.as_str()),
             Some("1.0.0-r0")
         );
         assert_eq!(
