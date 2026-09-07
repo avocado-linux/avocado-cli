@@ -1921,6 +1921,29 @@ mod tests {
         );
     }
 
+    /// A REAL v7 lockfile from a live project, not a minimal synthetic one.
+    ///
+    /// The synthetic test is not enough on its own: a real lock carries
+    /// `kernels`, `kernel-versions`, `repo-snapshot`, `runtimes` and
+    /// `extensions`, and any one of those failing to parse as the current shape
+    /// sends the whole file to the migration fallback and its `bail!`. The
+    /// version list is only half of what can break a bump.
+    #[test]
+    fn a_real_v7_lockfile_loads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("avocado.lock"),
+            include_str!("testdata/v7-real.lock"),
+        )
+        .unwrap();
+        let lock = super::LockFile::load(dir.path()).expect("a real v7 lockfile must load");
+        assert_eq!(lock.version, super::LOCKFILE_VERSION);
+        assert!(
+            lock.get_repo_snapshot("qemux86-64").is_some(),
+            "the snapshot pin survives the migration"
+        );
+    }
+
     /// Every version the fast path can carry forward, exercised through `load`.
     /// The list is easy to under-fill because a version is silently covered while
     /// it equals `LOCKFILE_VERSION`.

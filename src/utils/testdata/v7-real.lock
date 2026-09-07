@@ -1,0 +1,99 @@
+{
+  "distro_release": "2024",
+  "targets": {
+    "qemux86-64": {
+      "extensions": {
+        "avocado-bsp-qemux86-64": {
+          "source": {
+            "package": "avocado-bsp-qemux86-64",
+            "type": "package",
+            "version": "0.1.0-r0"
+          }
+        },
+        "avocado-ext-dev": {
+          "source": {
+            "package": "avocado-ext-dev",
+            "type": "package",
+            "version": "0.1.0-r0"
+          }
+        },
+        "avocado-ext-sshd-dev": {
+          "source": {
+            "package": "avocado-ext-sshd-dev",
+            "type": "package",
+            "version": "0.1.0-r0"
+          }
+        }
+      },
+      "initramfs": {
+        "avocado-pkg-initramfs": "0.0.0-r0.0.avocado_qemux86_64",
+        "packagegroup-avocado-initramfs-modules-6.6.127-yocto-standard": "6.6.127+git0+45f69741c7_70af2998be-r0.1.avocado_qemux86_64"
+      },
+      "kernel-versions": {
+        "initramfs": "6.6.127-yocto-standard",
+        "rootfs": "6.6.127-yocto-standard",
+        "runtimes/dev": "6.6.127-yocto-standard",
+        "runtimes/dev/extensions/avocado-ext-dev": "6.6.127-yocto-standard",
+        "runtimes/dev/extensions/avocado-ext-sshd-dev": "6.6.127-yocto-standard",
+        "target-sysroot": "6.6.127-yocto-standard"
+      },
+      "kernels": {
+        "6.6.127-yocto-standard": {
+          "kernel-image-6.6.127-yocto-standard": "6.6.127+git0+45f69741c7_70af2998be-r0.1.avocado_qemux86_64"
+        }
+      },
+      "repo-snapshot": {
+        "channel": "edge",
+        "created": "2026-07-08T02:51:06Z",
+        "release": "2024",
+        "repo_url": "https://repo.avocadolinux.org",
+        "snapshot": "18"
+      },
+      "rootfs": {
+        "avocado-pkg-rootfs": "0.0.0-r0.0.avocado_qemux86_64",
+        "kernel-image-6.6.127-yocto-standard": "6.6.127+git0+45f69741c7_70af2998be-r0.1.avocado_qemux86_64",
+        "packagegroup-avocado-rootfs-modules-6.6.127-yocto-standard": "6.6.127+git0+45f69741c7_70af2998be-r0.1.avocado_qemux86_64"
+      },
+      "runtimes": {
+        "dev": {
+          "extensions": {
+            "app": {},
+            "avocado-bsp-qemux86-64": {},
+            "avocado-ext-dev": {
+              "packages": {
+                "avocado-hitl": "1.0-r0.0.avocado_qemux86_64",
+                "gptfdisk": "1.0.9-r0.1.core2_64",
+                "rsync": "3.2.7-r0.1.core2_64",
+                "util-linux-findmnt": "2.39.3-r0.5.core2_64",
+                "util-linux-lsblk": "2.39.3-r0.5.core2_64",
+                "util-linux-partx": "2.39.3-r0.5.core2_64",
+                "util-linux-sfdisk": "2.39.3-r0.5.core2_64"
+              }
+            },
+            "avocado-ext-sshd-dev": {
+              "packages": {
+                "openssh": "9.6p1-r0.2.core2_64"
+              }
+            }
+          },
+          "packages": {
+            "avocado-runtime": "0.0.0-r0.1.avocado_qemux86_64",
+            "hello-feed": "1.0-1.noarch"
+          }
+        }
+      },
+      "sdk": {
+        "x86_64": {
+          "avocado-sdk-bootstrap": "0.0.0-r0.0.x86_64_avocadosdk",
+          "avocado-sdk-qemux86-64": "0.0.0-r0.4.all_avocadosdk",
+          "avocado-sdk-toolchain": "0.0.0-r0.21.x86_64_avocadosdk",
+          "nativesdk-avocado-hitl": "1.0-r0.42.x86_64_avocadosdk",
+          "nativesdk-openssh-scp": "9.6p1-r0.42.x86_64_avocadosdk",
+          "nativesdk-openssh-ssh": "9.6p1-r0.42.x86_64_avocadosdk",
+          "nativesdk-rsync": "3.2.7-r0.43.x86_64_avocadosdk"
+        }
+      }
+    }
+  },
+  "version": 7
+}
