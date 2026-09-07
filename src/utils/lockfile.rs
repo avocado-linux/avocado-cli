@@ -274,11 +274,24 @@ impl RpmQueryConfig {
     /// which come from the SDK image rather than a feed.
     pub fn build_origin_query_command(&self) -> Option<String> {
         let root = self.root_path.as_ref()?;
+        // Unset for the same reason `build_query_command` unsets them on its
+        // installroot branch: the entrypoint exports
+        // `RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"` on every container run, and
+        // pointing librpm at the SDK's rpmrc while asking about a target
+        // installroot is how that query reads the wrong database. dnf reaches the
+        // rpmdb through librpm too, so it inherits the hazard.
+        //
+        // Nothing is re-exported afterwards because there is nothing to
+        // re-export: every sysroot with a `root_path` has both fields `None`, and
+        // the only one that sets them — the SDK — has no installroot and returns
+        // above.
+        //
         // `|| true` for the same reason the rpm query needs it: the entrypoint runs
         // under `set -e` and a query that matches nothing must not abort the script.
         Some(format!(
-            "dnf --installroot=\"{root}\" --disablerepo=\"*\" repoquery --installed \
-             --qf '%{{name}}|%{{from_repo}}' 2>/dev/null || true"
+            "(unset RPM_ETCCONFIGDIR RPM_CONFIGDIR; \
+             dnf --installroot=\"{root}\" --disablerepo=\"*\" repoquery --installed \
+             --qf '%{{name}}|%{{from_repo}}' 2>/dev/null) || true"
         ))
     }
 
@@ -2190,6 +2203,39 @@ mod tests {
             let back: PackageVersions = serde_json::from_str(text).unwrap();
             assert_eq!(back["pkg"].version, "1.0-r0", "from {text}");
         }
+    }
+
+    /// The origin query runs with the SDK's rpm config unset.
+    ///
+    /// The container entrypoint exports `RPM_ETCCONFIGDIR="$AVOCADO_SDK_PREFIX"`
+    /// on every run. `build_query_command` already unsets it before an installroot
+    /// query, because pointing librpm at the SDK's rpmrc while asking about a
+    /// target root is how that query reads the wrong database — and dnf reaches
+    /// the rpmdb through librpm too.
+    #[test]
+    fn the_origin_query_unsets_the_sdk_rpm_config() {
+        use super::SysrootType;
+        let cmd = SysrootType::Rootfs
+            .get_rpm_query_config()
+            .build_origin_query_command()
+            .expect("a sysroot with an installroot has an origin query");
+        assert!(
+            cmd.starts_with("(unset RPM_ETCCONFIGDIR RPM_CONFIGDIR;"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("--installroot=\"$AVOCADO_PREFIX/rootfs\""),
+            "{cmd}"
+        );
+        // The subshell has to close before `|| true`, or the unset leaks into the
+        // rest of the entrypoint and every later rpm call sees the wrong config.
+        assert!(cmd.ends_with(") || true"), "{cmd}");
+
+        // The SDK has no installroot: its packages come from the image, not a feed.
+        assert!(SysrootType::Sdk("x86_64".into())
+            .get_rpm_query_config()
+            .build_origin_query_command()
+            .is_none());
     }
 
     /// Origins are applied only to packages the lock already tracks. The query
