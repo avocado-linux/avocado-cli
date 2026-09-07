@@ -1808,6 +1808,13 @@ fn package_files_digest(root: &Path, patterns: &[&str]) -> Result<String> {
     use crate::utils::overlay_preprocess::path_content_digest;
     let is_glob = |p: &str| p.contains(['*', '?', '[']);
     let mut lines: Vec<String> = Vec::new();
+    let mut globs: Vec<(&str, globset::GlobMatcher)> = Vec::new();
+
+    // Literals need no walk at all, so they are resolved directly and the tree
+    // is walked ONCE for every glob together. One walk per pattern made this
+    // O(patterns x files), which is real cost on a large source tree during
+    // stamp hashing — paid on every build, including the ones where nothing
+    // changed and the stamp is about to say so.
     for pat in patterns {
         if !is_glob(pat) {
             match path_content_digest(root, pat)? {
@@ -1819,30 +1826,54 @@ fn package_files_digest(root: &Path, patterns: &[&str]) -> Result<String> {
             }
             continue;
         }
-        let glob = globset::GlobBuilder::new(pat)
-            .literal_separator(true)
-            .build()
-            .with_context(|| format!("Invalid package_files pattern `{pat}`"))?
-            .compile_matcher();
-        let mut matched = false;
+        globs.push((
+            pat,
+            globset::GlobBuilder::new(pat)
+                .literal_separator(true)
+                .build()
+                .with_context(|| format!("Invalid package_files pattern `{pat}`"))?
+                .compile_matcher(),
+        ));
+    }
+
+    if !globs.is_empty() {
+        let mut matched = vec![false; globs.len()];
         for entry in walkdir::WalkDir::new(root).sort_by_file_name() {
             let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
             let Ok(rel) = entry.path().strip_prefix(root) else {
                 continue;
             };
             let Some(rel) = rel.to_str() else { continue };
-            if rel.is_empty() || !glob.is_match(rel) {
+            if rel.is_empty() {
                 continue;
             }
-            matched = true;
-            if let Some(d) = path_content_digest(root, rel)? {
-                lines.push(format!("{rel}\t{d}"));
+            // Digested once per entry, but still emitted once per matching
+            // pattern: two patterns covering the same file contribute two
+            // identical lines, exactly as the per-pattern walk did, so this
+            // change is a speed-up and not a digest change.
+            let mut digest = None;
+            for (i, (_, glob)) in globs.iter().enumerate() {
+                if !glob.is_match(rel) {
+                    continue;
+                }
+                matched[i] = true;
+                if digest.is_none() {
+                    digest = Some(path_content_digest(root, rel)?);
+                }
+                if let Some(Some(d)) = &digest {
+                    lines.push(format!("{rel}\t{d}"));
+                }
             }
         }
-        if !matched {
-            lines.push(format!("{pat}\t(no match)"));
+        // A pattern matching nothing still contributes, so removing the last
+        // match moves the digest rather than reading as "nothing declared".
+        for (i, (pat, _)) in globs.iter().enumerate() {
+            if !matched[i] {
+                lines.push(format!("{pat}\t(no match)"));
+            }
         }
     }
+
     lines.sort();
     Ok(compute_hash(&lines.join("\n")))
 }
@@ -2390,6 +2421,13 @@ pub const CONTENT_HASH_PLACEHOLDER: &str = "__AVOCADO_CONTENT_HASH__";
 /// substituted, with `sed` on a value that has just been checked to be hex. An
 /// unquoted heredoc would have expanded `$` and backticks in every path the
 /// config happened to name.
+///
+/// The substitution is anchored to the whole `"content_hash": "<placeholder>"`
+/// field and refused if that field is not there. The placeholder alone appeared
+/// in the pattern before, and the stamp carries user-controlled strings —
+/// `inputs.config_hash`, `outputs.exports`, a path from the config — so a value
+/// that happened to contain it would have been rewritten too, corrupting the
+/// stamp rather than failing.
 pub fn generate_write_stamp_script_with_digest(
     stamp: &Stamp,
     digest_script: &str,
@@ -2406,11 +2444,13 @@ pub fn generate_write_stamp_script_with_digest(
 case "$AVOCADO_CONTENT_HASH" in
     *[!0-9a-f]*|"") echo "ERROR: content digest for {stamp_path} is empty or not hex: '$AVOCADO_CONTENT_HASH'" >&2; exit 1 ;;
 esac
-mkdir -p "$AVOCADO_PREFIX/.stamps/$(dirname '{stamp_path}')"
-cat > "$AVOCADO_PREFIX/.stamps/{stamp_path}" << 'STAMP_EOF'
+_avocado_stamp="$AVOCADO_PREFIX/.stamps/{stamp_path}"
+mkdir -p "$(dirname "$_avocado_stamp")" || exit 1
+cat > "$_avocado_stamp" << 'STAMP_EOF' || exit 1
 {stamp_json}
 STAMP_EOF
-sed -i "s/{placeholder}/sha256:$AVOCADO_CONTENT_HASH/" "$AVOCADO_PREFIX/.stamps/{stamp_path}"
+grep -q '"content_hash": "{placeholder}"' "$_avocado_stamp" || {{ echo "ERROR: {stamp_path} has no content_hash placeholder to substitute" >&2; exit 1; }}
+sed -i 's|"content_hash": "{placeholder}"|"content_hash": "sha256:'"$AVOCADO_CONTENT_HASH"'"|' "$_avocado_stamp" || exit 1
 "#,
         placeholder = CONTENT_HASH_PLACEHOLDER,
     ))
@@ -5017,6 +5057,105 @@ extensions:
 
         // A literal path that does not exist is an error, like a script.
         assert!(package_files_digest(root, &["missing.txt"]).is_err());
+    }
+
+    /// One walk for every glob instead of one walk per glob — same digest.
+    ///
+    /// The speed-up is only safe if the output is unchanged, and the subtle part
+    /// is overlapping patterns: a file matched by two of them contributed two
+    /// identical lines under the per-pattern walk, so the digest is not the same
+    /// as a deduplicated one. These values were computed with the per-pattern
+    /// implementation; if a refactor dedupes, they move and this fails.
+    #[test]
+    fn package_files_digest_is_unchanged_by_the_single_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("one.sh"), "1").unwrap();
+        std::fs::write(root.join("a/two.sh"), "2").unwrap();
+
+        // Overlapping patterns: `**/*.sh` and `*.sh` both cover one.sh.
+        let overlapping = package_files_digest(root, &["**/*.sh", "*.sh"]).unwrap();
+        let single = package_files_digest(root, &["**/*.sh"]).unwrap();
+        assert_ne!(
+            overlapping, single,
+            "a doubly-matched file must still contribute twice"
+        );
+
+        // And order of declaration does not matter, because the lines are sorted.
+        assert_eq!(
+            overlapping,
+            package_files_digest(root, &["*.sh", "**/*.sh"]).unwrap()
+        );
+
+        // A literal alongside globs is resolved without a walk and still folded.
+        let with_literal = package_files_digest(root, &["**/*.sh", "one.sh"]).unwrap();
+        assert_ne!(with_literal, single);
+    }
+
+    /// The digest is substituted into `outputs.content_hash` and nowhere else.
+    ///
+    /// The stamp carries user-controlled strings — an export value, a path from
+    /// the config — and the substitution used to match the bare placeholder, so
+    /// one of those containing it was rewritten too. That corrupts the stamp
+    /// silently, which is the worst outcome for a record other steps trust. The
+    /// script now anchors on the whole field and refuses to run if it is absent.
+    #[test]
+    fn the_digest_substitution_touches_only_the_content_hash_field() {
+        let outputs = StampOutputs {
+            exports: Some(
+                [(
+                    "SOME_EXPORT".to_string(),
+                    super::CONTENT_HASH_PLACEHOLDER.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        let st = Stamp::new(
+            StampCommand::Build,
+            StampComponent::Extension,
+            Some("my-ext".to_string()),
+            "qemux86-64".to_string(),
+            StampInputs::new(super::CONTENT_HASH_PLACEHOLDER.to_string()),
+            outputs,
+        );
+        let script =
+            super::generate_write_stamp_script_with_digest(&st, "AVOCADO_CONTENT_HASH=deadbeef")
+                .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", dir.path())
+            .output()
+            .expect("sh should run");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let written =
+            std::fs::read_to_string(dir.path().join(".stamps").join(st.relative_path())).unwrap();
+        let parsed = Stamp::from_json(&written).expect("stamp must still be valid JSON");
+        assert_eq!(
+            parsed.outputs.content_hash.as_deref(),
+            Some("sha256:deadbeef"),
+            "the digest must land in content_hash"
+        );
+        assert_eq!(
+            parsed.inputs.config_hash,
+            super::CONTENT_HASH_PLACEHOLDER,
+            "a user-controlled input must not be rewritten"
+        );
+        assert_eq!(
+            parsed.outputs.exports.as_ref().unwrap()["SOME_EXPORT"],
+            super::CONTENT_HASH_PLACEHOLDER,
+            "a user-controlled export must not be rewritten"
+        );
     }
 
     /// `version: {file, key}` reads the version out of a file at build time;
