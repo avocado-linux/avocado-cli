@@ -36,11 +36,17 @@ static LOCKFILE_SAVE_GATE: Mutex<()> = Mutex::new(());
 ///            `RuntimeLock` carrying both `packages` and per-runtime
 ///            `extensions`. Migration from v5 wraps the old flat map as
 ///            `{ packages: <old>, extensions: {} }`.
+/// Version 8: Adds per-target `feeds`, the resolved feed set a target was built
+///            against — name, order, resolved URL, and a content digest for
+///            on-disk feeds. Additive: a v7 lockfile reads as v8 with an empty
+///            list. Per target, not global, because a feed's resolved URL
+///            contains `$target` and `targets:` can exclude a feed entirely, so
+///            two targets in one project genuinely resolve different sets.
 /// Version 7: Adds per-target `repo-snapshot`, the immutable channel snapshot
 ///            the target's packages were resolved against. Additive — v6
 ///            lockfiles read as v7 with `repo_snapshot: None` and behave
 ///            exactly as before (track the live channel head).
-const LOCKFILE_VERSION: u32 = 7;
+const LOCKFILE_VERSION: u32 = 8;
 
 /// Lock file name. Lives at the top level of `src_dir` (like `Cargo.lock` /
 /// `flake.lock`) so `.avocado/` can be a purely-scratch, gitignored directory.
@@ -310,6 +316,38 @@ pub type PackageVersions = HashMap<String, String>;
 /// Used for SDK (keyed by host arch) and runtimes (keyed by name)
 pub type NestedPackageVersions = HashMap<String, PackageVersions>;
 
+/// One feed a target was resolved against, as it stood at install time.
+///
+/// Records the *source*, never a credential. `repo-snapshot` pins the distro
+/// feed's content; nothing equivalent exists for a third-party or on-disk feed,
+/// which is why this exists: it cannot make an unpinned feed reproducible, but it
+/// makes the set that was used, and the order it was used in, part of the lock
+/// rather than something only the machine that ran the build knew.
+///
+/// Order matters and is why `position` is recorded rather than implied by
+/// serialization: declaration order is a strict dnf priority override, so the
+/// same package name and version can come from a different feed — and therefore
+/// be different bytes — purely because the list was reordered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedFeed {
+    /// The feed's name under `repos:`.
+    pub name: String,
+    /// Position in `distro.feeds`, which is its dnf priority order. First wins.
+    pub position: u32,
+    /// The resolved URL, with `$releasever` and `$target` already expanded. A
+    /// `file://` path for an on-disk feed, and the `connect://<org>/...`
+    /// placeholder for a Connect feed — never the minted host, which changes per
+    /// build and is not an input.
+    pub url: String,
+    /// Digest of an on-disk feed's `repodata/repomd.xml` at install time. The one
+    /// case where content *can* be pinned without the feed serving snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Which build stages the feed applied to. Absent means every stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stages: Option<Vec<String>>,
+}
+
 /// The immutable channel snapshot a target's packages were resolved against.
 ///
 /// Recorded on the first fetch that resolves a snapshot (auto-pin). Subsequent
@@ -528,6 +566,10 @@ pub struct TargetLocks {
         rename = "repo-snapshot"
     )]
     pub repo_snapshot: Option<RepoSnapshot>,
+
+    /// The feed set this target was resolved against, in priority order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feeds: Vec<LockedFeed>,
 
     /// In-memory only: sysroot sections explicitly cleared during this process
     /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
@@ -1086,6 +1128,12 @@ impl LockFile {
             // concurrent writer's freshly-resolved pin isn't dropped. An
             // explicit clear (unlock) goes through `save_replacing`, which
             // never merges, so a cleared pin stays cleared.
+            // Same rule as the snapshot: adopt the other side's record only when
+            // this side has none. An install replaces the set wholesale, so a
+            // merge must not resurrect feeds a later install dropped.
+            if self_target.feeds.is_empty() {
+                self_target.feeds = other_target.feeds;
+            }
             if self_target.repo_snapshot.is_none() {
                 self_target.repo_snapshot = other_target.repo_snapshot;
             }
@@ -1113,6 +1161,23 @@ impl LockFile {
     /// Get the recorded repo snapshot pin for a target, if any.
     pub fn get_repo_snapshot(&self, target: &str) -> Option<&RepoSnapshot> {
         self.targets.get(target)?.repo_snapshot.as_ref()
+    }
+
+    /// The feed set recorded for a target, in priority order.
+    pub fn get_feeds(&self, target: &str) -> &[LockedFeed] {
+        self.targets
+            .get(target)
+            .map(|t| t.feeds.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Record (or replace) the feed set for a target.
+    ///
+    /// Replace, not merge: the set is a snapshot of what this install resolved,
+    /// and a feed removed from the config has to disappear from the lock, or the
+    /// record would accumulate feeds no build uses.
+    pub fn set_feeds(&mut self, target: &str, feeds: Vec<LockedFeed>) {
+        self.targets.entry(target.to_string()).or_default().feeds = feeds;
     }
 
     /// Record (or replace) the repo snapshot pin for a target. Used by the
@@ -1764,6 +1829,71 @@ pub fn build_package_spec_with_lock(
 
 #[cfg(test)]
 mod tests {
+    /// The feed set is per target, and it has to be: a feed's resolved URL
+    /// contains `$target`, and `targets:` can exclude a feed entirely, so two
+    /// targets in one project genuinely resolve different sets. A single global
+    /// list would record one target's sources against the other's packages.
+    #[test]
+    fn the_feed_set_is_recorded_per_target() {
+        use super::{LockFile, LockedFeed};
+        let feed = |name: &str, pos: u32, url: &str| LockedFeed {
+            name: name.into(),
+            position: pos,
+            url: url.into(),
+            digest: None,
+            stages: None,
+        };
+        let mut lock = LockFile::default();
+        lock.set_feeds(
+            "jetson-agx-thor",
+            vec![feed("local", 10, "file:///run/avocado-feeds/paths/local")],
+        );
+        lock.set_feeds(
+            "qemux86-64",
+            vec![
+                feed("local", 10, "file:///run/avocado-feeds/paths/local"),
+                feed("avocado", 20, "https://repo.example/2026/next"),
+            ],
+        );
+        assert_eq!(lock.get_feeds("jetson-agx-thor").len(), 1);
+        assert_eq!(lock.get_feeds("qemux86-64").len(), 2);
+        assert_eq!(lock.get_feeds("never-built").len(), 0);
+        // Order is the record, because order is a strict priority override.
+        assert_eq!(lock.get_feeds("qemux86-64")[0].name, "local");
+        assert_eq!(lock.get_feeds("qemux86-64")[1].position, 20);
+    }
+
+    /// Replaced, not merged: a feed removed from the config must leave the lock,
+    /// or the record accumulates sources no build uses.
+    #[test]
+    fn recording_a_feed_set_replaces_the_previous_one() {
+        use super::{LockFile, LockedFeed};
+        let f = |name: &str| LockedFeed {
+            name: name.into(),
+            position: 10,
+            url: "https://x".into(),
+            digest: None,
+            stages: None,
+        };
+        let mut lock = LockFile::default();
+        lock.set_feeds("t", vec![f("a"), f("b")]);
+        lock.set_feeds("t", vec![f("a")]);
+        let names: Vec<&str> = lock
+            .get_feeds("t")
+            .iter()
+            .map(|x| x.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a"], "dropped feed must not linger");
+    }
+
+    /// A v7 lockfile has no `feeds` key at all and must still load.
+    #[test]
+    fn a_lockfile_without_a_feed_set_still_loads() {
+        let json = r#"{"version": 7, "targets": {"t": {"rootfs": {"pkg": "1.0"}}}}"#;
+        let lock: super::LockFile = serde_json::from_str(json).expect("v7 lockfile loads");
+        assert_eq!(lock.get_feeds("t").len(), 0);
+    }
+
     use super::*;
     use tempfile::TempDir;
 
