@@ -914,6 +914,13 @@ impl StampValidationError {
             renderer.shutdown();
         }
 
+        // Same reason as the renderer above: `process::exit` below skips main's
+        // cleanup, so a session container started for this invocation would be
+        // left parked until the next run swept it.
+        crate::utils::container::SessionContainers::shutdown_blocking(
+            &crate::utils::container::default_container_tool(),
+        );
+
         if crate::utils::output_format::is_json_output_active() {
             crate::utils::output_format::emit_json_event(&self.json_error_event());
         }

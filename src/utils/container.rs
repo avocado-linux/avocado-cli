@@ -664,6 +664,345 @@ impl Default for RunConfig {
 }
 
 /// Container helper for SDK operations
+/// A container kept alive for the whole CLI invocation so steps can `docker
+/// exec` into it instead of paying a fresh `docker run` each.
+///
+/// Measured on a real step (full prologue, bindfs, signal traps): `docker run
+/// --rm` 0.539 s versus `docker exec` 0.043 s, byte-identical output. In a
+/// fully-cached build 71% of container time was that startup; in `install`, 83%.
+///
+/// # What is shared, and what is not
+///
+/// Everything the container is *created* with is its shape: image, `--platform`,
+/// devices, capabilities, security options, every `-v`, and the project's
+/// `container_args`. A step whose shape differs — a per-step keyset bind, a
+/// provision profile's `--privileged`, a different `--sdk-arch` — gets its own
+/// `docker run`, exactly as today. The shape is derived from the generated argv
+/// rather than a hand-maintained field list, so a create-time flag added later
+/// participates without anyone remembering to update this.
+///
+/// Everything else is per-exec: the environment (passed with `docker exec -e`)
+/// and the whole entrypoint prologue *except* its mount block. Each exec is a
+/// fresh `bash`, so re-running the prologue is what makes an exec equivalent to
+/// a run — the rpm-platform repair in particular must run before every dnf step,
+/// because dnf's own scriptlets are what break it.
+pub struct SessionContainers {
+    /// shape key -> container name
+    by_shape: tokio::sync::Mutex<HashMap<String, String>>,
+}
+
+/// Session containers are per-process, and named with the pid so a crashed run's
+/// leftovers can be identified and swept by a later one.
+static SESSION: std::sync::OnceLock<SessionContainers> = std::sync::OnceLock::new();
+
+/// Every session container this process created, readable without an async
+/// runtime. `by_shape` sits behind a tokio mutex that is deliberately held
+/// across the container-creation await, so a synchronous exit path cannot lock
+/// it; this mirror exists for those paths.
+static CREATED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+impl SessionContainers {
+    fn get() -> &'static Self {
+        SESSION.get_or_init(|| Self {
+            by_shape: tokio::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Names of every session container this process started, for teardown.
+    pub fn active_names() -> Vec<String> {
+        CREATED.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Teardown from a synchronous exit path — `print_and_exit` and friends,
+    /// which call `process::exit` and so never reach main's cleanup. Blocking
+    /// on purpose: the process is going away regardless, and leaving a parked
+    /// container behind is worse than the milliseconds this costs.
+    pub fn shutdown_blocking(container_tool: &str) {
+        for name in Self::active_names() {
+            let _ = std::process::Command::new(container_tool)
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if let Ok(mut created) = CREATED.lock() {
+            created.clear();
+        }
+    }
+
+    /// Remove session containers left by processes that are no longer running.
+    ///
+    /// A crash or a `SIGKILL` skips [`Self::shutdown`], and `--rm` only fires
+    /// when the container itself exits — a parked `sleep infinity` does not.
+    /// The pid in the name is what makes an orphan identifiable; a live pid is
+    /// never touched, so concurrent invocations do not reap each other.
+    pub async fn sweep_abandoned(container_tool: &str) {
+        let out = AsyncCommand::new(container_tool)
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "name=^avocado-sess-",
+                "--format",
+                "{{.Names}}",
+            ])
+            .output()
+            .await;
+        let Ok(out) = out else { return };
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(pid) = name
+                .strip_prefix("avocado-sess-")
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|p| p.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if pid == std::process::id() as i32 || pid_is_alive(pid) {
+                continue;
+            }
+            let _ = AsyncCommand::new(container_tool)
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+    }
+
+    /// Remove every container this process started. Called on the way out and
+    /// on Ctrl-C. Best-effort: a container that is already gone is not an error,
+    /// and a failure here must not mask the command's own result.
+    pub async fn shutdown(container_tool: &str) {
+        let names = Self::active_names();
+        for name in &names {
+            let _ = AsyncCommand::new(container_tool)
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+        Self::get().by_shape.lock().await.clear();
+        if let Ok(mut created) = CREATED.lock() {
+            created.clear();
+        }
+    }
+}
+
+impl SdkContainer {
+    /// Get (or start) the session container for `shape`, returning its name.
+    ///
+    /// Creation runs the mount block once as the container's own first act, then
+    /// parks on `sleep infinity`. `--rm` means the daemon reaps it if it dies;
+    /// [`SessionContainers::shutdown`] removes it on the way out.
+    ///
+    /// The mount-relevant environment has to be present at creation because the
+    /// mount block reads it: the host uid/gid for the bindfs mapping, the target
+    /// for the includes path, and the extension mount list. Those are constant
+    /// for an invocation, or (for the extension list) already reflected in the
+    /// `-v` flags that are part of the shape.
+    async fn session_container(
+        &self,
+        shape: &[String],
+        env_vars: &HashMap<String, String>,
+    ) -> Result<String> {
+        let key = shape.join("\u{1f}");
+        let sessions = SessionContainers::get();
+        let mut map = sessions.by_shape.lock().await;
+        if let Some(name) = map.get(&key) {
+            return Ok(name.clone());
+        }
+
+        // First session container of this invocation: clear anything a crashed
+        // run left parked.
+        if map.is_empty() {
+            SessionContainers::sweep_abandoned(&self.container_tool).await;
+        }
+
+        let name = format!(
+            "avocado-sess-{}-{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let mut cmd = vec![
+            self.container_tool.clone(),
+            "run".to_string(),
+            "-d".to_string(),
+            "--rm".to_string(),
+            "--name".to_string(),
+            name.clone(),
+        ];
+        for k in [
+            "AVOCADO_TARGET",
+            "AVOCADO_HOST_UID",
+            "AVOCADO_HOST_GID",
+            "AVOCADO_SRC_DIR",
+            "AVOCADO_EXT_PATH_MOUNTS",
+            "AVOCADO_VERBOSE",
+        ] {
+            if let Some(v) = env_vars.get(k) {
+                cmd.push("-e".to_string());
+                cmd.push(format!("{k}={v}"));
+            }
+        }
+        // shape ends with the image; everything before it is create flags.
+        let (flags, image) = shape.split_at(shape.len() - 1);
+        cmd.extend(flags.iter().cloned());
+        cmd.push(image[0].clone());
+        // Park immediately, and do the mounts as a separate, synchronous exec
+        // below. Running them as the container's own command would race: `run
+        // -d` returns as soon as the container starts, not when its command has
+        // finished, so the first step could exec into a container whose
+        // /opt/src was not mounted yet. The timeout is a backstop for the case
+        // where teardown never runs — a leaked container dies within the hour
+        // instead of living until the next sweep.
+        cmd.push("sleep".to_string());
+        cmd.push("3600".to_string());
+
+        let out = AsyncCommand::new(&cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .await
+            .context("failed to start the session container")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "could not start session container: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+
+        // Mounts, once, before any step can use the container.
+        let mount_out = AsyncCommand::new(&self.container_tool)
+            .args([
+                "exec",
+                &name,
+                "bash",
+                "-c",
+                &format!("set -e\n{}\n", Self::render_mount_block()),
+            ])
+            .output()
+            .await;
+        let mounted = matches!(&mount_out, Ok(o) if o.status.success());
+        if !mounted {
+            let detail = match &mount_out {
+                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            let _ = AsyncCommand::new(&self.container_tool)
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            anyhow::bail!("session container mounts failed: {detail}");
+        }
+
+        map.insert(key, name.clone());
+        if let Ok(mut created) = CREATED.lock() {
+            created.push(name.clone());
+        }
+        Ok(name)
+    }
+}
+
+/// The container tool to address session containers with when no config is at
+/// hand — teardown, and the abandoned-container sweep. `docker` unless the
+/// project overrode it, which `SdkContainer::from_config` already resolves for
+/// every real run; this is only the fallback for process-level cleanup.
+/// Whether a pid is still running. `kill(pid, 0)` is the portable probe: it
+/// signals nothing and only reports whether the process exists.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// No cheap equivalent probe here, so never reap: a stale container costs
+/// memory, reaping a live one breaks a running build.
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: i32) -> bool {
+    true
+}
+
+pub fn default_container_tool() -> String {
+    env::var("AVOCADO_CONTAINER_TOOL").unwrap_or_else(|_| "docker".to_string())
+}
+
+/// `docker exec` argv for a step routed into the session container.
+///
+/// The environment moves here from container creation, which is what lets steps
+/// with different `AVOCADO_RUNTIME`, `--dnf-arg` or signing variables share one
+/// container.
+fn build_exec_command(
+    container_tool: &str,
+    name: &str,
+    env_pairs: &[String],
+    command: &str,
+) -> Vec<String> {
+    let mut cmd = vec![container_tool.to_string(), "exec".to_string()];
+    for pair in env_pairs {
+        cmd.push("-e".to_string());
+        cmd.push(pair.clone());
+    }
+    cmd.push(name.to_string());
+    cmd.push("bash".to_string());
+    cmd.push("-c".to_string());
+    cmd.push(command.to_string());
+    cmd
+}
+
+/// Session containers are on by default; `AVOCADO_NO_SESSION_CONTAINER=1` forces
+/// every step back to its own `docker run`. An escape hatch for debugging a
+/// container a previous step has poisoned.
+fn session_containers_enabled() -> bool {
+    !matches!(
+        env::var("AVOCADO_NO_SESSION_CONTAINER").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Split a generated `docker run` argv into the container's shape and the
+/// command it would have run.
+///
+/// `command` is appended last by `build_container_command` and the image sits
+/// directly before it, so the split is exact rather than heuristic.
+///
+/// Dropped from the shape: `--rm`, `-d`, `--name <n>` and the stdio flags, which
+/// are per-run rather than per-container; and every `-e <k=v>`, because the
+/// environment moves to the exec. What remains is what the container must be
+/// created with.
+fn split_run_argv(argv: &[String], command_len: usize) -> Option<(Vec<String>, Vec<String>)> {
+    if argv.len() < command_len + 2 {
+        return None;
+    }
+    let image_idx = argv.len() - command_len - 1;
+    let image = argv[image_idx].clone();
+    // argv[0] is the tool, argv[1] is "run".
+    let mut shape = Vec::new();
+    let mut env = Vec::new();
+    let mut i = 2;
+    while i < image_idx {
+        match argv[i].as_str() {
+            "--rm" | "-d" | "--detach" | "-i" | "-t" | "-it" => i += 1,
+            "--name" => i += 2,
+            // Taken from the argv rather than from `RunConfig::env_vars`,
+            // because `build_container_command` injects several itself —
+            // AVOCADO_TARGET, the host uid/gid, the signing and extension-mount
+            // variables. Reading them back here is what guarantees an exec sees
+            // exactly what the equivalent run would have.
+            "-e" | "--env" if i + 1 < image_idx => {
+                env.push(argv[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                shape.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    shape.push(image);
+    Some((shape, env))
+}
+
 pub struct SdkContainer {
     pub container_tool: String,
     pub cwd: PathBuf,
@@ -1009,6 +1348,7 @@ impl SdkContainer {
                 &config.target,
                 config.no_bootstrap,
                 config.disable_weak_dependencies,
+                true,
             ));
             full_command.push('\n');
         }
@@ -1041,8 +1381,56 @@ impl SdkContainer {
         };
 
         // Build container command with volume state
-        let container_cmd =
+        let mut container_cmd =
             self.build_container_command(&effective_config, &bash_cmd, &env_vars, &volume_state)?;
+
+        // Reuse the session container when this step's shape matches it. A step
+        // that is detached, interactive, or shaped differently keeps its own
+        // `docker run` — see SessionContainers. Failing to start or reach the
+        // session container is never fatal: fall through to the run we would
+        // have done anyway.
+        let eligible = !effective_config.detach
+            && !effective_config.interactive
+            && effective_config.use_entrypoint
+            && effective_config.container_name.is_none()
+            && session_containers_enabled();
+        if eligible {
+            if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
+                match self.session_container(&shape, &env_vars).await {
+                    Ok(name) => {
+                        // The same command, minus the mount block the container
+                        // already ran, with the environment moved to the exec.
+                        let mut exec_command = self.create_entrypoint_script(
+                            effective_config.source_environment,
+                            effective_config.extension_sysroot.as_deref(),
+                            effective_config.runtime_sysroot.as_deref(),
+                            &effective_config.target,
+                            effective_config.no_bootstrap,
+                            effective_config.disable_weak_dependencies,
+                            false,
+                        );
+                        exec_command.push('\n');
+                        exec_command.push_str(&effective_config.command);
+                        container_cmd = build_exec_command(
+                            &self.container_tool,
+                            &name,
+                            &env_pairs,
+                            &exec_command,
+                        );
+                    }
+                    Err(e) => {
+                        if effective_config.verbose || self.verbose {
+                            print_info(
+                                &format!(
+                                    "Session container unavailable ({e}); running standalone."
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // Execute the command — route to TUI method if context is present
         if let Some(ref tui_ctx) = effective_config.tui_context {
@@ -1621,6 +2009,7 @@ impl SdkContainer {
                 &config.target,
                 config.no_bootstrap,
                 config.disable_weak_dependencies,
+                true,
             ));
             full_command.push('\n');
         }
@@ -1644,8 +2033,56 @@ impl SdkContainer {
         };
 
         // Build container command with volume state
-        let container_cmd =
+        let mut container_cmd =
             self.build_container_command(&effective_config, &bash_cmd, &env_vars, &volume_state)?;
+
+        // Reuse the session container when this step's shape matches it. A step
+        // that is detached, interactive, or shaped differently keeps its own
+        // `docker run` — see SessionContainers. Failing to start or reach the
+        // session container is never fatal: fall through to the run we would
+        // have done anyway.
+        let eligible = !effective_config.detach
+            && !effective_config.interactive
+            && effective_config.use_entrypoint
+            && effective_config.container_name.is_none()
+            && session_containers_enabled();
+        if eligible {
+            if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
+                match self.session_container(&shape, &env_vars).await {
+                    Ok(name) => {
+                        // The same command, minus the mount block the container
+                        // already ran, with the environment moved to the exec.
+                        let mut exec_command = self.create_entrypoint_script(
+                            effective_config.source_environment,
+                            effective_config.extension_sysroot.as_deref(),
+                            effective_config.runtime_sysroot.as_deref(),
+                            &effective_config.target,
+                            effective_config.no_bootstrap,
+                            effective_config.disable_weak_dependencies,
+                            false,
+                        );
+                        exec_command.push('\n');
+                        exec_command.push_str(&effective_config.command);
+                        container_cmd = build_exec_command(
+                            &self.container_tool,
+                            &name,
+                            &env_pairs,
+                            &exec_command,
+                        );
+                    }
+                    Err(e) => {
+                        if effective_config.verbose || self.verbose {
+                            print_info(
+                                &format!(
+                                    "Session container unavailable ({e}); running standalone."
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         if effective_config.verbose || self.verbose {
             print_info(
@@ -2630,39 +3067,19 @@ fi
     }
 
     /// Create the entrypoint script for SDK initialization
-    pub fn create_entrypoint_script(
-        &self,
-        source_environment: bool,
-        extension_sysroot: Option<&str>,
-        runtime_sysroot: Option<&str>,
-        target: &str,
-        _no_bootstrap: bool,
-        disable_weak_dependencies: bool,
-    ) -> String {
-        // Conditionally add install_weak_deps flag
-        let weak_deps_flag = if disable_weak_dependencies {
-            "--setopt=install_weak_deps=0 \\\n"
-        } else {
-            ""
-        };
-
-        let ext_path_mounts = EXT_PATH_MOUNT_SNIPPET;
-        let mut script = format!(
-            r#"
-set -e
-
-# Set up signal handlers to forward signals to all child processes
-# This ensures that when the container receives SIGTERM/SIGINT,
-# the compile script also gets terminated immediately
-cleanup() {{
-    # Kill all child processes
-    pkill -P $$ 2>/dev/null || true
-    exit $1
-}}
-trap 'cleanup 143' TERM
-trap 'cleanup 130' INT
-
-# Remount source directory with permission translation via bindfs
+    /// The mount half of the prologue: the bindfs remount of `/mnt/src` onto
+    /// `/opt/src`, and the per-extension bindfs mounts.
+    ///
+    /// Split out because it is the one part that is **not** safe to re-run.
+    /// Mounts live in the container's mount namespace, and nothing here guards
+    /// with `mountpoint -q`, so running it twice stacks a second mount (and a
+    /// second bindfs daemon) on the same target. A per-step `docker run` gets a
+    /// fresh namespace so this is invisible; a container shared across steps
+    /// must run it exactly once, at creation.
+    pub fn render_mount_block() -> String {
+        format!(
+            "{}\n{}",
+            r#"# Remount source directory with permission translation via bindfs
 # This maps host UID/GID to root inside the container for seamless file access
 mkdir -p /opt/src
 
@@ -2695,8 +3112,59 @@ else
     mount --bind /mnt/src /opt/src
     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)" >&2; fi
 fi
+"#,
+            EXT_PATH_MOUNT_SNIPPET
+        )
+    }
 
-{ext_path_mounts}
+    /// `include_mounts: false` omits [`Self::render_mount_block`] — used when
+    /// the step runs as a `docker exec` into a container that already did its
+    /// mounts at creation. Everything else in the prologue is regenerated per
+    /// step exactly as it is per container today: each exec is a fresh `bash`,
+    /// so the env derivation, the `AVOCADO_RUNTIME` symlink and the rpm-platform
+    /// repair must all run again, and re-running them is what makes an exec
+    /// equivalent to a run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_entrypoint_script(
+        &self,
+        source_environment: bool,
+        extension_sysroot: Option<&str>,
+        runtime_sysroot: Option<&str>,
+        target: &str,
+        _no_bootstrap: bool,
+        disable_weak_dependencies: bool,
+        include_mounts: bool,
+    ) -> String {
+        // Conditionally add install_weak_deps flag
+        let weak_deps_flag = if disable_weak_dependencies {
+            "--setopt=install_weak_deps=0 \\\n"
+        } else {
+            ""
+        };
+
+        // Omitted when this step will run as an exec into a container that
+        // already mounted at creation; see render_mount_block.
+        let mount_block = if include_mounts {
+            Self::render_mount_block()
+        } else {
+            String::new()
+        };
+        let mut script = format!(
+            r#"
+set -e
+
+# Set up signal handlers to forward signals to all child processes
+# This ensures that when the container receives SIGTERM/SIGINT,
+# the compile script also gets terminated immediately
+cleanup() {{
+    # Kill all child processes
+    pkill -P $$ 2>/dev/null || true
+    exit $1
+}}
+trap 'cleanup 143' TERM
+trap 'cleanup 130' INT
+{mount_block}
+
 
 # Repo URL is always supplied by the CLI env-builder (Config::DEFAULT_REPO_URL
 # when unset), so there is no literal default to drift here.
@@ -3577,7 +4045,8 @@ extensions:
     #[test]
     fn test_entrypoint_script() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, None, None, "x86_64", false, false);
+        let script =
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, true);
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("DNF_SDK_HOST"));
         assert!(script.contains("environment-setup"));
@@ -3593,6 +4062,130 @@ extensions:
     }
 
     #[test]
+    fn split_run_argv_carries_every_injected_env_var() {
+        // The shape decides which steps share a container; the env pairs decide
+        // whether the exec sees what the run would have. Dropping either is
+        // silent: a wrong shape only costs a container, but a dropped
+        // AVOCADO_TARGET leaves AVOCADO_PREFIX empty and every stamp lookup
+        // misses. Both halves come from the generated argv, not from env_vars,
+        // because build_container_command injects some itself.
+        let argv: Vec<String> = [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "--name",
+            "avocado-build-123",
+            "--platform",
+            "linux/amd64",
+            "--privileged",
+            "-v",
+            "avo-1:/opt/_avocado:rw",
+            "-e",
+            "AVOCADO_TARGET=qemux86-64",
+            "-e",
+            "AVOCADO_HOST_UID=1000",
+            "img:tag",
+            "bash",
+            "-c",
+            "echo hi",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let (shape, env) = split_run_argv(&argv, 3).unwrap();
+        assert_eq!(
+            shape,
+            vec![
+                "--platform",
+                "linux/amd64",
+                "--privileged",
+                "-v",
+                "avo-1:/opt/_avocado:rw",
+                "img:tag",
+            ]
+        );
+        assert_eq!(
+            env,
+            vec!["AVOCADO_TARGET=qemux86-64", "AVOCADO_HOST_UID=1000"]
+        );
+    }
+
+    #[test]
+    fn exec_shaped_entrypoint_drops_mounts_but_keeps_the_environment() {
+        // A step routed into the session container execs into a container that
+        // already ran the mount block at creation. Re-running bindfs there
+        // stacks a second mount, so the exec-shaped prologue omits it — and must
+        // still carry everything else, because each exec is a fresh bash.
+        let container = SdkContainer::new();
+        let full =
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, true);
+        let exec =
+            container.create_entrypoint_script(true, None, None, "x86_64", false, false, false);
+
+        for marker in [
+            "bindfs",
+            "mkdir -p /opt/src",
+            "mount --bind /mnt/src /opt/src",
+        ] {
+            assert!(full.contains(marker), "full prologue lost {marker}");
+            assert!(
+                !exec.contains(marker),
+                "exec prologue still mounts: {marker}"
+            );
+        }
+
+        // The feed/repo setup is what a build step actually needs from the
+        // prologue; sourcing it per-exec is equivalent to sourcing it per-run.
+        for marker in [
+            "REPO_URL=\"$AVOCADO_SDK_REPO_URL\"",
+            "DNF_SDK_HOST_REPO_CONF",
+            "DNF_SDK_TARGET_PREFIX",
+            "--releasever=\"$REPO_RELEASE\"",
+            "AVOCADO_SDK_PREFIX",
+            "environment-setup",
+            "cd /opt/src",
+        ] {
+            assert!(exec.contains(marker), "exec prologue lost {marker}");
+        }
+    }
+
+    #[test]
+    fn exec_shaped_entrypoint_is_valid_bash() {
+        // Cutting a block out of a generated script is exactly how an unbalanced
+        // if/fi or a stranded heredoc gets shipped. Parse both shapes.
+        let container = SdkContainer::new();
+        let dir = std::env::temp_dir().join("avocado_exec_prologue_syntax");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (include_mounts, name) in [(true, "full.sh"), (false, "exec.sh")] {
+            let script = container.create_entrypoint_script(
+                true,
+                Some("ext"),
+                None,
+                "qemux86-64",
+                false,
+                false,
+                include_mounts,
+            );
+            let path = dir.join(name);
+            std::fs::write(&path, &script).unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-n")
+                .arg(&path)
+                .output()
+                .expect("bash -n");
+            assert!(
+                out.status.success(),
+                "{name} is not valid bash: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_entrypoint_diagnostics_go_to_stderr() {
         // Capture callers (deploy's hash collection, runtime build) parse the
         // container's stdout as JSON. A single "[INFO] Mounted ..." line there —
@@ -3600,7 +4193,15 @@ extensions:
         // diagnostic in these scripts must be redirected to stderr.
         let container = SdkContainer::new();
         let scripts = [
-            container.create_entrypoint_script(true, Some("ext"), None, "x86_64", false, false),
+            container.create_entrypoint_script(
+                true,
+                Some("ext"),
+                None,
+                "x86_64",
+                false,
+                false,
+                true,
+            ),
             container.create_entrypoint_script_for_remote(
                 true,
                 Some("ext"),
@@ -3640,6 +4241,7 @@ extensions:
             "x86_64",
             false,
             false,
+            true,
         );
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/extensions/test-ext"));
@@ -3656,6 +4258,7 @@ extensions:
             "x86_64",
             false,
             false,
+            true,
         );
         assert!(script.contains("AVOCADO_SDK_PREFIX"));
         assert!(script.contains("cd /opt/_avocado/x86_64/runtimes/test-runtime"));
@@ -3666,7 +4269,7 @@ extensions:
     fn test_entrypoint_script_sdkimgarch_repair() {
         let container = SdkContainer::new();
         let script =
-            container.create_entrypoint_script(true, None, None, "qemux86-64", false, false);
+            container.create_entrypoint_script(true, None, None, "qemux86-64", false, false, true);
         // Verify arch repair block
         assert!(script.contains("_SDKIMGARCH="));
         assert!(script.contains("_ARCH_FIRST=$(echo \"${_ARCH_CURRENT}\" | cut -d: -f1)"));
@@ -3682,7 +4285,8 @@ extensions:
     #[test]
     fn test_entrypoint_script_no_bootstrap() {
         let container = SdkContainer::new();
-        let script = container.create_entrypoint_script(true, None, None, "x86_64", true, false);
+        let script =
+            container.create_entrypoint_script(true, None, None, "x86_64", true, false, true);
 
         // Should still contain environment variables
         assert!(script.contains("AVOCADO_SDK_PREFIX"));

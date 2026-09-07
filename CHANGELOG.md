@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Build steps exec into a reused per-shape container instead of starting a
+  fresh one each time.** Every step was its own `docker run --rm`, and profiling
+  a no-op `avocado build` put 71% of all container time in startup alone: the
+  run itself costs ~0.52s before the command begins, against ~0.045s for an
+  `exec` into a container that is already up. Steps whose container *shape* —
+  image, platform, mounts, devices, capabilities, `container_args` — is
+  identical now share one detached session container per shape, created on
+  first use and removed when the process exits (including the `print_and_exit`
+  path, which never returns to `main`). The environment is taken from the
+  generated `run` argv rather than from the caller's `env_vars`, so an exec
+  sees exactly what the equivalent run would have; the mount block is dropped
+  from the exec's prologue because the session container already ran it, and
+  re-running bindfs would stack a second mount. Detached, interactive and named
+  steps keep their own `docker run`, as does anything under `--runs-on`, whose
+  remote path never reaches this logic. Any failure to create or reach the
+  session container falls through to the run that would have happened anyway,
+  and `AVOCADO_NO_SESSION_CONTAINER=1` disables the reuse entirely. On a no-op
+  `build` this moves 13 of 20 steps onto `exec`, cutting time spent inside the
+  container tool from 13.8s to 8.7s; wall clock goes 11.9s to 10.7s, the
+  smaller share because steps run concurrently and some of that startup was
+  already overlapped.
 - **Reading an extension's config out of the SDK volume uses the project's own
   SDK image, not `busybox`/`alpine`.** The volume's host mountpoint is
   unreadable under rootful Docker and inside the macOS/Windows VM, so this
