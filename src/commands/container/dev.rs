@@ -1505,6 +1505,16 @@ mod tests {
         );
 
         drop(held);
+        // `flock` locks belong to the open file description, and `fork` shares
+        // it: any test on another thread that is between `fork` and `exec` at
+        // this instant (`sh -n`, `python3`, ...) still holds a reference to the
+        // lock's fd until CLOEXEC closes it. So release is observable only once
+        // that window passes. Bound the wait with the same budget `acquire` uses
+        // to tell a transient hold from a real one.
+        let deadline = Instant::now() + LOCK_ACQUIRE_WAIT;
+        while session_is_live(&lock).unwrap() && Instant::now() < deadline {
+            std::thread::sleep(LOCK_ACQUIRE_POLL);
+        }
         assert!(
             !session_is_live(&lock).unwrap(),
             "releasing the lock must make the session read as dead again"
