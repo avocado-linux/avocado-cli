@@ -1615,12 +1615,25 @@ mod tests {
         use crate::commands::rootfs::install::dnf_sync_step;
         let step = dnf_sync_step(true, "rootfs", "", "-y", "");
         assert!(step.contains("-y"), "expected -y in: {step}");
-        // And the sources agree: no install site computes `yes` from a flag.
-        let src = include_str!("install.rs");
-        assert!(
-            !src.contains("if params.force { \"-y\" }"),
-            "install still derives -y from --force"
-        );
+        // And the sources agree, across every install site. One exact string in
+        // one file was too narrow: the coupling can come back in any of the five
+        // and can be spelled several ways, so match the shape instead — the
+        // assume-yes literal and a flag on the same line.
+        for (name, src) in [
+            ("rootfs/install.rs", include_str!("install.rs")),
+            ("install.rs", include_str!("../install.rs")),
+            ("sdk/install.rs", include_str!("../sdk/install.rs")),
+            ("runtime/install.rs", include_str!("../runtime/install.rs")),
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                assert!(
+                    !(line.contains("\"-y\"") && line.contains("force")),
+                    "{name}:{} derives the assume-yes flag from a flag: {line}",
+                    n + 1
+                );
+            }
+        }
     }
 
     #[test]

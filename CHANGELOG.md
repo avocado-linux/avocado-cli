@@ -31,9 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour when a person is driving dnf directly.
 
   No opt-out flag was added. An interactive confirmation cannot be answered
-  usefully in CI or under the TUI — that is why the renderer was gated on
-  `--force` in the first place — and the dnf pass-through commands already
+  usefully in CI or under the TUI, and the dnf pass-through commands already
   cover reviewing a transaction by hand.
+
+- **`--output json` no longer implies `--force`.** It did, because the TUI
+  renderer was gated on `--force` — dnf could prompt without it, and the
+  renderer made the prompt invisible — and because `docker run -it` fails
+  where no terminal is attached. Both reasons are gone: installs now always
+  pass `-y`, and `utils::interactivity` decides the container's stdio flags
+  from what the environment can actually support. With `--force` meaning
+  reinstall from scratch, keeping the coercion would have turned every request
+  for machine-readable output into a full rebuild. The renderer is no longer
+  gated on `--force` either, so an interactive `avocado install` gets the live
+  checklist without asking for a rebuild to see it.
 
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering

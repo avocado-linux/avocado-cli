@@ -200,28 +200,34 @@ impl InstallCommand {
         // Register SDK + sysroot tasks upfront (we know these from config).
         // Ext/runtime tasks are added after config reload.
         // Create a renderer when either:
-        //   • TUI mode is on (interactive terminal + --force), so the user
-        //     sees a live checklist; or
+        //   • TUI mode is on (an interactive terminal), so the user sees a
+        //     live checklist; or
         //   • JSON output mode is on, so the renderer's state-mutators
         //     emit NDJSON `step` events for the desktop app's step list.
         //
         // In JSON mode the renderer is in Passthrough mode and doesn't
         // paint anything to stderr — its hooks only fire the JSON sink.
-        let renderer =
-            if crate::utils::output::should_create_renderer() && !self.verbose && self.force {
-                let r = Arc::new(TaskRenderer::new(false));
-                r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
-                r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
-                r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
-                r.register_task(TaskId::InitramfsInstall, "initramfs install".to_string());
-                // target-dev install is registered dynamically by sdk/install.rs
-                // after fetching extensions and discovering compile sections
-                crate::utils::tui::set_active_renderer(&r);
-                r.start();
-                Some(r)
-            } else {
-                None
-            };
+        //
+        // No longer gated on `--force`. That gate existed because dnf could
+        // prompt without it and the TUI made the prompt invisible; installs
+        // now always pass `-y`, so the reason is gone. Keeping the gate is
+        // what forced `--output json` to imply `--force`, and with `--force`
+        // meaning reinstall-from-scratch that turned a request for machine
+        // output into a full rebuild.
+        let renderer = if crate::utils::output::should_create_renderer() && !self.verbose {
+            let r = Arc::new(TaskRenderer::new(false));
+            r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+            r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+            r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+            r.register_task(TaskId::InitramfsInstall, "initramfs install".to_string());
+            // target-dev install is registered dynamically by sdk/install.rs
+            // after fetching extensions and discovering compile sections
+            crate::utils::tui::set_active_renderer(&r);
+            r.start();
+            Some(r)
+        } else {
+            None
+        };
 
         // 1. Install SDK dependencies
         if let Some(ref r) = renderer {
@@ -429,8 +435,10 @@ impl InstallCommand {
             let sched_renderer = renderer
                 .clone()
                 .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
-            // Without TUI (no --force), run tasks sequentially so each
-            // interactive prompt gets exclusive stdin access.
+            // Without a renderer, run tasks sequentially: parallel tasks write
+            // to the same terminal, and interleaved dnf output is unreadable.
+            // (It used to be about giving each prompt exclusive stdin; installs
+            // no longer prompt.)
             let effective_parallel = if renderer.is_some() { max_parallel } else { 1 };
             let mut scheduler = TaskScheduler::new(graph, sched_renderer, effective_parallel);
 
