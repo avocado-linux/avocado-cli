@@ -148,6 +148,10 @@ pub struct StampOutputs {
     /// whatever input caused it, including inputs the host cannot see.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// Shell variables the step exported for later sections of the same build
+    /// script, recorded so a skipped re-run can replay them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exports: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A stamp representing successful completion of a command
@@ -1708,13 +1712,22 @@ pub fn compute_ext_image_input_hash(
             == Some("kab");
         if is_kab {
             if let Ok(keyset) = std::env::var("KAB_KEYSET_FILE") {
-                let digest = crate::utils::overlay_preprocess::path_content_digest(
-                    Path::new("/"),
-                    keyset.trim_start_matches('/'),
-                )?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("KAB_KEYSET_FILE is set but `{keyset}` does not exist")
-                })?;
+                // Empty is an error, not "unset". `path_content_digest` would be
+                // handed an empty relative path and digest `/` itself, so the
+                // stamp would silently depend on the whole filesystem and read as
+                // a rotated key on any unrelated change. Same treatment as a
+                // declared file that does not exist.
+                let rel = keyset.trim().trim_start_matches('/');
+                if rel.is_empty() {
+                    anyhow::bail!(
+                        "KAB_KEYSET_FILE is set but empty — unset it, or point it at the keyset file"
+                    );
+                }
+                let digest =
+                    crate::utils::overlay_preprocess::path_content_digest(Path::new("/"), rel)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("KAB_KEYSET_FILE is set but `{keyset}` does not exist")
+                        })?;
                 hash_data.insert(key("kab_keyset"), serde_yaml::Value::String(digest));
             }
         }
@@ -2630,7 +2643,8 @@ mkdir -p "$(dirname "$_avocado_stamp")" || exit 1
 cat > "$_avocado_stamp" << 'STAMP_EOF' || exit 1
 {stamp_json}
 STAMP_EOF
-sed -i "s/\"{placeholder}\"/\"sha256:$AVOCADO_CONTENT_HASH\"/" "$AVOCADO_PREFIX/.stamps/{stamp_path}"
+grep -q '"content_hash": "{placeholder}"' "$_avocado_stamp" || {{ echo "ERROR: {stamp_path} has no content_hash placeholder to substitute" >&2; exit 1; }}
+sed -i 's|"content_hash": "{placeholder}"|"content_hash": "sha256:'"$AVOCADO_CONTENT_HASH"'"|' "$_avocado_stamp" || exit 1
 "#,
         placeholder = CONTENT_HASH_PLACEHOLDER,
     ))
