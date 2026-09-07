@@ -13,6 +13,7 @@ use crate::utils::{
     output::{print_error, print_info, print_success, print_warning, OutputLevel},
     permissions::{mapping_from_map, render_users_groups_script},
     runs_on::RunsOnContext,
+    runtime_extension::ResolvedExtension,
     stamps::{
         compute_runtime_build_input_hash, compute_runtime_install_input_hash,
         generate_batch_read_stamps_script, generate_write_stamp_script,
@@ -616,7 +617,11 @@ impl RuntimeBuildCommand {
         if !resolved_extensions.is_empty() {
             env_vars.insert(
                 "AVOCADO_EXT_LIST".to_string(),
-                resolved_extensions.join(" "),
+                resolved_extensions
+                    .iter()
+                    .map(|ext| ext.versioned_name())
+                    .collect::<Vec<_>>()
+                    .join(" "),
             );
         }
 
@@ -1385,7 +1390,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         config: &Config,
         parsed: &serde_yaml::Value,
         target_arch: &str,
-        resolved_extensions: &[String],
+        resolved_extensions: &[ResolvedExtension],
     ) -> Result<String> {
         // Get merged runtime configuration including target-specific dependencies
         let merged_runtime = config
@@ -1443,25 +1448,13 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             target_arch,
         )?;
 
-        // Build a map from extension name to versioned name from resolved_extensions
-        // Format of resolved_extensions items: "ext_name-version" (e.g., "my-ext-1.0.0")
-        let mut ext_version_map: HashMap<String, String> = HashMap::new();
-        for versioned_name in resolved_extensions {
-            // Parse "ext_name-version" - find the last occurrence of -X.Y.Z pattern
-            if let Some(idx) = versioned_name.rfind('-') {
-                let (name, version_with_dash) = versioned_name.split_at(idx);
-                let version = &version_with_dash[1..]; // Skip the leading '-'
-                                                       // Verify it looks like a version (starts with a digit)
-                if version
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false)
-                {
-                    ext_version_map.insert(name.to_string(), versioned_name.clone());
-                }
-            }
-        }
+        // Map extension name -> "<name>-<version>" artifact basename. The
+        // resolver hands us the name and version separately, so this is a
+        // straight index, not a parse.
+        let ext_version_map: HashMap<&str, String> = resolved_extensions
+            .iter()
+            .map(|ext| (ext.name.as_str(), ext.versioned_name()))
+            .collect();
 
         // Build copy commands for required extensions
         let mut copy_commands = Vec::new();
@@ -1522,7 +1515,7 @@ fi"#
         // Process external/versioned extensions (those required but not defined locally)
         for ext_name in &all_required_extensions {
             if !processed_extensions.contains(ext_name) {
-                if let Some(versioned_name) = ext_version_map.get(ext_name) {
+                if let Some(versioned_name) = ext_version_map.get(ext_name.as_str()) {
                     copy_commands.push(format!(
                         r#"
 if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
@@ -1575,27 +1568,14 @@ fi"#
         // their KAB header identifier, everything else uuid5(sha256).
         let ext_info_pairs: Vec<String> = resolved_extensions
             .iter()
-            .map(|versioned_name| {
-                let (name, version) = if let Some(idx) = versioned_name.rfind('-') {
-                    let (n, v_with_dash) = versioned_name.split_at(idx);
-                    let v = &v_with_dash[1..];
-                    if v.chars()
-                        .next()
-                        .map(|c| c.is_ascii_digit())
-                        .unwrap_or(false)
-                    {
-                        (n.to_string(), v.to_string())
-                    } else {
-                        (versioned_name.clone(), "0.0.0".to_string())
-                    }
-                } else {
-                    (versioned_name.clone(), "0.0.0".to_string())
-                };
+            .map(|resolved| {
+                let name = &resolved.name;
+                let version = &resolved.version;
                 // Look up image type and verity flag from parsed config. The
                 // flag travels explicitly: the manifest step must not infer it
                 // from sidecar presence (stale sidecars would attach a wrong
                 // root_hash; a missing one would silently ship unverified).
-                let ext_cfg = parsed.get("extensions").and_then(|e| e.get(&name));
+                let ext_cfg = parsed.get("extensions").and_then(|e| e.get(name));
                 let image_type = ext_cfg
                     .and_then(crate::utils::config::get_ext_image_type)
                     .unwrap_or_else(|| "raw".to_string());
@@ -1857,25 +1837,52 @@ def sha256_file(filepath):
             h.update(chunk)
     return h.hexdigest()
 
-# --- KAB identity -----------------------------------------------------
-# kabtool stamps every KAB it builds with a random UUIDv4 "Identifier"
-# in the header and offers no build-time flag to pin it. For kab-typed
-# images that identifier — not a uuid5(sha256) of the wrapped file — is
-# the authoritative image id: it is what the KOS layer stack sees once
-# the kab is registered. Read it back with `kabtool -l` and use it as
-# both the image_id and the on-disk filename, so the manifest, the
-# filename, and the KAB header all agree.
-def kab_identifier(filepath):
+# --- KAB header -------------------------------------------------------
+# `kabtool -l` prints the signed header as aligned "Field : value" lines:
+#
+#     Identifier  : eb946c2d-a349-4fbf-995a-1809c0b9af62
+#     Type        : kos.layer.rootfs
+#     Tag         : raspberrypi4
+#     Version     : 2026.9.0
+#
+# Parsed once per file and cached, because both the image id and the
+# version come from it and kabtool is a subprocess per call.
+_kab_header_cache = {{}}
+def kab_header(filepath):
+    fields = _kab_header_cache.get(filepath)
+    if fields is not None:
+        return fields
     out = subprocess.run(
         ["kabtool", "-l", filepath],
         check=True, capture_output=True, text=True,
     ).stdout
+    fields = {{}}
     for line in out.splitlines():
-        # " Identifier : eb946c2d-a349-4fbf-995a-1809c0b9af62"
-        if line.strip().startswith("Identifier"):
-            _, _, val = line.partition(":")
-            return str(uuid.UUID(val.strip()))
-    raise ValueError("no Identifier field in kabtool -l output")
+        key, sep, val = line.partition(":")
+        if sep:
+            fields[key.strip()] = val.strip()
+    _kab_header_cache[filepath] = fields
+    return fields
+
+# kabtool stamps every KAB it builds with a random UUIDv4 "Identifier"
+# in the header and offers no build-time flag to pin it. For kab-typed
+# images that identifier — not a uuid5(sha256) of the wrapped file — is
+# the authoritative image id: it is what the KOS layer stack sees once
+# the kab is registered. Read it back and use it as both the image_id
+# and the on-disk filename, so the manifest, the filename, and the KAB
+# header all agree.
+def kab_identifier(filepath):
+    val = kab_header(filepath).get("Identifier", "")
+    if not val:
+        raise ValueError("no Identifier field in kabtool -l output")
+    return str(uuid.UUID(val))
+
+def kab_header_version(filepath):
+    """The `-v` value kabtool signed into the header; "" when it carries none."""
+    try:
+        return kab_header(filepath).get("Version", "")
+    except Exception:
+        return ""
 
 def image_id_for(filepath, sha256, image_type):
     """kab -> KAB header identifier; anything else -> uuid5(namespace, sha256)."""
@@ -1971,9 +1978,16 @@ def add_image_entry(img_path, version, image_type):
     size = os.path.getsize(img_path)
     image_id = image_id_for(img_path, sha256, image_type)
     suffix = ".kab" if image_type == "kab" else ".raw"
+    # A kab states its own version in its signed header — the `-v` from the
+    # image.args that built it — and that is the version the device sees once
+    # the layer is registered. Prefer it over the os-release VERSION_ID passed
+    # in, so the manifest entry and the artifact can never disagree. The
+    # fallback still covers a kab built without `-v`, and every .raw component.
+    if image_type == "kab":
+        version = kab_header_version(img_path) or version
     dest = os.path.join(images_dir, image_id + suffix)
     shutil.copy2(img_path, dest)
-    print("  Image: " + os.path.basename(img_path) + " -> " + image_id + suffix)
+    print("  Image: " + os.path.basename(img_path) + " (" + version + ") -> " + image_id + suffix)
     entry = dict(version=version, image_id=image_id, sha256=sha256)
     if image_type == "kab":
         entry["image_type"] = "kab"
@@ -3062,9 +3076,10 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
 
     /// Collect extensions required by this runtime with their resolved versions.
     ///
-    /// Returns a list of versioned extension names in the format "ext_name-version"
-    /// (e.g., "my-ext-1.0.0"). This ensures AVOCADO_EXT_LIST and the build script
-    /// use exact versions from the configuration, not wildcards.
+    /// Returns each extension as a [`ResolvedExtension`] — name and version kept
+    /// apart, so a semver pre-release version (`0.0.0-SNAPSHOT`) survives. This
+    /// ensures AVOCADO_EXT_LIST and the build script use exact versions from the
+    /// configuration, not wildcards.
     ///
     /// The runtime's `extensions:` list is **author intent**, not the final set:
     /// each entry's `depends_on` closure is expanded here, so an author names
@@ -3085,11 +3100,11 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
         config_path: &str,
         container_image: &str,
         container_args: Option<Vec<String>>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ResolvedExtension>> {
         let merged_runtime =
             config.get_merged_runtime_config(runtime_name, target_arch, config_path)?;
 
-        let mut extensions = Vec::new();
+        let mut extensions: Vec<ResolvedExtension> = Vec::new();
 
         // Read extensions from the new `extensions` array format
         let ext_list = merged_runtime
@@ -3162,7 +3177,7 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
                         container_args.clone(),
                     )
                     .await?;
-                extensions.push(format!("{ext_name}-{version}"));
+                extensions.push(ResolvedExtension::new(ext_name, version));
             }
         }
 
@@ -4207,7 +4222,7 @@ runtimes:
 
         // Pass empty resolved_extensions since no extensions are defined with versions
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions: Vec<String> = vec![];
+        let resolved_extensions: Vec<ResolvedExtension> = vec![];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -4574,7 +4589,7 @@ extensions:
         );
 
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let resolved_extensions = vec![ResolvedExtension::new("test-ext", "1.0.0")];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -4622,7 +4637,7 @@ extensions:
         );
 
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let resolved_extensions = vec![ResolvedExtension::new("test-ext", "1.0.0")];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -4692,7 +4707,7 @@ extensions:
         );
 
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let resolved_extensions = vec![ResolvedExtension::new("test-ext", "1.0.0")];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -4736,7 +4751,7 @@ extensions:
         );
 
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let resolved_extensions = vec![ResolvedExtension::new("test-ext", "1.0.0")];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -4872,7 +4887,7 @@ extensions:
         );
 
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
+        let resolved_extensions = vec![ResolvedExtension::new("test-ext", "1.0.0")];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -4898,6 +4913,15 @@ extensions:
         assert!(script.contains("manifest[\"kernel\"] = kernel_entry"));
         // VERSION_ID is sourced from rootfs os-release; shared by all three.
         assert!(script.contains("VERSION_ID="));
+        // ...but only as the fallback. A kab-wrapped OS component takes the
+        // version from its own signed header (the `-v` in image.args), so the
+        // manifest entry and the artifact can never disagree.
+        assert!(script.contains("def kab_header_version(filepath):"));
+        assert!(script.contains("version = kab_header_version(img_path) or version"));
+        // Both the image id and the version come from `kabtool -l`, which is a
+        // subprocess per call, so the header is parsed once per file.
+        assert!(script.contains("_kab_header_cache = {}"));
+        assert!(script.contains("fields = {}"));
         // image_type defaults to "raw" when the config has no `image:` block.
         assert!(script.contains("AVOCADO_ROOTFS_IMAGE_TYPE=\"raw\""));
         assert!(script.contains("AVOCADO_INITRAMFS_IMAGE_TYPE=\"raw\""));
@@ -5046,7 +5070,7 @@ runtimes:
 
         // Identifier is read back from the kab via kabtool, not recomputed.
         assert!(script.contains("[\"kabtool\", \"-l\", filepath]"));
-        assert!(script.contains("line.strip().startswith(\"Identifier\")"));
+        assert!(script.contains("kab_header(filepath).get(\"Identifier\", \"\")"));
 
         // Both id sources live behind one helper, keyed on image_type,
         // so extensions and rootfs/initramfs/kernel cannot diverge.
@@ -5096,7 +5120,7 @@ runtimes:
         );
 
         let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions: Vec<String> = vec![];
+        let resolved_extensions: Vec<ResolvedExtension> = vec![];
         let script = cmd
             .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
             .unwrap();
@@ -5141,5 +5165,77 @@ runtimes:
         assert!(script.contains("BUILD_ID=\""));
         // The manifest section should set BUILT_AT with a timestamp
         assert!(script.contains("BUILT_AT=\""));
+    }
+
+    /// A semver pre-release version (`0.0.0-SNAPSHOT`, `1.2.3-rc.1`) must
+    /// survive the round-trip through `resolved_extensions`.
+    ///
+    /// `collect_runtime_extensions` encodes each entry as `"{name}-{version}"`,
+    /// and `create_build_script` decodes it again. Splitting at the *last*
+    /// dash mis-parses any pre-release: `kos-layer-osconf-0.0.0-SNAPSHOT`
+    /// decodes as name `kos-layer-osconf-0.0.0` + version `SNAPSHOT`, which
+    /// fails the "starts with a digit" check, so the entry falls back to
+    /// version `0.0.0` and the manifest step then looks for an image named
+    /// `<name>-0.0.0-SNAPSHOT-0.0.0.raw` that nothing ever produced.
+    #[test]
+    fn test_create_build_script_handles_prerelease_ext_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+distro:
+  version: "0.1.0"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - kos-layer-osconf
+
+extensions:
+  kos-layer-osconf:
+    version: "0.0.0-SNAPSHOT"
+    image:
+      type: kab
+    types:
+      - confext
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+
+        let config = Config::load(&cmd.config_path).unwrap();
+        let resolved_extensions =
+            vec![ResolvedExtension::new("kos-layer-osconf", "0.0.0-SNAPSHOT")];
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
+            .unwrap();
+
+        // The pair the manifest step consumes must carry the real name and the
+        // full pre-release version, and the real image type from the config.
+        assert!(
+            script.contains("AVOCADO_EXT_PAIRS=\"kos-layer-osconf:0.0.0-SNAPSHOT:kab:plain\""),
+            "AVOCADO_EXT_PAIRS was mis-encoded; script contained: {}",
+            script
+                .lines()
+                .find(|l| l.contains("AVOCADO_EXT_PAIRS="))
+                .unwrap_or("<no AVOCADO_EXT_PAIRS line>")
+        );
+
+        // ...and the copy step must stage the artifact under the same
+        // basename the manifest step will look for.
+        assert!(script.contains("kos-layer-osconf-0.0.0-SNAPSHOT.kab"));
+        assert!(!script.contains("kos-layer-osconf-0.0.0-SNAPSHOT-0.0.0"));
     }
 }
