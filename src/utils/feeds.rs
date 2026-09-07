@@ -426,6 +426,23 @@ impl ResolvedFeedSet {
                         unsupported.join(", ")
                     );
                 }
+                // The distro feed's URL is a *base*: the CLI appends the
+                // releasever and the baked .repo files hang their own paths off
+                // it. A `$releasever` or `$target` written here is not expanded —
+                // the substitution only runs for named feeds — so it survives
+                // verbatim into a baseurl like `.../$releasever/.../2026/next`.
+                // Easy to write by copying a `repos:` example, and it fails as a
+                // 404 rather than as a config error, so refuse it here.
+                if let Some(url) = &def.url {
+                    if let Some(var) = ["$releasever", "$target"]
+                        .into_iter()
+                        .find(|v| url.contains(v))
+                    {
+                        bail!(
+                            "repos.{name}: the distro feed's `url` is a base URL and must not contain `{var}` —                              the release path is appended and the SDK image's baked .repo files add the rest.                              Write just the host and any prefix, e.g. https://repo.avocadolinux.org"
+                        );
+                    }
+                }
             }
             if def.stages.as_ref().is_some_and(|s| s.is_empty()) {
                 bail!("repos.{name}: `stages` must not be empty; omit it to enable the feed at every stage");
@@ -1441,6 +1458,29 @@ distro:
         // ca / tls_verify on the distro feed are fine — the getters honour them.
         let c = load("distro:\n  release: 2026\n  channel: next\n  repo: m\nrepos:\n  m:\n    url: https://m\n    tls_verify: false\n");
         assert!(c.get_repo_insecure());
+
+        // The distro URL is a base: the releasever is appended and the baked
+        // .repo files add the rest. A `$releasever` or `$target` copied from a
+        // `repos:` example is never expanded here, so it would survive into the
+        // baseurl and fail as a 404 rather than as a config error.
+        for var in ["$releasever", "$target"] {
+            let e = err(&format!(
+                "distro:\n  release: 2026\n  channel: next\n  repo: m\nrepos:\n  m:\n    url: https://m/{var}\n"
+            ));
+            assert!(e.contains("base URL") && e.contains(var), "{e}");
+        }
+        // And a named feed still requires the placeholder, so the two rules do
+        // not quietly contradict each other.
+        let named = load(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [v]\nrepos:\n  v:\n    url: https://v/$releasever\n",
+        );
+        let set = ResolvedFeedSet::resolve(&named, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            set.feeds.iter().any(|f| f.baseurl == "https://v/2026/next"),
+            "a named feed still expands the placeholder"
+        );
     }
 
     #[test]
