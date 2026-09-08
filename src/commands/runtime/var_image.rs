@@ -348,10 +348,18 @@ STONE_VAR_SIZE=$(( STONE_VAR_STAGED + STONE_VAR_STAGED / 5 + 67108864 ))
 # Build OS bundle (.aos) — needs rootfs + initramfs + kernel + var (all built above)
 STONE_MANIFEST="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-$TARGET_ARCH.json}}"
 STONE_INPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
-STONE_BUILD_DIR="$OUTPUT_DIR/stone"
+# NOT $OUTPUT_DIR. `$AVOCADO_PREFIX/output/runtimes/<rt>` and
+# `$AVOCADO_PREFIX/runtimes/<rt>` are two different trees: the former is where
+# the SDK's stone tooling looks (`$AVOCADO_STONE_DATA_DIR`), where the
+# device-tree overlay staging goes, and where provision keeps its state. A
+# review flagged these as duplicating `OUTPUT_DIR` and "easy to drift"; they are
+# not a duplicate, and repointing them left `provision` unpacking a stale
+# bootfiles tarball from the old location — which flashed an old GPT and old
+# firmware alongside a new system image. Caught on hardware, not here.
+STONE_BUILD_DIR="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/stone"
 # Clean previous stone build artifacts to prevent stale image reuse
 rm -rf "$STONE_BUILD_DIR"
-STONE_AOS_OUTPUT="$OUTPUT_DIR/os-bundle.aos"
+STONE_AOS_OUTPUT="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/os-bundle.aos"
 export STONE_AOS_OUTPUT
 
 # Build include path flags from AVOCADO_STONE_INCLUDE_PATHS
@@ -696,6 +704,35 @@ runtimes:
         assert!(
             !ota.contains("$FINAL_SIZE"),
             "FINAL_SIZE is a property of the built var image and is not available here"
+        );
+    }
+
+    /// `$AVOCADO_PREFIX/output/runtimes/<rt>` and `$AVOCADO_PREFIX/runtimes/<rt>`
+    /// are two different trees and stone's are in the first one. The SDK's stone
+    /// tooling reads that tree (`$AVOCADO_STONE_DATA_DIR`), the device-tree
+    /// overlay staging writes there, and `provision` keeps its state there.
+    ///
+    /// This exists because a review read them as duplicating `OUTPUT_DIR` and I
+    /// repointed them without checking. `provision` then unpacked a *stale*
+    /// bootfiles tarball still sitting at the old path and flashed an old GPT
+    /// and old firmware alongside a newly built system image — a board that
+    /// booted to initrd emergency for a reason nowhere near the symptom. It
+    /// cost hardware debugging time, so it is pinned.
+    #[test]
+    fn stone_writes_into_the_tree_the_sdk_reads_not_output_dir() {
+        let ota = ota_half(BASE);
+        assert!(ota
+            .contains(r#"STONE_BUILD_DIR="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/stone""#));
+        assert!(ota.contains(
+            r#"STONE_AOS_OUTPUT="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/os-bundle.aos""#
+        ));
+        assert!(
+            !ota.contains(r#"STONE_BUILD_DIR="$OUTPUT_DIR"#),
+            "OUTPUT_DIR is a different tree; stone's data dir is not under it"
+        );
+        assert!(
+            !ota.contains(r#"STONE_AOS_OUTPUT="$OUTPUT_DIR"#),
+            "OUTPUT_DIR is a different tree; the bundle is not under it"
         );
     }
 
