@@ -2423,12 +2423,9 @@ else
     REPO_RELEASE="https://repo.avocadolinux.org"
 
     # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found.
-    # `head -1` because os-release is a key=value file, not a map, and nothing
-    # stops a key repeating - both published SDK images carry VERSION_CODENAME
-    # twice. Without it the value is two lines and `dnf --releasever=<value>`
-    # hands dnf the second line as a subcommand.
+    # os-release may repeat a key; take the last, as os-release(5) prescribes.
     if [ -f /etc/os-release ]; then
-        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | head -1 | cut -d= -f2 | tr -d '"')
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | tail -n 1 | cut -d= -f2 | tr -d '"')
     fi
     REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
@@ -2715,12 +2712,9 @@ else
     REPO_RELEASE="https://repo.avocadolinux.org"
 
     # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found.
-    # `head -1` because os-release is a key=value file, not a map, and nothing
-    # stops a key repeating - both published SDK images carry VERSION_CODENAME
-    # twice. Without it the value is two lines and `dnf --releasever=<value>`
-    # hands dnf the second line as a subcommand.
+    # os-release may repeat a key; take the last, as os-release(5) prescribes.
     if [ -f /etc/os-release ]; then
-        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | head -1 | cut -d= -f2 | tr -d '"')
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | tail -n 1 | cut -d= -f2 | tr -d '"')
     fi
     REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
@@ -3825,6 +3819,14 @@ extensions:
     /// error - "no kernel versions found in the repository to choose from"
     /// against a repository that has them.
     ///
+    /// The two lines below carry DIFFERENT values, which the images' do not,
+    /// so this pins which line is taken rather than only that one line is.
+    /// `os-release(5)` settles that: "readers should pick the entries later in
+    /// the file in case of repeats, similarly to how a shell sourcing the file
+    /// would". Collapsing to the first would disagree with `. /etc/os-release`,
+    /// with systemd's own parser, and with
+    /// `platform.freedesktop_os_release()`.
+    ///
     /// Executed rather than pattern-matched: the defect is in what the shell
     /// does with the pipeline, so asserting on the script text would pass
     /// against any spelling that still returns two lines.
@@ -3837,7 +3839,7 @@ extensions:
         let mut f = std::fs::File::create(&os_release).unwrap();
         writeln!(f, "ID=avocado").unwrap();
         writeln!(f, "VERSION_CODENAME=\"2024/edge\"").unwrap();
-        writeln!(f, "VERSION_CODENAME=\"2024/edge\"").unwrap();
+        writeln!(f, "VERSION_CODENAME=\"2026/edge\"").unwrap();
         drop(f);
 
         // Lift the pipeline out of the production source rather than
@@ -3861,8 +3863,8 @@ extensions:
         let value = String::from_utf8_lossy(&out.stdout).to_string();
 
         assert_eq!(
-            value, "2024/edge",
-            "a duplicated key must not produce a multi-line releasever"
+            value, "2026/edge",
+            "a duplicated key must collapse to the LAST entry, on one line"
         );
         assert!(
             !value.contains('\n'),
@@ -3885,11 +3887,11 @@ extensions:
             .count();
         assert!(reads >= 2, "expected the two emission sites, found {reads}");
         let anchored = src
-            .matches(r#"grep "^VERSION_CODENAME=" /etc/os-release | head -1"#)
+            .matches(r#"grep "^VERSION_CODENAME=" /etc/os-release | tail -n 1"#)
             .count();
         assert_eq!(
             reads, anchored,
-            "every os-release read must pipe through `head -1`"
+            "every os-release read must pipe through `tail -n 1`"
         );
     }
 }
