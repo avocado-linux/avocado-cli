@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+
 ### Added
 - **`avocado build` produces the deployable set *and* the OTA payload;
   `avocado provision` builds the var image.** *(Breaking: `build` no longer
